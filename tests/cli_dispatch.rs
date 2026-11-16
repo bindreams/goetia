@@ -4005,8 +4005,9 @@ fn restart_prepares_both_legs_under_its_budget() {
     let two_legs: &[(&str, &str)] = &[("stop", "frpc"), ("start", "frpc"), ("stop", "web"), ("start", "web")];
     let native: &[(&str, &str)] = &[("restart", "frpc"), ("restart", "web")];
     for (budget, given, one_request, sent) in [
-        // No flag: each daemon's own stop timeout (30s by default) plus the teardown margin.
-        (&[][..], Budget::Bounded(Duration::from_secs(40)), false, two_legs),
+        // No flag: each daemon's own stop timeout (30s by default), the teardown margin and the start's
+        // usual wait.
+        (&[][..], Budget::Bounded(Duration::from_secs(50)), false, two_legs),
         (&["--no-timeout"][..], Budget::Unbounded, false, two_legs),
         (
             &["--timeout", "5s"][..],
@@ -5099,18 +5100,18 @@ fn secs(n: u64) -> Budget {
 }
 
 #[skuld::test]
-fn the_default_wait_of_stop_and_restart_is_the_stop_timeout_plus_ten_seconds() {
-    for (signal, timeout, expected) in [
-        ("terminate", Some(30), secs(40)),
-        ("terminate", Some(5), secs(15)),
-        ("terminate", Some(86_400), secs(86_410)),
-        ("interrupt", Some(120), secs(130)),
+fn the_default_wait_of_stop_is_the_stop_timeout_plus_ten_seconds_and_restart_adds_ten_for_the_start() {
+    for (signal, timeout, stop, restart) in [
+        ("terminate", Some(30), secs(40), secs(50)),
+        ("terminate", Some(5), secs(15), secs(25)),
+        ("terminate", Some(86_400), secs(86_410), secs(86_420)),
+        ("interrupt", Some(120), secs(130), secs(140)),
         // No timeout waits as long as the platform does.
-        ("terminate", None, Budget::Unbounded),
+        ("terminate", None, Budget::Unbounded, Budget::Unbounded),
         // `kill` has nothing to wait for: the wait is what it was.
-        ("kill", None, Budget::DEFAULT),
+        ("kill", None, Budget::DEFAULT, Budget::DEFAULT),
     ] {
-        for verb in ["stop", "restart"] {
+        for (verb, expected) in [("stop", stop), ("restart", restart)] {
             let fake = installed_with_stop_action(signal, timeout);
             assert_eq!(budget_of(&fake, verb, &[]), expected, "{verb} {signal} {timeout:?}");
         }

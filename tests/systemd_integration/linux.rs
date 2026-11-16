@@ -2799,6 +2799,9 @@ fn kill_ends_a_daemon_that_ignores_everything_at_once(#[fixture(systemd_group)] 
     );
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
+    // No `TimeoutStopSec=` is written, so systemd's own default bounds a process the kernel holds.
+    assert_eq!(show_property(guard.id(), "KillSignal"), "9");
+    assert_ne!(show_property(guard.id(), "TimeoutStopUSec"), "infinity");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");

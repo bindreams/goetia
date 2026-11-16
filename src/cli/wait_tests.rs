@@ -97,6 +97,47 @@ fn no_timeout_is_an_unbounded_wait_and_kill_keeps_the_previous_default() {
     assert_eq!(after(StopSignal::Kill, None), Budget::DEFAULT);
 }
 
+fn restart_after(signal: StopSignal, timeout: Option<u64>) -> Budget {
+    args(None, false).restart_budget(|| {
+        Ok(StopAction {
+            send_signal: signal,
+            timeout: timeout.map(Duration::from_secs),
+        })
+    })
+}
+
+#[skuld::test]
+fn a_restart_waits_for_the_stop_and_then_for_the_start() {
+    // The stop's timeout and teardown margin, and the start leg's previous default.
+    assert_eq!(
+        restart_after(StopSignal::Terminate, Some(30)),
+        Budget::Bounded(Duration::from_secs(50))
+    );
+    assert_eq!(
+        restart_after(StopSignal::Quit, Some(1)),
+        Budget::Bounded(Duration::from_secs(21))
+    );
+    assert_eq!(restart_after(StopSignal::Terminate, None), Budget::Unbounded);
+    assert_eq!(restart_after(StopSignal::Kill, None), Budget::DEFAULT);
+}
+
+#[skuld::test]
+fn a_restart_follows_the_flags_and_the_unreadable_default_as_a_stop_does() {
+    for (given, expected) in [
+        (
+            args(Some(Duration::from_secs(3)), false),
+            Budget::Bounded(Duration::from_secs(3)),
+        ),
+        (args(Some(Duration::ZERO), false), Budget::Immediate),
+        (args(None, true), Budget::Unbounded),
+    ] {
+        let budget = given.restart_budget(|| panic!("a flag was given: the daemon's stop action is not read"));
+        assert_eq!(budget, expected);
+    }
+    let absent = Error::NotInstalled { id: "frpc".to_string() };
+    assert_eq!(args(None, false).restart_budget(|| Err(absent)), Budget::DEFAULT);
+}
+
 #[skuld::test]
 fn a_flag_decides_without_reading_the_stop_action() {
     for (given, expected) in [

@@ -43,10 +43,10 @@ pub fn run(
             ids: &args.ids,
             get_manager,
             is_elevated,
-            // The stop leg waits as long as the daemon's own stop may take, so the budget is each
-            // daemon's, and the word follows it.
+            // The stop leg waits as long as the daemon's own stop may take, and the start leg then its
+            // usual wait, so the budget is each daemon's, and the word follows it.
             verb: &|mgr, id| {
-                let budget = args.wait.stop_budget(|| mgr.stop_action(id));
+                let budget = args.wait.restart_budget(|| mgr.stop_action(id));
                 restart(mgr, id, budget)?;
                 Ok(wait::reported(budget, "restarted", "restart requested"))
             },

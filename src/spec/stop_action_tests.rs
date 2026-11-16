@@ -38,8 +38,10 @@ fn a_native_signal_reads_in_any_case_and_is_written_as_systemd_names_it() {
         ("sigrtmin", "SIGRTMIN"),
         ("SIGRTMIN+0", "SIGRTMIN"),
         ("sigrtmin+15", "SIGRTMIN+15"),
+        ("sigrtmin+30", "SIGRTMIN+30"),
         ("SIGRTMAX", "SIGRTMAX"),
         ("sigrtmax-14", "SIGRTMAX-14"),
+        ("sigrtmax-30", "SIGRTMAX-30"),
     ] {
         let signal = StopSignal::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
         assert!(matches!(signal, StopSignal::Native(_)), "{text}");
@@ -63,8 +65,8 @@ fn a_typo_is_an_error_naming_the_choices_and_never_a_signal() {
         "usr1",
         "sigterrm",
         "SIG",
-        "sigrtmin+16",
-        "sigrtmax-15",
+        "sigrtmin+31",
+        "sigrtmax-31",
         "sigrtmin-1",
         "sigrtmax+1",
         "sigrtmin+",
@@ -297,6 +299,7 @@ fn the_scalar_form_is_the_signal_alone() {
         Some(RawStopAction {
             send_signal: Some("terminate".to_string()),
             timeout: None,
+            ..RawStopAction::default()
         })
     );
 }
@@ -308,6 +311,7 @@ fn the_canonical_form_reads_both_leaves_as_text() {
         Some(RawStopAction {
             send_signal: Some("interrupt".to_string()),
             timeout: Some(RawTimeout::Text("2m".to_string())),
+            ..RawStopAction::default()
         })
     );
 }
@@ -382,27 +386,32 @@ fn an_override_lays_its_leaves_over_the_base() {
     let base = Some(RawStopAction {
         send_signal: Some("quit".to_string()),
         timeout: Some(RawTimeout::Null),
+        ..RawStopAction::default()
     });
     let timeout_only = RawStopAction {
         send_signal: None,
         timeout: Some(RawTimeout::Text("5s".to_string())),
+        ..RawStopAction::default()
     };
     assert_eq!(
         timeout_only.over(&base),
         RawStopAction {
             send_signal: Some("quit".to_string()),
             timeout: Some(RawTimeout::Text("5s".to_string())),
+            ..RawStopAction::default()
         }
     );
     let signal_only = RawStopAction {
         send_signal: Some("interrupt".to_string()),
         timeout: None,
+        ..RawStopAction::default()
     };
     assert_eq!(
         signal_only.over(&base),
         RawStopAction {
             send_signal: Some("interrupt".to_string()),
             timeout: Some(RawTimeout::Null),
+            timeout_from_base: true,
         }
     );
     assert_eq!(signal_only.over(&None), signal_only);

@@ -109,7 +109,7 @@ fn unit_snapshot_full() {
          \n\
          [X-Goetia]\n\
          Marker=goetia\n\
-         Schema=1\n\
+         Schema=2\n\
          Version={version}\n\
          Spec={spec_b64}\n",
         exec = PROGRAM,
@@ -144,7 +144,7 @@ fn unit_snapshot_minimal() {
          \n\
          [X-Goetia]\n\
          Marker=goetia\n\
-         Schema=1\n\
+         Schema=2\n\
          Version={version}\n\
          Spec={spec_b64}\n",
         exec = PROGRAM,
@@ -979,7 +979,7 @@ fn goetia_text(spec: &DaemonSpec) -> String {
     format!(
         "[X-Goetia]\n\
          Marker=goetia\n\
-         Schema=1\n\
+         Schema=2\n\
          Version={version}\n\
          Spec={spec_b64}\n",
         version = crate::version(),
@@ -1313,12 +1313,10 @@ fn with_stop_action(stop_action: StopAction) -> DaemonSpec {
     with_fields(|f| f.stop_action = stop_action)
 }
 
-fn stop_lines(spec: &DaemonSpec) -> (String, String) {
+fn stop_lines(spec: &DaemonSpec) -> (String, Option<String>) {
     let text = unit(spec, &minimal_identity()).unwrap();
-    (
-        line_of(&text, "KillSignal=").to_string(),
-        line_of(&text, "TimeoutStopSec=").to_string(),
-    )
+    let timeout = text.contains("TimeoutStopSec=").then(|| line_of(&text, "TimeoutStopSec=").to_string());
+    (line_of(&text, "KillSignal=").to_string(), timeout)
 }
 
 #[skuld::test]
@@ -1326,7 +1324,7 @@ fn every_unit_writes_the_stop_signal_and_the_stop_timeout() {
     // Written for the default too, so that the unit never depends on systemd's own (90 s) default.
     assert_eq!(
         stop_lines(&minimal_spec()),
-        ("KillSignal=SIGTERM".to_string(), "TimeoutStopSec=30s".to_string())
+        ("KillSignal=SIGTERM".to_string(), Some("TimeoutStopSec=30s".to_string()))
     );
     for spec in [full_task(Some("30 3 * * *")), full_task(None)] {
         let text = unit(&spec, &full_identity()).unwrap();
@@ -1384,20 +1382,20 @@ fn the_timeout_is_whole_seconds_and_no_timeout_is_infinity() {
             send_signal: StopSignal::Terminate,
             timeout: timeout.map(Duration::from_secs),
         });
-        assert_eq!(stop_lines(&spec).1, written);
+        assert_eq!(stop_lines(&spec).1.as_deref(), Some(written));
     }
 }
 
 #[skuld::test]
-fn kill_is_a_sigkill_with_no_timeout() {
+fn kill_is_a_sigkill_and_writes_no_stop_timeout() {
+    // systemd's own default then still bounds a process the kernel holds (state D).
     let spec = with_stop_action(StopAction {
         send_signal: StopSignal::Kill,
         timeout: None,
     });
-    assert_eq!(
-        stop_lines(&spec),
-        ("KillSignal=SIGKILL".to_string(), "TimeoutStopSec=infinity".to_string())
-    );
+    let text = unit(&spec, &minimal_identity()).unwrap();
+    assert_eq!(line_of(&text, "KillSignal="), "KillSignal=SIGKILL");
+    assert!(!text.contains("TimeoutStopSec"), "{text}");
 }
 
 #[skuld::test]

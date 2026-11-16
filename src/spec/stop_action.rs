@@ -120,9 +120,9 @@ pub struct NativeSignal(Native);
 enum Native {
     /// `SIGUSR1`: the index of a name in [`NATIVE_SIGNALS`].
     Named(u8),
-    /// `SIGRTMIN+n`, `n` at most [`MAX_RTMIN_OFFSET`].
+    /// `SIGRTMIN+n`, `n` at most [`MAX_RT_OFFSET`].
     RtMin(u8),
-    /// `SIGRTMAX-n`, `n` at most [`MAX_RTMAX_OFFSET`].
+    /// `SIGRTMAX-n`, `n` at most [`MAX_RT_OFFSET`].
     RtMax(u8),
 }
 
@@ -161,10 +161,11 @@ const NATIVE_SIGNALS: [&str; 31] = [
     "SIGSYS",
 ];
 
-/// systemd takes `RTMIN+0` to `RTMIN+15`.
-const MAX_RTMIN_OFFSET: u8 = 15;
-/// systemd takes `RTMAX-14` to `RTMAX-0`.
-const MAX_RTMAX_OFFSET: u8 = 14;
+/// systemd's `signal_from_string` takes `RTMIN+n` and `RTMAX-n` for `0 <= n <= SIGRTMAX - SIGRTMIN`
+/// (its comment, "RTMIN+n (0 <= n <= SIGRTMAX-SIGRTMIN)", is the same in v242, v255 and main), which is
+/// 30 on glibc (`SIGRTMIN` 34, `SIGRTMAX` 64). A libc with another `SIGRTMIN` has another range, which
+/// is systemd's to refuse at install.
+const MAX_RT_OFFSET: u8 = 30;
 
 impl fmt::Display for NativeSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -245,15 +246,26 @@ impl StopSignal {
     }
 }
 
+impl StopSignal {
+    /// [`StopSignal::defect`] as the error of `id`'s generator: what a spec from a blob, which
+    /// `resolve` never saw, meets.
+    pub(crate) fn refuse(self, backend: BackendKind, id: &Id) -> Result<(), Error> {
+        match self.defect(backend) {
+            Some(message) => Err(invalid(id, &message)),
+            None => Ok(()),
+        }
+    }
+}
+
 impl NativeSignal {
     fn parse(text: &str) -> Option<NativeSignal> {
         let upper = text.to_ascii_uppercase();
         let name = upper.strip_prefix("SIG")?;
         if let Some(offset) = name.strip_prefix("RTMIN") {
-            return rt_offset(offset, '+', MAX_RTMIN_OFFSET).map(|n| NativeSignal(Native::RtMin(n)));
+            return rt_offset(offset, '+', MAX_RT_OFFSET).map(|n| NativeSignal(Native::RtMin(n)));
         }
         if let Some(offset) = name.strip_prefix("RTMAX") {
-            return rt_offset(offset, '-', MAX_RTMAX_OFFSET).map(|n| NativeSignal(Native::RtMax(n)));
+            return rt_offset(offset, '-', MAX_RT_OFFSET).map(|n| NativeSignal(Native::RtMax(n)));
         }
         let index = NATIVE_SIGNALS
             .iter()
@@ -345,13 +357,22 @@ pub(crate) struct Written {
 }
 
 impl Written {
-    /// What a resolved `action` shows of the manifest: a value that is the default may or may not
-    /// have been written, and counts as not.
+    /// What a resolved `action` shows of the manifest: a leaf that is the default may or may not have
+    /// been written, and counts as not.
     pub(crate) fn of(action: &StopAction) -> Self {
+        Self::of_leaves(Some(action.send_signal), Some(action.timeout))
+    }
+
+    /// [`Written::of`] for leaves not all known yet: `None` is a value a `$` still holds (an absent
+    /// leaf is its default, not `None`). A leaf that is not known is not judged, nor is a `timeout`
+    /// while the `send_signal` that sets its default is not.
+    pub(crate) fn of_leaves(send_signal: Option<StopSignal>, timeout: Option<Option<Duration>>) -> Self {
         let default = StopAction::default();
         Written {
-            send_signal: action.send_signal != default.send_signal,
-            timeout: action.timeout != StopAction::default_timeout(action.send_signal),
+            send_signal: send_signal.is_some_and(|signal| signal != default.send_signal),
+            timeout: send_signal
+                .zip(timeout)
+                .is_some_and(|(signal, timeout)| timeout != StopAction::default_timeout(signal)),
         }
     }
 }
@@ -410,6 +431,9 @@ pub(crate) fn kill_with_timeout(timeout: Duration) -> String {
 pub(super) struct RawStopAction {
     pub send_signal: Option<String>,
     pub timeout: Option<RawTimeout>,
+    /// The `timeout` is the base's, kept under an override that wrote its own `send-signal`. If that
+    /// signal is `kill`, which has no timeout of its own, it is dropped rather than refused.
+    pub timeout_from_base: bool,
 }
 
 /// `timeout:` as authored: the one field where `null` is a value.
@@ -421,11 +445,13 @@ pub(super) enum RawTimeout {
 
 impl RawStopAction {
     /// `self` laid over `base`, leaf by leaf: what a backend's override writes wins, and what it
-    /// does not write stays the base's.
+    /// does not write stays the base's, except that a base's `timeout` goes with `send-signal: kill`
+    /// only if the override writes one too (see [`RawStopAction::timeout_from_base`]).
     pub(super) fn over(&self, base: &Option<RawStopAction>) -> RawStopAction {
         let base = base.clone().unwrap_or_default();
         RawStopAction {
             send_signal: self.send_signal.clone().or(base.send_signal),
+            timeout_from_base: self.send_signal.is_some() && self.timeout.is_none() && base.timeout.is_some(),
             timeout: self.timeout.clone().or(base.timeout),
         }
     }
@@ -464,7 +490,7 @@ impl<'de> Visitor<'de> for StopActionVisitor {
     fn visit_str<E: de::Error>(self, v: &str) -> Result<RawStopAction, E> {
         Ok(RawStopAction {
             send_signal: Some(v.to_owned()),
-            timeout: None,
+            ..RawStopAction::default()
         })
     }
 

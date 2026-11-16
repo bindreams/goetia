@@ -232,7 +232,8 @@ entry that writes only `timeout` keeps the base's `send-signal`.
 A value a platform cannot send is refused, naming the platform, and never turned
 into another signal: `sigterrm` is an error, not a `SIGTERM`. A native signal is
 checked against the names systemd knows (`SIGHUP` to `SIGSYS`, `SIGRTMIN` to
-`SIGRTMIN+15`, `SIGRTMAX-14` to `SIGRTMAX`), on every host.
+`SIGRTMIN+30`, `SIGRTMAX-30` to `SIGRTMAX`: systemd takes an offset of 0 to
+`SIGRTMAX - SIGRTMIN`, which is 30 with glibc), on every host.
 
 `kill` has nothing to answer and nothing to wait for: its `timeout` is `null`,
 and any other value is refused. `quit` ends a systemd unit as failed, since
@@ -240,7 +241,9 @@ and any other value is refused. `quit` ends a systemd unit as failed, since
 records the end as it does.
 
 - **systemd** writes `KillSignal=` and `TimeoutStopSec=` into every unit
-  (`infinity` for `null`), and sends `SIGKILL` after the timeout.
+  (`infinity` for `null`), and sends `SIGKILL` after the timeout. `kill` writes
+  `KillSignal=SIGKILL` and no `TimeoutStopSec=`, so systemd's own default still
+  bounds a process the kernel holds.
 - **launchd** writes `ExitTimeOut`. launchd sends `SIGTERM` and nothing else,
   and `SIGKILL` once `ExitTimeOut` is over. `timeout: null` writes `2147483647`,
   the largest value launchd reads: a larger one (measured: `9223372036854775807`
@@ -259,16 +262,24 @@ records the end as it does.
   `protocol: native` service handles SCM's own stop itself, so it refuses
   `send-signal`; its `timeout` still sets the wait of `stop` and `restart`.
 
-`goetia daemon stop` and `restart` wait for the daemon's `timeout` plus 10 s
-(the stop's own teardown), unbounded for `null`, and as before (`10s`) for
-`kill`. `--timeout` and `--no-timeout` override it, and a daemon whose
-definition cannot be read gets the old default. `goetia daemon show` prints the
+`goetia daemon stop` waits for the daemon's `timeout` plus 10 s (the stop's own
+teardown), and `restart` for that plus 10 s for the start; both wait unbounded
+for `null`, and as before (`10s`) for `kill`. `--timeout` and `--no-timeout`
+override it, and a daemon whose definition cannot be read gets the old default. `goetia daemon show` prints the
 leaves that differ from the default.
 
 **Upgrading.** A stop used to wait 90 s on systemd (its own default), 5 s on
 launchd and nothing on Windows; the default is now `30s` on systemd and launchd
-for a daemon installed by this version. A daemon installed by an older goetia
-keeps its old unit until `goetia daemon install` writes it again.
+for a daemon installed by this version. Reinstall every daemon an older goetia
+installed, with `goetia daemon install`:
+
+- It keeps its old unit, with no `TimeoutStopSec=` or `ExitTimeOut`, until
+  `goetia daemon install` writes it again. Its definition reads as the default
+  `30s`, so until then `stop` and `restart` wait for 30 s plus the margin while
+  the unit waits for systemd's 90 s or launchd's 5 s.
+- A daemon installed by this version is unreadable to an older goetia, which
+  reports "unsupported blob schema 2" (the definition's schema is now 2; this
+  version still reads schema 1).
 
 ## Interpolation
 

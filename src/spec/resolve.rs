@@ -435,12 +435,14 @@ fn resolve_shape(
 
 /// `stop-action`'s two leaves, shaped like any other field. A `null` timeout is a value, not an
 /// absence: it parses to `None` (no timeout) and needs no substitution. A timeout beside `kill`, once
-/// both are known, is refused, since `kill` ends the daemon at once.
+/// both are known, is refused, since `kill` ends the daemon at once; but a base's timeout that an
+/// override's `kill` merely leaves in place is not the override's to refuse, and is dropped.
 fn shape_stop_action(
     id: &Id,
     action: RawStopAction,
     substitution: Substitution,
 ) -> Result<(Shaped<StopSignal>, Shaped<Option<Duration>>), Refused> {
+    let timeout_from_base = action.timeout_from_base;
     let signal = shape(
         id,
         Field::StopSignal,
@@ -455,6 +457,11 @@ fn shape_stop_action(
             parse_stop_timeout(id, text).map(Some)
         })?,
     };
+    if let (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(_))) = (&signal, &timeout)
+        && timeout_from_base
+    {
+        return Ok((signal, Shaped::Parsed(None)));
+    }
     if let (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(timeout))) = (&signal, &timeout) {
         return Err(Refused::at(
             Field::StopTimeout,

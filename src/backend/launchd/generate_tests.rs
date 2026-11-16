@@ -91,7 +91,7 @@ fn plist_snapshot_minimal() {
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <!-- goetia:begin\n\
          Marker: goetia\n\
-         Schema: 1\n\
+         Schema: 2\n\
          Version: {version}\n\
          Spec: {blob}\n\
          goetia:end -->\n\
@@ -127,7 +127,7 @@ fn plist_snapshot_full() {
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <!-- goetia:begin\n\
          Marker: goetia\n\
-         Schema: 1\n\
+         Schema: 2\n\
          Version: {version}\n\
          Spec: {blob}\n\
          goetia:end -->\n\
@@ -718,7 +718,7 @@ fn document(spec: &DaemonSpec, body: &str) -> String {
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <!-- goetia:begin\n\
          Marker: goetia\n\
-         Schema: 1\n\
+         Schema: 2\n\
          Version: {version}\n\
          Spec: {blob}\n\
          goetia:end -->\n\

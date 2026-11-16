@@ -46,7 +46,7 @@ use super::overrides::Supplied;
 use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
 use super::stop_action::{ScmDaemon, StopField, Written, scm_defect};
 use super::vars::is_valid_name;
-use super::{AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, StopSignal, User, Warning};
+use super::{AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, StopAction, StopSignal, User, Warning};
 use crate::error::Error;
 
 /// One of the three service-manager backends a `backend-specific:` entry
@@ -291,9 +291,21 @@ fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Su
         (DaemonKind::Service, Shaped::Absent) => ScmDaemon::PlainService,
         (DaemonKind::Service, Shaped::Deferred) => return Ok(()),
     };
+    // The leaves as resolve will settle them: an absent one is its default, a deferred one is not known.
+    let signal = match &spec.stop_signal {
+        Shaped::Parsed(signal) => Some(*signal),
+        Shaped::Absent => Some(StopAction::default().send_signal),
+        Shaped::Deferred => None,
+    };
+    let timeout = match (&spec.stop_timeout, signal) {
+        (Shaped::Parsed(timeout), _) => Some(*timeout),
+        (Shaped::Absent, Some(signal)) => Some(StopAction::default_timeout(signal)),
+        (Shaped::Absent, None) | (Shaped::Deferred, _) => None,
+    };
+    let known = Written::of_leaves(signal, timeout);
     let written = Written {
-        send_signal: signal_in_play && !matches!(spec.stop_signal, Shaped::Absent),
-        timeout: timeout_in_play && !matches!(spec.stop_timeout, Shaped::Absent),
+        send_signal: signal_in_play && known.send_signal,
+        timeout: timeout_in_play && known.timeout,
     };
     match scm_defect(daemon, written) {
         Some((leaf, defect)) => {

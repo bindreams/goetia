@@ -485,7 +485,7 @@ fn windows_refuses_a_stop_action_on_a_task() {
     let timeout = Shaped::Parsed(Some(Duration::from_secs(5)));
 
     let refused = BackendKind::Scm
-        .refuse(&task(Shaped::Parsed(StopSignal::Terminate), Shaped::Absent))
+        .refuse(&task(Shaped::Parsed(StopSignal::Quit), Shaped::Absent))
         .unwrap_err();
     assert_eq!(refused.field, Some(Field::StopSignal));
     let message = Error::from(refused).to_string();
@@ -498,6 +498,13 @@ fn windows_refuses_a_stop_action_on_a_task() {
     assert_eq!(refused.field, Some(Field::StopTimeout));
 
     assert!(BackendKind::Scm.refuse(&task(Shaped::Absent, Shaped::Absent)).is_ok());
+    // A leaf written as the default is not a request.
+    let thirty = || Shaped::Parsed(Some(Duration::from_secs(30)));
+    assert!(BackendKind::Scm.refuse(&task(Shaped::Parsed(StopSignal::Terminate), thirty())).is_ok());
+    assert!(BackendKind::Scm.refuse(&task(Shaped::Absent, thirty())).is_ok());
+    // The default timeout of `kill` is none, so `null` beside it asks for nothing more.
+    let refused = BackendKind::Scm.refuse(&task(Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(None)));
+    assert_eq!(refused.unwrap_err().field, Some(Field::StopSignal));
     // systemd and launchd stop a task as they stop a service.
     for backend in [BackendKind::Systemd, BackendKind::Launchd] {
         assert!(
@@ -516,8 +523,13 @@ fn windows_refuses_a_signal_for_a_native_service_and_keeps_its_timeout() {
     };
     assert!(
         BackendKind::Scm
-            .refuse(&native(Shaped::Parsed(StopSignal::Terminate), Shaped::Absent))
+            .refuse(&native(Shaped::Parsed(StopSignal::Quit), Shaped::Absent))
             .is_err()
+    );
+    assert!(
+        BackendKind::Scm
+            .refuse(&native(Shaped::Parsed(StopSignal::Terminate), Shaped::Absent))
+            .is_ok()
     );
     assert!(
         BackendKind::Scm

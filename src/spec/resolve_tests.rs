@@ -3662,7 +3662,7 @@ fn a_base_signal_is_never_judged_for_a_backend_that_is_not_the_hosts() {
 #[skuld::test]
 fn windows_refuses_a_stop_action_on_a_task_in_its_own_override_from_any_host() {
     let task = "id: frpc\ncommand: [bin/frpc]\ntype: task\n";
-    for line in ["stop-action: terminate", "stop-action: {timeout: 5s}"] {
+    for line in ["stop-action: quit", "stop-action: {timeout: 5s}", "stop-action: {timeout: null}"] {
         let yaml = format!("{task}backend-specific:\n  scm:\n    {line}\n");
         let msg = resolve_yaml(&yaml).unwrap_err().to_string();
         assert!(
@@ -3677,7 +3677,7 @@ fn windows_refuses_a_stop_action_on_a_task_in_its_own_override_from_any_host() {
 #[skuld::test]
 fn a_native_service_on_windows_takes_a_timeout_but_not_a_signal_in_its_own_override() {
     let native = "id: frpc\ncommand: [bin/frpc]\nprotocol: native\n";
-    let yaml = format!("{native}backend-specific:\n  scm:\n    stop-action: {{send-signal: terminate}}\n");
+    let yaml = format!("{native}backend-specific:\n  scm:\n    stop-action: {{send-signal: quit}}\n");
     let msg = resolve_yaml(&yaml).unwrap_err().to_string();
     assert!(
         msg.contains("backend-specific.scm: `stop-action.send-signal`") && msg.contains("SCM's own stop"),
@@ -3686,6 +3686,41 @@ fn a_native_service_on_windows_takes_a_timeout_but_not_a_signal_in_its_own_overr
     // A host that is not Windows judges only the override, and `timeout` is accepted.
     let yaml = format!("{native}backend-specific:\n  scm:\n    stop-action: {{timeout: 5s}}\n");
     assert!(resolve_yaml(&yaml).is_ok());
+}
+
+#[skuld::test]
+fn a_leaf_that_is_the_default_is_not_a_stop_action_windows_refuses() {
+    let task = "id: frpc
+command: [bin/frpc]
+type: task
+";
+    let native = "id: frpc
+command: [bin/frpc]
+protocol: native
+";
+    // Written, but what Windows would do anyway: nothing was asked of it.
+    for (manifest, line) in [
+        (task, "stop-action: terminate"),
+        (task, "stop-action: {timeout: 30s}"),
+        (task, "stop-action: {send-signal: terminate, timeout: 30s}"),
+        (native, "stop-action: terminate"),
+        (native, "stop-action: {send-signal: terminate, timeout: 5s}"),
+        (task, "stop-action: kill"),
+    ] {
+        let want_refused = line == "stop-action: kill";
+        // In the scm override...
+        let yaml = format!("{manifest}backend-specific:
+  scm:
+    {line}
+");
+        assert_eq!(resolve_yaml(&yaml).is_err(), want_refused, "{line} in scm's override of {manifest}");
+        // ...and in the base, which the native backend judges: here the base is Windows'.
+        if BackendKind::native() == Some(BackendKind::Scm) {
+            let yaml = format!("{manifest}{line}
+");
+            assert_eq!(resolve_yaml(&yaml).is_err(), want_refused, "{line} in the base of {manifest}");
+        }
+    }
 }
 
 #[skuld::test]
@@ -3710,6 +3745,72 @@ fn an_override_writes_the_native_backends_leaves_over_the_bases() {
     };
     let yaml = format!("{base}backend-specific:\n  {other}:\n    stop-action: {{timeout: 5s}}\n");
     assert_eq!(stop_action_of(&yaml).timeout, seconds(90));
+}
+
+#[skuld::test]
+fn an_override_that_sends_kill_does_not_inherit_the_bases_timeout() {
+    let base = format!("{SERVICE}stop-action: {{send-signal: quit, timeout: 90s}}
+");
+    for backend in BackendKind::ALL {
+        let yaml = format!("{base}backend-specific:
+  {backend}:
+    stop-action: kill
+");
+        if let Err(err) = resolve_yaml(&yaml) {
+            panic!("{backend}: {err}");
+        }
+    }
+    let native = BackendKind::native().expect("the tests run where there is a service manager");
+    let yaml = format!("{base}backend-specific:
+  {native}:
+    stop-action: kill
+");
+    assert_eq!(
+        stop_action_of(&yaml),
+        StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None
+        }
+    );
+}
+
+#[skuld::test]
+fn an_override_that_sends_kill_and_writes_a_timeout_is_still_refused() {
+    let base = format!("{SERVICE}stop-action: {{send-signal: quit, timeout: 90s}}
+");
+    for (backend, msg) in refused_per_backend(&base, "stop-action: {send-signal: kill, timeout: 5s}") {
+        assert!(
+            msg.starts_with(&format!(
+                "daemon `frpc`: backend-specific.{backend}: `stop-action.timeout`"
+            )) && msg.contains("cannot go with `send-signal: kill`"),
+            "{backend}: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_substituted_kill_in_an_override_does_not_inherit_the_bases_timeout(#[fixture(temp_dir)] dir: &Path) {
+    let native = BackendKind::native().expect("the tests run where there is a service manager");
+    write_fixture(
+        dir,
+        &format!(
+            "id: frpc\ncommand: ['/bin/frpc']\nstop-action: {{send-signal: quit, timeout: 90s}}\n\
+             backend-specific:\n  {native}:\n    stop-action: '${{S}}'\n"
+        ),
+        Some("S=kill
+"),
+    );
+    let (spec, _) = load(dir).unwrap();
+    let DaemonSpec::Service(service) = spec else {
+        panic!("a service")
+    };
+    assert_eq!(
+        service.stop_action,
+        StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None
+        }
+    );
 }
 
 #[skuld::test]

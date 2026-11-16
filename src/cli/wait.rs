@@ -23,9 +23,9 @@ use crate::spec::{StopAction, StopSignal};
 #[derive(ClapArgs, Debug, Default)]
 pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
-    /// state asked for. Defaults to 10s; for `stop` and `restart`, the daemon's own stop timeout
-    /// plus 10s (see `stop-action` in the README). `--timeout 0` issues the request
-    /// and returns without waiting, establishing nothing. On macOS, a stop and
+    /// state asked for. Defaults to 10s; for `stop`, the daemon's own stop timeout plus 10s, and for
+    /// `restart` that plus 10s for the start (see `stop-action` in the README). `--timeout 0` issues
+    /// the request and returns without waiting, establishing nothing. On macOS, a stop and
     /// some starts and installs also wait for launchd to remove a job; see the
     /// README. Write a compound duration unspaced (`2m30s`), or quote it as
     /// one argument: every verb taking this flag also takes a variadic id
@@ -53,18 +53,30 @@ impl WaitArgs {
         }
     }
 
-    /// [`Self::budget`] for a verb that stops a daemon (`stop`, `restart`), whose default wait is the
-    /// daemon's own: its stop timeout plus the teardown margin, unbounded for no timeout, and what it
-    /// always was ([`Budget::DEFAULT`]) for `kill`, which sends nothing to answer. `stop_action` reads it,
-    /// and is not asked when a flag was given. A daemon whose stop action cannot be read (not installed,
-    /// not goetia's, a definition that will not decode) has none to wait for, and the previous default
-    /// stands: the verb meets the same gate itself and reports it, as it always did, and the order in
-    /// which it does is unchanged.
+    /// [`Self::budget`] for `stop`, whose default wait is the daemon's own: its stop timeout plus the
+    /// teardown margin, unbounded for no timeout, and what it always was ([`Budget::DEFAULT`]) for `kill`,
+    /// which sends nothing to answer. `stop_action` reads it, and is not asked when a flag was given. A
+    /// daemon whose stop action cannot be read (not installed, not goetia's, a definition that will not
+    /// decode) has none to wait for, and the previous default stands: the verb meets the same gate itself
+    /// and reports it, as it always did, and the order in which it does is unchanged.
     pub fn stop_budget(&self, stop_action: impl FnOnce() -> Result<StopAction>) -> Budget {
+        self.default_after(stop_action, Duration::ZERO)
+    }
+
+    /// [`Self::stop_budget`] for `restart`, whose one budget covers both legs: the stop's, and the
+    /// previous default again for the start. `kill` keeps the previous default for the whole restart.
+    pub fn restart_budget(&self, stop_action: impl FnOnce() -> Result<StopAction>) -> Budget {
+        self.default_after(stop_action, Budget::DEFAULT_WAIT)
+    }
+
+    /// The flags' budget, or the daemon's default stop budget with `start_leg` added to it.
+    fn default_after(&self, stop_action: impl FnOnce() -> Result<StopAction>, start_leg: Duration) -> Budget {
         if self.was_given() {
             return self.budget();
         }
-        stop_action().map_or(Budget::DEFAULT, |stop_action| default_stop_budget(&stop_action))
+        stop_action().map_or(Budget::DEFAULT, |stop_action| {
+            default_stop_budget(&stop_action, start_leg)
+        })
     }
 
     /// Whether either flag was actually given, which [`Self::budget`] cannot
@@ -74,13 +86,14 @@ impl WaitArgs {
     }
 }
 
-/// The default wait of a verb that stops a daemon with `stop_action`: see [`WaitArgs::stop_budget`].
-fn default_stop_budget(stop_action: &StopAction) -> Budget {
+/// The default wait of a verb that stops a daemon with `stop_action`, and then spends `start_leg` more:
+/// see [`WaitArgs::stop_budget`].
+fn default_stop_budget(stop_action: &StopAction, start_leg: Duration) -> Budget {
     if stop_action.send_signal == StopSignal::Kill {
         return Budget::DEFAULT;
     }
     match stop_action.longest_stop() {
-        Some(longest) => Budget::Bounded(longest),
+        Some(longest) => Budget::Bounded(longest + start_leg),
         None => Budget::Unbounded,
     }
 }

@@ -167,7 +167,7 @@ fn tampered(encoded: &str, edit: impl FnOnce(&mut serde_json::Map<String, Value>
 fn task_blob_golden() {
     let program = serde_json::to_string(&program("backup")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[3]}},"minute":{{"restricted":true,"values":[30]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"30 3 * * *"}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":2,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[3]}},"minute":{{"restricted":true,"values":[30]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"30 3 * * *"}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
     );
     let spec = task_with(Some("30 3 * * *"));
 
@@ -180,7 +180,7 @@ fn task_blob_with_h_golden() {
     // `build-host`, `nightly`: `H H` resolves to minute 13, hour 2 (the vectors in the spec).
     let program = serde_json::to_string(&program("backup")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[2]}},"minute":{{"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":2,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[2]}},"minute":{{"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
     );
     let spec = task_with(Some("H H * * *"));
 
@@ -240,8 +240,20 @@ fn blob_without_type_is_a_service() {
 
     let blob = decode(&BASE64.encode(json)).unwrap();
 
+    // Written before `stop-action`: `schema` 1 and no `stop_action`, which reads as the default.
+    assert_eq!(blob.schema, 1);
     assert_eq!(blob.spec, golden_spec());
     assert!(matches!(blob.spec, DaemonSpec::Service(_)));
+}
+
+#[skuld::test]
+fn schema_0_is_refused_as_unsupported() {
+    let mut value: Value = serde_json::from_slice(&BASE64.decode(encode(&minimal_spec())).unwrap()).unwrap();
+    value["schema"] = Value::from(0);
+
+    let err = decode(&BASE64.encode(serde_json::to_vec(&value).unwrap())).unwrap_err();
+
+    assert!(err.to_string().contains("unsupported blob schema 0"), "{err}");
 }
 
 #[skuld::test]
@@ -310,7 +322,7 @@ fn blob_wire_names_are_pinned() {
     // intentional (a rename in `DaemonSpec` should not silently do this).
     let program = serde_json::to_string(&program("frpc")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program},"-c","frpc.toml"],"cwd":null,"env":{{"RUST_LOG":"info","URL":"http://x/a%20b"}},"id":"frpc","kind":"managed","logs":null,"name":"Frpc Tunnel","restart":"always","restart_delay":{{"nanos":500000000,"secs":2}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"user":{{"kind":"name","name":"svc-frpc"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":2,"spec":{{"command":[{program},"-c","frpc.toml"],"cwd":null,"env":{{"RUST_LOG":"info","URL":"http://x/a%20b"}},"id":"frpc","kind":"managed","logs":null,"name":"Frpc Tunnel","restart":"always","restart_delay":{{"nanos":500000000,"secs":2}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"user":{{"kind":"name","name":"svc-frpc"}}}},"version":"0.1.0"}}"#
     );
     assert_eq!(encode_with_version(&golden_spec(), "0.1.0"), BASE64.encode(expected));
 }
@@ -346,13 +358,16 @@ fn the_blob_alphabet_is_standard_and_padded() {
 #[skuld::test]
 fn decode_rejects_unknown_schema() {
     let envelope = WireEnvelope {
-        schema: 2,
+        schema: SCHEMA + 1,
         version: "0.1.0".to_string(),
         spec: base_wire_spec().into(),
     };
     let err = decode(&encode_wire_envelope(&envelope)).expect_err("an unknown schema must be rejected");
     let message = err.to_string();
-    assert!(message.contains('2'), "message should name the found schema: {message}");
+    assert!(
+        message.contains(&(SCHEMA + 1).to_string()),
+        "message should name the found schema: {message}"
+    );
     assert!(
         message.contains(&SCHEMA.to_string()),
         "message should name the supported schema: {message}"

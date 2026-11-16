@@ -43,13 +43,18 @@ use crate::spec::{
 
 // Constants ===========================================================================================================
 
-/// The envelope shape `encode`/`decode` agree on. Bumped only when the
-/// JSON structure itself changes for blobs already written, never for a
-/// change in generator output — that is what `version` is for. Adding a
-/// member to an existing variant bumps it, unless a blob without the member reads as
-/// its default (`stop_action`); adding a variant that leaves existing blobs unchanged does
-/// not bump it either, so installed blobs stay readable.
-pub const SCHEMA: u32 = 1;
+/// The envelope shape `encode` writes, bumped when the JSON structure changes for blobs already
+/// written, never for a change in generator output (that is what `version` is for). Adding a member to
+/// an existing variant bumps it, even where a blob without the member reads as its default: the wire
+/// structs refuse unknown fields, so an older goetia must meet the schema first and say "unsupported",
+/// not "unknown field". Adding a variant that leaves existing blobs unchanged does not bump it.
+///
+/// - 2: `stop_action`.
+pub const SCHEMA: u32 = 2;
+
+/// The oldest schema `decode` still reads. A blob of schema 1 has no `stop_action`, which reads as
+/// the default.
+pub const OLDEST_SCHEMA: u32 = 1;
 
 /// The literal value every generated artifact's marker carries, byte-exact
 /// per the Global Constraints (`Marker`, `Schema`, `Version`, `Spec`).
@@ -93,11 +98,10 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
         serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
     // The schema is read before the rest: a later schema may reshape or add to any other member.
     if let Some(found) = value.get("schema").and_then(Value::as_u64)
-        && found != u64::from(SCHEMA)
+        && !(u64::from(OLDEST_SCHEMA)..=u64::from(SCHEMA)).contains(&found)
     {
         return Err(Error::blob(format!(
-            "unsupported blob schema {found} (this build of goetia understands schema {supported})",
-            supported = SCHEMA,
+            "unsupported blob schema {found} (this build of goetia understands schemas {OLDEST_SCHEMA} to {SCHEMA})",
         )));
     }
     let envelope: WireEnvelope =

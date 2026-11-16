@@ -51,7 +51,7 @@ use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
 use crate::spec::{
-    BackendKind, DaemonSpec, Id, Protocol, Restart, ScmDaemon, ServiceSpec, User, Written, scm_defect,
+    BackendKind, DaemonSpec, Id, Protocol, Restart, ScmDaemon, ServiceSpec, User, Written, invalid, scm_defect,
     scm_restart_delay, windows_builtin,
 };
 
@@ -200,19 +200,13 @@ fn resolve_host(
 ///
 /// Until the shim asks for the stop, Windows still ends a service at once whatever it says (the README).
 fn refuse_stop_action(service: &ServiceSpec) -> Result<(), Error> {
-    let defect = service.stop_action.send_signal.defect(BackendKind::Scm).or_else(|| {
-        scm_defect(
-            ScmDaemon::of_service(service.protocol),
-            Written::of(&service.stop_action),
-        )
-        .map(|(_, defect)| defect)
-    });
-    match defect {
-        Some(message) => Err(Error::Invalid {
-            daemon: service.common.id.to_string(),
-            message,
-            source: None,
-        }),
+    let id = &service.common.id;
+    service.stop_action.send_signal.refuse(BackendKind::Scm, id)?;
+    match scm_defect(
+        ScmDaemon::of_service(service.protocol),
+        Written::of(&service.stop_action),
+    ) {
+        Some((_, message)) => Err(invalid(id, &message)),
         None => Ok(()),
     }
 }

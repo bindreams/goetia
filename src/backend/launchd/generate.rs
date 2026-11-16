@@ -400,19 +400,6 @@ fn exit_time_out(stop_action: &StopAction) -> u64 {
     }
 }
 
-/// Refuse a signal launchd cannot send ([`StopSignal::defect`]): its only one is SIGTERM, and
-/// another is never turned into it. `resolve` refuses it in a manifest; a spec from a blob arrives here.
-fn refuse_stop_signal(common: &DaemonFields, stop_action: &StopAction) -> Result<(), Error> {
-    match stop_action.send_signal.defect(BackendKind::Launchd) {
-        Some(message) => Err(Error::Invalid {
-            daemon: common.id.to_string(),
-            message,
-            source: None,
-        }),
-        None => Ok(()),
-    }
-}
-
 /// Render `spec` as launchd plists for the already-resolved account `id`: a service gives its plist;
 /// a task gives its job and, when it has a schedule, the timer that kickstarts it.
 ///
@@ -499,7 +486,7 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     let mut dict = String::new();
     match spec {
         DaemonSpec::Service(s) => {
-            refuse_stop_signal(&s.common, &s.stop_action)?;
+            s.stop_action.send_signal.refuse(BackendKind::Launchd, &s.common.id)?;
             push_job_head(&mut dict, &s.common, id, &s.common.command);
 
             push_keep_alive(&mut dict, INDENT, s.restart);
@@ -514,7 +501,7 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
             push_logs(&mut dict, &s.common);
         }
         DaemonSpec::Task(task) => {
-            refuse_stop_signal(&task.common, &task.stop_action)?;
+            task.stop_action.send_signal.refuse(BackendKind::Launchd, &task.common.id)?;
             let argv = task_argv(task)?;
             push_job_head(&mut dict, &task.common, id, &argv);
 

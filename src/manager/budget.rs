@@ -20,7 +20,9 @@ pub enum Budget {
 }
 
 impl Budget {
-    pub const DEFAULT: Budget = Budget::Bounded(Duration::from_secs(10));
+    /// How long a verb waits when no flag and no daemon says otherwise.
+    pub const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+    pub const DEFAULT: Budget = Budget::Bounded(Self::DEFAULT_WAIT);
 
     /// Whether this budget permits any waiting at all. `false` for
     /// `Immediate` and for `Bounded(Duration::ZERO)` alike: a zero-length
