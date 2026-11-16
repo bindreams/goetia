@@ -11,6 +11,7 @@ pub mod cmd;
 pub mod connect_back;
 #[cfg(unix)]
 pub mod cron_oracle;
+pub mod failed_install;
 pub mod kill;
 pub mod list_json;
 #[cfg(windows)]
@@ -39,6 +40,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
+pub use failed_install::assert_failed_on_a_path_under_a_file;
 pub use goetia::testing::groups::{Group, launchd_group, scm_group, systemd_group};
 #[cfg(windows)]
 pub use goetia::testing::wide_null;

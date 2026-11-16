@@ -137,7 +137,8 @@ use crate::backend::scm::shim::sweep::{
 use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
 use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
-    Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Settle, Standing, Unnamed,
+    WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
@@ -299,6 +300,11 @@ impl ScmSnapshot {
 pub(crate) enum WindowsSnapshot {
     Service(ScmSnapshot),
     Task(TaskSnapshot),
+}
+
+/// The lock makes nothing an install would take back.
+impl Settle for Option<InstallLock> {
+    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {}
 }
 
 impl InstalledService for WindowsSnapshot {
@@ -719,6 +725,12 @@ impl Backend for Scm {
                 self.retype_to_task(spec, definition, old, scope)
             }
         }
+    }
+
+    /// The install scope makes nothing besides the definition: the lock is released, and the folders an
+    /// elevated install makes are shared by every daemon and are never taken back.
+    fn standing(&self, _spec: &DaemonSpec, _definition: &WindowsDefinition) -> Standing {
+        Standing::Yes
     }
 
     fn live_status(&self, snapshot: &WindowsSnapshot) -> Result<Status> {

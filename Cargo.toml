@@ -123,8 +123,9 @@ libc = "0.2"
 # `openat`, for the same classifier: both of its opens resolve one final
 # component under one directory descriptor, which is what makes `ELOOP` mean
 # "that component is a symlink" and nothing else. Also unconditional, and the
-# same version the launchd backend already takes.
-nix = { version = "0.31", features = ["fs"] }
+# same version the launchd backend already takes. `dir` and `user` are for `backend::created_dirs`, which
+# reads a directory it made through its descriptor and names the account that can write a log directory.
+nix = { version = "0.31", features = ["fs", "dir", "user"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Unconditional (not behind the `cli` feature): the launchd backend itself
@@ -132,7 +133,7 @@ nix = { version = "0.31", features = ["fs"] }
 # account and to hand cwd/logs directories to it, regardless of whether the
 # CLI's own optional deps are pulled in.
 libc = "0.2"
-nix = { version = "0.31", features = ["user", "fs", "event"] }
+nix = { version = "0.31", features = ["user", "fs", "dir", "event"] }
 # `backend::launchd::next`: the next fire of a task's calendar entries in the system time zone, which
 # `launchd` (calendar intervals only, no next-fire query) cannot tell. Zones are read from
 # `/etc/localtime`'s bytes.

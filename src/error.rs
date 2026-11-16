@@ -11,7 +11,9 @@ mod report;
 mod within;
 
 #[cfg(feature = "cli")]
-pub(crate) use escape::{EscapedStream, escape};
+pub(crate) use escape::EscapedStream;
+#[cfg(any(feature = "cli", unix))]
+pub(crate) use escape::escape;
 pub use reason::Reason;
 pub(crate) use report::Chain;
 #[cfg(feature = "cli")]
@@ -233,6 +235,11 @@ pub enum Error {
         #[source]
         source: BoxError,
     },
+
+    /// A directory that is a daemon's `cwd`, the directory of its log, or one of their ancestors is
+    /// refused: `why` says what is wrong with it and what to do. No OS call failed.
+    #[error("refusing {} for a daemon's cwd or log directory: {why}", path.display())]
+    DirectoryRefused { path: PathBuf, why: String },
 
     /// A folder goetia keeps what runs as `LocalSystem` or what it reads back in (the shim's folder, a
     /// task's run records), one of its ancestors, or the shim host file itself, can be modified by an
@@ -781,6 +788,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::DirectoryRefused { .. }
             | Error::TaskFolderKept { .. }
             | Error::FolderUnsafe { .. }
             | Error::FolderNotAsMade { .. }
@@ -972,6 +980,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::DirectoryRefused { .. }
             | Error::TaskFolderKept { .. }
             | Error::FolderUnsafe { .. }
             | Error::FolderNotAsMade { .. }
