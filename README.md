@@ -437,7 +437,9 @@ owns it, since `install` is not a start and you may still be preparing it.
 - **What it makes.** Every missing component, owned by root, `0755`. It makes a directory only where every
   directory and symlink on the way (resolved, so `..` and links count) is root's: a path through a
   directory an account owns is refused, which includes a directory an earlier install handed to its
-  account (a second daemon's `cwd` below it).
+  account (a second daemon's `cwd` below it). The path is judged as written, every directory it names
+  included (one it leaves through `..` too), because the service manager resolves it by name when it
+  starts.
 - **Who gets what.** Only the deepest directory of a path is handed over, and only where the daemon's
   account has to write it: `cwd` goes to a non-root `user` (and its primary group) on both backends; the
   log directory goes to it on launchd, which opens the log as that user. On systemd the log directory

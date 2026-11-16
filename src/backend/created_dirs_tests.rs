@@ -285,31 +285,30 @@ fn create_decides_under_a_root_on_the_resolved_path_not_the_text() {
     assert!(layout.system().join("new").is_dir());
 }
 
-/// The trail holds what decides where the path resolves. A directory the path leaves through `..`
-/// does not: its owner cannot change what `..` of it is.
+/// The service manager resolves the path as written when it opens it, so every directory the path
+/// passes through decides where it leads, a directory it leaves through `..` included: the account that
+/// owns `u` can replace `u/sub` with a symlink, and `u/sub/..` then leads elsewhere.
 #[skuld::test(labels = [ELEVATED])]
-fn create_does_not_judge_a_directory_the_path_leaves_through_dotdot() {
+fn create_judges_a_directory_the_path_leaves_through_dotdot() {
     let layout = Layout::new();
     let account = layout.system().join("u");
     fs::create_dir(&account).unwrap();
     give_to_a_stranger(&account);
     let mut dirs = layout.dirs();
 
-    dirs.create(&account.join("../new/deep"), None)
-        .expect("an account's directory the path only passes through is not a reason");
-
-    assert!(layout.system().join("new/deep").is_dir());
     let err = dirs
-        .create(&account.join("inside"), None)
-        .expect_err("what is made in the account's directory is refused");
-    assert!(refusal(&err).contains("uid"), "{err:?}");
+        .create(&account.join("../new/deep"), None)
+        .expect_err("a `..` from an account's directory is decided by that account");
+
+    assert!(refusal(&err).contains(account.to_str().unwrap()), "{err:?}");
+    assert!(!layout.system().join("new").exists());
 }
 
-/// What an absolute symlink's path is read from is the link: the directories before it, which only led
-/// to the link, do not decide where the path resolves. The directory that holds the link does, and so
-/// does a link to `..`, whose directory the path is then left through.
+/// An account that owns an ancestor of a symlink's holder can swap the holder, so the directories
+/// before an absolute symlink's holder are judged too, though the link's own path restarts at `/`.
+/// A directory that holds the link, and a link to `..`, are judged as well.
 #[skuld::test(labels = [ELEVATED])]
-fn create_judges_the_directory_that_holds_a_link_but_not_those_before_it() {
+fn create_judges_the_directories_before_the_holder_of_a_link() {
     let layout = Layout::new();
     let account = layout.system().join("u");
     fs::create_dir_all(account.join("v")).unwrap();
@@ -317,10 +316,12 @@ fn create_judges_the_directory_that_holds_a_link_but_not_those_before_it() {
     symlink(layout.system(), account.join("v/to-system")).unwrap();
     let mut dirs = layout.dirs();
 
-    dirs.create(&account.join("v/to-system/new"), None)
-        .expect("u only led to the link; v, root's, holds it");
+    let err = dirs
+        .create(&account.join("v/to-system/new"), None)
+        .expect_err("u, the account's, can swap v, which holds the link");
 
-    assert!(layout.system().join("new").is_dir());
+    assert!(refusal(&err).contains(account.to_str().unwrap()), "{err:?}");
+    assert!(!layout.system().join("new").exists());
     symlink(layout.system(), account.join("holds")).unwrap();
     symlink("..", account.join("up")).unwrap();
     for link in ["holds", "up"] {

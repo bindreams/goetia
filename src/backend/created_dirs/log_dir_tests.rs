@@ -253,14 +253,16 @@ fn the_refusal_text_has_no_runs_of_spaces() {
     assert!(!why.contains("  "), "{why}");
 }
 
-/// A directory the path leaves through `..` does not decide where the log lands: its owner cannot
-/// change what `..` of it is.
+/// The service manager opens the log by the path as written, so a directory the path leaves through
+/// `..` decides where the log lands: the account that owns it can replace a subdirectory with a symlink.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_beside_a_dotdot_that_leaves_an_account_directory_is_accepted() {
+fn a_log_beside_a_dotdot_that_leaves_an_account_directory_is_refused() {
     let layout = Layout::new();
     let account = layout.system().join("u");
     fs::create_dir(&account).unwrap();
     give_to_a_stranger(&account);
 
-    check(&account.join("../app.log")).unwrap();
+    let why = refused(&account.join("../app.log"));
+
+    assert!(why.contains(account.to_str().unwrap()), "{why}");
 }
