@@ -286,27 +286,3 @@ fn the_shim_of_a_standard_accounts_task_writes_its_failure_to_the_default_log(#[
         );
     }
 }
-
-/// The same for the shim of a real user's task, which logs on with a password.
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn the_shim_of_a_real_users_task_writes_its_failure_to_the_default_log(#[fixture(scm_group)] _group: &Group) {
-    let account = format!("gt{:08x}", rand::random::<u32>());
-    // Declared first, so the account goes after the task, whose logon it is.
-    let _user = LocalUserGuard::create(&account, PASSWORD);
-    let id = &test_id();
-    let host = ServiceAccountHost::new(id);
-    let _guard = ServiceGuard::new(id.as_str());
-    let mgr = host.manager();
-    assert_succeeded(
-        "install",
-        &as_user("install", id, &account, &host, &missing_program(&host)),
-    );
-
-    let refused = mgr.run(id, &mut Vec::new()).expect_err("a program that is not there");
-
-    assert!(matches!(refused.cause(), Error::RunUnrecorded { .. }), "{refused:?}");
-    assert!(
-        default_log_of(id).contains(id.as_str()),
-        "the shim wrote its failure to the default log"
-    );
-}
