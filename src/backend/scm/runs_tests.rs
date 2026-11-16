@@ -379,6 +379,19 @@ fn ensure_for_another_principal_rewrites_the_dacl() {
 }
 
 #[skuld::test]
+fn a_task_has_records_to_remove_while_its_directory_is_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+    assert!(!runs.is_present());
+
+    runs.ensure(&process_user_sid()).unwrap();
+    assert!(runs.is_present());
+
+    runs.remove_all().unwrap();
+    assert!(!runs.is_present());
+}
+
+#[skuld::test]
 fn ensure_is_repeatable() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();

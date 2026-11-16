@@ -2,6 +2,7 @@
 //! directory and the machine's processes a table the tests state: which are alive, which can be held,
 //! and what a held one does when it is waited for (a shim writing its record).
 
+use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
 use super::*;
 use crate::backend::ReadOutcome;
-use crate::backend::scm::instance::{InstanceId, TaskAccount};
+use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::manager::task::write::Prepared;
@@ -116,32 +117,20 @@ impl Processes for Machine {
     }
 }
 
-fn no_password() -> Result<Option<String>> {
-    panic!("a service account reads no password")
-}
-
-fn disarmed_xml(spec: &DaemonSpec) -> String {
-    TaskXml::with_armed(&registered_task(spec, true).xml, false).unwrap()
-}
-
-fn disarm_call(spec: &DaemonSpec) -> Call {
-    Call::Register {
-        path: PATH.to_owned(),
-        xml: disarmed_xml(spec),
-        who: TaskAccount::Service("S-1-5-18".to_owned()),
-        password: None,
-        update: true,
-    }
+fn disable_call() -> Call {
+    Call::SetEnabled(PATH.to_owned(), false)
 }
 
 // Uninstall ===========================================================================================================
 
+/// The order of an uninstall, as the scheduler sees it: the task is disabled first, so that nothing
+/// starts another run; then the runs are stopped and waited for; then the task is deleted.
 #[skuld::test]
 fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
     let (dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_register(Ok(Registration::Created))
+    fake.on_set_enabled(Ok(()))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()))
@@ -151,19 +140,19 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
     machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::Stopped)).unwrap());
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
         .unwrap();
 
     assert_eq!(
         fake.calls(),
         [
-            disarm_call(&spec),
+            disable_call(),
             Call::Instances(PATH.to_owned()),
             Call::Instances(PATH.to_owned()),
             Call::Stop(PATH.to_owned(), instance_id(1)),
             Call::Delete(PATH.to_owned()),
         ],
-        "disarmed first, so nothing starts another run, then the run is stopped and the task deleted"
+        "disabled before the runs are read and stopped, and stopped before the delete"
     );
     assert_eq!(machine.held, [4242], "the run's process is held before it is stopped");
     assert_eq!(
@@ -175,33 +164,40 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
     fake.finish();
 }
 
+/// Disabling is not a registration, so it is made for every task, armed or not, and whatever its account.
 #[skuld::test]
-fn uninstall_of_an_idle_disarmed_task_writes_nothing_before_it_deletes() {
+fn uninstall_of_an_idle_disarmed_task_disables_it_before_it_deletes_it() {
     let (_dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new())).on_delete(Ok(true));
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
         .unwrap();
 
     assert_eq!(
         fake.calls(),
-        [Call::Instances(PATH.to_owned()), Call::Delete(PATH.to_owned())]
+        [
+            disable_call(),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned())
+        ]
     );
     assert!(!records_dir.exists());
 }
 
 /// What the shim could not end is a daemon that may run: the uninstall fails, with the task registered
-/// and disarmed, so that re-running it is the retry and nothing starts it meanwhile.
+/// and disabled, so that re-running it is the retry and nothing starts it meanwhile.
 #[skuld::test]
-fn uninstall_of_an_incomplete_stop_leaves_the_task_disarmed() {
+fn uninstall_of_an_incomplete_stop_leaves_the_task_disabled() {
     let (dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_register(Ok(Registration::Created))
+    fake.on_set_enabled(Ok(()))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()));
@@ -210,11 +206,11 @@ fn uninstall_of_an_incomplete_stop_leaves_the_task_disarmed() {
     machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::IncompleteStop)).unwrap());
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
         .unwrap_err();
 
     let text = failed.to_string();
-    assert!(text.contains("NOT deleted") && text.contains("disarmed"), "{text}");
+    assert!(text.contains("NOT deleted") && text.contains("disabled"), "{text}");
     assert!(
         text.contains("goetia daemon uninstall nightly"),
         "the retry is named: {text}"
@@ -222,7 +218,7 @@ fn uninstall_of_an_incomplete_stop_leaves_the_task_disarmed() {
     assert_eq!(
         fake.calls(),
         [
-            disarm_call(&spec),
+            disable_call(),
             Call::Instances(PATH.to_owned()),
             Call::Instances(PATH.to_owned()),
             Call::Stop(PATH.to_owned(), instance_id(1)),
@@ -233,63 +229,83 @@ fn uninstall_of_an_incomplete_stop_leaves_the_task_disarmed() {
     fake.finish();
 }
 
-/// Disarming is a registration, which a password-logon task makes only with its password (M3), so an
-/// armed one is refused before any write; a disarmed one is never registered and needs none.
+/// A record that cannot be read does not say the stop was complete: the uninstall fails and keeps the
+/// task, disabled, rather than delete it with the program possibly still running.
 #[skuld::test]
-fn uninstall_of_an_armed_real_user_task_without_its_password_is_refused_before_any_write() {
+fn a_record_that_cannot_be_read_fails_the_uninstall_and_keeps_the_task() {
+    let (_dir, records_dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_stop(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+    let garbage = records_dir.join(format!("{}.json", instance_id(1).hex()));
+    machine.on_exit = Box::new(move |_| std::fs::write(&garbage, b"not a record").unwrap());
+
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .unwrap_err();
+
+    let text = failed.to_string();
+    assert!(text.contains("NOT deleted") && text.contains("disabled"), "{text}");
+    assert!(
+        !fake.calls().iter().any(|call| matches!(call, Call::Delete(..))),
+        "nothing is deleted"
+    );
+    assert!(records_dir.exists());
+}
+
+/// The account's password is never read: an armed task of a real user is disabled and removed as any other,
+/// whether or not the password is known, changed or the account gone (measured, N1 and N2).
+#[skuld::test]
+fn uninstall_of_an_armed_real_user_task_needs_no_password() {
     let (_dir, records_dir, runs) = records();
     let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
     let fake = Fake::new();
-    let mut machine = Machine::new(&fake, &[]);
-
-    let refused = scm(&fake).task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine, || Ok(None));
-
-    assert!(matches!(refused, Err(Error::PasswordRequired { .. })), "{refused:?}");
-    assert_eq!(fake.calls(), []);
-    assert!(records_dir.exists(), "nothing was removed");
-}
-
-#[skuld::test]
-fn uninstall_of_an_armed_real_user_task_registers_it_disarmed_with_its_password() {
-    let (_dir, _records_dir, runs) = records();
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
-    let fake = Fake::new();
-    fake.on_register(Ok(Registration::Created))
+    fake.on_set_enabled(Ok(()))
         .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine, || {
-            Ok(Some("secret".to_owned()))
-        })
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
         .unwrap();
 
-    let calls = fake.calls();
-    let Call::Register {
-        who, password, update, ..
-    } = &calls[0]
-    else {
-        panic!("the disarm registers: {calls:?}");
-    };
-    assert_eq!(who, &TaskAccount::User("alice".to_owned()));
-    assert_eq!(password.as_deref(), Some("secret"));
-    assert!(update);
+    assert_eq!(
+        fake.calls(),
+        [
+            disable_call(),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned())
+        ],
+        "no registration"
+    );
+    assert!(!records_dir.exists());
 }
 
+/// A task whose blob will not decode is removed all the same: nothing here reads the blob.
 #[skuld::test]
-fn uninstall_of_a_disarmed_real_user_task_needs_no_password() {
+fn uninstall_of_a_task_whose_blob_will_not_decode_needs_nothing_of_it() {
     let (_dir, records_dir, runs) = records();
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let spec = task_spec(Some("30 3 * * *"));
+    let registered = registered_task(&spec, true);
+    let broken = TaskSnapshot::new(
+        id(),
+        Err(std::sync::Arc::new(Error::blob("cannot read it"))),
+        crate::backend::scm::manager::task::api::Registered {
+            xml: registered.xml,
+            data: registered.data.replace("Spec: ", "Spec: !"),
+        },
+    );
     let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new())).on_delete(Ok(true));
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[]);
 
-    scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, || {
-            panic!("a task that is disarmed is not registered, so it needs no password")
-        })
-        .unwrap();
+    scm(&fake).task_remove_with(&broken, &runs, &mut machine).unwrap();
 
     assert!(!records_dir.exists());
 }
@@ -300,7 +316,8 @@ fn every_live_instance_is_stopped() {
     let spec = task_spec(Some("30 3 * * *"));
     let both = || Ok(vec![instance(1, 100), instance(2, 200)]);
     let fake = Fake::new();
-    fake.on_instances(both())
+    fake.on_set_enabled(Ok(()))
+        .on_instances(both())
         .on_instances(both())
         .on_stop(Ok(()))
         .on_instances(both())
@@ -309,7 +326,7 @@ fn every_live_instance_is_stopped() {
     let mut machine = Machine::new(&fake, &[100, 200]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
         .unwrap();
 
     let stops: Vec<Call> = fake
@@ -338,16 +355,22 @@ fn a_listed_instance_whose_process_is_gone_is_not_stopped() {
     let (_dir, _records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(vec![instance(1, 4242)])).on_delete(Ok(true));
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
         .unwrap();
 
     assert_eq!(
         fake.calls(),
-        [Call::Instances(PATH.to_owned()), Call::Delete(PATH.to_owned())]
+        [
+            disable_call(),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned())
+        ]
     );
     assert!(machine.held.is_empty() && machine.waited.is_empty());
 }
@@ -359,13 +382,14 @@ fn a_run_that_ended_after_it_was_held_is_not_stopped_or_waited_for() {
     let (_dir, _records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(vec![instance(1, 4242)]))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
         .unwrap();
 
     assert_eq!(machine.held, [4242]);
@@ -379,7 +403,8 @@ fn a_stop_that_finds_the_run_ended_is_a_stop() {
     let (_dir, _records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(vec![instance(1, 4242)]))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Err(Error::os(
             "stop an instance",
@@ -389,7 +414,7 @@ fn a_stop_that_finds_the_run_ended_is_a_stop() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
         .unwrap();
 
     assert_eq!(machine.waited.len(), 1);
@@ -400,12 +425,13 @@ fn any_other_failure_of_a_stop_fails_the_uninstall_and_deletes_nothing() {
     let (_dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(vec![instance(1, 4242)]))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Err(Error::os("stop an instance", io::Error::other("denied"))));
     let mut machine = Machine::new(&fake, &[4242]);
 
-    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, no_password);
+    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine);
 
     assert!(failed.is_err());
     assert!(machine.waited.is_empty());
@@ -420,7 +446,7 @@ fn a_process_that_cannot_be_judged_fails_the_uninstall_before_a_stop() {
     let (_dir, _records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(vec![instance(1, 4242)]));
+    fake.on_set_enabled(Ok(())).on_instances(Ok(vec![instance(1, 4242)]));
     struct Denied;
     impl Processes for Denied {
         type Held = ();
@@ -436,29 +462,50 @@ fn a_process_that_cannot_be_judged_fails_the_uninstall_before_a_stop() {
     }
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut Denied, no_password)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut Denied)
         .unwrap_err();
 
     let report = failed.report().to_string();
     assert!(report.contains("denied access"), "{report}");
-    assert_eq!(fake.calls(), [Call::Instances(PATH.to_owned())]);
+    assert_eq!(fake.calls(), [disable_call(), Call::Instances(PATH.to_owned())]);
 }
 
+/// A task that goes between the read and the uninstall has nothing to disable or stop; the delete finds
+/// none, and the records still go.
 #[skuld::test]
 fn a_task_that_went_meanwhile_is_uninstalled_all_the_same() {
     let (_dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_register(Ok(Registration::Raced))
+    fake.on_set_enabled(Err(Error::NotInstalled { id: "nightly".into() }))
         .on_instances(Err(Error::NotInstalled { id: "nightly".into() }))
         .on_delete(Ok(false));
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine, no_password)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
         .unwrap();
 
     assert!(!records_dir.exists());
+}
+
+/// A disable that fails for any other reason is the uninstall's failure, before anything is stopped or
+/// deleted.
+#[skuld::test]
+fn a_failed_disable_fails_the_uninstall_before_anything_else() {
+    let (_dir, records_dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Err(Error::os("set the enabled flag", io::Error::other("denied"))));
+    let mut machine = Machine::new(&fake, &[]);
+
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .unwrap_err();
+
+    assert!(failed.to_string().contains("NOT deleted"), "{failed}");
+    assert_eq!(fake.calls(), [disable_call()]);
+    assert!(records_dir.exists());
 }
 
 #[skuld::test]
@@ -466,11 +513,12 @@ fn a_failed_delete_leaves_the_records_for_the_retry() {
     let (_dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new()))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
         .on_delete(Err(Error::os("delete the task", io::Error::other("denied"))));
     let mut machine = Machine::new(&fake, &[]);
 
-    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine, no_password);
+    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine);
 
     assert!(failed.is_err());
     assert!(records_dir.exists());
@@ -479,20 +527,41 @@ fn a_failed_delete_leaves_the_records_for_the_retry() {
 // The id that is gone -------------------------------------------------------------------------------------------------
 
 /// An `uninstall` of an id that is not installed is how an uninstall that could not remove the records
-/// is retried, and it sweeps as a service's does.
+/// is retried. The records are removed under the install lock, which an install that has just made
+/// them holds.
 #[skuld::test]
-fn uninstall_of_an_id_that_is_absent_removes_the_records_and_sweeps_as_a_service_does() {
+fn uninstall_of_an_id_that_is_absent_removes_the_records_under_the_install_lock() {
     let (_dir, records_dir, runs) = records();
     let fake = Fake::new();
+    let locked = Cell::new(false);
 
-    scm(&fake).uninstall_absent_with(&runs).unwrap();
+    scm(&fake)
+        .uninstall_absent_with(&runs, || {
+            assert!(records_dir.exists(), "the lock is taken before the records go");
+            locked.set(true);
+            Ok(())
+        })
+        .unwrap();
 
+    assert!(locked.get());
     assert!(!records_dir.exists());
     assert_eq!(
         fake.calls(),
         [],
         "a manager with no provider has nothing to sweep, and reads no task"
     );
+}
+
+/// With no records there is nothing to remove, and so no lock to take: a library caller that is not
+/// elevated keeps getting `NotInstalled` for an id that never was.
+#[skuld::test]
+fn uninstall_of_an_id_with_no_records_takes_no_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+
+    scm(&Fake::new())
+        .uninstall_absent_with(&runs, || -> Result<()> { panic!("there is nothing to guard") })
+        .unwrap();
 }
 
 // Retype ==============================================================================================================
@@ -504,18 +573,18 @@ fn a_crash_between_removal_and_creation_reads_as_absent_and_install_finishes() {
     let (_dir, _records_dir, runs) = records();
     let old = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new()))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true))
         .on_get(Ok(None))
         .on_register(Ok(Registration::Created));
     let scm = scm(&fake);
     let mut machine = Machine::new(&fake, &[]);
-    scm.task_remove_with(&snapshot_of(&old, false), &runs, &mut machine, no_password)
+    scm.task_remove_with(&snapshot_of(&old, false), &runs, &mut machine)
         .unwrap();
 
     assert!(matches!(scm.task_read(&id()).unwrap(), ReadOutcome::Absent));
-    let host = task_host();
-    let new = TaskXml::new(&old, host).unwrap();
+    let new = TaskXml::new(&old, task_host()).unwrap();
     let (_other, new_runs) = {
         let dir = tempfile::tempdir().unwrap();
         let runs = Runs::of(dir.path(), &id());

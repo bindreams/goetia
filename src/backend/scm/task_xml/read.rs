@@ -116,12 +116,16 @@ impl TaskXml {
             .collect())
     }
 
-    /// Whether every trigger of `xml` is enabled. A task with no trigger is not armed, and neither
-    /// is XML that cannot be read.
+    /// Whether every trigger of `xml` is enabled, and the task itself is (`Settings/Enabled`, which
+    /// Task Scheduler leaves out while it is true): a task that is not enabled is started by nothing.
+    /// A task with no trigger is not armed, and neither is XML that cannot be read.
     pub(crate) fn armed(xml: &str) -> bool {
         let Ok(document) = document(xml) else {
             return false;
         };
+        if !own_flag_is_true(document.root_element()) {
+            return false;
+        }
         let Some(triggers) = child(document.root_element(), "Triggers") else {
             return false;
         };
@@ -135,17 +139,27 @@ impl TaskXml {
         any
     }
 
-    /// `xml` with every trigger's `Enabled` flag set to `armed`, and nothing else changed: a hand
-    /// edit elsewhere in the task is kept. A flag Task Scheduler dropped (an enabled trigger) is
-    /// written when `armed` is false, and left out when it is true. XML with no trigger is returned
-    /// as it is.
+    /// `xml` with every trigger's `Enabled` flag set to `armed`, and nothing else changed but the
+    /// task's own flag: a hand edit elsewhere in the task is kept. A flag Task Scheduler dropped (an
+    /// enabled trigger) is written when `armed` is false, and left out when it is true.
+    ///
+    /// **The task's own flag (`Settings/Enabled`) is set true in both directions,** where it is stated:
+    /// an `uninstall` that did not finish leaves it false, and `enable` and `disable` both make the task
+    /// one that can be started again, `disable` with its triggers disabled. One that states none is
+    /// enabled already.
     pub(crate) fn with_armed(xml: &str, armed: bool) -> Result<String, Error> {
         let document = document(xml)?;
-        let Some(triggers) = child(document.root_element(), "Triggers") else {
-            return Ok(xml.to_owned());
-        };
         let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-        for trigger in elements(triggers) {
+        if let Some(flag) = child(document.root_element(), "Settings").and_then(|settings| child(settings, "Enabled")) {
+            edits.push(match flag.first_child().filter(Node::is_text) {
+                Some(value) => (value.range(), "true".to_owned()),
+                None => (flag.range(), "<Enabled>true</Enabled>".to_owned()),
+            });
+        }
+        for trigger in child(document.root_element(), "Triggers")
+            .into_iter()
+            .flat_map(elements)
+        {
             match child(trigger, "Enabled") {
                 Some(flag) => edits.push(match flag.first_child().filter(Node::is_text) {
                     Some(value) => (value.range(), armed.to_string()),
@@ -232,7 +246,17 @@ fn only(node: Node<'_, '_>, allowed: &[&str]) -> Option<()> {
 }
 
 fn enabled(trigger: Node<'_, '_>) -> bool {
-    child(trigger, "Enabled").is_none_or(|flag| !matches!(text(flag).to_ascii_lowercase().as_str(), "false" | "0"))
+    flag_is_true(child(trigger, "Enabled"))
+}
+
+/// Whether the task's own flag, `Settings/Enabled`, is true: it is when Task Scheduler states none.
+fn own_flag_is_true(root: Node<'_, '_>) -> bool {
+    flag_is_true(child(root, "Settings").and_then(|settings| child(settings, "Enabled")))
+}
+
+/// An `Enabled` element is true unless it says false; a missing one is Task Scheduler's default, true.
+fn flag_is_true(flag: Option<Node<'_, '_>>) -> bool {
+    flag.is_none_or(|flag| !matches!(text(flag).to_ascii_lowercase().as_str(), "false" | "0"))
 }
 
 // The action ----------------------------------------------------------------------------------------------------------

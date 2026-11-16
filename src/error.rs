@@ -165,13 +165,17 @@ pub enum Error {
     #[error("`{variable}` is set but its value is not valid Unicode")]
     InvalidPassword { variable: String },
 
-    /// A real account needs a password that was not given: to install, and for a task, to `enable`,
-    /// `disable` and `uninstall` it too, which register it again.
+    /// A real account needs a password that was not given: to install, and for a task, to `enable` and
+    /// `disable` it too, which register it again. `kind` is what the account runs.
     #[error(
-        "service account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
-         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again"
+        "{} account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
+         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again",
+        daemon_noun(*kind)
     )]
-    PasswordRequired { account: String },
+    PasswordRequired {
+        account: String,
+        kind: crate::spec::DaemonKind,
+    },
 
     /// goetia cannot confirm the manager or its client is at least its floor; nothing was sent.
     /// The sentences are written from what each source reported.
@@ -1337,6 +1341,14 @@ fn loaded_job(id: &str, kind: crate::spec::DaemonKind) -> String {
              were not installed and the installed ones are untouched: run `goetia daemon stop {id}` (a task that \
              has stopped is idle), then re-run install"
         ),
+    }
+}
+
+/// What a daemon of `kind` is called in a message.
+fn daemon_noun(kind: crate::spec::DaemonKind) -> &'static str {
+    match kind {
+        crate::spec::DaemonKind::Service => "service",
+        crate::spec::DaemonKind::Task => "task",
     }
 }
 

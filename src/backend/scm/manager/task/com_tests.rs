@@ -420,6 +420,47 @@ fn a_hand_added_logon_trigger_disarmed_by_with_armed_registers_and_reads_back_di
     }
 }
 
+/// The task's own flag, which an uninstall clears first: no registration, the XML says it, and the triggers'
+/// flags are what they were. A task that is not there is not installed.
+#[skuld::test]
+fn the_tasks_own_flag_is_set_without_a_registration(#[fixture(scm_group)] _group: &Group) {
+    use crate::backend::scm::task_xml::TaskXml;
+
+    let _lock = InstallLock::acquire().unwrap();
+    let (_guard, path) = TaskGuard::new("goetia-com-enabled");
+    let (_absent_guard, absent) = TaskGuard::new("goetia-com-enabled-absent");
+    let triggers = "<Triggers><CalendarTrigger><StartBoundary>2030-01-01T03:30:00</StartBoundary>\
+                    <Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>\
+                    </CalendarTrigger></Triggers><Actions";
+    let text = xml(1, "enabled", "").replace("<Actions", triggers);
+    Com.register(&path, &text, &system(), None, false).unwrap();
+    assert!(TaskXml::armed(&Com.get(&path).unwrap().unwrap().xml));
+
+    Com.set_enabled(&path, false).unwrap();
+    let off = Com.get(&path).unwrap().unwrap().xml;
+    assert!(off.contains("<Enabled>false</Enabled>"), "{off}");
+    assert!(!TaskXml::armed(&off), "{off}");
+    assert_eq!(
+        off.matches("<Enabled>false</Enabled>").count(),
+        1,
+        "only the task's own flag is false, not the trigger's: {off}"
+    );
+    // A task that is not enabled is refused a `Run`, with the code the message for it is made of.
+    let refused = Com.run(&path).unwrap_err();
+    assert!(
+        crate::backend::scm::manager::task::api::com_code(&refused)
+            == Some(windows::Win32::Foundation::SCHED_E_TASK_DISABLED),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("did not finish"), "{refused}");
+
+    Com.set_enabled(&path, true).unwrap();
+    assert!(TaskXml::armed(&Com.get(&path).unwrap().unwrap().xml));
+
+    let missing = Com.set_enabled(&absent, false);
+    assert!(matches!(missing, Err(Error::NotInstalled { .. })), "{missing:?}");
+}
+
 #[skuld::test]
 fn a_query_of_a_missing_task_is_not_installed(#[fixture(scm_group)] _group: &Group) {
     let _lock = InstallLock::acquire().unwrap();

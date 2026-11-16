@@ -12,12 +12,13 @@
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
+use super::remove::{Processes, System};
 use super::{TaskApi, TaskPath, TaskSnapshot};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::{self, Right, Written};
-use crate::backend::scm::manager::{Scm, ScmSnapshot, registry, written_user};
+use crate::backend::scm::manager::{Scm, ScmSnapshot, apply_gated, registry, service_gate, written_user};
 use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::sid::{Sid, sid_from_parts};
@@ -62,7 +63,10 @@ pub(super) fn password_of(
         TaskAccount::Service(_) => Ok(None),
         TaskAccount::User(name) => match read()? {
             Some(password) => Ok(Some(password)),
-            None => Err(Error::PasswordRequired { account: name.clone() }),
+            None => Err(Error::PasswordRequired {
+                account: name.clone(),
+                kind: DaemonKind::Task,
+            }),
         },
     }
 }
@@ -157,17 +161,23 @@ impl Scm {
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        let account = definition.account();
-        let prepared = prepare(&account)?;
-        // Every write, so a reinstall as another user can still write its records.
-        runs.ensure(&prepared.principal)
-            .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
+        let prepared = task_acquire(id, definition, runs, prepare)?;
+        self.task_register(id, definition, snapshot, &prepared)
+    }
 
+    /// The registration itself, once [`task_acquire`] has seen to what it needs.
+    fn task_register(
+        &self,
+        id: &Id,
+        definition: &TaskXml,
+        snapshot: Option<&TaskSnapshot>,
+        prepared: &Prepared,
+    ) -> Result<WriteOutcome> {
         let armed = snapshot.is_some_and(TaskSnapshot::armed);
         let registered = self.tasks.register(
             &TaskPath::of(id),
             &definition.to_xml(armed),
-            &account,
+            &definition.account(),
             prepared.password.as_deref(),
             snapshot.is_some(),
         )?;
@@ -176,6 +186,21 @@ impl Scm {
             Registration::Raced => WriteOutcome::Raced,
         })
     }
+}
+
+/// Everything a registration of `definition` needs, before any request: what the machine holds for the
+/// account (`prepare`), and the record directory with permissions that name it. Every write makes it, so
+/// a reinstall as another user can still write its records.
+fn task_acquire(
+    id: &Id,
+    definition: &TaskXml,
+    runs: &Runs,
+    prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
+) -> Result<Prepared> {
+    let prepared = prepare(&definition.account())?;
+    runs.ensure(&prepared.principal)
+        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
+    Ok(prepared)
 }
 
 // Enable and disable ==================================================================================================
@@ -213,21 +238,14 @@ impl Scm {
 // Retype ==============================================================================================================
 
 impl Scm {
-    /// Refuses a retype of `old`, a task, while it runs: [`Error::RetypeRunning`]. `alive` judges the
-    /// processes the listing names.
-    pub(super) fn refuse_running_task_with(
-        &self,
-        old: &TaskSnapshot,
-        alive: impl FnMut(u32) -> std::io::Result<Liveness>,
-    ) -> Result<()> {
-        refuse_running(old.id(), DaemonKind::Task, self.task_state_with(old, alive)?)
-    }
-
-    /// An install that changes a task into a service: the task is removed, then the service created.
-    /// Refused while the task runs. The install lock is held for both (the task's removal sweeps what
-    /// nothing references), and a crash between them leaves nothing at the id, which an install that
-    /// runs again creates. A start the user makes between the check and the removal is the user's own
-    /// action.
+    /// An install that changes a task into a service: the task is refused while it runs; everything the
+    /// service needs is acquired; the task is removed; the service is created. A start the user makes
+    /// between the check and the removal is the user's own action, and a crash between the removal and
+    /// the creation leaves nothing at the id, which an install that runs again creates.
+    ///
+    /// The install lock is held from here to the end of the install, as the removal and the sweep after
+    /// the creation need it: a service that runs the shim host holds it already, and a native one,
+    /// whose install takes none, takes it here.
     pub(in crate::backend::scm) fn retype_to_service(
         &self,
         spec: &DaemonSpec,
@@ -235,19 +253,57 @@ impl Scm {
         old: &TaskSnapshot,
         scope: &mut Option<InstallLock>,
     ) -> Result<WriteOutcome> {
-        refuse_running(old.id(), DaemonKind::Task, self.task_run_state(old)?)?;
         if scope.is_none() {
             *scope = Some(InstallLock::acquire()?);
         }
-        self.task_remove(old)?;
-        let wrote = self.service_write(spec, definition, None)?;
+        let runs = Runs::of(&program_data()?, old.id());
+        let written = written_user(&spec.common().user);
+        let wrote = self.retype_to_service_with(
+            old,
+            &runs,
+            &mut System,
+            || service_gate(definition, written),
+            |password| {
+                apply_gated(definition, password, true)?;
+                Ok(WriteOutcome::Done)
+            },
+        )?;
         self.sweep_after_retype();
         Ok(wrote)
     }
 
-    /// An install that changes a service into a task: the service is stopped and deleted, then the task
-    /// created. Refused while the service runs. The task's install holds the lock already. See
-    /// [`Self::retype_to_service`].
+    /// [`Self::retype_to_service`] over `processes` and the record directory `runs`, with `gate`, which
+    /// acquires what the service needs and says what its creation takes, and `create`, which creates it.
+    /// The order is the contract: refuse a task that runs, then `gate`, then the removal, then `create`;
+    /// a failure of any step leaves the task as the steps before it left it, and a refusal or a failed
+    /// `gate` leaves it untouched.
+    pub(super) fn retype_to_service_with<P: Processes, G>(
+        &self,
+        old: &TaskSnapshot,
+        runs: &Runs,
+        processes: &mut P,
+        gate: impl FnOnce() -> Result<G>,
+        create: impl FnOnce(G) -> Result<WriteOutcome>,
+    ) -> Result<WriteOutcome> {
+        self.refuse_running_task_with(old, |pid| processes.alive(pid))?;
+        let gated = gate()?;
+        self.task_remove_with(old, runs, processes)?;
+        create(gated)
+    }
+
+    /// Refuses a retype of `old`, a task, while it runs: [`Error::RetypeRunning`]. `alive` judges the
+    /// processes the listing names.
+    fn refuse_running_task_with(
+        &self,
+        old: &TaskSnapshot,
+        alive: impl FnMut(u32) -> std::io::Result<Liveness>,
+    ) -> Result<()> {
+        refuse_running(old.id(), DaemonKind::Task, self.task_state_with(old, alive)?)
+    }
+
+    /// An install that changes a service into a task: the service is refused while it runs; everything
+    /// the task needs is acquired; the service is stopped and deleted; the task is registered. The task's
+    /// install holds the lock already. See [`Self::retype_to_service`].
     pub(in crate::backend::scm) fn retype_to_task(
         &self,
         spec: &DaemonSpec,
@@ -256,20 +312,49 @@ impl Scm {
         scope: &mut Option<InstallLock>,
     ) -> Result<WriteOutcome> {
         debug_assert!(scope.is_some(), "a task's install holds the install lock");
-        refuse_running(
-            old.id(),
-            DaemonKind::Service,
-            self.service_live_status(old)?.common().state,
+        let runs = Runs::of(&program_data()?, &spec.common().id);
+        let wrote = self.retype_to_task_with(
+            spec,
+            definition,
+            &runs,
+            |account| prepare(account, written_user(&spec.common().user)),
+            || {
+                refuse_running(
+                    old.id(),
+                    DaemonKind::Service,
+                    self.service_live_status(old)?.common().state,
+                )
+            },
+            || self.service_retire(old),
         )?;
-        self.service_retire(old)?;
-        let wrote = self.task_write(spec, definition, None)?;
         self.sweep_after_retype();
         Ok(wrote)
     }
 
+    /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare`, `refuse` (the service
+    /// runs: [`Error::RetypeRunning`]) and `retire` (the service is removed). The order is the contract:
+    /// `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
+    /// registration; a refusal or a failed acquisition leaves the service untouched.
+    pub(super) fn retype_to_task_with(
+        &self,
+        spec: &DaemonSpec,
+        definition: &TaskXml,
+        runs: &Runs,
+        prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
+        refuse: impl FnOnce() -> Result<()>,
+        retire: impl FnOnce() -> Result<()>,
+    ) -> Result<WriteOutcome> {
+        let id = &spec.common().id;
+        refuse()?;
+        let prepared = task_acquire(id, definition, runs, prepare)?;
+        retire()?;
+        self.task_register(id, definition, None, &prepared)
+    }
+
     /// The sweep of what the removal left: the file a removed service's or task's host named, which
-    /// the daemon now installed may or may not run. The removal sweeps nothing itself, since it would
-    /// delete the host the new daemon is about to name. Like an install's, it does not fail the install.
+    /// the daemon now installed may or may not run. The removal sweeps nothing itself (it would delete
+    /// the host the new daemon is about to name), so the install sweeps once the new daemon exists.
+    /// Like an install's own sweep, it does not fail the install.
     fn sweep_after_retype(&self) {
         if let Some(shim) = &self.shim {
             self.sweep_before_install(&**shim);

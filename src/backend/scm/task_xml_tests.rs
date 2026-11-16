@@ -604,6 +604,58 @@ fn arming_flips_only_the_trigger_flags() {
     );
 }
 
+/// `xml` with the task's own flag stated as `flag` in its `Settings`, as Task Scheduler reads a task back
+/// whose own flag is not the default (it drops the default, true).
+fn with_own_flag(xml: &str, flag: bool) -> String {
+    xml.replace("<Settings>", &format!("<Settings>\n    <Enabled>{flag}</Enabled>"))
+}
+
+/// A task whose own flag is false is started by nothing, whatever its triggers say: it is not armed. An
+/// `uninstall` that did not finish leaves one.
+#[skuld::test]
+fn a_task_whose_own_flag_is_false_is_not_armed() {
+    let spec = spec();
+    let enabled_trigger = TaskXml::with_armed(&readback(&spec, &host(), DAILY_AT_0330), true).unwrap();
+    assert!(TaskXml::armed(&enabled_trigger));
+
+    assert!(!TaskXml::armed(&with_own_flag(&enabled_trigger, false)));
+    assert!(TaskXml::armed(&with_own_flag(&enabled_trigger, true)));
+}
+
+/// Arming and disarming both leave the task's own flag true: `enable` makes a task whose flag an
+/// unfinished `uninstall` cleared armed, and `disable` leaves it disarmed but able to be started.
+#[skuld::test]
+fn arming_and_disarming_both_set_the_tasks_own_flag() {
+    let spec = spec();
+    let xml = TaskXml::with_armed(&readback(&spec, &host(), DAILY_AT_0330), true).unwrap();
+    let off = with_own_flag(&xml, false);
+
+    let armed = TaskXml::with_armed(&off, true).unwrap();
+    assert!(TaskXml::armed(&armed), "{armed}");
+    assert!(
+        armed.contains("<Enabled>true</Enabled>\n    <MultipleInstancesPolicy>"),
+        "{armed}"
+    );
+    let disarmed = TaskXml::with_armed(&off, false).unwrap();
+    assert!(!TaskXml::armed(&disarmed));
+    assert!(
+        disarmed.contains("<Settings>\n    <Enabled>true</Enabled>"),
+        "the task's own flag is true, the triggers' false: {disarmed}"
+    );
+    // Nothing else changed: with the flags taken out the three are one text.
+    assert_eq!(without_flags(&armed), without_flags(&off));
+    assert_eq!(without_flags(&disarmed), without_flags(&off));
+
+    // A task with no trigger has only its own flag to set.
+    let no_triggers = readback(&spec, &host(), "");
+    assert_eq!(
+        TaskXml::with_armed(&with_own_flag(&no_triggers, false), false).unwrap(),
+        with_own_flag(&no_triggers, true)
+    );
+    // A task that states no flag has the default, true: nothing is added.
+    assert_eq!(TaskXml::with_armed(&no_triggers, true).unwrap(), no_triggers);
+}
+
 #[skuld::test]
 fn armed_flags_are_not_in_display() {
     let spec = spec();

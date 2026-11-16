@@ -10,7 +10,8 @@ use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL};
 
 use super::*;
-use crate::backend::scm::manager::task::api::Registration;
+use crate::backend::scm::instance::InstanceId;
+use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::shim::acl::read_object;
 use crate::backend::scm::sid::{Sid, sid_from_parts, system};
@@ -239,7 +240,7 @@ fn a_real_account_needs_its_password_and_a_service_account_is_never_given_one() 
 
     let error = password_of(&user, || Ok(None)).unwrap_err();
     assert!(
-        matches!(&error, Error::PasswordRequired { account } if account == "alice"),
+        matches!(&error, Error::PasswordRequired { account, kind: DaemonKind::Task } if account == "alice"),
         "{error:?}"
     );
     assert_eq!(
@@ -476,7 +477,7 @@ fn enable_of_a_real_user_task_without_its_password_is_refused_before_any_write()
     let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, false), true, || Ok(None));
 
     assert!(
-        matches!(&refused, Err(Error::PasswordRequired { account }) if account == "alice"),
+        matches!(&refused, Err(Error::PasswordRequired { account, kind: DaemonKind::Task }) if account == "alice"),
         "{refused:?}"
     );
     assert_eq!(fake.calls(), []);
@@ -574,23 +575,53 @@ fn a_running_daemon_is_not_retyped_and_a_stopped_one_is() {
     }
 }
 
-/// The task half of a retype to a service: a running task is refused before anything is asked of
-/// the scheduler but its listing, and the exact sentence says so.
-#[skuld::test]
-fn a_task_that_runs_is_not_retyped() {
-    use crate::backend::scm::instance::InstanceId;
-    use crate::backend::scm::manager::task::api::Instance;
-    let spec = task_spec(Some("30 3 * * *"));
-    let fake = Fake::new();
-    fake.on_instances(Ok(vec![Instance {
+/// The machine's processes for a retype's removal: the `alive` pids run, and none can be held (so a
+/// removal that meets one has failed the test).
+struct Running(Vec<u32>);
+
+impl Processes for Running {
+    type Held = ();
+
+    fn alive(&mut self, pid: u32) -> std::io::Result<Liveness> {
+        Ok(if self.0.contains(&pid) {
+            Liveness::Alive
+        } else {
+            Liveness::Gone
+        })
+    }
+
+    fn hold(&mut self, pid: u32) -> std::io::Result<Option<()>> {
+        unreachable!("a retype stops nothing: pid {pid} was held")
+    }
+
+    fn wait_for_exit(&mut self, _: ()) -> std::io::Result<()> {
+        unreachable!("a retype stops nothing")
+    }
+}
+
+fn running_run() -> Instance {
+    Instance {
         id: InstanceId::parse(&format!("{:032x}", 1)).unwrap(),
         pid: 4242,
-    }]));
+    }
+}
+
+/// A task that runs is refused before anything is acquired or removed, with the exact sentence.
+#[skuld::test]
+fn a_task_that_runs_is_not_changed_into_a_service() {
+    let (_dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_instances(Ok(vec![running_run()]));
 
     let refused = scm(&fake)
-        .refuse_running_task_with(&snapshot_of(&spec, false), |_| {
-            Ok(crate::backend::scm::manager::task::live::Liveness::Alive)
-        })
+        .retype_to_service_with(
+            &snapshot_of(&spec, false),
+            &runs,
+            &mut Running(vec![4242]),
+            || -> Result<()> { panic!("nothing is acquired for a retype that is refused") },
+            |()| -> Result<WriteOutcome> { panic!("no service is created") },
+        )
         .unwrap_err();
 
     assert!(
@@ -603,16 +634,207 @@ fn a_task_that_runs_is_not_retyped() {
         ),
         "{refused:?}"
     );
-    assert_eq!(fake.calls(), [Call::Instances(PATH.to_owned())]);
+    assert_eq!(
+        fake.calls(),
+        [Call::Instances(PATH.to_owned())],
+        "the task is untouched"
+    );
 }
 
+/// What the service needs (its account, password, logon right, event source) is acquired before the
+/// task is touched: a gate that fails leaves the task as it was, with the scheduler asked only whether it
+/// runs.
 #[skuld::test]
-fn a_task_that_is_idle_is_retyped() {
+fn a_gate_that_fails_leaves_the_task_untouched() {
+    let (dir, runs) = records();
+    runs.ensure(&process_user_sid()).unwrap();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_instances(Ok(Vec::new()));
 
-    scm(&fake)
-        .refuse_running_task_with(&snapshot_of(&spec, false), |_| panic!("nothing is listed"))
+    let refused = scm(&fake)
+        .retype_to_service_with(
+            &snapshot_of(&spec, true),
+            &runs,
+            &mut Running(vec![]),
+            || -> Result<()> {
+                Err(Error::PasswordRequired {
+                    account: "alice".to_owned(),
+                    kind: DaemonKind::Service,
+                })
+            },
+            |()| -> Result<WriteOutcome> { panic!("no service is created") },
+        )
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::PasswordRequired { .. }), "{refused:?}");
+    assert_eq!(
+        fake.calls(),
+        [Call::Instances(PATH.to_owned())],
+        "nothing was disabled or deleted"
+    );
+    assert!(records_dir(&dir).is_dir(), "its records are there");
+}
+
+#[skuld::test]
+fn a_task_is_removed_after_the_gate_and_before_the_service_is_created() {
+    let (dir, runs) = records();
+    runs.ensure(&process_user_sid()).unwrap();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_instances(Ok(Vec::new()))
+        .on_instances(Ok(Vec::new()))
+        .on_set_enabled(Ok(()))
+        .on_delete(Ok(true));
+    let scm = scm(&fake);
+    let order = std::cell::RefCell::new(Vec::new());
+
+    let wrote = scm
+        .retype_to_service_with(
+            &snapshot_of(&spec, true),
+            &runs,
+            &mut Running(vec![]),
+            || {
+                assert_eq!(
+                    fake.calls(),
+                    [Call::Instances(PATH.to_owned())],
+                    "only the refusal came first"
+                );
+                order.borrow_mut().push("gate");
+                Ok("password")
+            },
+            |gated| {
+                assert_eq!(gated, "password", "what the gate returned reaches the creation");
+                assert!(
+                    matches!(fake.calls().last(), Some(Call::Delete(_))),
+                    "the task is deleted before the service is created"
+                );
+                assert!(!records_dir(&dir).exists(), "and its records are gone");
+                order.borrow_mut().push("create");
+                Ok(WriteOutcome::Done)
+            },
+        )
         .unwrap();
+
+    assert!(matches!(wrote, WriteOutcome::Done));
+    assert_eq!(*order.borrow(), ["gate", "create"]);
+    fake.finish();
+}
+
+// ... and a service into a task. The service is the real SCM's, so its refusal and its removal are the
+// closures the real retype passes, and the order is the one that counts.
+
+#[skuld::test]
+fn a_service_that_runs_is_not_changed_into_a_task() {
+    let (dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            |_| panic!("nothing is acquired for a retype that is refused"),
+            || refuse_running(&id(), DaemonKind::Service, State::Running),
+            || panic!("the service is not removed"),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            refused,
+            Error::RetypeRunning {
+                old: DaemonKind::Service,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(fake.calls(), []);
+    assert!(!records_dir(&dir).exists());
+}
+
+/// A real account's password, logon right and the record directory are acquired before the service is
+/// removed: a gate that fails leaves the service installed.
+#[skuld::test]
+fn a_gate_that_fails_leaves_the_service_untouched() {
+    let (dir, runs) = records();
+    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            |account| {
+                password_of(account, || Ok(None)).map(|password| Prepared {
+                    principal: system(),
+                    password,
+                })
+            },
+            || Ok(()),
+            || panic!("the service is not removed when what the task needs is missing"),
+        )
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::PasswordRequired { .. }), "{refused:?}");
+    assert_eq!(fake.calls(), []);
+    assert!(!records_dir(&dir).exists(), "not even the record directory is made");
+
+    // And a record directory that cannot be made is the same.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let blocked = Runs::of(file.path(), &id());
+    let refused = scm(&fake).retype_to_task_with(
+        &spec,
+        &definition(&spec),
+        &blocked,
+        prepared_alice(),
+        || Ok(()),
+        || panic!("the service is not removed when its record directory cannot be made"),
+    );
+    assert!(refused.is_err());
+}
+
+fn prepared_alice() -> impl FnOnce(&TaskAccount) -> Result<Prepared> {
+    prepared(process_user_sid(), Some("secret"))
+}
+
+#[skuld::test]
+fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered() {
+    let (dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let retired = std::cell::Cell::new(false);
+
+    let wrote = scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            prepared(process_user_sid(), None),
+            || Ok(()),
+            || {
+                assert_eq!(
+                    fake.calls(),
+                    [],
+                    "the scheduler is asked nothing before the service goes"
+                );
+                assert!(records_dir(&dir).is_dir(), "the record directory is made first");
+                retired.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(wrote, WriteOutcome::Done), "{wrote:?}");
+    assert!(retired.get());
+    assert_eq!(
+        fake.calls(),
+        [register_call(&spec, false, root(), None, false)],
+        "a create, disarmed"
+    );
+    fake.finish();
 }

@@ -1,8 +1,9 @@
-//! Removing a task: disarm it so that nothing starts another run, stop every run, delete the task and its
-//! run records, and sweep the shim file nothing references any more.
+//! Removing a task: disable it so that nothing starts another run, stop every run, delete the task and its
+//! run records, and sweep the shim file nothing references any more. None of it needs the account's
+//! password.
 //!
 //! A re-run finishes what a failure left. The steps run in an order whose every prefix is a state the
-//! next `uninstall` reads and completes: a task that is registered and disarmed, a task that is gone
+//! next `uninstall` reads and completes: a task that is registered and disabled, a task that is gone
 //! with its records left (`uninstall` of an id that is absent removes them), or nothing.
 
 use std::io;
@@ -13,14 +14,13 @@ use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
 
 use super::api::{Registered, is_not_running};
 use super::live::{Liveness, probe};
-use super::write::{password_of, set_armed, stored_account};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::InstalledService;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::kill::HoldOutcome;
 use crate::backend::scm::kill::system::{open_process_with, wait_exit};
-use crate::backend::scm::manager::{Scm, Uninstalled, identity, open_refused, shim_exe};
+use crate::backend::scm::manager::{Scm, Uninstalled, open_refused, shim_exe};
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
@@ -65,10 +65,10 @@ impl Processes for System {
 
 /// Where a failed removal left the task, which is what its message may promise.
 enum Left {
-    /// Registering it disarmed failed: whether it is still armed is not known.
+    /// Disabling it failed: whether it is still enabled is not known.
     Unknown,
-    /// The task is registered and disarmed, so nothing starts it again.
-    Disarmed,
+    /// The task is registered and disabled, so nothing starts it again.
+    Disabled,
     /// The task is gone; its run records are not.
     Records,
 }
@@ -77,11 +77,11 @@ enum Left {
 fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
     let what = match left {
         Left::Unknown => format!(
-            "`{id}` was NOT deleted, and whether it is still armed is not known. Re-run `goetia daemon uninstall \
+            "`{id}` was NOT deleted, and whether it is still enabled is not known. Re-run `goetia daemon uninstall \
              {id}` to retry"
         ),
-        Left::Disarmed => format!(
-            "`{id}` was NOT deleted. It is disarmed, so nothing starts it. Re-run `goetia daemon uninstall {id}` to \
+        Left::Disabled => format!(
+            "`{id}` was NOT deleted. It is disabled, so nothing starts it. Re-run `goetia daemon uninstall {id}` to \
              retry"
         ),
         Left::Records => format!(
@@ -96,11 +96,11 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
 }
 
 /// What a stop whose shim recorded that it could not end the program's process tree leaves: the program
-/// may still run, and the task is kept, disarmed, until a stop ends it.
+/// may still run, and the task is kept, disabled, until a stop ends it.
 fn incomplete_stop(id: &Id) -> Error {
     uninstall_failed(
         id,
-        Left::Disarmed,
+        Left::Disabled,
         Error::os(
             format!("stop `{id}`"),
             io::Error::other(
@@ -139,12 +139,18 @@ impl Scm {
     /// What `uninstall` of an id that is absent does for a task: the run records an `uninstall` that
     /// deleted the task could not remove, and the sweep a service's does.
     pub(in crate::backend::scm) fn task_uninstall_absent(&self, id: &Id) -> Result<()> {
-        self.uninstall_absent_with(&Runs::of(&program_data()?, id))
+        self.uninstall_absent_with(&Runs::of(&program_data()?, id), InstallLock::acquire)
     }
 
-    pub(super) fn uninstall_absent_with(&self, runs: &Runs) -> Result<()> {
-        runs.remove_all()
-            .map_err(|e| Error::os("remove the run records of a task that is gone", e))?;
+    /// [`Self::task_uninstall_absent`] over the record directory `runs`, and `lock`, which takes the
+    /// install lock. The records are removed under it: an install that has just made them holds it, and
+    /// would lose them. With no records there is nothing to guard, and nothing is taken.
+    pub(super) fn uninstall_absent_with<L>(&self, runs: &Runs, lock: impl FnOnce() -> Result<L>) -> Result<()> {
+        if runs.is_present() {
+            let _lock = lock()?;
+            runs.remove_all()
+                .map_err(|e| Error::os("remove the run records of a task that is gone", e))?;
+        }
         self.service_uninstall_absent()
     }
 
@@ -152,57 +158,59 @@ impl Scm {
     /// [`Self::task_remove_with`].
     pub(in crate::backend::scm) fn task_remove(&self, snapshot: &TaskSnapshot) -> Result<()> {
         let runs = Runs::of(&program_data()?, snapshot.id());
-        self.task_remove_with(snapshot, &runs, &mut System, identity::service_password)
+        self.task_remove_with(snapshot, &runs, &mut System)
     }
 
     /// Removes `snapshot`'s task, in an order whose every prefix a re-run finishes:
     ///
-    /// 1. If it is armed, it is registered again disarmed, so that nothing starts another run. That is
-    ///    a registration, so a real user's task needs its password (M3), asked before anything is sent;
-    ///    a task that is disarmed is not registered again and needs none.
+    /// 1. The task is disabled (its own flag, [`TaskApi::set_enabled`]), whether or not it is armed, so
+    ///    that nothing starts another run. That is no registration, so it needs no password and works
+    ///    for an account whose password changed or that is gone: an uninstall never needs the password.
     /// 2. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
-    ///    event. A run whose shim recorded an incomplete stop keeps the task, disarmed.
+    ///    event. A run whose shim recorded an incomplete stop, or whose record cannot be read, keeps the
+    ///    task, disabled.
     /// 3. The task is deleted, then its run records.
+    ///
+    /// A task that is gone has nothing to disable or stop; the rest finds nothing.
     pub(super) fn task_remove_with<P: Processes>(
         &self,
         snapshot: &TaskSnapshot,
         runs: &Runs,
         processes: &mut P,
-        password: impl FnOnce() -> Result<Option<String>>,
     ) -> Result<()> {
         let id = snapshot.id();
         let path = TaskPath::of(id);
-        let registered = snapshot.registered();
 
-        let disarm = if snapshot.armed() {
-            let account = stored_account(registered)?;
-            let password = password_of(&account, password)?;
-            Some((account, password))
-        } else {
-            None
-        };
-        if let Some((account, password)) = &disarm {
-            // A task that is gone already has nothing to disarm: the rest finds nothing.
-            set_armed(&*self.tasks, &path, registered, false, account, password.as_deref())
-                .map_err(|e| uninstall_failed(id, Left::Unknown, e))?;
+        match self.tasks.set_enabled(&path, false) {
+            Ok(()) => {}
+            Err(e) if gone(&e) => {}
+            Err(e) => return Err(uninstall_failed(id, Left::Unknown, e)),
         }
 
         let stopped = self
             .stop_runs(id, &path, processes)
-            .map_err(|e| uninstall_failed(id, Left::Disarmed, e))?;
+            .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
         for instance in &stopped {
-            if let Ok(Some(RunRecord {
-                outcome: RunOutcome::IncompleteStop,
-                ..
-            })) = runs.read(instance)
-            {
-                return Err(incomplete_stop(id));
+            match runs.read(instance) {
+                Ok(Some(RunRecord {
+                    outcome: RunOutcome::IncompleteStop,
+                    ..
+                })) => return Err(incomplete_stop(id)),
+                Ok(_) => {}
+                // A record that cannot be read does not say the stop was complete.
+                Err(e) => {
+                    return Err(uninstall_failed(
+                        id,
+                        Left::Disabled,
+                        Error::os(format!("read the record of `{id}`'s stopped run"), e),
+                    ));
+                }
             }
         }
 
         self.tasks
             .delete(&path)
-            .map_err(|e| uninstall_failed(id, Left::Disarmed, e))?;
+            .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
         runs.remove_all().map_err(|e| {
             uninstall_failed(
                 id,

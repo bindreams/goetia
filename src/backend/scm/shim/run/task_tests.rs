@@ -408,6 +408,10 @@ impl TaskApi for StopsDuring {
         unreachable!("task mode reads its own task only")
     }
 
+    fn set_enabled(&self, _: &TaskPath, _: bool) -> crate::error::Result<()> {
+        unreachable!("task mode reads its own task only")
+    }
+
     fn delete(&self, _: &TaskPath) -> crate::error::Result<bool> {
         unreachable!("task mode reads its own task only")
     }

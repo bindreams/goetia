@@ -149,7 +149,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             kind: DaemonKind::Service,
         },
-        Error::PasswordRequired { account: id() },
+        Error::PasswordRequired {
+            account: id(),
+            kind: DaemonKind::Service,
+        },
         Error::UnsupportedManager {
             client: VersionReading::Major(241),
             manager: VersionReading::Unreadable(String::new()),
@@ -705,15 +708,20 @@ fn loaded_job_words_the_task_case() {
 
 #[skuld::test]
 fn report_of_a_missing_password() {
-    assert_eq!(
-        Error::PasswordRequired {
-            account: "DOM\\bob".to_string()
-        }
-        .report()
-        .to_string(),
-        "service account `DOM\\bob` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
-         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again"
-    );
+    for (kind, noun) in [(DaemonKind::Service, "service"), (DaemonKind::Task, "task")] {
+        assert_eq!(
+            Error::PasswordRequired {
+                account: "DOM\\bob".to_string(),
+                kind,
+            }
+            .report()
+            .to_string(),
+            format!(
+                "{noun} account `DOM\\bob` needs a password (it is not LocalSystem/LocalService/NetworkService, nor \
+                 an `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again"
+            )
+        );
+    }
 }
 
 #[skuld::test]

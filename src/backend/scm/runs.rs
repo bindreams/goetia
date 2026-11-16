@@ -195,6 +195,12 @@ impl Runs {
         Ok(appeared)
     }
 
+    /// Whether the task's directory is there to remove. A directory that cannot be looked at is taken
+    /// to be (the removal then says why not).
+    pub(crate) fn is_present(&self) -> bool {
+        !matches!(self.dir.try_exists(), Ok(false))
+    }
+
     /// Removes the directory and everything in it, pins too: the task is uninstalled. A directory
     /// that is not there is already removed. Uninstalling stops the task first; a `run` that still
     /// waits then is the user's own concurrent action, and does not hold the removal up: the

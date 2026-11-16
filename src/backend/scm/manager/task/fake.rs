@@ -25,6 +25,7 @@ pub(crate) enum Call {
         password: Option<String>,
         update: bool,
     },
+    SetEnabled(String, bool),
     Delete(String),
     Instances(String),
     Info(String),
@@ -39,6 +40,7 @@ struct Script {
     get: VecDeque<Result<Option<Registered>>>,
     names: VecDeque<Result<Vec<String>>>,
     register: VecDeque<Result<Registration>>,
+    set_enabled: VecDeque<Result<()>>,
     delete: VecDeque<Result<bool>>,
     instances: VecDeque<Result<Vec<Instance>>>,
     info: VecDeque<Result<TaskInfo>>,
@@ -78,6 +80,7 @@ impl Fake {
             ("get", script.get.len()),
             ("names", script.names.len()),
             ("register", script.register.len()),
+            ("set_enabled", script.set_enabled.len()),
             ("delete", script.delete.len()),
             ("instances", script.instances.len()),
             ("info", script.info.len()),
@@ -100,6 +103,11 @@ impl Fake {
 
     pub(crate) fn on_register(&self, reply: Result<Registration>) -> &Self {
         lock(&self.0).register.push_back(reply);
+        self
+    }
+
+    pub(crate) fn on_set_enabled(&self, reply: Result<()>) -> &Self {
+        lock(&self.0).set_enabled.push_back(reply);
         self
     }
 
@@ -168,6 +176,12 @@ impl TaskApi for Fake {
             update,
         };
         self.answer(call, |s| &mut s.register)
+    }
+
+    fn set_enabled(&self, path: &TaskPath, enabled: bool) -> Result<()> {
+        self.answer(Call::SetEnabled(path.as_str().to_owned(), enabled), |s| {
+            &mut s.set_enabled
+        })
     }
 
     fn delete(&self, path: &TaskPath) -> Result<bool> {

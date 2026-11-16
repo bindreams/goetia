@@ -49,6 +49,32 @@ fn ole_dates_keep_their_order() {
     assert!(apart(later, earlier) >= Duration::from_secs(23 * 3600));
 }
 
+// A task is left with its own flag false only by an `uninstall` that did not finish, so a `Run` of one says so.
+#[skuld::test]
+fn a_run_refused_for_a_disabled_task_says_an_uninstall_did_not_finish() {
+    use windows::Win32::Foundation::{E_ACCESSDENIED, SCHED_E_TASK_DISABLED};
+
+    let disabled = Error::os("start `\\Goetia\\x`", windows::core::Error::from(SCHED_E_TASK_DISABLED));
+    let said = disabled_run(disabled, "x");
+
+    let text = said.to_string();
+    assert!(
+        text.contains("`x` is disabled") && text.contains("of it did not finish"),
+        "{text}"
+    );
+    assert!(
+        text.contains("goetia daemon uninstall x"),
+        "the remedy is named: {text}"
+    );
+    assert!(com_code(&said) == Some(SCHED_E_TASK_DISABLED), "the cause is kept");
+
+    let other = Error::os("start `\\Goetia\\x`", windows::core::Error::from(E_ACCESSDENIED));
+    assert!(
+        matches!(disabled_run(other, "x"), Error::Os { .. }),
+        "any other failure is as it was"
+    );
+}
+
 // The one failure of a `Stop` a caller takes as a stop: the run ended before it was asked to.
 #[skuld::test]
 fn only_task_schedulers_not_running_code_says_the_run_had_ended() {

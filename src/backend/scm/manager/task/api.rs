@@ -8,8 +8,9 @@
 
 use std::time::SystemTime;
 
-use windows::Win32::Foundation::{SCHED_E_TASK_NOT_RUNNING, SYSTEMTIME};
+use windows::Win32::Foundation::{SCHED_E_TASK_DISABLED, SCHED_E_TASK_NOT_RUNNING, SYSTEMTIME};
 use windows::Win32::System::Variant::VariantTimeToSystemTime;
+use windows::core::HRESULT;
 
 use super::clock::local_to_system;
 use crate::backend::scm::instance::{InstanceId, TaskAccount, TaskPath};
@@ -80,6 +81,13 @@ pub(crate) trait TaskApi: Send + Sync {
         update: bool,
     ) -> Result<Registration>;
 
+    /// Sets the task's own `Enabled` flag (`IRegisteredTask.Enabled`, `Settings/Enabled` in its XML), which
+    /// a registration is not: it needs no password, so it works for a password-logon task whose password
+    /// changed and whose account is gone. A task that is not enabled is started by nothing, a `Run`
+    /// included; the triggers' own flags, and a run that is alive, are as they were. A task that is not
+    /// there is [`Error::NotInstalled`].
+    fn set_enabled(&self, path: &TaskPath, enabled: bool) -> Result<()>;
+
     /// Deletes the task: whether it existed. Task Scheduler keeps the folder when its last task goes,
     /// so the call then asks to remove `\Goetia`, which Task Scheduler refuses while any task is in
     /// it: after the last task, and after a delete that found none, no folder is left empty.
@@ -106,14 +114,35 @@ pub(crate) trait TaskApi: Send + Sync {
 /// Whether `error`, from [`TaskApi::stop`], says the run had ended: the one failure of a `Stop` that a
 /// caller takes as a stop. Task Scheduler's own code is in the error's source chain.
 pub(crate) fn is_not_running(error: &Error) -> bool {
+    com_code(error) == Some(SCHED_E_TASK_NOT_RUNNING)
+}
+
+/// The code of the Task Scheduler (COM) failure in `error`'s source chain, if there is one.
+pub(crate) fn com_code(error: &Error) -> Option<HRESULT> {
     let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = next {
         if let Some(com) = error.downcast_ref::<windows::core::Error>() {
-            return com.code() == SCHED_E_TASK_NOT_RUNNING;
+            return Some(com.code());
         }
         next = error.source();
     }
-    false
+    None
+}
+
+/// `error`, from the start of the task `id`, worded for a task whose own flag is false (`Run` refuses
+/// one with `SCHED_E_TASK_DISABLED`): goetia leaves a task so only when an `uninstall` of it did not
+/// finish, and running that again finishes it. Any other failure is as it was.
+pub(crate) fn disabled_run(error: Error, id: &str) -> Error {
+    if com_code(&error) != Some(SCHED_E_TASK_DISABLED) {
+        return error;
+    }
+    Error::Step {
+        what: format!(
+            "`{id}` is disabled: an `uninstall` of it did not finish. Run `goetia daemon uninstall {id}` again to \
+             remove it"
+        ),
+        source: Box::new(error),
+    }
 }
 
 /// 1999-11-30 00:00 as an OLE date.

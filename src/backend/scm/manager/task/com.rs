@@ -22,7 +22,7 @@ use windows::Win32::System::TaskScheduler::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{BSTR, HRESULT, IUnknown};
 
-use super::api::{Instance, Registered, Registration, Started, TaskApi, TaskInfo, ole_date};
+use super::api::{Instance, Registered, Registration, Started, TaskApi, TaskInfo, disabled_run, ole_date};
 #[cfg(any(test, feature = "testing"))]
 use super::clock::{local_to_system, system_to_local};
 use crate::backend::scm::instance::{InstanceId, TASK_FOLDER, TaskAccount, TaskPath};
@@ -406,6 +406,16 @@ impl TaskApi for Com {
         self.register_at(path.as_str(), xml, who, password, update)
     }
 
+    fn set_enabled(&self, path: &TaskPath, enabled: bool) -> Result<()> {
+        let session = Session::open()?;
+        session
+            .with_task(path.as_str(), "set the enabled flag of", |task| {
+                // SAFETY: a call on a live interface.
+                unsafe { task.SetEnabled(enabled.into()) }
+            })?
+            .ok_or_else(|| not_installed(path))
+    }
+
     fn delete(&self, path: &TaskPath) -> Result<bool> {
         self.delete_at(path.as_str())
     }
@@ -448,7 +458,8 @@ impl TaskApi for Com {
                     let instance = task.Run(&VARIANT::default())?;
                     Ok((instance.InstanceGuid()?.to_string(), started_pid(instance.EnginePID())?))
                 }
-            })?
+            })
+            .map_err(|e| disabled_run(e, path.name()))?
             .ok_or_else(|| not_installed(path))?;
         Ok(Started {
             id: instance_id(&guid)?,

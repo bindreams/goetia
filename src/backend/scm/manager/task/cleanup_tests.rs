@@ -1,11 +1,8 @@
 //! What a test's guard removes, over the table-driven fake of Task Scheduler.
 
 use super::*;
-use crate::backend::scm::manager::task::api::{Registered, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
-use crate::backend::scm::test_support::{registered_task, task_spec, task_spec_as};
 use crate::error::Error;
-use crate::spec::User;
 
 fn id() -> Id {
     Id::try_from("nightly").unwrap()
@@ -13,64 +10,30 @@ fn id() -> Id {
 
 const PATH: &str = r"\Goetia\nightly";
 
-fn registered(armed: bool) -> Registered {
-    registered_task(&task_spec(Some("30 3 * * *")), armed)
-}
-
 /// A scheduled fire between the guard's stop and its delete would start a run the delete leaves behind,
-/// so an armed task is disarmed first.
+/// so the task is disabled first, which takes no password and so works for any account.
 #[skuld::test]
-fn an_armed_task_is_disarmed_before_it_is_deleted() {
+fn a_task_is_disabled_before_it_is_deleted() {
     let fake = Fake::new();
-    let armed = registered(true);
-    fake.on_get(Ok(Some(armed.clone())))
-        .on_register(Ok(Registration::Created))
-        .on_delete(Ok(true));
+    fake.on_set_enabled(Ok(())).on_delete(Ok(true));
 
-    remove_task_with(&fake, &id());
-
-    let calls = fake.calls();
-    assert_eq!(calls[0], Call::Get(PATH.to_owned()));
-    let Call::Register { xml, update, .. } = &calls[1] else {
-        panic!("the task is registered disarmed: {calls:?}");
-    };
-    assert!(*update && !TaskXml::armed(xml), "{xml}");
-    assert_eq!(calls[2], Call::Delete(PATH.to_owned()));
-    fake.finish();
-}
-
-#[skuld::test]
-fn a_task_that_is_not_armed_or_not_there_is_only_deleted() {
-    let fake = Fake::new();
-    fake.on_get(Ok(Some(registered(false))))
-        .on_delete(Ok(true))
-        .on_get(Ok(None))
-        .on_delete(Ok(false));
-
-    remove_task_with(&fake, &id());
     remove_task_with(&fake, &id());
 
     assert_eq!(
         fake.calls(),
-        [
-            Call::Get(PATH.to_owned()),
-            Call::Delete(PATH.to_owned()),
-            Call::Get(PATH.to_owned()),
-            Call::Delete(PATH.to_owned()),
-        ]
+        [Call::SetEnabled(PATH.to_owned(), false), Call::Delete(PATH.to_owned())]
     );
+    fake.finish();
 }
 
-/// Disarming is best effort: a cleanup that cannot disarm (a read that failed, a real user's task, which
-/// takes its password to be registered again) still deletes, and never panics.
+/// Disabling is best effort: a task that is not there, or that cannot be disabled, is still deleted, and
+/// nothing panics.
 #[skuld::test]
-fn a_disarm_that_cannot_be_made_does_not_stop_the_delete() {
+fn a_disable_that_cannot_be_made_does_not_stop_the_delete() {
     let fake = Fake::new();
-    let user = registered_task(&task_spec_as(User::Name("alice".into()), Some("30 3 * * *")), true);
-    fake.on_get(Err(Error::os("read the task", std::io::Error::other("denied"))))
-        .on_delete(Ok(true))
-        .on_get(Ok(Some(user)))
-        .on_register(Err(Error::os("register the task", std::io::Error::other("denied"))))
+    fake.on_set_enabled(Err(Error::NotInstalled { id: "nightly".into() }))
+        .on_delete(Ok(false))
+        .on_set_enabled(Err(Error::os("disable the task", std::io::Error::other("denied"))))
         .on_delete(Ok(true));
 
     remove_task_with(&fake, &id());

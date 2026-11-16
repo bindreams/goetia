@@ -148,7 +148,7 @@ use crate::error::{Chain, Error, Reason, Result, terminating_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
-use crate::spec::{AccountId, DaemonSpec, Id, Protocol, User};
+use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Protocol, User};
 
 // Scm =================================================================================================================
 
@@ -1133,6 +1133,14 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// start type the service has, rather than resetting it; see `service_info`. `written` is what
 /// [`written_user`] says of the account's spec value.
 fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
+    let password = service_gate(reg, written)?;
+    apply_gated(reg, password, create)
+}
+
+/// What a service of `reg` needs before it is written, which a change of a task into a service sees to
+/// before it removes the task: the account is a user and its right is granted, the password is read,
+/// and the event source is registered. Returns the password to register with. See [`apply`].
+fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Result<Option<String>> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -1165,6 +1173,7 @@ fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool
         let user = identity::require_user_account(account, written)?;
         let pw = identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
             account: account.to_string(),
+            kind: DaemonKind::Service,
         })?;
         identity::grant_logon_right(&user, identity::Right::Service)?;
         Some(pw)
@@ -1175,7 +1184,12 @@ fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool
     // Here rather than in the shim: it writes under HKLM, and the shim may run as an unprivileged
     // account.
     registry::register_event_source()?;
+    Ok(password)
+}
 
+/// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it
+/// returned.
+fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool) -> Result<()> {
     if create {
         let scm = open_scm(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
         let info = service_info(reg, password, None);
