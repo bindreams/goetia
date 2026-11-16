@@ -193,7 +193,8 @@ fn compiled_triggers_fire_exactly_when_the_cron_says() {
         "0 9-17 * * 1-5",
         "*/15 9-17 * * 1-5",
         "*/7 * * * *",
-        "0 0 1 * 1",
+        // Days of the month no month has, beside a weekday: the weekdays alone.
+        "0 0 30 2 1",
         "0 0 */2 * *",
         "0 0 29-31 * *",
         "0 0 * 6 1",
@@ -303,19 +304,15 @@ fn distinct_minute_sets_cost_one_trigger_each() {
 
 #[skuld::test]
 fn more_than_48_triggers_is_refused_naming_the_limit() {
-    // 25 minutes of the first half hour, no two of them half an hour apart and none a class of 60:
-    // 25 triggers for the days of the month and again for the Mondays.
-    let minutes = "0-4,6-10,12-16,18-22,24-28";
-    let text = format!("{minutes} * 1 * 1");
+    // A run of minutes, a shorter run and a lone minute, at six hours that are no progression: 48
+    // triggers, the cap, which is accepted. Another lone minute makes 52.
+    let at_cap = "0-29,31-35,37 0,1,3,7,9,10 * * *";
+    assert_eq!(triggers(at_cap).len(), TRIGGER_LIMIT);
+    let text = "0-29,31-35,37,40 0,1,3,7,9,10 * * *";
     assert_eq!(
-        refusal(&text),
-        format!("daemon `{ID}`: schedule `{text}` compiles to 50 Task Scheduler triggers, and a task holds at most 48")
+        refusal(text),
+        format!("daemon `{ID}`: schedule `{text}` compiles to 52 Task Scheduler triggers, and a task holds at most 48")
     );
-    // The days of the month alone are 25, under the cap.
-    assert_eq!(triggers(&format!("{minutes} * 1 * *")).len(), 25);
-    // The cap itself is accepted: a repetition of the first half hour in each of the 24 hours, for the
-    // days of the month and again for the Mondays.
-    assert_eq!(triggers("0-29 * 1 * 1").len(), TRIGGER_LIMIT);
 }
 
 #[skuld::test]
@@ -328,6 +325,44 @@ fn an_and_of_two_restricted_day_fields_is_refused() {
              cannot hold `{text}`: one of its day fields starts with `*` (both must match) while both day fields \
              are restricted; use `*` for one of the two"
         )
+    );
+}
+
+#[skuld::test]
+fn an_either_or_of_two_restricted_day_fields_is_refused_naming_the_limit() {
+    // A date both name would start the task from two triggers at one instant, which `IgnoreNew` has
+    // been measured not to make one run.
+    for text in [
+        "0 0 1 * 1",
+        "30 3 1,15 * 1-5",
+        "0 0 29-31 * 0",
+        "0 0 1 3-5 1",
+        "*/15 9-17 13 * 5",
+    ] {
+        assert_eq!(
+            refusal(text),
+            format!(
+                "daemon `{ID}`: schedule `{text}` matches a day of the month or a day of the week, and on a date \
+                 both name Task Scheduler would start the task from two triggers at one instant, which `IgnoreNew` \
+                 does not reliably make one run; a task cannot hold a schedule whose day fields are both restricted: \
+                 use `*` for one of the two"
+            ),
+            "{text}"
+        );
+    }
+    // Either field alone, and either with the other full, compile.
+    assert_eq!(triggers("0 0 1 * *").len(), 1);
+    assert_eq!(triggers("0 0 * * 1").len(), 1);
+    // Days no month of the month set has never fire: the weekdays are all the schedule, and there is
+    // no second trigger to coincide with.
+    assert_eq!(
+        triggers("0 0 30 2 1"),
+        [Trigger::MonthlyWeekdays {
+            weekdays: set([1]),
+            months: set([2]),
+            at: (0, 0),
+            repeat: None
+        }]
     );
 }
 
@@ -407,23 +442,6 @@ fn the_day_forms() {
             at: (3, 0),
             repeat: None
         }]
-    );
-    // The OR of the two day fields is both, days of the month first.
-    assert_eq!(
-        triggers("0 0 1 * 1"),
-        [
-            Trigger::MonthlyDays {
-                days: set([1]),
-                months: months.clone(),
-                at: (0, 0),
-                repeat: None
-            },
-            Trigger::Weekly {
-                weekdays: set([1]),
-                at: (0, 0),
-                repeat: None
-            }
-        ]
     );
     // Some months, every day: the days of the month, not a daily trigger.
     assert_eq!(

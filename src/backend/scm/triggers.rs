@@ -10,9 +10,14 @@
 //!
 //! # Either-or days
 //!
-//! A restricted day of the month OR a restricted weekday is two sets of triggers, one for each,
-//! and a date both name has two triggers on the same minute (there is no AND-NOT). Whether
-//! `IgnoreNew` keeps that to one run is measured in Task 4 Step 0 (link to come).
+//! A restricted day of the month OR a restricted weekday would be two sets of triggers, one for
+//! each, and a date both name would have two triggers on the same minute (there is no AND-NOT).
+//! `IgnoreNew` does not keep that to one run: measured, with 450 such tasks due in three minutes,
+//! one started twice, the second trigger finding the first instance already over (the knowledge
+//! base's "Two triggers at the same instant under IgnoreNew started a task twice in one of 450
+//! SYSTEM samples and in none of 450 password-user samples"). So such a schedule is refused, naming
+//! the limit. One whose days of the month no month of its month set has (`0 0 30 2 1`) is only its
+//! weekdays, and compiles.
 //!
 //! # The time of day
 //!
@@ -30,6 +35,7 @@
 //! `*/7 * * * *` is not one repetition: it costs a trigger per minute it names.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 
 use crate::backend::refuse_day_fields_and;
 use crate::error::Error;
@@ -78,49 +84,104 @@ pub(crate) enum Trigger {
     Never,
 }
 
+/// One line, for a definition's text: the days, the time, the repetition.
+impl fmt::Display for Trigger {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn list(values: &BTreeSet<u8>) -> String {
+            values.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
+        }
+        let (at, repeat) = match self {
+            Trigger::Daily { every_days, at, repeat } => {
+                write!(out, "daily every {every_days} day(s)")?;
+                (at, repeat)
+            }
+            Trigger::Weekly { weekdays, at, repeat } => {
+                write!(out, "weekly on weekdays {}", list(weekdays))?;
+                (at, repeat)
+            }
+            Trigger::MonthlyDays {
+                days,
+                months,
+                at,
+                repeat,
+            } => {
+                write!(out, "monthly on days {} of months {}", list(days), list(months))?;
+                (at, repeat)
+            }
+            Trigger::MonthlyWeekdays {
+                weekdays,
+                months,
+                at,
+                repeat,
+            } => {
+                write!(out, "monthly on weekdays {} of months {}", list(weekdays), list(months))?;
+                (at, repeat)
+            }
+            Trigger::Never => return write!(out, "never"),
+        };
+        write!(out, " at {:02}:{:02}", at.0, at.1)?;
+        match repeat {
+            Some(Repeat {
+                every_minutes,
+                for_minutes,
+            }) => write!(out, " repeating every {every_minutes} min for {for_minutes} min"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The triggers that fire exactly when `schedule` does, with the fewest this compilation finds. A
 /// schedule that never fires (no month of its month set has any of its days) is `[Trigger::Never]`:
 /// the result is never empty.
 ///
 /// Refused with [`Error::Invalid`] for `id`: a day of the month and a day of the week that must both
-/// match, with neither full (Task Scheduler's day forms are either-or), and a schedule that needs
-/// more than [`TRIGGER_LIMIT`] triggers, saying how many.
+/// match, with neither full (Task Scheduler's day forms are either-or); a day of the month and a day
+/// of the week of which either may match, when some month has the day (a date both name would start
+/// the task from two triggers at one instant: see the module doc); and a schedule that needs more
+/// than [`TRIGGER_LIMIT`] triggers, saying how many.
 pub(crate) fn compile(schedule: &Schedule, id: &Id) -> Result<Vec<Trigger>, Error> {
     let [minutes, hours, days, months, weekdays] = schedule.fields();
     let dates = match schedule.days() {
-        DaySelection::Every => vec![Dates::Every],
-        DaySelection::OfMonth => vec![Dates::Days(&days.values)],
-        DaySelection::OfWeek => vec![Dates::Weekdays(&weekdays.values)],
-        DaySelection::Either => vec![Dates::Days(&days.values), Dates::Weekdays(&weekdays.values)],
+        DaySelection::Every => Dates::Every,
+        DaySelection::OfMonth => Dates::Days(&days.values),
+        DaySelection::OfWeek => Dates::Weekdays(&weekdays.values),
+        // Days no month has never fire, so the weekdays alone are the schedule.
+        DaySelection::Either if !some_month_has(&days.values, &months.values) => Dates::Weekdays(&weekdays.values),
+        DaySelection::Either => return Err(refuse_either_day_fields(id, schedule.text())),
         DaySelection::Both => return Err(refuse_day_fields_and(id, "Task Scheduler", schedule.text())),
     };
     // Task Scheduler refuses days no month has at registration, so such days are no trigger at all.
-    let dates: Vec<Dates> = dates
-        .into_iter()
-        .filter(|dates| match dates {
-            Dates::Days(days) => some_month_has(days, &months.values),
-            Dates::Every | Dates::Weekdays(_) => true,
-        })
-        .collect();
-    if dates.is_empty() {
+    if let Dates::Days(days) = &dates
+        && !some_month_has(days, &months.values)
+    {
         return Ok(vec![Trigger::Never]);
     }
 
     let times = times(&hours.values, &minutes.values);
-    let count = dates.len() * times.len();
-    if count > TRIGGER_LIMIT {
+    if times.len() > TRIGGER_LIMIT {
         return Err(invalid(
             id,
             &format!(
-                "schedule `{}` compiles to {count} Task Scheduler triggers, and a task holds at most {TRIGGER_LIMIT}",
-                schedule.text()
+                "schedule `{}` compiles to {} Task Scheduler triggers, and a task holds at most {TRIGGER_LIMIT}",
+                schedule.text(),
+                times.len()
             ),
         ));
     }
-    Ok(dates
-        .iter()
-        .flat_map(|dates| times.iter().map(|time| dates.trigger(&months.values, time)))
-        .collect())
+    Ok(times.iter().map(|time| dates.trigger(&months.values, time)).collect())
+}
+
+/// The refusal of a schedule whose either-or day fields would give two triggers on one date.
+fn refuse_either_day_fields(id: &Id, text: &str) -> Error {
+    invalid(
+        id,
+        &format!(
+            "schedule `{text}` matches a day of the month or a day of the week, and on a date both name Task \
+             Scheduler would start the task from two triggers at one instant, which `IgnoreNew` does not reliably \
+             make one run; a task cannot hold a schedule whose day fields are both restricted: use `*` for one of \
+             the two"
+        ),
+    )
 }
 
 // The days ============================================================================================================
