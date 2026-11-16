@@ -1975,31 +1975,152 @@ fn unelevated_list_works(#[fixture(systemd_group)] _group: &Group) {
 
 // Parent directories ==================================================================================================
 
-#[skuld::test]
-fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user(#[fixture(systemd_group)] _group: &Group) {
-    let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = std::env::temp_dir().join(format!("{}-parent-dirs", guard.id()));
-    let cwd = base.join("work");
-    let logs = base.join("logs").join("out.log");
-    let _rm = DirGuard::new(base.clone());
+/// A directory of one test's own under a root goetia makes directories in (`/var/lib`, `/var/log`),
+/// which the test makes and removes: the tests of a missing directory cannot use `/tmp`, where goetia
+/// makes none.
+fn under_root(root: &str, id: &str, what: &str) -> PathBuf {
+    PathBuf::from(root).join(format!("{id}-{what}"))
+}
 
-    let mut spec = service_fields(mk(guard.id()));
+fn nobody_spec(id: &str, cwd: Option<&Path>, logs: Option<&Path>) -> DaemonSpec {
+    let mut spec = service_fields(mk(id));
     spec.common.user = User::Name("nobody".to_string());
-    spec.common.cwd = Some(cwd.clone());
-    spec.common.logs = Some(logs.clone());
-    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+    spec.common.cwd = cwd.map(Path::to_path_buf);
+    spec.common.logs = logs.map(Path::to_path_buf);
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
+}
+
+/// What a refused directory says, and that no unit was written.
+fn refused_directory(err: &goetia::Error, id: &str) -> String {
+    let goetia::Error::DirectoryRefused { why, .. } = err else {
+        panic!("expected a refused directory, got {err:?}");
+    };
+    assert!(!unit_path(id).exists(), "a refused install writes no unit");
+    why.clone()
+}
+
+/// The directories an install makes for a daemon that runs as `nobody`: `cwd` is handed to it, and the
+/// log directory stays root's (systemd opens the log as root, and an account that could write the
+/// directory could make root append anywhere). The daemon starts: it enters its `cwd` and its log is
+/// opened.
+#[skuld::test]
+fn install_makes_cwd_for_the_account_and_a_log_directory_root_keeps(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let state = under_root("/var/lib", &id, "state");
+    let logs = under_root("/var/lib", &id, "logs");
+    let _rm_state = DirGuard::new(state.clone());
+    let _rm_logs = DirGuard::new(logs.clone());
+    let guard = ServiceGuard::new(&id);
+    let spec = nobody_spec(guard.id(), Some(&state.join("work")), Some(&logs.join("out.log")));
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let nobody_uid = uid_of("nobody");
-    for dir in [cwd.as_path(), logs.parent().unwrap()] {
+    let nobody_gid: u32 = cmd::run("id", &["-g", "nobody"])
+        .expect_ok()
+        .stdout
+        .trim()
+        .parse()
+        .expect("nobody's gid");
+    let seen = |dir: &Path| {
         let meta = fs::metadata(dir).unwrap_or_else(|e| panic!("stat {}: {e}", dir.display()));
-        assert!(meta.is_dir(), "{} must exist and be a directory", dir.display());
-        assert_eq!(meta.permissions().mode() & 0o777, 0o755, "{}: mode", dir.display());
-        assert_eq!(meta.uid(), nobody_uid, "{}: owner", dir.display());
-    }
+        assert!(meta.is_dir(), "{}", dir.display());
+        (meta.permissions().mode() & 0o777, meta.uid(), meta.gid())
+    };
+    assert_eq!(
+        seen(&state.join("work")),
+        (0o755, uid_of("nobody"), nobody_gid),
+        "the cwd is the account's"
+    );
+    assert_eq!(seen(&state).1, 0, "what is above the cwd stays root's");
+    let log_dir = seen(&logs);
+    assert_eq!((log_dir.0, log_dir.1), (0o755, 0), "the log directory stays root's");
+
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    assert!(logs.join("out.log").is_file(), "systemd opened the log");
+}
+
+#[skuld::test]
+fn install_refuses_a_missing_directory_outside_the_roots_and_makes_nothing(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = std::env::temp_dir().join(format!("{id}-outside"));
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    let spec = nobody_spec(guard.id(), Some(&base.join("work")), None);
+
+    let err = Systemd::new().install(&spec, false).expect_err("outside every root");
+
+    let why = refused_directory(&err, guard.id());
+    assert!(why.contains("create it first") && why.contains("/var/lib"), "{why}");
+    assert!(!base.exists(), "nothing was made outside the roots");
+}
+
+/// A log directory an account other than root can write is refused, existing or made, and the refusal
+/// names the writer; the same directory with the write bit gone is accepted.
+#[skuld::test]
+fn install_refuses_a_log_directory_an_account_can_write(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let dir = under_root("/var/lib", &id, "writable");
+    let _rm = DirGuard::new(dir.clone());
+    let guard = ServiceGuard::new(&id);
+    fs::create_dir(&dir).expect("make the directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).expect("chmod 0775");
+    let spec = nobody_spec(guard.id(), None, Some(&dir.join("out.log")));
+    let mgr = Systemd::new();
+
+    let err = mgr.install(&spec, false).expect_err("a group can write the directory");
+    let why = refused_directory(&err, guard.id());
+    assert!(why.contains("group") && why.contains(dir.to_str().unwrap()), "{why}");
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    mgr.install(&spec, false).expect("only root can write it now");
+}
+
+/// The log under the `cwd` handed to the account is the account's to retarget: refused, and what the
+/// install made for it is gone.
+#[skuld::test]
+fn install_refuses_a_log_under_the_cwd_it_hands_to_the_account(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "nested");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    let cwd = base.join("work");
+    let spec = nobody_spec(guard.id(), Some(&cwd), Some(&cwd.join("out.log")));
+
+    let err = Systemd::new()
+        .install(&spec, false)
+        .expect_err("the account owns the log directory");
+
+    let why = refused_directory(&err, guard.id());
+    assert!(why.contains("nobody"), "{why}");
+    assert!(!base.exists(), "the failed install removed what it made");
+}
+
+/// root's open of the log follows a link at its name: an existing one is refused, and the refusal comes
+/// before any directory is made, so the `cwd` the install would have made is not there.
+#[skuld::test]
+fn install_refuses_a_log_that_is_a_symlink_and_makes_nothing(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "linked");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let log = base.join("out.log");
+    std::os::unix::fs::symlink(base.join("target"), &log).expect("plant the link");
+    let cwd = base.join("work");
+    let spec = nobody_spec(guard.id(), Some(&cwd), Some(&log));
+
+    let err = Systemd::new().install(&spec, false).expect_err("the log is a symlink");
+
+    let why = refused_directory(&err, guard.id());
+    assert!(why.contains("symlink"), "{why}");
+    assert!(!cwd.exists(), "the cwd was made before the log was judged");
 }
 
 #[skuld::test]
@@ -2015,11 +2136,7 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write(#[fixture(sy
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     }
 
-    let mut spec = service_fields(mk(guard.id()));
-    spec.common.user = User::Name("nobody".to_string());
-    spec.common.cwd = Some(cwd.clone());
-    spec.common.logs = Some(log_dir.join("out.log"));
-    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+    let spec = nobody_spec(guard.id(), Some(&cwd), Some(&log_dir.join("out.log")));
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -2036,23 +2153,21 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write(#[fixture(sy
     }
 }
 
-/// The mixed case `ensure_dir`'s own doc comment is about: an ancestor that already exists
-/// must never be touched, even when a deeper, freshly-created component under it is.
+/// An ancestor that already exists is never touched, even when a deeper, freshly made component under
+/// it is handed to the account.
 #[skuld::test]
 fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = std::env::temp_dir().join(format!("{}-ancestor", guard.id()));
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "ancestor");
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
     fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
     let base_meta_before = fs::metadata(&base).expect("stat base before");
 
     let cwd = base.join("work");
-    let mut spec = service_fields(mk(guard.id()));
-    spec.common.user = User::Name("nobody".to_string());
-    spec.common.cwd = Some(cwd.clone());
-    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+    let spec = nobody_spec(guard.id(), Some(&cwd), None);
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -2074,8 +2189,154 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_g
     assert_eq!(
         cwd_meta.uid(),
         uid_of("nobody"),
-        "the newly-created leaf must be chowned"
+        "the newly-made leaf must be handed over"
     );
+}
+
+/// A spec whose `logs` parent is `logs_parent` and whose `cwd` lies under a regular file, so the
+/// install fails on the latter while judging it, before it makes what is missing of the former.
+fn spec_failing_on_cwd_after_logs_parent(id: &str, base: &Path, logs_parent: &Path) -> DaemonSpec {
+    let file = base.join("file");
+    fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+    let mut spec = service_fields(mk(id));
+    spec.common.logs = Some(logs_parent.join("out.log"));
+    spec.common.cwd = Some(file.join("work"));
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
+}
+
+#[skuld::test]
+fn an_install_refused_on_its_cwd_makes_none_of_the_directories_it_would_have_made(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "undo-made");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    let made = base.join("a").join("b");
+    let spec = spec_failing_on_cwd_after_logs_parent(guard.id(), &base, &made);
+
+    let err = Systemd::new()
+        .install(&spec, false)
+        .expect_err("the cwd is under a file");
+    support::assert_failed_on_a_path_under_a_file(&err);
+
+    assert!(!base.join("a").exists(), "the refused install made {}", made.display());
+    assert!(base.is_dir(), "a directory that existed before must stay");
+}
+
+#[skuld::test]
+fn an_install_refused_on_its_cwd_makes_no_new_directory_in_one_that_existed_before(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "undo-preexisting");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    let existing = base.join("logs");
+    fs::create_dir_all(&existing).unwrap_or_else(|e| panic!("mkdir {}: {e}", existing.display()));
+    let made = existing.join("new");
+    let spec = spec_failing_on_cwd_after_logs_parent(guard.id(), &base, &made);
+
+    let err = Systemd::new()
+        .install(&spec, false)
+        .expect_err("the cwd is under a file");
+    support::assert_failed_on_a_path_under_a_file(&err);
+
+    assert!(!made.exists(), "the refused install made {}", made.display());
+    assert!(existing.is_dir(), "a directory that existed before must stay");
+}
+
+/// Makes a file immutable, so the drop-in clearing that follows an update's write cannot remove it.
+struct Immutable(PathBuf);
+
+impl Immutable {
+    fn new(path: PathBuf) -> Self {
+        // No failure after the unit is written works without this in a container, short of a mount,
+        // which the lane keeps out of the container's own namespace.
+        let run = cmd::run("chattr", &["+i", path.to_str().unwrap()]);
+        assert!(
+            run.ok(),
+            "this test needs `chattr +i` on {}: the file system must support immutable files\n{run}",
+            support::SYSTEMD_UNIT_DIR
+        );
+        Self(path)
+    }
+}
+
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        warn_left_behind(cmd::run_cleanup("chattr", &[&["-i", self.0.to_str().unwrap()]], &[]));
+    }
+}
+
+/// The unit is replaced, then clearing its drop-in fails: the install fails with the new unit in
+/// place, so the directories it made for that unit stay.
+#[skuld::test]
+fn an_install_that_fails_after_writing_the_unit_keeps_its_directories(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "late-failure");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    write_dropin(guard.id());
+    // Declared after the guard, so it drops first: the guard's cleanup needs the drop-in removable.
+    let _immutable = Immutable::new(dropin_dir(guard.id()).join("override.conf"));
+    let cwd = base.join("work");
+    let mut spec = service_fields(mk(guard.id()));
+    spec.common.cwd = Some(cwd.clone());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+
+    mgr.install(&spec, true).expect_err("the drop-in cannot be cleared");
+
+    assert!(
+        fs::read_to_string(unit_path(guard.id()))
+            .expect("read the unit")
+            .contains(cwd.to_str().unwrap()),
+        "the update was not written"
+    );
+    assert!(cwd.is_dir(), "the directories of an installed unit must stay");
+}
+
+/// The unit cannot be replaced, after the directories for the new `cwd` and `logs` were made and `cwd`
+/// handed to the account: none of them is left, and one that existed before stays. This is the case the
+/// undo is for: the write fails with the old unit standing, which names none of the new directories.
+#[skuld::test]
+fn an_install_whose_unit_write_fails_removes_every_directory_it_made(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "write-fails");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    let old = fs::read_to_string(unit_path(guard.id())).expect("read the unit");
+    // Declared after the guard, so it drops first: the guard's cleanup needs the unit removable.
+    let _immutable = Immutable::new(unit_path(guard.id()));
+    let cwd = base.join("a").join("work");
+    let logs = base.join("b").join("c").join("out.log");
+    let spec = nobody_spec(guard.id(), Some(&cwd), Some(&logs));
+
+    let err = mgr.install(&spec, true).expect_err("the unit cannot be replaced");
+
+    assert!(
+        err.to_string().contains("quarantine"),
+        "the install must fail on the unit, not earlier: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(unit_path(guard.id())).expect("read the unit"),
+        old,
+        "the write must not have happened"
+    );
+    for made in [base.join("a"), base.join("b")] {
+        assert!(!made.exists(), "the failed install left {}", made.display());
+    }
+    assert!(base.is_dir(), "a directory that existed before must stay");
 }
 
 // Backslashes =========================================================================================================
@@ -2085,8 +2346,9 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_g
 #[skuld::test]
 fn values_ending_in_backslashes_read_back_from_systemd_exactly(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    // Creation order: see the module doc of `support::service_guard`.
-    let base = std::env::temp_dir().join(format!("{id}-backslashes"));
+    // Creation order: see the module doc of `support::service_guard`. Under a root, since goetia makes
+    // the directories and makes none elsewhere.
+    let base = under_root("/var/lib", &id, "backslashes");
     let _rm = DirGuard::new(base.clone());
     let guard = ServiceGuard::new(&id);
     let cwd = PathBuf::from(format!("{}/work\\", base.display()));

@@ -25,7 +25,7 @@ pub use crate::backend::launchd::next::system_zone;
 
 /// Runs every skuld test in the calling binary and exits; the `main` of every skuld test binary.
 /// Exits with an error first if a `GOETIA_TEST_<GROUP>` or `GOETIA_TEST_<GROUP>_CONSENT` variable, or
-/// `GOETIA_TEST_DEBUG_PRIVILEGE`, is invalid.
+/// `GOETIA_TEST_DEBUG_PRIVILEGE` or `GOETIA_TEST_ROOT_DIRS`, is invalid.
 ///
 /// A test is named `module::fn` (a crate-root test keeps its bare name), so two modules may each hold
 /// a `fn x`; under skuld's default bare names the binary panics at startup on the second.

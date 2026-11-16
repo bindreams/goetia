@@ -11,7 +11,9 @@ mod report;
 mod within;
 
 #[cfg(feature = "cli")]
-pub(crate) use escape::{EscapedStream, escape};
+pub(crate) use escape::EscapedStream;
+#[cfg(any(feature = "cli", unix))]
+pub(crate) use escape::escape;
 pub use reason::Reason;
 pub(crate) use report::Chain;
 #[cfg(feature = "cli")]
@@ -218,6 +220,11 @@ pub enum Error {
         path.display()
     )]
     NotADirectory { path: PathBuf },
+
+    /// A directory that is a daemon's `cwd`, the directory of its log, or one of their ancestors is
+    /// refused: `why` says what is wrong with it and what to do. No OS call failed.
+    #[error("refusing {} for a daemon's cwd or log directory: {why}", path.display())]
+    DirectoryRefused { path: PathBuf, why: String },
 
     /// A folder the shim would be written to, one of its ancestors, or the host file itself can be
     /// modified by an account goetia does not trust, so that account could replace the shim, which
@@ -739,6 +746,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::DirectoryRefused { .. }
             | Error::ShimFolderUnsafe { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
@@ -926,6 +934,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::DirectoryRefused { .. }
             | Error::ShimFolderUnsafe { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }

@@ -14,11 +14,17 @@ use super::super::{
 };
 use super::*;
 use crate::backend::InstalledService as _;
+use crate::backend::Settle as _;
+use crate::backend::account::Account;
 use crate::backend::bounded;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
+use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::Step;
-use crate::spec::{TaskSpec, User};
+use crate::spec::{ServiceSpec, TaskSpec, User};
+use crate::testing::elevation::ELEVATED;
+use crate::testing::groups::root_dirs;
+use crate::testing::service_fields;
 use crate::testing::task;
 
 // Fixtures ============================================================================================================
@@ -105,7 +111,10 @@ fn create(tree: &Tree, fake: &Fake, spec: &DaemonSpec) -> Result<WriteOutcome> {
         &desired,
         &Outcome::Create,
         None,
-        &mut reserved(&mgr, Step::Install),
+        Scope {
+            created: &mut CreatedDirs::default(),
+            reservation: &mut reserved(&mgr, Step::Install),
+        },
     )
 }
 
@@ -115,6 +124,17 @@ fn rewrite(tree: &Tree, fake: &Fake, spec: &DaemonSpec) -> Result<WriteOutcome> 
 }
 
 fn rewrite_drawing(tree: &Tree, fake: &Fake, spec: &DaemonSpec, reservation: &mut Reservation) -> Result<WriteOutcome> {
+    rewrite_making(tree, fake, spec, reservation, &mut CreatedDirs::default())
+}
+
+/// [`rewrite_drawing`], making the directories the spec names in `created`.
+fn rewrite_making(
+    tree: &Tree,
+    fake: &Fake,
+    spec: &DaemonSpec,
+    reservation: &mut Reservation,
+    created: &mut CreatedDirs,
+) -> Result<WriteOutcome> {
     let mgr = manager(fake);
     let snapshot = marked(tree.read());
     let desired = mgr.render(spec)?;
@@ -126,7 +146,7 @@ fn rewrite_drawing(tree: &Tree, fake: &Fake, spec: &DaemonSpec, reservation: &mu
             spec_diff: String::new(),
         },
         Some(&snapshot),
-        reservation,
+        Scope { created, reservation },
     )
 }
 
@@ -566,10 +586,15 @@ fn a_later_error_after_a_stray_timer_label_went_out_is_bare() {
 }
 
 /// An update that changes nothing still makes the directories the spec names, as it always did.
-#[skuld::test]
-fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
+#[skuld::test(labels = [ELEVATED])]
+fn an_update_with_nothing_to_change_still_makes_the_specs_directories(#[fixture(root_dirs)] _root: &()) {
     let tree = Tree::new();
-    let cwd = tree.dir(false).join("kept-cwd");
+    // Under `/tmp`, which root owns on every host: directories are made only where root's own are.
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("kept-cwd");
     let user = nix::unistd::User::from_uid(nix::unistd::getuid())
         .unwrap()
         .expect("the current user has an account")
@@ -586,10 +611,187 @@ fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
     tree.put(false, &timer_name(), rendered.timer.as_deref().unwrap());
     let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
 
-    rewrite(&tree, &fake, &spec).expect("an update with nothing to change");
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+    rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect("an update with nothing to change");
 
     fake.assert_spent("only the two reads");
     assert!(cwd.is_dir(), "the directory the spec names was made");
+}
+
+/// `spec` run as `user` in `cwd`.
+fn in_cwd(spec: DaemonSpec, cwd: &Path, user: User) -> DaemonSpec {
+    let DaemonSpec::Task(task) = spec else {
+        unreachable!("`task_spec` builds a task");
+    };
+    let mut fields = task.into_fields();
+    fields.common.cwd = Some(cwd.to_path_buf());
+    fields.common.user = user;
+    DaemonSpec::from(TaskSpec::new(fields).unwrap())
+}
+
+/// Every refusal about the spec's directories comes before the first action: an update whose `cwd` is
+/// refused (it does not exist and is under no root) sends launchd nothing, so the timer it would have
+/// booted out is still loaded.
+#[skuld::test]
+fn an_update_whose_directories_are_refused_sends_launchd_nothing() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new([]);
+    let spec = in_cwd(
+        task_spec(Some(SCHEDULE)),
+        Path::new("/goetia-no-such-root/cwd"),
+        User::Root,
+    );
+
+    let e = rewrite(&tree, &fake, &spec).expect_err("the cwd is made under no root");
+
+    assert!(matches!(e, Error::DirectoryRefused { .. }), "{e:?}");
+    fake.assert_spent("a refused update sends nothing");
+    assert_eq!(text_at(&tree, true, ID), old.job);
+    assert_eq!(text_at(&tree, true, &timer_name()), old.timer.unwrap());
+}
+
+/// What `plan_parent_dirs` makes of a service that logs to `logs` and runs as `uid`, with `system` as its
+/// one root. No account is looked up: the plan is given it.
+fn planned_for(uid: u32, logs: &Path, system: PathBuf) -> Result<()> {
+    let mut fields = service_fields(service_spec());
+    fields.common.logs = Some(logs.to_path_buf());
+    let spec = DaemonSpec::from(ServiceSpec::new(fields).unwrap());
+    let account = Account {
+        name: if uid == 0 { "root" } else { "daemon" }.to_string(),
+        uid: nix::unistd::Uid::from_raw(uid),
+        gid: nix::unistd::Gid::from_raw(uid),
+    };
+    plan_parent_dirs(&spec, &account, &CreatedDirs::under(vec![system])).map(|_| ())
+}
+
+/// launchd opens `StandardOutPath` as the job's user, which for a job that runs as root is root: it
+/// follows a symlink there, as systemd's `append:` does, so a log directory an account can write is
+/// refused for such a job, with every refusal about the directories before anything is made.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_directory_an_account_can_write_is_refused_for_a_job_that_runs_as_root(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("logs");
+    std::fs::create_dir(&dir).unwrap();
+    give_to_a_stranger(&dir);
+
+    let e = planned_for(0, &dir.join("out.log"), layout.system()).expect_err("an account can write the directory");
+
+    let Error::DirectoryRefused { why, .. } = &e else {
+        panic!("expected a refused directory, got {e:?}");
+    };
+    assert!(why.contains(dir.to_str().unwrap()) && why.contains("launchd"), "{why}");
+}
+
+/// A job that runs as another user has its log opened as that user: what the user can do with the
+/// directory it can do through its own open, so nothing is refused.
+#[skuld::test(labels = [ELEVATED])]
+fn the_same_log_directory_is_accepted_for_a_job_that_runs_as_another_user(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("logs");
+    std::fs::create_dir(&dir).unwrap();
+    give_to_a_stranger(&dir);
+
+    planned_for(1, &dir.join("out.log"), layout.system()).expect("launchd opens the log as the job's user");
+}
+
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_directory_only_root_can_change_is_accepted_for_a_job_that_runs_as_root(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("logs");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(layout.system(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    planned_for(0, &dir.join("out.log"), layout.system()).expect("only root can change it");
+}
+
+/// uid 0 is handed nothing: a directory made for a task that runs as root keeps the group it was made
+/// with (a new directory takes its parent's), where `chown(0, 0)` would make it wheel's.
+#[skuld::test(labels = [ELEVATED])]
+fn the_cwd_of_a_task_that_runs_as_root_keeps_the_group_it_was_made_with(#[fixture(root_dirs)] _root: &()) {
+    let tree = Tree::new();
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    // A group other than wheel, which the directories made below take from it.
+    let group = nix::unistd::Gid::from_raw(1);
+    nix::unistd::chown(root.path(), None, Some(group)).expect("give the directory to a group");
+    let control = root.path().join("control");
+    std::fs::create_dir(&control).unwrap();
+    let gid = |path: &Path| std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(path).unwrap());
+    assert_eq!(
+        gid(&control),
+        group.as_raw(),
+        "a directory takes its parent's group here"
+    );
+    let cwd = root.path().join("root-cwd");
+    let spec = in_cwd(task_spec(Some(SCHEDULE)), &cwd, User::Root);
+    let rendered = manager(&Fake::new([])).render(&spec).unwrap();
+    tree.put(false, ID, &rendered.job);
+    tree.put(false, &timer_name(), rendered.timer.as_deref().unwrap());
+    let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+
+    rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect("an update with nothing to change");
+
+    assert_eq!(gid(&cwd), group.as_raw(), "nothing was handed over");
+}
+
+/// The directory a task's account is to own is the account's by the time the write that can load the
+/// definition starts: a job that runs then finds its `cwd` in its final state. One a failed install
+/// made is taken back while it is still empty.
+#[skuld::test(labels = [ELEVATED])]
+fn the_cwd_is_the_accounts_before_the_definition_can_run(#[fixture(root_dirs)] _root: &()) {
+    let tree = Tree::new();
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("handed-cwd");
+    // `daemon` is uid 1, an account every macOS host has that is not root.
+    let DaemonSpec::Task(task) = task_spec(Some(SCHEDULE)) else {
+        unreachable!("`task_spec` builds a task");
+    };
+    let mut fields = task.into_fields();
+    fields.common.cwd = Some(cwd.clone());
+    fields.common.user = User::Name("daemon".to_string());
+    let spec = DaemonSpec::from(TaskSpec::new(fields).unwrap());
+    let rendered = manager(&Fake::new([])).render(&spec).unwrap();
+    tree.put(false, ID, &rendered.job);
+    tree.put(false, &timer_name(), rendered.timer.as_deref().unwrap());
+    let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+
+    rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect("an update with nothing to change");
+    let owner = |path: &std::path::Path| std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(path).unwrap());
+    assert_eq!(owner(&cwd), 1, "the account's when the directories are made");
+
+    created.settle(|| crate::backend::Standing::No);
+    drop(created);
+    assert!(!cwd.exists(), "taken back with the definition that never stood");
 }
 
 /// A timer label launchd holds with no plist of ours (removed by hand, or a stranger's) is booted out
@@ -724,12 +926,18 @@ fn a_print_that_failed_is_worded_as_a_failed_read() {
     assert_eq!(text_at(&tree, false, ID), old.job);
 }
 
-/// A refused update has created none of the new spec's directories.
-#[skuld::test]
-fn a_refused_update_creates_none_of_the_specs_directories() {
+/// A refused update leaves none of the new spec's directories: the `cwd` is one the install could
+/// make, so the refusal for a run in flight takes it back with the install.
+#[skuld::test(labels = [ELEVATED])]
+fn a_refused_update_leaves_none_of_the_specs_directories(#[fixture(root_dirs)] _root: &()) {
     let tree = Tree::new();
     installed(&tree, &task_spec(Some(SCHEDULE)), false);
-    let cwd = tree.dir(false).join("new-cwd");
+    // Under `/tmp`, which root owns on every host: directories are made only where root's own are.
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("new-cwd");
     let DaemonSpec::Task(task) = command("/bin/false") else {
         unreachable!("`command` builds a task");
     };
@@ -742,9 +950,64 @@ fn a_refused_update_creates_none_of_the_specs_directories() {
         print(job_label(), LOADED, BUSY),
     ]);
 
-    rewrite(&tree, &fake, &spec).expect_err("a run is in flight");
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+    let e = rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect_err("a run is in flight");
 
-    assert!(!cwd.exists(), "the refusal came first");
+    assert!(
+        matches!(
+            e,
+            Error::LoadedJob {
+                kind: DaemonKind::Task,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    drop(created);
+    assert!(!cwd.exists(), "the install took back what it made");
+}
+
+/// The directories are made before the first action that changes what launchd holds, so a refusal
+/// `make` can still give (a name another install took meanwhile) leaves the loaded timer loaded.
+#[skuld::test(labels = [ELEVATED])]
+fn an_update_whose_directories_are_refused_at_making_leaves_the_timer_loaded(#[fixture(root_dirs)] _root: &()) {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("taken-cwd");
+    // Dropping the schedule boots the timer out first. The name is taken after the directory was
+    // planned and before it is made: the read of the timer's label is between them.
+    let spec = in_cwd(task_spec(None), &cwd, User::Root);
+    let taken = cwd.clone();
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, "").then(move || std::fs::create_dir(&taken).unwrap()),
+    ]);
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+
+    let e = rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect_err("the name is taken");
+
+    assert!(matches!(e, Error::DirectoryRefused { .. }), "{e:?}");
+    fake.assert_spent("only the two reads: the timer was not booted out");
+    assert_eq!(text_at(&tree, true, ID), old.job);
+    assert_eq!(text_at(&tree, true, &timer_name()), old.timer.unwrap());
 }
 
 /// A stranger's file at the timer's name is a refusal whatever it is: a binary plist, bytes that are not
@@ -1469,8 +1732,18 @@ fn the_verbs_draw_no_more_than_they_reserved() {
     let mut held = reserved(&mgr, Step::Install);
     let spec = task_spec(Some(SCHEDULE));
     let desired = mgr.render(&spec).unwrap();
-    mgr.write_task(tree.dirs(), &spec, &desired, &Outcome::Create, None, &mut held)
-        .expect("a create");
+    mgr.write_task(
+        tree.dirs(),
+        &spec,
+        &desired,
+        &Outcome::Create,
+        None,
+        Scope {
+            created: &mut CreatedDirs::default(),
+            reservation: &mut held,
+        },
+    )
+    .expect("a create");
     assert_eq!(
         left(&held),
         (INSTALL_REQUESTS - 2, (INSTALL_CALLS - 6) * files),

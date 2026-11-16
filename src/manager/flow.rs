@@ -9,7 +9,9 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::backend::{Backend, InstalledService, ReadOutcome, RunHandle, ScanEntry, WriteOutcome};
+use crate::backend::{
+    Backend, InstalledService, ReadOutcome, RunHandle, ScanEntry, Settle as _, Standing, WriteOutcome,
+};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Exit, Installed, State, Status, Step, output};
@@ -194,21 +196,32 @@ pub(crate) fn install<B: Backend>(
         );
         match outcome {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
-                match b.write(
+                let written = b.write(
                     spec,
                     &desired,
                     &outcome,
                     found.snapshot.as_ref(),
                     &mut scope,
                     reservation,
-                )? {
+                );
+                // A write that landed knows its definition stands; any other end has to ask.
+                if matches!(written, Ok(WriteOutcome::Done)) {
+                    scope.settle(|| Standing::Yes);
+                } else {
+                    scope.settle(|| b.standing(spec, &desired));
+                }
+                match written? {
                     WriteOutcome::Done => return Ok(outcome),
                     WriteOutcome::Refused(refusal) => return Ok(refusal),
                     WriteOutcome::Raced => {}
                 }
             }
-            Outcome::UpToDate
-            | Outcome::Conflict { .. }
+            // The desired definition stands here, so what an earlier write made for it is kept.
+            Outcome::UpToDate => {
+                scope.settle(|| Standing::Yes);
+                return Ok(outcome);
+            }
+            Outcome::Conflict { .. }
             | Outcome::RefuseForeign { .. }
             | Outcome::RefuseOtherDaemon { .. }
             | Outcome::RefuseUnusable { .. } => return Ok(outcome),

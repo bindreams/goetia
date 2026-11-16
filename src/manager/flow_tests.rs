@@ -174,6 +174,60 @@ fn install_and_preview_refuse_a_service_the_manager_finds_for_another_daemon() {
     assert_eq!(fake.writes(), 0, "the installed service must not be written over");
 }
 
+/// An install that ends `UpToDate` after a write that raced ends where the desired definition is known
+/// to stand, so what the write made is settled on that exit too (and kept, not taken back when the scope
+/// drops): a scope left unsettled there is removed by its drop under a definition that stands.
+#[skuld::test]
+fn an_install_that_ends_up_to_date_settles_what_an_earlier_write_made() {
+    let theirs = mk("frpc");
+    let fake = Fake::new();
+    fake.seed_write_interloper("frpc", generate(&theirs));
+
+    assert_eq!(fake.install(&theirs, false).unwrap(), Outcome::UpToDate);
+
+    assert_eq!(fake.writes(), 1);
+    assert_eq!(fake.settles(), 2, "after the raced write, and on the exit that stands");
+}
+
+/// The scope settles after every write, the raced ones included, and asks whether the definition stands
+/// only if the write made something (see `Settle`) and did not land: a write that landed knows it
+/// does, and one that made nothing has nothing to keep or take back.
+#[skuld::test]
+fn an_install_settles_after_every_write_and_asks_for_the_standing_only_of_a_write_that_made_something_and_did_not_land()
+{
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    assert_eq!(fake.settles(), 1);
+    assert_eq!(fake.standings(), 0);
+
+    let fake = Fake::new();
+    fake.seed_write_races("frpc", 2);
+    fake.install(&mk("frpc"), false).unwrap();
+    assert_eq!(fake.settles(), 3);
+    assert_eq!(
+        fake.standings(),
+        0,
+        "writes that made nothing have nothing to keep or take back"
+    );
+
+    let fake = Fake::new();
+    fake.seed_write_makes_something("frpc");
+    fake.install(&mk("frpc"), false).unwrap();
+    assert_eq!(fake.settles(), 1);
+    assert_eq!(fake.standings(), 0, "a write that landed is not read back");
+
+    let fake = Fake::new();
+    fake.seed_write_makes_something("frpc");
+    fake.seed_write_races("frpc", 1);
+    fake.install(&mk("frpc"), false).unwrap();
+    assert_eq!(fake.settles(), 2);
+    assert_eq!(
+        fake.standings(),
+        1,
+        "only the raced write that made something is read back"
+    );
+}
+
 /// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.
 #[skuld::test]
 fn a_write_that_loses_to_an_ours_entry_follows_that_entry() {
