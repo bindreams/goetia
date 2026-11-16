@@ -49,7 +49,7 @@ impl Budget {
     }
 
     /// This budget with `by` added to a bound: what a verb reports having waited when part of its wait was
-    /// not counted against it, and, with [`Self::start_at`] over the instant the verb began, its deadline.
+    /// not counted against it, and, with `start_at` over the instant the verb began, its deadline.
     /// `Immediate` and `Unbounded` have no bound to move; a bound that overflows is [`Duration::MAX`], which
     /// no clock reaches, so its deadline never expires, as in [`Self::start`].
     pub fn extended(self, by: Duration) -> Budget {
