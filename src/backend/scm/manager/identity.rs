@@ -136,7 +136,15 @@ fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
 
 /// The SID a `user.id` string spells, the account's name, and its `SID_NAME_USE`.
 fn resolve_sid_string(sid_str: &str) -> Result<(Sid, String, i32)> {
-    let parse = || format!("parse {} as a SID string", subject(Some("user.id"), "SID", sid_str));
+    let sid = sid_from_string(sid_str, Some("user.id"))?;
+    let (name, use_) = lookup_account_sid(sid.as_ptr() as PSID, Some("user.id"), || sid_str.to_string())?;
+    Ok((sid, name, use_))
+}
+
+/// The SID that `sid_str` spells (`S-1-5-32-544`), by `ConvertStringSidToSidW`: no account is looked up,
+/// so the SID of a deleted account is still a SID. `field` is the spec field it came from, if any.
+fn sid_from_string(sid_str: &str, field: Option<&str>) -> Result<Sid> {
+    let parse = || format!("parse {} as a SID string", subject(field, "SID", sid_str));
     let wide_sid = wide_null(sid_str).map_err(|e| refused_input(parse(), e))?;
     let mut psid: PSID = std::ptr::null_mut();
     // SAFETY: `wide_sid` is a valid null-terminated wide string; `psid` is a
@@ -153,9 +161,17 @@ fn resolve_sid_string(sid_str: &str) -> Result<(Sid, String, i32)> {
     unsafe {
         LocalFree(psid);
     }
-    let sid = sid.expect("ConvertStringSidToSidW writes a valid SID");
-    let (name, use_) = lookup_account_sid(sid.as_ptr() as PSID, Some("user.id"), || sid_str.to_string())?;
-    Ok((sid, name, use_))
+    Ok(sid.expect("ConvertStringSidToSidW writes a valid SID"))
+}
+
+/// The SID of the account a task's stored principal names, as Task Scheduler stores it: a SID string as
+/// the SID it spells, anything else as an account name, looked up. An error when a name names no account.
+pub(in crate::backend::scm) fn sid_of_principal(principal: &str) -> Result<Sid> {
+    if principal.starts_with("S-1-") {
+        sid_from_string(principal, None)
+    } else {
+        sid_for_account_name(principal, None).map(|(sid, _kind)| sid)
+    }
 }
 
 /// The domain-qualified name of the account a binary SID names. An error when the bytes are not

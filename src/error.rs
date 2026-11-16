@@ -542,6 +542,15 @@ pub enum Error {
     #[error("{}", retype_running(id, *old))]
     RetypeRunning { id: String, old: crate::spec::DaemonKind },
 
+    /// An install that changes the account a task runs as registers the task again (an update would
+    /// leave it unreadable by the new account), which removes the old registration first, and so it
+    /// refuses while the task runs. Determinate: nothing was changed.
+    #[error(
+        "`{id}` is running, and installing it as another account registers it again, which removes the running \
+         task first: run `goetia daemon stop {id}`, then re-run install"
+    )]
+    AccountChangeRunning { id: String },
+
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
@@ -796,6 +805,7 @@ impl Error {
             | Error::AlreadyRunning { .. }
             | Error::StillRunning { .. }
             | Error::RetypeRunning { .. }
+            | Error::AccountChangeRunning { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -988,6 +998,7 @@ impl Error {
             | Error::AlreadyRunning { .. }
             | Error::StillRunning { .. }
             | Error::RetypeRunning { .. }
+            | Error::AccountChangeRunning { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }

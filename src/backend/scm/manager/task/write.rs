@@ -146,8 +146,9 @@ impl Scm {
     }
 
     /// Writes the task `spec` is: a create when nothing is installed, otherwise an update of
-    /// `snapshot`'s task that keeps whether it is armed (a create is disarmed). Write
-    /// [`Self::task_write_with`] over the machine's own record directory and account.
+    /// `snapshot`'s task that keeps whether it is armed (a create is disarmed). A task installed over
+    /// one of another account is registered again instead ([`Self::task_write_with`]). Write
+    /// [`Self::task_write_with`] over the machine's own record directory, processes and account.
     pub(in crate::backend::scm) fn task_write(
         &self,
         spec: &DaemonSpec,
@@ -155,48 +156,105 @@ impl Scm {
         snapshot: Option<&TaskSnapshot>,
     ) -> Result<WriteOutcome> {
         let runs = runs_for_write(&spec.common().id)?;
-        self.task_write_with(spec, definition, snapshot, &runs, |account| {
+        self.task_write_with(spec, definition, snapshot, &runs, &mut System, |account| {
             prepare(account, written_user(&spec.common().user))
         })
     }
 
-    /// [`Self::task_write`] with the record directory `runs` and `prepare`, which sees to what the
-    /// machine must hold for the account. Both come before the first request to Task Scheduler.
-    /// [`WriteOutcome::Raced`] when the task existed for a create or was gone for an update.
-    pub(super) fn task_write_with(
+    /// [`Self::task_write`] with the record directory `runs`, `processes` (which judge the old task's
+    /// run) and `prepare`, which sees to what the machine must hold for the account. All come before the
+    /// first request to Task Scheduler that changes anything. [`WriteOutcome::Raced`] when the task
+    /// existed for a create or was gone for an update.
+    ///
+    /// An account is the same when the stored principal's SID is the new account's, and then the task
+    /// is updated in place. Otherwise (a stored principal that cannot be told is a change) Task
+    /// Scheduler would keep the security descriptor the task was registered with, which names the old
+    /// account only and so leaves the task unreadable by the new account's shim. So the task is
+    /// registered again: refused while the old one runs (its shim still writes its record, and the
+    /// permissions of the record directory are for the new account only), then, with everything acquired,
+    /// the registration alone is deleted (its records stay) and created with the armed state it had.
+    /// A failure between the delete and the create leaves nothing at the id, which an install that runs
+    /// again creates (disarmed: `enable` arms it).
+    pub(super) fn task_write_with<P: Processes>(
         &self,
         spec: &DaemonSpec,
         definition: &TaskXml,
         snapshot: Option<&TaskSnapshot>,
         runs: &Runs,
+        processes: &mut P,
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        let prepared = task_acquire(id, definition, runs, prepare)?;
-        self.task_register(id, definition, snapshot, &prepared)
+        let prepared = prepare(&definition.account())?;
+        let changed = snapshot.filter(|old| stored_principal(old.registered()).as_ref() != Some(&prepared.principal));
+        if let Some(old) = changed {
+            self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
+        }
+        task_records(id, runs, &prepared)?;
+        match changed {
+            None => self.task_register(
+                id,
+                definition,
+                snapshot.is_some_and(TaskSnapshot::armed),
+                snapshot.is_some(),
+                &prepared,
+            ),
+            Some(old) => {
+                match self.tasks.delete(&TaskPath::of(id)) {
+                    // The task is gone; a folder that stays is still there for the create.
+                    Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+                self.task_register(id, definition, old.armed(), false, &prepared)
+            }
+        }
     }
 
-    /// The registration itself, once [`task_acquire`] has seen to what it needs.
+    /// Refuses installing `old`, a task, as another account while it runs:
+    /// [`Error::AccountChangeRunning`]. `alive` judges the processes the listing names.
+    fn refuse_account_change_while_running(
+        &self,
+        old: &TaskSnapshot,
+        alive: impl FnMut(u32) -> std::io::Result<Liveness>,
+    ) -> Result<()> {
+        match self.task_state_with(old, alive)? {
+            State::Running => Err(Error::AccountChangeRunning {
+                id: old.id().to_string(),
+            }),
+            State::Idle | State::Stopped | State::Failed | State::Unknown => Ok(()),
+        }
+    }
+
+    /// The registration itself, once what it needs is acquired: the task as `armed` says, an update of
+    /// the one there is or a create.
     fn task_register(
         &self,
         id: &Id,
         definition: &TaskXml,
-        snapshot: Option<&TaskSnapshot>,
+        armed: bool,
+        update: bool,
         prepared: &Prepared,
     ) -> Result<WriteOutcome> {
-        let armed = snapshot.is_some_and(TaskSnapshot::armed);
         let registered = self.tasks.register(
             &TaskPath::of(id),
             &definition.to_xml(armed),
             &definition.account(),
             prepared.password.as_deref(),
-            snapshot.is_some(),
+            update,
         )?;
         Ok(match registered {
             Registration::Created => WriteOutcome::Done,
             Registration::Raced => WriteOutcome::Raced,
         })
     }
+}
+
+/// The SID of the account a stored task runs as: its principal's, as Task Scheduler stores it. `None`
+/// when it cannot be told (no principal, or a name that names no account), which is not known to be
+/// the account being installed.
+fn stored_principal(registered: &Registered) -> Option<Sid> {
+    let (TaskAccount::Service(text) | TaskAccount::User(text)) = TaskXml::principal(&registered.xml).ok()?;
+    identity::sid_of_principal(&text).ok()
 }
 
 /// Everything a registration of `definition` needs, before any request: what the machine holds for the
@@ -209,9 +267,14 @@ fn task_acquire(
     prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
 ) -> Result<Prepared> {
     let prepared = prepare(&definition.account())?;
-    runs.ensure(&prepared.principal)
-        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
+    task_records(id, runs, &prepared)?;
     Ok(prepared)
+}
+
+/// The record directory of `id` with permissions that name the account `prepared` holds.
+fn task_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
+    runs.ensure(&prepared.principal)
+        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))
 }
 
 // Enable and disable ==================================================================================================
@@ -359,7 +422,7 @@ impl Scm {
         refuse()?;
         let prepared = task_acquire(id, definition, runs, prepare)?;
         retire()?;
-        self.task_register(id, definition, None, &prepared)
+        self.task_register(id, definition, false, false, &prepared)
     }
 
     /// The sweep of what the removal left: the file a removed service's or task's host named, which

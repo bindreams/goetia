@@ -102,6 +102,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             old: crate::spec::DaemonKind::Task,
         },
+        Error::AccountChangeRunning { id: id() },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -1286,6 +1287,12 @@ fn error_messages_and_exit_class() {
             },
             "`nightly` is running as a task, and changing it to a service removes it first: run `goetia daemon stop \
              nightly`, then re-run install",
+            false,
+        ),
+        (
+            Error::AccountChangeRunning { id: id() },
+            "`nightly` is running, and installing it as another account registers it again, which removes the \
+             running task first: run `goetia daemon stop nightly`, then re-run install",
             false,
         ),
         (

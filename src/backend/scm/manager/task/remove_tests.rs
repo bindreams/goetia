@@ -533,7 +533,7 @@ fn a_crash_between_removal_and_creation_reads_as_absent_and_install_finishes() {
         std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join("nightly")).unwrap();
         (dir, runs)
     };
-    scm.task_write_with(&old, &new, None, &new_runs, |_| {
+    scm.task_write_with(&old, &new, None, &new_runs, &mut machine, |_| {
         Ok(Prepared {
             principal: system(),
             password: None,

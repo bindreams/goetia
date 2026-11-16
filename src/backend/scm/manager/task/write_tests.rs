@@ -20,7 +20,7 @@ use crate::blob::Blob;
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::elevation::test_support::process_user_sid;
 use crate::manager::State;
-use crate::spec::{DaemonKind, User};
+use crate::spec::{AccountId, DaemonKind, User};
 
 fn id() -> Id {
     Id::try_from("nightly").unwrap()
@@ -99,7 +99,14 @@ fn install_of_a_task_creates_it_disarmed() {
     fake.on_register(Ok(Registration::Created));
 
     let outcome = scm(&fake)
-        .task_write_with(&spec, &definition(&spec), None, &runs, prepared(system(), None))
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            None,
+            &runs,
+            &mut Running(vec![]),
+            prepared(system(), None),
+        )
         .unwrap();
 
     assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
@@ -122,6 +129,7 @@ fn reinstall_keeps_the_armed_state() {
                 &definition(&spec),
                 Some(&installed),
                 &runs,
+                &mut Running(vec![]),
                 prepared(system(), None),
             )
             .unwrap();
@@ -183,11 +191,280 @@ fn a_changed_task_is_updated_in_place_over_the_installed_one() {
             &definition(&rescheduled),
             Some(&installed),
             &runs,
+            &mut Running(vec![]),
             prepared(system(), None),
         )
         .unwrap();
 
     assert_eq!(fake.calls(), [register_call(&rescheduled, false, root(), None, true)]);
+}
+
+// A change of account -------------------------------------------------------------------------------------------------
+
+/// `Users`, which has this test's account among its members: a record directory that names only it is still
+/// the test's to read and remove. (`NetworkService` would lock the test out of it.)
+fn users() -> Sid {
+    sid_from_parts(5, &[32, 545])
+}
+
+fn network_service() -> Sid {
+    sid_from_parts(5, &[20])
+}
+
+/// The task as `name` (`LocalService` or `NetworkService`) runs it, and what a task of it registered as
+/// that account's SID looks like to `read`.
+fn as_service(name: &str) -> DaemonSpec {
+    task_spec_as(User::Name(name.to_owned()), Some("30 3 * * *"))
+}
+
+fn service(sid: &str) -> TaskAccount {
+    TaskAccount::Service(sid.to_owned())
+}
+
+/// A task installed over one of another account is registered again, not updated: Task Scheduler keeps the
+/// security descriptor a task was registered with, so an update leaves the task unreadable by the new
+/// account's shim. It is deleted and created, with the armed state it had, and its records stay.
+#[skuld::test]
+fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_state_it_had() {
+    for armed in [false, true] {
+        let (dir, runs) = made_records();
+        let old = as_service("LocalService");
+        let new = as_service("NetworkService");
+        let record = records_dir(&dir).join("0123456789abcdef0123456789abcdef.json");
+        std::fs::write(&record, "{}").unwrap();
+        let fake = Fake::new();
+        fake.on_instances(Ok(Vec::new()))
+            .on_delete(Ok(true))
+            .on_register(Ok(Registration::Created));
+
+        let outcome = scm(&fake)
+            .task_write_with(
+                &new,
+                &definition(&new),
+                Some(&snapshot_of(&old, armed)),
+                &runs,
+                &mut Running(vec![]),
+                prepared(users(), None),
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
+        assert_eq!(
+            fake.calls(),
+            [
+                Call::Instances(PATH.to_owned()),
+                Call::Delete(PATH.to_owned()),
+                register_call(&new, armed, service("S-1-5-20"), None, false),
+            ],
+            "armed={armed}: a create, after the delete"
+        );
+        assert!(record.is_file(), "the old account's record stays");
+        assert!(
+            trustees_of(&records_dir(&dir)).contains(&users()),
+            "the directory names the new account"
+        );
+        fake.finish();
+    }
+}
+
+/// The old account's run is refused before anything is changed: its shim still writes its record, so the
+/// directory's permissions are not rewritten, and the task is not deleted.
+#[skuld::test]
+fn a_task_that_runs_is_not_installed_as_another_account() {
+    let (dir, runs) = records();
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let fake = Fake::new();
+    fake.on_instances(Ok(vec![running_run()]));
+
+    let refused = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![4242]),
+            prepared(network_service(), None),
+        )
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::AccountChangeRunning { .. }), "{refused:?}");
+    assert!(
+        refused.to_string().contains("another account"),
+        "the error names the account change: {refused}"
+    );
+    assert_eq!(
+        fake.calls(),
+        [Call::Instances(PATH.to_owned())],
+        "the task is untouched"
+    );
+    assert!(
+        !records_dir(&dir).exists(),
+        "the record directory's permissions are not rewritten while the old run writes in it"
+    );
+}
+
+/// What the new account needs (its password, its logon right) is acquired before the task is touched:
+/// a failure leaves it as it was, with the scheduler asked nothing.
+#[skuld::test]
+fn an_account_change_whose_acquisition_fails_touches_nothing() {
+    let (dir, runs) = records();
+    let old = as_service("LocalService");
+    let new = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            |account| {
+                password_of(account, || Ok(None)).map(|password| Prepared {
+                    principal: system(),
+                    password,
+                })
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::PasswordRequired { .. }), "{refused:?}");
+    assert_eq!(fake.calls(), []);
+    assert!(!records_dir(&dir).exists());
+}
+
+/// A task whose stored principal cannot be told is not known to be the same account, so it is registered
+/// again.
+#[skuld::test]
+fn a_stored_principal_that_cannot_be_read_is_an_account_change() {
+    let (_dir, runs) = made_records();
+    let new = as_service("NetworkService");
+    let installed = registered_task(&new, false);
+    let no_principal = Registered {
+        xml: installed.xml.replace("<UserId>S-1-5-20</UserId>", ""),
+        data: installed.data.clone(),
+    };
+    assert_ne!(no_principal.xml, installed.xml, "the principal is gone");
+    let fake = Fake::new();
+    fake.on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&TaskSnapshot::new(id(), Ok(blob(&new)), no_principal)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(network_service(), None),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        fake.calls().last(),
+        Some(Call::Register { update: false, .. })
+    ));
+    fake.finish();
+}
+
+/// A task that is the same account is updated in place and nothing is asked of its runs.
+#[skuld::test]
+fn a_task_installed_as_the_same_account_is_updated_in_place() {
+    let (_dir, runs) = made_records();
+    let old = as_service("NetworkService");
+    let new = task_spec_as(User::Name("NetworkService".into()), Some("0 4 * * *"));
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(network_service(), None),
+        )
+        .unwrap();
+
+    assert_eq!(
+        fake.calls(),
+        [register_call(&new, false, service("S-1-5-20"), None, true)]
+    );
+}
+
+/// A delete that took the task and could not remove the folder left empty is no failure: the task is gone,
+/// and the create uses the folder that stayed.
+#[skuld::test]
+fn a_folder_that_stays_after_the_delete_does_not_stop_the_create() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let (_dir, runs) = made_records();
+    let fake = Fake::new();
+    fake.on_instances(Ok(Vec::new()))
+        .on_delete(Err(Error::TaskFolderKept {
+            task: PATH.to_owned(),
+            folder: r"\Goetia".to_owned(),
+            source: Box::new(Error::os("remove", std::io::Error::other("in use"))),
+        }))
+        .on_register(Ok(Registration::Created));
+
+    let outcome = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap();
+
+    assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
+    fake.finish();
+}
+
+/// A create that finds a task there once the old one is deleted is raced, as any create is; a delete
+/// that fails creates nothing.
+#[skuld::test]
+fn a_raced_create_and_a_failed_delete_after_an_account_change() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let (_dir, runs) = made_records();
+    let fake = Fake::new();
+    fake.on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Raced))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))));
+    let scm = scm(&fake);
+    let write = || {
+        scm.task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+    };
+
+    let raced = write().unwrap();
+    let failed = write().unwrap_err();
+
+    assert!(matches!(raced, WriteOutcome::Raced), "{raced:?}");
+    assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| matches!(call, Call::Register { .. }))
+            .count(),
+        1,
+        "a delete that fails creates nothing"
+    );
+    fake.finish();
 }
 
 // The record directory ------------------------------------------------------------------------------------------------
@@ -214,14 +491,23 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
     let (dir, runs) = made_records();
     let spec = task_spec(Some("30 3 * * *"));
     let me = process_user_sid();
-    // `Users` has this test's account among its members, so the directory is still the test's to remove.
-    let users = sid_from_parts(5, &[32, 545]);
+    let users = users();
     let fake = Fake::new();
+    // The second write changes the account, so the task is deleted and created.
     fake.on_register(Ok(Registration::Created))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
         .on_register(Ok(Registration::Created));
     let scm = scm(&fake);
-    scm.task_write_with(&spec, &definition(&spec), None, &runs, prepared(me.clone(), None))
-        .unwrap();
+    scm.task_write_with(
+        &spec,
+        &definition(&spec),
+        None,
+        &runs,
+        &mut Running(vec![]),
+        prepared(me.clone(), None),
+    )
+    .unwrap();
     assert!(trustees_of(&records_dir(&dir)).contains(&me));
 
     scm.task_write_with(
@@ -229,6 +515,7 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
         &definition(&spec),
         Some(&snapshot_of(&spec, false)),
         &runs,
+        &mut Running(vec![]),
         prepared(users.clone(), None),
     )
     .unwrap();
@@ -270,12 +557,19 @@ fn a_real_account_needs_its_password_and_the_batch_right_before_any_write() {
     let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
     let fake = Fake::new();
 
-    let refused = scm(&fake).task_write_with(&spec, &definition(&spec), None, &runs, |account| {
-        password_of(account, || Ok(None)).map(|password| Prepared {
-            principal: system(),
-            password,
-        })
-    });
+    let refused = scm(&fake).task_write_with(
+        &spec,
+        &definition(&spec),
+        None,
+        &runs,
+        &mut Running(vec![]),
+        |account| {
+            password_of(account, || Ok(None)).map(|password| Prepared {
+                principal: system(),
+                password,
+            })
+        },
+    );
 
     assert!(matches!(refused, Err(Error::PasswordRequired { .. })), "{refused:?}");
     assert_eq!(fake.calls(), []);
@@ -294,19 +588,26 @@ fn install_of_a_real_user_task_grants_the_batch_right_before_the_first_write() {
     let granted = std::cell::Cell::new(false);
 
     scm(&fake)
-        .task_write_with(&spec, &definition(&spec), None, &runs, |account| {
-            assert_eq!(account, &TaskAccount::User("alice".to_owned()));
-            assert_eq!(
-                fake.calls(),
-                [],
-                "the right is granted before the scheduler is asked anything"
-            );
-            granted.set(true);
-            Ok(Prepared {
-                principal: process_user_sid(),
-                password: Some("secret".to_owned()),
-            })
-        })
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            None,
+            &runs,
+            &mut Running(vec![]),
+            |account| {
+                assert_eq!(account, &TaskAccount::User("alice".to_owned()));
+                assert_eq!(
+                    fake.calls(),
+                    [],
+                    "the right is granted before the scheduler is asked anything"
+                );
+                granted.set(true);
+                Ok(Prepared {
+                    principal: process_user_sid(),
+                    password: Some("secret".to_owned()),
+                })
+            },
+        )
         .unwrap();
 
     assert!(granted.get());
@@ -332,7 +633,14 @@ fn acquisition_precedes_the_first_register_call() {
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
 
-    let failed = scm(&fake).task_write_with(&spec, &definition(&spec), None, &runs, prepared(system(), None));
+    let failed = scm(&fake).task_write_with(
+        &spec,
+        &definition(&spec),
+        None,
+        &runs,
+        &mut Running(vec![]),
+        prepared(system(), None),
+    );
 
     assert!(failed.is_err());
     assert_eq!(fake.calls(), []);
@@ -355,15 +663,22 @@ fn a_raced_create_and_a_raced_update_are_raced() {
             &definition(&spec),
             None,
             &runs,
+            &mut Running(vec![]),
             prepared(process_user_sid(), None),
         )
         .unwrap();
+    // An update, so the task that is there already runs as the same account.
+    let as_me = task_spec_as(
+        User::Id(AccountId::Sid(crate::testing::shown_sid(&process_user_sid()))),
+        Some("30 3 * * *"),
+    );
     let updated = scm
         .task_write_with(
-            &spec,
-            &definition(&spec),
-            Some(&snapshot_of(&spec, false)),
+            &as_me,
+            &definition(&as_me),
+            Some(&snapshot_of(&as_me, false)),
             &runs,
+            &mut Running(vec![]),
             prepared(process_user_sid(), None),
         )
         .unwrap();
@@ -379,7 +694,14 @@ fn a_failed_registration_is_the_installs_error() {
     let fake = Fake::new();
     fake.on_register(Err(Error::os("register", std::io::Error::other("denied"))));
 
-    let failed = scm(&fake).task_write_with(&spec, &definition(&spec), None, &runs, prepared(system(), None));
+    let failed = scm(&fake).task_write_with(
+        &spec,
+        &definition(&spec),
+        None,
+        &runs,
+        &mut Running(vec![]),
+        prepared(system(), None),
+    );
 
     assert!(failed.is_err());
 }
