@@ -101,7 +101,7 @@ fn both_folders_are_made_owned_by_administrators_inheriting_and_each_is_judged_b
         Ok(())
     };
 
-    make_goetia_folders(dir.path(), &judge).unwrap();
+    make_goetia_folders(dir.path(), judge).unwrap();
 
     assert_eq!(
         *judged.borrow(),
@@ -118,7 +118,7 @@ fn both_folders_are_made_owned_by_administrators_inheriting_and_each_is_judged_b
         assert!(!protected, "{}: it inherits what %ProgramData% gives", folder.display());
     }
     judged.borrow_mut().clear();
-    make_goetia_folders(dir.path(), &judge).unwrap();
+    make_goetia_folders(dir.path(), judge).unwrap();
     assert_eq!(
         judged.borrow().len(),
         4,
