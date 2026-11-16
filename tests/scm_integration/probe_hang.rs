@@ -306,4 +306,6 @@ macro_rules! rounds {
     };
 }
 
-rounds!(hang_a, hang_b, hang_c, hang_d, hang_e, hang_f, hang_g, hang_h);
+// Three tests of six rounds: a runner's C: drive holds about 21 new users' profiles (the 22nd logon fails with "Windows
+// cannot copy profile ... you do not have enough disk space", event 1600, and logs no event 67), so a job makes 18.
+rounds!(hang_a, hang_b, hang_c);

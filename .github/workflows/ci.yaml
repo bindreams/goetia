@@ -51,7 +51,7 @@ jobs:
       matrix:
         os: [windows-latest]
         toolchain: [stable]
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
 
     steps:
       - name: Checkout
@@ -141,7 +141,7 @@ jobs:
           set -euo pipefail
 
           nextest="$(command -v cargo-nextest)"
-          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail -E 'test(/hang_[a-h]/)')
+          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail -E 'test(/hang_[a-c]/)')
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             mkdir -p target/nextest-extract
             "$nextest" "${args[@]}" --extract-to target/nextest-extract --extract-overwrite
