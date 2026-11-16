@@ -22,7 +22,13 @@
 //!   entry), and the lines of its stream are the output; the marker is not shown. Nothing bounds the
 //!   read at the next run's Starting entry: a run's lines can land after it.
 //! - The terminal entry can precede most of a chatty run's output, so once the run has ended the
-//!   output's follower is stopped, the journal is synced, and the rest of the stream is read.
+//!   output's follower is stopped, the journal is synced, and the rest of the unit's lines is read
+//!   after the last line of the stream shown. The live read and the rest go through one query (the
+//!   unit's stdout lines) and the stream is picked out of both: journald can store a line twice
+//!   across a file rotation, the old copy indexed under some fields and not others (knowledge base:
+//!   "journald can store a stdout line twice across a journal file rotation"), so reading the stream
+//!   by `_STREAM_ID=` for the rest would show a copy or not by where the follower stopped. The run
+//!   shows what the unit's lines hold, as stored.
 //! - journald's rate limit can drop the marker. Then, and only after the terminal entry, the sync
 //!   and one more read of the unit's lines, the run shows a note, and its exit is still the run's.
 //! - A task with a `logs` file writes the marker there too, as the first line of each run. The file
@@ -607,9 +613,10 @@ fn live(selection: &mut Selection, follower: &mut dyn Follower, out: &mut dyn Wr
     Ok(())
 }
 
-/// What the run wrote that the follower had not delivered, after the journal is synced: the rest of
-/// the marker's stream after its last line shown, or, when the follower never met the marker, the
-/// unit's lines after `from` searched for it once more. With none, the note ([`NO_MARKER`]).
+/// What the run wrote that the follower had not delivered, after the journal is synced: the unit's
+/// lines (`query`, the follower's own) after the marker's stream's last line shown, which `selection`
+/// reduces to the stream, or, when the follower never met the marker, after `from`, searched for it
+/// once more. With none, the note ([`NO_MARKER`]).
 fn rest(
     journal: &dyn Journal,
     query: &[Match],
@@ -620,15 +627,8 @@ fn rest(
     exit_recorded: bool,
 ) -> Result<()> {
     journal.sync()?;
-    let entries = match &selection.found {
-        Some((stream, last)) => journal.read_after(
-            Scope::Output,
-            &[Match::new("_STREAM_ID", stream.as_str())],
-            Some(last),
-            draws,
-        )?,
-        None => journal.read_after(Scope::Output, query, from, draws)?,
-    };
+    let after = selection.found.as_ref().map_or(from, |(_, last)| Some(last));
+    let entries = journal.read_after(Scope::Output, query, after, draws)?;
     let mut text = Vec::new();
     for entry in &entries {
         selection.take(entry, &mut text)?;
