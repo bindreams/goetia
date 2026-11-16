@@ -449,8 +449,9 @@ owns it, since `install` is not a start and you may still be preparing it.
   it hands over what is to be handed over, and last renames the tree into place with a rename that
   replaces nothing. All of this is done before the write that can start the definition, so a run that
   follows finds its directories as they are to stay, and an install stopped at any point leaves no
-  half-made directory at the path. A path that something else made after `install` looked fails the
-  install and is left untouched. A file system that cannot rename a directory without replacing what is at
+  half-made directory at the path. A root-owned directory that another install made at a name after
+  `install` looked is used: what is still missing goes inside it. Anything else that appeared there fails
+  the install and is left untouched. A file system that cannot rename a directory without replacing what is at
   the name (Linux's `RENAME_NOREPLACE`, macOS's `RENAME_EXCL`) fails it with an error that says so.
 - **What is judged, and when.** The checks above judge the paths as they are when `install` runs. A change
   made during or after it, by hand or by another goetia command running at the same time, is not judged;

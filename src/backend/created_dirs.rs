@@ -25,9 +25,13 @@
 //!   (`renameat2` with `RENAME_NOREPLACE`; on macOS `renameatx_np` with `RENAME_EXCL`), before
 //!   [`make`](CreatedDirs::make) returns. A directory therefore appears at its name only in its final
 //!   state, whenever the install stops: the definition can go live as soon as the write that follows
-//!   starts, and a run finds every directory made, owned and moded as it is to be. A name taken in the
-//!   meantime is a refusal, and a file system that cannot make that rename is an error: there is no
-//!   fallback to one that replaces.
+//!   starts, and a run finds every directory made, owned and moded as it is to be. (Where the holder
+//!   is a root-owned directory others can write, they can swap what is at the temporary name before
+//!   the rename, as they can write the final name directly: the accepted exposure of such a
+//!   holder.) A name taken in the meantime by a root-owned directory, another install's, is used:
+//!   what is still missing is moved into it, one component at a time, and the install's tree is
+//!   removed. Anything else at the name is a refusal, and a file system that cannot make that rename
+//!   is an error: there is no fallback to one that replaces.
 //!
 //! Every refusal that reading can show comes first. [`plan`](CreatedDirs::plan) reads and judges a
 //! path and changes nothing; a caller that has more to judge (the log directory, which only the
@@ -62,11 +66,17 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
 #[cfg(target_os = "linux")]
 pub(crate) use log_dir::refuse_writable_log_dir;
-use walk::{End, Walk, open_beneath, walk};
+use walk::{End, Entry, Walk, entry, open_beneath, walk};
 
 use super::account::describe_uid;
 use super::{Settle, Standing};
 use crate::error::{Error, Result};
+
+// The platform's rename that replaces nothing, with the arguments of `renameat2`.
+#[cfg(target_os = "macos")]
+use libc::{RENAME_EXCL as NO_REPLACE, renameatx_np as rename_flagged};
+#[cfg(target_os = "linux")]
+use libc::{RENAME_NOREPLACE as NO_REPLACE, renameat2 as rename_flagged};
 
 /// Where a missing `cwd` or log directory is made: the directories systemd's own `LogsDirectory=`,
 /// `StateDirectory=` and `CacheDirectory=` are under. `/run` is left out, since it is emptied at boot.
@@ -185,17 +195,18 @@ fn fd_of<'a>(made: &'a [Made], parent: &'a Parent) -> Option<BorrowedFd<'a>> {
     }
 }
 
-impl Made {
-    /// Where it is on disk now, for what is said of it.
-    fn at(&self) -> PathBuf {
-        match self.pending {
-            Some(_) => self.path.with_file_name(&self.name),
-            None => self.path.clone(),
+impl CreatedDirs {
+    /// Where `self.made[index]` is on disk now, for what is said of it: at a temporary name if it is a
+    /// tree's top not yet put in place, and below that name if it is inside such a tree.
+    fn at(&self, index: usize) -> PathBuf {
+        let made = &self.made[index];
+        match (&made.pending, &made.parent) {
+            (Some(_), _) => made.path.with_file_name(&made.name),
+            (None, Parent::Made(parent)) => self.at(*parent).join(&made.name),
+            (None, Parent::Existing(_)) => made.path.clone(),
         }
     }
-}
 
-impl CreatedDirs {
     /// A guard that makes directories under `roots`.
     pub(crate) fn under(roots: Vec<PathBuf>) -> Self {
         Self {
@@ -292,7 +303,7 @@ impl CreatedDirs {
             if let (Some(pending), Parent::Existing(dir)) = (&made.pending, &made.parent)
                 && pending == name
             {
-                let dir = fstat(dir).map_err(|e| Error::os_at("stat", made.at(), e))?;
+                let dir = fstat(dir).map_err(|e| Error::os_at("stat", self.at(index), e))?;
                 if (dir.st_dev, dir.st_ino) == (holder.st_dev, holder.st_ino) {
                     return Ok(Some(index));
                 }
@@ -373,39 +384,35 @@ impl CreatedDirs {
         hand: Option<Owner>,
         plan_owner: Option<Owner>,
     ) -> Result<usize> {
-        let parent_fd = fd_of(&self.made, &parent).expect("a directory is made only below one that is held");
-        let at = if pending.is_some() {
-            path.with_file_name(&name)
-        } else {
-            path.to_path_buf()
-        };
-        let opened =
-            open_beneath(parent_fd, &name, OFlag::O_RDONLY).and_then(|dir| fstat(&dir).map(|stat| (dir, stat)));
-        let (held, stat) = match opened {
-            Ok((dir, stat)) => (
-                Some(Held {
-                    dir,
-                    dev: stat.st_dev,
-                    ino: stat.st_ino,
-                }),
-                Ok(stat),
-            ),
-            Err(e) => (None, Err(Error::os_at("open", at, e))),
-        };
         let index = self.made.len();
         self.made.push(Made {
             path: path.to_path_buf(),
             name,
             pending,
             parent,
-            held,
+            held: None,
             hand,
             plan_owner,
             handed: false,
             left: false,
             ready: false,
         });
-        self.verify(index, &stat?)?;
+        let made = &self.made[index];
+        let parent_fd = fd_of(&self.made, &made.parent).expect("a directory is made only below one that is held");
+        let opened =
+            open_beneath(parent_fd, &made.name, OFlag::O_RDONLY).and_then(|dir| fstat(&dir).map(|stat| (dir, stat)));
+        let stat = match opened {
+            Ok((dir, stat)) => {
+                self.made[index].held = Some(Held {
+                    dir,
+                    dev: stat.st_dev,
+                    ino: stat.st_ino,
+                });
+                stat
+            }
+            Err(e) => return Err(Error::os_at("open", self.at(index), e)),
+        };
+        self.verify(index, &stat)?;
         Ok(index)
     }
 
@@ -437,43 +444,85 @@ impl CreatedDirs {
     /// Rename each tree to its final name, so that it appears there in its final state. Whatever is at the
     /// name by then is not the install's, and is not replaced.
     fn place(&mut self) -> Result<()> {
-        for made in &mut self.made {
-            let (Some(to), Parent::Existing(dir)) = (&made.pending, &made.parent) else {
-                continue;
-            };
-            rename_new(dir.as_fd(), &made.name, to).map_err(|e| match e {
-                Errno::EEXIST => Error::DirectoryRefused {
-                    path: made.path.clone(),
-                    why: "it exists: it appeared after the install looked, or it is the same directory as one this \
-                          install made for another path of the spec, under another spelling (a file system that \
-                          ignores case); it is left as it is"
-                        .to_string(),
-                },
-                Errno::EINVAL | Errno::ENOSYS | Errno::ENOTSUP => Error::DirectoryRefused {
-                    path: made.path.clone(),
-                    why: format!(
-                        "the file system it is on cannot rename a directory without replacing what is at the name \
-                         ({e}), which goetia needs to make it appear only in its final state"
-                    ),
-                },
-                e => Error::os_at("put in place", made.path.clone(), e),
-            })?;
-            made.name = to.clone();
-            made.pending = None;
+        for index in 0..self.made.len() {
+            if self.made[index].pending.is_some() {
+                self.place_tree(index)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rename the tree at `index` to its final name. If a root-owned directory is there, another
+    /// install's, the tree's contents go into it instead, and the tree is removed.
+    fn place_tree(&mut self, index: usize) -> Result<()> {
+        let made = &self.made[index];
+        let (Some(to), Parent::Existing(holder)) = (made.pending.clone(), &made.parent) else {
+            unreachable!("only the top of a tree has a name it is to be renamed to, and its parent exists");
+        };
+        let holder = holder
+            .try_clone()
+            .map_err(|e| Error::os_at("put in place", made.path.clone(), e))?;
+        match rename_new(holder.as_fd(), &made.name, holder.as_fd(), &to) {
+            Ok(()) => {
+                let made = &mut self.made[index];
+                made.name = to;
+                made.pending = None;
+                Ok(())
+            }
+            Err(Errno::EEXIST) => {
+                let existing = root_directory(holder.as_fd(), &to, &self.made[index].path)?;
+                self.merge(index, existing)
+            }
+            Err(e) => Err(put_in_place_error(&self.made[index].path, e)),
+        }
+    }
+
+    /// Move what the tree at `tree` holds into `into`, the directory that stands at its place, and remove
+    /// the tree. Each component moves by a rename that replaces nothing; one that is there as a
+    /// root-owned directory is entered and its own contents moved the same way: one component settled per
+    /// conflict, from the top down.
+    fn merge(&mut self, tree: usize, into: OwnedFd) -> Result<()> {
+        let children: Vec<usize> = (0..self.made.len())
+            .filter(|&child| matches!(self.made[child].parent, Parent::Made(parent) if parent == tree))
+            .collect();
+        for child in children {
+            let name = self.made[child].name.clone();
+            let from = fd_of(&self.made, &self.made[child].parent).expect("a tree being merged is held");
+            match rename_new(from, &name, into.as_fd(), &name) {
+                Ok(()) => {
+                    let above = into
+                        .try_clone()
+                        .map_err(|e| Error::os_at("put in place", self.made[child].path.clone(), e))?;
+                    self.made[child].parent = Parent::Existing(above);
+                }
+                Err(Errno::EEXIST) => {
+                    let existing = root_directory(into.as_fd(), &name, &self.made[child].path)?;
+                    self.merge(child, existing)?;
+                }
+                Err(e) => return Err(put_in_place_error(&self.made[child].path, e)),
+            }
+        }
+        // Empty now: nothing but this install has been in it.
+        if let Err(e) = self.remove(tree) {
+            report(format_args!(
+                "could not remove {}, which the install made and then did not need: {e}",
+                self.at(tree).display()
+            ));
         }
         Ok(())
     }
 
     /// Judge the directory just made, and open it up to `0755`.
     fn verify(&mut self, index: usize, stat: &FileStat) -> Result<()> {
+        let at = self.at(index);
         let made = &mut self.made[index];
         let held = made
             .held
             .as_ref()
             .expect("a directory is judged through the descriptor it was opened by");
-        let empty = is_empty(&held.dir).map_err(|e| Error::os_at("read", made.at(), e))?;
-        judge(stat, empty).map_err(|why| Error::DirectoryRefused { path: made.at(), why })?;
-        fchmod(&held.dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", made.at(), e))?;
+        let empty = is_empty(&held.dir).map_err(|e| Error::os_at("read", &at, e))?;
+        judge(stat, empty).map_err(|why| Error::DirectoryRefused { path: at.clone(), why })?;
+        fchmod(&held.dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", &at, e))?;
         made.ready = true;
         Ok(())
     }
@@ -481,36 +530,39 @@ impl CreatedDirs {
     /// Give every directory marked for an owner to it. The first that cannot be given is
     /// the error: the install fails, and the guard removes what is made.
     fn hand_over(&mut self) -> Result<()> {
-        for made in self.made.iter_mut().filter(|made| !made.handed) {
-            if let (Some(owner), Some(held)) = (made.hand, &made.held) {
+        for index in 0..self.made.len() {
+            let made = &self.made[index];
+            if let (Some(owner), Some(held), false) = (made.hand, &made.held, made.handed) {
                 fchown(&held.dir, Some(owner.uid), owner.gid)
-                    .map_err(|e| Error::os_at(format!("hand over to uid {}", owner.uid), &made.path, e))?;
-                made.handed = true;
+                    .map_err(|e| Error::os_at(format!("hand over to uid {}", owner.uid), self.at(index), e))?;
+                self.made[index].handed = true;
             }
         }
         Ok(())
     }
 
-    /// Let go of everything made: the directories stay. Returns a note for each that stays other than
-    /// as made, for the caller to report: one not verified (see `Made::ready`), and one not yet put in
-    /// place (a `make` that did not finish: it is at a temporary name, and nothing uses it). A finished
-    /// `make` has handed over and placed everything.
+    /// Let go of everything made: the directories stay, except a tree not yet put in place (a `make` that
+    /// did not finish), which is at a name no definition can name and is removed as an undo removes it.
+    /// Returns a note for each that stays other than as made, for the caller to report: one not
+    /// verified (see `Made::ready`). A finished `make` has handed over and placed everything.
     fn keep(&mut self) -> Vec<String> {
-        let mut notes = Vec::new();
+        let mut unplaced: Vec<bool> = Vec::with_capacity(self.made.len());
         for made in &self.made {
-            if made.pending.is_some() {
-                notes.push(format!(
-                    "{}, which the install was making for {}, was never put in place: it is left, and nothing                      uses it",
-                    made.at().display(),
-                    made.path.display()
-                ));
-            } else if !made.ready {
-                notes.push(format!(
+            unplaced.push(made.pending.is_some() || matches!(made.parent, Parent::Made(parent) if unplaced[parent]));
+        }
+        self.undo_where(|index| unplaced[index]);
+        let notes = self
+            .made
+            .iter()
+            .enumerate()
+            .filter(|&(index, made)| !unplaced[index] && !made.ready)
+            .map(|(_, made)| {
+                format!(
                     "{}, which the install created, was never verified: it is left behind",
                     made.path.display()
-                ));
-            }
-        }
+                )
+            })
+            .collect();
         self.made.clear();
         notes
     }
@@ -575,11 +627,16 @@ impl CreatedDirs {
     /// Remove what can be removed, deepest first, since each was made after its parent. A directory
     /// that stays keeps its ancestors, which then hold content.
     fn undo(&mut self) {
-        for index in (0..self.made.len()).rev() {
+        self.undo_where(|_| true);
+    }
+
+    /// [`undo`](Self::undo) for the directories `which` selects, by index.
+    fn undo_where(&mut self, which: impl Fn(usize) -> bool) {
+        for index in (0..self.made.len()).rev().filter(|&index| which(index)) {
             if let Err(e) = self.remove(index) {
                 report(format_args!(
                     "could not remove {}, which the failed install created: {e}",
-                    self.made[index].at().display()
+                    self.at(index).display()
                 ));
             }
         }
@@ -594,30 +651,56 @@ fn temporary_name() -> OsString {
     format!(".goetia-{:016x}", RandomState::new().hash_one(std::process::id())).into()
 }
 
-/// Rename `from` to `to`, both in `dir`, unless something is at `to`: then `EEXIST`, and nothing changes.
-#[cfg(target_os = "linux")]
-fn rename_new(dir: BorrowedFd<'_>, from: &OsStr, to: &OsStr) -> nix::Result<()> {
-    let fd = dir.as_raw_fd();
+/// Rename `from` in `from_dir` to `to` in `to_dir`, unless something is at `to`: then `EEXIST`, and
+/// nothing changes.
+fn rename_new(from_dir: BorrowedFd<'_>, from: &OsStr, to_dir: BorrowedFd<'_>, to: &OsStr) -> nix::Result<()> {
     from.with_nix_path(|from| {
         to.with_nix_path(|to| {
-            // SAFETY: both are NUL-terminated and outlive the call, and `fd` is open.
-            Errno::result(unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) })
+            // SAFETY: both are NUL-terminated and outlive the call, and both descriptors are open.
+            Errno::result(unsafe {
+                rename_flagged(
+                    from_dir.as_raw_fd(),
+                    from.as_ptr(),
+                    to_dir.as_raw_fd(),
+                    to.as_ptr(),
+                    NO_REPLACE,
+                )
+            })
         })
     })???;
     Ok(())
 }
 
-/// See the Linux version.
-#[cfg(target_os = "macos")]
-fn rename_new(dir: BorrowedFd<'_>, from: &OsStr, to: &OsStr) -> nix::Result<()> {
-    let fd = dir.as_raw_fd();
-    from.with_nix_path(|from| {
-        to.with_nix_path(|to| {
-            // SAFETY: both are NUL-terminated and outlive the call, and `fd` is open.
-            Errno::result(unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) })
-        })
-    })???;
-    Ok(())
+/// The directory at `name` in `dir` if it is root's, held as the walk holds what it passes through. What
+/// else is there (an account's directory, a file, a symlink) is not the install's, nor root's to use: a
+/// refusal that leaves it as it is.
+fn root_directory(dir: BorrowedFd<'_>, name: &OsStr, path: &Path) -> Result<OwnedFd> {
+    match entry(dir, name) {
+        Ok(Some(Entry::Dir(fd, stat))) if stat.st_uid == 0 => Ok(fd),
+        Ok(Some(_)) => Err(Error::DirectoryRefused {
+            path: path.to_path_buf(),
+            why: "it exists, and is not a directory root owns: it appeared after the install looked; it is left \
+                  as it is"
+                .to_string(),
+        }),
+        // Gone again since the rename found it.
+        Ok(None) => Err(Error::os_at("open", path, Errno::ENOENT)),
+        Err(e) => Err(Error::os_at("open", path, e)),
+    }
+}
+
+/// What a failed rename into place says, other than a name taken (which the caller settles).
+fn put_in_place_error(path: &Path, e: Errno) -> Error {
+    match e {
+        Errno::EINVAL | Errno::ENOSYS | Errno::ENOTSUP => Error::DirectoryRefused {
+            path: path.to_path_buf(),
+            why: format!(
+                "the file system it is on cannot rename a directory without replacing what is at the name ({e}), \
+                 which goetia needs to make it appear only in its final state"
+            ),
+        },
+        e => Error::os_at("put in place", path, e),
+    }
 }
 
 /// Whether a directory just made is root's, a directory and empty: the checks that say it is the one
