@@ -3,13 +3,10 @@
 //! an audit token (`backend::kill::process`; macOS 14.4 and later), and the wait for launchd's record
 //! is the existing wait on `print` until the job no longer shows the killed process.
 //!
-//! The confirmation after the hold is `print` again, as `stop` has it, and then `launchctl procinfo` on
-//! the held pid ([`Launchctl::names_launch`](super::Launchctl)). `print` can still show a pid after
-//! launchd has reaped its process, and the number may by then be a stranger's, which is what was
-//! opened: launchd's own lookup of the process held by its number, which names the job that owns it,
-//! is what ties the process to the job. A process that exited meanwhile is not the job's and is not
-//! signalled; a live one `print` shows that `procinfo` does not name is an error, never a kill that
-//! signalled nothing and said it worked.
+//! The confirmation after the hold is `print` again, then `launchctl procinfo` on the held pid
+//! ([`Launchctl::names_launch`](super::Launchctl)): `print` can show a pid after launchd reaped its
+//! process, so procinfo ties the process to the job. A process that exited meanwhile, or that procinfo
+//! does not name, is not the job's and is not signalled; the kill waits for launchd's record.
 
 use std::io;
 
@@ -26,9 +23,8 @@ use crate::manager::budget::Deadline;
 pub(super) struct JobKill<'a> {
     launchctl: &'a Launchctl,
     id: &'a str,
-    /// The files of the one counted call, taken before anything is sent so that a
-    /// [`Error::Reservation`] means nothing was: the confirmation's `procinfo` and the wait for the
-    /// record, which follow each other, read through them.
+    /// The files of the one counted call, taken up front so a [`Error::Reservation`] is raised before
+    /// any read; `procinfo` and the wait for the record read through them.
     kept: Kept,
 }
 
@@ -53,19 +49,15 @@ impl Reports for JobKill<'_> {
 
     /// Whether `launchctl procinfo` names `pid` as a launch of the job.
     fn names(&mut self, pid: u32) -> io::Result<bool> {
-        let mut files = self
-            .kept
-            .again()
-            .map_err(|source| io::Error::other(Error::Reservation { id: None, source }))?;
         self.launchctl
-            .names_launch(self.id, pid, &mut files)
+            .names_launch_again(self.id, pid, &self.kept)
             .map_err(io::Error::other)
     }
 
     /// Reads `print` until the job shows another pid, none, or is not held, or shows the killed pid's
-    /// number on a process that is not the killed one ([`Until::Recorded`]): launchd learns of the exit
-    /// after the process is a zombie, a throttled restart shows no pid, and an unthrottled one can be
-    /// given the number.
+    /// number on a new process of the job's ([`Until::Recorded`]): launchd learns of the exit after the
+    /// process is a zombie, a throttled restart shows no pid, and an unthrottled one can be given the
+    /// number.
     fn await_recorded(&mut self, pid: u32, held: Option<&Process>, deadline: Deadline) -> io::Result<Waited> {
         match self
             .launchctl

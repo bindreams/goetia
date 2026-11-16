@@ -86,7 +86,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Occupant, PutBackFound, Reason, Result};
+use crate::error::{Error, Occupant, PutBackFound, Reason, Result, carried};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Restart, User};
@@ -860,14 +860,17 @@ enum Until<'a> {
     ProcessOrNotScheduled,
     /// The end of the process `held` is recorded: `print` shows another pid, or none (a job launchd
     /// holds that has exited, or is throttled and `spawn scheduled`), or the label is not held, or it
-    /// shows `pid` and what has that number is not the process held (launchd started the job again
-    /// and the number was reused). `held` is `None` for a process that was gone before it could be
-    /// held.
+    /// shows `pid` on a process other than the held one that `procinfo` names as the job's (launchd
+    /// started the job again and the number was reused). A `pid` that `print` shows over a process
+    /// `procinfo` does not name is a stranger's: `print` is stale, and the wait goes on. `held` is
+    /// `None` for a process that was gone before it could be held.
     Recorded { pid: u32, held: Option<&'a Process> },
 }
 
 impl Until<'_> {
-    fn reached(self, printed: &Printed) -> Result<bool> {
+    /// Whether `printed` reaches `self`. `names` is [`Launchctl::names_launch`] of a pid, for the one
+    /// case that needs the process behind a pid shown by `print`.
+    fn reached(self, printed: &Printed, names: impl FnOnce(u32) -> Result<bool>) -> Result<bool> {
         Ok(match (self, printed) {
             // Not found: not loaded, so no process and no start.
             (_, Printed::Absent) => true,
@@ -881,8 +884,13 @@ impl Until<'_> {
             }
             (Until::Recorded { pid, held }, Printed::Present(capture)) => {
                 capture.complete
-                    && process::recorded(state::has_process(&String::from_utf8_lossy(&capture.stdout)), held, pid)
-                        .map_err(|e| Error::os(format!("read what has process {pid}"), e))?
+                    && process::recorded(
+                        state::has_process(&String::from_utf8_lossy(&capture.stdout)),
+                        held,
+                        pid,
+                        || names(pid).map_err(io::Error::other),
+                    )
+                    .map_err(|e| carried(e).unwrap_or_else(|e| Error::os(format!("read what has process {pid}"), e)))?
             }
         })
     }
@@ -1115,7 +1123,9 @@ impl Launchctl {
                 deadline
             };
             match self.print(id, read_deadline, Role::Query, &mut reread(id, kept)?)? {
-                Some(printed) if until.reached(&printed)? => return Ok(Some(())),
+                Some(printed) if until.reached(&printed, |pid| self.names_launch_again(id, pid, kept))? => {
+                    return Ok(Some(()));
+                }
                 Some(_) if !spent => {}
                 Some(_) | None => return Ok(None),
             }
@@ -1160,6 +1170,13 @@ impl Launchctl {
                 Ok(state::has_process(&String::from_utf8_lossy(&capture.stdout)))
             }
         }
+    }
+
+    /// [`Self::names_launch`] drawing its files from `kept`, the one counted call a wait or a hold reads
+    /// through. A failure to take them is an [`Error::Reservation`].
+    fn names_launch_again(&self, id: &str, pid: u32, kept: &Kept) -> Result<bool> {
+        let mut files = kept.again().map_err(|source| Error::Reservation { id: None, source })?;
+        self.names_launch(id, pid, &mut files)
     }
 
     /// Whether `launchctl procinfo <pid>` names `pid` as the launch of the job `id`: its output has the

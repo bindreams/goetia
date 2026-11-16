@@ -2569,24 +2569,28 @@ fn kill_is_recorded_when_launchd_shows_another_pid_or_no_job() {
     }
 }
 
-/// `print` still shows the pid, and launchd's own lookup of the process held does not name it as the
-/// job's, and the process is alive: it cannot be tied to the job, so the kill is an error that says so.
-/// Nothing is signalled, and it never reads as a kill that worked.
+/// `print` still shows the pid and launchd's own lookup of the process held does not name it as the
+/// job's, the live process being a stranger that was given the number after launchd reaped the job's
+/// process: the stranger is not signalled, and the kill waits for the record, which is `print` moving off
+/// the pid. It does not report that as a failure.
 #[skuld::test]
-fn kill_of_a_live_process_procinfo_does_not_name_is_an_error_and_signals_nothing() {
+fn kill_of_a_live_process_procinfo_does_not_name_signals_nothing_and_waits_for_the_record() {
     use super::watch::watch_tests::Held;
 
     let mut stranger = Held::new(0);
     let pid = stranger.pid();
-    let (result, script, _) = kill_over([printed_running(pid), printed_running(pid), procinfo_not_naming(pid)]);
+    let (result, script, _) = kill_over([
+        printed_running(pid),
+        printed_running(pid),
+        procinfo_not_naming(pid),
+        printed_running(pid),
+        answer("print", SPAWN_SCHEDULED),
+    ]);
 
-    let e = result.expect_err("a process not confirmed as the job's");
-    let report = e.report().to_string();
-    assert!(
-        report.contains(&format!("process {pid} could not be confirmed")),
-        "{report}"
+    assert!(matches!(result, Ok(())), "{result:?}");
+    script.assert_spent(
+        "the read, the confirmation and its lookup, then the wait's reads: the process held is the stranger",
     );
-    script.assert_spent("the read, the confirmation, and the lookup that does not name the process");
     assert_eq!(stranger.finish(), Some(0), "the stranger was left alone");
 }
 
@@ -2784,11 +2788,11 @@ fn wait_print_until_the_pid_is_not_the_killed_one() {
 }
 
 /// launchd started the job again and the new process was given the number of the one killed: `print`
-/// shows the same pid, and the process that has it is not the one held, so the end of the held one is
-/// recorded. A process that was gone before it could be held is the same: nothing held is what has the
-/// number now.
+/// shows the same pid on a process that is not the one held, and launchd's own lookup of it names the
+/// job, so the end of the held one is recorded. A process that was gone before it could be held is the
+/// same: nothing held is what has the number now.
 #[skuld::test]
-fn wait_print_until_the_number_of_the_killed_pid_is_another_process() {
+fn wait_print_until_the_number_of_the_killed_pid_is_another_process_the_job_owns() {
     use super::watch::watch_tests::Held;
 
     let mut killed = Held::new(0);
@@ -2802,14 +2806,51 @@ fn wait_print_until_the_number_of_the_killed_pid_is_another_process() {
         let (result, script) = waiting_over(
             Until::Recorded { pid, held },
             Budget::Unbounded.start(),
-            [printed_running(pid)],
+            [printed_running(pid), procinfo_naming(pid)],
         );
 
         assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
-        script.assert_spent(&format!("one read: {what}, and another process has the pid"));
+        script.assert_spent(&format!(
+            "one read and the lookup that names the job: {what}, and another process has the pid"
+        ));
     }
     killed.finish();
     newcomer.finish();
+}
+
+/// `print` can show a pid after launchd reaped its process, and the number can be a stranger's by then:
+/// a process other than the one held that launchd's lookup does not name as the job's is not the job's
+/// new process, so the report is stale and the wait goes on until `print` moves off the pid.
+#[skuld::test]
+fn wait_print_goes_on_while_the_number_of_the_killed_pid_is_a_stranger() {
+    use super::watch::watch_tests::Held;
+
+    let mut killed = Held::new(0);
+    let held = process::open(killed.pid())
+        .expect("open the child")
+        .expect("it is running");
+    let mut stranger = Held::new(0);
+    let pid = stranger.pid();
+    for (what, held) in [("a held process", Some(&held)), ("nothing held", None)] {
+        let (result, script) = waiting_over(
+            Until::Recorded { pid, held },
+            Budget::Unbounded.start(),
+            [
+                printed_running(pid),
+                procinfo_not_naming(pid),
+                printed_running(pid),
+                procinfo_not_naming(pid),
+                answer("print", NOT_RUNNING),
+            ],
+        );
+
+        assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
+        script.assert_spent(&format!(
+            "two reads a stranger answers, then `print` moves off the pid: {what}"
+        ));
+    }
+    killed.finish();
+    stranger.finish();
 }
 
 // A changed spec over a loaded job ====================================================================================

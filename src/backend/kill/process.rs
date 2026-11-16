@@ -6,23 +6,21 @@
 use std::io;
 
 use cosca::Process;
-use cosca::identity::{Liveness, ProcessId, Resolved};
+use cosca::identity::{ProcessId, Resolved};
 
 use super::{KillTarget, Waited};
 use crate::backend::bounded::{EXIT_AFTER_REFUSED_KILL, settle_kill};
 use crate::manager::budget::Deadline;
 
-/// What a Unix manager (systemd, launchd) says of a service, for [`Signalling`] to hold, signal and
-/// wait for the process by: the rest of a [`KillTarget`].
+/// What a Unix manager (systemd, launchd) reports of a service; [`Signalling`] adds the process half of
+/// a [`KillTarget`].
 pub(crate) trait Reports {
     /// The pid the manager reports for the service's process, in whatever state, or `None` when it
     /// reports none.
     fn service_pid(&mut self) -> io::Result<Option<u32>>;
 
-    /// Whether the manager's own lookup of the held process `pid`, by number, names it as the
-    /// service's. For a manager that reports a pid it has not yet let go of after the process was
-    /// reaped, so that an unrelated process that was given the number would pass the read of
-    /// [`Self::service_pid`] alone. The default is a manager that does not.
+    /// Whether the manager's own lookup of `pid` names the process now holding it as the service's; for
+    /// a manager that keeps reporting a pid after it reaped the process. Default: `true`.
     fn names(&mut self, _pid: u32) -> io::Result<bool> {
         Ok(true)
     }
@@ -42,23 +40,11 @@ impl<R: Reports> KillTarget for Signalling<R> {
         self.0.service_pid()
     }
 
-    /// The manager shows `pid` and names the process held as the service's. A manager that shows `pid`
-    /// without naming it has either reaped the process held, which is not the service's now (`false`:
-    /// not signalled, and the manager's record is waited for), or the process held is alive and cannot
-    /// be tied to the service: an error, since it is neither the service's nor an ended process.
-    fn confirm(&mut self, pid: u32, process: &Process) -> io::Result<bool> {
-        if self.0.service_pid()? != Some(pid) {
-            return Ok(false);
-        }
-        if self.0.names(pid)? {
-            return Ok(true);
-        }
-        match process.is_alive() {
-            Liveness::Dead => Ok(false),
-            Liveness::Alive | Liveness::Unknown => Err(io::Error::other(format!(
-                "process {pid} could not be confirmed as the service's: the manager reports it, but its own lookup of the process does not name the service"
-            ))),
-        }
+    /// The manager shows `pid` and its own lookup names the process held as the service's. One it shows
+    /// without naming is a stranger that was given the number after the manager reaped the service's
+    /// process, whether or not it is alive: not signalled, and the manager's record is waited for.
+    fn confirm(&mut self, pid: u32, _process: &Process) -> io::Result<bool> {
+        Ok(self.0.service_pid()? == Some(pid) && self.0.names(pid)?)
     }
 
     fn open(&mut self, pid: u32) -> io::Result<Option<Process>> {
@@ -83,9 +69,8 @@ pub(crate) fn open(pid: u32) -> io::Result<Option<Process>> {
     Process::open_pid(pid).map_err(io::Error::other)
 }
 
-/// `SIGKILL` through the hold. A process that has exited is success, and so is one that is exiting:
-/// on macOS a send by audit token refuses it with `EPERM`, which is success once the process is read
-/// to have exited ([`settle_kill`]), and the refusal otherwise.
+/// `SIGKILL` through the hold. On macOS a send by audit token refuses an exiting process with `EPERM`,
+/// which is success once the process is read to have exited ([`settle_kill`]), and the refusal otherwise.
 pub(crate) fn terminate(process: &Process) -> io::Result<()> {
     settle_kill(process.kill(), || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
         .map(|_| ())
@@ -104,29 +89,44 @@ pub(crate) fn await_exit(process: &Process, deadline: Deadline) -> io::Result<Wa
 }
 
 /// Whether the manager has recorded the end of `pid`'s process, held through `held`: its report of the
-/// service's pid is another pid or none, or is `pid` on a process other than the one held
-/// ([`report_is_stale`]). The one rule of "recorded" for every manager that reports a pid.
-pub(crate) fn recorded(reported: Option<u32>, held: Option<&Process>, pid: u32) -> io::Result<bool> {
-    Ok(reported != Some(pid) || !report_is_stale(held, pid)?)
+/// service's pid is another pid or none, or is `pid` on a process other than the one held that the
+/// manager's own lookup `names` as the service's ([`report_is_stale`]). The one rule of "recorded" for
+/// every manager that reports a pid.
+pub(crate) fn recorded(
+    reported: Option<u32>,
+    held: Option<&Process>,
+    pid: u32,
+    names: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
+    Ok(reported != Some(pid) || !report_is_stale(held, pid, names)?)
 }
 
 /// Whether the manager's report of `pid`, which it still shows after the process held through `held`
-/// has exited, is still about that process: `true` while the manager has not yet recorded the exit,
-/// `false` once `pid` names a process other than the one held. A manager that reaps an exit and
-/// restarts the service can hand the new process the number the old one had, and a wait that only
-/// compared numbers would never see the record.
+/// has exited, is still about that process: `true` while the manager has not yet recorded the exit.
 ///
-/// An exited process that is not yet reaped still has its identity, so the report is the old one;
-/// one that has been reaped is gone, and the report not yet updated. `held` is `None` when the
-/// process was gone before it could be opened: any process that has `pid` now is another.
-pub(crate) fn report_is_stale(held: Option<&Process>, pid: u32) -> io::Result<bool> {
-    stale(held.map(Process::id), ProcessId::of(pid), pid)
+/// An exited process that is not yet reaped still has its identity, so the report is the old one; one
+/// that has been reaped is gone, and the report not yet updated. Another process at `pid` is the
+/// service's new process when `names` says the manager's own lookup names it, as for systemd, whose
+/// `MainPID` is cleared at the reap and which has no lookup to make. Otherwise it is a stranger that
+/// was given the number while a manager whose report lags (launchd) still shows it, and the report is
+/// stale. `held` is `None` when the process was gone before it could be opened.
+pub(crate) fn report_is_stale(
+    held: Option<&Process>,
+    pid: u32,
+    names: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
+    stale(held.map(Process::id), ProcessId::of(pid), pid, names)
 }
 
-/// [`report_is_stale`] over what was read.
-fn stale(held: Option<ProcessId>, now: Resolved<ProcessId>, pid: u32) -> io::Result<bool> {
+fn stale(
+    held: Option<ProcessId>,
+    now: Resolved<ProcessId>,
+    pid: u32,
+    names: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
     match now {
-        Resolved::Found(id) => Ok(Some(id) == held),
+        Resolved::Found(id) if Some(id) == held => Ok(true),
+        Resolved::Found(_) => Ok(!names()?),
         Resolved::Gone => Ok(true),
         Resolved::Unknown => Err(io::Error::other(format!(
             "the manager still reports process {pid}, and the OS refused to say whether it is the one that was killed"
