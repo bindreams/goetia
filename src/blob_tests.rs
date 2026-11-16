@@ -246,6 +246,24 @@ fn blob_without_type_is_a_service() {
     assert!(matches!(blob.spec, DaemonSpec::Service(_)));
 }
 
+/// `stop_action` defaults only for the schema before it existed: a blob that says it has one and has
+/// none is malformed, whatever its kind.
+#[skuld::test]
+fn a_blob_of_the_current_schema_without_a_stop_action_is_malformed() {
+    for spec in [minimal_spec(), task_with(None)] {
+        let encoded = tampered(&encode(&spec), |spec| {
+            spec.remove("stop_action");
+        });
+
+        let err = decode(&encoded).unwrap_err();
+
+        assert!(
+            matches!(err, Error::Blob { .. }) && err.to_string().contains("stop_action"),
+            "{err:?}"
+        );
+    }
+}
+
 #[skuld::test]
 fn schema_0_is_refused_as_unsupported() {
     let mut value: Value = serde_json::from_slice(&BASE64.decode(encode(&minimal_spec())).unwrap()).unwrap();
@@ -864,12 +882,15 @@ fn the_stop_action_is_written_as_a_signal_name_and_whole_seconds() {
 #[skuld::test]
 fn a_blob_written_before_stop_action_reads_as_the_default() {
     for spec in [minimal_spec(), task_with(Some("30 3 * * *"))] {
-        let old = tampered(&encode(&spec), |object| {
-            assert!(object.remove("stop_action").is_some());
-        });
-        let blob = decode(&old).expect("a blob without `stop_action` is an old blob, not a damaged one");
+        let mut value: Value = serde_json::from_slice(&BASE64.decode(encode(&spec)).unwrap()).unwrap();
+        value["schema"] = Value::from(1);
+        assert!(value["spec"].as_object_mut().unwrap().remove("stop_action").is_some());
+        let old = BASE64.encode(serde_json::to_vec(&value).unwrap());
+
+        let blob = decode(&old).expect("a blob of schema 1 has no `stop_action`, and is not a damaged one");
+
         assert_eq!(blob.spec, spec);
-        assert_eq!(blob.schema, SCHEMA);
+        assert_eq!(blob.schema, 1);
     }
 }
 

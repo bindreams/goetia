@@ -56,6 +56,10 @@ pub const SCHEMA: u32 = 2;
 /// the default.
 pub const OLDEST_SCHEMA: u32 = 1;
 
+/// The first schema whose blobs carry `stop_action`: one of that schema without it is malformed, and
+/// only an older blob reads as the default.
+const STOP_ACTION_SCHEMA: u32 = 2;
+
 /// The literal value every generated artifact's marker carries, byte-exact
 /// per the Global Constraints (`Marker`, `Schema`, `Version`, `Spec`).
 pub const MARKER: &str = "goetia";
@@ -97,12 +101,15 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
     // The schema is read before the rest: a later schema may reshape or add to any other member.
-    if let Some(found) = value.get("schema").and_then(Value::as_u64)
-        && !(u64::from(OLDEST_SCHEMA)..=u64::from(SCHEMA)).contains(&found)
-    {
-        return Err(Error::blob(format!(
-            "unsupported blob schema {found} (this build of goetia understands schemas {OLDEST_SCHEMA} to {SCHEMA})",
-        )));
+    if let Some(found) = value.get("schema").and_then(Value::as_u64) {
+        if !(u64::from(OLDEST_SCHEMA)..=u64::from(SCHEMA)).contains(&found) {
+            return Err(Error::blob(format!(
+                "unsupported blob schema {found} (this build of goetia understands schemas {OLDEST_SCHEMA} to {SCHEMA})",
+            )));
+        }
+        if found >= u64::from(STOP_ACTION_SCHEMA) && value.pointer("/spec/stop_action").is_none() {
+            return Err(Error::blob(format!("a blob of schema {found} has no `stop_action`")));
+        }
     }
     let envelope: WireEnvelope =
         serde_json::from_value(value).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
