@@ -5,6 +5,7 @@ use std::io;
 use std::path::PathBuf;
 
 use tempfile::TempDir;
+use windows::Win32::System::Time::TIME_ZONE_INFORMATION;
 
 use super::TaskSnapshot;
 use super::api::Instance;
@@ -20,6 +21,16 @@ use crate::blob::Blob;
 use crate::elevation::test_support::process_user_sid;
 use crate::manager::budget::Deadline;
 use crate::spec::{DaemonSpec, Id};
+
+/// A zone with no change of clocks, `utc_offset_hours` east of UTC: the offset of a conversion that a
+/// test pins, where the machine's own zone is whatever the runner has.
+pub(super) fn fixed_zone(utc_offset_hours: i32) -> TIME_ZONE_INFORMATION {
+    TIME_ZONE_INFORMATION {
+        // `Bias` is the minutes to add to local time to get UTC: west of it is positive.
+        Bias: -utc_offset_hours * 60,
+        ..TIME_ZONE_INFORMATION::default()
+    }
+}
 
 pub(super) fn id() -> Id {
     Id::try_from("nightly").unwrap()

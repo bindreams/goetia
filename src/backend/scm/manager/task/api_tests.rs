@@ -5,8 +5,7 @@ use super::*;
 /// The OLE date of 1970-01-01 00:00.
 const OLE_UNIX_EPOCH: f64 = 25569.0;
 
-/// How far a local date may sit from the same digits read as UTC: the widest zone offset.
-const WIDEST_ZONE: Duration = Duration::from_secs(15 * 3600);
+use super::super::support::fixed_zone;
 
 fn apart(a: std::time::SystemTime, b: std::time::SystemTime) -> Duration {
     a.duration_since(b).unwrap_or_else(|e| e.duration())
@@ -28,15 +27,21 @@ fn ole_date_maps_the_sentinels_m1_measured_to_none() {
     assert_eq!(ole_date(f64::NEG_INFINITY), None);
 }
 
-// A zone-wide window: on a runner whose zone is UTC this cannot tell a local reading from a UTC one.
+/// A COM date is a local civil time: the same digits are other instants in other zones, and the machine's
+/// zone is whatever the runner has, so the offset is pinned in zones the test names.
 #[skuld::test]
-fn ole_date_lands_within_a_zone_of_the_digits_read_as_utc() {
-    let read = ole_date(OLE_UNIX_EPOCH + 18_000.5).expect("a date after the sentinel is a time");
-
+fn an_ole_date_is_read_as_a_local_time_in_the_zone_it_is_given() {
+    let date = OLE_UNIX_EPOCH + 18_000.5;
     let as_utc = UNIX_EPOCH + Duration::from_secs(18_000 * 86_400 + 43_200);
-    assert!(
-        apart(read, as_utc) <= WIDEST_ZONE,
-        "{read:?} is too far from {as_utc:?}"
+
+    assert_eq!(ole_date_in(Some(&fixed_zone(0)), date), Some(as_utc));
+    assert_eq!(
+        ole_date_in(Some(&fixed_zone(-5)), date),
+        Some(as_utc + Duration::from_secs(5 * 3600))
+    );
+    assert_eq!(
+        ole_date_in(Some(&fixed_zone(9)), date),
+        Some(as_utc - Duration::from_secs(9 * 3600))
     );
 }
 

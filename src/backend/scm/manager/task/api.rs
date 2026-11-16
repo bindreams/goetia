@@ -9,10 +9,11 @@
 use std::time::SystemTime;
 
 use windows::Win32::Foundation::{SCHED_E_TASK_DISABLED, SCHED_E_TASK_NOT_RUNNING, SYSTEMTIME};
+use windows::Win32::System::Time::TIME_ZONE_INFORMATION;
 use windows::Win32::System::Variant::VariantTimeToSystemTime;
 use windows::core::HRESULT;
 
-use super::clock::local_to_system;
+use super::clock::local_to_system_in;
 use crate::backend::scm::instance::{InstanceId, TaskAccount, TaskPath};
 use crate::error::{Error, Result};
 
@@ -155,6 +156,11 @@ const NO_DATE: f64 = 36494.0;
 /// date" (CI's first read of `LastRunTime`); OLE date zero (1899-12-30) is the same absence in
 /// the other places COM uses one. Both, and what is not a date at all, are `None`.
 pub(crate) fn ole_date(date: f64) -> Option<SystemTime> {
+    ole_date_in(None, date)
+}
+
+/// [`ole_date`] in `zone`, or in the machine's zone for `None`.
+fn ole_date_in(zone: Option<&TIME_ZONE_INFORMATION>, date: f64) -> Option<SystemTime> {
     if !date.is_finite() || date <= 0.0 || date == NO_DATE {
         return None;
     }
@@ -163,7 +169,7 @@ pub(crate) fn ole_date(date: f64) -> Option<SystemTime> {
     if unsafe { VariantTimeToSystemTime(date, &mut local) } == 0 {
         return None;
     }
-    local_to_system(&local)
+    local_to_system_in(zone, &local)
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 #[cfg(any(test, feature = "testing"))]
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
-use windows::Win32::System::Time::{SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime};
+use windows::Win32::System::Time::{SystemTimeToFileTime, TIME_ZONE_INFORMATION, TzSpecificLocalTimeToSystemTime};
 
 /// 100 ns ticks from 1601-01-01, the epoch of a `FILETIME`, to 1970-01-01.
 const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
@@ -40,11 +40,16 @@ pub(crate) fn file_time_of(time: SystemTime) -> Option<FILETIME> {
 
 /// The instant the machine's civil time `local` is, or `None` for a time the OS cannot place.
 pub(super) fn local_to_system(local: &SYSTEMTIME) -> Option<SystemTime> {
+    local_to_system_in(None, local)
+}
+
+/// [`local_to_system`] in `zone`, or in the machine's zone for `None`.
+pub(super) fn local_to_system_in(zone: Option<&TIME_ZONE_INFORMATION>, local: &SYSTEMTIME) -> Option<SystemTime> {
     let mut utc = SYSTEMTIME::default();
     let mut file_time = FILETIME::default();
     // SAFETY: each pointer is to a live value of the type the call writes or reads.
     unsafe {
-        TzSpecificLocalTimeToSystemTime(None, local, &mut utc).ok()?;
+        TzSpecificLocalTimeToSystemTime(zone.map(std::ptr::from_ref), local, &mut utc).ok()?;
         SystemTimeToFileTime(&utc, &mut file_time).ok()?;
     }
     instant_of(file_time)

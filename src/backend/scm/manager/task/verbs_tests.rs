@@ -496,6 +496,9 @@ fn a_start_that_started_nothing_is_still_a_start_that_was_accepted() {
     }));
 
     scm(&fake).task_start(&id()).unwrap();
+
+    assert_eq!(fake.calls(), [Call::Run(PATH.to_owned())]);
+    fake.finish();
 }
 
 /// `restart` is a stop and then a start. The run that was stopped can still be listed, and its process

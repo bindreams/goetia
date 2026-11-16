@@ -1,5 +1,6 @@
 use std::time::{Duration, UNIX_EPOCH};
 
+use super::super::support::fixed_zone;
 use super::*;
 
 fn local(year: u16, month: u16, day: u16, hour: u16) -> SYSTEMTIME {
@@ -33,14 +34,22 @@ fn a_date_past_the_range_of_u64_nanoseconds_is_not_clamped() {
     assert!(since > Duration::from_secs(30_000_000_000), "{since:?}");
 }
 
-// A zone-wide window: on a runner whose zone is UTC this cannot tell a local reading from a UTC one.
+/// The machine's zone is whatever the runner has (UTC on CI), so the offset is pinned in zones the
+/// test names: 2024-01-15 12:00 as UTC is `1_705_320_000` seconds.
 #[skuld::test]
-fn local_to_system_lands_within_a_zone_of_the_digits_read_as_utc() {
-    // 2024-01-15 12:00 as UTC.
+fn a_local_time_is_read_in_the_zone_it_is_given() {
     let as_utc = UNIX_EPOCH + Duration::from_secs(1_705_320_000);
+    let noon = local(2024, 1, 15, 12);
 
-    let read = local_to_system(&local(2024, 1, 15, 12)).unwrap();
-
-    let apart = read.duration_since(as_utc).unwrap_or_else(|e| e.duration());
-    assert!(apart <= Duration::from_secs(15 * 3600), "{read:?}");
+    assert_eq!(local_to_system_in(Some(&fixed_zone(0)), &noon), Some(as_utc));
+    assert_eq!(
+        local_to_system_in(Some(&fixed_zone(-5)), &noon),
+        Some(as_utc + Duration::from_secs(5 * 3600)),
+        "noon at UTC-5 is 17:00 UTC"
+    );
+    assert_eq!(
+        local_to_system_in(Some(&fixed_zone(9)), &noon),
+        Some(as_utc - Duration::from_secs(9 * 3600)),
+        "noon at UTC+9 is 03:00 UTC"
+    );
 }
