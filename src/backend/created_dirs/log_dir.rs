@@ -25,7 +25,7 @@ use nix::sys::stat::{Mode, SFlag};
 use nix::unistd::{Gid, Group};
 
 use super::walk::{End, Entry, Step, entry};
-use super::{CreatedDirs, Plan};
+use super::{CreatedDirs, Plan, roots_text};
 use crate::backend::account::describe_uid;
 use crate::error::{Error, Result};
 
@@ -61,8 +61,9 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
             continue;
         };
         let kind = if step.is_link() { "symlink" } else { "directory" };
+        let roots = plan.found.under_root(&created.roots);
         let advice = match logs.file_name() {
-            Some(file) if leaf && ancestor_passes && matches!(plan.found.under_root(&created.roots, dir), Ok(true)) => {
+            Some(file) if leaf && ancestor_passes && roots.holds => {
                 format!(
                     "use a directory of its own, such as {}, or one that only root can change",
                     dir.join(app).join(file).display()
@@ -71,7 +72,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
             _ => format!(
                 "use a log directory that only root can change, under directories only root can change (a missing \
                  one is made under {}), or drop `logs:` to log to the journal",
-                created.roots_text()
+                roots_text(&roots)
             ),
         };
         return Err(Error::DirectoryRefused {

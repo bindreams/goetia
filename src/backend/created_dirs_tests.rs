@@ -559,19 +559,15 @@ fn create_skips_a_root_below_a_regular_file(#[fixture(root_dirs)] _root: &()) {
     assert!(refusal(&err).contains("create it first"), "{err:?}");
 }
 
-/// Whether a root holds the path does not depend on where it stands among the others. A root that is
-/// not there (missing, below a file, a symlink loop) holds nothing and is skipped; any other failure to
-/// open one is kept and fails the install only when no root holds the path, naming the root and the
-/// path, with the OS error as the source.
+/// A root that cannot be read for a reason other than being absent (here `EACCES`) is not skipped. The
+/// first root that holds the path decides it, wherever the unreadable one stands, and the roots after
+/// that one are not read. With no holder it fails the install, naming the root and the path, with the OS
+/// error as the source, and nothing is made.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn create_finds_a_root_that_holds_the_path_whatever_the_order_of_the_roots(#[fixture(root_dirs)] _root: &()) {
+fn create_finds_a_root_that_holds_the_path_whatever_the_order_of_the_unreadable_one(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let unreadable = layout.unreadable_root();
-    let missing = layout.base().join("nowhere");
-    let file_shaped = layout.broken_root();
-    let looped = layout.outside().join("loop");
-    symlink(&looped, &looped).unwrap();
     let holder = layout.system();
     let path = holder.join("a");
     let _as_a_stranger = Fsuid::set(STRANGER);
@@ -579,13 +575,11 @@ fn create_finds_a_root_that_holds_the_path_whatever_the_order_of_the_roots(#[fix
     let rows = [
         ("holder, unreadable", vec![holder.clone(), unreadable.clone()], true),
         ("unreadable, holder", vec![unreadable.clone(), holder.clone()], true),
-        ("missing, holder", vec![missing, holder.clone()], true),
-        ("file-shaped, holder", vec![file_shaped, holder.clone()], true),
-        ("loop, holder", vec![looped, holder], true),
         ("unreadable only", vec![unreadable.clone()], false),
     ];
     for (name, roots, holds) in rows {
-        let planned = CreatedDirs::under(roots).plan(&path);
+        let mut dirs = CreatedDirs::under(roots);
+        let planned = dirs.plan(&path);
         if holds {
             planned.unwrap_or_else(|e| panic!("{name}: {e:?}"));
             continue;
@@ -600,7 +594,45 @@ fn create_finds_a_root_that_holds_the_path_whatever_the_order_of_the_roots(#[fix
         assert!(what.contains(unreadable.to_str().unwrap()), "{name}: {what}");
         let os = source.downcast_ref::<std::io::Error>().expect("the error of the open");
         assert_eq!(os.raw_os_error(), Some(libc::EACCES), "{name}: {os:?}");
+
+        dirs.create(&path, None).expect_err(name);
+        assert!(!path.exists(), "{name}: nothing is made");
+        assert_eq!(leftovers(&holder), Vec::<String>::new(), "{name}: nor a temporary tree");
     }
+}
+
+/// `under_root` returns one reading of the roots: the first that holds the path decides and those after
+/// it are not read; the roots that exist, and the ones that could not be read with the errors.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn under_root_returns_what_it_read_stopping_at_the_root_that_holds_the_path(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let unreadable = layout.unreadable_root();
+    let missing = layout.base().join("nowhere");
+    let holder = layout.system();
+    let other = layout.outside();
+    let found = walk(&holder.join("a")).unwrap();
+    let _as_a_stranger = Fsuid::set(STRANGER);
+
+    let read = found.under_root(&[missing.clone(), unreadable.clone(), holder.clone(), other.clone()]);
+
+    assert!(read.holds);
+    assert_eq!(
+        read.existing,
+        [holder.clone()],
+        "the roots after the holder are not read"
+    );
+    assert_eq!(
+        read.unreadable.iter().map(|(root, _)| root).collect::<Vec<_>>(),
+        [&unreadable]
+    );
+    assert_eq!(read.unreadable[0].1, Errno::EACCES);
+
+    let read = found.under_root(&[unreadable.clone(), other.clone(), missing]);
+
+    assert!(!read.holds);
+    assert_eq!(read.existing, [other]);
+    assert_eq!(read.unreadable.len(), 1);
 }
 
 /// What the refusal says of where goetia makes directories lists the roots that exist, as an install
@@ -1107,6 +1139,30 @@ fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_han
     assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
 }
 
+/// The refusal of a plan that hands nothing over and one that hands a directory over, as it says the
+/// roles. When the plan that hands nothing over asked first, the one that hands over is refused: its
+/// path is, or lies above, a directory the other made or passes through. Otherwise the one that hands
+/// nothing over is refused: its path is, or lies in, `handed`, which the other hands over.
+fn assert_roles(why: &str, handed_refused: bool, handed: &Path) {
+    if handed_refused {
+        assert!(
+            why.contains(
+                "it is, or lies above, a directory that another path of the spec, which is not handed to an \
+                 account, made or passes through, and this path is to be handed to "
+            ),
+            "{why}"
+        );
+    } else {
+        let named = format!(
+            "it is, or lies in, {}, which another path of the spec hands to {}, and this path is not handed to an \
+             account: keep",
+            handed.display(),
+            describe_uid(STRANGER)
+        );
+        assert!(why.contains(&named), "{why}");
+    }
+}
+
 /// The conflict between a plan that hands a directory over and one that does not is the same whichever
 /// comes first: the directory, or one below it, is the account's, and so cannot be what the other plan
 /// keeps as root's. Each order is refused and names the path of the plan that asks second, and the account;
@@ -1142,6 +1198,7 @@ fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_sh
                 why.contains(&format!("uid {STRANGER}")) && !why.contains("  "),
                 "{kept} {kept_first}: {why}"
             );
+            assert_roles(why, kept_first, &layout.system().join("a"));
             assert!(
                 !layout.system().join("a").exists(),
                 "{kept} {kept_first}: nothing is placed"
@@ -1192,6 +1249,7 @@ fn a_directory_a_plan_hands_over_is_refused_when_one_that_hands_nothing_over_pas
             let second = if kept_second { kept } else { "a/b" };
             assert_eq!(path, &layout.system().join(second), "{kept} {order:?}: {why}");
             assert!(why.contains(&format!("uid {STRANGER}")), "{kept} {order:?}: {why}");
+            assert_roles(why, !kept_second, &layout.system().join("a/b"));
             drop(dirs);
             assert_eq!(
                 leftovers(&layout.system()),

@@ -7,9 +7,10 @@
 //!   itself makes directories in (`LogsDirectory=` and its kin). Anywhere else it is an error that
 //!   says to create it first: goetia makes nothing in a user's home or a prefix of its own. A path
 //!   that exists whole is used as it is, wherever it is and whoever owns it. A root that is not there
-//!   (`ENOENT`, `ENOTDIR`, `ELOOP`) holds nothing and is skipped. Every root is read, in any order, and
-//!   one that holds the path decides it; one that cannot be read for any other reason fails the install,
-//!   naming the root and the path, only when none holds it.
+//!   (`ENOENT`, `ENOTDIR`, `ELOOP`) holds nothing and is skipped. The roots are read in order and the
+//!   first that holds the path decides it; the roots after it are not read. One that cannot be read
+//!   for any other reason fails the install, naming the root and the path, only when none that was
+//!   read holds it.
 //! - **Walk.** Where something is missing, [`walk()`] resolves the path on descriptors, and every
 //!   directory it passed through must be owned by root: root does not create inside a directory an
 //!   account owns. A symlink is judged by the directory that holds it, not by its owner: the owner of
@@ -71,7 +72,7 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
 #[cfg(target_os = "linux")]
 pub(crate) use log_dir::refuse_writable_log_dir;
-use walk::{End, Step, Walk, existing_roots, open_beneath, walk};
+use walk::{End, RootsRead, Step, Walk, open_beneath, walk};
 
 use super::account::describe_uid;
 use super::{Settle, Standing};
@@ -201,6 +202,27 @@ fn fd_of<'a>(made: &'a [Made], parent: &'a Parent) -> Option<BorrowedFd<'a>> {
     }
 }
 
+/// Where a directory is made, for what is said of it, from one reading of the roots: those that exist,
+/// and a clause for each that could not be read, which is not among them.
+fn roots_text(read: &RootsRead) -> String {
+    let mut text = match read.existing.as_slice() {
+        [] => "any of the places goetia makes directories in".to_string(),
+        roots => roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    for (root, errno) in &read.unreadable {
+        text.push_str(&format!(
+            "; {} could not be read: {}",
+            root.display(),
+            io::Error::from(*errno)
+        ));
+    }
+    text
+}
+
 impl CreatedDirs {
     /// Where `self.made[index]` is on disk now, for what is said of it: at a temporary name if it is a
     /// tree's top not yet put in place, and below that name if it is inside such a tree.
@@ -226,12 +248,20 @@ impl CreatedDirs {
     pub(crate) fn plan(&self, dir: &Path) -> Result<Plan> {
         let found = walk(dir)?;
         if matches!(found.end, End::Missing { .. }) {
-            if !found.under_root(&self.roots, dir)? {
+            let read = found.under_root(&self.roots);
+            if !read.holds {
+                if let Some((root, errno)) = read.unreadable.first() {
+                    return Err(Error::os_at(
+                        format!("open the root {} to check whether it holds", root.display()),
+                        dir,
+                        io::Error::from(*errno),
+                    ));
+                }
                 return Err(Error::DirectoryRefused {
                     path: dir.to_path_buf(),
                     why: format!(
                         "it does not exist and is not under {}; create it first",
-                        self.roots_text()
+                        roots_text(&read)
                     ),
                 });
             }
@@ -243,17 +273,6 @@ impl CreatedDirs {
             }
         }
         Ok(Plan { found })
-    }
-
-    /// Where a directory is made, for what is said of it: the roots that exist.
-    fn roots_text(&self) -> String {
-        let roots: Vec<_> = existing_roots(&self.roots)
-            .map(|root| root.display().to_string())
-            .collect();
-        match roots.as_slice() {
-            [] => "any of the places goetia makes directories in".to_string(),
-            roots => roots.join(", "),
-        }
     }
 
     /// Make what the plans say is missing, root's, each under the directory its plan holds, then hand
@@ -412,15 +431,16 @@ impl CreatedDirs {
     /// nothing over and that plan handed `dir` to an account, this path is it or lies in it: the other half
     /// of [`hand_to_one_owner`](Self::hand_to_one_owner)'s refusal, so that the two orders agree. A plan
     /// that hands nothing over is recorded as having passed, for the same refusal from the other side.
-    /// `path` is the asking plan's own, which the refusal names.
+    /// `path` is the asking plan's own, which the refusal names with the directory it is or lies in.
     fn reach(&mut self, dir: usize, path: &Path, hand_to: Option<Owner>) -> Result<usize> {
         let made = &mut self.made[dir];
         match (hand_to, made.hand) {
             (None, Some(owner)) => Err(Error::DirectoryRefused {
                 path: path.to_path_buf(),
                 why: format!(
-                    "it is to be handed to {}, and another path of the spec, which is not handed to an account, \
-                     is it or lies in it: keep the two paths apart",
+                    "it is, or lies in, {}, which another path of the spec hands to {}, and this path is not handed \
+                     to an account: keep the two paths apart",
+                    made.path.display(),
                     describe_uid(owner.uid.as_raw())
                 ),
             }),

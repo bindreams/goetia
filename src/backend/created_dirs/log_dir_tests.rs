@@ -235,20 +235,35 @@ fn a_skipped_root_leaves_the_log_refusal_to_the_roots_that_remain(#[fixture(root
 }
 
 /// A root that cannot be read does not hide the refusal: the log is refused with the advice that does
-/// not depend on the roots.
+/// not depend on the roots. The roots listed are those that could be read, and the one that could not
+/// is said so in a clause of its own, with the OS error.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn a_root_that_cannot_be_read_leaves_the_log_refused_with_the_generic_advice(#[fixture(root_dirs)] _root: &()) {
+fn a_root_that_cannot_be_read_leaves_the_log_refused_with_the_generic_advice_and_is_named_apart(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
     let unreadable = layout.unreadable_root();
-    let dir = layout.system().join("opt/logs");
+    let dir = layout.outside().join("opt/logs");
     fs::create_dir_all(&dir).unwrap();
     chmod(&dir, 0o775);
     let _as_a_stranger = Fsuid::set(STRANGER);
 
-    let why = refused_by(&CreatedDirs::under(vec![unreadable]), &dir.join("app.log"));
+    let why = refused_by(
+        &CreatedDirs::under(vec![unreadable.clone(), layout.system()]),
+        &dir.join("app.log"),
+    );
 
     assert!(!why.contains("such as") && why.contains("journal"), "{why}");
+    assert!(
+        why.contains(&format!(
+            "under {}; {} could not be read: Permission denied (os error 13)",
+            layout.system().display(),
+            unreadable.display()
+        )),
+        "{why}"
+    );
+    assert_eq!(why.matches(unreadable.to_str().unwrap()).count(), 1, "{why}");
 }
 
 /// Trusting the group of a root-owned ancestor does not trust everyone, or an account.

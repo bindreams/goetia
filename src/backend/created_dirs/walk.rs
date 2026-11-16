@@ -29,42 +29,49 @@ pub(super) struct Walk {
     chain: Vec<(libc::dev_t, libc::ino_t)>,
 }
 
-impl Walk {
-    /// Whether one of `roots` is among the directories the path resolved through, `spec` being the
-    /// path the walk was asked about. Every root is read, in any order, and one that holds the path is
-    /// the answer. They are opened here, and only here: a path that exists whole is used wherever it is,
-    /// so what a root is does not matter until a component is missing. A root that is not there (see
-    /// [`open_root`]) holds nothing and is skipped. Any other failure to open one is kept, and fails the
-    /// install, naming the root and `spec`, only if no root holds the path: goetia cannot tell.
-    pub(super) fn under_root(&self, roots: &[PathBuf], spec: &Path) -> Result<bool> {
-        let mut failed = None;
-        for root in roots {
-            match open_root(root) {
-                Ok(Some(id)) if self.chain.contains(&id) => return Ok(true),
-                Ok(_) => {}
-                Err(errno) => {
-                    failed.get_or_insert_with(|| {
-                        Error::os_at(
-                            format!("open the root {} to check whether it holds", root.display()),
-                            spec,
-                            io::Error::from(errno),
-                        )
-                    });
-                }
-            }
-        }
-        failed.map_or(Ok(false), Err)
-    }
+/// What was read of the roots to tell whether one holds a path: see [`Walk::under_root`].
+pub(super) struct RootsRead {
+    /// Whether a root holds the path.
+    pub(super) holds: bool,
+    /// The roots read that exist.
+    pub(super) existing: Vec<PathBuf>,
+    /// The roots that could not be read, each with the error of its open.
+    pub(super) unreadable: Vec<(PathBuf, Errno)>,
 }
 
-/// `roots` as an install can use them: those that are there, or whose state could not be read.
-pub(super) fn existing_roots(roots: &[PathBuf]) -> impl Iterator<Item = &PathBuf> {
-    roots.iter().filter(|root| !matches!(open_root(root), Ok(None)))
+impl Walk {
+    /// Read `roots` in order, and say whether one is among the directories the path resolved through.
+    /// The first root that holds the path decides, and the roots after it are not read. They are opened
+    /// here, and only here: a path that exists whole is used wherever it is, so what a root is does not
+    /// matter until a component is missing. A root that is not there (see [`open_system_root`]) holds
+    /// nothing and is not listed. Any other failure to open one is kept with its error: goetia cannot
+    /// tell whether that root holds the path, which matters only if none that was read does.
+    pub(super) fn under_root(&self, roots: &[PathBuf]) -> RootsRead {
+        let mut read = RootsRead {
+            holds: false,
+            existing: Vec::new(),
+            unreadable: Vec::new(),
+        };
+        for root in roots {
+            match open_system_root(root) {
+                Ok(Some(id)) => {
+                    read.existing.push(root.clone());
+                    if self.chain.contains(&id) {
+                        read.holds = true;
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(errno) => read.unreadable.push((root.clone(), errno)),
+            }
+        }
+        read
+    }
 }
 
 /// The device and inode of `root`, or `None` if it is not there: it, or a directory above it, is
 /// missing or a file (`ENOENT`, `ENOTDIR`), or it is a symlink loop (`ELOOP`).
-fn open_root(root: &Path) -> std::result::Result<Option<(libc::dev_t, libc::ino_t)>, Errno> {
+fn open_system_root(root: &Path) -> std::result::Result<Option<(libc::dev_t, libc::ino_t)>, Errno> {
     match open(root, search_directory(), Mode::empty()).and_then(|fd| fstat(&fd)) {
         Ok(stat) => Ok(Some((stat.st_dev, stat.st_ino))),
         Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => Ok(None),
