@@ -1615,7 +1615,9 @@ impl Drop for Immutable {
 
 /// The plist cannot be replaced, after the directories for the new `cwd` and `logs` were made: none of
 /// them is left, and one that existed before stays. This is the case the undo is for: the write fails
-/// with the old plist standing, which names none of the new directories.
+/// with the old plist standing, which names none of the new directories. The log directory is made
+/// below one of the test's own, since `/Library/Logs` is writable by the `admin` group, and a directory
+/// whose parent another can write is left, not removed by name.
 #[skuld::test]
 fn an_install_whose_plist_write_fails_removes_every_directory_it_made(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
@@ -1626,10 +1628,11 @@ fn an_install_whose_plist_write_fails_removes_every_directory_it_made(#[fixture(
     // Declared after the guard, so it drops first: the guard's cleanup needs the plist removable.
     let _immutable = Immutable::new(staging_path(&id));
     let cwd = under_state(&id, "write-fails");
-    let logs_parent = under_logs(&id, "write-fails");
+    let logs_root = under_logs(&id, "write-fails");
+    let logs_parent = logs_root.join("logs");
     let logs = logs_parent.join("out.log");
     let _cleanup_cwd = DirGuard::new(cwd.clone());
-    let _cleanup_logs_parent = DirGuard::new(logs_parent.clone());
+    let _cleanup_logs_root = DirGuard::new(logs_root.clone());
     let mut fields = service_fields(spec);
     fields.common.cwd = Some(cwd.clone());
     fields.common.logs = Some(logs.clone());

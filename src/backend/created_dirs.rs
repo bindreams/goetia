@@ -16,21 +16,27 @@
 //! - **Making.** Each component is made `0700` by `mkdirat` under the descriptor of the one above,
 //!   and recorded at once, so that one that is then refused is removed too. It must be root's, a
 //!   directory, and empty (a link count or a mode says nothing a file system keeps the same), and is
-//!   then made `0755`. A parent that another can write (Debian's `/var/log` is `root:syslog 0775`) can
-//!   at most swap in an empty directory of root's, which that group could already remove.
+//!   then made `0755`.
 //! - **Handing over.** Only the deepest directory of a path, and only where the daemon's account has
 //!   to write it ([`Owner`]), is given to the account, once everything is made and before
 //!   [`make`](CreatedDirs::make) returns: the definition can go live as soon as the write that
-//!   follows starts, and a run then finds every directory in its final state.
+//!   follows starts, and a run then finds every directory in its final state. A directory one plan
+//!   made, which it hands to nobody, is never handed over by another plan that names it (that plan's
+//!   path is then the same directory, or above it, whatever its names say): that is a refusal.
 //!
 //! Every refusal comes first. [`plan`](CreatedDirs::plan) reads and judges a path and changes
 //! nothing; a caller that has more to judge (the log directory, which only the caller knows is
 //! one) does it on the plans, and only then does [`make`](CreatedDirs::make) change anything. A
-//! failure after that point is an I/O error, and undoes what was made.
+//! failure after that point is an I/O error, and undoes what was made, as is the one refusal only what
+//! is made can show: two plans whose paths are one directory (see "Handing over").
 //!
 //! An install that fails, or leaves a definition other than the one it wrote, removes what it made,
 //! deepest first, by descriptor: an entry is unlinked only if it is still the directory that was made
-//! and is empty, and a symlink is never followed. One that could not be opened when it was made cannot
+//! and is empty, and a symlink is never followed. An entry is unlinked by its name in its parent, so
+//! only where no one but root can write the parent (root's, no write for the group or everyone, or
+//! sticky): where another can, that one could put another directory at the name between the check and
+//! the unlink, and the directory is left, and reported (Debian's `/var/log` is `root:syslog 0775`, and
+//! macOS's `/Library/Logs` is `root:admin 0775`). One that could not be opened when it was made cannot
 //! be told from what is at its name later: it is left, and reported. So is one that was handed over and
 //! that the account has since written into: it is the account's now, and is not emptied.
 
@@ -50,9 +56,10 @@ use nix::sys::stat::{FileStat, Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
 #[cfg(target_os = "linux")]
-pub(crate) use log_dir::{log_in_handed_dir, refuse_writable_log_dir};
+pub(crate) use log_dir::refuse_writable_log_dir;
 use walk::{End, Entry, Walk, entry, open_beneath, require_directory, walk};
 
+use super::account::describe_uid;
 use super::{Settle, Standing};
 use crate::error::{Error, Result};
 
@@ -110,18 +117,15 @@ pub(crate) struct Plan {
     found: Walk,
 }
 
+/// The plans of one install and whom each plan's deepest directory is handed to: what
+/// [`make`](CreatedDirs::make) takes.
+pub(crate) type Planned = Vec<(Plan, Option<Owner>)>;
+
 impl Plan {
     /// Whether `make` would make any of it: the path does not exist.
     #[cfg(target_os = "linux")]
     pub(crate) fn makes(&self) -> bool {
         matches!(self.found.end, End::Missing { .. })
-    }
-
-    /// Whether the directory this plan makes is at or under the one `outer` makes: a path that exists
-    /// is neither.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn is_at_or_under(&self, outer: &Plan) -> bool {
-        self.found.is_at_or_under_missing(&outer.found)
     }
 }
 
@@ -137,6 +141,9 @@ struct Made {
     held: Option<Held>,
     /// Whom it is to be handed to, if anyone.
     hand: Option<Owner>,
+    /// Whom the plan that made it hands its deepest directory to: `None` for a plan that hands nothing
+    /// over, which another plan does not hand this to either.
+    plan_owner: Option<Owner>,
     /// Whether it has been: the account may write in it from then on.
     handed: bool,
     /// Judged and given its mode. One that is not is left behind by a keep, and named.
@@ -223,7 +230,7 @@ impl CreatedDirs {
     /// each plan's deepest directory to the owner it names, if it names one. Nothing is handed over until
     /// everything is made, so that root never makes a directory inside one an account owns. A plan whose
     /// path exists needs nothing. On an error, what was made is the guard's to remove.
-    pub(crate) fn make(&mut self, plans: Vec<(Plan, Option<Owner>)>) -> Result<()> {
+    pub(crate) fn make(&mut self, plans: Planned) -> Result<()> {
         for (plan, hand_to) in plans {
             self.make_missing(plan.found, hand_to)?;
         }
@@ -261,6 +268,7 @@ impl CreatedDirs {
                         parent,
                         held,
                         hand: if last { hand_to } else { None },
+                        plan_owner: hand_to,
                         handed: false,
                         ready: false,
                     });
@@ -284,14 +292,31 @@ impl CreatedDirs {
                     }
                     if last {
                         let stat = require_directory(parent_fd, name, &found, path)?;
-                        // One an earlier plan of this call made is this plan's to hand over, too.
+                        // One an earlier plan of this call made, by identity: names can differ and be one
+                        // directory (a file system that ignores case).
                         if let Some(ours) = self.made.iter_mut().find(|made| {
                             made.held
                                 .as_ref()
                                 .is_some_and(|held| held.dev == stat.st_dev && held.ino == stat.st_ino)
                         }) && ours.hand.is_none()
+                            && let Some(owner) = hand_to
                         {
-                            ours.hand = hand_to;
+                            // A plan that hands over is this one's to hand over too. One that hands
+                            // nothing is not: that directory is root's, and a path that is to be the
+                            // account's cannot be it or hold it.
+                            if ours.plan_owner.is_none() {
+                                return Err(Error::DirectoryRefused {
+                                    path: path.clone(),
+                                    why: format!(
+                                        "it is, or lies above, a directory this install made for another path of \
+                                         the spec, which is not handed to an account, and this path is to be \
+                                         handed to {} (two names can be one directory on a file system that \
+                                         ignores case): keep the two paths apart",
+                                        describe_uid(owner.uid.as_raw())
+                                    ),
+                                });
+                            }
+                            ours.hand = Some(owner);
                         }
                         return Ok(());
                     }
@@ -336,21 +361,30 @@ impl CreatedDirs {
         Ok(())
     }
 
-    /// Let go of everything made: the directories stay. One that was not verified when it was made
-    /// (refused, or never opened) is named in what is returned, for the caller to report, since it is
-    /// left as it is.
+    /// Let go of everything made: the directories stay. One that is ready and marked for an owner and
+    /// not yet handed to it (a `make` that did not finish) is handed over first, as `make` would have.
+    /// Every one that stays other than as it should (not verified when it was made, refused or never
+    /// opened; or one that cannot be handed over) is named in what is returned, for the caller to
+    /// report, since it is left as it is.
     fn keep(&mut self) -> Vec<String> {
-        let notes = self
-            .made
-            .iter()
-            .filter(|made| !made.ready)
-            .map(|made| {
-                format!(
+        let mut notes = Vec::new();
+        for made in &self.made {
+            if !made.ready {
+                notes.push(format!(
                     "{}, which the install created, was never verified: it is left behind",
                     made.path.display()
-                )
-            })
-            .collect();
+                ));
+            } else if let (false, Some(owner), Some(held)) = (made.handed, made.hand, &made.held)
+                && let Err(e) = fchown(&held.dir, Some(owner.uid), owner.gid)
+            {
+                notes.push(format!(
+                    "{}, which the install created, could not be handed over to uid {}: {e}; it is left \
+                     owned by root",
+                    made.path.display(),
+                    owner.uid
+                ));
+            }
+        }
         self.made.clear();
         notes
     }
@@ -362,9 +396,12 @@ impl CreatedDirs {
         }
     }
 
-    /// Remove `self.made[index]` from its parent if the name still refers to the directory that was
-    /// made and it is empty. A directory that is gone is removed; one that has gained content stays,
-    /// without a word, unless it was handed over: that is the account's data, and is named.
+    /// Remove `self.made[index]` from its parent if the parent can be written by no one but root, the
+    /// name still refers to the directory that was made and it is empty. A directory is unlinked by
+    /// name, so where another can write the parent, they can put a different directory at the name
+    /// between the check and the unlink: that one is left and named. A directory that is gone is
+    /// removed; one that has gained content stays, without a word, unless it was handed over: that is the
+    /// account's data, and is named.
     fn remove(&self, index: usize) -> std::result::Result<(), String> {
         let made = &self.made[index];
         let parent = fd_of(&self.made, &made.parent).ok_or("the directory above it was not held")?;
@@ -372,6 +409,14 @@ impl CreatedDirs {
             .held
             .as_ref()
             .ok_or("it could not be opened when it was made, so what is at its name cannot be told from it")?;
+        let above = fstat(parent).map_err(|e| e.to_string())?;
+        if !only_root_can_change(&above) {
+            return Err(
+                "the directory above it can be written by others, who could put another directory at its name \
+                 between a check and the removal, so it is left"
+                    .to_string(),
+            );
+        }
         match fstatat(parent, made.name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(now) if now.st_dev == held.dev && now.st_ino == held.ino => {}
             Ok(_) => return Err("it is no longer the directory the install made".to_string()),
@@ -399,6 +444,14 @@ impl CreatedDirs {
             }
         }
     }
+}
+
+/// Whether nobody but root can add, remove or rename an entry of `dir`: root owns it and neither the
+/// group nor everyone can write it, or it is sticky, which keeps others from touching an entry that
+/// is root's.
+fn only_root_can_change(dir: &FileStat) -> bool {
+    let mode = dir.st_mode as libc::mode_t;
+    dir.st_uid == 0 && (mode & libc::S_ISVTX != 0 || mode & (libc::S_IWGRP | libc::S_IWOTH) == 0)
 }
 
 /// Whether a directory just made is root's, a directory and empty: the checks that say it is the one
@@ -453,8 +506,9 @@ impl Settle for CreatedDirs {
 impl Drop for CreatedDirs {
     /// Removes what was not kept: see [`undo`](CreatedDirs::undo). A panic may come after the
     /// definition was written, which leaves its standing as unknown as an unreadable one does, so the
-    /// directories are kept (they were handed over when they were made). A step that fails is reported
-    /// on stderr, and a failed report is ignored: this never panics.
+    /// directories are kept, and any that is ready and not yet handed to its owner is handed over, as
+    /// [`keep`](CreatedDirs::keep) does. A step that fails is reported on stderr, and a failed report is
+    /// ignored: this never panics.
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.keep_and_report();

@@ -13,8 +13,8 @@ use std::os::fd::AsFd as _;
 use nix::sys::stat::SFlag;
 use nix::unistd::{Gid, Group};
 
+use super::Plan;
 use super::walk::{End, Entry, Step, entry};
-use super::{Owner, Plan};
 use crate::backend::account::describe_uid;
 use crate::error::{Error, Result};
 
@@ -74,20 +74,6 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan) -> Result<()> {
 const LED_ASTRAY: &str = "make root's open of the log (systemd opens it before it drops privileges, and follows a \
                           symlink) write any file; use a log directory that only root can change, under \
                           directories only root can change";
-
-/// The refusal of a log in `cwd`, or under it, which the install is about to make and hand to `owner`:
-/// from then on it is the account's.
-pub(crate) fn log_in_handed_dir(logs: &Path, cwd: &Path, owner: Owner) -> Error {
-    Error::DirectoryRefused {
-        path: logs.parent().unwrap_or(logs).to_path_buf(),
-        why: format!(
-            "the directory {} will belong to {}, to whom this install hands it once it has made every \
-            directory, who could {LED_ASTRAY}",
-            cwd.display(),
-            describe_uid(owner.uid.as_raw()),
-        ),
-    }
-}
 
 /// Who besides root can change what `step` passed, if anyone: its owner, or the group or everyone
 /// who can write a directory. The sticky bit excuses that unless `leaf`, the directory the log lands in.

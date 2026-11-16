@@ -3,7 +3,7 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use super::*;
 use crate::backend::created_dirs::CreatedDirs;
-use crate::backend::created_dirs::created_dirs_tests::{Layout, STRANGER, give_to_a_stranger, stranger_owner};
+use crate::backend::created_dirs::created_dirs_tests::{Layout, STRANGER, give_to_a_stranger};
 use crate::testing::elevation::ELEVATED;
 
 fn chmod(path: &Path, mode: u32) {
@@ -239,24 +239,6 @@ fn a_log_an_account_owns_is_refused_naming_the_account() {
         why.contains(logs.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
         "{why}"
     );
-}
-
-// What the install is about to hand over ------------------------------------------------------------------------------
-
-/// The directory `cwd` is handed to an account once everything is made, so a log in it, or under it,
-/// is refused, and says why.
-#[skuld::test(labels = [ELEVATED])]
-fn the_refusal_of_a_log_in_the_directory_to_be_handed_names_the_directory_and_the_account() {
-    let layout = Layout::new();
-    let cwd = layout.system().join("work");
-
-    let Error::DirectoryRefused { why, .. } = log_in_handed_dir(&cwd.join("app.log"), &cwd, stranger_owner()) else {
-        panic!("a directory is refused")
-    };
-
-    assert!(why.contains(cwd.to_str().unwrap()) && why.contains("hand"), "{why}");
-    assert!(why.contains(&format!("uid {STRANGER}")), "{why}");
-    assert!(!why.contains("  "), "{why}");
 }
 
 #[skuld::test(labels = [ELEVATED])]

@@ -77,7 +77,7 @@ use cosca::Process;
 use crate::backend::account::{Account, Unlisted, resolve_account};
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
-use crate::backend::created_dirs::CreatedDirs;
+use crate::backend::created_dirs::{CreatedDirs, Planned};
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service, process};
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
@@ -462,13 +462,14 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).map_err(|e| Error::os_at("chmod", dir, e))
 }
 
-/// Make `cwd` itself and the parent of `logs` (a file path; launchd creates the log file but not
-/// its directory) where they are missing, world-readable and searchable, and hand each to `account`
-/// before this returns: the job can run as soon as the write that follows loads it.
+/// What `prepare_parent_dirs` would make, read and judged, nothing made: `cwd` itself and the parent of
+/// `logs` (a file path; launchd creates the log file but not its directory), each with the account it
+/// is to be handed to, which root is not.
 /// launchd opens the log and enters `cwd` as the job's user, so a non-root daemon whose
 /// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a missing
-/// `WorkingDirectory` refuses the job outright. Both are judged before either is made.
-fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
+/// `WorkingDirectory` refuses the job outright. Every refusal is here, before anything is made or
+/// anything else is changed.
+fn plan_parent_dirs(spec: &DaemonSpec, account: &Account, created: &CreatedDirs) -> Result<Planned> {
     let owner = account.owner()?;
     let parent_of_logs = spec
         .common()
@@ -478,8 +479,16 @@ fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut Creat
         .filter(|parent| !parent.as_os_str().is_empty());
     let mut plans = Vec::new();
     for dir in spec.common().cwd.as_deref().into_iter().chain(parent_of_logs) {
-        plans.push((created.plan(dir)?, Some(owner)));
+        plans.push((created.plan(dir)?, owner));
     }
+    Ok(plans)
+}
+
+/// Make `cwd` itself and the parent of `logs` where they are missing, world-readable and searchable,
+/// and hand each to `account` before this returns: the job can run as soon as the write that follows
+/// loads it. Both are judged before either is made: see `plan_parent_dirs`.
+fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
+    let plans = plan_parent_dirs(spec, account, created)?;
     created.make(plans)
 }
 

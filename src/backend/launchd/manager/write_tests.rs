@@ -622,6 +622,80 @@ fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
     assert!(cwd.is_dir(), "the directory the spec names was made");
 }
 
+/// `spec` run as `user` in `cwd`.
+fn in_cwd(spec: DaemonSpec, cwd: &Path, user: User) -> DaemonSpec {
+    let DaemonSpec::Task(task) = spec else {
+        unreachable!("`task_spec` builds a task");
+    };
+    let mut fields = task.into_fields();
+    fields.common.cwd = Some(cwd.to_path_buf());
+    fields.common.user = user;
+    DaemonSpec::from(TaskSpec::new(fields).unwrap())
+}
+
+/// Every refusal about the spec's directories comes before the first action: an update whose `cwd` is
+/// refused (it does not exist and is under no root) sends launchd nothing, so the timer it would have
+/// booted out is still loaded.
+#[skuld::test]
+fn an_update_whose_directories_are_refused_sends_launchd_nothing() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new([]);
+    let spec = in_cwd(
+        task_spec(Some(SCHEDULE)),
+        Path::new("/goetia-no-such-root/cwd"),
+        User::Root,
+    );
+
+    let e = rewrite(&tree, &fake, &spec).expect_err("the cwd is made under no root");
+
+    assert!(matches!(e, Error::DirectoryRefused { .. }), "{e:?}");
+    fake.assert_spent("a refused update sends nothing");
+    assert_eq!(text_at(&tree, true, ID), old.job);
+    assert_eq!(text_at(&tree, true, &timer_name()), old.timer.unwrap());
+}
+
+/// uid 0 is handed nothing: a directory made for a task that runs as root keeps the group it was made
+/// with (a new directory takes its parent's), where `chown(0, 0)` would make it wheel's.
+#[skuld::test(labels = [ELEVATED])]
+fn the_cwd_of_a_task_that_runs_as_root_keeps_the_group_it_was_made_with() {
+    require_elevated();
+    let tree = Tree::new();
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    // A group other than wheel, which the directories made below take from it.
+    let group = nix::unistd::Gid::from_raw(1);
+    nix::unistd::chown(root.path(), None, Some(group)).expect("give the directory to a group");
+    let control = root.path().join("control");
+    std::fs::create_dir(&control).unwrap();
+    let gid = |path: &Path| std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(path).unwrap());
+    assert_eq!(
+        gid(&control),
+        group.as_raw(),
+        "a directory takes its parent's group here"
+    );
+    let cwd = root.path().join("root-cwd");
+    let spec = in_cwd(task_spec(Some(SCHEDULE)), &cwd, User::Root);
+    let rendered = manager(&Fake::new([])).render(&spec).unwrap();
+    tree.put(false, ID, &rendered.job);
+    tree.put(false, &timer_name(), rendered.timer.as_deref().unwrap());
+    let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+
+    rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect("an update with nothing to change");
+
+    assert_eq!(gid(&cwd), group.as_raw(), "nothing was handed over");
+}
+
 /// The directory a task's account is to own is the account's by the time the write that can load the
 /// definition starts: a job that runs then finds its `cwd` in its final state. One a failed install
 /// made is taken back while it is still empty.

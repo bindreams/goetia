@@ -4,7 +4,7 @@
 use crate::backend::account::{Unlisted, resolve_account};
 use std::path::Path;
 
-use crate::backend::created_dirs::{CreatedDirs, Owner, log_in_handed_dir, refuse_writable_log_dir};
+use crate::backend::created_dirs::{CreatedDirs, Owner, refuse_writable_log_dir};
 use crate::error::Result;
 use crate::spec::{DaemonSpec, User};
 
@@ -17,7 +17,9 @@ use crate::spec::{DaemonSpec, User};
 /// account can write, and an existing log that is a link or the account's.
 ///
 /// Everything is judged first, on what [`CreatedDirs::plan`] read, and nothing is made until it all
-/// passes. Runs while still elevated. The account is looked up only when `cwd` is to be made and handed
+/// passes, except one thing only what is made can show: a log's directory that is `cwd`, or in it, is
+/// found when [`CreatedDirs::make`] reaches `cwd` (a file system that ignores case makes two names
+/// one directory), and what was made is then taken back. Runs while still elevated. The account is looked up only when `cwd` is to be made and handed
 /// to it: an install that hands nothing over does not need it to exist yet (`sysusers` or a package may
 /// make it later), and an unknown one then fails before anything is made. A uid with no passwd entry is
 /// the number: systemd runs a unit as one, and its `cwd` is to be handed to it with the group left as it
@@ -39,13 +41,9 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
         Some(cwd) if cwd.makes() => owner_of(&common.user)?,
         _ => None,
     };
-    if let (Some(owner), Some(cwd_dir), Some(cwd), Some(log), Some(logs)) =
-        (owner, &common.cwd, &cwd, &log, &common.logs)
-        && log.is_at_or_under(cwd)
-    {
-        return Err(log_in_handed_dir(logs, cwd_dir, owner));
-    }
 
+    // The log's plan comes first: a log directory that is `cwd`, or below it, is then a directory an
+    // earlier plan made without handing it over, which `make` refuses to hand to the account.
     created.make(
         log.map(|log| (log, None))
             .into_iter()
@@ -60,11 +58,7 @@ fn owner_of(user: &User) -> Result<Option<Owner>> {
     if matches!(user, User::Root) {
         return Ok(None);
     }
-    let account = resolve_account(user, Unlisted::AsNumber)?;
-    if account.uid.is_root() {
-        return Ok(None);
-    }
-    account.owner().map(Some)
+    resolve_account(user, Unlisted::AsNumber)?.owner()
 }
 
 #[cfg(test)]

@@ -17,12 +17,12 @@ use tempfile::NamedTempFile;
 
 use super::verbs::{self, Quiet};
 use super::{
-    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, Unlisted, ensure_dir, move_no_clobber,
-    never_expires, persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact,
+    Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, Unlisted, ensure_dir, move_no_clobber, never_expires,
+    persist_new, persist_new_unraced, persist_over, plan_parent_dirs, plist_in, prepare_parent_dirs, read_artifact,
     resolve_account, staged_tempfile, still_present,
 };
 use crate::backend::bounded::Reservation;
-use crate::backend::created_dirs::CreatedDirs;
+use crate::backend::created_dirs::{CreatedDirs, Planned};
 use crate::backend::launchd::generate::{self, Plists, timer_label};
 use crate::backend::launchd::refuse;
 use crate::backend::launchd::task::{Action, Old, OnDisk, disable_plan, enable_plan, uninstall_plan, update_plan};
@@ -108,6 +108,9 @@ impl Launchd {
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
+                // Every refusal about the spec's directories comes before the first action, which may
+                // unload the timer: a refused update leaves what is installed as it was.
+                let dirs_planned = plan_parent_dirs(spec, &account, created)?;
                 let old = self.old_of(snapshot, reservation)?;
                 let plan = update_plan(&old, desired, spec);
                 let (job, timer) = (
@@ -176,8 +179,9 @@ impl Launchd {
                     staged_timer,
                     verb: Verb::Install,
                     timer_out: false,
-                    // After a refusal, as the service path has it: a refused update creates nothing.
-                    prepare: Some((spec, &account, created)),
+                    // Made after the last refusal, as the service path has it: a refused update creates
+                    // nothing.
+                    prepare: Some((created, dirs_planned)),
                 }
                 .run(&plan, reservation)
             }
@@ -345,9 +349,9 @@ struct Executor<'a> {
     /// Whether this plan booted out a timer that has a plist and has not loaded it again or removed
     /// it: an error then says the timer is not loaded, and a refusal loads it again first.
     timer_out: bool,
-    /// The directories the spec names (`cwd`, the parent of `logs`), made before the first action that
-    /// changes anything a refusal could leave untouched.
-    prepare: Option<(&'a DaemonSpec, &'a Account, &'a mut CreatedDirs)>,
+    /// The directories the spec names (`cwd`, the parent of `logs`), already planned and judged, and
+    /// made before the first action that changes anything a refusal could leave untouched.
+    prepare: Option<(&'a mut CreatedDirs, Planned)>,
 }
 
 /// The verb a plan belongs to.
@@ -364,9 +368,9 @@ impl Executor<'_> {
         // A plan with no action has no refusal to come before: the directories are made, as an
         // install that changes nothing has always made them.
         if plan.is_empty()
-            && let Some((spec, account, created)) = self.prepare.take()
+            && let Some((created, planned)) = self.prepare.take()
         {
-            prepare_parent_dirs(spec, account, created)?;
+            created.make(planned)?;
         }
         for (at, &action) in plan.iter().enumerate() {
             match self.perform(action, reservation) {
@@ -383,9 +387,9 @@ impl Executor<'_> {
     /// `Some` where the install ends with a refusal that is not an error.
     fn perform(&mut self, action: Action, reservation: &mut Reservation) -> Result<Option<WriteOutcome>> {
         if !matches!(action, Action::BootoutTimer | Action::CheckJobIdle)
-            && let Some((spec, account, created)) = self.prepare.take()
+            && let Some((created, planned)) = self.prepare.take()
         {
-            prepare_parent_dirs(spec, account, created)?;
+            created.make(planned)?;
         }
         let (launchctl, id) = (&self.launchd.launchctl, self.id.as_str());
         let deadline = Budget::Unbounded.start();

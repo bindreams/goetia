@@ -451,7 +451,9 @@ owns it, since `install` is not a start and you may still be preparing it.
   others from renaming, but not the log's own directory, where it does not keep them from making an
   entry (a symlink at the log's name). A log that already exists is refused when it is a symlink or an
   account's file. A log in or under the `cwd` that is to be handed to the account is refused. All of this
-  is judged before any directory is made, and covers a directory that already exists. Debian
+  is judged before any directory is made and covers a directory that already exists, except that a log
+  directory that is the `cwd`, or in it, is found when `install` reaches the `cwd` (on a file system that
+  ignores case two names can be one directory), and what it made is then taken back. Debian
   and Ubuntu ship `/var/log` as `root:syslog 0775`, and the group can rename what is inside it, so there
   no log under `/var/log` is accepted, however deep; keep it under another root such as `/var/lib`, or in
   a directory only root can change.
@@ -461,12 +463,18 @@ owns it, since `install` is not a start and you may still be preparing it.
   no passwd entry is used as that number (systemd runs a unit as one): `cwd` is handed to it and its group
   is left as it is. On launchd it is an error, as it was. On systemd the account is looked up only when
   `install` makes a `cwd` to hand to it: a `user` that does not exist yet, with no `cwd` or one that exists,
-  installs as it did. uid 0, by any spelling, is root and is handed nothing.
+  installs as it did. On systemd a `user` that is a number (`"1000"`, no sign, no leading zero) is that
+  uid, as systemd reads `User=`: it is never looked up as the name of an account that has those digits.
+  uid 0, by any spelling, is root and is handed nothing, on both backends.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
   (the unit or plist cannot be read back): it then says so and keeps them, since removing them could
-  break a definition that stands. A directory it handed to the account that the account has since
-  written into is left, and named.
+  break a definition that stands. It hands over, first, any directory it made for the account and had not
+  yet given to it, and names one it cannot. A directory it handed to the account that the account has
+  since written into is left, and named. So is one whose parent anyone but root can write (the parent is
+  not root's, or the group or everyone can write it and it is not sticky: Debian's `/var/log`, macOS's
+  `/Library/Logs`): it is unlinked by name, and someone who can write the parent could swap another
+  directory in, so it is left empty and named.
 - **A limit.** An install killed between making `cwd` and handing it over leaves a root-owned `cwd`. The
   next install uses it as it is, and the daemon cannot write it: remove the directory and run `install`
   again.

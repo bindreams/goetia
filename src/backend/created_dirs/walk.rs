@@ -44,19 +44,6 @@ impl Walk {
         }
         Ok(under)
     }
-
-    /// Whether the path this walk resolved, which does not exist yet, is at or under the one `outer`
-    /// resolved, which does not either: both go on from the same existing directory, and `outer`'s
-    /// missing names are the first of this one's.
-    #[cfg(target_os = "linux")]
-    pub(super) fn is_at_or_under_missing(&self, outer: &Walk) -> bool {
-        let (End::Missing { missing: own, .. }, End::Missing { missing: other, .. }) = (&self.end, &outer.end) else {
-            return false;
-        };
-        self.chain.last() == outer.chain.last()
-            && own.len() >= other.len()
-            && own.iter().zip(other).all(|(a, b)| a.1 == b.1)
-    }
 }
 
 pub(super) enum End {

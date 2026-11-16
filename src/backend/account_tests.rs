@@ -103,8 +103,52 @@ fn the_uid_that_means_unchanged_is_not_an_owner() {
 
 #[skuld::test]
 fn an_account_is_an_owner_with_its_group() {
-    let owner = resolve_account(&User::Root, Unlisted::Refuse).unwrap().owner().unwrap();
-    assert_eq!((owner.uid.as_raw(), owner.gid.map(|gid| gid.as_raw())), (0, Some(0)));
+    let account = resolve_account(&User::Id(AccountId::Uid(4_242_424)), Unlisted::AsNumber).unwrap();
+    let owner = account
+        .owner()
+        .unwrap()
+        .expect("an account that is not root's is handed what it is to write");
+    assert_eq!((owner.uid.as_raw(), owner.gid), (4_242_424, None));
+}
+
+/// A directory is already root's, and `chown(0, 0)` would take its group away: uid 0 is handed nothing,
+/// by any spelling.
+#[skuld::test]
+fn root_is_handed_nothing() {
+    let spellings = [
+        (User::Root, Unlisted::Refuse),
+        (User::Id(AccountId::Uid(0)), Unlisted::Refuse),
+        (User::Name("root".to_string()), Unlisted::Refuse),
+        (User::Name("0".to_string()), Unlisted::AsNumber),
+    ];
+    for (user, unlisted) in spellings {
+        let account = resolve_account(&user, unlisted).unwrap_or_else(|e| panic!("{user:?}: {e}"));
+        assert!(account.owner().unwrap().is_none(), "{user:?}");
+    }
+}
+
+/// systemd's `get_user_creds` reads a `User=` that is a number as a uid, and never asks the name
+/// database for it (`src/basic/user-util.c`, `parse_uid` then `getpwuid`, as in v242): an account
+/// whose name is made of digits is not `User=`'s. Here `0` is root, found by its uid.
+#[skuld::test]
+fn as_number_reads_a_numeric_name_as_the_uid_and_not_as_a_name() {
+    let by_name = resolve_account(&User::Name("0".to_string()), Unlisted::AsNumber).unwrap();
+    let by_uid = resolve_account(&User::Id(AccountId::Uid(0)), Unlisted::AsNumber).unwrap();
+    assert_eq!(
+        (by_name.name.as_str(), by_name.uid, gid(&by_name)),
+        ("root", by_uid.uid, Some(0))
+    );
+}
+
+/// `parse_uid` refuses the two values that are no uid (`uid_is_valid`: 0xFFFF and 0xFFFFFFFF), so
+/// systemd takes them for names, which no account has.
+#[skuld::test]
+fn as_number_does_not_take_a_number_that_is_no_uid() {
+    for number in ["65535", "4294967295"] {
+        let err = resolve_account(&User::Name(number.to_string()), Unlisted::AsNumber)
+            .expect_err("systemd reads it as a name");
+        assert!(matches!(err, Error::AccountLookup { .. }), "{number}: {err:?}");
+    }
 }
 
 #[cfg(target_os = "linux")]

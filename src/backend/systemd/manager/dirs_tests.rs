@@ -130,8 +130,6 @@ fn nothing_is_made_when_the_log_check_refuses() {
     for (name, logs) in [
         ("a log directory an account owns", owned.join("out.log")),
         ("a log that is a symlink", planted.join("out.log")),
-        ("a log in the cwd to be handed", work.join("out.log")),
-        ("a log under the cwd to be handed", work.join("sub/out.log")),
     ] {
         let mut created = CreatedDirs::under(vec![layout.system()]);
 
@@ -171,30 +169,30 @@ fn a_log_the_check_refuses_comes_before_the_account_is_looked_up() {
     assert!(matches!(err, Error::DirectoryRefused { .. }), "{err:?}");
 }
 
-/// The log in a `cwd` that is to be the account's is refused, naming it and the account.
+/// The log in a `cwd` that is to be the account's, or under it, is refused naming the directory and the
+/// account, and what the install had made by then is taken back when the guard drops: that the two are
+/// one directory is found when the `cwd` is reached.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_in_the_cwd_to_be_handed_is_refused_naming_the_directory() {
+fn a_log_in_or_under_the_cwd_to_be_handed_is_refused_and_what_was_made_is_taken_back() {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
-    let mut created = CreatedDirs::under(vec![layout.system()]);
+    for logs in [cwd.join("out.log"), cwd.join("sub/out.log")] {
+        let mut created = CreatedDirs::under(vec![layout.system()]);
 
-    let err = ensure_parent_dirs(
-        &spec(
-            User::Id(AccountId::Uid(STRANGER)),
-            Some(&cwd),
-            Some(&cwd.join("out.log")),
-        ),
-        &mut created,
-    )
-    .expect_err("a log in the directory that is to be the account's");
+        let err = ensure_parent_dirs(
+            &spec(User::Id(AccountId::Uid(STRANGER)), Some(&cwd), Some(&logs)),
+            &mut created,
+        )
+        .expect_err("a log in the directory that is to be the account's");
+        drop(created);
 
-    let Error::DirectoryRefused { why, .. } = err else {
-        panic!("{err:?}")
-    };
-    assert!(
-        why.contains(cwd.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
-        "{why}"
-    );
+        let Error::DirectoryRefused { path, why } = err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(path, cwd, "{why}");
+        assert!(why.contains(&format!("uid {STRANGER}")) && !why.contains("  "), "{why}");
+        assert!(!cwd.exists(), "{}: what was made for the log was left", logs.display());
+    }
 }
 
 /// A log directory beside the `cwd` that is handed over is accepted, and a log directory above it too.

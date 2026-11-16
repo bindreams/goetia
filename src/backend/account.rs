@@ -16,7 +16,9 @@ pub(crate) enum Unlisted {
     /// does not say it accepts a number, so a number with no entry is no account there.
     Refuse,
     /// The number, with no name and no group. systemd takes `User=4242` with no entry, and `chown`
-    /// accepts a bare number: the daemon runs, so what it works in must be its.
+    /// accepts a bare number: the daemon runs, so what it works in must be its. A name that is a number
+    /// is a uid before it is a name, as systemd reads it: `get_user_creds` in `src/basic/user-util.c`
+    /// calls `parse_uid` and then only `getpwuid`, and asks `getpwnam` for a string that is no uid.
     AsNumber,
 }
 
@@ -33,9 +35,13 @@ pub(crate) struct Account {
 }
 
 impl Account {
-    /// Whom a directory is handed to for this account.
-    pub(crate) fn owner(&self) -> Result<Owner> {
-        Owner::new(self.uid, self.gid)
+    /// Whom a directory is handed to for this account: nobody for root, whose directory it already is
+    /// (`chown(0, 0)` would take its group away).
+    pub(crate) fn owner(&self) -> Result<Option<Owner>> {
+        if self.uid.is_root() {
+            return Ok(None);
+        }
+        Owner::new(self.uid, self.gid).map(Some)
     }
 
     fn number(uid: u32) -> Self {
@@ -63,14 +69,19 @@ pub(crate) fn resolve_account(user: &User, unlisted: Unlisted) -> Result<Account
         User::Root => by_uid(0, unlisted),
         User::Id(AccountId::Uid(uid)) => by_uid(*uid, unlisted),
         User::Name(name) => {
+            // systemd reads a name that is a uid as the uid, and never looks it up as a name.
+            if matches!(unlisted, Unlisted::AsNumber)
+                && let Some(uid) = systemd_uid(name)
+            {
+                return by_uid(uid, unlisted);
+            }
             let found = nix::unistd::User::from_name(name).map_err(|e| Error::AccountLookup {
                 detail: format!("look up user `{name}`"),
                 source: Some(e.into()),
             })?;
-            match (found, unlisted, canonical_uid(name)) {
-                (Some(found), ..) => Ok(found.into()),
-                (None, Unlisted::AsNumber, Some(uid)) => Ok(Account::number(uid)),
-                (None, ..) => Err(Error::AccountLookup {
+            match found {
+                Some(found) => Ok(found.into()),
+                None => Err(Error::AccountLookup {
                     detail: format!("no such user `{name}` on this host"),
                     source: None,
                 }),
@@ -90,6 +101,12 @@ fn canonical_uid(name: &str) -> Option<u32> {
     canonical.then(|| name.parse().ok()).flatten()
 }
 
+/// `name` as systemd's `parse_uid` reads it: a canonical number that is a valid uid, which excludes
+/// 0xFFFF and 0xFFFFFFFF (`uid_is_valid`). Anything else is a name to systemd.
+fn systemd_uid(name: &str) -> Option<u32> {
+    canonical_uid(name).filter(|&uid| uid != 0xFFFF && uid != u32::MAX)
+}
+
 fn by_uid(uid: u32, unlisted: Unlisted) -> Result<Account> {
     let found = nix::unistd::User::from_uid(Uid::from_raw(uid)).map_err(|e| Error::AccountLookup {
         detail: format!("look up uid {uid}"),
@@ -106,7 +123,6 @@ fn by_uid(uid: u32, unlisted: Unlisted) -> Result<Account> {
 }
 
 /// An account as an error names it: its name where it has a passwd entry, and always its uid.
-#[cfg(target_os = "linux")]
 pub(crate) fn describe_uid(uid: u32) -> String {
     match by_uid(uid, Unlisted::Refuse) {
         Ok(account) => format!("`{}` (uid {uid})", account.name),

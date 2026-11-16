@@ -602,7 +602,7 @@ fn a_made_directory_in_a_setgid_parent_is_accepted_and_given_0755() {
 /// refused; it was recorded when it was made, so it is removed with the rest.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
+fn a_made_directory_that_is_not_roots_is_refused_and_left_in_a_parent_anyone_can_write() {
     let layout = Layout::new();
     let parent = layout.system().join("open");
     fs::create_dir(&parent).unwrap();
@@ -618,7 +618,10 @@ fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
     assert!(refusal(&err).contains(&format!("uid {STRANGER}")), "{err:?}");
     assert!(parent.join("new").is_dir(), "it was made");
     drop(dirs);
-    assert!(!parent.join("new").exists(), "the undo removes a refused directory");
+    assert!(
+        parent.join("new").is_dir(),
+        "the undo leaves it: anyone can write the directory above it"
+    );
 }
 
 // Planning ------------------------------------------------------------------------------------------------------------
@@ -637,40 +640,6 @@ fn a_plan_makes_nothing_and_says_whether_make_would() {
     assert!(!existing.makes());
     assert!(!layout.system().join("a").exists());
     assert!(dirs.made.is_empty());
-}
-
-#[cfg(target_os = "linux")]
-#[skuld::test(labels = [ELEVATED])]
-fn a_plan_is_at_or_under_another_when_it_goes_on_from_the_same_directory_by_the_same_names() {
-    let layout = Layout::new();
-    let dirs = layout.dirs();
-    let plan = |path: &str| dirs.plan(&layout.system().join(path)).unwrap();
-
-    assert!(plan("a/b/c").is_at_or_under(&plan("a/b")));
-    assert!(plan("a/b").is_at_or_under(&plan("a/b")));
-    assert!(plan("a").is_at_or_under(&plan("a")));
-    assert!(!plan("a").is_at_or_under(&plan("a/b")), "above is not under");
-    assert!(!plan("a/c").is_at_or_under(&plan("a/b")), "beside is not under");
-    assert!(!plan("ab").is_at_or_under(&plan("a")), "a name is not a prefix of one");
-    assert!(
-        !dirs.plan(&layout.system()).unwrap().is_at_or_under(&plan("a")),
-        "an existing directory is under nothing that is yet to be made"
-    );
-}
-
-/// Two plans that reach the same missing directories from different directories above them are at or
-/// under each other by where they resolve, not by their text: here through a link.
-#[cfg(target_os = "linux")]
-#[skuld::test(labels = [ELEVATED])]
-fn a_plan_is_judged_by_where_it_resolves_not_by_its_text() {
-    let layout = Layout::new();
-    symlink(layout.system(), layout.outside().join("link")).unwrap();
-    let dirs = layout.dirs();
-
-    let direct = dirs.plan(&layout.system().join("a")).unwrap();
-    let through_link = dirs.plan(&layout.outside().join("link/a/b")).unwrap();
-
-    assert!(through_link.is_at_or_under(&direct));
 }
 
 // Handing over --------------------------------------------------------------------------------------------------------
@@ -701,19 +670,49 @@ fn make_without_an_owner_leaves_everything_roots() {
     assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
 }
 
-/// `cwd` may be an ancestor of the log directory, or the other way about: a directory an earlier plan
-/// made is the one handed over when a later plan names it.
+/// A directory an earlier plan made is that plan's: a later plan that names it and is to hand it over
+/// is a conflict between the spec's paths (a log directory is never handed to the account, and `cwd`
+/// is), refused, never upgraded to the later plan's owner. Whether two names are one directory is
+/// the file system's to say, which is why this is judged on what was made, not on the names.
 #[skuld::test(labels = [ELEVATED])]
-fn a_directory_an_earlier_plan_made_is_handed_over_when_a_later_plan_names_it() {
+fn a_directory_an_earlier_plan_made_without_an_owner_is_never_handed_over_by_a_later_plan_that_names_it() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let below = dirs.plan(&layout.system().join("a/b")).unwrap();
     let named = dirs.plan(&layout.system().join("a")).unwrap();
 
-    dirs.make(vec![(below, None), (named, Some(stranger_owner()))]).unwrap();
+    let err = dirs
+        .make(vec![(below, None), (named, Some(stranger_owner()))])
+        .expect_err("the directory above `a/b` is one root's, and is not to be handed over");
 
-    assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
-    assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
+    let why = refusal(&err);
+    assert!(
+        why.contains(&format!("uid {STRANGER}")) && why.contains("another"),
+        "{why}"
+    );
+    assert_eq!(owner_of(&layout.system().join("a")).0, 0, "nothing was handed over");
+    drop(dirs);
+    assert!(
+        !layout.system().join("a").exists(),
+        "and the guard took back what was made"
+    );
+}
+
+/// The same directory named twice by plans that hand it to the same owner, or by one that hands it and
+/// one that does not hand it after, is the owner's, as the first plan said.
+#[skuld::test(labels = [ELEVATED])]
+fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_names_it() {
+    for later in [Some(stranger_owner()), None] {
+        let layout = Layout::new();
+        let mut dirs = layout.dirs();
+        let first = dirs.plan(&layout.system().join("a")).unwrap();
+        let again = dirs.plan(&layout.system().join("a")).unwrap();
+
+        dirs.make(vec![(first, Some(stranger_owner())), (again, later)])
+            .unwrap();
+
+        assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
+    }
 }
 
 /// A hand-over that fails is the install's error, never a warning, and the whole `make` returns it: every
@@ -771,6 +770,54 @@ fn undo_leaves_a_directory_that_was_not_handed_over_and_gained_content_without_a
     fs::write(layout.system().join("a/data"), b"x").unwrap();
 
     dirs.remove(0).expect("not a failure");
+}
+
+/// A directory is unlinked by its name in its parent: where anyone but root can write the parent, they
+/// can put another directory at the name between a check and the unlink, so it is left, and named.
+#[skuld::test(labels = [ELEVATED])]
+fn undo_leaves_a_directory_whose_parent_another_user_can_write_and_names_it() {
+    for (mode, writer) in [(0o775, "group"), (0o757, "everyone")] {
+        let layout = Layout::new();
+        let mut dirs = layout.dirs();
+        dirs.create(&layout.system().join("a"), None).unwrap();
+        fs::set_permissions(layout.system(), fs::Permissions::from_mode(mode)).unwrap();
+
+        let left = dirs.remove(0).expect_err(writer);
+
+        assert!(left.contains("written"), "{writer}: {left}");
+        assert!(layout.system().join("a").is_dir(), "{writer}: removed");
+    }
+}
+
+/// Only root, or the sticky bit (which keeps others from touching an entry that is not theirs), makes a
+/// parent safe to unlink from by name.
+#[skuld::test(labels = [ELEVATED])]
+fn undo_removes_a_directory_whose_parent_only_root_can_change_or_is_sticky() {
+    for mode in [0o755, 0o700, 0o1777] {
+        let layout = Layout::new();
+        let mut dirs = layout.dirs();
+        dirs.create(&layout.system().join("a"), None).unwrap();
+        fs::set_permissions(layout.system(), fs::Permissions::from_mode(mode)).unwrap();
+
+        dirs.remove(0).unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+
+        assert!(!layout.system().join("a").exists(), "{mode:o}");
+    }
+}
+
+/// A parent that is not root's is the account's to change, a directory this install handed over
+/// included.
+#[skuld::test(labels = [ELEVATED])]
+fn undo_leaves_a_directory_whose_parent_another_user_owns() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    dirs.create(&layout.system().join("a"), None).unwrap();
+    give_to_a_stranger(&layout.system());
+
+    let left = dirs.remove(0).expect_err("the parent is the account's");
+
+    assert!(left.contains("written"), "{left}");
+    assert!(layout.system().join("a").is_dir());
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -928,6 +975,61 @@ fn keep_leaves_a_directory_that_was_not_verified_and_names_it() {
         notes[1].contains(&layout.system().join("unopened").display().to_string()),
         "{notes:?}"
     );
+}
+
+/// A directory that is ready, marked for an owner and not yet handed (a `make` that stopped before it
+/// handed anything over) is handed over when what stands is kept, whether the definition's standing is
+/// unknown or the thread is unwinding from a panic.
+#[skuld::test(labels = [ELEVATED])]
+fn keep_hands_over_a_ready_directory_marked_for_an_owner() {
+    let layout = Layout::new();
+    let made_but_not_handed = |dirs: &mut CreatedDirs, name: &str| {
+        let plan = dirs.plan(&layout.system().join(name)).unwrap();
+        dirs.make_missing(plan.found, Some(stranger_owner())).unwrap();
+        assert_eq!(
+            owner_of(&layout.system().join(name)).0,
+            0,
+            "{name} is made and not handed"
+        );
+    };
+
+    let mut dirs = layout.dirs();
+    made_but_not_handed(&mut dirs, "unknown");
+    dirs.settle(|| Standing::Unknown("could not read the unit".to_string()));
+    drop(dirs);
+    assert_eq!(owner_of(&layout.system().join("unknown")), (STRANGER, STRANGER));
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut dirs = layout.dirs();
+        made_but_not_handed(&mut dirs, "panicking");
+        panic!("after the definition may have been written");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(owner_of(&layout.system().join("panicking")), (STRANGER, STRANGER));
+}
+
+/// One that cannot be handed over is kept root's and named, with what the hand-over said.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn keep_names_a_directory_it_cannot_hand_over() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let plan = dirs.plan(&layout.system().join("a")).unwrap();
+    dirs.make_missing(plan.found, Some(stranger_owner())).unwrap();
+
+    let notes = {
+        let _no_chown = WithoutChown::new();
+        dirs.keep()
+    };
+
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(&layout.system().join("a").display().to_string())
+            && notes[0].contains(&format!("uid {STRANGER}"))
+            && notes[0].contains("root"),
+        "{notes:?}"
+    );
+    assert_eq!(owner_of(&layout.system().join("a")).0, 0);
 }
 
 #[skuld::test(labels = [ELEVATED])]
