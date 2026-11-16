@@ -253,7 +253,8 @@ pub enum Error {
     /// who made it or what is in it. No OS call failed.
     #[error(
         "refusing {}: its owner or permissions are not those goetia gives the folder, so goetia cannot vouch for \
-         it; delete the folder (nothing in it is needed once its tasks are uninstalled) and run the command again",
+         it; delete the folder (it holds only the records of finished runs, which the next run writes again) and \
+         run the command again",
         path.display()
     )]
     FolderNotAsMade { path: PathBuf },

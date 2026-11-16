@@ -201,7 +201,9 @@ fn map_generic(mask: u32) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckPermissions {
     Enable,
-    /// For a folder whose protection the caller guarantees some other way. Skips only this check.
+    /// For a folder whose protection the caller guarantees some other way. Skips only this check: the
+    /// folders under `%ProgramData%\Goetia` that a task's run records are kept in are judged whatever it
+    /// is, since no caller guarantees them.
     Disable,
 }
 

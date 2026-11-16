@@ -4,9 +4,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-use windows::Win32::System::Time::{
-    FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime, TzSpecificLocalTimeToSystemTime,
-};
+#[cfg(any(test, feature = "testing"))]
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+use windows::Win32::System::Time::{SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime};
 
 /// 100 ns ticks from 1601-01-01, the epoch of a `FILETIME`, to 1970-01-01.
 const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
@@ -50,7 +50,9 @@ pub(super) fn local_to_system(local: &SYSTEMTIME) -> Option<SystemTime> {
     instant_of(file_time)
 }
 
-/// The machine's civil time at `time`, or `None` for an instant the OS cannot place.
+/// The machine's civil time at `time`, or `None` for an instant the OS cannot place. Only `run_times`,
+/// which production never asks, reads it.
+#[cfg(any(test, feature = "testing"))]
 pub(super) fn system_to_local(time: SystemTime) -> Option<SYSTEMTIME> {
     let file_time = file_time_of(time)?;
     let mut utc = SYSTEMTIME::default();
