@@ -3928,6 +3928,30 @@ fn a_substituted_kill_does_not_hand_its_null_timeout_to_another_signal(#[fixture
     }
 }
 
+/// A base signal that cannot be substituted is not known to be anything but `kill`: the `null` beside it
+/// is not known to be the signal's own, so the override's other signal does not inherit it, and has its
+/// own default.
+#[skuld::test]
+fn a_base_signal_that_does_not_substitute_does_not_hand_its_null_timeout_to_another_signal(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    for &native in HOST_BACKENDS {
+        let yaml = format!(
+            "{SERVICE}stop-action: {{send-signal: '${{UNSET}}', timeout: null}}\n\
+             backend-specific:\n  {native}:\n    stop-action: terminate\n"
+        );
+        write_fixture(dir, &yaml, Some("OTHER=1\n"));
+
+        let (spec, _) =
+            resolve_as(parse_manifest(&yaml), dir, Some(native)).unwrap_or_else(|e| panic!("{native}: {e}"));
+
+        let DaemonSpec::Service(service) = spec else {
+            panic!("a service")
+        };
+        assert_eq!(service.stop_action, StopAction::default(), "{native}");
+    }
+}
+
 /// A refusal that comes of a leaf the base wrote names that leaf, with no `backend-specific` in front: the
 /// override wrote the signal, and the `null` timeout that launchd refuses beside it is the base's.
 #[skuld::test]

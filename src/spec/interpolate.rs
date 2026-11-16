@@ -366,12 +366,14 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
         if let Some(RawTimeout::Text(text)) = &mut stop_action.timeout {
             substitute(text, Field::StopTimeout, vars, &mut from_env)?;
         }
-        // Only says whether a `null` timeout was a `kill`'s: text that does not substitute is not that, and is
-        // not this pass's to refuse. Its `.env` is no part of what the signal's errors blame.
-        if let Some(text) = &mut stop_action.base_signal
-            && substitute(text, Field::StopSignal, vars, &mut BTreeSet::new()).is_err()
-        {
-            stop_action.base_signal = None;
+        // Only says whether a `null` timeout was a `kill`'s. Text that does not substitute stays as written, and
+        // is an unknown signal to `shape_stop_action`: not for this pass to refuse. Its `.env` is no part of
+        // what the signal's errors blame.
+        if let Some(text) = &mut stop_action.base_signal {
+            let mut substituted = text.clone();
+            if substitute(&mut substituted, Field::StopSignal, vars, &mut BTreeSet::new()).is_ok() {
+                *text = substituted;
+            }
         }
     }
 

@@ -437,7 +437,8 @@ fn resolve_shape(
 /// absence: it parses to `None` (no timeout) and needs no substitution. A timeout beside `kill`, once
 /// both are known, is refused, since `kill` ends the daemon at once; but a base's timeout that an
 /// override's `kill` merely leaves in place is not the override's to refuse, and is dropped. So is a
-/// base `kill`'s `null`, which an override's other signal does not take: it has the signal's default.
+/// base `kill`'s `null`, which an override's other signal does not take: it has the signal's default. So is
+/// the `null` of a base signal that is unknown (it did not substitute), which may have been `kill`.
 fn shape_stop_action(
     id: &Id,
     action: RawStopAction,
@@ -459,17 +460,16 @@ fn shape_stop_action(
         })?,
     };
     if timeout_from_base && matches!(timeout, Shaped::Parsed(None)) && !matches!(signal, Shaped::Deferred) {
-        // A base signal that does not parse is the base's to refuse, so it is no `kill` here.
+        // A base signal that does not parse (or did not substitute) is the base's to refuse, and is unknown
+        // here: the `null` beside it is not known to be its own, so it is not handed on.
         let base_signal = match action.base_signal {
-            Some(text) => {
-                shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal).unwrap_or(Shaped::Absent)
-            }
-            None => Shaped::Absent,
+            Some(text) => shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal),
+            None => Ok(Shaped::Absent),
         };
         match (&signal, base_signal) {
             (Shaped::Parsed(StopSignal::Kill), _) => {}
-            (_, Shaped::Parsed(StopSignal::Kill)) => return Ok((signal, Shaped::Absent)),
-            (_, Shaped::Deferred) => return Ok((signal, Shaped::Deferred)),
+            (_, Ok(Shaped::Parsed(StopSignal::Kill)) | Err(_)) => return Ok((signal, Shaped::Absent)),
+            (_, Ok(Shaped::Deferred)) => return Ok((signal, Shaped::Deferred)),
             _ => {}
         }
     }
