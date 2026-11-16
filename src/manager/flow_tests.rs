@@ -174,6 +174,21 @@ fn install_and_preview_refuse_a_service_the_manager_finds_for_another_daemon() {
     assert_eq!(fake.writes(), 0, "the installed service must not be written over");
 }
 
+/// An install that ends `UpToDate` after a write that raced ends where the desired definition is known
+/// to stand, so what the write made is settled on that exit too (and kept, not taken back when the scope
+/// drops): a scope left unsettled there is removed by its drop under a definition that stands.
+#[skuld::test]
+fn an_install_that_ends_up_to_date_settles_what_an_earlier_write_made() {
+    let theirs = mk("frpc");
+    let fake = Fake::new();
+    fake.seed_write_interloper("frpc", generate(&theirs));
+
+    assert_eq!(fake.install(&theirs, false).unwrap(), Outcome::UpToDate);
+
+    assert_eq!(fake.writes(), 1);
+    assert_eq!(fake.settles(), 2, "after the raced write, and on the exit that stands");
+}
+
 /// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.
 #[skuld::test]
 fn a_write_that_loses_to_an_ours_entry_follows_that_entry() {

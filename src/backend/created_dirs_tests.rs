@@ -855,20 +855,93 @@ fn a_directory_an_earlier_plan_made_without_an_owner_is_never_handed_over_by_a_l
     );
 }
 
-/// The same directory named twice by plans that hand it to the same owner, or by one that hands it and
-/// one that does not hand it after, is the owner's, as the first plan said.
+/// The same directory named twice by plans that hand it to the same owner is the owner's, as the first
+/// plan said.
 #[skuld::test(labels = [ELEVATED])]
-fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_names_it() {
-    for later in [Some(stranger_owner()), None] {
-        let layout = Layout::new();
-        let mut dirs = layout.dirs();
-        let first = dirs.plan(&layout.system().join("a")).unwrap();
-        let again = dirs.plan(&layout.system().join("a")).unwrap();
+fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_hands_it_too() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let first = dirs.plan(&layout.system().join("a")).unwrap();
+    let again = dirs.plan(&layout.system().join("a")).unwrap();
 
-        dirs.make(vec![(first, Some(stranger_owner())), (again, later)])
-            .unwrap();
+    dirs.make(vec![(first, Some(stranger_owner())), (again, Some(stranger_owner()))])
+        .unwrap();
 
-        assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
+    assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
+}
+
+/// The conflict between a plan that hands a directory over and one that does not is the same whichever
+/// comes first: the directory, or one below it, is the account's, and so cannot be what the other plan
+/// keeps as root's. Each order is refused and names the directory handed over and the account; nothing
+/// is handed over, and the guard takes back what was made.
+#[skuld::test(labels = [ELEVATED])]
+fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_share_it_in_either_order() {
+    // (handed, kept): the directory handed over is `a`; `kept` is `a` itself or below it.
+    for kept in ["a", "a/sub"] {
+        // The plan that hands nothing over first (a log's) and second.
+        for kept_first in [true, false] {
+            let layout = Layout::new();
+            let mut dirs = layout.dirs();
+            let handed = dirs.plan(&layout.system().join("a")).unwrap();
+            let kept_plan = dirs.plan(&layout.system().join(kept)).unwrap();
+            let plans = if kept_first {
+                vec![(kept_plan, None), (handed, Some(stranger_owner()))]
+            } else {
+                vec![(handed, Some(stranger_owner())), (kept_plan, None)]
+            };
+
+            let err = dirs
+                .make(plans)
+                .expect_err("one directory cannot be root's and the account's");
+
+            let Error::DirectoryRefused { path, why } = &err else {
+                panic!("{kept} {kept_first}: {err:?}")
+            };
+            assert_eq!(path, &layout.system().join("a"), "{kept} {kept_first}: {why}");
+            assert!(
+                why.contains(&format!("uid {STRANGER}")) && !why.contains("  "),
+                "{kept} {kept_first}: {why}"
+            );
+            assert!(
+                !layout.system().join("a").exists(),
+                "{kept} {kept_first}: nothing is placed"
+            );
+            drop(dirs);
+            assert_eq!(
+                leftovers(&layout.system()),
+                Vec::<String>::new(),
+                "{kept} {kept_first}: the guard took back what was made"
+            );
+        }
+    }
+}
+
+/// A plan that hands nothing over beside a directory handed over, or above it, is no conflict in either
+/// order: that is the log directory beside or above the `cwd`.
+#[skuld::test(labels = [ELEVATED])]
+fn a_plan_that_hands_nothing_over_beside_or_above_a_handed_directory_is_accepted_in_either_order() {
+    for (handed, kept) in [("a/work", "a/logs"), ("a/work", "a")] {
+        for kept_first in [true, false] {
+            let layout = Layout::new();
+            let mut dirs = layout.dirs();
+            let handed_plan = dirs.plan(&layout.system().join(handed)).unwrap();
+            let kept_plan = dirs.plan(&layout.system().join(kept)).unwrap();
+            let plans = if kept_first {
+                vec![(kept_plan, None), (handed_plan, Some(stranger_owner()))]
+            } else {
+                vec![(handed_plan, Some(stranger_owner())), (kept_plan, None)]
+            };
+
+            dirs.make(plans)
+                .unwrap_or_else(|e| panic!("{handed} {kept} {kept_first}: {e}"));
+
+            assert_eq!(owner_of(&layout.system().join(handed)), (STRANGER, STRANGER));
+            assert_eq!(
+                owner_of(&layout.system().join(kept)).0,
+                0,
+                "{handed} {kept} {kept_first}"
+            );
+        }
     }
 }
 
@@ -1166,35 +1239,8 @@ fn settle_keeps_the_directories_when_the_read_did_not_complete() {
     assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
 }
 
-/// A directory `verify` refused, or one that could not be opened to be judged, was never shown to be
-/// the one that was made: keeping what stands says it is left.
-#[skuld::test(labels = [ELEVATED])]
-fn keep_leaves_a_directory_that_was_not_verified_and_names_it() {
-    let layout = Layout::new();
-    let mut dirs = layout.dirs();
-    dirs.create(&layout.system().join("refused"), None).unwrap();
-    dirs.create(&layout.system().join("unopened"), None).unwrap();
-    dirs.create(&layout.system().join("verified"), None).unwrap();
-    dirs.made[0].ready = false;
-    dirs.made[1].held = None;
-    dirs.made[1].ready = false;
-
-    let notes = dirs.keep();
-
-    assert_eq!(notes.len(), 2, "{notes:?}");
-    assert!(
-        notes[0].contains(&layout.system().join("refused").display().to_string()),
-        "{notes:?}"
-    );
-    assert!(
-        notes[1].contains(&layout.system().join("unopened").display().to_string()),
-        "{notes:?}"
-    );
-}
-
 /// A `make` that did not finish (a panic unwinding out of it) leaves its trees at their temporary names,
-/// which no definition can name: keeping what stands removes them, with no note, and keeps what was
-/// put in place.
+/// which no definition can name: keeping what stands removes them and keeps what was put in place.
 #[skuld::test(labels = [ELEVATED])]
 fn keep_removes_a_tree_that_was_not_put_in_place_and_keeps_the_rest() {
     let layout = Layout::new();
@@ -1204,9 +1250,8 @@ fn keep_removes_a_tree_that_was_not_put_in_place_and_keeps_the_rest() {
     dirs.make_missing(plan.found, Some(stranger_owner())).unwrap();
     assert_eq!(leftovers(&layout.system()).len(), 1);
 
-    let notes = dirs.keep();
+    dirs.keep();
 
-    assert_eq!(notes, Vec::<String>::new());
     assert_eq!(leftovers(&layout.system()), Vec::<String>::new());
     assert!(!layout.system().join("a").exists());
     assert!(layout.system().join("placed").is_dir());

@@ -183,6 +183,8 @@ struct Store {
     /// What the manager applies to an id from outside its artifact, by id; absent means none.
     externals: BTreeMap<String, ExternalConfig>,
     writes: usize,
+    /// Times an install settled its scope.
+    settles: usize,
     calls: Vec<(&'static str, String)>,
     prepared: Vec<(Vec<Step>, Budget)>,
     /// What a run of each task does, by id; absent means a clean exit and no output.
@@ -635,6 +637,12 @@ impl Fake {
         state.writes
     }
 
+    /// How many times an install settled what its writes made.
+    pub fn settles(&self) -> usize {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.settles
+    }
+
     /// The steps and budget every reservation was asked for, in order, failed
     /// ones included: [`ServiceManager::prepare`]'s, and one for each verb run
     /// outside a sequence.
@@ -784,10 +792,19 @@ impl Fake {
     }
 }
 
+/// What an install of [`Fake`] holds: it makes nothing, and counts the times the install settled it.
+pub struct FakeScope(Arc<Mutex<Store>>);
+
+impl crate::backend::Settle for FakeScope {
+    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {
+        self.0.lock().expect("Fake mutex poisoned").settles += 1;
+    }
+}
+
 impl crate::backend::Backend for Fake {
     type Definition = String;
     type Snapshot = Artifact;
-    type InstallScope = ();
+    type InstallScope = FakeScope;
     type Reservation = ();
     type Run = FakeRun;
 
@@ -806,12 +823,13 @@ impl crate::backend::Backend for Fake {
     }
 
     /// An opaque id, then no manager. Before `read`, which has no way to say a manager is missing.
-    fn begin_install(&self, spec: &DaemonSpec, _desired: &String, _reservation: &mut ()) -> Result<()> {
+    fn begin_install(&self, spec: &DaemonSpec, _desired: &String, _reservation: &mut ()) -> Result<FakeScope> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         if state.opaque.contains(spec.common().id.as_str()) {
             return Err(Store::undetermined(&spec.common().id));
         }
-        state.manager()
+        state.manager()?;
+        Ok(FakeScope(Arc::clone(&self.state)))
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
@@ -892,7 +910,7 @@ impl crate::backend::Backend for Fake {
         definition: &String,
         _outcome: &Outcome,
         snapshot: Option<&Artifact>,
-        _scope: &mut (),
+        _scope: &mut FakeScope,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");

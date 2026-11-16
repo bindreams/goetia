@@ -17,7 +17,7 @@ use tempfile::NamedTempFile;
 
 use super::verbs::{self, Quiet};
 use super::{
-    Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, Unlisted, ensure_dir, move_no_clobber, never_expires,
+    Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, ensure_dir, move_no_clobber, never_expires,
     persist_new, persist_new_unraced, persist_over, plan_parent_dirs, plist_in, prepare_parent_dirs, read_artifact,
     resolve_account, staged_tempfile, still_present,
 };
@@ -68,7 +68,7 @@ impl Launchd {
         let Scope { created, reservation } = scope;
         // Resolved again: `render` kept only the plists, which name the account, and launchd resolves
         // that name at launch too.
-        let account = resolve_account(&spec.common().user, Unlisted::Refuse)?;
+        let account = resolve_account(&spec.common().user)?;
         let id = &spec.common().id;
         let staging = Path::new(dirs[0].0);
 

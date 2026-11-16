@@ -27,7 +27,7 @@ pub const RUN_UNTIL_KILLED: &str = "--goetia-run-until-killed";
 /// which account a job actually launched under — `UserName: root` in the
 /// plist is a claim; this confirms launchd honoured it, proving whether
 /// that key takes a name or a numeric uid (this backend always resolves
-/// to a name; see `backend::account::Unlisted::Refuse`'s doc
+/// to a name; see `backend::account::resolve_account`'s doc
 /// comment).
 #[cfg(unix)]
 pub const REPORT_UID: &str = "--goetia-report-uid";

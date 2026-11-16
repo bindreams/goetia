@@ -74,7 +74,7 @@ use std::{fs, io};
 
 use cosca::Process;
 
-use crate::backend::account::{Account, Unlisted, resolve_account};
+use crate::backend::account::{Account, resolve_account};
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::created_dirs::{CreatedDirs, Planned};
@@ -441,9 +441,9 @@ impl InstalledService for Plist {
 
 // Account resolution ==================================================================================================
 
-/// The [`Identity`] a generator needs of an account. Every account here is resolved by name and
-/// `Unlisted::Refuse`: `launchd.plist(5)` does not say whether `UserName` accepts a numeric string,
-/// so a uid goes through a passwd lookup too, and one with no entry is an error.
+/// The [`Identity`] a generator needs of an account. Every account here is resolved by name: `launchd.plist(5)`
+/// does not say whether `UserName` accepts a numeric string, so a uid goes through a passwd lookup too, and
+/// one with no entry is an error.
 impl Account {
     fn identity(&self) -> Identity {
         Identity {
@@ -1440,7 +1440,7 @@ impl backend::Backend for Launchd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<Plists> {
-        let account = resolve_account(&spec.common().user, Unlisted::Refuse)?;
+        let account = resolve_account(&spec.common().user)?;
         generate::plists(spec, &account.identity())
     }
 
@@ -1506,7 +1506,7 @@ impl backend::Backend for Launchd {
         }
         // Resolved again: `render` kept only the plist, which names the account, and launchd
         // resolves that name at launch too.
-        let account = resolve_account(&spec.common().user, Unlisted::Refuse)?;
+        let account = resolve_account(&spec.common().user)?;
         let desired = desired.job.as_str();
         let deadline = Budget::Unbounded.start();
 

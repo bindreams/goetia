@@ -2,13 +2,13 @@ use super::*;
 use crate::error::Error;
 use crate::spec::AccountId;
 
-fn gid(account: &Account) -> Option<u32> {
-    account.gid.map(|gid| gid.as_raw())
+fn gid(account: &Account) -> u32 {
+    account.gid.as_raw()
 }
 
 #[skuld::test]
 fn root_is_uid_zero_named_root() {
-    let account = resolve_account(&User::Root, Unlisted::Refuse).expect("root always exists");
+    let account = resolve_account(&User::Root).expect("root always exists");
     assert_eq!((account.uid.as_raw(), account.name.as_str()), (0, "root"));
 }
 
@@ -16,138 +16,66 @@ fn root_is_uid_zero_named_root() {
 /// spelling of uid 0 either used.
 #[skuld::test]
 fn uid_zero_is_also_root() {
-    let account = resolve_account(&User::Id(AccountId::Uid(0)), Unlisted::Refuse).unwrap();
+    let account = resolve_account(&User::Id(AccountId::Uid(0))).unwrap();
     assert_eq!(account.name, "root");
 }
 
 #[skuld::test]
 fn a_name_is_the_accounts_uid_and_primary_group() {
-    let account = resolve_account(&User::Name("root".to_string()), Unlisted::AsNumber).unwrap();
-    assert_eq!((account.uid.as_raw(), gid(&account)), (0, Some(0)));
+    let account = resolve_account(&User::Name("root".to_string())).unwrap();
+    assert_eq!((account.uid.as_raw(), gid(&account)), (0, 0));
 }
 
 #[skuld::test]
 fn a_windows_sid_is_rejected() {
     let sid = User::Id(AccountId::Sid("S-1-5-21-0".to_string()));
-    for unlisted in [Unlisted::Refuse, Unlisted::AsNumber] {
-        let err = resolve_account(&sid, unlisted).expect_err("a SID names no Unix account");
-        assert!(
-            matches!(err, Error::AccountLookup { .. }) && err.to_string().contains("SID"),
-            "{err}"
-        );
-    }
+    let err = resolve_account(&sid).expect_err("a SID names no Unix account");
+    assert!(
+        matches!(err, Error::AccountLookup { .. }) && err.to_string().contains("SID"),
+        "{err}"
+    );
 }
 
 #[skuld::test]
-fn a_name_that_is_no_account_and_no_number_is_an_error_either_way() {
-    for unlisted in [Unlisted::Refuse, Unlisted::AsNumber] {
-        let err =
-            resolve_account(&User::Name("goetia-no-such-user-xyz".to_string()), unlisted).expect_err("no such user");
-        assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
-        assert!(err.to_string().contains("goetia-no-such-user-xyz"), "{err}");
-    }
+fn a_name_that_is_no_account_is_an_error() {
+    let err = resolve_account(&User::Name("goetia-no-such-user-xyz".to_string())).expect_err("no such user");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(err.to_string().contains("goetia-no-such-user-xyz"), "{err}");
 }
 
-/// launchd's behaviour: an account with no passwd entry is an error, a number included.
+/// An account with no passwd entry is an error, a number included: a number given as a name is looked up
+/// as a name.
 #[skuld::test]
-fn refuse_makes_a_uid_or_a_number_with_no_entry_an_error() {
+fn a_uid_or_a_number_with_no_entry_is_an_error() {
     for user in [User::Id(AccountId::Uid(4_242_424)), User::Name("4242424".to_string())] {
-        let err = resolve_account(&user, Unlisted::Refuse).expect_err("no such account");
+        let err = resolve_account(&user).expect_err("no such account");
         assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     }
 }
 
-/// systemd's behaviour, which `chown` shares: systemd takes `User=4242424` with no entry, so the
-/// directory is handed to that uid and its group is left as it is.
 #[skuld::test]
-fn as_number_takes_a_uid_or_a_number_with_no_entry_as_it_is() {
-    for user in [User::Id(AccountId::Uid(4_242_424)), User::Name("4242424".to_string())] {
-        let account = resolve_account(&user, Unlisted::AsNumber).unwrap();
-        assert_eq!((account.uid.as_raw(), gid(&account)), (4_242_424, None));
-    }
-}
-
-/// Only decimal digits with no sign and no leading zero are a uid: whether systemd's `User=` reads
-/// `+4242424` or `04242424` as 4242424 is not known, so they are names, and no account has them.
-#[skuld::test]
-fn as_number_takes_only_the_canonical_spelling_of_a_number() {
-    for spelling in [
-        "+4242424",
-        "04242424",
-        "004242424",
-        "00",
-        "-4242424",
-        "4242424 ",
-        "４２４２４２４",
-    ] {
-        let err = resolve_account(&User::Name(spelling.to_string()), Unlisted::AsNumber)
-            .expect_err("not the canonical spelling of a number");
-        assert!(matches!(err, Error::AccountLookup { .. }), "{spelling:?}: {err:?}");
-    }
-}
-
-#[skuld::test]
-fn a_uid_with_an_entry_takes_the_entrys_group_either_way() {
-    for unlisted in [Unlisted::Refuse, Unlisted::AsNumber] {
-        let account = resolve_account(&User::Id(AccountId::Uid(0)), unlisted).unwrap();
-        assert_eq!(gid(&account), Some(0));
-    }
-}
-
-/// What `chown` reads as "unchanged" is no account.
-#[skuld::test]
-fn the_uid_that_means_unchanged_is_not_an_owner() {
-    let account = resolve_account(&User::Id(AccountId::Uid(u32::MAX)), Unlisted::AsNumber).unwrap();
-    account.owner().expect_err("`chown` would leave the owner as it is");
+fn a_uid_with_an_entry_takes_the_entrys_group() {
+    let account = resolve_account(&User::Id(AccountId::Uid(0))).unwrap();
+    assert_eq!(gid(&account), 0);
 }
 
 #[skuld::test]
 fn an_account_is_an_owner_with_its_group() {
-    let account = resolve_account(&User::Id(AccountId::Uid(4_242_424)), Unlisted::AsNumber).unwrap();
+    let account = resolve_account(&User::Name("nobody".to_string())).expect("every host has `nobody`");
     let owner = account
         .owner()
         .unwrap()
         .expect("an account that is not root's is handed what it is to write");
-    assert_eq!((owner.uid.as_raw(), owner.gid), (4_242_424, None));
+    assert_eq!((owner.uid, owner.gid), (account.uid, Some(account.gid)));
 }
 
 /// A directory is already root's, and `chown(0, 0)` would take its group away: uid 0 is handed nothing,
 /// by any spelling.
 #[skuld::test]
 fn root_is_handed_nothing() {
-    let spellings = [
-        (User::Root, Unlisted::Refuse),
-        (User::Id(AccountId::Uid(0)), Unlisted::Refuse),
-        (User::Name("root".to_string()), Unlisted::Refuse),
-        (User::Name("0".to_string()), Unlisted::AsNumber),
-    ];
-    for (user, unlisted) in spellings {
-        let account = resolve_account(&user, unlisted).unwrap_or_else(|e| panic!("{user:?}: {e}"));
+    for user in [User::Root, User::Id(AccountId::Uid(0)), User::Name("root".to_string())] {
+        let account = resolve_account(&user).unwrap_or_else(|e| panic!("{user:?}: {e}"));
         assert!(account.owner().unwrap().is_none(), "{user:?}");
-    }
-}
-
-/// systemd's `get_user_creds` reads a `User=` that is a number as a uid, and never asks the name
-/// database for it (`src/basic/user-util.c`, `parse_uid` then `getpwuid`, as in v242): an account
-/// whose name is made of digits is not `User=`'s. Here `0` is root, found by its uid.
-#[skuld::test]
-fn as_number_reads_a_numeric_name_as_the_uid_and_not_as_a_name() {
-    let by_name = resolve_account(&User::Name("0".to_string()), Unlisted::AsNumber).unwrap();
-    let by_uid = resolve_account(&User::Id(AccountId::Uid(0)), Unlisted::AsNumber).unwrap();
-    assert_eq!(
-        (by_name.name.as_str(), by_name.uid, gid(&by_name)),
-        ("root", by_uid.uid, Some(0))
-    );
-}
-
-/// `parse_uid` refuses the two values that are no uid (`uid_is_valid`: 0xFFFF and 0xFFFFFFFF), so
-/// systemd takes them for names, which no account has.
-#[skuld::test]
-fn as_number_does_not_take_a_number_that_is_no_uid() {
-    for number in ["65535", "4294967295"] {
-        let err = resolve_account(&User::Name(number.to_string()), Unlisted::AsNumber)
-            .expect_err("systemd reads it as a name");
-        assert!(matches!(err, Error::AccountLookup { .. }), "{number}: {err:?}");
     }
 }
 

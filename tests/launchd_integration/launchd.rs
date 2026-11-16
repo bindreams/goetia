@@ -1188,7 +1188,7 @@ impl Drop for ModeGuard {
 
 /// Verifies that launchd's `UserName` honours the account this backend
 /// resolves `user:` to (always a real name, never a numeric uid — see
-/// `backend::account::Unlisted::Refuse`'s doc comment): this is the empirical proof that the
+/// `backend::account::resolve_account`'s doc comment): this is the empirical proof that the
 /// resolved account actually runs the job, for the most consequential case.
 #[skuld::test]
 fn root_user_runs_as_uid_zero(#[fixture(launchd_group)] _group: &Group) {

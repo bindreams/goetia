@@ -5,7 +5,7 @@ use std::path::Path;
 use super::*;
 use crate::backend::Settle as _;
 use crate::backend::Standing;
-use crate::backend::created_dirs::created_dirs_tests::{Layout, STRANGER, give_to_a_stranger};
+use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
 use crate::error::Error;
 use crate::spec::{AccountId, ServiceSpec};
 use crate::testing::elevation::ELEVATED;
@@ -23,6 +23,13 @@ fn spec(user: User, cwd: Option<&Path>, logs: Option<&Path>) -> DaemonSpec {
 
 fn no_entry() -> User {
     User::Name(NO_ENTRY.to_string())
+}
+
+/// An account with a passwd entry that is not root's, on every host the suite runs on.
+const NOBODY: u32 = 65534;
+
+fn nobody() -> User {
+    User::Id(AccountId::Uid(NOBODY))
 }
 
 /// The account is looked up to hand a directory to it, and for nothing else: an account that does not
@@ -58,22 +65,101 @@ fn an_account_with_no_entry_refuses_the_install_before_it_makes_the_cwd_it_would
     assert!(!cwd.exists(), "the directory is made only for an account that is found");
 }
 
-/// A uid with no entry is the number, as it is to systemd: the directory is made and the account is
-/// not looked up further. It is the account's when this returns: the unit can run as soon as the write
-/// that follows starts.
+/// The account's `cwd` is its own when this returns: the unit can run as soon as the write that follows
+/// starts.
 #[skuld::test(labels = [ELEVATED])]
-fn a_uid_with_no_entry_is_handed_the_cwd_as_a_number_before_the_write_starts() {
+fn an_account_with_an_entry_is_handed_the_cwd_before_the_write_starts() {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
 
-    ensure_parent_dirs(
-        &spec(User::Id(AccountId::Uid(4_242_424)), Some(&cwd), None),
-        &mut created,
-    )
-    .unwrap();
+    ensure_parent_dirs(&spec(nobody(), Some(&cwd), None), &mut created).unwrap();
 
-    assert_eq!(fs::metadata(&cwd).unwrap().uid(), 4_242_424);
+    assert_eq!(fs::metadata(&cwd).unwrap().uid(), NOBODY);
+}
+
+/// systemd fails every start of a unit run as a uid no passwd entry has (`217/USER`), and does not load
+/// one that names 65535 or 4294967295 (not valid uids). Such a spec is refused at install, by id or by a
+/// numeric name, whether or not a directory is made for it, and before anything is made.
+#[skuld::test(labels = [ELEVATED])]
+fn a_user_systemd_will_not_run_refuses_every_install_before_anything_is_made() {
+    let layout = Layout::new();
+    let existing = layout.system().join("work");
+    fs::create_dir(&existing).unwrap();
+    let new_cwd = layout.system().join("new-work");
+    let new_logs = layout.system().join("logs/out.log");
+    let users = [
+        User::Id(AccountId::Uid(4_242_424)),
+        User::Name("4242424".to_string()),
+        User::Id(AccountId::Uid(0xFFFF)),
+        User::Name("65535".to_string()),
+        User::Id(AccountId::Uid(u32::MAX)),
+        User::Name("4294967295".to_string()),
+    ];
+
+    for user in users {
+        for (cwd, logs) in [
+            (None, None),
+            (Some(existing.as_path()), None),
+            (Some(new_cwd.as_path()), Some(new_logs.as_path())),
+        ] {
+            let mut created = CreatedDirs::under(vec![layout.system()]);
+
+            let err =
+                ensure_parent_dirs(&spec(user.clone(), cwd, logs), &mut created).expect_err("systemd will not run it");
+
+            assert!(
+                matches!(err, Error::AccountLookup { .. }) && err.to_string().contains("systemd will not run"),
+                "{user:?}: {err}"
+            );
+            assert!(
+                !new_cwd.exists() && !new_logs.parent().unwrap().exists(),
+                "{user:?}: something was made"
+            );
+        }
+    }
+}
+
+/// A number is a uid to systemd, never the name of an account whose name is those digits, and a uid with
+/// an entry is the entry's account: `0` is root.
+#[skuld::test]
+fn a_user_that_is_a_number_is_the_account_of_that_uid() {
+    for user in [User::Id(AccountId::Uid(0)), User::Name("0".to_string())] {
+        let account = numeric_account(&user)
+            .unwrap_or_else(|e| panic!("{user:?}: {e}"))
+            .expect("a number is an account by its uid");
+        assert_eq!(
+            (account.name.as_str(), account.uid.as_raw(), account.gid.as_raw()),
+            ("root", 0, 0),
+            "{user:?}"
+        );
+    }
+}
+
+/// Only decimal digits with no sign and no leading zero are a uid: whether systemd's `User=` reads
+/// `+4242424` or `04242424` as 4242424 is not known, so they are names, which an install looks up only
+/// to hand a directory to them.
+#[skuld::test]
+fn a_user_that_is_not_the_canonical_spelling_of_a_number_is_a_name() {
+    for spelling in [
+        "+4242424",
+        "04242424",
+        "00",
+        "-4242424",
+        "4242424 ",
+        "４２４２４２４",
+        "root",
+        "99999999999",
+    ] {
+        let user = User::Name(spelling.to_string());
+        assert!(
+            numeric_account(&user)
+                .unwrap_or_else(|e| panic!("{spelling:?}: {e}"))
+                .is_none(),
+            "{spelling:?}"
+        );
+    }
+    assert!(numeric_account(&User::Root).unwrap().is_none());
 }
 
 /// A write that fails after the directories are made takes them back, handed over as they were: the
@@ -84,11 +170,7 @@ fn a_failed_install_takes_back_the_cwd_it_handed_over() {
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
 
-    ensure_parent_dirs(
-        &spec(User::Id(AccountId::Uid(4_242_424)), Some(&cwd), None),
-        &mut created,
-    )
-    .unwrap();
+    ensure_parent_dirs(&spec(nobody(), Some(&cwd), None), &mut created).unwrap();
     created.settle(|| Standing::No);
     drop(created);
 
@@ -123,7 +205,7 @@ fn nothing_is_made_when_the_log_check_refuses() {
     let planted = layout.system().join("planted");
     fs::create_dir(&planted).unwrap();
     symlink(layout.outside(), planted.join("out.log")).unwrap();
-    let user = || User::Id(AccountId::Uid(4_242_424));
+    let user = nobody;
     let work = layout.system().join("work");
     let new_logs = layout.system().join("newlogs");
 
@@ -179,18 +261,15 @@ fn a_log_in_or_under_the_cwd_to_be_handed_is_refused_and_what_was_made_is_taken_
     for logs in [cwd.join("out.log"), cwd.join("sub/out.log")] {
         let mut created = CreatedDirs::under(vec![layout.system()]);
 
-        let err = ensure_parent_dirs(
-            &spec(User::Id(AccountId::Uid(STRANGER)), Some(&cwd), Some(&logs)),
-            &mut created,
-        )
-        .expect_err("a log in the directory that is to be the account's");
+        let err = ensure_parent_dirs(&spec(nobody(), Some(&cwd), Some(&logs)), &mut created)
+            .expect_err("a log in the directory that is to be the account's");
         drop(created);
 
         let Error::DirectoryRefused { path, why } = err else {
             panic!("{err:?}")
         };
         assert_eq!(path, cwd, "{why}");
-        assert!(why.contains(&format!("uid {STRANGER}")) && !why.contains("  "), "{why}");
+        assert!(why.contains(&format!("uid {NOBODY}")) && !why.contains("  "), "{why}");
         assert!(!cwd.exists(), "{}: what was made for the log was left", logs.display());
     }
 }
@@ -204,7 +283,7 @@ fn a_log_beside_or_above_the_cwd_to_be_handed_is_accepted() {
 
         ensure_parent_dirs(
             &spec(
-                User::Id(AccountId::Uid(STRANGER)),
+                nobody(),
                 Some(&layout.system().join(cwd)),
                 Some(&layout.system().join(logs)),
             ),
@@ -212,7 +291,7 @@ fn a_log_beside_or_above_the_cwd_to_be_handed_is_accepted() {
         )
         .unwrap_or_else(|e| panic!("{cwd} {logs}: {e}"));
 
-        assert_eq!(fs::metadata(layout.system().join(cwd)).unwrap().uid(), STRANGER);
+        assert_eq!(fs::metadata(layout.system().join(cwd)).unwrap().uid(), NOBODY);
         assert_eq!(
             fs::metadata(layout.system().join(logs).parent().unwrap())
                 .unwrap()

@@ -165,8 +165,6 @@ struct Made {
     handed: bool,
     /// Whether the undo could not remove it. What a directory above it then holds is that.
     left: bool,
-    /// Judged and given its mode. One that is not is left behind by a keep, and named.
-    ready: bool,
 }
 
 #[derive(Debug)]
@@ -279,12 +277,12 @@ impl CreatedDirs {
         let hand = |n: usize| if n == last { hand_to } else { None };
         let (first_path, first_name) = &missing[0];
         let mut dir = match self.pending_top(&holder, first_path, first_name)? {
-            Some(top) => top,
+            Some(top) => self.reach(top, hand_to)?,
             None => self.make_top(holder, first_path, first_name, hand(0), hand_to)?,
         };
         for (n, (path, name)) in missing.iter().enumerate().skip(1) {
             dir = match self.child_named(dir, name) {
-                Some(child) => child,
+                Some(child) => self.reach(child, hand_to)?,
                 None => self.make_inside(dir, path, name, hand(n), hand_to)?,
             };
         }
@@ -393,7 +391,6 @@ impl CreatedDirs {
             plan_owner,
             handed: false,
             left: false,
-            ready: false,
         });
         let made = &self.made[index];
         let parent_fd = fd_of(&self.made, &made.parent).expect("a directory is made only below one that is held");
@@ -412,6 +409,24 @@ impl CreatedDirs {
         };
         self.verify(index, &stat)?;
         Ok(index)
+    }
+
+    /// A plan that hands nothing over passes through or ends at `dir`, which an earlier plan of this call
+    /// made. If that plan handed it to an account, this path is it or lies in it: the other half of
+    /// [`hand_to_one_owner`](Self::hand_to_one_owner)'s refusal, so that the two orders agree.
+    fn reach(&self, dir: usize, hand_to: Option<Owner>) -> Result<usize> {
+        let made = &self.made[dir];
+        match (hand_to, made.hand) {
+            (None, Some(owner)) => Err(Error::DirectoryRefused {
+                path: made.path.clone(),
+                why: format!(
+                    "it is to be handed to {}, and another path of the spec, which is not handed to an account, \
+                     is it or lies in it: keep the two paths apart",
+                    describe_uid(owner.uid.as_raw())
+                ),
+            }),
+            _ => Ok(dir),
+        }
     }
 
     /// A later plan names the directory at `dir`, which an earlier plan of this call made, and hands the
@@ -501,7 +516,7 @@ impl CreatedDirs {
     /// Judge the directory just made, and open it up to `0755`.
     fn verify(&mut self, index: usize, stat: &FileStat) -> Result<()> {
         let at = self.at(index);
-        let made = &mut self.made[index];
+        let made = &self.made[index];
         let held = made
             .held
             .as_ref()
@@ -509,7 +524,6 @@ impl CreatedDirs {
         let empty = is_empty(&held.dir).map_err(|e| Error::os_at("read", &at, e))?;
         judge(stat, empty).map_err(|why| Error::DirectoryRefused { path: at.clone(), why })?;
         fchmod(&held.dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", &at, e))?;
-        made.ready = true;
         Ok(())
     }
 
@@ -529,35 +543,14 @@ impl CreatedDirs {
 
     /// Let go of everything made: the directories stay, except a tree not yet put in place (a `make` that
     /// did not finish), which is at a name no definition can name and is removed as an undo removes it.
-    /// Returns a note for each that stays other than as made, for the caller to report: one not
-    /// verified (see `Made::ready`). A finished `make` has handed over and placed everything.
-    fn keep(&mut self) -> Vec<String> {
+    /// A finished `make` has judged, handed over and placed everything.
+    fn keep(&mut self) {
         let mut unplaced: Vec<bool> = Vec::with_capacity(self.made.len());
         for made in &self.made {
             unplaced.push(made.pending.is_some() || matches!(made.parent, Parent::Made(parent) if unplaced[parent]));
         }
         self.undo_where(|index| unplaced[index]);
-        let notes = self
-            .made
-            .iter()
-            .enumerate()
-            .filter(|&(index, made)| !unplaced[index] && !made.ready)
-            .map(|(_, made)| {
-                format!(
-                    "{}, which the install created, was never verified: it is left behind",
-                    made.path.display()
-                )
-            })
-            .collect();
         self.made.clear();
-        notes
-    }
-
-    /// [`keep`](Self::keep), reporting what it returns.
-    fn keep_and_report(&mut self) {
-        for note in self.keep() {
-            report(format_args!("{note}"));
-        }
     }
 
     /// Remove `self.made[index]` from its parent if the name still refers to the directory that was
@@ -696,11 +689,11 @@ impl Settle for CreatedDirs {
             return;
         }
         match standing() {
-            Standing::Yes => self.keep_and_report(),
+            Standing::Yes => self.keep(),
             Standing::No => {}
             Standing::Unknown(reason) => {
                 report(format_args!("{reason}; keeping the directories the install created"));
-                self.keep_and_report();
+                self.keep();
             }
         }
     }
@@ -712,7 +705,7 @@ impl Drop for CreatedDirs {
     /// failed report is ignored.
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.keep_and_report();
+            self.keep();
         } else {
             self.undo();
         }

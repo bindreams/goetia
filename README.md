@@ -474,13 +474,14 @@ owns it, since `install` is not a start and you may still be preparing it.
   a directory only root can change.
 - **A path that is not a directory** (a file, or a symlink that leads nowhere) is refused by both
   backends.
-- **An account with no passwd entry.** On systemd a `user` that is a uid, or a name that is a number, with
-  no passwd entry is used as that number (systemd runs a unit as one): `cwd` is handed to it and its group
-  is left as it is. On launchd it is an error, as it was. On systemd the account is looked up only when
-  `install` makes a `cwd` to hand to it: a `user` that does not exist yet, with no `cwd` or one that exists,
-  installs as it did. On systemd a `user` that is a number (`"1000"`, no sign, no leading zero) is that
-  uid, as systemd reads `User=`: it is never looked up as the name of an account that has those digits.
-  uid 0, by any spelling, is root and is handed nothing, on both backends.
+- **An account with no passwd entry.** On launchd a `user` with no passwd entry is an error. On systemd a
+  `user` that is a number (a uid, or a name written `"1000"`: digits only, no sign, no leading zero) is that
+  uid, as systemd reads `User=`, and is never looked up as the name of an account made of digits. `install`
+  refuses one that systemd will not run, on every install, before it makes anything: a uid with no passwd
+  entry (every start of the unit would fail with `217/USER`), and 65535 and 4294967295 (systemd does not load
+  a unit that names them). A `user` that is a name is looked up only when `install` makes a `cwd` to hand to
+  it: one that does not exist yet, with no `cwd` or one that exists, installs as it did. uid 0, by any
+  spelling, is root and is handed nothing, on both backends.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
   (the unit or plist cannot be read back): it then says so and keeps them, since removing them could
