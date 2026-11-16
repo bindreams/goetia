@@ -15,7 +15,7 @@
 
 use std::process::{Command, Output};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use goetia::backend::scm::manager::Scm;
@@ -171,8 +171,31 @@ fn count_profile_loads() -> usize {
 fn assert_profile_loaded(id: &str, before: usize) {
     let after = count_profile_loads();
     eprintln!("[probe] {id} newest event 67 record {before} -> {after}");
-    assert!(after > before, "no event 67 logged by the round of {id}");
+    if after > before {
+        return;
+    }
+    // Names what the log holds instead, and goes on: the test fails at its end.
+    MISSING_67.store(true, Ordering::SeqCst);
+    let channel = "Microsoft-Windows-User Profile Service/Operational";
+    for args in [
+        vec!["qe", channel, "/c:12", "/rd:true", "/f:text"],
+        vec!["gl", channel],
+        vec!["gli", channel],
+    ] {
+        let out = Command::new("wevtutil.exe")
+            .args(&args)
+            .output()
+            .expect("spawn wevtutil");
+        eprintln!(
+            "[probe] {id} wevtutil {args:?}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
+
+/// Set when a round's logon logged no new event 67.
+static MISSING_67: AtomicBool = AtomicBool::new(false);
 
 /// A new user's first logon by the first run of a task of the user.
 fn task_round(n: usize) {
@@ -272,6 +295,7 @@ macro_rules! rounds {
                 for n in 0..6 {
                     round(n);
                 }
+                assert!(!MISSING_67.load(Ordering::SeqCst), "a round logged no event 67");
             }
         )*
     };
