@@ -351,16 +351,28 @@ fn a_wait_that_is_not_counted_extends_the_deadline_and_the_budget_by_its_length(
     let now = Instant::now();
     let by = Duration::from_secs(3);
 
-    let deadline = Budget::Bounded(Duration::from_secs(10)).start_at(now).extended(by);
+    let deadline = Budget::Bounded(Duration::from_secs(10)).extended(by).start_at(now);
 
     assert_eq!(deadline.at(), Some(now + Duration::from_secs(13)));
     assert_eq!(
         Budget::Bounded(Duration::from_secs(10)).extended(by),
         Budget::Bounded(Duration::from_secs(13))
     );
-    assert_eq!(Budget::Unbounded.start_at(now).extended(by).at(), None);
+    assert_eq!(Budget::Unbounded.extended(by).start_at(now).at(), None);
     assert_eq!(Budget::Unbounded.extended(by), Budget::Unbounded);
     assert_eq!(Budget::Immediate.extended(by), Budget::Immediate);
+}
+
+/// A bound that overflows when it is extended is a deadline that never expires, as a bound too large for
+/// the clock is at the start.
+#[skuld::test]
+fn a_bound_that_overflows_when_extended_has_a_deadline_that_never_expires() {
+    let now = Instant::now();
+
+    let extended = Budget::Bounded(Duration::MAX - Duration::from_secs(1)).extended(Duration::from_secs(3));
+
+    assert_eq!(extended, Budget::Bounded(Duration::MAX));
+    assert_eq!(extended.start_at(now).at(), None);
 }
 
 /// A zero bound has run out when the wait began, and the wait is not counted: it has run out when the
@@ -371,7 +383,7 @@ fn a_zero_bound_extended_by_a_wait_has_run_out_when_the_wait_ends() {
     let by = Duration::from_millis(50);
     let ends = began + by;
 
-    let deadline = Budget::Bounded(Duration::ZERO).start_at(began).extended(by);
+    let deadline = Budget::Bounded(Duration::ZERO).extended(by).start_at(began);
 
     assert_eq!(deadline.remaining_at(ends), Some(Duration::ZERO));
 }
