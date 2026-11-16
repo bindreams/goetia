@@ -114,6 +114,68 @@ impl Drop for Fsuid {
     }
 }
 
+/// This thread without `CAP_CHOWN`, put back on drop: root can still make directories, and cannot give
+/// one to another uid. Capabilities are per thread, so only the thread that holds the guard is affected.
+#[cfg(target_os = "linux")]
+struct WithoutChown {
+    held: [CapData; 2],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl WithoutChown {
+    /// `_LINUX_CAPABILITY_VERSION_3`: two words of capabilities. `pid` 0 is the calling thread.
+    const HEADER: CapHeader = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    const CAP_CHOWN: u32 = 1 << 0;
+
+    fn new() -> Self {
+        let mut held = [CapData::default(); 2];
+        // SAFETY: `capget` fills the two words the header's version names.
+        let got = unsafe { libc::syscall(libc::SYS_capget, &Self::HEADER, held.as_mut_ptr()) };
+        assert_eq!(got, 0, "capget: {}", std::io::Error::last_os_error());
+        let mut without = held;
+        without[0].effective &= !Self::CAP_CHOWN;
+        Self::set(&without).expect("capset");
+        Self { held }
+    }
+
+    fn set(data: &[CapData; 2]) -> std::io::Result<()> {
+        // SAFETY: `capset` reads the two words the header's version names, for this thread.
+        match unsafe { libc::syscall(libc::SYS_capset, &Self::HEADER, data.as_ptr()) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for WithoutChown {
+    fn drop(&mut self) {
+        if let Err(e) = Self::set(&self.held) {
+            eprintln!("WithoutChown: the capability was not put back: {e}");
+        }
+    }
+}
+
 // Creating ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test(labels = [ELEVATED])]
@@ -654,27 +716,34 @@ fn a_directory_an_earlier_plan_made_is_handed_over_when_a_later_plan_names_it() 
     assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
 }
 
-/// A hand-over that fails is the install's error, never a warning: the directory it was for is taken
-/// back with the rest while it is still empty. (An `fchown` that fails for root is made by taking away
-/// its capability, which `setfsuid` does for the thread.)
+/// A hand-over that fails is the install's error, never a warning, and the whole `make` returns it: every
+/// directory made, the one that was to be handed over included, is taken back by the guard.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn a_hand_over_that_fails_is_an_error_and_the_guard_removes_what_was_made() {
+fn a_make_whose_hand_over_fails_is_an_error_and_the_guard_removes_every_directory_made() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
-    let plan = dirs.plan(&layout.system().join("a/b")).unwrap();
-    dirs.make_missing(plan.found, Some(stranger_owner())).unwrap();
+    let log = dirs.plan(&layout.system().join("logs/x")).unwrap();
+    let cwd = dirs.plan(&layout.system().join("a/b")).unwrap();
 
     let result = {
-        let _fs = Fsuid::set(STRANGER);
-        dirs.hand_over()
+        let _no_chown = WithoutChown::new();
+        dirs.make(vec![(log, None), (cwd, Some(stranger_owner()))])
     };
 
-    let err = result.expect_err("an account may not give a directory away");
+    let err = result.expect_err("root without the right to give a directory away cannot hand one over");
     assert!(err.to_string().contains("hand over"), "{err}");
-    assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
+    for made in ["logs/x", "a/b"] {
+        assert_eq!(
+            owner_of(&layout.system().join(made)).0,
+            0,
+            "{made} was made, and is root's"
+        );
+    }
     drop(dirs);
-    assert!(!layout.system().join("a").exists());
+    for made in ["logs", "a"] {
+        assert!(!layout.system().join(made).exists(), "the guard left {made}");
+    }
 }
 
 /// What an account has written into a directory it was handed is its own: the undo does not empty it,

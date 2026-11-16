@@ -24,7 +24,7 @@ use goetia::manager::{self, Budget, Installed, ServiceManager, State};
 use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
 use goetia::testing::service_fields;
 
-use crate::support::cleanup::{DirGuard, FileGuard};
+use crate::support::cleanup::{DirGuard, FileGuard, warn_left_behind};
 use crate::support::{self, ConnectBack, Group, cmd, launchd_group, may_account_for};
 
 /// Held by every test that reads or seeds hostile state in the shared
@@ -1540,8 +1540,8 @@ fn install_refuses_a_missing_directory_outside_the_roots_and_makes_nothing(#[fix
     assert!(!staging_path(&id).exists(), "a refused install writes no plist");
 }
 
-/// A spec whose `cwd` is `cwd` and whose `logs` parent lies under a regular file, so the install makes
-/// what is missing of the former and then fails on the latter.
+/// A spec whose `cwd` is `cwd` and whose `logs` parent lies under a regular file, so the install fails
+/// on the latter while judging it, before it makes what is missing of the former.
 fn spec_failing_on_logs_after_cwd(id: &str, base: &Path, cwd: &Path) -> DaemonSpec {
     let file = base.join("file");
     std::fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
@@ -1552,7 +1552,9 @@ fn spec_failing_on_logs_after_cwd(id: &str, base: &Path, cwd: &Path) -> DaemonSp
 }
 
 #[skuld::test]
-fn a_failed_install_removes_the_directories_it_made(#[fixture(launchd_group)] _group: &Group) {
+fn an_install_refused_on_its_logs_makes_none_of_the_directories_it_would_have_made(
+    #[fixture(launchd_group)] _group: &Group,
+) {
     let id = support::random_test_id();
     let base = under_state(&id, "undo-made");
     let _cleanup = DirGuard::new(base.clone());
@@ -1565,12 +1567,14 @@ fn a_failed_install_removes_the_directories_it_made(#[fixture(launchd_group)] _g
         .expect_err("the logs parent is under a file");
     support::assert_failed_on_a_path_under_a_file(&err);
 
-    assert!(!base.join("a").exists(), "the failed install left its cwd");
+    assert!(!base.join("a").exists(), "the refused install made its cwd");
     assert!(base.is_dir(), "a directory that existed before must stay");
 }
 
 #[skuld::test]
-fn a_failed_install_removes_a_new_directory_in_one_that_existed_before(#[fixture(launchd_group)] _group: &Group) {
+fn an_install_refused_on_its_logs_makes_no_new_directory_in_one_that_existed_before(
+    #[fixture(launchd_group)] _group: &Group,
+) {
     let id = support::random_test_id();
     let base = under_state(&id, "undo-preexisting");
     let _cleanup = DirGuard::new(base.clone());
@@ -1585,8 +1589,69 @@ fn a_failed_install_removes_a_new_directory_in_one_that_existed_before(#[fixture
         .expect_err("the logs parent is under a file");
     support::assert_failed_on_a_path_under_a_file(&err);
 
-    assert!(!made.exists(), "the failed install left {}", made.display());
+    assert!(!made.exists(), "the refused install made {}", made.display());
     assert!(existing.is_dir(), "a directory that existed before must stay");
+}
+
+/// Makes a file immutable (`uchg`), so a plist cannot be replaced.
+struct Immutable(PathBuf);
+
+impl Immutable {
+    fn new(path: PathBuf) -> Self {
+        cmd::run("chflags", &["uchg", path.to_str().unwrap()]).expect_ok();
+        Self(path)
+    }
+}
+
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        warn_left_behind(cmd::run_cleanup(
+            "chflags",
+            &[&["nouchg", self.0.to_str().unwrap()]],
+            &[],
+        ));
+    }
+}
+
+/// The plist cannot be replaced, after the directories for the new `cwd` and `logs` were made: none of
+/// them is left, and one that existed before stays. This is the case the undo is for: the write fails
+/// with the old plist standing, which names none of the new directories.
+#[skuld::test]
+fn an_install_whose_plist_write_fails_removes_every_directory_it_made(#[fixture(launchd_group)] _group: &Group) {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let spec = base_spec(&id, vec!["/bin/true".to_string()]);
+    let _guard = Guard::install(&mgr, &spec);
+    let old = std::fs::read_to_string(staging_path(&id)).expect("read the plist");
+    // Declared after the guard, so it drops first: the guard's cleanup needs the plist removable.
+    let _immutable = Immutable::new(staging_path(&id));
+    let cwd = under_state(&id, "write-fails");
+    let logs_parent = under_logs(&id, "write-fails");
+    let logs = logs_parent.join("out.log");
+    let _cleanup_cwd = DirGuard::new(cwd.clone());
+    let _cleanup_logs_parent = DirGuard::new(logs_parent.clone());
+    let mut fields = service_fields(spec);
+    fields.common.cwd = Some(cwd.clone());
+    fields.common.logs = Some(logs.clone());
+    let updated = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
+
+    let err = mgr.install(&updated, false).expect_err("the plist cannot be replaced");
+
+    assert!(
+        err.to_string().contains("replace"),
+        "the install must fail on the plist, not earlier: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(staging_path(&id)).expect("read the plist"),
+        old,
+        "the write must not have happened"
+    );
+    assert!(!cwd.exists(), "the failed install left {}", cwd.display());
+    assert!(
+        !logs_parent.exists(),
+        "the failed install left {}",
+        logs_parent.display()
+    );
 }
 
 /// An update that writes a plist asking for a new `cwd` makes it and keeps it: the directories are kept

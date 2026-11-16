@@ -2302,6 +2302,43 @@ fn an_install_that_fails_after_writing_the_unit_keeps_its_directories(#[fixture(
     assert!(cwd.is_dir(), "the directories of an installed unit must stay");
 }
 
+/// The unit cannot be replaced, after the directories for the new `cwd` and `logs` were made and `cwd`
+/// handed to the account: none of them is left, and one that existed before stays. This is the case the
+/// undo is for: the write fails with the old unit standing, which names none of the new directories.
+#[skuld::test]
+fn an_install_whose_unit_write_fails_removes_every_directory_it_made(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "write-fails");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    let old = fs::read_to_string(unit_path(guard.id())).expect("read the unit");
+    // Declared after the guard, so it drops first: the guard's cleanup needs the unit removable.
+    let _immutable = Immutable::new(unit_path(guard.id()));
+    let cwd = base.join("a").join("work");
+    let logs = base.join("b").join("c").join("out.log");
+    let spec = nobody_spec(guard.id(), Some(&cwd), Some(&logs));
+
+    let err = mgr.install(&spec, true).expect_err("the unit cannot be replaced");
+
+    assert!(
+        err.to_string().contains("quarantine"),
+        "the install must fail on the unit, not earlier: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(unit_path(guard.id())).expect("read the unit"),
+        old,
+        "the write must not have happened"
+    );
+    for made in [base.join("a"), base.join("b")] {
+        assert!(!made.exists(), "the failed install left {}", made.display());
+    }
+    assert!(base.is_dir(), "a directory that existed before must stay");
+}
+
 // Backslashes =========================================================================================================
 
 /// Values that end in backslashes are written so that systemd reads each back exactly, and the
