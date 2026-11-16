@@ -5,14 +5,13 @@ use std::process::{Command, Output};
 
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
-use goetia::spec::{Id, User};
-use goetia::testing::remove_task;
+use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
-use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT};
+use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT, RUN_UNTIL_KILLED};
 use crate::support::windows_tasks::{ServiceAccountHost, task_spec};
-use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, kill, scm_group};
+use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, cleanup, kill, scm_group};
 use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
 
 /// The password of the accounts these tests make: at most 14 characters, since a longer one makes
@@ -139,12 +138,67 @@ fn record_files(id: &Id) -> Vec<String> {
     names
 }
 
-/// A task installed as another account over the records of the first: the record directory's permissions
-/// name the new account, which writes its record and prunes the one the first account's run left (the
-/// first's record has an entry for that account only, so the new one deletes it through the directory's
-/// own delete-child right). The accounts are two that need no password, LocalService and NetworkService.
-/// The prune is waited for with no cap, since it is a state of the directory: a prune that fails hangs the
-/// test.
+/// What a service of `account` (no `logs:`) leaves of goetia's folders, then a task install: with no
+/// `%ProgramData%\Goetia` to start from, a service run as a non-administrator account is installed, runs
+/// and logs, and a task install after it must not be refused for the folders that service made. Only an
+/// elevated install makes `Goetia` and `Goetia\logs`, so they are goetia's, and the account can write the
+/// log in the one it is given.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_service_of_a_standard_account_leaves_no_folder_that_refuses_a_task_install(#[fixture(scm_group)] _group: &Group) {
+    // Declared first, so it goes last: the folders that every account of this test made.
+    let goetia = support::program_data().join("Goetia");
+    let _folders = cleanup::DirGuard::new(goetia.clone());
+    for account in ["LocalService", "NetworkService"] {
+        cleanup::remove_or_warn(&goetia, true);
+        assert!(!goetia.exists(), "precondition: no {} to start from", goetia.display());
+
+        let service = test_id();
+        let host = ServiceAccountHost::new(&service);
+        let _service_guard = ServiceGuard::new(service.as_str());
+        let mgr = host.manager();
+        let started = ConnectBack::listen();
+        let spec = ServiceSpec::new({
+            let base = support::base_fields(
+                service.as_str(),
+                vec![
+                    host.exe.path_str(),
+                    RUN_UNTIL_KILLED.to_owned(),
+                    started.port().to_string(),
+                ],
+            );
+            ServiceFields {
+                common: DaemonFields {
+                    user: User::Name(account.to_owned()),
+                    ..base.common
+                },
+                protocol: Protocol::Plain,
+                ..base
+            }
+        })
+        .map(DaemonSpec::from)
+        .expect("a valid service");
+        mgr.install(&spec, false)
+            .unwrap_or_else(|e| panic!("install the service as {account}: {}", e.report()));
+        mgr.start(&service, Budget::Unbounded)
+            .unwrap_or_else(|e| panic!("start the service as {account}: {}", e.report()));
+        started.accept("the program of a service run by a standard account");
+        let log = support::shim_default_log(&support::program_data(), service.as_str());
+        assert!(log.is_file(), "the shim of {account} opened {}", log.display());
+        mgr.stop(&service, Budget::DEFAULT)
+            .unwrap_or_else(|e| panic!("stop the service as {account}: {}", e.report()));
+
+        let task = TaskGuard::new();
+        mgr.install(&task_as(&task.id, User::Root, None), false)
+            .unwrap_or_else(|e| panic!("install a task after a service of {account}: {}", e.report()));
+    }
+}
+
+/// A task installed as another account over the records of the first, without being removed first: the
+/// task is registered again as the new account, whose shim reads it, writes its record and prunes the
+/// ones the first account's run and its own left (a record has an entry for the account that wrote it
+/// only, so the new account deletes them through the record directory's own delete-child right). The
+/// accounts are two that need no password, LocalService and NetworkService. The prune is waited for with
+/// no cap, since it is a state of the directory: a prune that fails hangs the test.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_task_installed_as_another_account_over_the_first_ones_records_still_records_and_prunes(
     #[fixture(scm_group)] _group: &Group,
@@ -171,19 +225,26 @@ fn a_task_installed_as_another_account_over_the_first_ones_records_still_records
     let first_records = record_files(id);
     assert_eq!(first_records.len(), 1, "{first_records:?}");
 
-    // The task goes and its records stay, so the install that follows finds the directory there and sets
-    // its permissions for the new account. (An in-place update of the task to another account leaves the
-    // task unreadable by that account's shim, which is not what this tests.)
-    remove_task(id);
-    assert!(!task_exists(id) && records_of(id).is_dir());
+    // Installed over the task, which is not removed: the account changes while the task and its records
+    // stay. The run is a `run`, whose pin keeps the prune off, so a task its new shim cannot read ends
+    // unrecorded here, as an error, and not as a wait that has no end.
     mgr.install(&as_account("NetworkService"), false)
-        .unwrap_or_else(|e| panic!("install as NetworkService: {}", e.report()));
-    // `start`, not `run`: a `run` waits holding a pin on the records, and a write prunes nothing then.
+        .unwrap_or_else(|e| panic!("install over it as NetworkService: {}", e.report()));
+    let exit = mgr
+        .run(id, &mut Vec::new())
+        .unwrap_or_else(|e| panic!("run as NetworkService: {}", e.report()));
+    assert_eq!(exit, Exit::Code(0), "a recorded run of the second account");
+    let second_records = record_files(id);
+    assert!(
+        second_records.len() == 2 && second_records.contains(&first_records[0]),
+        "the pin kept the first record: {second_records:?}"
+    );
+
+    // `start`, not `run`: a write of a run nobody waits for prunes the records of both runs before it.
     mgr.start(id, Budget::DEFAULT)
         .unwrap_or_else(|e| panic!("start as NetworkService: {}", e.report()));
-
     kill::until(|| {
         let now = record_files(id);
-        now.len() == 1 && now != first_records
+        now.len() == 1 && !second_records.contains(&now[0])
     });
 }
