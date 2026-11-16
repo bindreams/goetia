@@ -82,7 +82,27 @@ use crate::error::{Error, Result, escape};
 #[cfg(target_os = "macos")]
 use libc::{RENAME_EXCL as NO_REPLACE, renameatx_np as rename_flagged};
 #[cfg(target_os = "linux")]
-use libc::{RENAME_NOREPLACE as NO_REPLACE, renameat2 as rename_flagged};
+use libc::{RENAME_NOREPLACE as NO_REPLACE, c_char, c_int, c_uint};
+
+/// `renameat2`, called as the system call: the musl libc the release builds link statically has no
+/// wrapper for it, and an older glibc has none either. Returns `-1` with `errno` set, as the wrapper does.
+///
+/// # Safety
+///
+/// Both paths are NUL-terminated and outlive the call, and both descriptors are open.
+#[cfg(target_os = "linux")]
+unsafe fn rename_flagged(
+    from_dir: c_int,
+    from: *const c_char,
+    to_dir: c_int,
+    to: *const c_char,
+    flags: c_uint,
+) -> c_int {
+    // SAFETY: the caller's; `SYS_renameat2` takes exactly these five arguments.
+    let rc = unsafe { libc::syscall(libc::SYS_renameat2, from_dir, from, to_dir, to, flags) };
+    // The system call returns 0 or -1 here, both of which an `int` holds.
+    rc as c_int
+}
 
 /// Where a missing `cwd` or log directory is made: the directories systemd's own `LogsDirectory=`,
 /// `StateDirectory=` and `CacheDirectory=` are under. `/run` is left out, since it is emptied at boot.
