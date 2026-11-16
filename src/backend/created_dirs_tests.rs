@@ -42,8 +42,7 @@ impl Layout {
         self.base().join("outside")
     }
 
-    /// A root that cannot be opened: below a regular file, so that opening it says `ENOTDIR`, which
-    /// is not "not there".
+    /// A root below a regular file: opening it says `ENOTDIR`.
     pub(crate) fn broken_root(&self) -> PathBuf {
         let file = self.base().join("a-file");
         fs::write(&file, b"x").unwrap();

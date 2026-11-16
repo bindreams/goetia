@@ -6,7 +6,9 @@
 //! - **Roots.** A missing directory is made only under one of [`SYSTEM_ROOTS`], the places systemd
 //!   itself makes directories in (`LogsDirectory=` and its kin). Anywhere else it is an error that
 //!   says to create it first: goetia makes nothing in a user's home or a prefix of its own. A path
-//!   that exists whole is used as it is, wherever it is and whoever owns it.
+//!   that exists whole is used as it is, wherever it is and whoever owns it. A root that is not there
+//!   (`ENOENT`, `ENOTDIR`, `ELOOP`) holds nothing and is skipped; one that cannot be read for any other
+//!   reason fails the install, naming the root and the path.
 //! - **Walk.** Where something is missing, [`walk()`] resolves the path on descriptors, and every
 //!   directory it passed through must be owned by root: root does not create inside a directory an
 //!   account owns. A symlink is judged by the directory that holds it, not by its owner: the owner of

@@ -221,7 +221,10 @@ fn a_skipped_root_leaves_the_log_refusal_to_the_roots_that_remain(#[fixture(root
     let roots = || CreatedDirs::under(vec![broken.clone(), layout.system()]);
 
     let why = refused_by(&roots(), &held);
-    assert!(why.contains(held.parent().unwrap().join("app/app.log").to_str().unwrap()), "{why}");
+    assert!(
+        why.contains(held.parent().unwrap().join("app/app.log").to_str().unwrap()),
+        "{why}"
+    );
 
     let why = refused_by(&roots(), &not_held);
     assert!(!why.contains("such as") && why.contains("journal"), "{why}");
