@@ -4,7 +4,8 @@
 //! symlink there (measured on systemd 255). So whoever can write the log's directory can plant a link
 //! at the log's name before the first start, and whoever can write an ancestor of it can rename the
 //! directory away and make one of their own. The directory is therefore refused while an account other
-//! than root can change it, as it is when install runs.
+//! than root can change it, as it is when install runs. A symlink on the way is judged by the
+//! directory that holds it, which the walk passed too: its owner cannot change where it leads.
 
 use std::path::Path;
 
@@ -32,11 +33,10 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan) -> Result<()> {
             && matches!(&plan.found.end, End::Whole { stat, .. }
                 if step.stat.st_dev == stat.st_dev && step.stat.st_ino == stat.st_ino);
         let Some(who) = writer(step, leaf) else { continue };
-        let kind = if step.link { "the symlink" } else { "the directory" };
         return Err(Error::DirectoryRefused {
             path: dir.to_path_buf(),
             why: format!(
-                "{kind} {} can be changed by {who}, who could {LED_ASTRAY}",
+                "the directory {} can be changed by {who}, who could {LED_ASTRAY}",
                 step.at.display()
             ),
         });
@@ -70,9 +70,13 @@ const LED_ASTRAY: &str = "make root's open of the log (systemd opens it before i
                           symlink) write any file; use a log directory that only root can change, under \
                           directories only root can change";
 
-/// Who besides root can change what `step` passed, if anyone: its owner, or the group or everyone
-/// who can write a directory. The sticky bit excuses that unless `leaf`, the directory the log lands in.
+/// Who besides root can change what `step` passed, if anyone: the owner of a directory, or the group or
+/// everyone who can write it. The sticky bit excuses that unless `leaf`, the directory the log lands
+/// in. A symlink has no one: whoever can write its holder is named at the holder's own step.
 fn writer(step: &Step, leaf: bool) -> Option<String> {
+    if step.link {
+        return None;
+    }
     if step.stat.st_uid != 0 {
         return Some(format!("its owner {}", describe_uid(step.stat.st_uid)));
     }

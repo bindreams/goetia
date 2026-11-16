@@ -8,10 +8,12 @@
 //!   says to create it first: goetia makes nothing in a user's home or a prefix of its own. A path
 //!   that exists whole is used as it is, wherever it is and whoever owns it.
 //! - **Walk.** Where something is missing, [`walk()`] resolves the path on descriptors, and every
-//!   directory and symlink it passed through must be owned by root: root does not create inside a
-//!   directory, nor follow a link, that an account owns. Modes are not judged: a root-owned directory
-//!   others can write is accepted (the administrator's exposure). Where writability matters the
-//!   caller judges it: for a log systemd opens as root, `refuse_writable_log_dir` (Linux).
+//!   directory it passed through must be owned by root: root does not create inside a directory an
+//!   account owns. A symlink is judged by the directory that holds it, not by its owner: the owner of
+//!   a link cannot change where it leads, and only whoever can write the holder can replace it. Modes
+//!   are not judged: a root-owned directory others can write is accepted (the administrator's
+//!   exposure). Where writability matters the caller judges it: for a log systemd opens as root,
+//!   `refuse_writable_log_dir` (Linux).
 //! - **Making.** The first missing component of a path is made beside where it will be, under a
 //!   temporary name (`.goetia-` and a random one), and the rest inside it under their final names. A
 //!   later path whose missing part starts at the same component of the same directory is made in that
@@ -225,13 +227,12 @@ impl CreatedDirs {
                     ),
                 });
             }
-            if let Some(step) = found.trail.iter().find(|step| step.stat.st_uid != 0) {
+            if let Some(step) = found.trail.iter().find(|step| !step.link && step.stat.st_uid != 0) {
                 return Err(Error::DirectoryRefused {
                     path: dir.to_path_buf(),
                     why: format!(
-                        "{} {} is owned by uid {}, not root, and root does not create inside what an account can \
-                         change; create it first",
-                        if step.link { "the symlink" } else { "the directory" },
+                        "the directory {} is owned by uid {}, not root, and root does not create inside what an \
+                         account can change; create it first",
                         step.at.display(),
                         step.stat.st_uid
                     ),

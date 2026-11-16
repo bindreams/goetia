@@ -109,7 +109,8 @@ impl Launchd {
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
                 // Every refusal about the spec's directories comes before the first action, which may
-                // unload the timer: a refused update leaves what is installed as it was.
+                // unload the timer: the plan is judged here, and made before that action (see
+                // `Executor::prepare`). A refused update leaves what is installed as it was.
                 let dirs_planned = plan_parent_dirs(spec, &account, created)?;
                 let old = self.old_of(snapshot, reservation)?;
                 let plan = update_plan(&old, desired, spec);
@@ -179,8 +180,7 @@ impl Launchd {
                     staged_timer,
                     verb: Verb::Install,
                     timer_out: false,
-                    // Made after the last refusal, as the service path has it: a refused update creates
-                    // nothing.
+                    // Made by `run` before its first action, after every refusal that reading can give.
                     prepare: Some((created, dirs_planned)),
                 }
                 .run(&plan, reservation)
@@ -350,7 +350,9 @@ struct Executor<'a> {
     /// it: an error then says the timer is not loaded, and a refusal loads it again first.
     timer_out: bool,
     /// The directories the spec names (`cwd`, the parent of `logs`), already planned and judged, and
-    /// made before the first action that changes anything a refusal could leave untouched.
+    /// made before the first action: `make` can still refuse (a name taken meanwhile, two spellings of
+    /// one name), and what the actions change is not to be left half done by it. A later failure takes
+    /// them back with the install.
     prepare: Option<(&'a mut CreatedDirs, Planned)>,
 }
 
@@ -365,11 +367,7 @@ enum Verb {
 
 impl Executor<'_> {
     fn run(&mut self, plan: &[Action], reservation: &mut Reservation) -> Result<WriteOutcome> {
-        // A plan with no action has no refusal to come before: the directories are made, as an
-        // install that changes nothing has always made them.
-        if plan.is_empty()
-            && let Some((created, planned)) = self.prepare.take()
-        {
+        if let Some((created, planned)) = self.prepare.take() {
             created.make(planned)?;
         }
         for (at, &action) in plan.iter().enumerate() {
@@ -386,11 +384,6 @@ impl Executor<'_> {
 
     /// `Some` where the install ends with a refusal that is not an error.
     fn perform(&mut self, action: Action, reservation: &mut Reservation) -> Result<Option<WriteOutcome>> {
-        if !matches!(action, Action::BootoutTimer | Action::CheckJobIdle)
-            && let Some((created, planned)) = self.prepare.take()
-        {
-            created.make(planned)?;
-        }
         let (launchctl, id) = (&self.launchd.launchctl, self.id.as_str());
         let deadline = Budget::Unbounded.start();
         let timer_label = timer_label(id);

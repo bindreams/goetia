@@ -21,13 +21,12 @@ use crate::spec::{AccountId, DaemonSpec, User};
 /// found when [`CreatedDirs::make`] reaches `cwd` (a file system that ignores case makes two names
 /// one directory), and what was made is then taken back. Runs while still elevated.
 ///
-/// A `user` that is a number is refused on every install, as `numeric_account` says, before anything is
-/// planned. A `user` that is a name is looked up only when `cwd` is to be made and handed to it: an
-/// install that hands nothing over does not need it to exist yet (`sysusers` or a package may make it
-/// later), and an unknown one then fails before anything is made.
+/// A `user` that is a number systemd will not run is refused where the definition is rendered for an
+/// install (see [`numeric_account`]), not here. Here an account is looked up only when `cwd` is to be
+/// made and handed to it: an install that hands nothing over does not need it to exist yet (`sysusers`
+/// or a package may make it later), and an unknown one then fails before anything is made.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -> Result<()> {
     let common = spec.common();
-    let numeric = numeric_account(&common.user)?;
     let logs_parent = common
         .logs
         .as_deref()
@@ -40,7 +39,7 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
         refuse_writable_log_dir(logs, log)?;
     }
     let owner = match &cwd {
-        Some(cwd) if cwd.makes() => owner_of(&common.user, numeric)?,
+        Some(cwd) if cwd.makes() => owner_of(&common.user)?,
         _ => None,
     };
 
@@ -52,13 +51,13 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
     )
 }
 
-/// Whom `cwd` is handed to for `user`, whose account is `numeric` if it is a number. Root, by any
-/// spelling (uid 0 is root whatever names it), is handed nothing: the directory is already root's.
-fn owner_of(user: &User, numeric: Option<Account>) -> Result<Option<Owner>> {
+/// Whom `cwd` is handed to for `user`. Root, by any spelling (uid 0 is root whatever names it), is
+/// handed nothing: the directory is already root's.
+fn owner_of(user: &User) -> Result<Option<Owner>> {
     if matches!(user, User::Root) {
         return Ok(None);
     }
-    match numeric {
+    match numeric_account(user)? {
         Some(account) => account.owner(),
         None => resolve_account(user)?.owner(),
     }
@@ -70,8 +69,9 @@ fn owner_of(user: &User, numeric: Option<Account>) -> Result<Option<Owner>> {
 ///
 /// An error where systemd will not run a unit as that uid (measured on systemd 255): one with no passwd
 /// entry fails every start with `217/USER`, and 65535 and 4294967295, which `uid_is_valid` refuses, do
-/// not load.
-fn numeric_account(user: &User) -> Result<Option<Account>> {
+/// not load. The refusal is the spec's, so `render_for_install` makes it, for `preview_install` and
+/// `install` alike.
+pub(super) fn numeric_account(user: &User) -> Result<Option<Account>> {
     let uid = match user {
         User::Id(AccountId::Uid(uid)) => *uid,
         User::Name(name) => match canonical_uid(name) {

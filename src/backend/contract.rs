@@ -280,17 +280,13 @@ pub(crate) enum Standing {
     Unknown(String),
 }
 
-/// What a [`Backend::write`] made besides the definition, in the [`Backend::InstallScope`]. `()`
-/// for a backend that makes nothing.
+/// What a [`Backend::write`] made besides the definition, in the [`Backend::InstallScope`]. A backend
+/// that makes nothing implements it with an empty `settle` (SCM's, which only holds a lock).
 pub(crate) trait Settle {
     /// Keep what was made, or take it back, by whether the definition stands. `standing` is asked
     /// only if something was made. What is not kept is taken back when the scope is dropped, so a
     /// write that lost a race and a later one that failed are both undone.
     fn settle(&mut self, standing: impl FnOnce() -> Standing);
-}
-
-impl Settle for () {
-    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {}
 }
 
 /// One [`Backend`]'s native restart of a service the gate passed.

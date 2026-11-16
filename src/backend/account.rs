@@ -11,8 +11,6 @@ use crate::spec::{AccountId, User};
 #[derive(Debug)]
 pub(crate) struct Account {
     /// Its name.
-    // Read where a backend names the account to its manager (launchd's `UserName`).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) name: String,
     pub(crate) uid: Uid,
     /// Its primary group.

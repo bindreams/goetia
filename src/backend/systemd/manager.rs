@@ -184,6 +184,14 @@ impl Backend for Systemd {
         generate::units(spec, &identity_for(&spec.common().user)?)
     }
 
+    /// [`Self::render`], refusing a numeric `user` systemd will not run (see
+    /// [`dirs::numeric_account`]). Only here: `status` and `list` render with [`Self::render`], and an
+    /// account removed since the install is no reason they cannot show the unit.
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<Units> {
+        dirs::numeric_account(&spec.common().user)?;
+        self.render(spec)
+    }
+
     /// The units as `snapshot` holds them, unmodified: see [`task::regenerate`].
     fn regenerate(&self, spec: &DaemonSpec, snapshot: &Fragment) -> Result<Units> {
         task::regenerate(spec, snapshot)
