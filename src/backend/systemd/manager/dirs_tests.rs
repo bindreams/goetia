@@ -2,7 +2,9 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt as _, symlink};
 use std::path::Path;
 
+use super::super::Systemd;
 use super::*;
+use crate::backend::Backend as _;
 use crate::backend::Settle as _;
 use crate::backend::Standing;
 use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
@@ -79,15 +81,12 @@ fn an_account_with_an_entry_is_handed_the_cwd_before_the_write_starts() {
 }
 
 /// systemd fails every start of a unit run as a uid no passwd entry has (`217/USER`), and does not load
-/// one that names 65535 or 4294967295 (not valid uids). Such a spec is refused at install, by id or by a
-/// numeric name, whether or not a directory is made for it, and before anything is made.
-#[skuld::test(labels = [ELEVATED])]
-fn a_user_systemd_will_not_run_refuses_every_install_before_anything_is_made() {
-    let layout = Layout::new();
-    let existing = layout.system().join("work");
-    fs::create_dir(&existing).unwrap();
-    let new_cwd = layout.system().join("new-work");
-    let new_logs = layout.system().join("logs/out.log");
+/// one that names 65535 or 4294967295 (not valid uids). Such a spec is refused where the definition is
+/// rendered for an install, which is where `preview_install` and `install` both go, and not where a
+/// definition is rendered for `status` and `list`: an account that was removed since is no reason they
+/// cannot show the unit.
+#[skuld::test]
+fn a_user_systemd_will_not_run_is_refused_when_rendered_for_an_install_and_not_otherwise() {
     let users = [
         User::Id(AccountId::Uid(4_242_424)),
         User::Name("4242424".to_string()),
@@ -96,27 +95,20 @@ fn a_user_systemd_will_not_run_refuses_every_install_before_anything_is_made() {
         User::Id(AccountId::Uid(u32::MAX)),
         User::Name("4294967295".to_string()),
     ];
+    let systemd = Systemd::default();
 
     for user in users {
-        for (cwd, logs) in [
-            (None, None),
-            (Some(existing.as_path()), None),
-            (Some(new_cwd.as_path()), Some(new_logs.as_path())),
-        ] {
-            let mut created = CreatedDirs::under(vec![layout.system()]);
+        let spec = spec(user.clone(), None, None);
 
-            let err =
-                ensure_parent_dirs(&spec(user.clone(), cwd, logs), &mut created).expect_err("systemd will not run it");
+        let err = systemd.render_for_install(&spec).expect_err("systemd will not run it");
 
-            assert!(
-                matches!(err, Error::AccountLookup { .. }) && err.to_string().contains("systemd will not run"),
-                "{user:?}: {err}"
-            );
-            assert!(
-                !new_cwd.exists() && !new_logs.parent().unwrap().exists(),
-                "{user:?}: something was made"
-            );
-        }
+        assert!(
+            matches!(err, Error::AccountLookup { .. }) && err.to_string().contains("systemd will not run"),
+            "{user:?}: {err}"
+        );
+        systemd
+            .render(&spec)
+            .unwrap_or_else(|e| panic!("{user:?}: a render for status refused: {e}"));
     }
 }
 

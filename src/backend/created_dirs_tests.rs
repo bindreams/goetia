@@ -368,8 +368,11 @@ fn create_refuses_a_missing_component_below_a_directory_an_account_owns() {
     assert!(!owned.join("new").exists());
 }
 
+/// A symlink's owner does not decide where it leads: only whoever can write the directory that holds
+/// it can replace it, and that directory is judged like any other. A link an account made in a
+/// directory only root can write is followed.
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_missing_component_below_a_symlink_an_account_owns() {
+fn create_makes_below_a_symlink_an_account_owns_when_only_root_can_write_its_holder() {
     let layout = Layout::new();
     let link = layout.system().join("link");
     symlink(layout.system().join("real"), &link).unwrap();
@@ -377,12 +380,9 @@ fn create_refuses_a_missing_component_below_a_symlink_an_account_owns() {
     std::os::unix::fs::lchown(&link, Some(STRANGER), Some(STRANGER)).unwrap();
     let mut dirs = layout.dirs();
 
-    let err = dirs
-        .create(&link.join("new"), None)
-        .expect_err("the account can retarget its link");
+    dirs.create(&link.join("new"), None).expect("root holds the link");
 
-    assert!(refusal(&err).contains(&format!("uid {STRANGER}")));
-    assert!(!layout.system().join("real/new").exists());
+    assert!(layout.system().join("real/new").is_dir());
 }
 
 #[skuld::test(labels = [ELEVATED])]

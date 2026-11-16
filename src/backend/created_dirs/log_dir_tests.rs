@@ -105,8 +105,10 @@ fn an_ancestor_an_account_can_change_is_refused_though_the_directory_is_roots() 
     assert!(why.contains(ancestor.to_str().unwrap()), "{why}");
 }
 
+/// A symlink's owner cannot change where it leads: a link an account made in a directory only root can
+/// write is followed.
 #[skuld::test(labels = [ELEVATED])]
-fn a_symlink_an_account_owns_on_the_way_to_the_log_directory_is_refused() {
+fn a_symlink_an_account_owns_in_a_directory_only_root_can_write_is_followed() {
     let layout = Layout::new();
     let real = layout.system().join("real");
     fs::create_dir(&real).unwrap();
@@ -114,10 +116,24 @@ fn a_symlink_an_account_owns_on_the_way_to_the_log_directory_is_refused() {
     symlink(&real, &link).unwrap();
     std::os::unix::fs::lchown(&link, Some(STRANGER), Some(STRANGER)).unwrap();
 
-    let why = refused(&link.join("app.log"));
+    check(&link.join("app.log")).unwrap();
+}
+
+/// A link is judged by its holder: whoever can write the directory it is in can replace it.
+#[skuld::test(labels = [ELEVATED])]
+fn a_symlink_in_a_directory_an_account_can_write_is_refused_naming_the_directory() {
+    let layout = Layout::new();
+    let real = layout.system().join("real");
+    fs::create_dir(&real).unwrap();
+    let holder = layout.system().join("holder");
+    fs::create_dir(&holder).unwrap();
+    symlink(&real, holder.join("link")).unwrap();
+    give_to_a_stranger(&holder);
+
+    let why = refused(&holder.join("link/app.log"));
 
     assert!(
-        why.contains("symlink") && why.contains(&format!("uid {STRANGER}")),
+        why.contains(holder.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
         "{why}"
     );
 }

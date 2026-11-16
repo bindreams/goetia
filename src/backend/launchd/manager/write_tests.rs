@@ -870,10 +870,10 @@ fn a_print_that_failed_is_worded_as_a_failed_read() {
     assert_eq!(text_at(&tree, false, ID), old.job);
 }
 
-/// A refused update has created none of the new spec's directories: the `cwd` is one the install could
-/// make, so the refusal for a run in flight is what leaves it missing.
+/// A refused update leaves none of the new spec's directories: the `cwd` is one the install could
+/// make, so the refusal for a run in flight takes it back with the install.
 #[skuld::test(labels = [ELEVATED])]
-fn a_refused_update_creates_none_of_the_specs_directories() {
+fn a_refused_update_leaves_none_of_the_specs_directories() {
     require_elevated();
     let tree = Tree::new();
     installed(&tree, &task_spec(Some(SCHEDULE)), false);
@@ -915,7 +915,45 @@ fn a_refused_update_creates_none_of_the_specs_directories() {
         ),
         "{e:?}"
     );
-    assert!(!cwd.exists(), "the refusal came first");
+    drop(created);
+    assert!(!cwd.exists(), "the install took back what it made");
+}
+
+/// The directories are made before the first action that changes what launchd holds, so a refusal
+/// `make` can still give (a name another install took meanwhile) leaves the loaded timer loaded.
+#[skuld::test(labels = [ELEVATED])]
+fn an_update_whose_directories_are_refused_at_making_leaves_the_timer_loaded() {
+    require_elevated();
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("taken-cwd");
+    // Dropping the schedule boots the timer out first. The name is taken after the directory was
+    // planned and before it is made: the read of the timer's label is between them.
+    let spec = in_cwd(task_spec(None), &cwd, User::Root);
+    let taken = cwd.clone();
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, "").then(move || std::fs::create_dir(&taken).unwrap()),
+    ]);
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+
+    let e = rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect_err("the name is taken");
+
+    assert!(matches!(e, Error::DirectoryRefused { .. }), "{e:?}");
+    fake.assert_spent("only the two reads: the timer was not booted out");
+    assert_eq!(text_at(&tree, true, ID), old.job);
+    assert_eq!(text_at(&tree, true, &timer_name()), old.timer.unwrap());
 }
 
 /// A stranger's file at the timer's name is a refusal whatever it is: a binary plist, bytes that are not
