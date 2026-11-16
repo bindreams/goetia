@@ -305,7 +305,10 @@ fn windows_refuses_what_it_decides_itself() {
 #[skuld::test]
 fn a_refusal_message_has_no_run_of_spaces() {
     let mut messages = vec!["sigfoo".parse::<StopSignal>().unwrap_err()];
-    for (kind, protocol) in [(DaemonKind::Task, Protocol::Plain), (DaemonKind::Service, Protocol::Native)] {
+    for (kind, protocol) in [
+        (DaemonKind::Task, Protocol::Plain),
+        (DaemonKind::Service, Protocol::Native),
+    ] {
         let refusals = action("quit", Some(5)).refuse(BackendKind::Scm, kind, protocol);
         messages.extend([refusals.signal, refusals.timeout].into_iter().flatten());
     }

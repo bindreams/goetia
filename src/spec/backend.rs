@@ -282,9 +282,7 @@ fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Su
         (Shaped::Deferred, _) | (_, Shaped::Absent | Shaped::Deferred) => Protocol::Plain,
         (_, Shaped::Parsed(protocol)) => *protocol,
     };
-    let judge = |signal: Option<StopSignal>| {
-        StopAction::from_leaves(signal, timeout).refuse(backend, kind, protocol)
-    };
+    let judge = |signal: Option<StopSignal>| StopAction::from_leaves(signal, timeout).refuse(backend, kind, protocol);
     let refusals = match &spec.stop_signal {
         Shaped::Parsed(signal) => judge(Some(*signal)),
         Shaped::Absent => judge(None),

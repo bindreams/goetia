@@ -585,10 +585,17 @@ fn a_pending_signal_does_not_skip_the_refusals_every_signal_has() {
     assert!(BackendKind::Scm.refuse(&task(Shaped::Absent)).is_ok());
 
     // What no backend refuses stays unjudged.
-    assert!(BackendKind::Systemd.refuse(&with_stop(Shaped::Deferred, ninety())).is_ok());
+    assert!(
+        BackendKind::Systemd
+            .refuse(&with_stop(Shaped::Deferred, ninety()))
+            .is_ok()
+    );
     assert!(
         BackendKind::Launchd
-            .refuse(&with_stop(Shaped::Deferred, Shaped::Parsed(Some(Duration::from_secs(60)))))
+            .refuse(&with_stop(
+                Shaped::Deferred,
+                Shaped::Parsed(Some(Duration::from_secs(60)))
+            ))
             .is_ok()
     );
 }

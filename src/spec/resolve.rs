@@ -461,8 +461,9 @@ fn shape_stop_action(
     if timeout_from_base && matches!(timeout, Shaped::Parsed(None)) && !matches!(signal, Shaped::Deferred) {
         // A base signal that does not parse is the base's to refuse, so it is no `kill` here.
         let base_signal = match action.base_signal {
-            Some(text) => shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal)
-                .unwrap_or(Shaped::Absent),
+            Some(text) => {
+                shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal).unwrap_or(Shaped::Absent)
+            }
             None => Shaped::Absent,
         };
         match (&signal, base_signal) {
