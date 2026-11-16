@@ -70,6 +70,22 @@ pub enum DayRule {
     Or,
 }
 
+/// Which days a schedule runs on, as its two day fields combine. A field that matches every value of
+/// its range counts as unrestricted, whatever its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaySelection {
+    Every,
+    /// The days of the month its field names.
+    OfMonth,
+    /// The weekdays its field names.
+    OfWeek,
+    /// A day of the month it names or a weekday it names.
+    Either,
+    /// A day of the month it names that is also a weekday it names: the AND of two restricted fields,
+    /// which a backend that matches them as either-or cannot hold.
+    Both,
+}
+
 /// A parsed schedule: its text and the five resolved fields. Equal when both are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
@@ -106,6 +122,17 @@ impl Schedule {
             DayRule::Or
         } else {
             DayRule::And
+        }
+    }
+
+    pub(crate) fn days(&self) -> DaySelection {
+        let [.., days, _, weekdays] = self.fields();
+        match (self.day_rule(), days.values.len() == 31, weekdays.values.len() == 7) {
+            (_, true, true) | (DayRule::Or, true, false) | (DayRule::Or, false, true) => DaySelection::Every,
+            (DayRule::And, true, false) => DaySelection::OfWeek,
+            (DayRule::And, false, true) => DaySelection::OfMonth,
+            (DayRule::Or, false, false) => DaySelection::Either,
+            (DayRule::And, false, false) => DaySelection::Both,
         }
     }
 

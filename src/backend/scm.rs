@@ -14,6 +14,9 @@ pub(crate) mod shim;
 pub(crate) mod sid;
 #[cfg(test)]
 pub(crate) mod test_support;
+// Pure, like `instance`: builds and is tested on every host; only the Windows backend will use it.
+#[allow(dead_code, reason = "off Windows nothing calls it; on it, the task verbs come next")]
+pub(crate) mod triggers;
 // `pub` on Windows for the shim integration tests and the marker-inertness probe; crate-private
 // elsewhere.
 #[cfg(windows)]
