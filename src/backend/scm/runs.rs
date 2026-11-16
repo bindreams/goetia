@@ -23,8 +23,10 @@
 //!
 //! The folders above it are goetia's to make ([`Runs::ensure_roots`]): a standard user can create
 //! `%ProgramData%\Goetia` first, so one that exists must be one goetia could trust, and `runs` must
-//! be as goetia makes it. None is repaired. `Goetia` and its `logs` are made by an elevated install
-//! ([`make_goetia_folders`]) and never by a shim.
+//! be as goetia makes it. None is repaired. `Goetia` and its `logs` are made by an elevated install and
+//! never by a shim: [`make_goetia_folders`] does it, called when an install of any daemon that runs
+//! through the shim host begins (a service or a task, a change between them included) and by
+//! [`Runs::ensure_roots`].
 
 mod files;
 
