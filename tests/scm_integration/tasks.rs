@@ -16,7 +16,7 @@ use goetia::testing::service_fields;
 use crate::common::conformance_mk;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{PRINT_AND_EXIT, RUN_UNTIL_KILLED};
-use crate::support::windows_tasks::{EndsTheRunOnPanic, task_spec};
+use crate::support::windows_tasks::{EndsTheRunOnPanic, ProcessHandle, task_spec};
 use crate::support::{self, ConnectBack, Group, ServiceGuard, kill, scm_group};
 
 pub(crate) const SCHEDULE: &str = "30 3 * * *";
@@ -467,14 +467,14 @@ fn uninstall_of_a_running_armed_task_ends_it(#[fixture(scm_group)] _group: &Grou
     mgr.start(id, Budget::DEFAULT).expect("start");
     listener.accept("the task's program to start");
     let pid = task_status(&mgr, id).common.pid.expect("a running task has a pid");
-    let shim = kill::identity_of(pid);
+    let shim = ProcessHandle::open(pid);
 
     mgr.uninstall(id).expect("uninstall of a running, armed task");
 
     let gone = mgr.status(id).expect_err("the task is gone");
     assert!(matches!(gone.cause(), Error::NotInstalled { .. }), "{gone:?}");
     assert!(
-        !kill::is_still_reported(Some(pid), shim),
+        shim.has_exited(),
         "the uninstall returned while the shim (pid {pid}) was still running"
     );
     assert!(!records_of(id).exists(), "its records go with it");

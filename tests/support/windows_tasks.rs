@@ -1,7 +1,11 @@
 //! What the Windows task suites share: the task specs they install, and the guard that ends a run for
 //! a test that fails while a `run` thread waits for it.
 
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
+
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use goetia::backend::scm::manager::Scm;
 use goetia::spec::{DaemonSpec, Id, TaskSpec, User};
@@ -50,6 +54,33 @@ pub fn task_spec(id: &Id, command: Vec<String>, schedule: Option<&str>, user: Us
     fields.common.user = user;
     fields.common.logs = logs.map(Path::to_path_buf);
     TaskSpec::new(fields).map(DaemonSpec::from).expect("a valid task")
+}
+
+/// An open handle to a process, which keeps its pid from being given to another, to ask whether it has
+/// exited. Task Scheduler's own handle to a shim outlives the shim until it drops the run from its listing
+/// (M5), so a process that exited still resolves by its pid: only a handle says it ended.
+pub struct ProcessHandle(OwnedHandle);
+
+impl ProcessHandle {
+    /// Opens the process `pid`, which the caller knows to be running: a process that cannot be opened
+    /// fails the test.
+    pub fn open(pid: u32) -> Self {
+        // SAFETY: a plain call; the handle it returns is checked and then owned.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        assert!(
+            !raw.is_null(),
+            "OpenProcess({pid}): {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a handle just returned and nothing else owns.
+        Self(unsafe { OwnedHandle::from_raw_handle(raw.cast()) })
+    }
+
+    /// Whether the process has exited, read without waiting: a state read, not a wait.
+    pub fn has_exited(&self) -> bool {
+        // SAFETY: the handle is live with `SYNCHRONIZE` access.
+        unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+    }
 }
 
 /// What ends a run for a test that fails while a `run` thread waits for it. A `thread::scope` joins its
