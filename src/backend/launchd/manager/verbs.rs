@@ -288,10 +288,10 @@ impl Launchd {
         }
         // A run sent SIGTERM has its `timeout` to answer, if the caller waits that long; SIGKILL has no
         // answer to wait for, and is waited for as long as the caller's budget allows.
-        let grace = match ending.grace.filter(|_| !kills) {
-            Some(grace) => Some(ending.grace_end(pid, grace)),
-            None => None,
-        };
+        let grace = ending
+            .grace
+            .filter(|_| !kills)
+            .map(|grace| ending.grace_end(pid, grace));
         let (until, escalating) = match grace {
             Some(grace) if ends_before(grace, deadline) => (grace, true),
             _ => (deadline, false),

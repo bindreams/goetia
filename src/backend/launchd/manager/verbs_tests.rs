@@ -650,26 +650,31 @@ fn stop_under_a_bounded_budget_expires_into_wait_timeout_and_leaves_the_signal()
 /// nothing to say of it.
 #[skuld::test]
 fn a_wait_that_ends_inside_the_grace_names_the_limit_and_one_that_does_not_stays_plain() {
-    let recovery = |action: StopAction| {
+    // `sent` is the signal the fake answers, which does not end the run.
+    let recovery = |action: StopAction, sent: Entry| {
         let run = Held::new(0);
         let pid = run.pid();
-        let fake = Fake::new([print(&running(pid)), print(&running(pid)), sigterm()]);
+        let fake = Fake::new([print(&running(pid)), print(&running(pid)), sent]);
         match stopping_as(&fake, Budget::Bounded(Duration::from_millis(100)), action) {
             Err(Error::WaitTimeout { recovery, .. }) => recovery,
             other => panic!("expected a wait timeout, got {other:?}"),
         }
     };
 
-    let in_grace = recovery(StopAction::default());
+    let in_grace = recovery(StopAction::default(), sigterm());
     assert!(
         in_grace.contains("SIGKILL") && in_grace.contains("goetia daemon kill"),
         "{in_grace}"
     );
 
-    let no_grace = recovery(StopAction {
-        send_signal: StopSignal::Terminate,
-        timeout: None,
-    });
+    // `kill` sends SIGKILL at once: no grace is pending.
+    let no_grace = recovery(
+        StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None,
+        },
+        sigkill(),
+    );
     assert!(!no_grace.contains("goetia daemon kill"), "{no_grace}");
 }
 
