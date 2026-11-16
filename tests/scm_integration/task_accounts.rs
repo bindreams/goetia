@@ -86,7 +86,11 @@ fn a_real_user_task_installs_arms_and_runs(#[fixture(scm_group)] _group: &Group)
     assert_succeeded("disable", &as_user("disable", id, &account, &host, &command));
     assert!(!task_status(&mgr, id).common.enabled);
 
-    // A first logon under a new account builds its profile, which is slow: `run` waits on the run itself.
+    // A first logon under a new account builds its profile, which is slow: `run` waits on the run itself,
+    // with no cap. On CI that wait ends because the workflow removes the Sync Center profile handler before
+    // the tests: with it, about 1 first logon in 10 blocks for good in Windows and `run` never returns (knowledge
+    // base: "Windows - A password-logon task's first start under a new local user can block for good in the
+    // User Profile Service's call to the Sync Center notification handler").
     let exit = mgr
         .run(id, &mut Vec::new())
         .unwrap_or_else(|e| panic!("run as {account}: {}", e.report()));
