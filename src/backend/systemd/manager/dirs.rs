@@ -36,7 +36,7 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
     let cwd = common.cwd.as_deref().map(|cwd| created.plan(cwd)).transpose()?;
 
     if let (Some(logs), Some(log)) = (&common.logs, &log) {
-        refuse_writable_log_dir(logs, log)?;
+        refuse_writable_log_dir(logs, log, common.id.as_str())?;
     }
     let owner = match &cwd {
         Some(cwd) if cwd.makes() => owner_of(&common.user)?,

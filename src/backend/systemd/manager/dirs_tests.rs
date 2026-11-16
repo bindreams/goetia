@@ -11,6 +11,7 @@ use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_strange
 use crate::error::Error;
 use crate::spec::{AccountId, ServiceSpec};
 use crate::testing::elevation::ELEVATED;
+use crate::testing::groups::root_dirs;
 
 /// A name no passwd database has: an account a package or `sysusers` makes after the install.
 const NO_ENTRY: &str = "goetia-no-such-user-xyz";
@@ -37,7 +38,7 @@ fn nobody() -> User {
 /// The account is looked up to hand a directory to it, and for nothing else: an account that does not
 /// exist yet is no reason to refuse an install that hands it nothing.
 #[skuld::test(labels = [ELEVATED])]
-fn an_account_with_no_entry_is_not_looked_up_when_nothing_is_handed_to_it() {
+fn an_account_with_no_entry_is_not_looked_up_when_nothing_is_handed_to_it(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let existing = layout.system().join("work");
     fs::create_dir(&existing).unwrap();
@@ -56,7 +57,9 @@ fn an_account_with_no_entry_is_not_looked_up_when_nothing_is_handed_to_it() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn an_account_with_no_entry_refuses_the_install_before_it_makes_the_cwd_it_would_hand_over() {
+fn an_account_with_no_entry_refuses_the_install_before_it_makes_the_cwd_it_would_hand_over(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
@@ -70,7 +73,7 @@ fn an_account_with_no_entry_refuses_the_install_before_it_makes_the_cwd_it_would
 /// The account's `cwd` is its own when this returns: the unit can run as soon as the write that follows
 /// starts.
 #[skuld::test(labels = [ELEVATED])]
-fn an_account_with_an_entry_is_handed_the_cwd_before_the_write_starts() {
+fn an_account_with_an_entry_is_handed_the_cwd_before_the_write_starts(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
@@ -157,7 +160,7 @@ fn a_user_that_is_not_the_canonical_spelling_of_a_number_is_a_name() {
 /// A write that fails after the directories are made takes them back, handed over as they were: the
 /// account has not been able to write in one, since the unit it is for never stood.
 #[skuld::test(labels = [ELEVATED])]
-fn a_failed_install_takes_back_the_cwd_it_handed_over() {
+fn a_failed_install_takes_back_the_cwd_it_handed_over(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
@@ -172,7 +175,7 @@ fn a_failed_install_takes_back_the_cwd_it_handed_over() {
 /// uid 0 is root whichever way the spec spells it: nothing is handed over, so a log in the `cwd` is
 /// the root-owned directory it stays, not one "that will belong to root".
 #[skuld::test(labels = [ELEVATED])]
-fn uid_zero_is_root_and_is_handed_nothing() {
+fn uid_zero_is_root_and_is_handed_nothing(#[fixture(root_dirs)] _root: &()) {
     for user in [User::Root, User::Id(AccountId::Uid(0)), User::Name("root".to_string())] {
         let layout = Layout::new();
         let cwd = layout.system().join("work");
@@ -189,7 +192,7 @@ fn uid_zero_is_root_and_is_handed_nothing() {
 /// A log the check refuses leaves nothing made, whatever the refusal is for, and whether the directory
 /// it is in is to be made or not: no directory is made until every path is judged.
 #[skuld::test(labels = [ELEVATED])]
-fn nothing_is_made_when_the_log_check_refuses() {
+fn nothing_is_made_when_the_log_check_refuses(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let owned = layout.system().join("owned");
     fs::create_dir(&owned).unwrap();
@@ -223,7 +226,7 @@ fn nothing_is_made_when_the_log_check_refuses() {
 
 /// A log the check refuses is refused whatever the account is: it comes before the account is looked up.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_the_check_refuses_comes_before_the_account_is_looked_up() {
+fn a_log_the_check_refuses_comes_before_the_account_is_looked_up(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let owned = layout.system().join("owned");
     fs::create_dir(&owned).unwrap();
@@ -247,7 +250,7 @@ fn a_log_the_check_refuses_comes_before_the_account_is_looked_up() {
 /// account, and what the install had made by then is taken back when the guard drops: that the two are
 /// one directory is found when the `cwd` is reached.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_in_or_under_the_cwd_to_be_handed_is_refused_and_what_was_made_is_taken_back() {
+fn a_log_in_or_under_the_cwd_to_be_handed_is_refused_and_what_was_made_is_taken_back(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     for logs in [cwd.join("out.log"), cwd.join("sub/out.log")] {
@@ -268,7 +271,7 @@ fn a_log_in_or_under_the_cwd_to_be_handed_is_refused_and_what_was_made_is_taken_
 
 /// A log directory beside the `cwd` that is handed over is accepted, and a log directory above it too.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_beside_or_above_the_cwd_to_be_handed_is_accepted() {
+fn a_log_beside_or_above_the_cwd_to_be_handed_is_accepted(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     for (cwd, logs) in [("work", "logs/out.log"), ("a/work", "a/out.log")] {
         let mut created = CreatedDirs::under(vec![layout.system()]);

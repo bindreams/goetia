@@ -1,4 +1,4 @@
-use super::{DEBUG_PRIVILEGE, check_group, enter, need, require_enabled, validate_all};
+use super::{DEBUG_PRIVILEGE, ROOT_DIRS, check_group, enter, need, require_enabled, validate_all};
 
 const GROUP: &str = "GOETIA_TEST_X";
 const CONSENT: &str = "GOETIA_TEST_X_CONSENT";
@@ -170,4 +170,16 @@ fn the_debug_privilege_switch_is_validated_at_start() {
     assert!(validate_all(env(&[(DEBUG_PRIVILEGE, "1")])).is_ok());
     let why = validate_all(env(&[(DEBUG_PRIVILEGE, "maybe")])).unwrap_err();
     assert!(why.contains(DEBUG_PRIVILEGE) && why.contains("maybe"), "{why}");
+}
+
+#[skuld::test]
+fn the_root_dirs_switch_is_validated_at_start_and_needs_no_consent() {
+    assert!(validate_all(env(&[(ROOT_DIRS, "0")])).is_ok());
+    assert!(validate_all(env(&[(ROOT_DIRS, "1")])).is_ok());
+    let why = validate_all(env(&[(ROOT_DIRS, "maybe")])).unwrap_err();
+    assert!(why.contains(ROOT_DIRS) && why.contains("maybe"), "{why}");
+    // On by default, off with `=0`; no `_CONSENT` variable is read.
+    assert!(require_enabled(ROOT_DIRS, env(&[])).is_ok());
+    assert!(require_enabled(ROOT_DIRS, env(&[(ROOT_DIRS, "0")])).is_err());
+    assert!(validate_all(env(&[(&format!("{ROOT_DIRS}_CONSENT"), "maybe")])).is_ok());
 }

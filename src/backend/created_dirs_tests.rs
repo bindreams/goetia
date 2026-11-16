@@ -5,17 +5,11 @@ use nix::unistd::{Gid, Uid, chown};
 
 use super::*;
 use crate::error::Error;
-use crate::testing::elevation::{ELEVATED, require_elevated};
+use crate::testing::elevation::ELEVATED;
+use crate::testing::groups::root_dirs;
 
 /// A uid no account has, to own what a test makes foreign.
 pub(crate) const STRANGER: u32 = 4242;
-
-/// These tests make root-owned directories, which is what the code under test accepts, so they run
-/// as root: CI's elevated test step does.
-pub(super) fn as_root() {
-    require_elevated();
-    assert!(Uid::effective().is_root(), "an elevated process is root on Unix");
-}
 
 /// A directory under `/tmp`, which is root's on every host (a macOS temp directory is the
 /// logged-in user's), holding `system`, the one root of the tests, and `outside`, which is not.
@@ -25,7 +19,6 @@ pub(crate) struct Layout {
 
 impl Layout {
     pub(crate) fn new() -> Self {
-        as_root();
         let tmp = tempfile::Builder::new()
             .prefix("goetia-dirs-")
             .tempdir_in("/tmp")
@@ -190,7 +183,7 @@ impl Drop for WithoutChown {
 // Creating ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_makes_every_missing_component_under_a_root_as_roots_0755() {
+fn create_makes_every_missing_component_under_a_root_as_roots_0755(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -205,7 +198,7 @@ fn create_makes_every_missing_component_under_a_root_as_roots_0755() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_leaves_a_directory_that_exists_as_found_wherever_it_is_and_whoever_owns_it() {
+fn create_leaves_a_directory_that_exists_as_found_wherever_it_is_and_whoever_owns_it(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let dir = layout.outside().join("existing");
     fs::create_dir(&dir).unwrap();
@@ -221,7 +214,9 @@ fn create_leaves_a_directory_that_exists_as_found_wherever_it_is_and_whoever_own
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_uses_a_path_that_exists_whole_through_directories_and_links_an_account_owns() {
+fn create_uses_a_path_that_exists_whole_through_directories_and_links_an_account_owns(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
     let owned = layout.outside().join("owned");
     fs::create_dir_all(owned.join("deep")).unwrap();
@@ -235,7 +230,9 @@ fn create_uses_a_path_that_exists_whole_through_directories_and_links_an_account
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_missing_directory_outside_the_roots_naming_the_path_and_the_roots() {
+fn create_refuses_a_missing_directory_outside_the_roots_naming_the_path_and_the_roots(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let wanted = layout.outside().join("a/b");
@@ -256,7 +253,7 @@ fn create_refuses_a_missing_directory_outside_the_roots_naming_the_path_and_the_
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_missing_directory_when_no_root_exists() {
+fn create_refuses_a_missing_directory_when_no_root_exists(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = CreatedDirs::under(vec![layout.base().join("no-such-root")]);
 
@@ -271,7 +268,7 @@ fn create_refuses_a_missing_directory_when_no_root_exists() {
 /// "Under a root" is read on the path the walk resolved: a `..` that leaves the root is outside it
 /// however the text starts, and one that stays inside is not.
 #[skuld::test(labels = [ELEVATED])]
-fn create_decides_under_a_root_on_the_resolved_path_not_the_text() {
+fn create_decides_under_a_root_on_the_resolved_path_not_the_text(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -289,7 +286,7 @@ fn create_decides_under_a_root_on_the_resolved_path_not_the_text() {
 /// passes through decides where it leads, a directory it leaves through `..` included: the account that
 /// owns `u` can replace `u/sub` with a symlink, and `u/sub/..` then leads elsewhere.
 #[skuld::test(labels = [ELEVATED])]
-fn create_judges_a_directory_the_path_leaves_through_dotdot() {
+fn create_judges_a_directory_the_path_leaves_through_dotdot(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let account = layout.system().join("u");
     fs::create_dir(&account).unwrap();
@@ -308,7 +305,7 @@ fn create_judges_a_directory_the_path_leaves_through_dotdot() {
 /// before an absolute symlink's holder are judged too, though the link's own path restarts at `/`.
 /// A directory that holds the link, and a link to `..`, are judged as well.
 #[skuld::test(labels = [ELEVATED])]
-fn create_judges_the_directories_before_the_holder_of_a_link() {
+fn create_judges_the_directories_before_the_holder_of_a_link(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let account = layout.system().join("u");
     fs::create_dir_all(account.join("v")).unwrap();
@@ -333,7 +330,7 @@ fn create_judges_the_directories_before_the_holder_of_a_link() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_follows_a_root_owned_link_into_a_root_and_judges_the_target_not_the_name() {
+fn create_follows_a_root_owned_link_into_a_root_and_judges_the_target_not_the_name(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     symlink(layout.system(), layout.outside().join("in")).unwrap();
     symlink(layout.outside(), layout.system().join("out")).unwrap();
@@ -351,7 +348,7 @@ fn create_follows_a_root_owned_link_into_a_root_and_judges_the_target_not_the_na
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_missing_component_below_a_directory_an_account_owns() {
+fn create_refuses_a_missing_component_below_a_directory_an_account_owns(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let owned = layout.system().join("owned");
     fs::create_dir(&owned).unwrap();
@@ -372,7 +369,7 @@ fn create_refuses_a_missing_component_below_a_directory_an_account_owns() {
 /// it can replace it, and that directory is judged like any other. A link an account made in a
 /// directory only root can write is followed.
 #[skuld::test(labels = [ELEVATED])]
-fn create_makes_below_a_symlink_an_account_owns_when_only_root_can_write_its_holder() {
+fn create_makes_below_a_symlink_an_account_owns_when_only_root_can_write_its_holder(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let link = layout.system().join("link");
     symlink(layout.system().join("real"), &link).unwrap();
@@ -389,7 +386,9 @@ fn create_makes_below_a_symlink_an_account_owns_when_only_root_can_write_its_hol
 /// make another, so a link there that an account owns can be made to lead anywhere: it is refused. A link
 /// root owns there, or an account's in a directory only root can write, is followed.
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_to_make_below_a_symlink_an_account_owns_in_a_sticky_directory_others_can_write() {
+fn create_refuses_to_make_below_a_symlink_an_account_owns_in_a_sticky_directory_others_can_write(
+    #[fixture(root_dirs)] _root: &(),
+) {
     for writable in [0o1777, 0o1775] {
         let layout = Layout::new();
         let real = layout.system().join("real");
@@ -424,7 +423,7 @@ fn create_refuses_to_make_below_a_symlink_an_account_owns_in_a_sticky_directory_
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_to_make_anything_below_a_dangling_link() {
+fn create_refuses_to_make_anything_below_a_dangling_link(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     symlink(layout.system().join("nowhere"), layout.system().join("link")).unwrap();
     let mut dirs = layout.dirs();
@@ -436,7 +435,7 @@ fn create_refuses_to_make_anything_below_a_dangling_link() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_dangling_link_or_a_file_at_the_last_name() {
+fn create_refuses_a_dangling_link_or_a_file_at_the_last_name(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     symlink(layout.system().join("nowhere"), layout.system().join("link")).unwrap();
     fs::write(layout.system().join("file"), b"x").unwrap();
@@ -454,7 +453,7 @@ fn create_refuses_a_dangling_link_or_a_file_at_the_last_name() {
 
 /// A symlink to a file is refused as the file is: the same error.
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_symlink_to_a_file_at_the_last_name_as_a_file_is_refused() {
+fn create_refuses_a_symlink_to_a_file_at_the_last_name_as_a_file_is_refused(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     fs::write(layout.system().join("file"), b"x").unwrap();
     for target in ["file", "../system/file", "./file/."] {
@@ -471,7 +470,7 @@ fn create_refuses_a_symlink_to_a_file_at_the_last_name_as_a_file_is_refused() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_under_a_regular_file_fails_and_makes_nothing() {
+fn create_under_a_regular_file_fails_and_makes_nothing(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     fs::write(layout.system().join("file"), b"x").unwrap();
     let mut dirs = layout.dirs();
@@ -488,7 +487,7 @@ fn create_under_a_regular_file_fails_and_makes_nothing() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_accepts_a_symlink_to_a_directory_as_existing() {
+fn create_accepts_a_symlink_to_a_directory_as_existing(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     fs::create_dir(layout.system().join("real")).unwrap();
     symlink("real", layout.system().join("link")).unwrap();
@@ -500,7 +499,7 @@ fn create_accepts_a_symlink_to_a_directory_as_existing() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_stops_at_a_symlink_loop() {
+fn create_stops_at_a_symlink_loop(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     symlink("b", layout.system().join("a")).unwrap();
     symlink("a", layout.system().join("b")).unwrap();
@@ -519,7 +518,7 @@ fn create_stops_at_a_symlink_loop() {
 
 /// Only a root that is not there is not a root: one that cannot be opened for another reason says so.
 #[skuld::test(labels = [ELEVATED])]
-fn create_fails_when_a_root_cannot_be_opened_for_a_reason_other_than_not_being_there() {
+fn create_fails_when_a_root_cannot_be_opened_for_a_reason_other_than_not_being_there(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let file = layout.outside().join("file");
     fs::write(&file, b"x").unwrap();
@@ -539,7 +538,7 @@ fn create_fails_when_a_root_cannot_be_opened_for_a_reason_other_than_not_being_t
 /// A path that exists whole is used as it is, wherever it is: the roots are opened only when a
 /// component is missing and the walk asks whether it is under one.
 #[skuld::test(labels = [ELEVATED])]
-fn create_uses_a_path_that_exists_whatever_state_the_roots_are_in() {
+fn create_uses_a_path_that_exists_whatever_state_the_roots_are_in(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let file = layout.outside().join("file");
     fs::write(&file, b"x").unwrap();
@@ -555,7 +554,7 @@ fn create_uses_a_path_that_exists_whatever_state_the_roots_are_in() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_ignores_a_root_that_does_not_exist() {
+fn create_ignores_a_root_that_does_not_exist(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = CreatedDirs::under(vec![layout.base().join("nowhere"), layout.system()]);
 
@@ -565,7 +564,7 @@ fn create_ignores_a_root_that_does_not_exist() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_relative_path() {
+fn create_refuses_a_relative_path(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -574,7 +573,7 @@ fn create_refuses_a_relative_path() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_refuses_dotdot_below_a_component_that_does_not_exist() {
+fn create_refuses_dotdot_below_a_component_that_does_not_exist(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -585,8 +584,7 @@ fn create_refuses_dotdot_below_a_component_that_does_not_exist() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn walking_dotdot_at_the_root_stays_at_the_root() {
-    as_root();
+fn walking_dotdot_at_the_root_stays_at_the_root(#[fixture(root_dirs)] _root: &()) {
     let mut dirs = CreatedDirs::under(vec![PathBuf::from("/")]);
 
     dirs.create(Path::new("/../.."), None).expect("the root is a directory");
@@ -595,7 +593,7 @@ fn walking_dotdot_at_the_root_stays_at_the_root() {
 /// A path with nothing left to walk is a directory that exists, wherever the roots are: `/` has no
 /// last component, and a path that ends in `..` has none the walk takes.
 #[skuld::test(labels = [ELEVATED])]
-fn create_uses_the_root_directory_whatever_the_roots_are() {
+fn create_uses_the_root_directory_whatever_the_roots_are(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -604,7 +602,7 @@ fn create_uses_the_root_directory_whatever_the_roots_are() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_uses_a_path_that_ends_in_dotdot_as_the_directory_it_names() {
+fn create_uses_a_path_that_ends_in_dotdot_as_the_directory_it_names(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     fs::create_dir(layout.outside().join("deep")).unwrap();
     let mut dirs = layout.dirs();
@@ -619,7 +617,9 @@ fn create_uses_a_path_that_ends_in_dotdot_as_the_directory_it_names() {
 /// is not the install's: it fails, whatever it is and whoever owns it, the entry is left as it is, and
 /// nothing of the install's is left beside it. Running the install again uses it.
 #[skuld::test(labels = [ELEVATED])]
-fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_it_is() {
+fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_it_is(
+    #[fixture(root_dirs)] _root: &(),
+) {
     for kind in [
         "a stranger's directory",
         "a root-owned directory",
@@ -669,7 +669,7 @@ fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_
 /// What stands at the final name is a directory this same install made: the spec names one directory
 /// twice (on a file system that ignores case, under two spellings). The refusal says so.
 #[skuld::test(labels = [ELEVATED])]
-fn make_says_two_paths_name_the_same_directory_when_the_name_taken_is_one_it_made() {
+fn make_says_two_paths_name_the_same_directory_when_the_name_taken_is_one_it_made(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let first = dirs.plan(&layout.system().join("a/x")).unwrap();
@@ -693,7 +693,7 @@ fn make_says_two_paths_name_the_same_directory_when_the_name_taken_is_one_it_mad
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_does_not_descend_into_a_symlink_planted_after_the_walk() {
+fn create_does_not_descend_into_a_symlink_planted_after_the_walk(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let found = dirs.plan(&layout.system().join("a/b")).unwrap();
@@ -740,7 +740,7 @@ fn a_made_directory_is_refused_when_not_roots_or_not_empty_or_not_a_directory() 
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn a_made_directory_in_a_setgid_parent_is_accepted_and_given_0755() {
+fn a_made_directory_in_a_setgid_parent_is_accepted_and_given_0755(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let parent = layout.system().join("setgid");
     fs::create_dir(&parent).unwrap();
@@ -758,7 +758,7 @@ fn a_made_directory_in_a_setgid_parent_is_accepted_and_given_0755() {
 /// parent.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
+fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest(#[fixture(root_dirs)] _root: &()) {
     for parent_after in [0o777, 0o755] {
         let layout = Layout::new();
         let parent = layout.system().join("open");
@@ -790,12 +790,34 @@ fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
     }
 }
 
+/// The temporary name means nothing to whoever wrote the spec: an OS error while the directory is made
+/// names the path the spec wrote, and says where the directory is until it is placed.
+#[skuld::test]
+fn an_os_error_while_a_directory_is_made_names_the_specs_path_and_where_it_is_being_made() {
+    let spec = Path::new("/var/log/app");
+    let at = Path::new("/var/log/.goetia-0123");
+
+    let err = os_while_making("open", spec, at, Errno::EACCES);
+
+    let Error::Os { what, path, source } = &err else {
+        panic!("expected an OS error, got {err:?}")
+    };
+    assert_eq!(what, "open");
+    assert_eq!(path.as_deref(), Some(spec));
+    let source = source.to_string();
+    assert!(
+        source.starts_with(&Errno::EACCES.desc().to_string())
+            && source.ends_with("(while it was being made at /var/log/.goetia-0123)"),
+        "{source}"
+    );
+}
+
 // Planning ------------------------------------------------------------------------------------------------------------
 
 /// A plan reads and judges, and makes nothing: what it refuses is refused before any directory is.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn a_plan_makes_nothing_and_says_whether_make_would() {
+fn a_plan_makes_nothing_and_says_whether_make_would(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let dirs = layout.dirs();
 
@@ -813,7 +835,7 @@ fn a_plan_makes_nothing_and_says_whether_make_would() {
 /// The definition can go live as soon as the write that follows starts: what is to be the account's is
 /// the account's when `make` returns, and nothing but the deepest directory of a path is.
 #[skuld::test(labels = [ELEVATED])]
-fn make_hands_over_the_deepest_directory_to_the_owner_and_no_other_before_it_returns() {
+fn make_hands_over_the_deepest_directory_to_the_owner_and_no_other_before_it_returns(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -829,7 +851,7 @@ fn make_hands_over_the_deepest_directory_to_the_owner_and_no_other_before_it_ret
 /// A `cwd` and a log directory inside it, both handed to the account, and a second path of its own: every
 /// directory is at its name in its final state when `make` returns, and no temporary one is left.
 #[skuld::test(labels = [ELEVATED])]
-fn nested_directories_appear_in_their_final_state_and_leave_no_temporary_directory() {
+fn nested_directories_appear_in_their_final_state_and_leave_no_temporary_directory(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let logs = dirs.plan(&layout.system().join("x/y/logs")).unwrap();
@@ -859,7 +881,7 @@ fn nested_directories_appear_in_their_final_state_and_leave_no_temporary_directo
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn make_without_an_owner_leaves_everything_roots() {
+fn make_without_an_owner_leaves_everything_roots(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -873,7 +895,9 @@ fn make_without_an_owner_leaves_everything_roots() {
 /// is), refused, never upgraded to the later plan's owner. Whether two names are one directory is
 /// the file system's to say, which is why this is judged on what was made, not on the names.
 #[skuld::test(labels = [ELEVATED])]
-fn a_directory_an_earlier_plan_made_without_an_owner_is_never_handed_over_by_a_later_plan_that_names_it() {
+fn a_directory_an_earlier_plan_made_without_an_owner_is_never_handed_over_by_a_later_plan_that_names_it(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let below = dirs.plan(&layout.system().join("a/b")).unwrap();
@@ -906,7 +930,9 @@ fn a_directory_an_earlier_plan_made_without_an_owner_is_never_handed_over_by_a_l
 /// The same directory named twice by plans that hand it to the same owner is the owner's, as the first
 /// plan said.
 #[skuld::test(labels = [ELEVATED])]
-fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_hands_it_too() {
+fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_hands_it_too(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let first = dirs.plan(&layout.system().join("a")).unwrap();
@@ -923,7 +949,9 @@ fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_han
 /// keeps as root's. Each order is refused and names the directory handed over and the account; nothing
 /// is handed over, and the guard takes back what was made.
 #[skuld::test(labels = [ELEVATED])]
-fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_share_it_in_either_order() {
+fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_share_it_in_either_order(
+    #[fixture(root_dirs)] _root: &(),
+) {
     // (handed, kept): the directory handed over is `a`; `kept` is `a` itself or below it.
     for kept in ["a", "a/sub"] {
         // The plan that hands nothing over first (a log's) and second.
@@ -968,7 +996,9 @@ fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_sh
 /// is a conflict whatever the order of the plans, also when a third plan made the directory and the one
 /// that hands it over comes after the one that does not.
 #[skuld::test(labels = [ELEVATED])]
-fn a_directory_a_plan_hands_over_is_refused_when_one_that_hands_nothing_over_passed_it_in_any_order() {
+fn a_directory_a_plan_hands_over_is_refused_when_one_that_hands_nothing_over_passed_it_in_any_order(
+    #[fixture(root_dirs)] _root: &(),
+) {
     const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
     // The plans: `a/b/c` handed over (it makes `a/b`), `kept` handed to no one, and `a/b` handed over.
     for kept in ["a/b", "a/b/e"] {
@@ -1009,7 +1039,9 @@ fn a_directory_a_plan_hands_over_is_refused_when_one_that_hands_nothing_over_pas
 /// A plan that hands nothing over beside a directory handed over, or above it, is no conflict in either
 /// order: that is the log directory beside or above the `cwd`.
 #[skuld::test(labels = [ELEVATED])]
-fn a_plan_that_hands_nothing_over_beside_or_above_a_handed_directory_is_accepted_in_either_order() {
+fn a_plan_that_hands_nothing_over_beside_or_above_a_handed_directory_is_accepted_in_either_order(
+    #[fixture(root_dirs)] _root: &(),
+) {
     for (handed, kept) in [("a/work", "a/logs"), ("a/work", "a")] {
         for kept_first in [true, false] {
             let layout = Layout::new();
@@ -1039,7 +1071,9 @@ fn a_plan_that_hands_nothing_over_beside_or_above_a_handed_directory_is_accepted
 /// directory made, the one that was to be handed over included, is taken back by the guard.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn a_make_whose_hand_over_fails_is_an_error_and_the_guard_removes_every_directory_made() {
+fn a_make_whose_hand_over_fails_is_an_error_and_the_guard_removes_every_directory_made(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let log = dirs.plan(&layout.system().join("logs/x")).unwrap();
@@ -1079,7 +1113,7 @@ fn a_make_whose_hand_over_fails_is_an_error_and_the_guard_removes_every_director
 /// What an account has written into a directory it was handed is its own: the undo does not empty it,
 /// and says it is left.
 #[skuld::test(labels = [ELEVATED])]
-fn undo_leaves_a_handed_directory_the_account_has_written_into_and_names_it() {
+fn undo_leaves_a_handed_directory_the_account_has_written_into_and_names_it(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     dirs.create(&layout.system().join("a"), Some(stranger_owner())).unwrap();
@@ -1094,7 +1128,7 @@ fn undo_leaves_a_handed_directory_the_account_has_written_into_and_names_it() {
 
 /// One that was not handed over and has content stays too, and is named like every other that is left.
 #[skuld::test(labels = [ELEVATED])]
-fn undo_leaves_a_directory_that_was_not_handed_over_and_gained_content_and_names_it() {
+fn undo_leaves_a_directory_that_was_not_handed_over_and_gained_content_and_names_it(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     dirs.create(&layout.system().join("a"), None).unwrap();
@@ -1111,7 +1145,7 @@ fn undo_leaves_a_directory_that_was_not_handed_over_and_gained_content_and_names
 /// where others can write the parent, a directory they put at the name in between is empty, and is
 /// removed as they could remove it themselves.
 #[skuld::test(labels = [ELEVATED])]
-fn undo_removes_a_directory_whatever_the_mode_and_owner_of_its_parent() {
+fn undo_removes_a_directory_whatever_the_mode_and_owner_of_its_parent(#[fixture(root_dirs)] _root: &()) {
     for mode in [0o755, 0o700, 0o1777, 0o775, 0o757] {
         let layout = Layout::new();
         let mut dirs = layout.dirs();
@@ -1136,7 +1170,7 @@ fn undo_removes_a_directory_whatever_the_mode_and_owner_of_its_parent() {
 /// A `cwd` that holds the log directory, both handed to the account, as launchd's spec makes them: a
 /// failed install removes both, the one below first.
 #[skuld::test(labels = [ELEVATED])]
-fn undo_removes_a_handed_directory_that_holds_a_handed_one_made_below_it() {
+fn undo_removes_a_handed_directory_that_holds_a_handed_one_made_below_it(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let logs = dirs.plan(&layout.system().join("x/logs")).unwrap();
@@ -1155,7 +1189,7 @@ fn undo_removes_a_handed_directory_that_holds_a_handed_one_made_below_it() {
 /// What is left in a handed directory is the account's only if goetia did not make it: a directory the
 /// install made below it and left is named as that, not as the account's writing.
 #[skuld::test(labels = [ELEVATED])]
-fn a_handed_directory_that_holds_what_undo_left_is_not_blamed_on_the_account() {
+fn a_handed_directory_that_holds_what_undo_left_is_not_blamed_on_the_account(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let logs = dirs.plan(&layout.system().join("x/logs")).unwrap();
@@ -1178,7 +1212,7 @@ fn a_handed_directory_that_holds_what_undo_left_is_not_blamed_on_the_account() {
 /// A later plan that hands over a directory an earlier plan made and marked for an owner hands it to
 /// that owner: asking for another is an error that names the two, not a guess.
 #[skuld::test(labels = [ELEVATED])]
-fn a_later_plan_that_hands_a_made_directory_to_another_owner_is_an_error() {
+fn a_later_plan_that_hands_a_made_directory_to_another_owner_is_an_error(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let first = dirs.plan(&layout.system().join("a")).unwrap();
@@ -1199,7 +1233,7 @@ fn a_later_plan_that_hands_a_made_directory_to_another_owner_is_an_error() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn an_owner_refuses_the_ids_that_mean_unchanged() {
+fn an_owner_refuses_the_ids_that_mean_unchanged(#[fixture(root_dirs)] _root: &()) {
     assert!(Owner::new(Uid::from_raw(u32::MAX), None).is_err());
     assert!(Owner::new(Uid::from_raw(1), Some(Gid::from_raw(u32::MAX))).is_err());
     assert!(Owner::new(Uid::from_raw(1), None).is_ok());
@@ -1214,7 +1248,7 @@ fn make_chain(layout: &Layout) -> CreatedDirs {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn drop_removes_every_directory_made_deepest_first() {
+fn drop_removes_every_directory_made_deepest_first(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
 
     drop(make_chain(&layout));
@@ -1223,7 +1257,7 @@ fn drop_removes_every_directory_made_deepest_first() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn drop_leaves_a_directory_that_existed_before() {
+fn drop_leaves_a_directory_that_existed_before(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     fs::create_dir(layout.system().join("before")).unwrap();
     let mut dirs = layout.dirs();
@@ -1236,7 +1270,7 @@ fn drop_leaves_a_directory_that_existed_before() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn drop_leaves_a_directory_that_is_no_longer_empty_and_its_ancestors() {
+fn drop_leaves_a_directory_that_is_no_longer_empty_and_its_ancestors(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let dirs = make_chain(&layout);
     let file = layout.system().join("a/b/c/data");
@@ -1250,7 +1284,7 @@ fn drop_leaves_a_directory_that_is_no_longer_empty_and_its_ancestors() {
 /// The account a daemon runs as owns what is handed to it and can swap a directory for a symlink
 /// before the drop; the drop, which runs as root, must not follow it.
 #[skuld::test(labels = [ELEVATED])]
-fn drop_does_not_follow_a_symlink_swapped_in_for_a_made_directory() {
+fn drop_does_not_follow_a_symlink_swapped_in_for_a_made_directory(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     fs::create_dir(layout.outside().join("c")).unwrap();
     let dirs = make_chain(&layout);
@@ -1263,7 +1297,7 @@ fn drop_does_not_follow_a_symlink_swapped_in_for_a_made_directory() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn drop_leaves_a_directory_that_is_no_longer_the_one_made() {
+fn drop_leaves_a_directory_that_is_no_longer_the_one_made(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let dir = layout.system().join("a");
@@ -1278,7 +1312,7 @@ fn drop_leaves_a_directory_that_is_no_longer_the_one_made() {
 
 /// A directory whose open failed after `mkdirat` cannot be told from whatever is at its name now.
 #[skuld::test(labels = [ELEVATED])]
-fn drop_leaves_a_directory_it_could_not_identify() {
+fn drop_leaves_a_directory_it_could_not_identify(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = make_chain(&layout);
     let victim = layout.system().join("a/b/c");
@@ -1294,7 +1328,7 @@ fn drop_leaves_a_directory_it_could_not_identify() {
 // Settling ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test(labels = [ELEVATED])]
-fn settle_keeps_every_directory_when_the_definition_stands() {
+fn settle_keeps_every_directory_when_the_definition_stands(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = make_chain(&layout);
 
@@ -1305,7 +1339,7 @@ fn settle_keeps_every_directory_when_the_definition_stands() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn settle_takes_the_directories_back_when_the_definition_does_not_stand() {
+fn settle_takes_the_directories_back_when_the_definition_does_not_stand(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = make_chain(&layout);
 
@@ -1318,7 +1352,7 @@ fn settle_takes_the_directories_back_when_the_definition_does_not_stand() {
 /// An unreadable definition may stand: removing what it names could break it, so the directories
 /// stay, handed over, as an install that stands leaves them.
 #[skuld::test(labels = [ELEVATED])]
-fn settle_keeps_the_directories_when_the_read_did_not_complete() {
+fn settle_keeps_the_directories_when_the_read_did_not_complete(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     dirs.create(&layout.system().join("a"), Some(stranger_owner())).unwrap();
@@ -1332,7 +1366,7 @@ fn settle_keeps_the_directories_when_the_read_did_not_complete() {
 /// A `make` that did not finish (a panic unwinding out of it) leaves its trees at their temporary names,
 /// which no definition can name: keeping what stands removes them and keeps what was put in place.
 #[skuld::test(labels = [ELEVATED])]
-fn keep_removes_a_tree_that_was_not_put_in_place_and_keeps_the_rest() {
+fn keep_removes_a_tree_that_was_not_put_in_place_and_keeps_the_rest(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     dirs.create(&layout.system().join("placed"), None).unwrap();
@@ -1348,7 +1382,7 @@ fn keep_removes_a_tree_that_was_not_put_in_place_and_keeps_the_rest() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn settle_does_not_ask_when_nothing_was_made() {
+fn settle_does_not_ask_when_nothing_was_made(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -1356,7 +1390,7 @@ fn settle_does_not_ask_when_nothing_was_made() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn drop_keeps_the_directories_while_a_panic_unwinds() {
+fn drop_keeps_the_directories_while_a_panic_unwinds(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let path = layout.system().join("a");
 

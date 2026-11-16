@@ -464,19 +464,21 @@ owns it, since `install` is not a start and you may still be preparing it.
   made during or after it, by hand or by another goetia command running at the same time, is not judged;
   see [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
 - **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory on the way to
-  it, a user other than root can change (owned by another user, or writable by a group or by everyone),
-  and names who. The sticky bit excuses a writable directory above the log's, which it keeps others from
-  renaming, but not the log's own directory, where it does not keep them from making an entry (a symlink
-  at the log's name). A symlink on the way is judged by the directory that holds it, as for any path
-  (above): where that directory is sticky and a group or everyone can write it, a symlink that root does
-  not own is refused too, since its owner can replace it. A log that already exists is refused when it is
-  a symlink or an account's file. A log in or under the `cwd` that is to be handed to the account is refused. All of this
-  is judged before any directory is made and covers a directory that already exists, except that a log
-  directory that is the `cwd`, or in it, is found when `install` reaches the `cwd` (on a file system that
-  ignores case two names can be one directory), and what it made is then taken back. Debian
-  and Ubuntu ship `/var/log` as `root:syslog 0775`, and the group can rename what is inside it, so there
-  no log under `/var/log` is accepted, however deep; keep it under another root such as `/var/lib`, or in
-  a directory only root can change.
+  it, a user other than root can change (owned by another user, or writable by everyone), and names who.
+  Above the log's own directory, the group of a directory root owns is trusted, as systemd's own
+  `LogsDirectory=` trusts it: Debian and Ubuntu ship `/var/log` as `root:syslog 0775`, and
+  `/var/log/<app>/app.log` is accepted there. The log's own directory is judged strictly: a group that can
+  write it is refused too, so `/var/log/app.log` is refused on Debian and Ubuntu, and the error suggests
+  `/var/log/<app>/app.log`. The sticky bit excuses a directory everyone can write above the log's, which
+  it keeps others from renaming, but not the log's own directory, where it does not keep them from making
+  an entry (a symlink at the log's name). A symlink on the way is judged by the directory that holds it,
+  as for any path (above): where that directory is sticky and a group or everyone can write it, a
+  symlink that root does not own is refused too, since its owner can replace it. A log that already
+  exists is refused when it is a symlink or an account's file. A log in or under the `cwd` that is to be
+  handed to the account is refused. All of this is judged before any directory is made and covers a
+  directory that already exists, except that a log directory that is the `cwd`, or in it, is found when
+  `install` reaches the `cwd` (on a file system that ignores case two names can be one directory), and
+  what it made is then taken back.
 - **A path that is not a directory** (a file, or a symlink that leads nowhere) is refused by both
   backends.
 - **An account with no passwd entry.** On launchd a `user` with no passwd entry is an error. On systemd a
@@ -1664,6 +1666,11 @@ On Windows, some tests need a token holding `SeDebugPrivilege` (an elevated Admi
 usually does) but change no system state, so they have a switch and no consent:
 `GOETIA_TEST_DEBUG_PRIVILEGE` unset or `1` runs them, and they **fail** on a token without the
 privilege; `0` ignores them.
+
+On Linux and macOS, the tests of the directories `install` makes need root (they make directories root owns
+and give files to other uids) but change nothing outside their own temporary directory under `/tmp`, so
+they too have a switch and no consent: `GOETIA_TEST_ROOT_DIRS` unset or `1` runs them, and they **fail**
+when the process is not root; `0` ignores them.
 
 ## License
 

@@ -407,7 +407,7 @@ impl CreatedDirs {
                 });
                 stat
             }
-            Err(e) => return Err(Error::os_at("open", self.at(index), e)),
+            Err(e) => return Err(os_while_making("open", &self.made[index].path, &self.at(index), e)),
         };
         self.verify(index, &stat)?;
         Ok(index)
@@ -529,12 +529,12 @@ impl CreatedDirs {
             .held
             .as_ref()
             .expect("a directory is judged through the descriptor it was opened by");
-        let empty = is_empty(&held.dir).map_err(|e| Error::os_at("read", &at, e))?;
+        let empty = is_empty(&held.dir).map_err(|e| os_while_making("read", &made.path, &at, e))?;
         judge(stat, empty).map_err(|why| Error::DirectoryRefused {
             path: made.path.clone(),
-            why: format!("{why} (while it was being made at {})", at.display()),
+            why: format!("{why} {}", while_making(&at)),
         })?;
-        fchmod(&held.dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", &at, e))?;
+        fchmod(&held.dir, Mode::from_bits_truncate(0o755)).map_err(|e| os_while_making("chmod", &made.path, &at, e))?;
         Ok(())
     }
 
@@ -679,6 +679,23 @@ fn rename_new(from_dir: BorrowedFd<'_>, from: &OsStr, to_dir: BorrowedFd<'_>, to
         })
     })???;
     Ok(())
+}
+
+/// Where a directory is while it is made, which the path the spec wrote does not show: at a temporary
+/// name until it is placed.
+fn while_making(at: &Path) -> String {
+    format!("(while it was being made at {})", at.display())
+}
+
+/// An OS call on a directory being made failed. It names the path the spec wrote, and says where the
+/// directory is ([`while_making`]).
+fn os_while_making(what: &str, spec: &Path, at: &Path, source: impl Into<io::Error>) -> Error {
+    let source = source.into();
+    Error::os_at(
+        what,
+        spec,
+        io::Error::new(source.kind(), format!("{source} {}", while_making(at))),
+    )
 }
 
 /// Whether a directory just made is root's, a directory and empty: the checks that say it is the one

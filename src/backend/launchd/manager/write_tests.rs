@@ -20,7 +20,8 @@ use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::Step;
 use crate::spec::{TaskSpec, User};
-use crate::testing::elevation::{ELEVATED, require_elevated};
+use crate::testing::elevation::ELEVATED;
+use crate::testing::groups::root_dirs;
 use crate::testing::task;
 
 // Fixtures ============================================================================================================
@@ -583,8 +584,7 @@ fn a_later_error_after_a_stray_timer_label_went_out_is_bare() {
 
 /// An update that changes nothing still makes the directories the spec names, as it always did.
 #[skuld::test(labels = [ELEVATED])]
-fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
-    require_elevated();
+fn an_update_with_nothing_to_change_still_makes_the_specs_directories(#[fixture(root_dirs)] _root: &()) {
     let tree = Tree::new();
     // Under `/tmp`, which root owns on every host: directories are made only where root's own are.
     let root = tempfile::Builder::new()
@@ -658,8 +658,7 @@ fn an_update_whose_directories_are_refused_sends_launchd_nothing() {
 /// uid 0 is handed nothing: a directory made for a task that runs as root keeps the group it was made
 /// with (a new directory takes its parent's), where `chown(0, 0)` would make it wheel's.
 #[skuld::test(labels = [ELEVATED])]
-fn the_cwd_of_a_task_that_runs_as_root_keeps_the_group_it_was_made_with() {
-    require_elevated();
+fn the_cwd_of_a_task_that_runs_as_root_keeps_the_group_it_was_made_with(#[fixture(root_dirs)] _root: &()) {
     let tree = Tree::new();
     let root = tempfile::Builder::new()
         .prefix("goetia-cwd-")
@@ -700,8 +699,7 @@ fn the_cwd_of_a_task_that_runs_as_root_keeps_the_group_it_was_made_with() {
 /// definition starts: a job that runs then finds its `cwd` in its final state. One a failed install
 /// made is taken back while it is still empty.
 #[skuld::test(labels = [ELEVATED])]
-fn the_cwd_is_the_accounts_before_the_definition_can_run() {
-    require_elevated();
+fn the_cwd_is_the_accounts_before_the_definition_can_run(#[fixture(root_dirs)] _root: &()) {
     let tree = Tree::new();
     let root = tempfile::Builder::new()
         .prefix("goetia-cwd-")
@@ -873,8 +871,7 @@ fn a_print_that_failed_is_worded_as_a_failed_read() {
 /// A refused update leaves none of the new spec's directories: the `cwd` is one the install could
 /// make, so the refusal for a run in flight takes it back with the install.
 #[skuld::test(labels = [ELEVATED])]
-fn a_refused_update_leaves_none_of_the_specs_directories() {
-    require_elevated();
+fn a_refused_update_leaves_none_of_the_specs_directories(#[fixture(root_dirs)] _root: &()) {
     let tree = Tree::new();
     installed(&tree, &task_spec(Some(SCHEDULE)), false);
     // Under `/tmp`, which root owns on every host: directories are made only where root's own are.
@@ -922,8 +919,7 @@ fn a_refused_update_leaves_none_of_the_specs_directories() {
 /// The directories are made before the first action that changes what launchd holds, so a refusal
 /// `make` can still give (a name another install took meanwhile) leaves the loaded timer loaded.
 #[skuld::test(labels = [ELEVATED])]
-fn an_update_whose_directories_are_refused_at_making_leaves_the_timer_loaded() {
-    require_elevated();
+fn an_update_whose_directories_are_refused_at_making_leaves_the_timer_loaded(#[fixture(root_dirs)] _root: &()) {
     let tree = Tree::new();
     let old = installed(&tree, &task_spec(Some(SCHEDULE)), true);
     let root = tempfile::Builder::new()
