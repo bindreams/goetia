@@ -741,11 +741,52 @@ fn a_process_launchd_no_longer_names_when_the_timeout_is_over_is_not_sent_sigkil
         send_signal: StopSignal::Terminate,
         timeout: Some(StopAction::MIN_TIMEOUT),
     };
+    let began = Instant::now();
 
     stopping_as(&fake, Budget::Unbounded, action).expect("a stop that finds no run to end");
 
     fake.assert_spent("SIGTERM, the timeout, the confirmation that refused, and the read that found none");
     assert_eq!(run.finish(), Some(0), "the process was not signalled");
+    assert!(
+        began.elapsed() >= StopAction::MIN_TIMEOUT + UNLOAD_POLL,
+        "the refusal is paced, as the one before the SIGTERM is, while launchd's view catches up"
+    );
+}
+
+/// SIGTERM goes by label, so a later pass can find the run that was sent it again: here launchd's lookup
+/// did not name the process when the grace was over, and does by the next pass. That pass sends no second
+/// SIGTERM, and the grace it finds is the one that began at the first: it is over, and the run is killed
+/// through the hold at once.
+#[skuld::test]
+fn a_run_found_again_is_not_sent_a_second_sigterm_and_keeps_the_grace_that_began_at_the_first() {
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        sigterm(),
+        // The grace is over, and launchd does not name the process held.
+        print(&running(pid)),
+        procinfo_not_naming(pid),
+        // The next pass holds the same process: the grace is over, so it is killed through the hold.
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        print(&running(pid)),
+        procinfo(pid),
+        print(IDLE),
+    ]);
+    let action = StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(StopAction::MIN_TIMEOUT),
+    };
+
+    stopping_as(&fake, Budget::Unbounded, action).expect("a stop that ends the run");
+
+    fake.assert_spent("SIGTERM once, the refused confirmation, then the kill of the same run");
+    assert_eq!(calls_of(&fake, "kill"), [["kill", "SIGTERM", target().as_str()]]);
+    assert_eq!(run.finish(), None, "the run died of a signal");
 }
 
 /// A pid that launchd shows and does not name is not signalled at all, SIGTERM included: it is read again.

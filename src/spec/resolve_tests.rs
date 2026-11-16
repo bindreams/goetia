@@ -3928,6 +3928,22 @@ fn a_substituted_kill_does_not_hand_its_null_timeout_to_another_signal(#[fixture
     }
 }
 
+/// A base signal that is plainly invalid (no substitution) is refused, whatever the override beside it
+/// writes: it is not left to the override's other signal to make it the base's no longer to refuse.
+#[skuld::test]
+fn a_plainly_invalid_base_signal_is_refused_beside_an_override_signal() {
+    for &native in HOST_BACKENDS {
+        let yaml = format!(
+            "{SERVICE}stop-action: {{send-signal: bogus, timeout: null}}\n\
+             backend-specific:\n  {native}:\n    stop-action: terminate\n"
+        );
+
+        let refused = resolve_yaml_as(native, &yaml).expect_err("an invalid signal in the base is refused");
+
+        assert!(refused.to_string().contains("bogus"), "{native}: {refused}");
+    }
+}
+
 /// A base signal that cannot be substituted is not known to be anything but `kill`: the `null` beside it
 /// is not known to be the signal's own, so the override's other signal does not inherit it, and has its
 /// own default.

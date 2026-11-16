@@ -460,8 +460,10 @@ fn shape_stop_action(
         })?,
     };
     if timeout_from_base && matches!(timeout, Shaped::Parsed(None)) && !matches!(signal, Shaped::Deferred) {
-        // A base signal that does not parse (or did not substitute) is the base's to refuse, and is unknown
-        // here: the `null` beside it is not known to be its own, so it is not handed on.
+        // A plainly invalid base signal never gets here: the base is shaped alone first (`Pending`), which
+        // refuses it. An error here is a signal that did not substitute or did not parse once it had; it is
+        // the base's to refuse and unknown here: the `null` beside it is not known to be its own, so it is
+        // not handed on.
         let base_signal = match action.base_signal {
             Some(text) => shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal),
             None => Ok(Shaped::Absent),
