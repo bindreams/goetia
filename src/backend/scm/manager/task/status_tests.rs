@@ -50,7 +50,7 @@ fn exit_of_reads_the_codes_m1_measured() {
 
 #[skuld::test]
 fn no_live_instance_is_idle_and_reports_the_last_run() {
-    let status = task_status(&info(7), Some(&[]), true);
+    let status = task_status(&info(7), &[], true);
 
     assert_eq!(status.common.state, State::Idle);
     assert_eq!(status.common.pid, None);
@@ -64,7 +64,7 @@ fn no_live_instance_is_idle_and_reports_the_last_run() {
 fn a_live_instance_is_running_with_the_first_instances_pid() {
     let live = [instance(1, 4242), instance(2, 9999)];
 
-    let status = task_status(&info(0x0004_1301), Some(&live), true);
+    let status = task_status(&info(0x0004_1301), &live, true);
 
     assert_eq!(status.common.state, State::Running);
     assert_eq!(status.common.pid, Some(4242));
@@ -74,7 +74,7 @@ fn a_live_instance_is_running_with_the_first_instances_pid() {
 /// The status of Task Scheduler alone does not make a task run: a run is a live process.
 #[skuld::test]
 fn a_running_result_with_no_live_instance_is_idle() {
-    let status = task_status(&info(0x0004_1301), Some(&[]), true);
+    let status = task_status(&info(0x0004_1301), &[], true);
 
     assert_eq!(status.common.state, State::Idle);
     assert_eq!(status.last_result, None);
@@ -88,7 +88,7 @@ fn a_task_that_never_ran_has_no_result_and_no_last_run() {
         next_run: None,
     };
 
-    let status = task_status(&never, Some(&[]), false);
+    let status = task_status(&never, &[], false);
 
     assert_eq!(status.last_result, None);
     assert_eq!(status.last_run, None);
@@ -98,19 +98,8 @@ fn a_task_that_never_ran_has_no_result_and_no_last_run() {
 // M1: Task Scheduler computes a next run for triggers that are disabled too.
 #[skuld::test]
 fn next_run_is_none_for_a_disarmed_task_whatever_the_scheduler_reports() {
-    let status = task_status(&info(0), Some(&[]), false);
+    let status = task_status(&info(0), &[], false);
 
     assert!(!status.common.enabled);
     assert_eq!(status.next_run, None);
-}
-
-/// A listing or a probe that failed leaves the state unknown: never running, and no pid to name.
-#[skuld::test]
-fn a_run_state_that_could_not_be_read_is_unknown_and_keeps_the_rest() {
-    let status = task_status(&info(7), None, true);
-
-    assert_eq!(status.common.state, State::Unknown);
-    assert_eq!(status.common.pid, None);
-    assert_eq!(status.last_result, Some(Exit::Code(7)));
-    assert_eq!(status.next_run, Some(at(2_000)));
 }

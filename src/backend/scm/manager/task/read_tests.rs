@@ -14,6 +14,7 @@ use crate::blob::Blob;
 use crate::error::Error;
 use crate::manager::{Exit, Installed, State, Status};
 use crate::spec::{DaemonSpec, Protocol};
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 fn id() -> Id {
     Id::try_from("nightly").unwrap()
@@ -233,30 +234,59 @@ fn a_listed_instance_whose_process_exited_is_idle_and_does_not_refuse_a_run() {
         }));
     let scm = scm(&fake);
 
-    assert_eq!(scm.task_state_with(&snapshot(), gone), State::Idle);
+    assert_eq!(scm.task_state_with(&snapshot(), gone).unwrap(), State::Idle);
     let status = task_status_of(scm.task_status_with(&snapshot(), gone).unwrap());
     assert_eq!(status.common.state, State::Idle);
     assert_eq!(status.common.pid, None);
     assert_eq!(status.last_result, Some(Exit::Code(3)));
 }
 
+/// A process goetia may not open is neither running nor idle: the denial is the call's error, worded
+/// for the verb and naming the process, and no state is guessed. `status` and `list` report it as
+/// `unusable` and `run` refuses with it. Only an Administrator prompt can check a task that runs as
+/// another account.
 #[skuld::test]
-fn a_failed_liveness_probe_makes_the_state_unknown_never_running() {
+fn a_denied_liveness_probe_is_the_error_naming_the_denial_never_running() {
     let fake = Fake::new();
     fake.on_instances(Ok(vec![instance(1, 4242)]))
-        .on_instances(Ok(vec![instance(1, 4242)]))
-        .on_info(Ok(never_run()));
-    let denied = |_pid| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let denied = |_pid| Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
     let scm = scm(&fake);
 
-    assert_eq!(scm.task_state_with(&snapshot(), denied), State::Unknown);
-    let status = task_status_of(scm.task_status_with(&snapshot(), denied).unwrap());
-    assert_eq!(status.common.state, State::Unknown);
-    assert_eq!(status.common.pid, None);
+    let for_run = scm.task_state_with(&snapshot(), denied).unwrap_err();
+    let for_status = scm.task_status_with(&snapshot(), denied).unwrap_err();
+
+    for (error, verb) in [(for_status, "status"), (for_run, "run")] {
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "{verb}: the OS error is kept"
+        );
+        let said = error.report().to_string();
+        assert!(
+            said.contains(&format!(
+                "`{verb}` was denied access to the process of `nightly`'s run (pid 4242)"
+            )),
+            "{said}"
+        );
+    }
+}
+
+/// Any other failed probe is the error too, without a denial's wording.
+#[skuld::test]
+fn a_probe_that_fails_otherwise_is_the_error_never_running() {
+    let fake = Fake::new();
+    fake.on_instances(Ok(vec![instance(1, 4242)]));
+    let failed = |_pid| Err(io::Error::from_raw_os_error(1117));
+
+    let error = scm(&fake).task_state_with(&snapshot(), failed).unwrap_err();
+
+    assert_eq!(error.raw_os_error(), Some(1117));
+    assert!(!error.report().to_string().contains("denied access"));
 }
 
 #[skuld::test]
-fn a_failed_listing_makes_the_state_unknown_never_idle() {
+fn a_failed_listing_is_the_error_never_idle() {
     let fake = Fake::new();
     let listing_failed = || {
         Err(Error::os(
@@ -264,14 +294,15 @@ fn a_failed_listing_makes_the_state_unknown_never_idle() {
             io::Error::other("the Schedule service stopped"),
         ))
     };
-    fake.on_instances(listing_failed())
-        .on_instances(listing_failed())
-        .on_info(Ok(never_run()));
+    fake.on_instances(listing_failed()).on_instances(listing_failed());
     let scm = scm(&fake);
 
-    assert_eq!(scm.task_state_with(&snapshot(), alive), State::Unknown);
-    let status = task_status_of(scm.task_status_with(&snapshot(), alive).unwrap());
-    assert_eq!(status.common.state, State::Unknown);
+    let for_run = scm.task_state_with(&snapshot(), alive).unwrap_err();
+    let for_status = scm.task_status_with(&snapshot(), alive).unwrap_err();
+
+    for error in [for_run, for_status] {
+        assert!(error.report().to_string().contains("the Schedule service stopped"));
+    }
 }
 
 /// `run` reads the state before it requests a run: a part of the status that can fail must not refuse it.
@@ -281,7 +312,7 @@ fn a_failed_info_does_not_fail_task_state() {
     // No `info` reply is stated: asking for it would panic and fail the test.
     fake.on_instances(Ok(Vec::new()));
 
-    assert_eq!(scm(&fake).task_state_with(&snapshot(), alive), State::Idle);
+    assert_eq!(scm(&fake).task_state_with(&snapshot(), alive).unwrap(), State::Idle);
     fake.finish();
     assert_eq!(fake.calls(), [Call::Instances(r"\Goetia\nightly".to_owned())]);
 }

@@ -27,22 +27,20 @@ pub(super) fn exit_of(last_result: i32) -> Option<Exit> {
     }
 }
 
-/// The state of a task whose live instances are `live`, and the pid it runs as. `None` is a listing
-/// or a liveness probe that failed: the state is [`State::Unknown`] and there is no pid to name.
-///
-/// A task is `Running` while any instance is alive, and `pid` is the first one's.
-pub(super) fn run_state(live: Option<&[Instance]>) -> (State, Option<u32>) {
+/// The state of a task whose live instances are `live`, and the pid it runs as. A task is `Running`
+/// while any instance is alive, and `pid` is the first one's. A listing or a probe that failed has no
+/// live instances to give: it is the call's error, never a state.
+pub(super) fn run_state(live: &[Instance]) -> (State, Option<u32>) {
     match live {
-        None => (State::Unknown, None),
-        Some([]) => (State::Idle, None),
-        Some([first, ..]) => (State::Running, Some(first.pid)),
+        [] => (State::Idle, None),
+        [first, ..] => (State::Running, Some(first.pid)),
     }
 }
 
 /// The status of a task whose live instances are `live` (see [`run_state`]). Its `last_result` is
 /// [`exit_of`]. A disarmed task has no next run whatever Task Scheduler reports, which computes one
 /// for disabled triggers too; `enabled` is `armed`.
-pub(super) fn task_status(info: &TaskInfo, live: Option<&[Instance]>, armed: bool) -> TaskStatus {
+pub(super) fn task_status(info: &TaskInfo, live: &[Instance], armed: bool) -> TaskStatus {
     let (state, pid) = run_state(live);
     TaskStatus {
         common: DaemonStatus {

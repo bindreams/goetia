@@ -4,15 +4,16 @@
 //! A task is goetia's by the marker in its `Data`, as a service is by its `Parameters`; its blob
 //! may not decode, and the marker alone is proof of ownership.
 
+use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
 
-use super::api::Registered;
+use super::api::{Instance, Registered};
 use super::live::{Liveness, live_instances, probe};
 use super::status::{run_state, task_status};
 use super::{TaskApi, TaskPath};
 use crate::backend::scm::generate::{self, WindowsDefinition};
-use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot};
+use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, open_refused};
 use crate::backend::scm::task_xml::{TaskXml, extract_from_data};
 use crate::backend::{Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed};
 use crate::blob::Blob;
@@ -120,44 +121,65 @@ impl Scm {
     }
 
     /// The run state of a task: [`Self::task_state_with`] over the real process probe.
-    pub(in crate::backend::scm) fn task_run_state(&self, snapshot: &TaskSnapshot) -> State {
+    pub(in crate::backend::scm) fn task_run_state(&self, snapshot: &TaskSnapshot) -> Result<State> {
         self.task_state_with(snapshot, probe)
     }
 
-    /// The status of `snapshot`'s task, a run being live where `alive` says its process is. A task's
-    /// own record of its runs that cannot be read fails the status; a listing or a probe that
-    /// failed leaves the state unknown.
+    /// The status of `snapshot`'s task, a run being live where `alive` says its process is. What
+    /// cannot be read fails the status: the listing, a probe, and Task Scheduler's own record of the
+    /// task's runs. A state that was not established is never reported.
     pub(super) fn task_status_with(
         &self,
         snapshot: &TaskSnapshot,
         alive: impl FnMut(u32) -> io::Result<Liveness>,
     ) -> Result<Status> {
         let path = TaskPath::of(&snapshot.id);
-        let live = self.live_runs(&path, alive);
+        let live = self.live_runs("status", &snapshot.id, &path, alive)?;
         let info = self.tasks.info(&path)?;
-        Ok(Status::Task(task_status(&info, live.as_deref(), snapshot.armed())))
+        Ok(Status::Task(task_status(&info, &live, snapshot.armed())))
     }
 
     /// The run state of `snapshot`'s task from its listing and the liveness of what it lists alone:
     /// everything [`flow::run`](crate::manager::flow::run) reads before it requests a run, so that
-    /// a part of the status that can fail (Task Scheduler's own record) cannot refuse one.
+    /// a part of the status that can fail (Task Scheduler's own record) cannot refuse one. What
+    /// cannot be read is the error, which `run` reports in place of a state.
     pub(super) fn task_state_with(
         &self,
         snapshot: &TaskSnapshot,
         alive: impl FnMut(u32) -> io::Result<Liveness>,
-    ) -> State {
-        let live = self.live_runs(&TaskPath::of(&snapshot.id), alive);
-        run_state(live.as_deref()).0
+    ) -> Result<State> {
+        let live = self.live_runs("run", &snapshot.id, &TaskPath::of(&snapshot.id), alive)?;
+        Ok(run_state(&live).0)
     }
 
-    /// The runs of the task at `path` that are alive, or `None` where the listing or a probe failed.
+    /// The runs of the task at `path` that are alive, for the verb `operation`. The listing that
+    /// failed is its own error. A process that cannot be judged is the error too, worded as
+    /// [`open_refused`] words a denial: a task that runs as another account (SYSTEM, LocalService,
+    /// an Administrator's own elevated task) has a process that only an Administrator may open, so
+    /// from any other prompt its state cannot be told, and re-running as Administrator clears it.
     fn live_runs(
         &self,
+        operation: &str,
+        id: &Id,
         path: &TaskPath,
         alive: impl FnMut(u32) -> io::Result<Liveness>,
-    ) -> Option<Vec<super::api::Instance>> {
-        let listed = self.tasks.instances(path).ok()?;
-        live_instances(listed, alive).ok()
+    ) -> Result<Vec<Instance>> {
+        let listed = self.tasks.instances(path)?;
+        let judged = Cell::new(None);
+        let mut alive = alive;
+        live_instances(listed, |pid| {
+            judged.set(Some(pid));
+            alive(pid)
+        })
+        .map_err(|e| {
+            let pid = judged.get().unwrap_or_default();
+            open_refused(
+                operation,
+                &format!("the process of `{id}`'s run (pid {pid})"),
+                &format!("open the process of `{id}`'s run (pid {pid}) to check that it runs"),
+                e,
+            )
+        })
     }
 }
 

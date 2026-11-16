@@ -583,6 +583,15 @@ impl Scm {
     }
 }
 
+/// What the read of `spec`'s id is for: only a service's install sets aside a Task Scheduler that
+/// cannot be read, since a machine whose Task Scheduler is unusable still installs a new service.
+fn purpose_of(spec: &DaemonSpec) -> Purpose {
+    match spec {
+        DaemonSpec::Service(_) => Purpose::ServiceInstall,
+        DaemonSpec::Task(_) => Purpose::Verb,
+    }
+}
+
 /// The refusal every verb gives a task until the write and run sides of the task half land: a task is
 /// read, listed and reported, but nothing installs one yet, so none reaches a verb that changes it.
 fn task_verbs_pending(id: &Id) -> Error {
@@ -648,11 +657,7 @@ impl Backend for Scm {
     /// aside: a machine whose Task Scheduler is unusable still installs a new service.
     fn read_for_install(&self, spec: &DaemonSpec) -> Result<ReadOutcome<WindowsSnapshot>> {
         let id = &spec.common().id;
-        let purpose = match spec {
-            DaemonSpec::Service(_) => Purpose::ServiceInstall,
-            DaemonSpec::Task(_) => Purpose::Verb,
-        };
-        which(self.service_read(id)?, || self.task_read(id), purpose)
+        which(self.service_read(id)?, || self.task_read(id), purpose_of(spec))
     }
 
     fn installed(&self, snapshot: &WindowsSnapshot) -> Result<InstalledDefinition<WindowsDefinition>> {
@@ -697,7 +702,7 @@ impl Backend for Scm {
     fn task_state(&self, snapshot: &WindowsSnapshot) -> Result<State> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => Ok(self.service_live_status(snapshot)?.common().state),
-            WindowsSnapshot::Task(snapshot) => Ok(self.task_run_state(snapshot)),
+            WindowsSnapshot::Task(snapshot) => self.task_run_state(snapshot),
         }
     }
 
@@ -1313,7 +1318,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
                 "uninstall",
                 &format!("service `{id}`"),
                 &format!("open `{id}` before uninstall"),
-                windows_service::Error::Winapi(e),
+                e,
             );
             return Err(uninstall_failed(id, &UninstallFailure::Untouched, refused));
         }
@@ -1348,7 +1353,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
                 "uninstall",
                 &format!("service `{id}`"),
                 &format!("open `{id}` to delete it"),
-                e,
+                winapi_io(e),
             );
             return Err(uninstall_failed(id, &UninstallFailure::Delete { previous }, refused));
         }
@@ -1872,7 +1877,7 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
                 "uninstall",
                 &format!("service `{id}`"),
                 &format!("open `{id}` to disable it"),
-                e,
+                winapi_io(e),
             );
             return Err(uninstall_failed(id, &UninstallFailure::Untouched, refused));
         }
@@ -2157,10 +2162,11 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
 /// which says goetia cannot tell whether anything is installed. A denial's message names the verb
 /// and the `target` it was denied.
 ///
-/// `context` is the open, as [`to_error`] takes it.
-fn open_refused(operation: &str, target: &str, context: &str, e: windows_service::Error) -> Error {
-    let access_denied = is_access_denied(&e);
-    let failed = to_error(context, e);
+/// `context` is the open, as [`to_error`] takes it, and `e` its failure: a process's, for a task's run
+/// that a caller who is not an Administrator may not open (see `task::read`).
+fn open_refused(operation: &str, target: &str, context: &str, e: std::io::Error) -> Error {
+    let access_denied = e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    let failed = Error::os(context, e);
     if !access_denied {
         return failed;
     }
@@ -2178,7 +2184,7 @@ fn open_scm_for(id: &Id, operation: &str) -> Result<WinServiceManager> {
             operation,
             "the service manager",
             &format!("open the Service Control Manager to {operation} `{id}`"),
-            e,
+            winapi_io(e),
         )
     })
 }
@@ -2198,7 +2204,7 @@ fn open_existing(id: &Id, operation: &str, access: ServiceAccess) -> Result<(Win
                 operation,
                 &format!("service `{id}`"),
                 &format!("open service `{id}` to {operation} it"),
-                e,
+                winapi_io(e),
             )
         }
     })?;

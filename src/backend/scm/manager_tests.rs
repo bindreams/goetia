@@ -164,7 +164,7 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
 #[skuld::test]
 fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
     for (raw, denied) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
-        let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
+        let e = std::io::Error::from_raw_os_error(raw);
         let err = open_refused("enable", "service `x`", "open service `x` to enable it", e);
 
         assert!(
@@ -1252,7 +1252,7 @@ fn a_failed_disable_claims_only_that_the_service_was_not_deleted() {
 
 #[skuld::test]
 fn a_denied_service_manager_open_is_named_as_the_managers() {
-    let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
     let report = open_refused(
         "uninstall",
         "the service manager",
@@ -1506,6 +1506,21 @@ fn unusable_task_scheduler() -> crate::backend::scm::manager::task::fake::Fake {
         std::io::Error::other("the Schedule service stopped"),
     )));
     fake
+}
+
+/// Only a service's install sets Task Scheduler's failure aside: a task's own install needs the store.
+#[skuld::test]
+fn only_a_services_install_reads_with_task_scheduler_unusable_set_aside() {
+    assert_eq!(purpose_of(&simple_daemon()), Purpose::ServiceInstall);
+    assert_eq!(purpose_of(&daemon_spec(Restart::Never)), Purpose::ServiceInstall);
+    assert_eq!(
+        purpose_of(&crate::testing::task(
+            "nightly",
+            vec![r"C:\bin\job.exe".to_string()],
+            None
+        )),
+        Purpose::Verb
+    );
 }
 
 /// What an install sweeps is files nothing references, and a Task Scheduler that cannot say what its tasks
