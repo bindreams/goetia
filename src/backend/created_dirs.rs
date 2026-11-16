@@ -279,7 +279,7 @@ impl CreatedDirs {
             Some(top) => self.reach(top, hand_to)?,
             None => self.make_top(holder, first_path, first_name, hand_to)?,
         };
-        for (n, (path, name)) in missing.iter().enumerate().skip(1) {
+        for (path, name) in missing.iter().skip(1) {
             dir = match self.child_named(dir, name) {
                 Some(child) => self.reach(child, hand_to)?,
                 None => self.make_inside(dir, path, name, hand_to)?,
