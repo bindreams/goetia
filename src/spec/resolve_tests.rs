@@ -3694,14 +3694,8 @@ fn a_native_service_on_windows_takes_a_timeout_but_not_a_signal_in_its_own_overr
 
 #[skuld::test]
 fn a_leaf_that_is_the_default_is_not_a_stop_action_windows_refuses() {
-    let task = "id: frpc
-command: [bin/frpc]
-type: task
-";
-    let native = "id: frpc
-command: [bin/frpc]
-protocol: native
-";
+    let task = "id: frpc\ncommand: [bin/frpc]\ntype: task\n";
+    let native = "id: frpc\ncommand: [bin/frpc]\nprotocol: native\n";
     // Written, but what Windows would do anyway: nothing was asked of it. `kill` is a signal.
     for (manifest, line, refused) in [
         (task, "stop-action: terminate", false),
@@ -3711,10 +3705,7 @@ protocol: native
         (native, "stop-action: {send-signal: terminate, timeout: 5s}", false),
         (task, "stop-action: kill", true),
     ] {
-        let yaml = format!("{manifest}backend-specific:
-  scm:
-    {line}
-");
+        let yaml = format!("{manifest}backend-specific:\n  scm:\n    {line}\n");
         assert_eq!(
             resolve_yaml(&yaml).is_err(),
             refused,
@@ -3722,8 +3713,7 @@ protocol: native
         );
         // The base is judged by the native backend alone, which is Windows' here.
         if BackendKind::native() == Some(BackendKind::Scm) {
-            let yaml = format!("{manifest}{line}
-");
+            let yaml = format!("{manifest}{line}\n");
             assert_eq!(
                 resolve_yaml(&yaml).is_err(),
                 refused,
