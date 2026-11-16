@@ -274,17 +274,15 @@ impl CreatedDirs {
             return Ok(());
         };
         let last = missing.len() - 1;
-        // Only the deepest directory of the path is handed over.
-        let hand = |n: usize| if n == last { hand_to } else { None };
         let (first_path, first_name) = &missing[0];
         let mut dir = match self.pending_top(&holder, first_path, first_name)? {
             Some(top) => self.reach(top, hand_to)?,
-            None => self.make_top(holder, first_path, first_name, hand(0), hand_to)?,
+            None => self.make_top(holder, first_path, first_name, hand_to)?,
         };
         for (n, (path, name)) in missing.iter().enumerate().skip(1) {
             dir = match self.child_named(dir, name) {
                 Some(child) => self.reach(child, hand_to)?,
-                None => self.make_inside(dir, path, name, hand(n), hand_to)?,
+                None => self.make_inside(dir, path, name, hand_to)?,
             };
         }
         match hand_to {
@@ -317,14 +315,7 @@ impl CreatedDirs {
     }
 
     /// The top of a plan's tree: made in `holder` under a temporary name, to be renamed to `name`.
-    fn make_top(
-        &mut self,
-        holder: OwnedFd,
-        path: &Path,
-        name: &OsStr,
-        hand: Option<Owner>,
-        plan_owner: Option<Owner>,
-    ) -> Result<usize> {
+    fn make_top(&mut self, holder: OwnedFd, path: &Path, name: &OsStr, plan_owner: Option<Owner>) -> Result<usize> {
         let temporary = loop {
             let temporary = temporary_name();
             match mkdirat(holder.as_fd(), temporary.as_os_str(), PRIVATE) {
@@ -346,21 +337,13 @@ impl CreatedDirs {
             path,
             temporary,
             Some(name.to_owned()),
-            hand,
             plan_owner,
         )
     }
 
     /// A directory inside one this call made, under its final name. Nothing else can write the tree, so
     /// a name that is taken there is the same directory under another spelling.
-    fn make_inside(
-        &mut self,
-        parent: usize,
-        path: &Path,
-        name: &OsStr,
-        hand: Option<Owner>,
-        plan_owner: Option<Owner>,
-    ) -> Result<usize> {
+    fn make_inside(&mut self, parent: usize, path: &Path, name: &OsStr, plan_owner: Option<Owner>) -> Result<usize> {
         let above = parent;
         let parent = Parent::Made(parent);
         let parent_fd = fd_of(&self.made, &parent).expect("a directory is made only below one that is held");
@@ -378,7 +361,7 @@ impl CreatedDirs {
                 return Err(os_while_making("create directory", path, &self.at(above).join(name), e));
             }
         }
-        self.record(parent, path, name.to_owned(), None, hand, plan_owner)
+        self.record(parent, path, name.to_owned(), None, plan_owner)
     }
 
     /// Hold the directory just made in `parent` under `name`, record it, judge it and open it up.
@@ -388,7 +371,6 @@ impl CreatedDirs {
         path: &Path,
         name: OsString,
         pending: Option<OsString>,
-        hand: Option<Owner>,
         plan_owner: Option<Owner>,
     ) -> Result<usize> {
         let index = self.made.len();
@@ -398,7 +380,7 @@ impl CreatedDirs {
             pending,
             parent,
             held: None,
-            hand,
+            hand: None,
             plan_owner,
             handed: false,
             passed: false,

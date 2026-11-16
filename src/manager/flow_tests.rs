@@ -190,9 +190,11 @@ fn an_install_that_ends_up_to_date_settles_what_an_earlier_write_made() {
 }
 
 /// The scope settles after every write, the raced ones included, and asks whether the definition stands
-/// only if something was made (see `Settle`): the fake's scope makes nothing, so it never asks.
+/// only if the write made something (see `Settle`) and did not land: a write that landed knows it
+/// does, and one that made nothing has nothing to keep or take back.
 #[skuld::test]
-fn an_install_settles_after_every_write_and_a_scope_that_made_nothing_is_never_asked() {
+fn an_install_settles_after_every_write_and_asks_for_the_standing_only_of_a_write_that_made_something_and_did_not_land()
+{
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
     assert_eq!(fake.settles(), 1);
@@ -205,7 +207,24 @@ fn an_install_settles_after_every_write_and_a_scope_that_made_nothing_is_never_a
     assert_eq!(
         fake.standings(),
         0,
-        "a scope that made nothing has nothing to keep or take back"
+        "writes that made nothing have nothing to keep or take back"
+    );
+
+    let fake = Fake::new();
+    fake.seed_write_makes_something("frpc");
+    fake.install(&mk("frpc"), false).unwrap();
+    assert_eq!(fake.settles(), 1);
+    assert_eq!(fake.standings(), 0, "a write that landed is not read back");
+
+    let fake = Fake::new();
+    fake.seed_write_makes_something("frpc");
+    fake.seed_write_races("frpc", 1);
+    fake.install(&mk("frpc"), false).unwrap();
+    assert_eq!(fake.settles(), 2);
+    assert_eq!(
+        fake.standings(),
+        1,
+        "only the raced write that made something is read back"
     );
 }
 

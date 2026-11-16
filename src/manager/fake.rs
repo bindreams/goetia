@@ -176,6 +176,8 @@ struct Store {
     absent_cleanup_fails: Option<Failure>,
     live_status_fails: BTreeMap<String, Failure>,
     write_races: BTreeMap<String, usize>,
+    /// Ids whose writes make something besides the entry: see [`Fake::seed_write_makes_something`].
+    write_makes: BTreeSet<String>,
     /// Ids whose service is gone by the time it is regenerated against or its live state is queried.
     live_status_gone: BTreeSet<String>,
     /// Text another process puts at an id just before this Fake's next write there, by id.
@@ -549,6 +551,13 @@ impl Fake {
         state.write_races.insert(id.to_string(), times);
     }
 
+    /// Test-only seeding: every write at `id` makes something besides the entry, as a systemd write
+    /// makes a directory, so its scope is asked whether the definition stands when it is settled.
+    pub fn seed_write_makes_something(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.write_makes.insert(id.to_string());
+    }
+
     /// Test-only seeding: `id` is found gone when its live state is queried, as when a concurrent
     /// uninstall removes it after `read` or `scan` saw it. The query completes and says
     /// [`Error::NotInstalled`], and so does `regenerate`, which reads what is installed on SCM.
@@ -801,13 +810,21 @@ impl Fake {
     }
 }
 
-/// What an install of [`Fake`] holds: it makes nothing, and counts the times the install settled it.
-pub struct FakeScope(Arc<Mutex<Store>>);
+/// What an install of [`Fake`] holds: whether a write made something besides the entry (see
+/// [`Fake::seed_write_makes_something`]), and the times the install settled it.
+pub struct FakeScope {
+    state: Arc<Mutex<Store>>,
+    made: bool,
+}
 
 impl crate::backend::Settle for FakeScope {
-    /// Nothing was made, so the standing is not asked (see [`Settle`](crate::backend::Settle)).
-    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {
-        self.0.lock().expect("Fake mutex poisoned").settles += 1;
+    /// Asks the standing only if a write made something (see [`Settle`](crate::backend::Settle)),
+    /// which is then settled.
+    fn settle(&mut self, standing: impl FnOnce() -> Standing) {
+        self.state.lock().expect("Fake mutex poisoned").settles += 1;
+        if std::mem::take(&mut self.made) {
+            standing();
+        }
     }
 }
 
@@ -839,7 +856,10 @@ impl crate::backend::Backend for Fake {
             return Err(Store::undetermined(&spec.common().id));
         }
         state.manager()?;
-        Ok(FakeScope(Arc::clone(&self.state)))
+        Ok(FakeScope {
+            state: Arc::clone(&self.state),
+            made: false,
+        })
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
@@ -920,7 +940,7 @@ impl crate::backend::Backend for Fake {
         definition: &String,
         _outcome: &Outcome,
         snapshot: Option<&Artifact>,
-        _scope: &mut FakeScope,
+        scope: &mut FakeScope,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -936,6 +956,7 @@ impl crate::backend::Backend for Fake {
             );
         }
         state.writes += 1;
+        scope.made |= state.write_makes.contains(spec.common().id.as_str());
         if let Some(left) = state.write_races.get_mut(spec.common().id.as_str())
             && *left > 0
         {
@@ -970,7 +991,7 @@ impl crate::backend::Backend for Fake {
         Ok(WriteOutcome::Done)
     }
 
-    /// The fake's scope makes nothing but the entry.
+    /// Counts the asks: the scope asks only after a write that made something.
     fn standing(&self, _spec: &DaemonSpec, _definition: &String) -> Standing {
         self.state.lock().expect("Fake mutex poisoned").standings += 1;
         Standing::Yes

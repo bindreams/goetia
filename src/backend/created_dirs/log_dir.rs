@@ -35,6 +35,8 @@ use crate::error::{Error, Result};
 /// log's own directory is refused but a directory made in it would be accepted, and `created` would make
 /// one there (it is under one of its roots), suggests a directory of its own named for `app`, the
 /// daemon's id.
+/// The suggestion is a courtesy: a root that cannot be read leaves the refusal with the advice that
+/// needs no root.
 pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, created: &CreatedDirs) -> Result<()> {
     let Some(dir) = logs.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
@@ -58,10 +60,12 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
         };
         let kind = if step.is_link() { "symlink" } else { "directory" };
         let advice = match logs.file_name() {
-            Some(file) if leaf && ancestor_passes && plan.found.under_root(&created.roots)? => format!(
-                "use a directory of its own, such as {}, or one that only root can change",
-                dir.join(app).join(file).display()
-            ),
+            Some(file) if leaf && ancestor_passes && matches!(plan.found.under_root(&created.roots), Ok(true)) => {
+                format!(
+                    "use a directory of its own, such as {}, or one that only root can change",
+                    dir.join(app).join(file).display()
+                )
+            }
             _ => format!(
                 "use a log directory that only root can change, under directories only root can change (a \
                  missing one is made under {}), or drop `logs:` to log to the journal",
