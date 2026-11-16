@@ -42,6 +42,11 @@ const INSTANCE: InstanceId = InstanceId([
 ]);
 
 #[skuld::test]
+fn a_runs_log_marker_is_goetia_run_and_the_instances_digits() {
+    assert_eq!(INSTANCE.marker(), "goetia-run 001aff102030405060708090a0b0c0d0");
+}
+
+#[skuld::test]
 fn instance_id_hex_is_32_lowercase_digits() {
     assert_eq!(INSTANCE.hex(), "001aff102030405060708090a0b0c0d0");
     assert_eq!(InstanceId([0; 16]).hex(), "0".repeat(32));

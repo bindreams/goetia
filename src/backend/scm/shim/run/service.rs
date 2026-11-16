@@ -27,7 +27,6 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
-use super::super::marker;
 use super::exit;
 use super::logging::Log;
 use super::os::{Os, Real, Spawned, spawn_error_code};
@@ -45,8 +44,6 @@ pub(super) const TABLE_NAME: &str = "goetia-shim";
 /// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments: the
 /// service name comes from SCM.
 pub(crate) fn run() -> ! {
-    // Every host reaches here, and this read is what keeps its version marker in the linked binary.
-    std::hint::black_box(&marker::MARKER);
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
         Log::real().failure(TABLE_NAME, &dispatcher_failure(e));
         exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
@@ -97,9 +94,7 @@ fn run_service(id: &str, log: Arc<Log>) {
         }
     };
 
-    if let Some(path) = log.daemon_log_path(id, blob.spec.common().logs.as_deref()) {
-        log.set_daemon_log(path);
-    }
+    set_daemon_log(&log, id, &blob.spec);
     log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
     let reported = run_daemon(
         &blob.spec,
@@ -111,11 +106,19 @@ fn run_service(id: &str, log: Arc<Log>) {
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
 
-/// Why the shim reads no spec to run, and what it tells SCM.
+/// From now on the shim's failures go to the daemon's own log (the default one when `spec` sets no
+/// `logs`), interleaved with its output. Call right after the spec decodes.
+pub(super) fn set_daemon_log(log: &Log, id: &str, spec: &DaemonSpec) {
+    if let Some(path) = log.daemon_log_path(id, spec.common().logs.as_deref()) {
+        log.set_daemon_log(path);
+    }
+}
+
+/// Why the shim reads no spec to run, and what it reports for it.
 #[derive(Debug)]
-struct SpecStop {
-    message: String,
-    reported: Reported,
+pub(super) struct SpecStop {
+    pub(super) message: String,
+    pub(super) reported: Reported,
 }
 
 /// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker, has an
@@ -321,7 +324,7 @@ pub(super) fn run_daemon(
 
 /// How one pass ended, before it is read as anything: what the service tells SCM
 /// ([`PassOutcome::reported`]) and what a task records.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PassOutcome {
     /// The daemon exited on its own, with its tree terminated; `None` when its exit status could not
     /// be had, which is already logged.
@@ -603,6 +606,9 @@ fn stdio_set<T, E: std::error::Error + 'static>(log: &Log, id: &str, assigned: R
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
 /// containment, and stdout+stderr merged into the daemon's log file, which `os` opens. `log`
 /// names that file when the spec does not, and reports a failed open or redirect.
+///
+/// A service with no `logs` writes the default log. A task with none sends its output to `NUL`
+/// and says nothing of it: that is what such a task asked for.
 pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str) -> cosca::Command {
     let mut cmd = cosca::run(spec.common().command.iter().cloned());
     if let Some(cwd) = &spec.common().cwd {
@@ -611,9 +617,14 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
     cmd.envs(spec.common().env.clone());
     cmd.contain();
 
-    let opened = match log.daemon_log_path(id, spec.common().logs.as_deref()) {
-        Some(path) => os.open_log(&path).map_err(|e| log_open_failed(&path, &e)),
-        None => Err(NO_LOG_FILE.to_string()),
+    let logs = spec.common().logs.as_deref();
+    // `Err(None)`: no file, by design.
+    let opened = match (spec, logs) {
+        (DaemonSpec::Task(_), None) => Err(None),
+        (_, logs) => match log.daemon_log_path(id, logs) {
+            Some(path) => os.open_log(&path).map_err(|e| Some(log_open_failed(&path, &e))),
+            None => Err(Some(NO_LOG_FILE.to_string())),
+        },
     };
     match opened {
         Ok(file) => {
@@ -630,7 +641,9 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
             stdio_set(log, id, cmd.stderr(Stdio::merge(Fd::STDOUT)));
         }
         Err(message) => {
-            log.failure(id, &message);
+            if let Some(message) = message {
+                log.failure(id, &message);
+            }
             // Same reasoning as above, for `Stdio::null()`.
             stdio_set(log, id, cmd.stdout(Stdio::null()));
             stdio_set(log, id, cmd.stderr(Stdio::null()));

@@ -66,6 +66,12 @@ impl InstanceId {
         self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    /// The first line a task's shim writes to the log of this run, so that a reader knows where the
+    /// run's own output begins: `goetia-run` and the [`hex`](Self::hex) digits.
+    pub(crate) fn marker(&self) -> String {
+        format!("goetia-run {}", self.hex())
+    }
+
     /// A GUID as COM writes it (`{6F9619FF-8B86-D011-B42D-00C04FC964FF}`), or as [`hex`](Self::hex)
     /// does, or dashed without braces. Digits of either case; `None` for anything else.
     pub(crate) fn parse(braced_or_plain: &str) -> Option<Self> {

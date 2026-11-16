@@ -320,6 +320,9 @@ struct State {
     spawns: VecDeque<SpawnReply>,
     threads: VecDeque<ThreadReply>,
     open_log_failures: Vec<PathBuf>,
+    /// Every log opened, in order: the path asked for and a handle to what was opened, which is
+    /// what the code under test writes into.
+    opened_logs: Vec<(PathBuf, File)>,
     append_failures: Vec<PathBuf>,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
@@ -442,6 +445,25 @@ impl Fake {
     /// code under test.
     pub(crate) fn calls(&self, op: Op) -> usize {
         lock(&self.shared.state).calls.get(&op).copied().unwrap_or(0)
+    }
+
+    /// The path the `n`th log opened (counting from 0) was asked for.
+    pub(crate) fn opened_log_path(&self, n: usize) -> PathBuf {
+        lock(&self.shared.state).opened_logs[n].0.clone()
+    }
+
+    /// What has been written into the `n`th log opened, whole.
+    pub(crate) fn opened_log_text(&self, n: usize) -> String {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let mut file = lock(&self.shared.state).opened_logs[n]
+            .1
+            .try_clone()
+            .expect("clone the log");
+        file.seek(SeekFrom::Start(0)).expect("rewind the log");
+        let mut text = String::new();
+        file.read_to_string(&mut text).expect("read the log");
+        text
     }
 
     /// Whether thread `n` has ended, without waiting for it. Its end is still read with
@@ -631,7 +653,11 @@ impl Os for Fake {
             }
             None => {
                 drop(state);
-                tempfile::tempfile()
+                let file = tempfile::tempfile()?;
+                lock(&self.shared.state)
+                    .opened_logs
+                    .push((path.to_path_buf(), file.try_clone()?));
+                Ok(file)
             }
         }
     }

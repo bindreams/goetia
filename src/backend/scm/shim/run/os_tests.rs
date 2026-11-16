@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec};
+use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
 use crate::testing::base_fields;
 use cosca::identity::Liveness;
 use cosca::{Process, Stdio};
@@ -19,6 +20,7 @@ use skuld::temp_dir;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
 use super::*;
+use crate::backend::scm::shim::run::logging::Log;
 use crate::backend::scm::shim::run::os::fake::FakeGuard;
 use crate::backend::scm::shim::run::service::build_command;
 use crate::backend::scm::shim::run::test_support::not_found;
@@ -246,6 +248,90 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     assert!(
         lines.contains(&"to-stderr"),
         "stderr is not in the daemon's log: {log:?}"
+    );
+}
+
+/// A task that runs `cmd /c <script>` as root, with the `cwd`, `env` and `logs` given.
+fn task_running(
+    script: &str,
+    cwd: Option<PathBuf>,
+    env: BTreeMap<String, String>,
+    logs: Option<PathBuf>,
+) -> DaemonSpec {
+    let comspec = std::env::var("ComSpec").expect("ComSpec names cmd.exe");
+    let base = base_fields(ID, vec![comspec, "/c".to_string(), script.to_string()]);
+    TaskSpec::new(TaskFields {
+        common: DaemonFields {
+            cwd,
+            env,
+            logs,
+            ..base.common
+        },
+        schedule: None,
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+/// The program's own variables and directory are the spec's, over what the shim inherited: a task
+/// starts in `system32` with the machine's variables, and the spec's `env` replaces one of them and
+/// adds another. The program's output is in the spec's `logs`.
+#[skuld::test]
+fn a_task_programs_env_and_cwd_are_the_specs_over_the_inherited_ones(#[fixture(temp_dir)] dir: &Path) {
+    let cwd = dir.join("goetia-task-cwd");
+    std::fs::create_dir(&cwd).expect("the program's working directory");
+    let logs = dir.join("task.log");
+    // `USERNAME` is there in every session that runs the tests: the spec's value replaces it.
+    let env = BTreeMap::from([
+        ("USERNAME".to_string(), "from-spec".to_string()),
+        ("GOETIA_TEST_VAR".to_string(), "added".to_string()),
+    ]);
+    let spec = task_running(
+        "echo %CD%& echo %USERNAME%& echo %GOETIA_TEST_VAR%",
+        Some(cwd),
+        env,
+        Some(logs.clone()),
+    );
+    let fake = FakeGuard::new();
+    let mut reap = Reap::default();
+
+    let program = reap.hold(
+        Real.spawn(build_command(&spec, &Real, &fake.log(), ID))
+            .expect("spawn the program"),
+    );
+    program.wait().expect("the program exits");
+
+    let log = std::fs::read_to_string(&logs).expect("the program's log");
+    let lines: Vec<&str> = log.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), 3, "{log:?}");
+    assert!(
+        lines[0].ends_with("goetia-task-cwd"),
+        "the program ran outside its `cwd`: {log:?}"
+    );
+    assert_eq!(&lines[1..], ["from-spec", "added"], "{log:?}");
+}
+
+/// A task with no `logs` has its output discarded: no log is made for it, not even the default one a
+/// service gets, and nothing is reported of that.
+#[skuld::test]
+fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] dir: &Path) {
+    let defaults = dir.join("default-logs");
+    let fake = FakeGuard::new();
+    let log = Arc::new(Log::new(fake.channels(), defaults.clone()));
+    let spec = task_running("echo discarded", None, BTreeMap::new(), None);
+    let mut reap = Reap::default();
+
+    let program = reap.hold(
+        Real.spawn(build_command(&spec, &Real, &log, ID))
+            .expect("spawn the program"),
+    );
+    program.wait().expect("the program exits");
+
+    assert!(!defaults.exists(), "a default log was made for a task with no `logs`");
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![],
+        "something was reported of the missing log"
     );
 }
 
