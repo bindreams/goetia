@@ -98,6 +98,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::NotATask { id: id() },
         Error::AlreadyRunning { id: id() },
         Error::StillRunning { id: id(), pid: 1 },
+        Error::RetypeRunning {
+            id: id(),
+            old: crate::spec::DaemonKind::Task,
+        },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -708,7 +712,7 @@ fn report_of_a_missing_password() {
         .report()
         .to_string(),
         "service account `DOM\\bob` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
-         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD before installing"
+         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again"
     );
 }
 
@@ -1224,6 +1228,24 @@ fn error_messages_and_exit_class() {
             "`nightly` still has the run that was sent SIGTERM (pid 4242), and launchd starts no new run of a task \
              while one is in flight, so no start was issued; `goetia daemon start nightly` starts one once it has \
              exited, and `goetia daemon restart nightly` without `--timeout 0` waits for the exit",
+            false,
+        ),
+        (
+            Error::RetypeRunning {
+                id: id(),
+                old: crate::spec::DaemonKind::Service,
+            },
+            "`nightly` is running as a service, and changing it to a task removes it first: run `goetia daemon stop \
+             nightly`, then re-run install",
+            false,
+        ),
+        (
+            Error::RetypeRunning {
+                id: id(),
+                old: crate::spec::DaemonKind::Task,
+            },
+            "`nightly` is running as a task, and changing it to a service removes it first: run `goetia daemon stop \
+             nightly`, then re-run install",
             false,
         ),
         (

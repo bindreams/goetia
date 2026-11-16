@@ -52,7 +52,7 @@
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
 //! (`ERROR_LOGON_FAILURE`) while `install` has already reported success. See
-//! `identity::grant_service_logon_right`, called before the service is
+//! `identity::grant_logon_right`, called before the service is
 //! created or changed, for every account [`generate::account_needs_password`]
 //! says needs a password — every other account (`LocalSystem`, a built-in, or an
 //! `NT SERVICE\<id>` virtual account) already holds the right, and
@@ -338,19 +338,25 @@ impl Scm {
         if !generate::hosted(spec) {
             return Ok(None);
         }
+        self.begin_hosted_install(HostCommand {
+            exe: desired.executable.clone(),
+            args: desired.arguments.clone(),
+        })
+        .map(Some)
+    }
+
+    /// What an install of a daemon that runs under the shim host does first, for a service and a task
+    /// alike: see [`Self::service_begin_install`]. `rendered` is the host the definition names.
+    fn begin_hosted_install(&self, rendered: HostCommand) -> Result<InstallLock> {
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
         self.sweep_before_install(shim);
         let provided = shim.provide(&self.folders)?;
-        let rendered = HostCommand {
-            exe: desired.executable.clone(),
-            args: desired.arguments.clone(),
-        };
         let provided = confirm_provided(rendered, provided)?;
         require_absolute(&provided.exe)?;
         self.folders.check(&provided.exe)?;
         marker::verify(&provided.exe)?;
-        Ok(Some(lock))
+        Ok(lock)
     }
 
     fn service_render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
@@ -483,9 +489,32 @@ impl Scm {
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
-        let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
-        let uninstalled = uninstall_locked(&scm, &id, &answer, hold)?;
+        let uninstalled = self.service_remove(&id, &answer, hold)?;
         self.after_uninstall(&id, uninstalled, host)
+    }
+
+    /// The service stopped and deleted, with its process held (`hold`) for the caller to wait for.
+    fn service_remove(&self, id: &Id, answer: &ShimAnswer, hold: bool) -> Result<Uninstalled> {
+        let scm = open_scm_for(id, "uninstall").map_err(|e| uninstall_failed(id, &UninstallFailure::Untouched, e))?;
+        uninstall_locked(&scm, id, answer, hold)
+    }
+
+    /// What an install that changes a service into a task removes first: the service, stopped and
+    /// deleted, under the install lock the install already holds, with nothing swept and no process
+    /// waited for (the install sweeps once the task exists: the new host may be the old one). The
+    /// snapshot's own handle stays open until the install ends, so the record goes with it then.
+    fn service_retire(&self, snapshot: &ScmSnapshot) -> Result<()> {
+        // The lock is held by the caller: nothing is taken here.
+        let plan = plan_uninstall(
+            snapshot.blob(),
+            || Ok(()),
+            || {
+                snapshot
+                    .config()
+                    .map(|config| config.executable_path.to_string_lossy().into_owned())
+            },
+        )?;
+        self.service_remove(snapshot.id(), &plan.answer, false).map(drop)
     }
 
     /// Under the lock, the sweep an `install` makes before it provides, which is how an `uninstall`
@@ -592,8 +621,8 @@ fn purpose_of(spec: &DaemonSpec) -> Purpose {
     }
 }
 
-/// The refusal every verb gives a task until the write and run sides of the task half land: a task is
-/// read, listed and reported, but nothing installs one yet, so none reaches a verb that changes it.
+/// The refusal the verbs that start, stop and run a task give until the run side of the task half
+/// lands: a task is installed, read, listed and reported, but nothing starts one yet.
 fn task_verbs_pending(id: &Id) -> Error {
     crate::backend::cannot_run_tasks("the Windows service manager", id)
 }
@@ -615,7 +644,7 @@ impl Backend for Scm {
     ) -> Result<Option<InstallLock>> {
         match desired {
             WindowsDefinition::Service(desired) => self.service_begin_install(spec, desired),
-            WindowsDefinition::Task(_) => Err(task_verbs_pending(&spec.common().id)),
+            WindowsDefinition::Task(desired) => self.begin_hosted_install(desired.host()).map(Some),
         }
     }
 
@@ -640,12 +669,10 @@ impl Backend for Scm {
         }
     }
 
-    /// A task is refused as before until the write side lands: its install would otherwise place the
-    /// shim file before it fails.
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<WindowsDefinition> {
         match spec {
             DaemonSpec::Service(_) => self.service_render_for_install(spec).map(WindowsDefinition::Service),
-            DaemonSpec::Task(_) => Err(task_verbs_pending(&spec.common().id)),
+            DaemonSpec::Task(_) => self.task_render_for_install(spec),
         }
     }
 
@@ -678,7 +705,7 @@ impl Backend for Scm {
         definition: &WindowsDefinition,
         _outcome: &Outcome,
         snapshot: Option<&WindowsSnapshot>,
-        _scope: &mut Option<InstallLock>,
+        scope: &mut Option<InstallLock>,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         match (definition, snapshot) {
@@ -686,7 +713,16 @@ impl Backend for Scm {
             (WindowsDefinition::Service(definition), Some(WindowsSnapshot::Service(snapshot))) => {
                 self.service_write(spec, definition, Some(snapshot))
             }
-            _ => Err(task_verbs_pending(&spec.common().id)),
+            (WindowsDefinition::Service(definition), Some(WindowsSnapshot::Task(old))) => {
+                self.retype_to_service(spec, definition, old, scope)
+            }
+            (WindowsDefinition::Task(definition), None) => self.task_write(spec, definition, None),
+            (WindowsDefinition::Task(definition), Some(WindowsSnapshot::Task(snapshot))) => {
+                self.task_write(spec, definition, Some(snapshot))
+            }
+            (WindowsDefinition::Task(definition), Some(WindowsSnapshot::Service(old))) => {
+                self.retype_to_task(spec, definition, old, scope)
+            }
         }
     }
 
@@ -713,25 +749,27 @@ impl Backend for Scm {
     fn uninstall(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_uninstall(snapshot),
-            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+            WindowsSnapshot::Task(snapshot) => self.task_uninstall(snapshot),
         }
     }
 
-    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
-        self.service_uninstall_absent()
+    /// The id is in neither store, so what is left of it is a task's run records, which a task's
+    /// uninstall that could not remove them leaves, and what a service's uninstall leaves to sweep.
+    fn uninstall_absent(&self, id: &Id) -> Result<()> {
+        self.task_uninstall_absent(id)
     }
 
     fn enable(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_enable(snapshot),
-            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+            WindowsSnapshot::Task(snapshot) => self.task_enable(&snapshot),
         }
     }
 
     fn disable(&self, snapshot: WindowsSnapshot) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_disable(snapshot),
-            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+            WindowsSnapshot::Task(snapshot) => self.task_disable(&snapshot),
         }
     }
 
@@ -774,15 +812,16 @@ impl Backend for Scm {
     }
 }
 
-/// The service registration `build` makes for `spec`. A task is refused here, before the host is
-/// asked, as it always was: [`Scm::task_render`] builds a task's definition.
+/// The service registration `build` makes for the service `spec`: [`Scm::task_render`] and
+/// [`Scm::task_render_for_install`] build a task's definition.
 fn service_registration(
     spec: &DaemonSpec,
     build: impl FnOnce() -> Result<generate::WindowsDefinition>,
 ) -> Result<ScmRegistration> {
-    if let DaemonSpec::Task(_) = spec {
-        return Err(task_verbs_pending(&spec.common().id));
-    }
+    debug_assert!(
+        matches!(spec, DaemonSpec::Service(_)),
+        "a task is not a service's registration"
+    );
     match build()? {
         generate::WindowsDefinition::Service(registration) => Ok(registration),
         generate::WindowsDefinition::Task(_) => unreachable!("a service spec is built as a service"),
@@ -1127,7 +1166,7 @@ fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool
         let pw = identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
             account: account.to_string(),
         })?;
-        identity::grant_service_logon_right(&user)?;
+        identity::grant_logon_right(&user, identity::Right::Service)?;
         Some(pw)
     } else {
         None
@@ -1569,6 +1608,11 @@ pub(super) fn shim_answer(
 /// provider.
 fn shim_host(image: &str) -> Option<PathBuf> {
     let (exe, _) = split_command_line(image);
+    shim_exe(exe)
+}
+
+/// `exe` itself, when its file name is that of a shim file placed by a provider.
+fn shim_exe(exe: PathBuf) -> Option<PathBuf> {
     let is_shim = exe.file_name()?.to_str().and_then(shim_file) == Some(ShimFile::Current);
     is_shim.then_some(exe)
 }

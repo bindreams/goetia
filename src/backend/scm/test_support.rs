@@ -48,6 +48,19 @@ pub(crate) fn task_spec(schedule: Option<&str>) -> crate::spec::DaemonSpec {
     crate::testing::task("nightly", vec![crate::spec::test_support::program("job")], schedule)
 }
 
+/// The task `nightly` as `user` runs it.
+#[cfg(windows)]
+pub(crate) fn task_spec_as(user: crate::spec::User, schedule: Option<&str>) -> crate::spec::DaemonSpec {
+    let crate::spec::DaemonSpec::Task(task) = task_spec(schedule) else {
+        unreachable!("`task_spec` builds a task")
+    };
+    let mut fields = task.into_fields();
+    fields.common.user = user;
+    crate::spec::TaskSpec::new(fields)
+        .map(crate::spec::DaemonSpec::from)
+        .expect("a task as another user")
+}
+
 /// The shim host a task runs.
 #[cfg(windows)]
 pub(crate) fn task_host() -> crate::shim::HostCommand {

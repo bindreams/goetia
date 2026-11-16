@@ -48,7 +48,7 @@ const SCM_DENIAL: skuld::Label;
 /// which the lock tests in `src/backend/scm/shim/lock_tests.rs` and `tests/shim_integration` poll
 /// for who holds it. Shared with both by label *name*.
 #[skuld::label]
-const UNIT_DIR_EXCLUSIVE: skuld::Label;
+pub(crate) const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")

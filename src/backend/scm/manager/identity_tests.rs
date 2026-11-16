@@ -368,6 +368,14 @@ fn a_sid_is_cut_to_the_length_its_sub_authority_count_gives() {
     assert_eq!(whole_sid_prefix(vec![2, 0, 0, 0, 0, 0, 0, 5]), None);
 }
 
+// Right ===============================================================================================================
+
+#[skuld::test]
+fn each_right_is_named_as_windows_names_it() {
+    assert_eq!(Right::Service.name(), "SeServiceLogonRight");
+    assert_eq!(Right::Batch.name(), "SeBatchLogonRight");
+}
+
 // account_error =======================================================================================================
 
 #[skuld::test]

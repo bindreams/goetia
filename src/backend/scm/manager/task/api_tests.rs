@@ -48,3 +48,27 @@ fn ole_dates_keep_their_order() {
     assert!(earlier < later);
     assert!(apart(later, earlier) >= Duration::from_secs(23 * 3600));
 }
+
+// The one failure of a `Stop` a caller takes as a stop: the run ended before it was asked to.
+#[skuld::test]
+fn only_task_schedulers_not_running_code_says_the_run_had_ended() {
+    use windows::Win32::Foundation::{E_ACCESSDENIED, SCHED_E_TASK_NOT_RUNNING};
+
+    let ended = Error::os("stop an instance", windows::core::Error::from(SCHED_E_TASK_NOT_RUNNING));
+    let wrapped = Error::Step {
+        what: "stop `x`".to_owned(),
+        source: Box::new(Error::os(
+            "stop an instance",
+            windows::core::Error::from(SCHED_E_TASK_NOT_RUNNING),
+        )),
+    };
+    let denied = Error::os("stop an instance", windows::core::Error::from(E_ACCESSDENIED));
+
+    assert!(is_not_running(&ended));
+    assert!(is_not_running(&wrapped));
+    assert!(!is_not_running(&denied));
+    assert!(!is_not_running(&Error::os(
+        "stop an instance",
+        std::io::Error::other("x")
+    )));
+}

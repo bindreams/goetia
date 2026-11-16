@@ -8,12 +8,12 @@
 
 use std::time::SystemTime;
 
-use windows::Win32::Foundation::SYSTEMTIME;
+use windows::Win32::Foundation::{SCHED_E_TASK_NOT_RUNNING, SYSTEMTIME};
 use windows::Win32::System::Variant::VariantTimeToSystemTime;
 
 use super::clock::local_to_system;
 use crate::backend::scm::instance::{InstanceId, TaskAccount, TaskPath};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// One run of a task that Task Scheduler lists. A listing is not proof the run is alive: the entry
 /// outlives the process.
@@ -101,6 +101,19 @@ pub(crate) trait TaskApi: Send + Sync {
     /// call's own `Error::Os`, with the HRESULT in its source, never as `NotInstalled`, and the
     /// caller maps it (to `Ok`: the run is stopped).
     fn stop(&self, path: &TaskPath, instance: &InstanceId) -> Result<()>;
+}
+
+/// Whether `error`, from [`TaskApi::stop`], says the run had ended: the one failure of a `Stop` that a
+/// caller takes as a stop. Task Scheduler's own code is in the error's source chain.
+pub(crate) fn is_not_running(error: &Error) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = next {
+        if let Some(com) = error.downcast_ref::<windows::core::Error>() {
+            return com.code() == SCHED_E_TASK_NOT_RUNNING;
+        }
+        next = error.source();
+    }
+    false
 }
 
 /// 1999-11-30 00:00 as an OLE date.

@@ -30,6 +30,9 @@ mod kill;
 #[cfg(windows)]
 #[path = "scm_integration/managed.rs"]
 mod managed;
+#[cfg(windows)]
+#[path = "scm_integration/tasks.rs"]
+mod tasks;
 
 fn main() {
     // Dispatched before the harness starts, exactly like

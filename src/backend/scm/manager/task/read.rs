@@ -40,8 +40,13 @@ impl TaskSnapshot {
     }
 
     /// Whether every trigger is enabled.
-    fn armed(&self) -> bool {
+    pub(super) fn armed(&self) -> bool {
         TaskXml::armed(&self.registered.xml)
+    }
+
+    /// The definition as Task Scheduler stores it: what a verb that registers the task again starts from.
+    pub(super) fn registered(&self) -> &Registered {
+        &self.registered
     }
 }
 
@@ -157,7 +162,7 @@ impl Scm {
     /// [`open_refused`] words a denial: a task that runs as another account (SYSTEM, LocalService,
     /// an Administrator's own elevated task) has a process that only an Administrator may open, so
     /// from any other prompt its state cannot be told, and re-running as Administrator clears it.
-    fn live_runs(
+    pub(super) fn live_runs(
         &self,
         operation: &str,
         id: &Id,

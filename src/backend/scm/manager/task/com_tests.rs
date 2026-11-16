@@ -352,6 +352,74 @@ fn only_the_lookup_decides_that_a_task_is_missing(#[fixture(scm_group)] _group: 
     assert!(!done.get());
 }
 
+/// What a task registers the principal of: the SID the XML names, as the account `RegisterTask` is given
+/// (goetia's `TaskAccount::Service` holds it that way). If Task Scheduler took only the names, the
+/// account would be one, and the SID would stay in the XML.
+#[skuld::test]
+fn a_well_known_account_registers_by_its_sid(#[fixture(scm_group)] _group: &Group) {
+    let _lock = InstallLock::acquire().unwrap();
+    let (_guard, path) = TaskGuard::new("goetia-com-sid");
+
+    for sid in ["S-1-5-18", "S-1-5-19", "S-1-5-20"] {
+        let text = xml(1, sid, "").replace("<UserId>S-1-5-18</UserId>", &format!("<UserId>{sid}</UserId>"));
+        let who = TaskAccount::Service(sid.to_owned());
+
+        let first = Com.register(&path, &text, &who, None, false).unwrap_or_else(|e| {
+            panic!("create as {sid}: {}", e.report());
+        });
+        assert_eq!(first, Registration::Created, "{sid}");
+        let update = Com.register(&path, &text, &who, None, true).unwrap_or_else(|e| {
+            panic!("update as {sid}: {}", e.report());
+        });
+        assert_eq!(update, Registration::Created, "{sid}");
+        let read = Com.get(&path).unwrap().expect("the task is registered");
+        assert!(
+            read.xml.contains(sid),
+            "the principal reads back as {sid}: {}",
+            read.xml
+        );
+
+        assert!(Com.delete(&path).unwrap());
+    }
+}
+
+/// A trigger goetia did not write, disarmed by `with_armed`: Task Scheduler takes the flag where it puts
+/// it (first among the trigger's children, or after a boundary), and reads it back as disabled.
+#[skuld::test]
+fn a_hand_added_logon_trigger_disarmed_by_with_armed_registers_and_reads_back_disarmed(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    use crate::backend::scm::task_xml::TaskXml;
+
+    let _lock = InstallLock::acquire().unwrap();
+    let (_guard, path) = TaskGuard::new("goetia-com-logon");
+    let with =
+        |triggers: &str| xml(1, "logon", "").replace("<Actions", &format!("<Triggers>{triggers}</Triggers><Actions"));
+    let triggers = [
+        "<LogonTrigger></LogonTrigger>",
+        "<LogonTrigger><UserId>S-1-5-18</UserId><Delay>PT1M</Delay></LogonTrigger>",
+        "<LogonTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary></LogonTrigger>",
+        "<BootTrigger><Delay>PT1M</Delay></BootTrigger>",
+    ];
+
+    for trigger in triggers {
+        let text = with(trigger);
+        let disarmed = TaskXml::with_armed(&text, false).unwrap();
+        assert!(disarmed.contains("<Enabled>false</Enabled>"), "{disarmed}");
+
+        Com.register(&path, &disarmed, &system(), None, false)
+            .unwrap_or_else(|e| panic!("{trigger}: registered as {disarmed}: {}", e.report()));
+
+        let read = Com.get(&path).unwrap().expect("the task is registered");
+        assert!(
+            !TaskXml::armed(&read.xml),
+            "{trigger}: reads back disarmed: {}",
+            read.xml
+        );
+        assert!(Com.delete(&path).unwrap());
+    }
+}
+
 #[skuld::test]
 fn a_query_of_a_missing_task_is_not_installed(#[fixture(scm_group)] _group: &Group) {
     let _lock = InstallLock::acquire().unwrap();

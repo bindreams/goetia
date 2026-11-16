@@ -165,10 +165,11 @@ pub enum Error {
     #[error("`{variable}` is set but its value is not valid Unicode")]
     InvalidPassword { variable: String },
 
-    /// A real account needs a password that was not given.
+    /// A real account needs a password that was not given: to install, and for a task, to `enable`,
+    /// `disable` and `uninstall` it too, which register it again.
     #[error(
         "service account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
-         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD before installing"
+         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again"
     )]
     PasswordRequired { account: String },
 
@@ -509,6 +510,11 @@ pub enum Error {
     )]
     StillRunning { id: String, pid: u32 },
 
+    /// An install that changes a daemon between a service and a task removes the old one first, and
+    /// refuses while it runs. `old` is what is installed. Determinate: nothing was changed.
+    #[error("{}", retype_running(id, *old))]
+    RetypeRunning { id: String, old: crate::spec::DaemonKind },
+
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
@@ -760,6 +766,7 @@ impl Error {
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
             | Error::StillRunning { .. }
+            | Error::RetypeRunning { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -949,6 +956,7 @@ impl Error {
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
             | Error::StillRunning { .. }
+            | Error::RetypeRunning { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }
@@ -1330,6 +1338,18 @@ fn loaded_job(id: &str, kind: crate::spec::DaemonKind) -> String {
              has stopped is idle), then re-run install"
         ),
     }
+}
+
+/// The message of [`Error::RetypeRunning`].
+fn retype_running(id: &str, old: crate::spec::DaemonKind) -> String {
+    let (old, new) = match old {
+        crate::spec::DaemonKind::Service => ("service", "task"),
+        crate::spec::DaemonKind::Task => ("task", "service"),
+    };
+    format!(
+        "`{id}` is running as a {old}, and changing it to a {new} removes it first: run `goetia daemon stop {id}`, \
+         then re-run install"
+    )
 }
 
 /// The message of [`Error::LoadedJobInDoubt`].

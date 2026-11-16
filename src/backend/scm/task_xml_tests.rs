@@ -451,6 +451,34 @@ fn the_account_is_the_blobs_and_never_read_from_the_principal() {
     assert_eq!(installed.to_string(), built(&spec).to_string());
 }
 
+/// A task whose blob cannot be read still has a principal, which is how it is registered again (an
+/// `uninstall` that disarms it first): a password logon is a user's, anything else a service account.
+#[skuld::test]
+fn a_stored_principal_names_the_account_to_register_again_as() {
+    let service = built(&spec()).to_xml(true);
+    assert_eq!(
+        TaskXml::principal(&service).unwrap(),
+        TaskAccount::Service("S-1-5-18".to_owned())
+    );
+
+    let user = built(&spec_of(User::Name("alice".into()), Some(SCHEDULE))).to_xml(true);
+    assert_eq!(
+        TaskXml::principal(&user).unwrap(),
+        TaskAccount::User("alice".to_owned())
+    );
+
+    // As Task Scheduler reads it back: the account a SID.
+    let normalised = user.replace("<UserId>alice</UserId>", "<UserId>S-1-5-21-1-2-3-1001</UserId>");
+    assert_eq!(
+        TaskXml::principal(&normalised).unwrap(),
+        TaskAccount::User("S-1-5-21-1-2-3-1001".to_owned())
+    );
+
+    let none = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions/></Task>";
+    assert!(TaskXml::principal(none).is_err());
+    assert!(TaskXml::principal("<Task><Principals>").is_err());
+}
+
 #[skuld::test]
 fn a_readback_is_a_fixed_point() {
     let spec = spec();

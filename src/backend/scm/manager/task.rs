@@ -13,7 +13,9 @@ mod com;
 pub(crate) mod fake;
 mod live;
 mod read;
+mod remove;
 mod status;
+mod write;
 
 pub(crate) use api::TaskApi;
 pub(in crate::backend::scm) use classify::{Purpose, which};

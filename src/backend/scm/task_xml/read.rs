@@ -11,6 +11,7 @@ use roxmltree::{Document, Node};
 use super::{
     MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, TASK_MODE_ARG, TaskXml, WEEKDAYS, account_of, extract_from_data,
 };
+use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::triggers::{Repeat, Trigger};
 use crate::error::Error;
 use crate::shim::HostCommand;
@@ -79,6 +80,26 @@ impl TaskXml {
             data,
             settings,
             unrecognised,
+        })
+    }
+
+    /// The account `xml`'s principal names, for registering the task again when its blob cannot say
+    /// (see [`TaskXml::parse`], which reads it from the blob): a password logon is a user's, any other
+    /// a service account's. The name is as Task Scheduler stores it, usually a SID.
+    pub(crate) fn principal(xml: &str) -> Result<TaskAccount, Error> {
+        let document = document(xml)?;
+        let principal = child(document.root_element(), "Principals")
+            .and_then(|principals| child(principals, "Principal"))
+            .and_then(|principal| child(principal, "UserId").map(|user| (principal, text(user))))
+            .filter(|(_, user)| !user.is_empty());
+        let Some((principal, user)) = principal else {
+            return Err(Error::blob("the task's XML names no principal"));
+        };
+        let password = child(principal, "LogonType").is_some_and(|logon| text(logon).eq_ignore_ascii_case("Password"));
+        Ok(if password {
+            TaskAccount::User(user)
+        } else {
+            TaskAccount::Service(user)
         })
     }
 
