@@ -264,13 +264,18 @@ records the end as it does.
   `ExitTimeOut` applies only when launchd itself boots a job out, which a task's
   `stop` never does: goetia ends a task's run itself, with `SIGKILL` at once for
   `kill` and otherwise `SIGTERM`, then `SIGKILL` if the run is still going when
-  `timeout` is over. That is the grace the manifest configures, and it is
-  kept only while goetia waits: on a launchd task alone, a `stop --timeout`
-  shorter than the `timeout`, or `--timeout 0`, ends the wait after the
-  `SIGTERM`, nothing sends the `SIGKILL`, and a run that ignores `SIGTERM`
-  keeps going until `goetia daemon kill <id>` ends it. The wait does not
-  count the time a queued start took to fork, and the `SIGKILL` goes to the
-  process that was sent the `SIGTERM`, never to a run that began after.
+  `timeout` is over. Both signals go through a hold on the process that
+  `launchctl procinfo` names as the job's, never by pid or by the label, so
+  neither reaches a run that began after, or a process that reused the pid; and
+  they go to that process alone, not to its process group (measured:
+  `launchctl kill` signals the leader only). The `timeout` is the grace the manifest
+  configures, and it is kept only while goetia waits: on a launchd task alone, a
+  `stop --timeout` shorter than the `timeout`, or `--timeout 0`, ends the wait
+  after the `SIGTERM`, nothing sends the `SIGKILL`, and a run that ignores
+  `SIGTERM` keeps going until `goetia daemon kill <id>` ends it; the same holds
+  when the wait is spent just as the `timeout` ends, and the error says whether
+  a `SIGKILL` had gone out. The wait does not count the time a queued start took
+  to fork.
 - **Windows** reads, checks and records the field, and does not apply it yet:
   the shim still ends the daemon at once on every stop, `stop`, `restart` and
   `uninstall` included, whatever `stop-action` says. A task is stopped by Task
