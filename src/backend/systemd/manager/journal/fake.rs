@@ -1,5 +1,8 @@
 //! A test journal: entries stated newest first, followers that deliver what they are given and then
 //! wait to be stopped, and a record of what was asked.
+//!
+//! What is scripted is delivered whatever the query matched, except an entry made [`Fake::unindexed`]
+//! under a field, as journald leaves a stored-twice entry across a file rotation.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -28,6 +31,15 @@ struct State {
     /// The cursor `tail` answers, and how many times it was asked.
     tail: Option<String>,
     tails: usize,
+    unindexed: Vec<Unindexed>,
+}
+
+/// The entry at `cursor` is in no query that matches on `field`.
+struct Unindexed {
+    cursor: String,
+    field: String,
+    /// An entry at `cursor` has passed through a query, delivered or withheld.
+    met: bool,
 }
 
 /// What one follower delivers.
@@ -108,6 +120,30 @@ impl Fake {
         self.script(Script { entries, ends: true })
     }
 
+    /// The entry at `cursor` is in no query that matches on `field`.
+    pub(in crate::backend::systemd::manager) fn unindexed(self, cursor: &str, field: &str) -> Fake {
+        self.state.lock().unwrap().unindexed.push(Unindexed {
+            cursor: cursor.to_string(),
+            field: field.to_string(),
+            met: false,
+        });
+        self
+    }
+
+    /// Panics unless the cursor of every [`Fake::unindexed`] named a scripted entry that a query
+    /// went through. Whether the field withheld it is not asked: the code under test may issue no
+    /// query on that field, which is the point of such a test.
+    pub(in crate::backend::systemd::manager) fn assert_spent(&self) {
+        let state = self.state.lock().unwrap();
+        let unmet: Vec<&str> = state
+            .unindexed
+            .iter()
+            .filter(|u| !u.met)
+            .map(|u| u.cursor.as_str())
+            .collect();
+        assert!(unmet.is_empty(), "unindexed cursors that met no entry: {unmet:?}");
+    }
+
     fn script(self, script: Script) -> Fake {
         self.state.lock().unwrap().follows.push_back(script);
         self
@@ -168,6 +204,25 @@ impl Fake {
         matches.iter().map(Match::argument).collect()
     }
 
+    /// What of `entries` a query that asked for `matches` sees.
+    fn seen(&self, entries: Vec<Entry>, matches: &[Match]) -> Vec<Entry> {
+        let mut state = self.state.lock().unwrap();
+        entries
+            .into_iter()
+            .filter(|entry| {
+                let cursor = entry.get("__CURSOR");
+                let mut seen = true;
+                for u in &mut state.unindexed {
+                    if Some(u.cursor.as_str()) == cursor {
+                        u.met = true;
+                        seen &= !matches.iter().any(|m| m.is(&u.field));
+                    }
+                }
+                seen
+            })
+            .collect()
+    }
+
     fn unread() -> Error {
         Error::os("read the journal", std::io::Error::other("no journal"))
     }
@@ -193,7 +248,7 @@ impl Journal for Fake {
             return Err(Fake::unread());
         }
         Ok(Box::new(Scripted {
-            entries: self.entries.clone().into_iter(),
+            entries: self.seen(self.entries.clone(), matches).into_iter(),
             then_fails: self.then_fails,
             state: Arc::clone(&self.state),
         }))
@@ -223,7 +278,7 @@ impl Journal for Fake {
         let script = script.expect("an unscripted `follow`");
         Ok(Box::new(Live {
             queue: Arc::new(Queue {
-                state: Mutex::new((script.entries.into(), false)),
+                state: Mutex::new((self.seen(script.entries, matches).into(), false)),
                 wake: Condvar::new(),
                 ends: script.ends,
             }),
@@ -248,7 +303,8 @@ impl Journal for Fake {
         if self.unreadable {
             return Err(Fake::unread());
         }
-        Ok(self.state.lock().unwrap().after.pop_front().unwrap_or_default())
+        let entries = self.state.lock().unwrap().after.pop_front().unwrap_or_default();
+        Ok(self.seen(entries, matches))
     }
 
     fn tail(&self) -> Result<Option<Cursor>> {
