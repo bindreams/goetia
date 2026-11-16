@@ -153,7 +153,8 @@ pub struct FailureActions {
 /// - a `protocol: native` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics;
-/// - a `stop-action` Windows cannot honour ([`refuse_stop_action`]).
+/// - a `stop-action` Windows cannot honour: a signal it has no equivalent of, or a signal for a
+///   `protocol: native` service, which handles SCM's own stop itself.
 pub fn registration(
     spec: &DaemonSpec,
     id: &Identity,

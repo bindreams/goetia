@@ -248,7 +248,9 @@ records the end as it does.
   26.4 and later cap the wait at 60 s**, so any `timeout` over `60s`, `null`
   included, waits 60 s there. launchd sends `SIGTERM` to the job's whole process
   group, but `SIGKILL` only to the job's process, so a descendant that ignores
-  `SIGTERM` outlives a stop.
+  `SIGTERM` outlives a stop. `kill` writes an `ExitTimeOut` of `0`, which ends
+  the job at once on macOS 26 (measured); `launchd.plist(5)` documents `0` as
+  no limit, and earlier releases are not measured.
 - **Windows** reads, checks and records the field, and does not apply it yet:
   the shim still ends the daemon at once on every stop, `stop`, `restart` and
   `uninstall` included, whatever `stop-action` says. A task is stopped by Task

@@ -179,7 +179,7 @@ impl fmt::Display for NativeSignal {
 }
 
 impl fmt::Display for StopSignal {
-    /// The manifest's spelling, which [`StopSignal::parse`] reads back.
+    /// The manifest's spelling, which `FromStr` reads back.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StopSignal::Terminate => f.write_str("terminate"),
