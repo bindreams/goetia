@@ -34,7 +34,7 @@ pub fn run(
             is_elevated,
             // The wait is each daemon's own, so the word follows it.
             verb: &|mgr, id| {
-                let budget = args.wait.stop_budget(|| mgr.stop_action(id))?;
+                let budget = args.wait.stop_budget(|| mgr.stop_action(id));
                 mgr.stop(id, budget)?;
                 Ok(wait::reported(budget, "stopped", "stop requested"))
             },

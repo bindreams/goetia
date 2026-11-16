@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clap::Args as ClapArgs;
 
-use crate::error::{Chain, Error, Result};
+use crate::error::{Chain, Result};
 use crate::manager::Budget;
 use crate::spec::{StopAction, StopSignal};
 
@@ -56,17 +56,15 @@ impl WaitArgs {
     /// [`Self::budget`] for a verb that stops a daemon (`stop`, `restart`), whose default wait is the
     /// daemon's own: its stop timeout plus the teardown margin, unbounded for no timeout, and what it
     /// always was ([`Budget::DEFAULT`]) for `kill`, which sends nothing to answer. `stop_action` reads it,
-    /// and is not asked when a flag was given. A definition that will not decode has none to read, and
-    /// the stop does not need it: the previous default. Any other error is the verb's own, found early.
-    pub fn stop_budget(&self, stop_action: impl FnOnce() -> Result<StopAction>) -> Result<Budget> {
+    /// and is not asked when a flag was given. A daemon whose stop action cannot be read (not installed,
+    /// not goetia's, a definition that will not decode) has none to wait for, and the previous default
+    /// stands: the verb meets the same gate itself and reports it, as it always did, and the order in
+    /// which it does is unchanged.
+    pub fn stop_budget(&self, stop_action: impl FnOnce() -> Result<StopAction>) -> Budget {
         if self.was_given() {
-            return Ok(self.budget());
+            return self.budget();
         }
-        match stop_action() {
-            Ok(stop_action) => Ok(default_stop_budget(&stop_action)),
-            Err(e) if matches!(e.cause(), Error::Kept(_)) => Ok(Budget::DEFAULT),
-            Err(e) => Err(e),
-        }
+        stop_action().map_or(Budget::DEFAULT, |stop_action| default_stop_budget(&stop_action))
     }
 
     /// Whether either flag was actually given, which [`Self::budget`] cannot

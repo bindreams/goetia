@@ -66,14 +66,12 @@ fn was_given_is_false_only_when_neither_flag_appears() {
 // The default wait of a stop ==========================================================================================
 
 fn after(signal: StopSignal, timeout: Option<u64>) -> Budget {
-    args(None, false)
-        .stop_budget(|| {
-            Ok(StopAction {
-                send_signal: signal,
-                timeout: timeout.map(Duration::from_secs),
-            })
+    args(None, false).stop_budget(|| {
+        Ok(StopAction {
+            send_signal: signal,
+            timeout: timeout.map(Duration::from_secs),
         })
-        .unwrap()
+    })
 }
 
 #[skuld::test]
@@ -109,19 +107,17 @@ fn a_flag_decides_without_reading_the_stop_action() {
         (args(Some(Duration::ZERO), false), Budget::Immediate),
         (args(None, true), Budget::Unbounded),
     ] {
-        let budget = given
-            .stop_budget(|| panic!("a flag was given: the daemon's stop action is not read"))
-            .unwrap();
+        let budget = given.stop_budget(|| panic!("a flag was given: the daemon's stop action is not read"));
         assert_eq!(budget, expected);
     }
 }
 
 #[skuld::test]
-fn a_definition_that_will_not_decode_gets_the_previous_default_and_any_other_error_stands() {
+fn a_stop_action_that_cannot_be_read_gets_the_previous_default_whatever_the_reason() {
+    // The verb meets the same gate itself, and says why.
     let kept = Error::Kept(std::sync::Arc::new(Error::blob("unreadable".to_string())));
-    assert_eq!(args(None, false).stop_budget(|| Err(kept)).unwrap(), Budget::DEFAULT);
-
     let absent = Error::NotInstalled { id: "frpc".to_string() };
-    let err = args(None, false).stop_budget(|| Err(absent)).unwrap_err();
-    assert!(matches!(err.cause(), Error::NotInstalled { .. }), "{err:?}");
+    for error in [kept, absent] {
+        assert_eq!(args(None, false).stop_budget(|| Err(error)), Budget::DEFAULT);
+    }
 }
