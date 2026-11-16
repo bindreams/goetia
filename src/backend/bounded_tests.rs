@@ -532,6 +532,71 @@ fn a_kill_refused_with_eperm_is_returned_at_once_off_macos() {
     );
 }
 
+/// [`settle_kill`] is [`kill_root`] for a signal sent by anyone through anything and a liveness read
+/// of anything, so a signal to a process held through `cosca::Process` settles as a child's does. A
+/// signal that went through, and a refusal other than `EPERM`, read nothing.
+#[skuld::test]
+fn a_sent_signal_and_a_refusal_other_than_eperm_are_settled_without_reading_liveness() {
+    let never = || -> Liveness { panic!("liveness was read") };
+
+    assert!(matches!(
+        settle_kill(Ok(()), never, Duration::from_millis(50)),
+        Ok(KillRootOutcome::Sent)
+    ));
+    let refused = settle_kill(
+        Err(io::Error::from_raw_os_error(libc::EACCES).into()),
+        never,
+        Duration::from_millis(50),
+    )
+    .expect_err("the kill is refused");
+    assert!(
+        matches!(&refused, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EACCES)),
+        "{refused:?}"
+    );
+}
+
+/// `EPERM` is a real refusal off macOS: returned as it came, with nothing read.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn an_eperm_is_settled_at_once_off_macos() {
+    let never = || -> Liveness { panic!("liveness was read") };
+
+    let refused = settle_kill(Err(eperm()), never, Duration::from_millis(50)).expect_err("the kill is refused");
+
+    assert!(
+        matches!(&refused, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
+        "{refused:?}"
+    );
+}
+
+/// On macOS an `EPERM` is the answer of a process that is exiting, and the process read `Dead` is the
+/// kill's end, however many reads it took to see it. One still `Alive` at the bound is a refusal.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_eperm_is_settled_by_what_the_process_is_read_to_be_on_macos() {
+    let reads = std::cell::Cell::new(0);
+    let exiting = || {
+        reads.set(reads.get() + 1);
+        if reads.get() < 3 {
+            Liveness::Alive
+        } else {
+            Liveness::Dead
+        }
+    };
+
+    let ended = settle_kill(Err(eperm()), exiting, EXIT_AFTER_REFUSED_KILL).expect("the process exited");
+
+    assert!(matches!(ended, KillRootOutcome::ExitedAfterRefusal), "{ended:?}");
+    assert_eq!(reads.get(), 3);
+    let refused = settle_kill(Err(eperm()), || Liveness::Alive, Duration::from_millis(50)).expect_err("still running");
+    assert!(
+        cosca::error::Report::new(&refused)
+            .to_string()
+            .contains("the process was still running"),
+        "{refused:?}"
+    );
+}
+
 /// The warning prints the cause of the refusal, not only the refusal's own text. A refusal other than
 /// `EPERM` is returned at once on every platform.
 #[skuld::test]

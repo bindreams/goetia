@@ -224,29 +224,38 @@ pub trait ServiceManager {
     /// [`Error::StopUnconfirmed`]: crate::Error::StopUnconfirmed
     fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
 
-    /// End the service's running process as a failure, and return once that is delivered. Does not
-    /// wait for the process to be gone, and does not change its boot-enablement. What happens next
-    /// is the manager's restart policy: a `restart: always` daemon comes back, a `restart: never`
-    /// one stays down.
+    /// End the process the manager reports as the service's, as a failure, and return once it has
+    /// exited and the manager no longer reports it: on every backend, the next `status` does not show
+    /// the killed process. Does not change the service's boot-enablement. What happens next is the
+    /// manager's restart policy: a `restart: always` daemon comes back, a `restart: never` one stays
+    /// down. A caller that wants the next process calls [`start`](Self::start) after `kill`, which
+    /// returns once the service runs, starting it now if the policy's delay has not yet. The restart
+    /// does not depend on the caller surviving the kill: the signal is sent before any wait.
     ///
-    /// Addresses the service, never a bare pid: systemd signals the unit's main process with
-    /// `SIGKILL` (`systemctl kill`), launchd signals the job (`launchctl kill`), and SCM, which has
-    /// no kill-by-service call, reads the service's process and terminates it only after SCM
-    /// confirms it is still the service's. Descendants are the manager's to clean up: the cgroup,
-    /// the process group, or `goetia-shim`'s Job Object.
+    /// Addresses the service, never a bare pid: the manager is asked for the service's process, which
+    /// is held (a pidfd on Linux, an audit token on macOS, a handle on Windows) and asked for again
+    /// before it is signalled, so the signal reaches that process and never a stranger that took its
+    /// pid. systemd and launchd send `SIGKILL`; SCM, which has no kill-by-service call, terminates the
+    /// process. Descendants are the manager's to clean up: the cgroup, the process group, or
+    /// `goetia-shim`'s Job Object.
     ///
-    /// [`Error::NotRunning`] where the service has no process, **classified off the kill request's
-    /// own answer** and never off a state read before it, which would race the kill. Not an
-    /// `Ok(())`: nothing was killed. The one read after that answer is a launchd task's: `kickstart`
-    /// returns before the fork, and a task whose accepted start has not forked yet (which `status` reports
-    /// as running) has no process to signal, so its `kill` waits, under no budget, for the pid and then
-    /// signals; where the start does not happen, or the job was idle, it is `NotRunning`.
+    /// The process killed is the one the manager reported when the kill began. If it ended on its own
+    /// in the moment before the signal landed, the kill still returns `Ok` once the manager has
+    /// recorded that end, and the restart policy decides what follows, as it would had the process
+    /// exited a moment before `kill` was called. Nothing chases a service that restarts under the
+    /// kill.
     ///
-    /// SCM returns once it has recorded the exit: the service is then stopped, or already restarted
-    /// by its restart policy. systemd and launchd return once the signal is sent.
+    /// [`Error::NotRunning`] where the service has no process, **classified off the read that starts
+    /// the kill**: the manager reports none. Not an `Ok(())`: nothing was killed. A launchd task whose
+    /// accepted start has not forked yet (which `status` reports as running, after `kickstart`
+    /// returned) has no process to kill, so its `kill` waits, under no budget, for the pid and then
+    /// kills it; where the start does not happen, or the job was idle, it is `NotRunning`. An error
+    /// after the signal was sent says so.
     ///
-    /// Takes no budget: what SCM waits for is the exit of a process whose termination was
-    /// delivered, which is not a wait to bound.
+    /// Takes no budget. The exit of a process whose kill was delivered is an event, not a wait to
+    /// bound, on every backend; a process the kernel holds (one in uninterruptible sleep, on a hung
+    /// mount or in a stuck driver) cannot exit, and the wait for it lasts while it does, as `stop`'s
+    /// does. The CLI's wait ends on Ctrl-C with the signal standing.
     ///
     /// [`Error::NotRunning`]: crate::Error::NotRunning
     fn kill(&self, id: &Id) -> Result<()>;
