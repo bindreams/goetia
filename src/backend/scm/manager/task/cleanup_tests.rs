@@ -11,8 +11,70 @@ fn id() -> Id {
 
 fn removed(fake: &Fake, alive: &[u32]) -> Machine {
     let mut machine = Machine::new(fake, alive);
-    remove_task_with(fake, &id(), &mut machine);
+    remove_task_with(fake, &id(), &mut machine, || Ok(()));
     machine
+}
+
+/// What the install lock does in a test: notes how many calls the scheduler had had when it was taken and
+/// when it was let go.
+struct NotedLock {
+    fake: Fake,
+    released_at: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
+}
+
+impl Drop for NotedLock {
+    fn drop(&mut self) {
+        *self.released_at.lock().unwrap() = Some(self.fake.calls().len());
+    }
+}
+
+/// The delete, which ends in the removal of the empty `\Goetia` folder, is made under the install lock, as
+/// an install is made under it: a guard of an unrelated test that deletes a task that is not there must not
+/// remove the folder between an install's folder and its registration. The stop is not made under it: it
+/// waits for a shim, and an install would wait on the lock the while.
+#[skuld::test]
+fn the_delete_is_made_under_the_install_lock_and_the_stop_is_not() {
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true));
+    let released_at = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let taken_at = std::cell::Cell::new(None);
+    let mut machine = Machine::new(&fake, &[]);
+
+    remove_task_with(&fake, &id(), &mut machine, || {
+        taken_at.set(Some(fake.calls().len()));
+        Ok(NotedLock {
+            fake: fake.clone(),
+            released_at: released_at.clone(),
+        })
+    });
+
+    assert_eq!(
+        taken_at.get(),
+        Some(2),
+        "taken after the disable and the stop, before the delete"
+    );
+    assert_eq!(*released_at.lock().unwrap(), Some(3), "let go after the delete");
+    fake.finish();
+}
+
+/// A lock that cannot be taken is warned of and the task is deleted all the same: a guard leaves nothing
+/// behind for want of it.
+#[skuld::test]
+fn a_lock_that_cannot_be_taken_does_not_stop_the_delete() {
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true));
+    let mut machine = Machine::new(&fake, &[]);
+
+    remove_task_with(&fake, &id(), &mut machine, || -> Result<()> {
+        Err(Error::os("take the lock", std::io::Error::other("denied")))
+    });
+
+    assert!(fake.calls().contains(&Call::Delete(PATH.to_owned())));
+    fake.finish();
 }
 
 /// A scheduled fire between the guard's stop and its delete would start a run the delete leaves behind,

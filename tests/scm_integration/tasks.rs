@@ -11,7 +11,7 @@ use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, TaskStatus, conformance};
 use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
-use goetia::testing::service_fields;
+use goetia::testing::{remove_task, service_fields};
 
 use crate::common::conformance_mk;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
@@ -30,12 +30,18 @@ pub(crate) struct TaskGuard {
 
 impl TaskGuard {
     pub fn new() -> Self {
-        let id = Id::try_from(support::random_test_id().as_str()).expect("a test id is an id");
+        let id = test_id();
         Self {
             _guard: ServiceGuard::new(id.as_str()),
             id,
         }
     }
+}
+
+/// A fresh test id, for a test that makes things its guard must outlive (and so makes the id before the
+/// guard, with a [`ServiceGuard`] of it).
+pub(crate) fn test_id() -> Id {
+    Id::try_from(support::random_test_id().as_str()).expect("a test id is an id")
 }
 
 /// Where the shim of task `id` writes its run records.
@@ -503,8 +509,30 @@ pub(crate) fn task_exists(id: &Id) -> bool {
     support::cmd::run("schtasks.exe", &["/query", "/tn", &format!(r"\Goetia\{id}")]).ok()
 }
 
+/// Removes every task `\Goetia` holds, which an abrupt stop of an earlier run can have left, so that a test
+/// whose subject is the folder's emptiness starts from an empty one. A task goetia can name is removed as a
+/// guard removes it (its runs ended first); any other is deleted outright.
+fn clear_goetia_folder() {
+    for name in goetia_folder_tasks() {
+        let id = name.rsplit('\\').next().and_then(|stem| Id::try_from(stem).ok());
+        match id {
+            Some(id) => {
+                remove_task(&id);
+                support::cleanup::remove_or_warn(&records_of(&id), true);
+            }
+            None => {
+                let deleted = support::cmd::run("schtasks.exe", &["/delete", "/tn", &name, "/f"]);
+                if !deleted.ok() {
+                    eprintln!("warning: left behind: {deleted}");
+                }
+            }
+        }
+    }
+}
+
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_removes_the_task_its_records_and_the_empty_folder(#[fixture(scm_group)] _group: &Group) {
+    clear_goetia_folder();
     let guard = TaskGuard::new();
     let id = &guard.id;
     let mgr = support::stock_shim_manager();
@@ -514,7 +542,8 @@ fn uninstall_removes_the_task_its_records_and_the_empty_folder(#[fixture(scm_gro
     assert_eq!(
         goetia_folder_tasks(),
         [format!(r"\Goetia\{id}")],
-        "precondition: this is the only task in the folder, so its removal empties it"
+        "precondition: this is the only task in the folder (leftovers were removed at the start), so its \
+         removal empties it"
     );
     assert!(records_of(id).is_dir(), "precondition: the run left its records");
 

@@ -11,8 +11,8 @@ use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::CONNECT_BACK;
 use crate::support::windows_tasks::ServiceAccountHost;
-use crate::support::{self, ConnectBack, Group, LocalUserGuard, scm_group};
-use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status};
+use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, scm_group};
+use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
 
 /// The password of the accounts these tests make: at most 14 characters, since a longer one makes
 /// `net user ... /add` ask about pre-Windows-2000 compatibility and wait on stdin.
@@ -53,9 +53,11 @@ fn a_real_user_task_installs_arms_and_runs(#[fixture(scm_group)] _group: &Group)
     let account = format!("gt{:08x}", rand::random::<u32>());
     // Declared first, so the account goes after the task, whose logon it is.
     let _user = LocalUserGuard::create(&account, PASSWORD);
-    let guard = TaskGuard::new();
-    let id = &guard.id;
+    // The copies of this binary and the shim before the guard, so they go after the task is removed, and the
+    // shim copy is not deleted under a shim that still runs.
+    let id = &test_id();
     let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
     let mgr = host.manager();
     let listener = ConnectBack::listen();
     let command = vec![
