@@ -18,8 +18,10 @@
 //! name.
 //!
 //! goetia does not evaluate ACLs. A directory on the path that carries one, of any kind and whatever it
-//! grants (see [`acl`]), is refused, before its mode is looked at: an ACL can let an account write a
-//! directory whose mode says nobody can, and one that grants nobody anything is refused too.
+//! grants (see [`acl`]), is refused: an ACL can let an account write a directory whose mode says nobody
+//! can, and one that grants nobody anything is refused too. The owner and the writers the mode names are
+//! judged first, so that a directory refused for them is not refused for its ACL, which stripping would
+//! not mend.
 
 use std::os::fd::AsFd as _;
 use std::path::Path;
@@ -34,7 +36,7 @@ use super::{CreatedDirs, Plan, roots_text};
 use crate::backend::account::describe_uid;
 use crate::error::{Error, Result};
 
-/// Refuse a log whose directory, or an ancestor, carries an ACL or a user other than root can change, or
+/// Refuse a log whose directory, or an ancestor, a user other than root can change or that carries an ACL, or
 /// whose existing entry is a symlink or another user's file (see the module doc), before anything is
 /// made. Sticky and the group of a root-owned directory excuse ancestors only. The error names the
 /// writer, and where the log's own directory is refused but a directory made in it would be accepted, and
@@ -54,28 +56,10 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
         let leaf = !step.is_link()
             && matches!(&plan.found.end, End::Whole { stat, .. }
                 if step.stat.st_dev == stat.st_dev && step.stat.st_ino == stat.st_ino);
-        let acl = match &step.dir {
-            Some(held) => acl::has_acl(held.as_fd()),
-            None => Ok(false),
-        };
-        let why = match acl {
-            Ok(false) => None,
-            Ok(true) => Some(format!(
-                "{} carries an ACL, which goetia does not evaluate; a log root opens must have none on its path",
-                step.at.display()
-            )),
-            Err(e) => Some(format!(
-                "whether {} carries an ACL, which goetia does not evaluate, is not known as it could not be read ({e})",
-                step.at.display()
-            )),
-        };
-        if let Some(why) = why {
-            return Err(Error::DirectoryRefused {
-                path: dir.to_path_buf(),
-                why: format!("{why}; use a log directory with no ACL on its path, or {WITHOUT_THE_LOG}"),
-            });
-        }
+        // The writer is judged first, so that a directory an account owns or can write is refused for that,
+        // and nobody is told to strip an ACL that is not the problem.
         let Some(Writer { who, ancestor_passes }) = writer(step, leaf) else {
+            refuse_acl(step, dir)?;
             continue;
         };
         let kind = if step.is_link() { "symlink" } else { "directory" };
@@ -125,6 +109,28 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
     Ok(())
 }
 
+/// Refuse `step` if it carries an ACL, or if whether it does could not be read.
+fn refuse_acl(step: &Step, dir: &Path) -> Result<()> {
+    let why = match &step.dir {
+        None => return Ok(()),
+        Some(held) => match acl::has_acl(held.as_fd()) {
+            Ok(false) => return Ok(()),
+            Ok(true) => format!(
+                "{} carries an ACL, which goetia does not evaluate; a log root opens must have none on its path",
+                step.at.display()
+            ),
+            Err(e) => format!(
+                "whether {} carries an ACL, which goetia does not evaluate, is not known as it could not be read ({e})",
+                step.at.display()
+            ),
+        },
+    };
+    Err(Error::DirectoryRefused {
+        path: dir.to_path_buf(),
+        why: format!("{why}; use a log directory with no ACL on its path, or {WITHOUT_THE_LOG}"),
+    })
+}
+
 /// Who opens the log as root, in the words of a refusal.
 #[cfg(target_os = "linux")]
 const ROOT_OPENS: &str = "systemd opens it before it drops privileges, and follows a symlink";
@@ -147,8 +153,7 @@ struct Writer {
 /// everyone who can write it. Unless `leaf`, the directory the log lands in, the sticky bit excuses
 /// everyone's writing and the group of a root-owned directory is trusted. A symlink has no one but its
 /// owner where its holder is sticky and others can write it; otherwise whoever can write its holder is
-/// named at the holder's own step. The mode alone is judged: the caller has refused a directory with an
-/// ACL.
+/// named at the holder's own step. The mode alone is judged; the caller refuses an ACL after.
 fn writer(step: &Step, leaf: bool) -> Option<Writer> {
     let named = |who: String| {
         Some(Writer {

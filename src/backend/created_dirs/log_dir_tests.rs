@@ -40,42 +40,51 @@ fn refused_by(dirs: &CreatedDirs, logs: &Path) -> String {
 /// bits of the mode then read as the ACL's mask.
 #[cfg(target_os = "linux")]
 fn name_the_stranger_in_the_acl(path: &Path) {
-    set_posix_acl(path, Some(7));
+    set_posix_acl(path, ACCESS_ACL, Some(7), 5);
 }
 
 /// Give `path` an access ACL that lets nobody but its owner write it: the stranger may read it, and the
 /// mask has no write.
 #[cfg(target_os = "linux")]
 fn give_an_acl_that_lets_nobody_write(path: &Path) {
-    set_posix_acl(path, Some(5));
+    set_posix_acl(path, ACCESS_ACL, Some(5), 5);
 }
 
-/// Set the access ACL of `path` to the owner's (rwx), the group's and others' (r-x), and with
+/// Give `path` an access ACL that names the stranger and leaves everyone's write in the mode, so that a
+/// directory of mode 1777 stays 1777.
+#[cfg(target_os = "linux")]
+fn give_an_acl_that_leaves_everyone_writing(path: &Path) {
+    set_posix_acl(path, ACCESS_ACL, Some(7), 7);
+}
+
+/// Give `path` a default ACL, the one a directory made in it inherits, and no access ACL: its own mode
+/// is untouched.
+#[cfg(target_os = "linux")]
+fn give_a_default_acl(path: &Path) {
+    set_posix_acl(path, c"system.posix_acl_default", Some(5), 5);
+}
+
+#[cfg(target_os = "linux")]
+const ACCESS_ACL: &std::ffi::CStr = c"system.posix_acl_access";
+
+/// Set the ACL `attribute` of `path` to the owner's (rwx), the group's (r-x) and `other`'s, and with
 /// `stranger` the stranger's permissions and a mask of the same. Entries are kept in the order the kernel
 /// requires: by tag.
 #[cfg(target_os = "linux")]
-fn set_posix_acl(path: &Path, stranger: Option<u16>) {
+fn set_posix_acl(path: &Path, attribute: &std::ffi::CStr, stranger: Option<u16>, other: u16) {
     const NO_ID: u32 = u32::MAX;
     let mut entries = vec![(0x01u16, 7u16, NO_ID)]; // ACL_USER_OBJ
     entries.extend(stranger.map(|perm| (0x02, perm, STRANGER))); // ACL_USER
     entries.push((0x04, 5, NO_ID)); // ACL_GROUP_OBJ
     entries.extend(stranger.map(|perm| (0x10, perm, NO_ID))); // ACL_MASK
-    entries.push((0x20, 5, NO_ID)); // ACL_OTHER
+    entries.push((0x20, other, NO_ID)); // ACL_OTHER
     let mut acl = 2u32.to_le_bytes().to_vec(); // POSIX_ACL_XATTR_VERSION
     for (tag, perm, id) in entries {
         acl.extend([tag.to_le_bytes().as_slice(), &perm.to_le_bytes(), &id.to_le_bytes()].concat());
     }
     let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: both strings are NUL-terminated and `acl` is the length it is given with, all for this call.
-    let set = unsafe {
-        libc::setxattr(
-            path_c.as_ptr(),
-            c"system.posix_acl_access".as_ptr(),
-            acl.as_ptr().cast(),
-            acl.len(),
-            0,
-        )
-    };
+    let set = unsafe { libc::setxattr(path_c.as_ptr(), attribute.as_ptr(), acl.as_ptr().cast(), acl.len(), 0) };
     assert_eq!(
         set,
         0,
@@ -105,6 +114,12 @@ fn name_the_stranger_in_the_acl(path: &Path) {
 /// Give `path` an extended ACL that lets nobody write it: an entry that allows listing.
 #[cfg(target_os = "macos")]
 fn give_an_acl_that_lets_nobody_write(path: &Path) {
+    chmod_plus_a(path, "everyone allow list");
+}
+
+/// Give `path` an extended ACL and leave its mode as it is, as `chmod +a` always does.
+#[cfg(target_os = "macos")]
+fn give_an_acl_that_leaves_everyone_writing(path: &Path) {
     chmod_plus_a(path, "everyone allow list");
 }
 
@@ -366,7 +381,8 @@ fn an_ancestor_that_carries_an_acl_is_refused_though_its_mode_and_its_acl_let_no
     );
 }
 
-/// The sticky bit excuses an ancestor everyone can write, not one that carries an ACL.
+/// The sticky bit excuses an ancestor everyone can write, not one that carries an ACL: the directory is
+/// still 1777 with the ACL on it, and is refused for the ACL.
 #[skuld::test(labels = [ELEVATED])]
 fn an_ancestor_that_carries_an_acl_is_refused_though_it_is_sticky(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
@@ -374,7 +390,12 @@ fn an_ancestor_that_carries_an_acl_is_refused_though_it_is_sticky(#[fixture(root
     let dir = ancestor.join("logs");
     fs::create_dir_all(&dir).unwrap();
     chmod(&ancestor, 0o1777);
-    give_an_acl_that_lets_nobody_write(&ancestor);
+    give_an_acl_that_leaves_everyone_writing(&ancestor);
+    assert_eq!(
+        fs::metadata(&ancestor).unwrap().permissions().mode() & 0o7777,
+        0o1777,
+        "the ACL leaves the mode a sticky directory everyone can write"
+    );
 
     let why = refused(&dir.join("app.log"));
 
@@ -382,6 +403,49 @@ fn an_ancestor_that_carries_an_acl_is_refused_though_it_is_sticky(#[fixture(root
         why.contains(ancestor.to_str().unwrap()) && why.contains("carries an ACL"),
         "{why}"
     );
+}
+
+/// A default ACL is an ACL: a directory whose only one is it, the access ACL being its mode, is refused
+/// like any other.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn an_ancestor_whose_only_acl_is_a_default_one_is_refused(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let ancestor = layout.system().join("log");
+    let dir = ancestor.join("app");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&ancestor, 0o755);
+    give_a_default_acl(&ancestor);
+
+    let why = refused(&dir.join("app.log"));
+
+    assert!(
+        why.contains(&format!(
+            "{} carries an ACL, which goetia does not evaluate",
+            ancestor.display()
+        )),
+        "{why}"
+    );
+}
+
+/// An account that owns a directory is the refusal's reason, and the ACL on it is not: stripping it
+/// would not make the directory acceptable.
+#[skuld::test(labels = [ELEVATED])]
+fn a_directory_an_account_owns_is_refused_for_its_owner_though_it_carries_an_acl(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let ancestor = layout.system().join("log");
+    let dir = ancestor.join("app");
+    fs::create_dir_all(&dir).unwrap();
+    give_to_a_stranger(&ancestor);
+    name_the_stranger_in_the_acl(&ancestor);
+
+    let why = refused(&dir.join("app.log"));
+
+    assert!(
+        why.contains(&format!("uid {STRANGER}")) && why.contains(ancestor.to_str().unwrap()),
+        "{why}"
+    );
+    assert!(!why.contains("ACL"), "{why}");
 }
 
 /// An ACL the mode already says (what `setfacl -m u::rwx,g::r-x,o::r-x` leaves) is no ACL: the kernel
@@ -394,7 +458,7 @@ fn an_ancestor_whose_posix_acl_is_only_its_mode_is_not_one(#[fixture(root_dirs)]
     let dir = ancestor.join("app");
     fs::create_dir_all(&dir).unwrap();
     chmod(&ancestor, 0o755);
-    set_posix_acl(&ancestor, None);
+    set_posix_acl(&ancestor, ACCESS_ACL, None, 5);
 
     check(&dir.join("app.log")).unwrap();
 }
@@ -422,9 +486,10 @@ fn an_ancestor_whose_acl_names_an_account_is_refused_though_its_group_bits_allow
     assert!(why.contains(var_log.to_str().unwrap()) && why.contains("ACL"), "{why}");
 }
 
-/// The log's own directory is refused for a group that can write it, and an ACL says whom it is.
+/// The log's own directory is refused for a group that can write it, not for an ACL it carries: the
+/// group is what to change. A directory made inside it would be accepted, as it is ACL-free.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_directory_whose_acl_names_an_account_is_refused_with_no_directory_of_its_own_suggested(
+fn a_log_directory_a_group_can_write_is_refused_for_the_group_though_it_carries_an_acl(
     #[fixture(root_dirs)] _root: &(),
 ) {
     let layout = Layout::new();
@@ -436,11 +501,8 @@ fn a_log_directory_whose_acl_names_an_account_is_refused_with_no_directory_of_it
 
     let why = refused_by(&under_a_root, &dir.join("app.log"));
 
-    assert!(why.contains("ACL"), "{why}");
-    assert!(
-        !why.contains("such as"),
-        "a directory made inside would be refused as an ancestor too: {why}"
-    );
+    assert!(why.contains("which can write it"), "{why}");
+    assert!(!why.contains("ACL"), "{why}");
 }
 
 /// The ACL is read through the descriptor the walk holds and not by opening the directory again: a
