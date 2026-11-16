@@ -49,6 +49,17 @@ impl Layout {
         file.join("root")
     }
 
+    /// A root whose open fails with `EACCES` for an account that is not root: below a directory nobody
+    /// can search. Linux only, where `Fsuid` drops root's override.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn unreadable_root(&self) -> PathBuf {
+        fs::set_permissions(self.base(), fs::Permissions::from_mode(0o711)).unwrap();
+        let locked = self.system().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        locked.join("root")
+    }
+
     /// A guard that treats `system` as its only root.
     fn dirs(&self) -> CreatedDirs {
         CreatedDirs::under(vec![self.system()])
@@ -548,35 +559,70 @@ fn create_skips_a_root_below_a_regular_file(#[fixture(root_dirs)] _root: &()) {
     assert!(refusal(&err).contains("create it first"), "{err:?}");
 }
 
-/// Any other failure to open a root is goetia's to report, not a root to skip: the install fails, naming
-/// the root and the path being judged, even where a later root would have held the path.
+/// Whether a root holds the path does not depend on where it stands among the others. A root that is
+/// not there (missing, below a file, a symlink loop) holds nothing and is skipped; any other failure to
+/// open one is kept and fails the install only when no root holds the path, naming the root and the
+/// path, with the OS error as the source.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn create_fails_with_a_root_it_cannot_read_naming_the_root_and_the_path(#[fixture(root_dirs)] _root: &()) {
+fn create_finds_a_root_that_holds_the_path_whatever_the_order_of_the_roots(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
-    fs::set_permissions(layout.base(), fs::Permissions::from_mode(0o711)).unwrap();
-    let locked = layout.system().join("locked");
-    fs::create_dir(&locked).unwrap();
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let unreadable = locked.join("root");
-    let path = layout.system().join("a");
-    let mut dirs = CreatedDirs::under(vec![unreadable.clone(), layout.system()]);
+    let unreadable = layout.unreadable_root();
+    let missing = layout.base().join("nowhere");
+    let file_shaped = layout.broken_root();
+    let looped = layout.outside().join("loop");
+    symlink(&looped, &looped).unwrap();
+    let holder = layout.system();
+    let path = holder.join("a");
+    let _as_a_stranger = Fsuid::set(STRANGER);
 
-    let err = {
-        let _as_a_stranger = Fsuid::set(STRANGER);
-        dirs.create(&path, None).expect_err("the root cannot be read")
-    };
+    let rows = [
+        ("holder, unreadable", vec![holder.clone(), unreadable.clone()], true),
+        ("unreadable, holder", vec![unreadable.clone(), holder.clone()], true),
+        ("missing, holder", vec![missing, holder.clone()], true),
+        ("file-shaped, holder", vec![file_shaped, holder.clone()], true),
+        ("loop, holder", vec![looped, holder], true),
+        ("unreadable only", vec![unreadable.clone()], false),
+    ];
+    for (name, roots, holds) in rows {
+        let planned = CreatedDirs::under(roots).plan(&path);
+        if holds {
+            planned.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            continue;
+        }
+        let err = planned
+            .err()
+            .unwrap_or_else(|| panic!("{name}: no root holds the path"));
+        let Error::Os { what, path: at, source } = &err else {
+            panic!("{name}: expected an OS error, got {err:?}")
+        };
+        assert_eq!(at.as_deref(), Some(path.as_path()), "{name}: {err:?}");
+        assert!(what.contains(unreadable.to_str().unwrap()), "{name}: {what}");
+        let os = source.downcast_ref::<std::io::Error>().expect("the error of the open");
+        assert_eq!(os.raw_os_error(), Some(libc::EACCES), "{name}: {os:?}");
+    }
+}
 
-    let Error::Os { path: at, .. } = &err else {
-        panic!("expected an OS error, got {err:?}")
-    };
-    assert_eq!(at.as_deref(), Some(path.as_path()), "{err:?}");
-    let source = std::error::Error::source(&err).expect("the OS error").to_string();
-    assert!(
-        source.contains(unreadable.to_str().unwrap()) && source.contains("Permission denied"),
-        "{source}"
-    );
-    assert!(!path.exists());
+/// What the refusal says of where goetia makes directories lists the roots that exist, as an install
+/// can use them; one that is not there is not listed.
+#[skuld::test(labels = [ELEVATED])]
+fn create_refuses_naming_only_the_roots_that_exist(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let missing = layout.base().join("nowhere");
+    let file_shaped = layout.broken_root();
+    let looped = layout.outside().join("loop");
+    symlink(&looped, &looped).unwrap();
+    let roots = vec![missing.clone(), file_shaped.clone(), layout.system(), looped.clone()];
+
+    let err = CreatedDirs::under(roots)
+        .create(&layout.outside().join("a"), None)
+        .expect_err("outside every root");
+
+    let why = refusal(&err);
+    assert!(why.contains(layout.system().to_str().unwrap()), "{why}");
+    for gone in [missing, file_shaped, looped] {
+        assert!(!why.contains(gone.to_str().unwrap()), "{gone:?} is not a root: {why}");
+    }
 }
 
 /// A path that exists whole is used as it is, wherever it is: the roots are opened only when a
@@ -1063,8 +1109,8 @@ fn a_directory_an_earlier_plan_hands_over_stays_the_owners_when_a_later_plan_han
 
 /// The conflict between a plan that hands a directory over and one that does not is the same whichever
 /// comes first: the directory, or one below it, is the account's, and so cannot be what the other plan
-/// keeps as root's. Each order is refused and names the directory handed over and the account; nothing
-/// is handed over, and the guard takes back what was made.
+/// keeps as root's. Each order is refused and names the path of the plan that asks second, and the account;
+/// nothing is handed over, and the guard takes back what was made.
 #[skuld::test(labels = [ELEVATED])]
 fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_share_it_in_either_order(
     #[fixture(root_dirs)] _root: &(),
@@ -1090,7 +1136,8 @@ fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_sh
             let Error::DirectoryRefused { path, why } = &err else {
                 panic!("{kept} {kept_first}: {err:?}")
             };
-            assert_eq!(path, &layout.system().join("a"), "{kept} {kept_first}: {why}");
+            let second = if kept_first { "a" } else { kept };
+            assert_eq!(path, &layout.system().join(second), "{kept} {kept_first}: {why}");
             assert!(
                 why.contains(&format!("uid {STRANGER}")) && !why.contains("  "),
                 "{kept} {kept_first}: {why}"
@@ -1140,7 +1187,10 @@ fn a_directory_a_plan_hands_over_is_refused_when_one_that_hands_nothing_over_pas
             let Error::DirectoryRefused { path, why } = &err else {
                 panic!("{kept} {order:?}: {err:?}")
             };
-            assert_eq!(path, &layout.system().join("a/b"), "{kept} {order:?}: {why}");
+            // Only `kept` and the plan of `a/b` conflict; the one that comes second is refused.
+            let kept_second = order.iter().position(|&i| i == 1) > order.iter().position(|&i| i == 2);
+            let second = if kept_second { kept } else { "a/b" };
+            assert_eq!(path, &layout.system().join(second), "{kept} {order:?}: {why}");
             assert!(why.contains(&format!("uid {STRANGER}")), "{kept} {order:?}: {why}");
             drop(dirs);
             assert_eq!(
@@ -1366,6 +1416,29 @@ fn the_refusal_of_a_second_owner_names_the_path_the_asking_plan_wrote(#[fixture(
     let err = dirs
         .make(vec![(first, Some(stranger_owner())), (again, Some(other))])
         .expect_err("one directory has one owner");
+
+    let Error::DirectoryRefused { path, .. } = &err else {
+        panic!("expected a refused directory, got {err:?}")
+    };
+    assert_eq!(path, &again_path);
+}
+
+/// The refusal of a plan that hands nothing over, through a directory an earlier plan handed to an
+/// account, names the path of the plan that asks, in its own spelling.
+#[skuld::test(labels = [ELEVATED])]
+fn the_refusal_of_a_plan_through_a_handed_directory_names_the_path_the_asking_plan_wrote(
+    #[fixture(root_dirs)] _root: &(),
+) {
+    let layout = Layout::new();
+    symlink(".", layout.system().join("link")).unwrap();
+    let mut dirs = layout.dirs();
+    let first = dirs.plan(&layout.system().join("a")).unwrap();
+    let again_path = layout.system().join("link/a");
+    let again = dirs.plan(&again_path).unwrap();
+
+    let err = dirs
+        .make(vec![(first, Some(stranger_owner())), (again, None)])
+        .expect_err("the directory is handed to an account");
 
     let Error::DirectoryRefused { path, .. } = &err else {
         panic!("expected a refused directory, got {err:?}")

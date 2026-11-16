@@ -228,6 +228,27 @@ fn a_skipped_root_leaves_the_log_refusal_to_the_roots_that_remain(#[fixture(root
 
     let why = refused_by(&roots(), &not_held);
     assert!(!why.contains("such as") && why.contains("journal"), "{why}");
+    assert!(
+        why.contains(layout.system().to_str().unwrap()) && !why.contains(broken.to_str().unwrap()),
+        "lists the roots that exist: {why}"
+    );
+}
+
+/// A root that cannot be read does not hide the refusal: the log is refused with the advice that does
+/// not depend on the roots.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn a_root_that_cannot_be_read_leaves_the_log_refused_with_the_generic_advice(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let unreadable = layout.unreadable_root();
+    let dir = layout.system().join("opt/logs");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&dir, 0o775);
+    let _as_a_stranger = Fsuid::set(STRANGER);
+
+    let why = refused_by(&CreatedDirs::under(vec![unreadable]), &dir.join("app.log"));
+
+    assert!(!why.contains("such as") && why.contains("journal"), "{why}");
 }
 
 /// Trusting the group of a root-owned ancestor does not trust everyone, or an account.
