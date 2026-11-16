@@ -1614,10 +1614,9 @@ impl Drop for Immutable {
 }
 
 /// The plist cannot be replaced, after the directories for the new `cwd` and `logs` were made: none of
-/// them is left, and one that existed before stays. This is the case the undo is for: the write fails
-/// with the old plist standing, which names none of the new directories. The log directory is made
-/// below one of the test's own, since `/Library/Logs` is writable by the `admin` group, and a directory
-/// whose parent another can write is left, not removed by name.
+/// them is left, `logs_root` (made directly under `/Library/Logs`, which the `admin` group can write)
+/// included. This is the case the undo is for: the write fails with the old plist standing, which
+/// names none of the new directories.
 #[skuld::test]
 fn an_install_whose_plist_write_fails_removes_every_directory_it_made(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
@@ -1650,11 +1649,9 @@ fn an_install_whose_plist_write_fails_removes_every_directory_it_made(#[fixture(
         "the write must not have happened"
     );
     assert!(!cwd.exists(), "the failed install left {}", cwd.display());
-    assert!(
-        !logs_parent.exists(),
-        "the failed install left {}",
-        logs_parent.display()
-    );
+    for made in [&logs_parent, &logs_root] {
+        assert!(!made.exists(), "the failed install left {}", made.display());
+    }
 }
 
 /// An update that writes a plist asking for a new `cwd` makes it and keeps it: the directories are kept

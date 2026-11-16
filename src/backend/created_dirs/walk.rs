@@ -106,8 +106,7 @@ impl Entry {
 
 /// `name` in `parent`, not followed: `None` if there is none. As systemd's `chase` does on Linux, the
 /// entry is opened `O_PATH | O_NOFOLLOW` and judged by `fstat` of that descriptor, which for a link is
-/// the link itself, and a link is read through the same descriptor: the entry that was judged is the
-/// entry that is used, however the name is renamed meanwhile.
+/// the link itself, and a link is read through the same descriptor.
 #[cfg(target_os = "linux")]
 pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<Entry>> {
     let fd = match openat(
@@ -237,8 +236,12 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
         if name == ".." {
             let up = open_beneath(cur.as_fd(), &name, SEARCH).map_err(|e| Error::os_at("open", &at, e))?;
             let stat = fstat(&up).map_err(|e| Error::os_at("stat", &at, e))?;
-            if chain.len() > 1 {
-                chain.pop();
+            if !step_up(&mut chain, id_of(&stat)) {
+                return Err(Error::os_at(
+                    "open",
+                    &at,
+                    io::Error::other("a directory on the path was moved while it was being resolved"),
+                ));
             }
             shown.pop();
             trail.push(Step {
@@ -318,6 +321,15 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
     Ok(Walk { end, trail, chain })
 }
 
+/// Pop `chain` for a `..` that opened the directory `up`. Whether `up` is the one the pop exposes is
+/// what says the chain still describes where the walk is.
+fn step_up(chain: &mut Vec<(libc::dev_t, libc::ino_t)>, up: (libc::dev_t, libc::ino_t)) -> bool {
+    if chain.len() > 1 {
+        chain.pop();
+    }
+    chain.last() == Some(&up)
+}
+
 /// The steps of `path`, as names and `..`, the root and `.` left out.
 fn components(path: &Path, from_link: bool) -> VecDeque<(OsString, bool)> {
     path.components()
@@ -340,3 +352,7 @@ pub(super) fn open_beneath(parent: BorrowedFd<'_>, name: &OsStr, base: OFlag) ->
         Mode::empty(),
     )
 }
+
+#[cfg(test)]
+#[path = "walk_tests.rs"]
+mod walk_tests;

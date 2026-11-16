@@ -599,29 +599,30 @@ fn a_made_directory_in_a_setgid_parent_is_accepted_and_given_0755() {
 }
 
 /// A directory made as another uid, which is what a root-squashing file system hands back, is
-/// refused; it was recorded when it was made, so it is removed with the rest.
+/// refused; it was recorded when it was made, so it is removed with the rest, whoever can write the
+/// parent.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn a_made_directory_that_is_not_roots_is_refused_and_left_in_a_parent_anyone_can_write() {
-    let layout = Layout::new();
-    let parent = layout.system().join("open");
-    fs::create_dir(&parent).unwrap();
-    fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
-    let mut dirs = layout.dirs();
+fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
+    for parent_after in [0o777, 0o755] {
+        let layout = Layout::new();
+        let parent = layout.system().join("open");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let mut dirs = layout.dirs();
 
-    let result = {
-        let _fs = Fsuid::set(STRANGER);
-        dirs.create(&parent.join("new"), None)
-    };
+        let result = {
+            let _fs = Fsuid::set(STRANGER);
+            dirs.create(&parent.join("new"), None)
+        };
 
-    let err = result.expect_err("the directory belongs to another uid");
-    assert!(refusal(&err).contains(&format!("uid {STRANGER}")), "{err:?}");
-    assert!(parent.join("new").is_dir(), "it was made");
-    drop(dirs);
-    assert!(
-        parent.join("new").is_dir(),
-        "the undo leaves it: anyone can write the directory above it"
-    );
+        let err = result.expect_err("the directory belongs to another uid");
+        assert!(refusal(&err).contains(&format!("uid {STRANGER}")), "{err:?}");
+        assert!(parent.join("new").is_dir(), "it was made");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(parent_after)).unwrap();
+        drop(dirs);
+        assert!(!parent.join("new").exists(), "{parent_after:o}: left");
+    }
 }
 
 // Planning ------------------------------------------------------------------------------------------------------------
@@ -761,39 +762,27 @@ fn undo_leaves_a_handed_directory_the_account_has_written_into_and_names_it() {
     assert_eq!(fs::read(layout.system().join("a/data")).unwrap(), b"x");
 }
 
-/// One that was not handed over and has content stays without a word, as before.
+/// One that was not handed over and has content stays too, and is named like every other that is left.
 #[skuld::test(labels = [ELEVATED])]
-fn undo_leaves_a_directory_that_was_not_handed_over_and_gained_content_without_a_word() {
+fn undo_leaves_a_directory_that_was_not_handed_over_and_gained_content_and_names_it() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     dirs.create(&layout.system().join("a"), None).unwrap();
     fs::write(layout.system().join("a/data"), b"x").unwrap();
 
-    dirs.remove(0).expect("not a failure");
+    let left = dirs.remove(0).expect_err("it holds a file");
+
+    assert!(left.contains("content"), "{left}");
+    assert!(!left.contains("account"), "{left}");
+    assert_eq!(fs::read(layout.system().join("a/data")).unwrap(), b"x");
 }
 
-/// A directory is unlinked by its name in its parent: where anyone but root can write the parent, they
-/// can put another directory at the name between a check and the unlink, so it is left, and named.
+/// A directory is removed by its name in its parent after its identity is checked, under any parent:
+/// where others can write the parent, a directory they put at the name in between is empty, and is
+/// removed as they could remove it themselves.
 #[skuld::test(labels = [ELEVATED])]
-fn undo_leaves_a_directory_whose_parent_another_user_can_write_and_names_it() {
-    for (mode, writer) in [(0o775, "group"), (0o757, "everyone")] {
-        let layout = Layout::new();
-        let mut dirs = layout.dirs();
-        dirs.create(&layout.system().join("a"), None).unwrap();
-        fs::set_permissions(layout.system(), fs::Permissions::from_mode(mode)).unwrap();
-
-        let left = dirs.remove(0).expect_err(writer);
-
-        assert!(left.contains("written"), "{writer}: {left}");
-        assert!(layout.system().join("a").is_dir(), "{writer}: removed");
-    }
-}
-
-/// Only root, or the sticky bit (which keeps others from touching an entry that is not theirs), makes a
-/// parent safe to unlink from by name.
-#[skuld::test(labels = [ELEVATED])]
-fn undo_removes_a_directory_whose_parent_only_root_can_change_or_is_sticky() {
-    for mode in [0o755, 0o700, 0o1777] {
+fn undo_removes_a_directory_whatever_the_mode_and_owner_of_its_parent() {
+    for mode in [0o755, 0o700, 0o1777, 0o775, 0o757] {
         let layout = Layout::new();
         let mut dirs = layout.dirs();
         dirs.create(&layout.system().join("a"), None).unwrap();
@@ -803,21 +792,72 @@ fn undo_removes_a_directory_whose_parent_only_root_can_change_or_is_sticky() {
 
         assert!(!layout.system().join("a").exists(), "{mode:o}");
     }
-}
 
-/// A parent that is not root's is the account's to change, a directory this install handed over
-/// included.
-#[skuld::test(labels = [ELEVATED])]
-fn undo_leaves_a_directory_whose_parent_another_user_owns() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     dirs.create(&layout.system().join("a"), None).unwrap();
     give_to_a_stranger(&layout.system());
 
-    let left = dirs.remove(0).expect_err("the parent is the account's");
+    dirs.remove(0).expect("a parent another user owns");
 
-    assert!(left.contains("written"), "{left}");
-    assert!(layout.system().join("a").is_dir());
+    assert!(!layout.system().join("a").exists(), "a parent another user owns");
+}
+
+/// A `cwd` that holds the log directory, both handed to the account, as launchd's spec makes them: a
+/// failed install removes both, the one below first.
+#[skuld::test(labels = [ELEVATED])]
+fn undo_removes_a_handed_directory_that_holds_a_handed_one_made_below_it() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let logs = dirs.plan(&layout.system().join("x/logs")).unwrap();
+    let cwd = dirs.plan(&layout.system().join("x")).unwrap();
+    dirs.make(vec![(logs, Some(stranger_owner())), (cwd, Some(stranger_owner()))])
+        .unwrap();
+    for made in ["x", "x/logs"] {
+        assert_eq!(owner_of(&layout.system().join(made)).0, STRANGER, "{made} is handed");
+    }
+
+    drop(dirs);
+
+    assert!(!layout.system().join("x").exists());
+}
+
+/// What is left in a handed directory is the account's only if goetia did not make it: a directory the
+/// install made below it and left is named as that, not as the account's writing.
+#[skuld::test(labels = [ELEVATED])]
+fn a_handed_directory_that_holds_what_undo_left_is_not_blamed_on_the_account() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let logs = dirs.plan(&layout.system().join("x/logs")).unwrap();
+    let cwd = dirs.plan(&layout.system().join("x")).unwrap();
+    dirs.make(vec![(logs, Some(stranger_owner())), (cwd, Some(stranger_owner()))])
+        .unwrap();
+    dirs.made[1].held = None;
+
+    let below = dirs.remove(1).expect_err("it could not be identified");
+    let above = dirs.remove(0).expect_err("it holds what was left");
+
+    assert!(below.contains("could not be opened"), "{below}");
+    assert!(
+        above.contains(&layout.system().join("x/logs").display().to_string()),
+        "{above}"
+    );
+    assert!(!above.contains("written"), "{above}");
+}
+
+/// A later plan that hands over a directory an earlier plan made and marked for an owner hands it to
+/// that owner: asking for another is a bug of the caller, which gives every plan one account.
+#[cfg(debug_assertions)]
+#[skuld::test(labels = [ELEVATED])]
+#[should_panic(expected = "another owner")]
+fn a_later_plan_that_hands_a_made_directory_to_another_owner_is_a_bug() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let first = dirs.plan(&layout.system().join("a")).unwrap();
+    let again = dirs.plan(&layout.system().join("a")).unwrap();
+    let other = Owner::new(Uid::from_raw(STRANGER + 1), None).unwrap();
+
+    let _ = dirs.make(vec![(first, Some(stranger_owner())), (again, Some(other))]);
 }
 
 #[skuld::test(labels = [ELEVATED])]

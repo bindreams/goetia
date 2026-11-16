@@ -470,11 +470,8 @@ owns it, since `install` is not a start and you may still be preparing it.
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
   (the unit or plist cannot be read back): it then says so and keeps them, since removing them could
   break a definition that stands. It hands over, first, any directory it made for the account and had not
-  yet given to it, and names one it cannot. A directory it handed to the account that the account has
-  since written into is left, and named. So is one whose parent anyone but root can write (the parent is
-  not root's, or the group or everyone can write it and it is not sticky: Debian's `/var/log`, macOS's
-  `/Library/Logs`): it is unlinked by name, and someone who can write the parent could swap another
-  directory in, so it is left empty and named.
+  yet given to it, and names one it cannot. A directory that has gained content (the account's own
+  writing, in one handed to it) is left, and named, and so are the directories above it.
 - **A limit.** An install killed between making `cwd` and handing it over leaves a root-owned `cwd`. The
   next install uses it as it is, and the daemon cannot write it: remove the directory and run `install`
   again.

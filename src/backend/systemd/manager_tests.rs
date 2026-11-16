@@ -536,3 +536,48 @@ fn a_step_that_watches_nothing_reserves_nothing() {
         );
     }
 }
+
+// unit_standing -------------------------------------------------------------------------------------------------------
+
+/// Whether a failed install keeps its directories rests on this mapping: the service unit read back is
+/// what was written (`Yes`), is not (`No`), or cannot be told (`Unknown`). A task's timer is not read.
+#[skuld::test]
+fn the_unit_read_back_is_what_was_written_or_is_not_or_cannot_be_told() {
+    let id = crate::backend::Identity {
+        user: "root".to_string(),
+    };
+    let service = ServiceSpec::new(base_fields("goetia-standing", vec!["/bin/true".to_string()]))
+        .map(DaemonSpec::from)
+        .unwrap();
+    let service = generate::units(&service, &id).unwrap();
+    let task = crate::testing::task("goetia-standing", vec!["/bin/true".to_string()], Some("30 3 * * *"));
+    let task = generate::units(&task, &id).unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("goetia-standing.service");
+
+    // Yes: a service's unit, and a task's, whatever is beside it.
+    for units in [&service, &task] {
+        std::fs::write(&path, &units.service).unwrap();
+        assert!(matches!(unit_standing(&path, &units.service), Standing::Yes));
+    }
+
+    // No: nothing there, another unit, a masked unit (a symlink, never read through).
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(unit_standing(&path, &service.service), Standing::No), "absent");
+    std::fs::write(&path, &task.service).unwrap();
+    assert!(
+        matches!(unit_standing(&path, &service.service), Standing::No),
+        "another unit"
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+    assert!(matches!(unit_standing(&path, &service.service), Standing::No), "masked");
+
+    // Unknown: the read did not complete, here for a directory that is a file.
+    let blocked = tmp.path().join("not-a-directory");
+    std::fs::write(&blocked, "").unwrap();
+    match unit_standing(&blocked.join("goetia-standing.service"), &service.service) {
+        Standing::Unknown(reason) => assert!(reason.contains("could not read the unit"), "{reason}"),
+        other => panic!("expected an unknown standing, got {other:?}"),
+    }
+}

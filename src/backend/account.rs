@@ -16,9 +16,8 @@ pub(crate) enum Unlisted {
     /// does not say it accepts a number, so a number with no entry is no account there.
     Refuse,
     /// The number, with no name and no group. systemd takes `User=4242` with no entry, and `chown`
-    /// accepts a bare number: the daemon runs, so what it works in must be its. A name that is a number
-    /// is a uid before it is a name, as systemd reads it: `get_user_creds` in `src/basic/user-util.c`
-    /// calls `parse_uid` and then only `getpwuid`, and asks `getpwnam` for a string that is no uid.
+    /// accepts a bare number: the daemon runs, so what it works in must be its. A name that is a
+    /// canonical uid is a uid, never looked up as a name, as systemd reads it (see `systemd_uid`).
     AsNumber,
 }
 
@@ -69,7 +68,6 @@ pub(crate) fn resolve_account(user: &User, unlisted: Unlisted) -> Result<Account
         User::Root => by_uid(0, unlisted),
         User::Id(AccountId::Uid(uid)) => by_uid(*uid, unlisted),
         User::Name(name) => {
-            // systemd reads a name that is a uid as the uid, and never looks it up as a name.
             if matches!(unlisted, Unlisted::AsNumber)
                 && let Some(uid) = systemd_uid(name)
             {

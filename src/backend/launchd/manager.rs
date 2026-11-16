@@ -492,6 +492,19 @@ fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut Creat
     created.make(plans)
 }
 
+/// What a read of the id says of whether `desired`'s job is the one that stands: the plist is what
+/// names the directories, so a task's timer is not compared.
+fn plist_standing(read: Result<ReadOutcome<Plist>>, desired: &Plists) -> Standing {
+    match read {
+        Ok(ReadOutcome::Marked(plist)) => match &plist.job {
+            Some(job) if job.text == desired.job => Standing::Yes,
+            _ => Standing::No,
+        },
+        Ok(_) => Standing::No,
+        Err(e) => Standing::Unknown(format!("could not read the plist: {}", e.report())),
+    }
+}
+
 /// Build a `0644` named temp file in `dir` (so a later hard-link persist stays on one filesystem)
 /// carrying `content`, and check it with `plutil -lint` before handing it back. `install` does not
 /// bootstrap the plist, so this catches malformed XML at install rather than at the first `start`.
@@ -1574,14 +1587,7 @@ impl backend::Backend for Launchd {
     /// Whether the job's plist, read as `read` reads it, is `desired`'s: the plist is what names the
     /// directories. A timer's names none.
     fn standing(&self, spec: &DaemonSpec, desired: &Plists) -> Standing {
-        match self.read(&spec.common().id) {
-            Ok(ReadOutcome::Marked(plist)) => match &plist.job {
-                Some(job) if job.text == desired.job => Standing::Yes,
-                _ => Standing::No,
-            },
-            Ok(_) => Standing::No,
-            Err(e) => Standing::Unknown(format!("could not read the plist: {}", e.report())),
-        }
+        plist_standing(self.read(&spec.common().id), desired)
     }
 
     fn live_status(&self, snapshot: &Plist) -> Result<Status> {

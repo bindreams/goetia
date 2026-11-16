@@ -18,13 +18,9 @@ use super::walk::{End, Entry, Step, entry};
 use crate::backend::account::describe_uid;
 use crate::error::{Error, Result};
 
-/// Refuse a log at `logs`, whose directory `dir` was planned as `plan`, that root's open could be led
-/// astray in, before anything is made: a directory or symlink on the way to the log's directory that a
-/// user other than root can change (owned by another, or writable by a group or by everyone), or a log
-/// that is already there as a symlink or as another user's file. An ancestor that everyone can write is
-/// accepted when it is sticky, which keeps others from renaming root's entries; the log's own
-/// directory is not, since the sticky bit does not keep them from making an entry in it. A directory
-/// that is to be made is root's. Names the writer.
+/// Refuse a log whose directory, or an ancestor, a user other than root can change, or whose existing
+/// entry is a symlink or another user's file (see the module doc), before anything is made. Sticky
+/// excuses ancestors only. The error names the writer.
 pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan) -> Result<()> {
     let Some(dir) = logs.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
@@ -45,8 +41,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan) -> Result<()> {
             ),
         });
     }
-    // Only root can have left what is in a directory only root can change, but an account may own it
-    // all the same, and a link there is followed by the open.
+    // A directory only root can change can still hold an account-owned entry, or a link the open follows.
     if let (End::Whole { dir: held, .. }, Some(name)) = (&plan.found.end, logs.file_name()) {
         let why = match entry(held.as_fd(), name).map_err(|e| Error::os_at("stat", logs, e))? {
             Some(Entry::Link(..)) => format!(
