@@ -126,14 +126,6 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             blob: Arc::new(Error::blob(String::new())),
             source: Box::new(not_installed()),
         },
-        Error::OpenRefusedAfterPrivilegeStep {
-            open: std::io::Error::other("x"),
-            step: std::io::Error::other("y"),
-        },
-        Error::ReadFailedAfterRefusedOpen {
-            read: std::io::Error::other("x"),
-            open: std::io::Error::other("y"),
-        },
         Error::AlreadyExists { path: PathBuf::new() },
         Error::ConcurrentChange { id: id(), path: None },
         Error::QuarantineStranded {
@@ -1249,6 +1241,32 @@ fn the_os_error_inside_an_error_carried_by_an_io_error_is_found() {
     );
     assert_eq!(
         Error::os("read", std::io::Error::other(not_installed())).raw_os_error(),
+        None
+    );
+}
+
+/// An `io::Error` that carries any error is searched through what it carries: a custom payload's
+/// `source()` is its own, which skips the payload.
+#[skuld::test]
+fn the_os_error_inside_any_payload_of_an_io_error_is_found() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("a payload")]
+    struct Payload(#[source] std::io::Error);
+
+    assert_eq!(
+        Error::os("read", std::io::Error::other(std::io::Error::from_raw_os_error(8))).raw_os_error(),
+        Some(8)
+    );
+    assert_eq!(
+        Error::os(
+            "read",
+            std::io::Error::other(Payload(std::io::Error::from_raw_os_error(8)))
+        )
+        .raw_os_error(),
+        Some(8)
+    );
+    assert_eq!(
+        Error::os("read", std::io::Error::other(Payload(std::io::Error::other("x")))).raw_os_error(),
         None
     );
 }

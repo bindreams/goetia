@@ -20,7 +20,7 @@ pub(crate) use report::Chain;
 pub(crate) use report::Sink;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
-pub(crate) use within::{carried, within};
+pub(crate) use within::{carried, paired, within};
 
 use report::Report;
 
@@ -687,19 +687,6 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// The process of a service could not be opened to be ended, and enabling `SeDebugPrivilege` for
-    /// the open failed first: the refusal may be that failure's doing. `open` is the refusal, printed
-    /// first and the failure's OS code; `step` is the step that failed, named by its call and printed
-    /// in the message after it. Windows only.
-    #[error("{}", open_refused_after_privilege_step(open, step))]
-    OpenRefusedAfterPrivilegeStep { open: std::io::Error, step: std::io::Error },
-
-    /// The process of a service could not be opened, and the read of the service manager that
-    /// would say whether it still vouches for the pid failed too. `read` is the failure, printed first
-    /// and the failure's OS code; `open` is the refusal, printed in the message after it.
-    #[error("{}", read_failed_after_refused_open(read, open))]
-    ReadFailedAfterRefusedOpen { read: std::io::Error, open: std::io::Error },
-
     /// A backend tried to create or move an artifact to `path`, but
     /// something already occupies it — a state none of that backend's own
     /// operations should produce.
@@ -786,8 +773,6 @@ impl Error {
             | Error::ElevationRequired { .. }
             | Error::UnsupportedPlatform { .. }
             | Error::AccountLookup { .. }
-            | Error::OpenRefusedAfterPrivilegeStep { .. }
-            | Error::ReadFailedAfterRefusedOpen { .. }
             | Error::AlreadyExists { .. } => false,
         }
     }
@@ -926,8 +911,6 @@ impl Error {
                 terminate_failed.as_deref(),
                 recovery,
             )),
-            Error::OpenRefusedAfterPrivilegeStep { open, step } => Some(open_refused_after_privilege_step(open, step)),
-            Error::ReadFailedAfterRefusedOpen { read, open } => Some(read_failed_after_refused_open(read, open)),
             Error::Os { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
@@ -1310,26 +1293,6 @@ pub(crate) fn terminating_failed<'a>(
         error: terminate_failed.map(|e| e as &(dyn std::error::Error + 'static)),
         error_is_cause: false,
         after: tail.into(),
-    }
-}
-
-/// The message of [`Error::OpenRefusedAfterPrivilegeStep`].
-fn open_refused_after_privilege_step<'a>(open: &'a std::io::Error, step: &std::io::Error) -> Sentence<'a> {
-    Sentence {
-        before: "".into(),
-        error: Some(open),
-        error_is_cause: true,
-        after: format!(" (enabling SeDebugPrivilege for the open also failed: {})", Chain(step)).into(),
-    }
-}
-
-/// The message of [`Error::ReadFailedAfterRefusedOpen`].
-fn read_failed_after_refused_open<'a>(read: &'a std::io::Error, open: &std::io::Error) -> Sentence<'a> {
-    Sentence {
-        before: "".into(),
-        error: Some(read),
-        error_is_cause: true,
-        after: format!(" (after the service's process could not be opened: {})", Chain(open)).into(),
     }
 }
 

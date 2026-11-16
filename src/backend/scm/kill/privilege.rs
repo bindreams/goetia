@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
-use crate::error::{Chain, Error, within};
+use crate::error::{Chain, paired, within};
 
 /// While alive, the calling thread runs with the caller's `SeDebugPrivilege` enabled, if the caller
 /// holds it. Dropping restores the thread's earlier token.
@@ -44,14 +44,14 @@ impl DebugPrivilege {
     }
 
     /// `open`'s error, with the failed privilege step named when the open was denied: the denial may
-    /// be the privilege that could not be enabled. The error keeps the open's OS code and kind. It takes
-    /// the failed step, so it explains one open.
-    pub(super) fn explain_denial(&mut self, open: io::Error) -> io::Error {
+    /// be the privilege that could not be enabled. The error keeps the open's OS code and kind. It
+    /// consumes the guard, so it explains one open.
+    pub(super) fn explain_denial(mut self, open: io::Error) -> io::Error {
         if open.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
             return open;
         }
         match self.failure.take() {
-            Some(step) => io::Error::new(open.kind(), Error::OpenRefusedAfterPrivilegeStep { open, step }),
+            Some(step) => paired(open, "enabling SeDebugPrivilege for the open also failed:", step),
             None => open,
         }
     }

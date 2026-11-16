@@ -14,6 +14,7 @@ use windows_sys::Win32::Security::{
 };
 
 use super::{DebugPrivilege, enable_in, restore_notice};
+use crate::backend::kill::kill_failed;
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
 use crate::error::{Error, os_error_in, within};
 use crate::testing::groups::debug_privilege;
@@ -171,7 +172,7 @@ fn a_denied_open_names_the_privilege_step_that_failed() {
 /// The denial's code is the open's, with a failed step and without one.
 #[skuld::test]
 fn a_denied_open_keeps_its_os_code_whether_or_not_a_step_failed() {
-    let mut no_step = DebugPrivilege {
+    let no_step = DebugPrivilege {
         restore: None,
         failure: None,
     };
@@ -190,10 +191,29 @@ fn a_denied_open_with_the_failed_step_is_found_by_os_error_in() {
     assert_eq!(os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
 }
 
+/// A kill whose open was denied says what was being killed: the denial with its step is not a goetia
+/// error that comes back as itself.
+#[skuld::test]
+fn a_denied_open_with_the_failed_step_keeps_the_kills_context() {
+    let e = failed_to_enable().explain_denial(denied());
+
+    let failed = kill_failed("frpc", e);
+
+    assert_eq!(failed.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "failed to kill `frpc`: {} (enabling SeDebugPrivilege for the open also failed: DuplicateTokenEx: {})",
+            denied(),
+            io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
+        )
+    );
+}
+
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.
 #[skuld::test]
 fn a_denied_open_with_no_failed_step_is_unchanged() {
-    let mut guard = DebugPrivilege {
+    let guard = DebugPrivilege {
         restore: None,
         failure: None,
     };

@@ -1089,6 +1089,27 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
 }
 
+/// A hold whose reads of SCM failed after a refused open reports both failures, once, behind what the
+/// hold was for.
+#[skuld::test]
+fn a_failed_hold_reports_the_read_and_the_refused_open_it_followed() {
+    let read = std::io::Error::from_raw_os_error(1722);
+    let open = std::io::Error::from_raw_os_error(5);
+    let (read_text, open_text) = (read.to_string(), open.to_string());
+    let e = crate::error::paired(read, "after the service's process could not be opened:", open);
+
+    let error = hold_failed(&Id::try_from("frpc").unwrap(), e);
+
+    assert_eq!(error.raw_os_error(), Some(1722));
+    assert_eq!(
+        error.report().to_string(),
+        format!(
+            "failed to hold `frpc`'s process to wait for its exit: {read_text} (after the service's process \
+             could not be opened: {open_text})"
+        )
+    );
+}
+
 /// A stop whose hold expired and whose STOP was sent is the wait that ran out, led by the process SCM
 /// still named.
 #[skuld::test]

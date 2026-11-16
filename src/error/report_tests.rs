@@ -202,6 +202,25 @@ fn a_commands_stderr_keeps_a_carriage_return_that_ends_a_line() {
     assert!(text.ends_with(concat!(": one\r\ntwo", r"\u{d}", "three")), "{text:?}");
 }
 
+/// An `io::Error` that carries an error of ours is written as that error: its remedy is printed last
+/// and its child's stderr is kept, as for an error that is not carried.
+#[skuld::test]
+fn an_error_carried_by_an_io_error_is_written_with_its_remedy_and_stderr() {
+    let carried = Error::Undetermined {
+        id: id(),
+        reason: Box::new(command(
+            "no such
+service",
+        )),
+        recovery: "re-run as root".to_string(),
+    };
+    let expected = carried.report().to_string();
+
+    let e = Error::os("read", std::io::Error::other(carried));
+
+    assert_eq!(e.report().to_string(), format!("failed to read: {expected}"));
+}
+
 /// A [`Reason`] prints as the report does, a child's stderr included.
 #[skuld::test]
 fn a_reason_wrapping_a_command_error_prints_its_stderr_as_the_report_does() {

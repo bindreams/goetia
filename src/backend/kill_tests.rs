@@ -22,6 +22,8 @@ enum Open {
     Fails,
     /// Fails with an OS error of this code.
     FailsWithOsError(i32),
+    /// Fails with this goetia error, passed through an `io::Error` as a manager's target does.
+    FailsCarrying(Error),
 }
 
 /// What the manager answers each `service_pid`, and what each `open` does. The signal and the waits
@@ -169,6 +171,7 @@ impl KillTarget for Scripted {
             Open::Gone => Ok(None),
             Open::Fails => Err(io::Error::other("access denied")),
             Open::FailsWithOsError(code) => Err(io::Error::from_raw_os_error(code)),
+            Open::FailsCarrying(e) => Err(io::Error::other(e)),
         }
     }
 
@@ -563,7 +566,8 @@ fn a_failed_read_after_a_refused_open_reports_both_errors() {
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
-/// The code of the failure is the read's, the primary error; the refused open is named after it.
+/// The code of the failure is the read's, the primary error; the refused open is named after it. The
+/// kill's own context leads, as for any OS failure of a kill.
 #[skuld::test]
 fn the_os_code_of_a_failed_read_is_found_after_a_refused_open() {
     const READ_CODE: i32 = 1722;
@@ -579,12 +583,59 @@ fn the_os_code_of_a_failed_read_is_found_after_a_refused_open() {
     let read = io::Error::from_raw_os_error(READ_CODE).to_string();
     let open = io::Error::from_raw_os_error(OPEN_CODE).to_string();
     assert_eq!(
-        failed.to_string(),
-        format!("{read} (after the service's process could not be opened: {open})")
+        failed.report().to_string(),
+        format!("failed to kill `{ID}`: {read} (after the service's process could not be opened: {open})")
     );
+}
+
+/// A kill that fails with an OS error says what was being killed, whether or not the error is a
+/// pair of failures: the pair is not a goetia error that comes back as itself.
+#[skuld::test]
+fn a_failed_read_after_a_refused_open_keeps_the_kills_context() {
+    let mut target = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);
+
+    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
+
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "failed to kill `{ID}`: manager read failed (after the service's process could not be opened: access denied)"
+        )
+    );
+}
+
+/// An error of goetia's that the refused open carries is written in full, as the report writes any:
+/// its child's stderr and its remedy are not lost to the parenthesis it sits in.
+#[skuld::test]
+fn a_carried_error_inside_the_refused_open_keeps_its_stderr_and_remedy() {
+    let open = Error::Undetermined {
+        id: ID.to_string(),
+        reason: Box::new(Error::Command {
+            command: "launchctl print".to_string(),
+            status: crate::error::error_tests::exit_status(1),
+            stderr: "no such
+service"
+                .to_string(),
+        }),
+        recovery: "re-run as root".to_string(),
+    };
+    let mut target = Scripted::new([Some(100)], [Open::FailsCarrying(open)]).failing_read(2);
+
+    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
+
     let report = failed.report().to_string();
-    assert_eq!(report.matches(&read).count(), 1, "{report}");
-    assert_eq!(report.matches(&open).count(), 1, "{report}");
+    assert!(
+        report.starts_with(&format!("failed to kill `{ID}`: manager read failed (")),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            ": no such
+service)"
+        ),
+        "{report}"
+    );
+    assert!(report.ends_with(". re-run as root"), "{report}");
 }
 
 /// The confirming read, with the process held: it is let go and nothing is signalled.

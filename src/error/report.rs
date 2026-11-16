@@ -3,6 +3,7 @@
 use std::fmt::{self, Write as _};
 
 use super::escape::{write_escaped, write_escaped_keeping_layout};
+use super::within::PairedFailure;
 use super::{Error, Sentence};
 
 /// What [`Error::report`] and `Error::report_unescaped` return: the chain, formatted on `Display`.
@@ -111,6 +112,10 @@ impl fmt::Display for Chain<'_> {
 /// first and each once: a [`Both`](Error::Both)'s halves can carry the same one. An error `e` sets
 /// inside its own sentence (see [`Error::sentence`]) is written there, with its remedies collected.
 ///
+/// An [`io::Error`](std::io::Error) with a custom payload is written as its payload, whatever the
+/// payload is, as its `source()` skips the payload: a goetia [`Error`] it carries is written in full.
+/// A [`PairedFailure`] is written as its primary, then the phrase and the second in parentheses.
+///
 /// A `cosca` error and everything below it is written by [`cosca::error::Report`], since a `source()`
 /// walk shows only the first member of a list and never a `cleanup`.
 pub(super) fn write_chain<'a>(
@@ -118,8 +123,17 @@ pub(super) fn write_chain<'a>(
     out: &mut Sink,
     remedies: &mut Vec<&'a str>,
 ) -> fmt::Result {
+    if let Some(payload) = e.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref) {
+        return write_chain(payload, out, remedies);
+    }
     if e.is::<cosca::error::Error>() {
         return write!(out, "{}", cosca::error::Report::new(e));
+    }
+    if let Some(pair) = e.downcast_ref::<PairedFailure>() {
+        write_chain(&pair.primary, out, remedies)?;
+        write!(out, " ({} ", pair.phrase)?;
+        write_chain(&pair.second, out, remedies)?;
+        return out.write_str(")");
     }
     // A `#[source]` of type `Box<Error>` reaches here as the box.
     let ours = e
@@ -153,18 +167,18 @@ pub(super) fn write_chain<'a>(
     Ok(())
 }
 
-/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. An error
-/// of ours that an [`io::Error`](std::io::Error) carries is searched as itself. A [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
-/// holds. A `cosca` list's later members, a `MembersLeft`'s `others` and a `MayHaveStarted`'s
-/// `cleanup` are not on the `source()` chain and are not searched.
+/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. An
+/// [`io::Error`](std::io::Error) with a custom payload is searched as that payload, whatever it is:
+/// its `source()` skips the payload. A [`Both`](Error::Both) is searched first half first;
+/// [`Error::Kept`] is searched as the error it holds. A `cosca` list's later members, a
+/// `MembersLeft`'s `others` and a `MayHaveStarted`'s `cleanup` are not on the `source()` chain and are
+/// not searched.
 pub(crate) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
     if let Some(io) = e.downcast_ref::<std::io::Error>() {
         if let Some(code) = io.raw_os_error() {
             return Some(code);
         }
-        // A custom `io::Error`'s `source()` is its payload's source, which skips an error of ours
-        // passed through it, so that one is searched itself.
-        if let Some(payload) = io.get_ref().filter(|payload| payload.is::<Error>()) {
+        if let Some(payload) = io.get_ref() {
             return os_error_in(payload);
         }
     }

@@ -19,7 +19,7 @@
 use std::io;
 use std::time::Duration;
 
-use crate::error::{Error, carried, terminating_failed, within};
+use crate::error::{Error, carried, paired, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
 #[cfg(unix)]
@@ -229,9 +229,10 @@ pub(crate) fn hold_once<T: KillTarget>(
                 // and `e` is superseded by that.
                 Ok(_) => Ok(Hold::Ended { pid, held: None }),
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
-                Err(read) => Err(HoldError::Read(io::Error::new(
-                    read.kind(),
-                    Error::ReadFailedAfterRefusedOpen { read, open: e },
+                Err(read) => Err(HoldError::Read(paired(
+                    read,
+                    "after the service's process could not be opened:",
+                    e,
                 ))),
             };
         }
