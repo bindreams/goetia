@@ -354,18 +354,21 @@ pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exi
     }
 }
 
-/// Whether the marked service `snapshot` is a service or a task, from its blob. A blob that will not
-/// decode is its error: the kind is not guessed.
-pub(crate) fn kind_of<S: InstalledService>(snapshot: &S) -> Result<DaemonKind> {
+/// The spec of the marked service `snapshot`, from its blob. A blob that will not decode is its error:
+/// what is read of the spec is not guessed.
+fn installed_spec_of<S: InstalledService>(snapshot: &S) -> Result<&DaemonSpec> {
     let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
-    Ok(blob.spec.kind())
+    Ok(&blob.spec)
 }
 
-/// What a stop of the marked service `snapshot` asks of it, from its blob. A blob that will not decode
-/// is its error, as for [`kind_of`]: the stop action is not guessed.
+/// Whether the marked service `snapshot` is a service or a task, from its blob.
+pub(crate) fn kind_of<S: InstalledService>(snapshot: &S) -> Result<DaemonKind> {
+    Ok(installed_spec_of(snapshot)?.kind())
+}
+
+/// What a stop of the marked service `snapshot` asks of it, from its blob.
 pub(crate) fn stop_action_of<S: InstalledService>(snapshot: &S) -> Result<StopAction> {
-    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
-    Ok(*blob.spec.stop_action())
+    Ok(*installed_spec_of(snapshot)?.stop_action())
 }
 
 /// The thread that waits for a run, made before the run is requested.
