@@ -87,3 +87,10 @@ fn an_account_is_an_owner_with_its_group() {
     let owner = resolve_account(&User::Root, Unlisted::Refuse).unwrap().owner().unwrap();
     assert_eq!((owner.uid.as_raw(), owner.gid.map(|gid| gid.as_raw())), (0, Some(0)));
 }
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_account_is_named_by_its_entry_and_always_by_its_uid() {
+    assert_eq!(describe_uid(0), "`root` (uid 0)");
+    assert_eq!(describe_uid(4_242_424), "uid 4242424");
+}

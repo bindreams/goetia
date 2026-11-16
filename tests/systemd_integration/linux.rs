@@ -1916,11 +1916,12 @@ fn refused_directory(err: &goetia::Error, id: &str) -> String {
 #[skuld::test]
 fn install_makes_cwd_for_the_account_and_a_log_directory_root_keeps(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let state = under_root("/var/lib", guard.id(), "state");
-    let logs = under_root("/var/lib", guard.id(), "logs");
+    // Creation order: see the module doc of `support::service_guard`.
+    let state = under_root("/var/lib", &id, "state");
+    let logs = under_root("/var/lib", &id, "logs");
     let _rm_state = DirGuard::new(state.clone());
     let _rm_logs = DirGuard::new(logs.clone());
+    let guard = ServiceGuard::new(&id);
     let spec = nobody_spec(guard.id(), Some(&state.join("work")), Some(&logs.join("out.log")));
 
     let mgr = Systemd::new();
@@ -1953,9 +1954,10 @@ fn install_makes_cwd_for_the_account_and_a_log_directory_root_keeps(#[fixture(sy
 #[skuld::test]
 fn install_refuses_a_missing_directory_outside_the_roots_and_makes_nothing(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = std::env::temp_dir().join(format!("{}-outside", guard.id()));
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = std::env::temp_dir().join(format!("{id}-outside"));
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     let spec = nobody_spec(guard.id(), Some(&base.join("work")), None);
 
     let err = Systemd::new().install(&spec, false).expect_err("outside every root");
@@ -1970,9 +1972,10 @@ fn install_refuses_a_missing_directory_outside_the_roots_and_makes_nothing(#[fix
 #[skuld::test]
 fn install_refuses_a_log_directory_an_account_can_write(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let dir = under_root("/var/lib", guard.id(), "writable");
+    // Creation order: see the module doc of `support::service_guard`.
+    let dir = under_root("/var/lib", &id, "writable");
     let _rm = DirGuard::new(dir.clone());
+    let guard = ServiceGuard::new(&id);
     fs::create_dir(&dir).expect("make the directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).expect("chmod 0775");
     let spec = nobody_spec(guard.id(), None, Some(&dir.join("out.log")));
@@ -1991,9 +1994,10 @@ fn install_refuses_a_log_directory_an_account_can_write(#[fixture(systemd_group)
 #[skuld::test]
 fn install_refuses_a_log_under_the_cwd_it_hands_to_the_account(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = under_root("/var/lib", guard.id(), "nested");
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "nested");
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     let cwd = base.join("work");
     let spec = nobody_spec(guard.id(), Some(&cwd), Some(&cwd.join("out.log")));
 
@@ -2041,9 +2045,10 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write(#[fixture(sy
 #[skuld::test]
 fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = under_root("/var/lib", guard.id(), "ancestor");
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "ancestor");
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
     fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
     let base_meta_before = fs::metadata(&base).expect("stat base before");
@@ -2089,9 +2094,10 @@ fn spec_failing_on_cwd_after_logs_parent(id: &str, base: &Path, logs_parent: &Pa
 #[skuld::test]
 fn a_failed_install_removes_the_directories_it_made(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = under_root("/var/lib", guard.id(), "undo-made");
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "undo-made");
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
     let made = base.join("a").join("b");
     let spec = spec_failing_on_cwd_after_logs_parent(guard.id(), &base, &made);
@@ -2108,9 +2114,10 @@ fn a_failed_install_removes_the_directories_it_made(#[fixture(systemd_group)] _g
 #[skuld::test]
 fn a_failed_install_removes_a_new_directory_in_one_that_existed_before(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = under_root("/var/lib", guard.id(), "undo-preexisting");
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "undo-preexisting");
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     let existing = base.join("logs");
     fs::create_dir_all(&existing).unwrap_or_else(|e| panic!("mkdir {}: {e}", existing.display()));
     let made = existing.join("new");
@@ -2153,9 +2160,10 @@ impl Drop for Immutable {
 #[skuld::test]
 fn an_install_that_fails_after_writing_the_unit_keeps_its_directories(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = under_root("/var/lib", guard.id(), "late-failure");
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "late-failure");
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     let mgr = Systemd::new();
     mgr.install(&mk(guard.id()), false).expect("install");
     write_dropin(guard.id());

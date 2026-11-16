@@ -98,6 +98,15 @@ fn by_uid(uid: u32, unlisted: Unlisted) -> Result<Account> {
     }
 }
 
+/// An account as an error names it: its name where it has a passwd entry, and always its uid.
+#[cfg(target_os = "linux")]
+pub(crate) fn describe_uid(uid: u32) -> String {
+    match by_uid(uid, Unlisted::Refuse) {
+        Ok(account) => format!("`{}` (uid {uid})", account.name),
+        Err(_) => format!("uid {uid}"),
+    }
+}
+
 #[cfg(test)]
 #[path = "account_tests.rs"]
 mod account_tests;

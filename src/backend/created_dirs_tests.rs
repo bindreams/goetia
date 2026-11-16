@@ -316,7 +316,7 @@ fn create_fails_when_a_root_cannot_be_opened_for_a_reason_other_than_not_being_t
     let mut dirs = CreatedDirs::under(vec![file.clone(), layout.system()]);
 
     let err = dirs
-        .create(&layout.system(), None)
+        .create(&layout.system().join("a"), None)
         .expect_err("a root that is a file cannot be searched");
 
     assert!(
@@ -324,6 +324,24 @@ fn create_fails_when_a_root_cannot_be_opened_for_a_reason_other_than_not_being_t
             && err.to_string().contains(file.to_str().unwrap()),
         "{err:?}"
     );
+}
+
+/// A path that exists whole is used as it is, wherever it is: the roots are opened only when a
+/// component is missing and the walk asks whether it is under one.
+#[skuld::test(labels = [ELEVATED])]
+fn create_uses_a_path_that_exists_whatever_state_the_roots_are_in() {
+    let layout = Layout::new();
+    let file = layout.outside().join("file");
+    fs::write(&file, b"x").unwrap();
+    let looped = layout.outside().join("loop");
+    symlink(&looped, &looped).unwrap();
+    let mut dirs = CreatedDirs::under(vec![file, looped, layout.system()]);
+
+    dirs.create(&layout.outside(), None)
+        .expect("an existing directory outside every root");
+    dirs.create(&layout.system(), None).expect("an existing root");
+
+    assert!(dirs.made.is_empty());
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -394,7 +412,7 @@ fn create_uses_a_component_that_appeared_after_the_walk_and_makes_what_is_below_
     let layout = Layout::new();
     let raced = layout.system().join("a");
     let leaf = raced.join("b");
-    let found = walk(&leaf, &[layout.system()]).unwrap();
+    let found = walk(&leaf).unwrap();
     fs::create_dir(&raced).unwrap();
     fs::set_permissions(&raced, fs::Permissions::from_mode(0o700)).unwrap();
     let mut dirs = layout.dirs();
@@ -412,7 +430,7 @@ fn create_uses_a_component_that_appeared_after_the_walk_and_makes_what_is_below_
 fn create_refuses_a_component_that_appeared_after_the_walk_for_an_account() {
     let layout = Layout::new();
     let raced = layout.system().join("a");
-    let found = walk(&raced.join("b"), &[layout.system()]).unwrap();
+    let found = walk(&raced.join("b")).unwrap();
     fs::create_dir(&raced).unwrap();
     give_to_a_stranger(&raced);
     let mut dirs = layout.dirs();
@@ -426,7 +444,7 @@ fn create_refuses_a_component_that_appeared_after_the_walk_for_an_account() {
 #[skuld::test(labels = [ELEVATED])]
 fn create_does_not_descend_into_a_symlink_planted_after_the_walk() {
     let layout = Layout::new();
-    let found = walk(&layout.system().join("a/b"), &[layout.system()]).unwrap();
+    let found = walk(&layout.system().join("a/b")).unwrap();
     symlink(layout.outside(), layout.system().join("a")).unwrap();
     let mut dirs = layout.dirs();
 

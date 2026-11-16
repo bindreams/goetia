@@ -3,6 +3,8 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use super::*;
+use crate::backend::Settle as _;
+use crate::backend::Standing;
 use crate::backend::created_dirs::created_dirs_tests::Layout;
 use crate::error::Error;
 use crate::spec::{AccountId, ServiceSpec};
@@ -88,4 +90,28 @@ fn uid_zero_is_root_and_is_handed_nothing() {
 
         assert_eq!(fs::metadata(&cwd).unwrap().uid(), 0, "{user:?}");
     }
+}
+
+/// A log the check refused under a `cwd` this install made is never handed over: a later `settle` that
+/// keeps the directories (an unknown standing) leaves the `cwd` root's, not the account's.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_the_check_refused_under_a_new_cwd_leaves_the_cwd_root_s_whatever_settles_it() {
+    let layout = Layout::new();
+    let cwd = layout.system().join("work");
+    let logs = cwd.join("out.log");
+    let mut created = CreatedDirs::under(vec![layout.system()]);
+
+    let err = ensure_parent_dirs(
+        &spec(User::Id(AccountId::Uid(4_242_424)), Some(&cwd), Some(&logs)),
+        &mut created,
+    )
+    .expect_err("a log in the directory that is to be the account's");
+    assert!(matches!(err, Error::DirectoryRefused { .. }), "{err:?}");
+    created.settle(|| Standing::Unknown("could not read the unit".to_string()));
+
+    assert_eq!(
+        fs::metadata(&cwd).unwrap().uid(),
+        0,
+        "the refused directory was handed over"
+    );
 }

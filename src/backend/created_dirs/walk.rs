@@ -20,9 +20,30 @@ pub(super) struct Walk {
     pub(super) end: End,
     /// Every directory entered and every symlink followed, in order, with what the walk read of each.
     pub(super) trail: Vec<Step>,
-    /// Whether one of the roots is among the directories the path resolved through above its first
-    /// missing component, by device and inode: `..` and symlinks are resolved, never compared as text.
-    pub(super) under_root: bool,
+    /// The directories the path resolved through above its first missing component, `/` first, by
+    /// device and inode: `..` and symlinks are resolved, never compared as text.
+    chain: Vec<(libc::dev_t, libc::ino_t)>,
+}
+
+impl Walk {
+    /// Whether one of `roots` is among the directories the path resolved through. They are opened
+    /// here, and only here: a path that exists whole is used wherever it is, so what a root is does
+    /// not matter until a component is missing. A root that is not there is no root; one that cannot
+    /// be opened for any other reason is an error.
+    pub(super) fn under_root(&self, roots: &[PathBuf]) -> Result<bool> {
+        let search = search_directory();
+        let mut under = false;
+        for root in roots {
+            let fd = match open(root.as_path(), search, Mode::empty()) {
+                Ok(fd) => fd,
+                Err(Errno::ENOENT) => continue,
+                Err(e) => return Err(Error::os_at("open", root, e)),
+            };
+            let stat = fstat(&fd).map_err(|e| Error::os_at("stat", root, e))?;
+            under |= self.chain.contains(&(stat.st_dev, stat.st_ino));
+        }
+        Ok(under)
+    }
 }
 
 pub(super) enum End {
@@ -50,6 +71,11 @@ pub(super) struct Step {
 pub(super) const SEARCH: OFlag = OFlag::O_PATH;
 #[cfg(not(target_os = "linux"))]
 pub(super) const SEARCH: OFlag = OFlag::O_SEARCH;
+
+/// How a directory is opened by name to be searched.
+fn search_directory() -> OFlag {
+    OFlag::O_DIRECTORY | SEARCH | OFlag::O_CLOEXEC
+}
 
 /// Symlinks one walk follows before it gives up on a cycle: the kernel's own `ELOOP` bound, Linux's
 /// `MAXSYMLINKS` in `include/linux/namei.h` (40) and macOS's `MAXSYMLINKS` in `sys/param.h` (32).
@@ -160,9 +186,9 @@ pub(super) fn require_directory(parent: BorrowedFd<'_>, name: &OsStr, found: &En
 /// every symlink that leads through it and, as the last component, one that leads to a directory. A
 /// component that does not exist ends the resolution: what remains is reported as missing, and `..`
 /// below it is an error. A link that leads nowhere is an error too, since what is made below it would
-/// be made at its target. `roots` are opened first, so that "under a root" is a fact about the
-/// directories the path resolved through.
-pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
+/// be made at its target. [`Walk::under_root`] says whether the directories the path resolved through
+/// include a root.
+pub(super) fn walk(dir: &Path) -> Result<Walk> {
     if !dir.has_root() {
         return Err(Error::os_at(
             "create directory",
@@ -170,18 +196,7 @@ pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
             io::Error::other("not an absolute path"),
         ));
     }
-    let search = OFlag::O_DIRECTORY | SEARCH | OFlag::O_CLOEXEC;
-    // A root that is not there is no root; one that cannot be opened for any other reason is an error.
-    let mut root_ids: Vec<(libc::dev_t, libc::ino_t)> = Vec::new();
-    for root in roots {
-        let fd = match open(root.as_path(), search, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::ENOENT) => continue,
-            Err(e) => return Err(Error::os_at("open", root, e)),
-        };
-        let stat = fstat(&fd).map_err(|e| Error::os_at("stat", root, e))?;
-        root_ids.push((stat.st_dev, stat.st_ino));
-    }
+    let search = search_directory();
     let open_root = || open("/", search, Mode::empty()).map_err(|e| Error::os_at("open", "/", e));
     let id_of = |stat: &FileStat| (stat.st_dev, stat.st_ino);
 
@@ -253,11 +268,10 @@ pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
             let stat = require_directory(cur.as_fd(), &name, &found, &so_far)?;
             trail.push(Step { at, stat, link: false });
             chain.push(id_of(&stat));
-            let under_root = chain.iter().any(|id| root_ids.contains(id));
             return Ok(Walk {
                 end: End::Whole(stat),
                 trail,
-                under_root,
+                chain,
             });
         }
         match found {
@@ -289,7 +303,6 @@ pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
             Entry::Other(_) => return Err(Error::os_at("stat", &at, Errno::ENOTDIR)),
         }
     }
-    let under_root = chain.iter().any(|id| root_ids.contains(id));
     // Nothing is missing when the path ended in `..`, or in a link to `/`, or is `/`: the directory
     // the walk is in is the one the path names.
     let end = if missing.is_empty() {
@@ -297,7 +310,7 @@ pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
     } else {
         End::Missing { holder: cur, missing }
     };
-    Ok(Walk { end, trail, under_root })
+    Ok(Walk { end, trail, chain })
 }
 
 /// The steps of `path`, as names and `..`, the root and `.` left out.

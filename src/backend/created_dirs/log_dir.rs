@@ -9,10 +9,11 @@
 use std::path::Path;
 
 use nix::sys::stat::SFlag;
-use nix::unistd::{Gid, Group, Uid, User};
+use nix::unistd::{Gid, Group};
 
 use super::PendingHandOver;
 use super::walk::{End, Step, walk};
+use crate::backend::account::describe_uid;
 use crate::error::{Error, Result};
 
 /// Refuse a log at `logs` whose directory, or any directory or symlink on the way to it, a user other
@@ -25,7 +26,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, handing: &[PendingHandOver]) 
     let Some(dir) = logs.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
     };
-    let walked = walk(dir, &[])?;
+    let walked = walk(dir)?;
     let End::Whole(end) = walked.end else {
         return Err(Error::os_at(
             "stat",
@@ -46,7 +47,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, handing: &[PendingHandOver]) 
                 "{kind} {} will belong to {}, to whom this install hands {} once it has made every directory, \
                  who could",
                 step.at.display(),
-                account_text(pending.owner.uid.as_raw()),
+                describe_uid(pending.owner.uid.as_raw()),
                 pending.path.display(),
             ),
             (None, Some(who)) => format!("{kind} {} can be changed by {who}, who could", step.at.display()),
@@ -68,7 +69,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, handing: &[PendingHandOver]) 
 /// who can write a directory. The sticky bit excuses that unless `leaf`, the directory the log lands in.
 fn writer(step: &Step, leaf: bool) -> Option<String> {
     if step.stat.st_uid != 0 {
-        return Some(format!("its owner {}", account_text(step.stat.st_uid)));
+        return Some(format!("its owner {}", describe_uid(step.stat.st_uid)));
     }
     let mode = step.stat.st_mode as libc::mode_t;
     let directory = SFlag::from_bits_truncate(step.stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFDIR;
@@ -87,14 +88,6 @@ fn writer(step: &Step, leaf: bool) -> Option<String> {
         })
     } else {
         None
-    }
-}
-
-/// An account as an error names it: its name where it has an entry, and always its uid.
-fn account_text(uid: u32) -> String {
-    match User::from_uid(Uid::from_raw(uid)) {
-        Ok(Some(user)) => format!("`{}` (uid {uid})", user.name),
-        _ => format!("uid {uid}"),
     }
 }
 

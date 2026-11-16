@@ -27,8 +27,13 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
     if let Some(cwd) = &common.cwd {
         created.create_for(cwd, || owner_of(&common.user))?;
     }
-    if let Some(logs) = &common.logs {
-        refuse_writable_log_dir(logs, &created.to_hand_over())?;
+    if let Some(logs) = &common.logs
+        && let Err(refused) = refuse_writable_log_dir(logs, &created.to_hand_over())
+    {
+        // The directories stay for the guard to remove or keep, and a keep must not hand over the one
+        // the check refused: the log is in it.
+        created.withhold_hand_over();
+        return Err(refused);
     }
     created.hand_over()
 }

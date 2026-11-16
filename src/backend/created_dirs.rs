@@ -8,14 +8,16 @@
 //!   says to create it first: goetia makes nothing in a user's home or a prefix of its own. A path
 //!   that exists whole is used as it is, wherever it is and whoever owns it.
 //! - **Walk.** Where something is missing, [`walk()`] resolves the path on descriptors, and every
-//!   directory and symlink it passed through must be root's: root does not create inside a directory
-//!   an account can rename, nor follow a link it can retarget.
+//!   directory and symlink it passed through must be owned by root: root does not create inside a
+//!   directory, nor follow a link, that an account owns. Modes are not judged: a root-owned directory
+//!   that a group or everyone can write is accepted: that is the administrator's exposure, and
+//!   what it allows here is covered under "Making". Where writability matters the caller judges it:
+//!   for a log systemd opens as root, `refuse_writable_log_dir` (Linux).
 //! - **Making.** Each component is made `0700` by `mkdirat` under the descriptor of the one above,
 //!   and recorded at once, so that one that is then refused is removed too. It must be root's, a
 //!   directory, and empty (a link count or a mode says nothing a file system keeps the same), and is
-//!   then made `0755`. The one parent that may be written by another (Debian's `/var/log` is
-//!   `root:syslog 0775`) can at most swap in an empty directory of root's, which that group could
-//!   already remove.
+//!   then made `0755`. A parent that another can write (Debian's `/var/log` is `root:syslog 0775`) can
+//!   at most swap in an empty directory of root's, which that group could already remove.
 //! - **Handing over.** Only the deepest directory of a path, and only where the daemon's account has
 //!   to write it ([`Owner`]), is given to the account, once everything is made.
 //!
@@ -181,9 +183,9 @@ impl CreatedDirs {
     /// existing path, or one this guard made and an earlier call marked, needs no owner. `Ok(None)` is
     /// no hand-over.
     pub(crate) fn create_for(&mut self, dir: &Path, owner: impl FnOnce() -> Result<Option<Owner>>) -> Result<()> {
-        let found = walk(dir, &self.roots)?;
+        let found = walk(dir)?;
         if matches!(found.end, End::Missing { .. }) {
-            if !found.under_root {
+            if !found.under_root(&self.roots)? {
                 return Err(Error::DirectoryRefused {
                     path: dir.to_path_buf(),
                     why: format!(
@@ -332,6 +334,13 @@ impl CreatedDirs {
                 })
             })
             .collect()
+    }
+
+    /// Unmark every directory, so that nothing is handed over by [`hand_over`](Self::hand_over) or by a
+    /// settle that keeps them: for an install the log check refused, which hands nothing to anyone.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn withhold_hand_over(&mut self) {
+        self.made.iter_mut().for_each(|made| made.hand = None);
     }
 
     /// Give every directory marked for an owner to it. The account can enter what it owns, so this is
