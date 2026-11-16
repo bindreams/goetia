@@ -163,7 +163,7 @@ impl Scm {
 
     /// Removes `snapshot`'s task, in an order whose every prefix a re-run finishes:
     ///
-    /// 1. The task is disabled (its own flag, [`TaskApi::set_enabled`]), whether or not it is armed, so
+    /// 1. The task is disabled (its own flag, `TaskApi::set_enabled`), whether or not it is armed, so
     ///    that nothing starts another run. That is no registration, so it needs no password and works
     ///    for an account whose password changed or that is gone: an uninstall never needs the password.
     /// 2. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
