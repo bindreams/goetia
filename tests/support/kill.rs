@@ -26,11 +26,17 @@ pub fn until(mut condition: impl FnMut() -> bool) {
 
 /// The identity of the running process `pid`: its start time and unique id along with the number, so
 /// that a process that is later given the same number is another.
-fn identity_of(pid: u32) -> ProcessId {
+pub fn identity_of(pid: u32) -> ProcessId {
     match ProcessId::of(pid) {
         Resolved::Found(id) => id,
         other => panic!("precondition: process {pid} is running ({other:?})"),
     }
+}
+
+/// Whether the manager's report of `pid` is still of the process `old`, which was running before a kill.
+/// Compared by identity: a number the killed process had can be given to the process that replaced it.
+pub fn is_still_reported(pid: Option<u32>, old: ProcessId) -> bool {
+    pid.is_some_and(|pid| ProcessId::of(pid) == Resolved::Found(old))
 }
 
 /// `restart` restarts a killed daemon: it is started, killed, and comes back as a different process.
@@ -45,21 +51,21 @@ pub fn a_killed_daemon_comes_back_with_a_new_pid(mgr: &dyn ServiceManager, id: &
         State::Running,
         "precondition: running ({before:?})"
     );
-    let old_pid = before.common().pid.expect("a running daemon reports a pid");
+    let old = identity_of(before.common().pid.expect("a running daemon reports a pid"));
 
     mgr.kill(id).expect("kill");
 
     let right_after = mgr.status(id).expect("status straight after the kill");
-    assert_ne!(
-        right_after.common().pid,
-        Some(old_pid),
+    assert!(
+        !is_still_reported(right_after.common().pid, old),
         "kill returned while the manager still reported the killed process ({right_after:?})"
     );
     started.accept("the daemon to be restarted by the manager after the kill");
     let after = mgr.status(id).expect("status after the restart");
     let new_pid = after.common().pid.expect("the restarted daemon reports a pid");
     assert_ne!(
-        new_pid, old_pid,
+        identity_of(new_pid),
+        old,
         "the manager restarted the daemon as a new process ({after:?})"
     );
 }

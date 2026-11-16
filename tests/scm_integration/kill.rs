@@ -120,12 +120,13 @@ fn kill_with_the_privilege_disabled(user: User) {
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::Unbounded).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
-    let old_pid = mgr
-        .status(&spec.common().id)
-        .expect("status before the kill")
-        .common()
-        .pid
-        .expect("a running service reports a pid");
+    let old = support::kill::identity_of(
+        mgr.status(&spec.common().id)
+            .expect("status before the kill")
+            .common()
+            .pid
+            .expect("a running service reports a pid"),
+    );
 
     {
         let _disabled = DebugPrivilegeDisabled::new();
@@ -135,9 +136,8 @@ fn kill_with_the_privilege_disabled(user: User) {
 
     // `kill` returns once SCM has recorded the exit, so the process is not the one still reported.
     let right_after = mgr.status(&spec.common().id).expect("status straight after the kill");
-    assert_ne!(
-        right_after.common().pid,
-        Some(old_pid),
+    assert!(
+        !support::kill::is_still_reported(right_after.common().pid, old),
         "kill returned while SCM still reported the killed process ({right_after:?})"
     );
 }
