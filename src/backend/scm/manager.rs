@@ -294,15 +294,8 @@ impl ScmSnapshot {
     }
 }
 
-impl Backend for Scm {
-    type Definition = ScmRegistration;
-    type Snapshot = ScmSnapshot;
-    /// The install lock, which `protocol: plain` holds until its install ends: what places, repairs
-    /// and deletes shim files, for this process and every other, takes it.
-    type InstallScope = Option<InstallLock>;
-    type Reservation = ();
-    type Run = std::convert::Infallible;
-
+/// The service half of every verb: what the Windows backend does for an id the SCM holds.
+impl Scm {
     /// For `protocol: plain`: the install flow has rendered the definition already, so every refusal
     /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
     /// has come before the lock is taken or the provider writes. The lock is taken and the files
@@ -315,12 +308,7 @@ impl Backend for Scm {
     /// sweep that cannot read what is referenced or cannot delete a file does not fail the install:
     /// the file is not what the install needs, and the next sweep finds it. `protocol: native` has no
     /// host, so nothing is held or checked: its preconditions are `apply`'s, before any write.
-    fn begin_install(
-        &self,
-        spec: &DaemonSpec,
-        desired: &ScmRegistration,
-        _reservation: &mut (),
-    ) -> Result<Option<InstallLock>> {
+    fn service_begin_install(&self, spec: &DaemonSpec, desired: &ScmRegistration) -> Result<Option<InstallLock>> {
         if !generate::hosted(spec) {
             return Ok(None);
         }
@@ -341,12 +329,7 @@ impl Backend for Scm {
         Ok(Some(lock))
     }
 
-    /// SCM sends its requests through the OS, with no thread or file of ours to run out.
-    fn reserve(&self, _steps: &[Step], _budget: Budget) -> Result<()> {
-        Ok(())
-    }
-
-    fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+    fn service_render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
         service_registration(spec, || {
             generate::registration(spec, &identity, &|| self.provider()?.preview())
@@ -357,7 +340,7 @@ impl Backend for Scm {
     /// provider (a moved folder, another goetia version, a standalone host) put there is the same
     /// spec, and no provider is consulted. `protocol: native` has no host, so its snapshot's config is
     /// never read.
-    fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
+    fn service_regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
         service_registration(spec, || {
             generate::registration(spec, &identity, &|| {
@@ -372,7 +355,7 @@ impl Backend for Scm {
     }
 
     /// The host is previewed once, for the check and the registration alike.
-    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+    fn service_render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
         service_registration(spec, || {
             generate::install_registration(spec, &identity, &|| self.provider()?.preview())
@@ -381,7 +364,7 @@ impl Backend for Scm {
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
     /// absent nor goetia's.
-    fn read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
+    fn service_read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
         let scm = open_scm_to_classify(id.as_str())?;
         let service = match scm.open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
             Ok(service) => service,
@@ -393,7 +376,7 @@ impl Backend for Scm {
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
-    fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
+    fn service_installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
         let id = snapshot.id();
         let config = snapshot.config()?;
         let definition = read_live_registration(config, snapshot.service()?, id.as_str(), &snapshot.parameters)?;
@@ -403,20 +386,17 @@ impl Backend for Scm {
         })
     }
 
-    fn write(
+    fn service_write(
         &self,
         spec: &DaemonSpec,
         definition: &ScmRegistration,
-        _outcome: &Outcome,
         snapshot: Option<&ScmSnapshot>,
-        _scope: &mut Option<InstallLock>,
-        _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         apply(definition, written_user(&spec.common().user), snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
-    fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
+    fn service_live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
         let id = snapshot.id();
         let enabled = snapshot.config()?.start_type == ServiceStartType::AutoStart;
         let (state, pid) = query_live(snapshot.service()?, id.as_str())?;
@@ -427,7 +407,7 @@ impl Backend for Scm {
     /// `SC_MANAGER_ENUMERATE_SERVICE`/`EnumServicesStatusExW` need no more privilege than reading
     /// this key does, and one pass here avoids an `OpenService` round trip per candidate on a host
     /// with hundreds of unrelated services.
-    fn scan(&self) -> Scan<ScmSnapshot> {
+    fn service_scan(&self) -> Scan<ScmSnapshot> {
         let mut entries = Vec::new();
         let mut unreadable: Vec<Unreadable> = Vec::new();
         let incomplete = registry::scan_services(|name, services| {
@@ -464,7 +444,7 @@ impl Backend for Scm {
     /// disabled, before the stop or the wait for one under way (see [`uninstall_locked`]), and once
     /// the service is stopped and deleted the uninstall waits for that process and sweeps the folders
     /// the files can be in: see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
-    fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_uninstall(&self, snapshot: ScmSnapshot) -> Result<()> {
         let plan = plan_uninstall(snapshot.blob(), InstallLock::acquire, || {
             snapshot
                 .config()
@@ -487,7 +467,7 @@ impl Backend for Scm {
     /// Under the lock, the sweep an `install` makes before it provides, which is how an `uninstall`
     /// that stopped short of its own sweep is retried: by running it again. A manager with no
     /// provider has nothing of its own to sweep, and takes no lock and reads nothing.
-    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+    fn service_uninstall_absent(&self) -> Result<()> {
         let Some(shim) = &self.shim else {
             return Ok(());
         };
@@ -496,19 +476,19 @@ impl Backend for Scm {
             .map_err(|failure| *failure.error)
     }
 
-    fn enable(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_enable(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.id();
         let (_scm, service) = open_existing(id, "enable", ServiceAccess::CHANGE_CONFIG)?;
         set_start_type(&service, ServiceStartType::AutoStart).map_err(|e| Error::os(format!("enable `{id}`"), e))
     }
 
-    fn disable(&self, snapshot: ScmSnapshot) -> Result<()> {
+    fn service_disable(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.id();
         let (_scm, service) = open_existing(id, "disable", ServiceAccess::CHANGE_CONFIG)?;
         set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::os(format!("disable `{id}`"), e))
     }
 
-    fn start(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+    fn service_start(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
         // First, so the wait is counted from the verb's entry. What it bounds is the wait:
         // `start_via_notify` issues the start whatever is left of it.
         let deadline = budget.start();
@@ -522,7 +502,7 @@ impl Backend for Scm {
     /// `super::wait::request_start_after_stop`: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
     /// simple` service reads `RUNNING` until its shim has taken the stop.
-    fn request_start_after_stop(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_request_start_after_stop(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to start it"), e))?;
@@ -543,7 +523,7 @@ impl Backend for Scm {
     /// STOP is sent, the STOP reaches the new process, which goetia does not hold. `stop` can then
     /// return while that process is still exiting, and an `uninstall` right after may leave the shim
     /// file for the next sweep.
-    fn stop(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+    fn service_stop(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
         let deadline = budget.start();
@@ -566,7 +546,7 @@ impl Backend for Scm {
     /// Exit code `1` (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery
     /// actions, as for a crash. For `protocol: plain` the process is `goetia-shim`, whose Job Object
     /// takes the daemon's tree with it.
-    fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_kill(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.into_id();
         let (_scm, service) = open_existing(&id, "kill", ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
@@ -576,6 +556,102 @@ impl Backend for Scm {
                 id: id.as_str().to_string(),
             }),
         }
+    }
+}
+
+impl Backend for Scm {
+    type Definition = ScmRegistration;
+    type Snapshot = ScmSnapshot;
+    /// The install lock, which `protocol: plain` holds until its install ends: what places, repairs
+    /// and deletes shim files, for this process and every other, takes it.
+    type InstallScope = Option<InstallLock>;
+    type Reservation = ();
+    type Run = std::convert::Infallible;
+
+    fn begin_install(
+        &self,
+        spec: &DaemonSpec,
+        desired: &ScmRegistration,
+        _reservation: &mut (),
+    ) -> Result<Option<InstallLock>> {
+        self.service_begin_install(spec, desired)
+    }
+
+    /// SCM sends its requests through the OS, with no thread or file of ours to run out.
+    fn reserve(&self, _steps: &[Step], _budget: Budget) -> Result<()> {
+        Ok(())
+    }
+
+    fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+        self.service_render(spec)
+    }
+
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
+        self.service_regenerate(spec, snapshot)
+    }
+
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+        self.service_render_for_install(spec)
+    }
+
+    fn read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
+        self.service_read(id)
+    }
+
+    fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
+        self.service_installed(snapshot)
+    }
+
+    fn write(
+        &self,
+        spec: &DaemonSpec,
+        definition: &ScmRegistration,
+        _outcome: &Outcome,
+        snapshot: Option<&ScmSnapshot>,
+        _scope: &mut Option<InstallLock>,
+        _reservation: &mut (),
+    ) -> Result<WriteOutcome> {
+        self.service_write(spec, definition, snapshot)
+    }
+
+    fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
+        self.service_live_status(snapshot)
+    }
+
+    fn scan(&self) -> Scan<ScmSnapshot> {
+        self.service_scan()
+    }
+
+    fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+        self.service_uninstall(snapshot)
+    }
+
+    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+        self.service_uninstall_absent()
+    }
+
+    fn enable(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+        self.service_enable(snapshot)
+    }
+
+    fn disable(&self, snapshot: ScmSnapshot) -> Result<()> {
+        self.service_disable(snapshot)
+    }
+
+    fn start(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+        self.service_start(snapshot, budget)
+    }
+
+    fn request_start_after_stop(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+        self.service_request_start_after_stop(snapshot)
+    }
+
+    fn stop(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+        self.service_stop(snapshot, budget)
+    }
+
+    fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+        self.service_kill(snapshot)
     }
 
     /// Interim: SCM installs no task yet, so no id reaches here as one.
