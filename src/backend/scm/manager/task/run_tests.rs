@@ -126,6 +126,36 @@ fn a_start_that_named_nothing_follows_the_one_live_instance() {
     );
 }
 
+/// A `Run` whose `EnginePID` read `SCHED_E_TASK_NOT_RUNNING` returns the instance's GUID and no pid: the
+/// run began and had ended already. Its own record, whichever runs are alive or recorded beside it, is
+/// the run followed.
+#[skuld::test]
+fn a_start_that_named_no_pid_but_whose_own_run_left_a_record_follows_that_record() {
+    let own = written(1, 7, RunOutcome::Exited(0));
+    // Another run's record that began earlier: the earliest rule would take it.
+    let earlier = written(9, 2, RunOutcome::Exited(5));
+
+    // None alive.
+    assert_eq!(
+        identify(Some(&unnamed(1)), &[], &[earlier.clone(), own.clone()]),
+        Identity::Done(own.clone())
+    );
+    // One other run alive: not the one followed.
+    assert_eq!(
+        identify(Some(&unnamed(1)), &[instance(9, 900)], &[own.clone()]),
+        Identity::Done(own.clone())
+    );
+    // Several others alive: not unrecorded.
+    assert_eq!(
+        identify(
+            Some(&unnamed(1)),
+            &[instance(8, 800), instance(9, 900)],
+            &[earlier, own.clone()]
+        ),
+        Identity::Done(own)
+    );
+}
+
 #[skuld::test]
 fn a_run_that_started_nothing_is_not_live_and_is_unrecorded() {
     assert_eq!(identify(Some(&unnamed(1)), &[], &[]), Identity::Unrecorded);

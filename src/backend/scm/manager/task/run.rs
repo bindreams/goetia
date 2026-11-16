@@ -51,13 +51,19 @@ pub(super) enum Identity {
 /// The run a `run` follows, from what `started` (the `Run` call) named, the runs that are `live` and the
 /// records that `appeared` after the pin was taken. A pure function of the three.
 ///
-/// `Run` named an instance when it returned a pid: that instance is followed if it is alive, and its
-/// record read if not, whatever else is alive or recorded. `Run` named none when it returned no pid (the
-/// start was ignored under `IgnoreNew`, or refused): then one run alive is the one followed (a scheduled
-/// run began after the command was asked), several alive are none known to be ours, and with none alive
-/// the records decide: one is it, none is unrecorded, and several are the earliest by `started` (the
-/// user's own concurrent start: a stated contract).
+/// A record of the instance `Run` returned is the run followed, whether or not `Run` returned a pid.
+/// Without one, `Run` named an instance when it returned a pid: that instance is followed if it is
+/// alive, and its record read if not, whatever else is alive or recorded. `Run` named none when it
+/// returned no pid (the start was ignored under `IgnoreNew`, or refused): then one run alive is the
+/// one followed (a scheduled run began after the command was asked), several alive are none known to
+/// be ours, and with none alive the records decide: one is it, none is unrecorded, and several are
+/// the earliest by `started` (the user's own concurrent start: a stated contract).
 pub(super) fn identify(started: Option<&Started>, live: &[Instance], appeared: &[RunRecord]) -> Identity {
+    // A record of the run `Run` named, whatever pid it came with: `EnginePID` reads
+    // `SCHED_E_TASK_NOT_RUNNING` for a run that began and ended before it was asked, and that run is ours.
+    if let Some(record) = started.and_then(|started| appeared.iter().find(|record| record.instance == started.id)) {
+        return Identity::Done(record.clone());
+    }
     let named = started.and_then(|started| started.pid.map(|_| started.id));
     match (named, live) {
         (Some(own), _) => match live.iter().find(|instance| instance.id == own) {
