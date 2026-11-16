@@ -3,8 +3,11 @@
 //!
 //! `start` loads the job from wherever its plist is and kicks it: it requests a run and returns, and a
 //! run in flight is left alone (measured: `kickstart` of a running job does nothing). `stop` ends the
-//! run in flight, and any run that begins while it does, with SIGTERM by label, and returns when
-//! launchd shows no process.
+//! run in flight, and any run that begins while it does, as the task's `stop-action` says (SIGTERM by
+//! label, then SIGKILL once its `timeout` is over; SIGKILL at once for `kill`), and returns when launchd
+//! shows no process.
+
+use std::time::Duration;
 
 use super::kill::JobKill;
 use super::task::TaskPrint;
@@ -16,7 +19,7 @@ use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, State, Step, flow};
-use crate::spec::Id;
+use crate::spec::{Id, StopAction, StopSignal};
 
 /// What one pass of `stop` left to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +32,46 @@ enum Pass {
     /// found none for) or a job other than the one watched, and its view has to catch up. The pause is
     /// [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing.
     Behind,
+    /// Read again: the run with this pid ignored SIGTERM for its `timeout`, so the next pass that finds
+    /// it sends SIGKILL.
+    Escalate(u32),
+}
+
+/// What a task's stop sends and how long a run has to answer it: its `stop-action`. A job whose
+/// metadata does not decode has none, and is sent SIGTERM and waited for as long as the caller's budget
+/// allows, as before `stop-action`.
+#[derive(Debug, Clone, Copy)]
+struct Ending {
+    /// `send-signal: kill`: SIGKILL at once.
+    kill: bool,
+    /// How long a run has to answer SIGTERM before it is sent SIGKILL. `None` never escalates.
+    grace: Option<Duration>,
+    /// The run whose grace ran out: SIGKILL is for it, and a run that began since is a new one.
+    escalated: Option<u32>,
+}
+
+impl Ending {
+    fn of(action: Option<StopAction>) -> Ending {
+        Ending {
+            kill: action.is_some_and(|action| action.send_signal == StopSignal::Kill),
+            grace: action.and_then(|action| action.timeout),
+            escalated: None,
+        }
+    }
+
+    /// Whether the run `pid` is sent SIGKILL, rather than SIGTERM.
+    fn kills(&self, pid: u32) -> bool {
+        self.kill || self.escalated == Some(pid)
+    }
+}
+
+/// Whether `a` ends before `b`; no deadline never does.
+fn ends_before(a: Deadline, b: Deadline) -> bool {
+    match (a.at(), b.at()) {
+        (Some(a), Some(b)) => a < b,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// What a `print` that shows no pid says of the job.
@@ -83,25 +126,38 @@ impl Launchd {
     ///   signal cannot reach before (`launchctl kill` of that state answers "No process to signal"
     ///   and does not cancel the start). That wait is on `print`, and under no budget, whatever it is:
     ///   it lasts as long as launchd's throttle.
-    /// - A pid: watches it, confirms that `print` still shows it, signals SIGTERM by label, and waits
-    ///   for the exit under `budget` (`Immediate` does not wait). A run that began meanwhile is a real
-    ///   run and is ended too, so the loop ends only when no process is left.
+    /// - A pid: watches it, confirms that `print` still shows it, signals it by label, and waits for the
+    ///   exit under `budget` (`Immediate` does not wait). The signal is the `action`'s: SIGKILL for
+    ///   `send-signal: kill`, else SIGTERM. A run that ignores SIGTERM for the action's `timeout` (if the
+    ///   budget lasts that long) is sent SIGKILL by the next pass, which finds it by its pid, and is waited
+    ///   for under `budget` too: the `timeout` is the grace the user configured, as systemd's
+    ///   `TimeoutStopSec=` is. No `action`, or a `timeout` of `null`, never escalates. A run that began
+    ///   meanwhile is a real run and is ended too, with a grace of its own, so the loop ends only when no
+    ///   process is left.
     ///
     /// A pid that exited before it was watched, or is not the job's any more, is the next pass, paced
     /// by [`UNLOAD_POLL`] while launchd's view catches up. The first pass draws on `reservation`, and each
     /// later one on one of its own: an uncapped loop would draw what was never reserved. A pass that
     /// cannot reserve returns that error, the SIGTERM standing. The one [`Watch`] is made first, so that
     /// failing to make it sends nothing.
-    pub(super) fn stop_task(&self, id: &Id, budget: Budget, reservation: &mut Reservation) -> Result<()> {
+    pub(super) fn stop_task(
+        &self,
+        id: &Id,
+        action: Option<StopAction>,
+        budget: Budget,
+        reservation: &mut Reservation,
+    ) -> Result<()> {
         let watch = Watch::new()?;
+        let mut ending = Ending::of(action);
         // From the verb's entry. Unused under `Immediate`, which waits for no exit.
         let deadline = budget.start();
         let mut own: Option<Reservation> = None;
         loop {
             let pass = own.as_mut().unwrap_or(&mut *reservation);
-            match self.stop_pass(id, budget, deadline, &watch, pass)? {
+            match self.stop_pass(id, &ending, budget, deadline, &watch, pass)? {
                 Pass::Done => return Ok(()),
                 Pass::Again => {}
+                Pass::Escalate(pid) => ending.escalated = Some(pid),
                 Pass::Behind => std::thread::sleep(UNLOAD_POLL),
             }
             own = Some(flow::reserved(self, id, &[Step::Stop], budget)?);
@@ -156,6 +212,7 @@ impl Launchd {
     fn stop_pass(
         &self,
         id: &Id,
+        ending: &Ending,
         budget: Budget,
         deadline: Deadline,
         watch: &Watch,
@@ -189,14 +246,27 @@ impl Launchd {
         if still.pid != Some(pid) {
             return Ok(Pass::Behind);
         }
-        if self.launchctl.signal(name, "SIGTERM", reservation)? == SignalOutcome::NoProcess {
+        let kills = ending.kills(pid);
+        let signal = if kills { "SIGKILL" } else { "SIGTERM" };
+        if self.launchctl.signal(name, signal, reservation)? == SignalOutcome::NoProcess {
             return Ok(Pass::Behind);
         }
         if budget == Budget::Immediate {
             return Ok(Pass::Done);
         }
-        match registered.wait(Some(deadline))? {
+        // A run sent SIGTERM has its `timeout` to answer, if the caller waits that long; SIGKILL has no
+        // answer to wait for, and is waited for as long as the caller's budget allows.
+        let grace = match ending.grace {
+            Some(grace) if !kills => Some(Budget::Bounded(grace).start()),
+            _ => None,
+        };
+        let (until, escalating) = match grace {
+            Some(grace) if ends_before(grace, deadline) => (grace, true),
+            _ => (deadline, false),
+        };
+        match registered.wait(Some(until))? {
             Some(_) => Ok(Pass::Again),
+            None if escalating => Ok(Pass::Escalate(pid)),
             None => Err(budget::timed_out(name, "stopped", budget)),
         }
     }

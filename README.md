@@ -261,6 +261,12 @@ records the end as it does.
   (measured), but macOS 14, which goetia supports, could not be measured:
   GitHub no longer offers a runner for it. `1` does not depend on what `0` does
   there.
+  `ExitTimeOut` applies only when launchd itself boots a job out, which a task's
+  `stop` never does: goetia ends a task's run itself, with `SIGKILL` at once for
+  `kill` and otherwise `SIGTERM`, then `SIGKILL` if the run is still going when
+  `timeout` is over. As systemd's `TimeoutStopSec=` is, that is the grace the
+  manifest configures; a `stop --timeout` shorter than it ends the wait first,
+  and the run keeps going.
 - **Windows** reads, checks and records the field, and does not apply it yet:
   the shim still ends the daemon at once on every stop, `stop`, `restart` and
   `uninstall` included, whatever `stop-action` says. A task is stopped by Task
