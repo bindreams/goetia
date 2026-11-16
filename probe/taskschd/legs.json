@@ -1,3 +1,4 @@
 [
-  {"name": "f", "cmd": "f.ps1"}
+  {"name": "f", "cmd": "f.ps1"},
+  {"name": "f3", "cmd": "f.ps1 -Only F3"}
 ]

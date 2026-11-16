@@ -6,7 +6,7 @@
 #       (owner, protection and the set of entries: what is_as_wanted compares).
 #   F3  which DACL call on runs\<id> leaves a child file's DACL, and the DACL of a hard link's target, as they were:
 #       SetNamedSecurityInfoW on the path, or SetSecurityInfo on a handle opened with WRITE_DAC.
-param()
+param([string]$Only = 'F12 F3')
 . "$PSScriptRoot\common.ps1"
 Section "platform"; Show-Platform
 
@@ -47,6 +47,15 @@ public static class F {
         var sa = new SA { Length = Marshal.SizeOf(typeof(SA)), Sd = Sd(sddl), Inherit = 0 };
         return CreateDirectoryW(path, ref sa) ? 0 : Marshal.GetLastWin32Error();
     }
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool SetKernelObjectSecurity(SafeFileHandle h, uint info, IntPtr sd);
+    // The same through the kernel's own call, which has no propagation to children: the SD's protected bit is the one set.
+    public static uint SetDaclKernel(string path, string sddl) {
+        using (var h = CreateFileW(path, 0x40000 | 0x20000, 7, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero)) {
+            if (h.IsInvalid) return (uint)Marshal.GetLastWin32Error();
+            return SetKernelObjectSecurity(h, DACL_PROTECTED, Sd(sddl)) ? 0u : (uint)Marshal.GetLastWin32Error();
+        }
+    }
     public static int HardLink(string link, string existing) { return CreateHardLinkW(link, existing, IntPtr.Zero) ? 0 : Marshal.GetLastWin32Error(); }
     const uint DACL_PROTECTED = 0x80000004; // DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
     // The DACL of `sddl`, protected, set on the path by name.
@@ -84,6 +93,7 @@ function Remove-Tree([string]$Path) { if (Test-Path -LiteralPath $Path) { Remove
 $PD = $env:ProgramData
 $FOLDER = 'O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;WD)'
 
+if ($Only -match 'F12') {
 # F1 ==================================================================================================================
 Section "F1 a standard user creating a folder under $PD"
 icacls $PD
@@ -127,40 +137,62 @@ if ($r -eq 0) {
     }
 }
 Remove-Tree $g
+}
 
 # F3 ==================================================================================================================
-Section "F3 the DACL call for runs\<id> and what it leaves alone"
+if ($Only -match 'F3') {
+Section "F3 the DACL call for runs\<id>: what it leaves alone, and what the new principal can still do"
+New-Item -ItemType Directory -Force C:\probe | Out-Null
+icacls C:\probe '/grant' 'Everyone:(OI)(CI)M' | Out-Null
 $root = 'C:\probe\f3'
 Remove-Tree $root; New-Item -ItemType Directory -Force $root | Out-Null
-$A = 'S-1-5-32-545'   # Users stands for the first principal
-$B = 'S-1-5-32-546'   # Guests stands for the new one
-function Runs-Sddl([string]$Principal, [switch]$DeleteChild) {
-    # the principal's entry for the folder itself carries delete-child; the inheritable one is for files
-    $own = if ($DeleteChild) { "(A;;0x1301fb;;;$Principal)" } else { '' }
-    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OI;0x1301bf;;;$Principal)$own"
+$ua = New-ProbeUser 'gfa' -NoBatchRight
+$ub = New-ProbeUser 'gfb' -NoBatchRight
+function Runs-Sddl([string]$Principal) {
+    # the principal's inheritable entry is for the files made in the folder (inherit-only); its entry for the
+    # folder itself has no add-subdirectory (0x4) and has delete-child (0x40)
+    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OIIO;0x1301bf;;;$Principal)(A;;0x1301fb;;;$Principal)"
 }
-foreach ($variant in 'named', 'handle') {
+function As($U, [string]$Command) {
+    $cred = New-Object Management.Automation.PSCredential($U.Qualified, (ConvertTo-SecureString $U.Password -AsPlainText -Force))
+    $o = "C:\probe\as-$($U.Name).out"; Remove-Item $o -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', "$Command > $o 2>&1" -Credential $cred -WorkingDirectory C:\probe -LoadUserProfile -Wait -PassThru
+    "    as $($U.Name): $Command -> exit $($p.ExitCode) $((Get-Content $o -Raw -ErrorAction SilentlyContinue) -replace '\s+', ' ')"
+}
+# A victim: a file in an unprotected folder, so a propagating call would rewrite its inherited entries.
+$vd = Join-Path $root 'victims'; New-Item -ItemType Directory $vd | Out-Null
+foreach ($variant in 'named', 'handle', 'kernel') {
     "--- $variant"
     $d = Join-Path $root "id-$variant"
-    $victim = Join-Path $root "victim-$variant.txt"
+    $victim = Join-Path $vd "victim-$variant.txt"
     "x" | Set-Content $victim
-    icacls $victim '/inheritance:r' '/grant:r' 'SYSTEM:(F)' 'Administrators:(F)' 'Everyone:(R)' | Out-Null
-    $e = [F]::MakeDir($d, (Runs-Sddl $A))
-    "MakeDir(id) win32 result $e"
+    "MakeDir(id) win32 result $([F]::MakeDir($d, (Runs-Sddl $ua.Sid)))"
+    "  the folder as made: $(Sddl $d)"
+    As $ua "copy NUL $d\recA.json"
+    "  recA.json as made by the first principal: $(Sddl (Join-Path $d 'recA.json'))"
     $child = Join-Path $d 'rec.json'
     "x" | Set-Content $child
     $link = Join-Path $d 'link.json'
     "HardLink(link -> victim) win32 result $([F]::HardLink($link, $victim))"
-    $before = @{ dir = (Sddl $d); child = (Sddl $child); victim = (Sddl $victim) }
-    $new = Runs-Sddl $B -DeleteChild
-    $status = if ($variant -eq 'named') { [F]::SetDaclNamed($d, $new) } else { [F]::SetDaclHandle($d, $new) }
+    $before = @{ dir = (Sddl $d); child = (Sddl $child); victim = (Sddl $victim); recA = (Sddl (Join-Path $d 'recA.json')) }
+    $new = Runs-Sddl $ub.Sid
+    $status = switch ($variant) { 'named' { [F]::SetDaclNamed($d, $new) } 'handle' { [F]::SetDaclHandle($d, $new) } 'kernel' { [F]::SetDaclKernel($d, $new) } }
     "set the DACL ($variant): win32 result $status"
-    $after = @{ dir = (Sddl $d); child = (Sddl $child); victim = (Sddl $victim) }
-    foreach ($k in 'dir', 'child', 'victim') {
+    $after = @{ dir = (Sddl $d); child = (Sddl $child); victim = (Sddl $victim); recA = (Sddl (Join-Path $d 'recA.json')) }
+    foreach ($k in 'dir', 'child', 'recA', 'victim') {
         "$k unchanged: $($before[$k] -eq $after[$k])"
         "  before: $($before[$k])"
         "  after : $($after[$k])"
     }
-    "link.json (the same file as the victim) after: $(Sddl $link)"
+    "the folder, read back: $(Sddl $d)"
+    "the new principal, after the change:"
+    As $ub "copy NUL $d\recB.json"
+    As $ub "del $d\recA.json"
+    As $ub "mkdir $d\sub"
+    "the first principal, after the change:"
+    As $ua "copy NUL $d\recA2.json"
+    "left in the folder: $((Get-ChildItem $d -Force | ForEach-Object Name) -join ', ')"
 }
+Remove-ProbeUser $ua; Remove-ProbeUser $ub
 Remove-Tree $root
+}
