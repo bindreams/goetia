@@ -270,7 +270,7 @@ fn an_evenly_spaced_list_is_one_trigger_with_a_repetition() {
             repeat: repeat(15, 525)
         }]
     );
-    // Every hour of the day from 03:00 and a lone hour: the grid is the minutes' own.
+    // A step that does not divide 60 in a lone hour: one repetition, on the minutes' own grid.
     assert_eq!(
         triggers("*/7 3 * * *"),
         [Trigger::Daily {
@@ -309,7 +309,7 @@ fn more_than_48_triggers_is_refused_naming_the_limit() {
     let text = format!("{minutes} * 1 * 1");
     assert_eq!(
         refusal(&text),
-        format!("daemon `{ID}`: schedule `{text}` needs 50 Task Scheduler triggers, and a task holds at most 48")
+        format!("daemon `{ID}`: schedule `{text}` compiles to 50 Task Scheduler triggers, and a task holds at most 48")
     );
     // The days of the month alone are 25, under the cap.
     assert_eq!(triggers(&format!("{minutes} * 1 * *")).len(), 25);
@@ -351,6 +351,7 @@ fn a_date_none_of_the_day_fields_has_is_the_weekday_part_alone() {
             repeat: None
         }]
     );
+    assert_fires_as_cron_says(&["0 0 30 2 1"]);
 }
 
 #[skuld::test]

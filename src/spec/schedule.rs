@@ -125,6 +125,8 @@ impl Schedule {
         }
     }
 
+    /// The days the two day fields name together, combined as [`Schedule::day_rule`] says; a field
+    /// that matches every value of its range is unrestricted.
     pub(crate) fn days(&self) -> DaySelection {
         let [.., days, _, weekdays] = self.fields();
         match (self.day_rule(), days.values.len() == 31, weekdays.values.len() == 7) {

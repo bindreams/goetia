@@ -8,6 +8,12 @@
 //! one trigger, and a `Duration` includes its last tick; a task holds at most [`TRIGGER_LIMIT`]
 //! triggers.
 //!
+//! # Either-or days
+//!
+//! A restricted day of the month OR a restricted weekday is two sets of triggers, one for each,
+//! and a date both name has two triggers on the same minute (there is no AND-NOT). Whether
+//! `IgnoreNew` keeps that to one run is measured in Task 4 Step 0 (link to come).
+//!
 //! # The time of day
 //!
 //! Cron's minute grid restarts each hour and Task Scheduler's each day, so minutes are one
@@ -106,7 +112,7 @@ pub(crate) fn compile(schedule: &Schedule, id: &Id) -> Result<Vec<Trigger>, Erro
         return Err(invalid(
             id,
             &format!(
-                "schedule `{}` needs {count} Task Scheduler triggers, and a task holds at most {TRIGGER_LIMIT}",
+                "schedule `{}` compiles to {count} Task Scheduler triggers, and a task holds at most {TRIGGER_LIMIT}",
                 schedule.text()
             ),
         ));
