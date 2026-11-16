@@ -144,28 +144,33 @@ fn watch(id: String, step: Arc<AtomicUsize>) {
     });
 }
 
-/// How many event 67 ("profile loaded") the User Profile Service has logged. Rounds run one at a time, so a round
-/// whose count after the logon is higher than before it loaded a profile.
+/// The record number of the newest event 67 ("profile loaded") of the User Profile Service (0 for none). The log is
+/// circular, so its event count stops growing once it is full; record numbers only grow. Rounds run one at a time,
+/// so a round whose number after the logon is higher than before it loaded a profile.
 fn count_profile_loads() -> usize {
     let out = Command::new("wevtutil.exe")
         .args([
             "qe",
             "Microsoft-Windows-User Profile Service/Operational",
             "/q:*[System[(EventID=67)]]",
+            "/c:1",
+            "/rd:true",
             "/f:xml",
         ])
         .output()
         .expect("spawn wevtutil");
     assert!(out.status.success(), "wevtutil: {out:?}");
-    String::from_utf8_lossy(&out.stdout)
-        .matches("<EventID>67</EventID>")
-        .count()
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split("<EventRecordID>")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .map_or(0, |id| id.parse().expect("a record number"))
 }
 
-/// Asserts that the round's logon loaded a profile: event 67 was logged since `before`.
+/// Asserts that the round's logon loaded a profile: a newer event 67 was logged since `before`.
 fn assert_profile_loaded(id: &str, before: usize) {
     let after = count_profile_loads();
-    eprintln!("[probe] {id} event 67 count {before} -> {after}");
+    eprintln!("[probe] {id} newest event 67 record {before} -> {after}");
     assert!(after > before, "no event 67 logged by the round of {id}");
 }
 
