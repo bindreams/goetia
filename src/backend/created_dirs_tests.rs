@@ -285,6 +285,52 @@ fn create_decides_under_a_root_on_the_resolved_path_not_the_text() {
     assert!(layout.system().join("new").is_dir());
 }
 
+/// The trail holds what decides where the path resolves. A directory the path leaves through `..`
+/// does not: its owner cannot change what `..` of it is.
+#[skuld::test(labels = [ELEVATED])]
+fn create_does_not_judge_a_directory_the_path_leaves_through_dotdot() {
+    let layout = Layout::new();
+    let account = layout.system().join("u");
+    fs::create_dir(&account).unwrap();
+    give_to_a_stranger(&account);
+    let mut dirs = layout.dirs();
+
+    dirs.create(&account.join("../new/deep"), None)
+        .expect("an account's directory the path only passes through is not a reason");
+
+    assert!(layout.system().join("new/deep").is_dir());
+    let err = dirs
+        .create(&account.join("inside"), None)
+        .expect_err("what is made in the account's directory is refused");
+    assert!(refusal(&err).contains("uid"), "{err:?}");
+}
+
+/// What an absolute symlink's path is read from is the link: the directories before it, which only led
+/// to the link, do not decide where the path resolves. The directory that holds the link does, and so
+/// does a link to `..`, whose directory the path is then left through.
+#[skuld::test(labels = [ELEVATED])]
+fn create_judges_the_directory_that_holds_a_link_but_not_those_before_it() {
+    let layout = Layout::new();
+    let account = layout.system().join("u");
+    fs::create_dir_all(account.join("v")).unwrap();
+    give_to_a_stranger(&account);
+    symlink(layout.system(), account.join("v/to-system")).unwrap();
+    let mut dirs = layout.dirs();
+
+    dirs.create(&account.join("v/to-system/new"), None)
+        .expect("u only led to the link; v, root's, holds it");
+
+    assert!(layout.system().join("new").is_dir());
+    symlink(layout.system(), account.join("holds")).unwrap();
+    symlink("..", account.join("up")).unwrap();
+    for link in ["holds", "up"] {
+        let err = dirs
+            .create(&account.join(link).join("other"), None)
+            .expect_err("the account that holds the link decides where it leads");
+        assert!(refusal(&err).contains(account.to_str().unwrap()), "{link}: {err:?}");
+    }
+}
+
 #[skuld::test(labels = [ELEVATED])]
 fn create_follows_a_root_owned_link_into_a_root_and_judges_the_target_not_the_name() {
     let layout = Layout::new();
@@ -531,11 +577,16 @@ fn create_uses_a_path_that_ends_in_dotdot_as_the_directory_it_names() {
 }
 
 /// What an install made is put in place by a rename that replaces nothing, so what is at a name by then
-/// is not the install's, and is not replaced. A root-owned directory is used, as the walk would have
-/// used it; anything else is a refusal, left as it is, with nothing of the install's beside it.
+/// is not the install's: it fails, whatever it is and whoever owns it, the entry is left as it is, and
+/// nothing of the install's is left beside it. Running the install again uses it.
 #[skuld::test(labels = [ELEVATED])]
-fn make_refuses_what_appeared_at_the_final_name_after_the_walk_unless_it_is_a_root_owned_directory() {
-    for kind in ["a stranger's directory", "a file", "a symlink to a directory"] {
+fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_it_is() {
+    for kind in [
+        "a stranger's directory",
+        "a root-owned directory",
+        "a file",
+        "a symlink to a directory",
+    ] {
         let layout = Layout::new();
         let raced = layout.system().join("a");
         let mut dirs = layout.dirs();
@@ -546,121 +597,60 @@ fn make_refuses_what_appeared_at_the_final_name_after_the_walk_unless_it_is_a_ro
             _ => {
                 fs::create_dir(&raced).unwrap();
                 fs::set_permissions(&raced, fs::Permissions::from_mode(0o700)).unwrap();
-                give_to_a_stranger(&raced);
+                if kind == "a stranger's directory" {
+                    give_to_a_stranger(&raced);
+                }
             }
         }
 
         let err = dirs.make(vec![(found, None)]).expect_err("the name is taken");
 
-        assert!(refusal(&err).contains("exists"), "{kind}: {err:?}");
+        let why = refusal(&err);
+        assert!(
+            why.contains("appeared while the install ran") && why.contains("running the install again"),
+            "{kind}: {err:?}"
+        );
         drop(dirs);
         assert_eq!(leftovers(&layout.system()), Vec::<String>::new(), "{kind}");
         assert_eq!(fs::read_dir(layout.outside()).unwrap().count(), 0, "{kind}");
+        if kind.ends_with("directory") && !kind.starts_with("a symlink") {
+            assert_eq!(mode(&raced), 0o700, "{kind}");
+            assert_eq!(
+                fs::read_dir(&raced).unwrap().count(),
+                0,
+                "{kind}: nothing was put in it"
+            );
+        }
         if kind == "a stranger's directory" {
             assert_eq!(owner_of(&raced), (STRANGER, STRANGER));
-            assert_eq!(mode(&raced), 0o700);
-            assert_eq!(fs::read_dir(&raced).unwrap().count(), 0, "nothing was put in it");
         }
     }
 }
 
-/// A root-owned directory that appears at a name after the walk (another install's) is where the rest
-/// is made: what is still missing goes inside it, it is not touched, and the install's own tree is
-/// gone. One component is settled per conflict, from the top down.
+/// What stands at the final name is a directory this same install made: the spec names one directory
+/// twice (on a file system that ignores case, under two spellings). The refusal says so.
 #[skuld::test(labels = [ELEVATED])]
-fn make_uses_a_root_owned_directory_that_appeared_after_the_walk_and_makes_what_is_missing_in_it() {
-    for already in [vec!["a"], vec!["a", "b"], vec!["a", "b", "c"]] {
-        let layout = Layout::new();
-        let mut dirs = layout.dirs();
-        let found = dirs.plan(&layout.system().join("a/b/c")).unwrap();
-        let mut taken = layout.system();
-        for name in &already {
-            taken.push(name);
-            fs::create_dir(&taken).unwrap();
-            fs::set_permissions(&taken, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-
-        dirs.make(vec![(found, None)]).unwrap();
-
-        let deepest = layout.system().join("a/b/c");
-        assert_eq!(
-            mode(&layout.system().join("a")),
-            0o700,
-            "{already:?}: what was there is untouched"
-        );
-        assert_eq!(owner_of(&deepest), (0, 0), "{already:?}");
-        assert_eq!(leftovers(&layout.system()), Vec::<String>::new(), "{already:?}");
-        if already.len() < 3 {
-            assert_eq!(mode(&deepest), 0o755, "{already:?}");
-        }
-        drop(dirs);
-        // Only what the install made is taken back.
-        assert!(layout.system().join(already.join("/")).is_dir(), "{already:?}");
-        assert_eq!(
-            layout.system().join("a/b/c").exists(),
-            already.len() == 3,
-            "{already:?}"
-        );
-        assert_eq!(leftovers(&layout.system()), Vec::<String>::new(), "{already:?}");
-    }
-}
-
-/// Two daemons whose paths share a parent that is missing, installed at once: whichever puts the parent
-/// in place first, the other uses it, and both installs succeed. Each takes back only its own.
-#[skuld::test(labels = [ELEVATED])]
-fn two_installs_that_share_a_missing_parent_both_succeed_and_each_undoes_only_its_own() {
-    let layout = Layout::new();
-    let mut first = layout.dirs();
-    let mut second = layout.dirs();
-    let for_first = first.plan(&layout.system().join("shared/a")).unwrap();
-    let for_second = second.plan(&layout.system().join("shared/b")).unwrap();
-
-    first.make(vec![(for_first, Some(stranger_owner()))]).unwrap();
-    second.make(vec![(for_second, Some(stranger_owner()))]).unwrap();
-
-    assert_eq!(owner_of(&layout.system().join("shared/a")), (STRANGER, STRANGER));
-    assert_eq!(owner_of(&layout.system().join("shared/b")), (STRANGER, STRANGER));
-    assert_eq!(owner_of(&layout.system().join("shared")), (0, 0));
-    assert_eq!(leftovers(&layout.system()), Vec::<String>::new());
-    drop(second);
-    assert!(!layout.system().join("shared/b").exists());
-    assert!(
-        layout.system().join("shared/a").is_dir(),
-        "the other install's is not taken back"
-    );
-    drop(first);
-    assert!(
-        !layout.system().join("shared").exists(),
-        "the one that made it takes it back, now empty"
-    );
-}
-
-/// The deepest directory is handed over only if the install made it: where it already stands, it is not
-/// the install's to hand to anyone.
-#[skuld::test(labels = [ELEVATED])]
-fn make_hands_over_only_what_it_ended_up_making_when_part_of_the_path_appeared() {
+fn make_says_two_paths_name_the_same_directory_when_the_name_taken_is_one_it_made() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
-    let found = dirs.plan(&layout.system().join("a/b")).unwrap();
-    fs::create_dir(layout.system().join("a")).unwrap();
-    let again = dirs.plan(&layout.system().join("c")).unwrap();
-    fs::create_dir(layout.system().join("c")).unwrap();
-
-    dirs.make(vec![(found, Some(stranger_owner())), (again, Some(stranger_owner()))])
+    let first = dirs.plan(&layout.system().join("a/x")).unwrap();
+    let second = dirs.plan(&layout.system().join("b/y")).unwrap();
+    dirs.make_missing(first.found, None).unwrap();
+    dirs.make_missing(second.found, None).unwrap();
+    // What a file system that ignores case does: the second tree's final name is the first's.
+    let second_top = dirs
+        .made
+        .iter()
+        .position(|made| made.pending.as_deref() == Some(OsStr::new("b")))
         .unwrap();
+    dirs.made[second_top].pending = Some(OsString::from("a"));
 
-    assert_eq!(owner_of(&layout.system().join("a")), (0, 0));
-    assert_eq!(
-        owner_of(&layout.system().join("a/b")),
-        (STRANGER, STRANGER),
-        "made, so handed over"
+    let err = dirs.place().expect_err("the first tree is at the name");
+
+    assert!(
+        refusal(&err).contains("two paths in the spec name the same directory"),
+        "{err:?}"
     );
-    assert_eq!(
-        owner_of(&layout.system().join("c")),
-        (0, 0),
-        "it stood, so it is not handed over"
-    );
-    assert_eq!(leftovers(&layout.system()), Vec::<String>::new());
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -1022,18 +1012,26 @@ fn a_handed_directory_that_holds_what_undo_left_is_not_blamed_on_the_account() {
 }
 
 /// A later plan that hands over a directory an earlier plan made and marked for an owner hands it to
-/// that owner: asking for another is a bug of the caller, which gives every plan one account.
-#[cfg(debug_assertions)]
+/// that owner: asking for another is an error that names the two, not a guess.
 #[skuld::test(labels = [ELEVATED])]
-#[should_panic(expected = "another owner")]
-fn a_later_plan_that_hands_a_made_directory_to_another_owner_is_a_bug() {
+fn a_later_plan_that_hands_a_made_directory_to_another_owner_is_an_error() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     let first = dirs.plan(&layout.system().join("a")).unwrap();
     let again = dirs.plan(&layout.system().join("a")).unwrap();
     let other = Owner::new(Uid::from_raw(STRANGER + 1), None).unwrap();
 
-    let _ = dirs.make(vec![(first, Some(stranger_owner())), (again, Some(other))]);
+    let err = dirs
+        .make(vec![(first, Some(stranger_owner())), (again, Some(other))])
+        .expect_err("one directory has one owner");
+
+    let why = refusal(&err);
+    assert!(
+        why.contains(&STRANGER.to_string()) && why.contains(&(STRANGER + 1).to_string()),
+        "{why}"
+    );
+    drop(dirs);
+    assert!(!layout.system().join("a").exists(), "nothing is left");
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -1238,4 +1236,15 @@ fn drop_keeps_the_directories_while_a_panic_unwinds() {
         (STRANGER, STRANGER),
         "kept, as handed over when it was made"
     );
+}
+
+/// A path from the spec is text a person reads on stderr: a control character in it is written escaped,
+/// as the CLI writes what it quotes.
+#[skuld::test]
+fn a_warning_escapes_the_paths_it_names() {
+    let path = Path::new("/var/lib/a\nerror: b\u{1b}[2J");
+
+    let line = warning_line(format_args!("could not remove {}", path.display()));
+
+    assert_eq!(line, r"warning: could not remove /var/lib/a\u{a}error: b\u{1b}[2J");
 }

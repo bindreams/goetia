@@ -11,7 +11,9 @@ mod report;
 mod within;
 
 #[cfg(feature = "cli")]
-pub(crate) use escape::{EscapedStream, escape};
+pub(crate) use escape::EscapedStream;
+#[cfg(any(feature = "cli", unix))]
+pub(crate) use escape::escape;
 pub use reason::Reason;
 pub(crate) use report::Chain;
 #[cfg(feature = "cli")]

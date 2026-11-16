@@ -252,3 +252,15 @@ fn the_refusal_text_has_no_runs_of_spaces() {
 
     assert!(!why.contains("  "), "{why}");
 }
+
+/// A directory the path leaves through `..` does not decide where the log lands: its owner cannot
+/// change what `..` of it is.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_beside_a_dotdot_that_leaves_an_account_directory_is_accepted() {
+    let layout = Layout::new();
+    let account = layout.system().join("u");
+    fs::create_dir(&account).unwrap();
+    give_to_a_stranger(&account);
+
+    check(&account.join("../app.log")).unwrap();
+}

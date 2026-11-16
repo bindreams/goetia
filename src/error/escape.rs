@@ -48,7 +48,7 @@ fn write_keeping(out: &mut dyn fmt::Write, text: &str, keep_layout: bool) -> fmt
 }
 
 /// `text` as [`write_escaped`] writes it.
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", unix))]
 pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     write_escaped(&mut out, text).expect("writing to a String cannot fail");

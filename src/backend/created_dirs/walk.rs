@@ -22,7 +22,10 @@ use crate::error::{Error, Result};
 /// What a walk found.
 pub(super) struct Walk {
     pub(super) end: End,
-    /// Every directory entered and every symlink followed, in order, with what the walk read of each.
+    /// What decides where the path resolves, in order, with what the walk read of each: every symlink
+    /// followed and every directory that holds one, and every directory entered that the path did not
+    /// leave through `..` or by an absolute symlink (whoever can change such a directory cannot change
+    /// where the path goes from there).
     pub(super) trail: Vec<Step>,
     /// The directories the path resolved through above its first missing component, `/` first, by
     /// device and inode: `..` and symlinks are resolved, never compared as text.
@@ -196,6 +199,10 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
     let stat = fstat(&cur).map_err(|e| Error::os_at("stat", "/", e))?;
     // The directories from `/` to `cur`, `..` and symlinks resolved.
     let mut chain = vec![id_of(&stat)];
+    // For each directory of `chain`, its place in `trail` and whether a symlink followed lies in it.
+    let mut dirs = vec![(0, false)];
+    // What `trail` does not hold in the end.
+    let mut dropped: Vec<usize> = Vec::new();
     let mut trail = vec![Step {
         at: PathBuf::from("/"),
         stat,
@@ -227,6 +234,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
         if name == ".." {
             let up = open_beneath(cur.as_fd(), &name, SEARCH).map_err(|e| Error::os_at("open", &at, e))?;
             let stat = fstat(&up).map_err(|e| Error::os_at("stat", &at, e))?;
+            let leaves = chain.len() > 1;
             if !step_up(&mut chain, id_of(&stat)) {
                 return Err(Error::os_at(
                     "open",
@@ -234,12 +242,10 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
                     io::Error::other("a directory on the path was moved while it was being resolved"),
                 ));
             }
+            if leaves && let Some((step, false)) = dirs.pop() {
+                dropped.push(step);
+            }
             shown.pop();
-            trail.push(Step {
-                at: shown.clone(),
-                stat,
-                link: false,
-            });
             cur = up;
             continue;
         }
@@ -257,6 +263,9 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
                 stat: *stat,
                 link: true,
             });
+            if let Some((_, holds)) = dirs.last_mut() {
+                *holds = true;
+            }
         }
         // A link as the last component is walked to its target like one in the middle, so that every
         // directory its target is under reaches the trail.
@@ -268,7 +277,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
             chain.push(id_of(&stat));
             return Ok(Walk {
                 end: End::Whole { dir, stat },
-                trail,
+                trail: decided(trail, &dropped),
                 chain,
             });
         }
@@ -279,6 +288,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
                     stat,
                     link: false,
                 });
+                dirs.push((trail.len() - 1, false));
                 chain.push(id_of(&stat));
                 cur = fd;
                 shown = at;
@@ -292,6 +302,9 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
                     cur = open_root()?;
                     let stat = fstat(&cur).map_err(|e| Error::os_at("stat", "/", e))?;
                     chain = vec![id_of(&stat)];
+                    // The path goes on from `/`: the directories that led to the link do not decide it.
+                    dropped.extend(dirs.iter().skip(1).filter(|(_, holds)| !holds).map(|&(step, _)| step));
+                    dirs.truncate(1);
                     shown = PathBuf::from("/");
                 }
                 for step in components(Path::new(&target), true).into_iter().rev() {
@@ -309,7 +322,21 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
     } else {
         End::Missing { holder: cur, missing }
     };
-    Ok(Walk { end, trail, chain })
+    Ok(Walk {
+        end,
+        trail: decided(trail, &dropped),
+        chain,
+    })
+}
+
+/// `trail` without the steps at `dropped`.
+fn decided(trail: Vec<Step>, dropped: &[usize]) -> Vec<Step> {
+    trail
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !dropped.contains(index))
+        .map(|(_, step)| step)
+        .collect()
 }
 
 /// Pop `chain` for a `..` that opened the directory `up`. Whether `up` is the one the pop exposes is
