@@ -368,10 +368,10 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
         }
         // Only says whether a `null` timeout was a `kill`'s: text that does not substitute is not that, and is
         // not this pass's to refuse. Its `.env` is no part of what the signal's errors blame.
-        if let Some(text) = &mut stop_action.base_signal {
-            if substitute(text, Field::StopSignal, vars, &mut BTreeSet::new()).is_err() {
-                stop_action.base_signal = None;
-            }
+        if let Some(text) = &mut stop_action.base_signal
+            && substitute(text, Field::StopSignal, vars, &mut BTreeSet::new()).is_err()
+        {
+            stop_action.base_signal = None;
         }
     }
 

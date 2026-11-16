@@ -3928,6 +3928,26 @@ fn a_substituted_kill_does_not_hand_its_null_timeout_to_another_signal(#[fixture
     }
 }
 
+/// A refusal that comes of a leaf the base wrote names that leaf, with no `backend-specific` in front: the
+/// override wrote the signal, and the `null` timeout that launchd refuses beside it is the base's.
+#[skuld::test]
+fn a_refusal_of_a_merged_in_leaf_names_the_leaf_the_base_wrote() {
+    if !HOST_BACKENDS.contains(&BackendKind::Launchd) {
+        return;
+    }
+    let yaml =
+        format!("{SERVICE}stop-action: {{timeout: null}}\nbackend-specific:\n  launchd:\n    stop-action: terminate\n");
+
+    let msg = resolve_yaml_as(BackendKind::Launchd, &yaml)
+        .expect_err("a wait with no limit is refused on launchd")
+        .to_string();
+
+    assert!(
+        msg.starts_with("daemon `frpc`: `stop-action.timeout: null` is refused on launchd"),
+        "{msg}"
+    );
+}
+
 #[skuld::test]
 fn stop_action_leaves_take_a_substitution(#[fixture(temp_dir)] dir: &Path) {
     write_fixture(
