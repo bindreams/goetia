@@ -938,12 +938,13 @@ fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     );
     assert_eq!(
         journal.read_after_calls(),
-        [(call(&["_STREAM_ID=s1"]), Some("c6".to_string()))],
-        "what is left is read from the stream, after the stream's last line shown"
+        [(stdout_query("x.service"), Some("c6".to_string()))],
+        "what is left is read through the unit's own lines, as the live read was, after the stream's last line shown"
     );
 }
 
-/// After the run's end the rest is read by the stream, so an entry of another stream is not shown.
+/// The rest is read through the unit's lines and the run's stream is picked out of them, so an entry of
+/// another stream is not shown.
 #[skuld::test]
 fn the_rest_of_the_stream_shows_only_the_stream() {
     let journal = JournalFake::new(Vec::new())
