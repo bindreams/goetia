@@ -11,7 +11,7 @@ use goetia::testing::remove_task;
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT};
-use crate::support::windows_tasks::ServiceAccountHost;
+use crate::support::windows_tasks::{ServiceAccountHost, task_spec};
 use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, kill, scm_group};
 use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
 
@@ -139,20 +139,17 @@ fn record_files(id: &Id) -> Vec<String> {
     names
 }
 
-/// A task installed as another user over the records of the first: the record directory's permissions name the new user, who
-/// writes its record and prunes the one the first user's run left. The first user's record carries an
-/// entry for that user only, so the new one deletes it through the directory's own delete-child right.
+/// A task installed as another account over the records of the first: the record directory's permissions
+/// name the new account, which writes its record and prunes the one the first account's run left (the
+/// first's record has an entry for that account only, so the new one deletes it through the directory's
+/// own delete-child right). The accounts are two that need no password, LocalService and NetworkService.
 /// The prune is waited for with no cap, since it is a state of the directory: a prune that fails hangs the
 /// test.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_task_installed_as_another_user_over_the_first_users_records_still_records_and_prunes(
+fn a_task_installed_as_another_account_over_the_first_ones_records_still_records_and_prunes(
     #[fixture(scm_group)] _group: &Group,
 ) {
-    // Declared first, so the accounts go after the task, whose logon they are.
-    let first = format!("gt{:08x}", rand::random::<u32>());
-    let second = format!("gt{:08x}", rand::random::<u32>());
-    let _first_user = LocalUserGuard::create(&first, PASSWORD);
-    let _second_user = LocalUserGuard::create(&second, PASSWORD);
+    // The copies of this binary and the shim before the guard, so they go after the task is removed.
     let id = &test_id();
     let host = ServiceAccountHost::new(id);
     let _guard = ServiceGuard::new(id.as_str());
@@ -163,30 +160,27 @@ fn a_task_installed_as_another_user_over_the_first_users_records_still_records_a
         "0".to_owned(),
         "run".to_owned(),
     ];
+    let as_account = |name: &str| task_spec(id, command.clone(), None, User::Name(name.to_owned()), None);
 
-    assert_succeeded(
-        "install as the first user",
-        &as_user("install", id, &first, &host, &command),
-    );
+    mgr.install(&as_account("LocalService"), false)
+        .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
     let exit = mgr
         .run(id, &mut Vec::new())
-        .unwrap_or_else(|e| panic!("run as {first}: {}", e.report()));
-    assert_eq!(exit, Exit::Code(0), "a recorded run of the first user");
+        .unwrap_or_else(|e| panic!("run as LocalService: {}", e.report()));
+    assert_eq!(exit, Exit::Code(0), "a recorded run of the first account");
     let first_records = record_files(id);
     assert_eq!(first_records.len(), 1, "{first_records:?}");
 
     // The task goes and its records stay, so the install that follows finds the directory there and sets
-    // its permissions for the new user. (An in-place update of the task to another user leaves the task
-    // unreadable by that user's shim, which is not what this tests.)
+    // its permissions for the new account. (An in-place update of the task to another account leaves the
+    // task unreadable by that account's shim, which is not what this tests.)
     remove_task(id);
     assert!(!task_exists(id) && records_of(id).is_dir());
-    assert_succeeded(
-        "install as the second user",
-        &as_user("install", id, &second, &host, &command),
-    );
+    mgr.install(&as_account("NetworkService"), false)
+        .unwrap_or_else(|e| panic!("install as NetworkService: {}", e.report()));
     // `start`, not `run`: a `run` waits holding a pin on the records, and a write prunes nothing then.
     mgr.start(id, Budget::DEFAULT)
-        .unwrap_or_else(|e| panic!("start as {second}: {}", e.report()));
+        .unwrap_or_else(|e| panic!("start as NetworkService: {}", e.report()));
 
     kill::until(|| {
         let now = record_files(id);
