@@ -52,13 +52,16 @@ pub(super) fn snapshot_of(spec: &DaemonSpec, armed: bool) -> TaskSnapshot {
     TaskSnapshot::new(id(), Ok(blob), registered_task(spec, armed))
 }
 
-/// The task's record directory in a temporary `%ProgramData%`, made as an install makes it, for the
-/// account this test runs as (the test removes it).
+/// The task's record directory in a temporary `%ProgramData%`, with the permissions an install gives it
+/// for the account this test runs as (the test removes it). The folders are made plainly first: naming
+/// Administrators as their owner, as an install does, needs an elevated token, and an existing directory
+/// has only its permissions set.
 pub(super) fn records() -> (TempDir, PathBuf, Runs) {
     let dir = tempfile::tempdir().unwrap();
     let runs = Runs::of(dir.path(), &id());
-    runs.ensure(&process_user_sid()).unwrap();
     let path = dir.path().join("Goetia").join("runs").join("nightly");
+    std::fs::create_dir_all(&path).unwrap();
+    runs.ensure(&process_user_sid()).unwrap();
     (dir, path, runs)
 }
 

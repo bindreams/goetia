@@ -5,6 +5,7 @@
 //! and execute; the DACL is protected, so nothing it would inherit is added. A folder has the same,
 //! inherited by what is made in it. `Descriptor` holds them as SDDL, the one place the spec's
 //! permissions are written down, and [`is_as_wanted`] compares what a file has with them.
+//! `Descriptor` also makes the folders, never adopting one that exists ([`Descriptor::create_each`]).
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use super::{Ace, ObjectSecurity};
@@ -27,26 +28,28 @@ fn sorted(aces: &[Ace]) -> Vec<&Ace> {
 }
 
 #[cfg(windows)]
-pub(crate) use system::Descriptor;
+pub(crate) use system::{Descriptor, missing_components};
 
 #[cfg(windows)]
 mod system {
     use std::ffi::c_void;
-    use std::fs::File;
+    use std::fs::{self, File, OpenOptions};
     use std::io;
-    use std::os::windows::io::FromRawHandle as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::path::{Path, PathBuf};
 
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, READ_CONTROL, WRITE_DAC,
     };
 
     use super::super::{ObjectSecurity, system::describe};
@@ -65,6 +68,10 @@ mod system {
     /// for administrators, and the lock's owner check would then refuse a lock another goetia made.
     /// Naming `BA` needs it enabled in the creator's token.
     const LOCK: &str = "O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
+
+    /// What names only the owner: Administrators own it, and the DACL is left for what it is made in to
+    /// inherit. Naming `BA` needs it enabled in the creator's token, like [`LOCK`].
+    const INHERITING: &str = "O:BA";
 
     /// A security descriptor that a file or folder is created with.
     pub(crate) struct Descriptor {
@@ -87,10 +94,20 @@ mod system {
             Self::from_sddl(LOCK)
         }
 
-        /// The permissions of a task's run-record directory: SYSTEM and Administrators have full
-        /// control and `principal`, the account the task runs as, may modify (`0x1301bf`: read,
-        /// write, run and delete, but not change permissions or take ownership); all inherited by
-        /// what is made in it. A SID that is not whole is an error.
+        /// The permissions of the folder that holds goetia's own folders under `%ProgramData%`:
+        /// Administrators own it and it inherits what `%ProgramData%` gives, as the services' logs
+        /// folder under it always has.
+        pub(crate) fn for_goetia() -> Result<Self> {
+            Self::from_sddl(INHERITING)
+        }
+
+        /// The permissions of a task's run-record directory: Administrators own it; SYSTEM and
+        /// Administrators have full control of it and of what is made in it; `principal`, the account the
+        /// task runs as, may modify the files made in it (`0x1301bf`: read, write, run and delete, but
+        /// not change permissions or take ownership; an entry only files inherit) and has, on the
+        /// directory itself, the same without adding a subdirectory (`0x4`) and with deleting entries
+        /// (`0x40`), so that an account that replaces it can prune what it wrote: it holds no entry on
+        /// the files the other made. A SID that is not whole is an error.
         pub(crate) fn for_runs(principal: &Sid) -> Result<Self> {
             let principal = try_sid_display(principal).ok_or_else(|| {
                 Error::os(
@@ -99,7 +116,7 @@ mod system {
                 )
             })?;
             Self::from_sddl(&format!(
-                "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{principal})"
+                "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OIIO;0x1301bf;;;{principal})(A;;0x1301fb;;;{principal})"
             ))
         }
 
@@ -183,30 +200,35 @@ mod system {
             Ok(())
         }
 
-        /// Makes this descriptor's DACL, protected, the DACL of the existing folder or file `path`,
-        /// and of what inherits from it. The owner is left as it is.
-        pub(crate) fn set_dacl(&self, path: &Path) -> io::Result<()> {
-            let wide = wide_null(path)?;
-            let mut dacl: *mut ACL = std::ptr::null_mut();
-            let (mut present, mut defaulted) = (0, 0);
-            // SAFETY: `self.raw` is live until `drop`; the out-pointers are valid lvalues.
-            if unsafe { GetSecurityDescriptorDacl(self.raw, &mut present, &mut dacl, &mut defaulted) } == 0 {
-                return Err(io::Error::last_os_error());
+        /// Creates each of `paths` in order, as folders with this descriptor, each with a call that
+        /// fails when it exists, so that goetia never adopts a folder it did not make: see [`created`].
+        pub(crate) fn create_each(&self, paths: &[PathBuf]) -> Result<()> {
+            for path in paths {
+                self.create_dir(path).map_err(|e| created(path, e))?;
             }
-            // SAFETY: `wide` is NUL-terminated; `dacl` points into `self.raw`, which is live for the call.
-            let status = unsafe {
-                SetNamedSecurityInfoW(
-                    wide.as_ptr(),
-                    SE_FILE_OBJECT,
+            Ok(())
+        }
+
+        /// Makes this descriptor's DACL, protected, the DACL of the existing folder `path`, and changes
+        /// nothing else: not the owner, and not what is in the folder. It is `SetKernelObjectSecurity` on
+        /// a handle opened for `WRITE_DAC`, not following a link at `path`. `SetNamedSecurityInfo` and
+        /// `SetSecurityInfo` apply the new DACL to everything that inherits it, which reaches through a
+        /// hard link in the folder to its target wherever that is; the kernel's call does not.
+        pub(crate) fn set_dacl(&self, path: &Path) -> io::Result<()> {
+            let folder = OpenOptions::new()
+                .access_mode(WRITE_DAC | READ_CONTROL)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            // SAFETY: `folder` is open with `WRITE_DAC`, and `self.raw` is a live descriptor.
+            let set = unsafe {
+                SetKernelObjectSecurity(
+                    folder.as_raw_handle() as HANDLE,
                     DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    dacl,
-                    std::ptr::null(),
+                    self.raw,
                 )
             };
-            if status != ERROR_SUCCESS {
-                return Err(io::Error::from_raw_os_error(status as i32));
+            if set == 0 {
+                return Err(io::Error::last_os_error());
             }
             Ok(())
         }
@@ -218,6 +240,41 @@ mod system {
                 lpSecurityDescriptor: self.raw,
                 bInheritHandle: 0,
             }
+        }
+    }
+
+    /// The folders of `dir` that do not exist, outermost first: those below its first existing
+    /// ancestor.
+    pub(crate) fn missing_components(dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut missing = Vec::new();
+        for ancestor in dir.ancestors() {
+            match fs::symlink_metadata(ancestor) {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(ancestor.to_path_buf()),
+                Err(e) => return Err(Error::os_at("read the type of", ancestor, e)),
+            }
+        }
+        missing.reverse();
+        Ok(missing)
+    }
+
+    /// The error for `error`, from creating `path`, which was found missing. A folder that exists
+    /// now was made by someone else since, and goetia cannot tell a hostile one from another's (a
+    /// non-administrator can add folders under `C:\` and `%ProgramData%`, and could leave a link): it
+    /// is refused.
+    pub(super) fn created(path: &Path, error: io::Error) -> Error {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Error::os_at("create", path, error);
+        }
+        Error::Step {
+            what: format!(
+                "refusing `{}`: it appeared after goetia found it missing, so goetia did not make it and cannot \
+                 vouch for it",
+                path.display()
+            ),
+            source: Box::new(Error::AlreadyExists {
+                path: path.to_path_buf(),
+            }),
         }
     }
 

@@ -90,7 +90,8 @@ pub(crate) trait TaskApi: Send + Sync {
 
     /// Deletes the task: whether it existed. Task Scheduler keeps the folder when its last task goes,
     /// so the call then asks to remove `\Goetia`, which Task Scheduler refuses while any task is in
-    /// it: after the last task, and after a delete that found none, no folder is left empty.
+    /// it: after the last task, and after a delete that found none, no folder is left empty. A folder
+    /// that cannot be removed after a task was deleted is [`Error::TaskFolderKept`]: the task is gone.
     fn delete(&self, path: &TaskPath) -> Result<bool>;
 
     /// The runs Task Scheduler lists for the task: not proof of life.

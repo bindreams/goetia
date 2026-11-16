@@ -30,13 +30,13 @@ use crate::backend::scm::sid::sid_display;
 use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_installer};
 
 #[cfg(windows)]
-pub(crate) use protected::{Descriptor, is_as_wanted};
+pub(crate) use protected::{Descriptor, is_as_wanted, missing_components};
 #[cfg(all(windows, any(test, feature = "testing")))]
 #[doc(hidden)]
 pub use system::{Dacl, kernel_object_dacl};
 #[cfg(windows)]
 pub(crate) use system::{
-    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
+    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, read_path, require_acls_under,
 };
 
 #[cfg(windows)]
@@ -220,7 +220,7 @@ impl FolderCheck {
 
     /// `Ok` under [`Disable`](CheckPermissions::Disable), without reading anything. Otherwise
     /// reads `path`, a folder or a host file, which need not exist (its first existing ancestor
-    /// stands for it), and every ancestor, and refuses with [`Error::ShimFolderUnsafe`] naming the
+    /// stands for it), and every ancestor, and refuses with [`Error::FolderUnsafe`] naming the
     /// first object and account found to be unsafe. A file is refused too when an untrusted account
     /// can write to it, change its permissions, take it over or delete it; a link at `path` is read
     /// as itself, and so is what it leads to. An object that cannot be read is an error, never a
@@ -243,7 +243,7 @@ impl FolderCheck {
 impl Unsafe {
     /// The error for this refusal. An account with no name (a deleted one) is written as its SID.
     fn into_error(self) -> Error {
-        Error::ShimFolderUnsafe {
+        Error::FolderUnsafe {
             account: account_name(&self.account),
             path: self.path,
             right: self.right,
@@ -589,6 +589,15 @@ mod system {
             return Err(Error::os_at(what, label, io::Error::from_raw_os_error(status as i32)));
         }
         Ok(info)
+    }
+
+    /// The owner and DACL of the object at `path` alone, on a volume that keeps ACLs. A link at `path`
+    /// is read as itself, not what it leads to.
+    pub(crate) fn read_path(path: &Path) -> Result<ObjectSecurity> {
+        let file = open(path).map_err(|e| Error::os_at("read the permissions of", path, e))?;
+        let shown = display_path(path);
+        require_acls(file.as_raw_handle() as HANDLE, &shown)?;
+        read_object(&file, shown)
     }
 
     /// The owner and DACL of an object on a volume that keeps ACLs ([`require_acls`]).

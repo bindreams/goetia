@@ -748,7 +748,7 @@ mod windows {
         let failure = sweep_folder(dir.path(), &[], &on(), elsewhere)
             .expect_err("a folder in the temp directory gives its owner's account rights over it");
 
-        assert!(matches!(*failure.error, Error::ShimFolderUnsafe { .. }), "{failure:?}");
+        assert!(matches!(*failure.error, Error::FolderUnsafe { .. }), "{failure:?}");
         assert!(file.exists(), "a refused folder is not swept");
     }
 

@@ -4,14 +4,14 @@
 use std::process::{Command, Output};
 
 use goetia::error::Error;
-use goetia::manager::{Exit, ServiceManager as _, State};
+use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{Id, User};
 
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
-use crate::support::sentinel::CONNECT_BACK;
+use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT};
 use crate::support::windows_tasks::ServiceAccountHost;
-use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, scm_group};
+use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, kill, scm_group};
 use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
 
 /// The password of the accounts these tests make: at most 14 characters, since a longer one makes
@@ -122,4 +122,66 @@ fn a_virtual_account_is_refused_at_install_and_writes_nothing(#[fixture(scm_grou
     assert!(!records_of(id).exists(), "no records were made");
     let absent = mgr.status(id).expect_err("nothing is installed");
     assert!(matches!(absent.cause(), Error::NotInstalled { .. }), "{absent:?}");
+}
+
+/// The names of the run records of `id`, in order.
+fn record_files(id: &Id) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(records_of(id))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                .filter(|name| name.ends_with(".json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// A task installed again as another user: the record directory's permissions name the new user, who
+/// writes its record and prunes the one the first user's run left. The first user's record carries an
+/// entry for that user only, so the new one deletes it through the directory's own delete-child right.
+/// The prune is waited for with no cap, since it is a state of the directory: a prune that fails hangs the
+/// test.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_task_installed_again_as_another_user_still_records_and_prunes(#[fixture(scm_group)] _group: &Group) {
+    // Declared first, so the accounts go after the task, whose logon they are.
+    let first = format!("gt{:08x}", rand::random::<u32>());
+    let second = format!("gt{:08x}", rand::random::<u32>());
+    let _first_user = LocalUserGuard::create(&first, PASSWORD);
+    let _second_user = LocalUserGuard::create(&second, PASSWORD);
+    let id = &test_id();
+    let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = host.manager();
+    let command = vec![
+        host.exe.path_str(),
+        PRINT_AND_EXIT.to_owned(),
+        "0".to_owned(),
+        "run".to_owned(),
+    ];
+
+    assert_succeeded(
+        "install as the first user",
+        &as_user("install", id, &first, &host, &command),
+    );
+    let exit = mgr
+        .run(id, &mut Vec::new())
+        .unwrap_or_else(|e| panic!("run as {first}: {}", e.report()));
+    assert_eq!(exit, Exit::Code(0), "a recorded run of the first user");
+    let first_records = record_files(id);
+    assert_eq!(first_records.len(), 1, "{first_records:?}");
+
+    assert_succeeded(
+        "install as the second user",
+        &as_user("install", id, &second, &host, &command),
+    );
+    // `start`, not `run`: a `run` waits holding a pin on the records, and a write prunes nothing then.
+    mgr.start(id, Budget::DEFAULT)
+        .unwrap_or_else(|e| panic!("start as {second}: {}", e.report()));
+
+    kill::until(|| {
+        let now = record_files(id);
+        now.len() == 1 && now != first_records
+    });
 }

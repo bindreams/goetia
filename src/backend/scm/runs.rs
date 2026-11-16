@@ -15,9 +15,15 @@
 //! **`started` only orders** the records of runs that overlap: no decision compares it to the time.
 //!
 //! The directory's permissions name the task's account ([`Runs::ensure`]) because the shim runs
-//! as it: SYSTEM and Administrators have full control and the account may modify, and nobody else
-//! reaches it. The permissions are written on every `ensure`, so a reinstall that changes the
-//! account can still write.
+//! as it: SYSTEM and Administrators have full control and the account may modify the files made in
+//! it (and delete entries of the directory, but not add a subdirectory), and nobody else reaches
+//! it. The permissions are written on every `ensure`, to the directory alone and never to what is
+//! in it, so a reinstall that changes the account can still write and prune what the old account
+//! wrote.
+//!
+//! The folders above it are goetia's to make ([`Runs::ensure_roots`]): a standard user can create
+//! `%ProgramData%\Goetia` first, so one that exists must be one goetia could trust, and `runs` must
+//! be as goetia makes it. Neither is repaired.
 
 mod files;
 
@@ -29,8 +35,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
-use super::shim::acl::Descriptor;
+use super::shim::acl::{Descriptor, FolderCheck, is_as_wanted, missing_components, read_path, require_acls_under};
 use super::sid::Sid;
+use crate::error::{Error, Result};
 use crate::spec::Id;
 
 use super::instance::InstanceId;
@@ -100,13 +107,51 @@ impl Runs {
         }
     }
 
-    /// Makes the directory, with permissions that name `principal`, the account the task runs as; or,
-    /// when it is there, rewrites its permissions to name it. Call it on every write of the task.
+    /// Sees to the folders above the task's directory, `<ProgramData>\Goetia` and `Goetia\runs`, which
+    /// a standard user can make before goetia does (`%ProgramData%` lets any user create a folder
+    /// in it). Neither is ever adopted or repaired:
+    ///
+    /// - `Goetia` that is missing is made with Administrators as its owner and the entries
+    ///   `%ProgramData%` gives, as the services' logs folder under it has always had. One that is there
+    ///   must pass `folders` over its whole chain, as the shim's folder does, or it is refused
+    ///   ([`Error::FolderUnsafe`]); one that appears after it was found missing is refused too.
+    /// - `runs` that is missing is made with [`Descriptor::for_folder`]. One that is there must be as
+    ///   that is (owner, protection and entries), or it is refused ([`Error::FolderNotAsMade`]).
+    ///
+    /// Call it before [`Runs::ensure`] on every write of a task, since a reinstall may find them gone.
+    pub(crate) fn ensure_roots(&self, folders: &FolderCheck) -> Result<()> {
+        let runs_root = self.dir.parent().expect("a task's directory is in `runs`");
+        let goetia = runs_root.parent().expect("`runs` is in `Goetia`");
+        // Before anything is made, so that a `Goetia` under an unsafe ancestor is refused without a
+        // trace: of a folder that is missing this judges its first existing ancestor.
+        folders.check(goetia)?;
+        require_acls_under(goetia)?;
+        let missing = missing_components(goetia)?;
+        if !missing.is_empty() {
+            Descriptor::for_goetia()?.create_each(&missing)?;
+            // After: what the folder inherits from an ancestor is only judged now it is there.
+            folders.check(goetia)?;
+        }
+        let wanted = Descriptor::for_folder()?;
+        let missing = missing_components(runs_root)?;
+        if !missing.is_empty() {
+            return wanted.create_each(&missing);
+        }
+        if is_as_wanted(&read_path(runs_root)?, &wanted.wanted()?) {
+            Ok(())
+        } else {
+            Err(Error::FolderNotAsMade {
+                path: runs_root.to_path_buf(),
+            })
+        }
+    }
+
+    /// Makes the directory, in `runs`, which [`Runs::ensure_roots`] saw to, with permissions that name
+    /// `principal`, the account the task runs as; or, when it is there, sets its permissions to name it
+    /// ([`Descriptor::set_dacl`]: the directory alone, never what is in it). Call it on every write of
+    /// the task, so that a reinstall that changes the account can still write.
     pub(crate) fn ensure(&self, principal: &Sid) -> io::Result<()> {
         let permissions = Descriptor::for_runs(principal).map_err(io::Error::other)?;
-        if let Some(parent) = self.dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
         match permissions.create_dir(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => permissions.set_dacl(&self.dir),
             made => made,

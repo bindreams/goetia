@@ -309,8 +309,16 @@ impl Com {
             Err(e) if not_found(&e) => false,
             Err(e) => return Err(failed(e)),
         };
-        session.remove_folder(parent)?;
-        Ok(existed)
+        match (existed, session.remove_folder(parent)) {
+            (_, Ok(())) => Ok(existed),
+            // The task is gone: only the empty folder is left, which is its own error, not the delete's.
+            (true, Err(e)) => Err(Error::TaskFolderKept {
+                task: path.to_owned(),
+                folder: parent.to_owned(),
+                source: Box::new(e),
+            }),
+            (false, Err(e)) => Err(e),
+        }
     }
 
     /// The times `path` is to run in the window `(from, to]`, Task Scheduler's own answer

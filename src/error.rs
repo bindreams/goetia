@@ -224,19 +224,39 @@ pub enum Error {
     )]
     NotADirectory { path: PathBuf },
 
-    /// A folder the shim would be written to, one of its ancestors, or the host file itself can be
-    /// modified by an account goetia does not trust, so that account could replace the shim, which
-    /// runs as `LocalSystem`. No OS call failed.
+    /// Task Scheduler deleted a task, and the folder it was in, left empty, could not be removed. The
+    /// task is gone; only the empty folder is left.
+    #[error("the task `{task}` is deleted, but its empty folder `{folder}` could not be removed")]
+    TaskFolderKept {
+        task: String,
+        folder: String,
+        #[source]
+        source: BoxError,
+    },
+
+    /// A folder goetia keeps what runs as `LocalSystem` or what it reads back in (the shim's folder, a
+    /// task's run records), one of its ancestors, or the shim host file itself, can be modified by an
+    /// account goetia does not trust, so that account could replace what is in it. No OS call failed.
     #[error(
-        "refusing to use {} for the shim: {account} can {right} it, so it could replace the shim; fix its \
+        "refusing to use {}: {account} can {right} it, so it could replace what goetia keeps in it; fix its \
          permissions",
         path.display()
     )]
-    ShimFolderUnsafe {
+    FolderUnsafe {
         path: PathBuf,
         account: String,
         right: &'static str,
     },
+
+    /// A folder goetia makes for itself exists and is not as goetia makes it (its owner, whether its
+    /// permissions are inherited, and its entries). It is refused, never repaired: goetia cannot tell
+    /// who made it or what is in it. No OS call failed.
+    #[error(
+        "refusing {}: its owner or permissions are not those goetia gives the folder, so goetia cannot vouch for \
+         it; delete the folder (nothing in it is needed once its tasks are uninstalled) and run the command again",
+        path.display()
+    )]
+    FolderNotAsMade { path: PathBuf },
 
     /// A file that is to be the shim host has no goetia version marker: it is not a service host
     /// built from this library. No OS call failed.
@@ -751,7 +771,9 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
-            | Error::ShimFolderUnsafe { .. }
+            | Error::TaskFolderKept { .. }
+            | Error::FolderUnsafe { .. }
+            | Error::FolderNotAsMade { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider
@@ -939,7 +961,9 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
-            | Error::ShimFolderUnsafe { .. }
+            | Error::TaskFolderKept { .. }
+            | Error::FolderUnsafe { .. }
+            | Error::FolderNotAsMade { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider

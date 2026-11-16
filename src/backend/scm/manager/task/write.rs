@@ -20,6 +20,7 @@ use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::{self, Right, Written};
 use crate::backend::scm::manager::{Scm, ScmSnapshot, apply_gated, registry, service_gate, written_user};
 use crate::backend::scm::runs::Runs;
+use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::sid::{Sid, sid_from_parts};
 use crate::backend::scm::task_xml::TaskXml;
@@ -69,6 +70,16 @@ pub(super) fn password_of(
             }),
         },
     }
+}
+
+/// The record directory of task `id` under the machine's `%ProgramData%`, with the folders above it
+/// seen to ([`Runs::ensure_roots`]). The folders are always judged: whatever the manager's check of the
+/// shim's folder is, a standard user can make them first, and no caller has said another way keeps
+/// them safe.
+fn runs_for_write(id: &Id) -> Result<Runs> {
+    let runs = Runs::of(&program_data()?, id);
+    runs.ensure_roots(&FolderCheck::new(CheckPermissions::Enable))?;
+    Ok(runs)
 }
 
 /// What an install of a task needs of the machine before it writes anything. For a real user: the
@@ -143,7 +154,7 @@ impl Scm {
         definition: &TaskXml,
         snapshot: Option<&TaskSnapshot>,
     ) -> Result<WriteOutcome> {
-        let runs = Runs::of(&program_data()?, &spec.common().id);
+        let runs = runs_for_write(&spec.common().id)?;
         self.task_write_with(spec, definition, snapshot, &runs, |account| {
             prepare(account, written_user(&spec.common().user))
         })
@@ -312,7 +323,7 @@ impl Scm {
         scope: &mut Option<InstallLock>,
     ) -> Result<WriteOutcome> {
         debug_assert!(scope.is_some(), "a task's install holds the install lock");
-        let runs = Runs::of(&program_data()?, &spec.common().id);
+        let runs = runs_for_write(&spec.common().id)?;
         let wrote = self.retype_to_task_with(
             spec,
             definition,

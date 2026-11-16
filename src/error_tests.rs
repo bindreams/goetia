@@ -175,10 +175,16 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             source: Box::new(not_installed()),
         },
-        Error::ShimFolderUnsafe {
+        Error::FolderUnsafe {
             path: PathBuf::new(),
             account: String::new(),
             right: OWN,
+        },
+        Error::FolderNotAsMade { path: PathBuf::new() },
+        Error::TaskFolderKept {
+            task: String::new(),
+            folder: String::new(),
+            source: Box::new(std::io::Error::other("x")),
         },
         Error::ShimMarkerMissing { path: PathBuf::new() },
         Error::ShimNotEmbedded,
@@ -795,17 +801,43 @@ fn report_of_a_path_that_is_not_a_directory() {
 }
 
 #[skuld::test]
-fn report_of_an_unsafe_shim_folder_names_the_path_the_account_and_the_right() {
-    let e = Error::ShimFolderUnsafe {
+fn report_of_an_unsafe_folder_names_the_path_the_account_and_the_right() {
+    let e = Error::FolderUnsafe {
         path: PathBuf::from("/p"),
         account: "Users".to_string(),
         right: CHANGE_PERMISSIONS_OF,
     };
     assert_eq!(
         e.report().to_string(),
-        "refusing to use /p for the shim: Users can change permissions of it, so it could replace the shim; fix its permissions"
+        "refusing to use /p: Users can change permissions of it, so it could replace what goetia keeps in it; fix its permissions"
     );
     assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_folder_that_is_not_as_made_names_the_path_and_the_way_out() {
+    let e = Error::FolderNotAsMade {
+        path: PathBuf::from("/p"),
+    };
+    let text = e.report().to_string();
+    assert!(
+        text.starts_with("refusing /p: its owner or permissions are not those goetia gives the folder"),
+        "{text}"
+    );
+    assert!(text.ends_with("run the command again"), "{text}");
+}
+
+#[skuld::test]
+fn report_of_a_folder_kept_after_a_delete_names_the_task_the_folder_and_the_cause() {
+    let e = Error::TaskFolderKept {
+        task: r"\Goetia\x".to_string(),
+        folder: r"\Goetia".to_string(),
+        source: Box::new(std::io::Error::other("refused")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        r"the task `\Goetia\x` is deleted, but its empty folder `\Goetia` could not be removed: refused"
+    );
 }
 
 #[skuld::test]

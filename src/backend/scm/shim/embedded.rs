@@ -58,7 +58,8 @@ mod stock {
     use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
 
     use super::super::acl::{
-        Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
+        Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, missing_components, read_object,
+        require_acls_under,
     };
     use super::super::marker::read_retrying;
     use super::super::provider::{ShimProvider, require_absolute};
@@ -288,54 +289,11 @@ mod stock {
     /// Creates the folders of `dir` that do not exist, outermost first, with the permissions of a
     /// shim folder.
     fn create_missing(dir: &Path) -> Result<()> {
-        create_each(&missing_components(dir)?)
-    }
-
-    /// The folders of `dir` that do not exist, outermost first: those below its first existing
-    /// ancestor.
-    pub(super) fn missing_components(dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut missing = Vec::new();
-        for ancestor in dir.ancestors() {
-            match fs::symlink_metadata(ancestor) {
-                Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(ancestor.to_path_buf()),
-                Err(e) => return Err(Error::os_at("read the type of", ancestor, e)),
-            }
-        }
-        missing.reverse();
-        Ok(missing)
-    }
-
-    /// Creates each of `paths` in order, as a shim folder, each one with a call that fails when it
-    /// exists, so that goetia never adopts a folder it did not make: see [`created`].
-    pub(super) fn create_each(paths: &[PathBuf]) -> Result<()> {
-        if paths.is_empty() {
+        let missing = missing_components(dir)?;
+        if missing.is_empty() {
             return Ok(());
         }
-        let folder = Descriptor::for_folder()?;
-        for path in paths {
-            folder.create_dir(path).map_err(|e| created(path, e))?;
-        }
-        Ok(())
-    }
-
-    /// The error for `error`, from creating `path`, which was found missing. A folder that exists
-    /// now was made by someone else since, and goetia cannot tell a hostile one from another's (a
-    /// non-administrator can add folders under `C:\`, and could leave a link): it is refused.
-    pub(super) fn created(path: &Path, error: io::Error) -> Error {
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Error::os_at("create", path, error);
-        }
-        Error::Step {
-            what: format!(
-                "refusing `{}` for the shim: it appeared after goetia found it missing, so goetia did not make it \
-                 and cannot vouch for it",
-                path.display()
-            ),
-            source: Box::new(Error::AlreadyExists {
-                path: path.to_path_buf(),
-            }),
-        }
+        Descriptor::for_folder()?.create_each(&missing)
     }
 
     /// What `inspect` found at the file's path.

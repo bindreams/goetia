@@ -133,9 +133,13 @@ impl Scm {
         self.task_stop_with("uninstall", id, Budget::Unbounded, runs, processes)
             .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
 
-        self.tasks
-            .delete(&path)
-            .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
+        match self.tasks.delete(&path) {
+            Ok(_) => {}
+            // The task is gone, and an empty folder is the scheduler's own: the uninstall is done. The
+            // manager has no channel for a warning, so it is said on stderr as its other warnings are.
+            Err(e @ Error::TaskFolderKept { .. }) => eprintln!("warning: {}", e.report()),
+            Err(e) => return Err(uninstall_failed(id, Left::Disabled, e)),
+        }
         runs.remove_all().map_err(|e| {
             uninstall_failed(
                 id,

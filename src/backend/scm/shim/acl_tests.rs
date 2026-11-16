@@ -528,7 +528,7 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(
             matches!(
                 refusal,
-                Error::ShimFolderUnsafe {
+                Error::FolderUnsafe {
                     right: BYPASS_ACCESS_CONTROL_ON,
                     ..
                 }
@@ -568,7 +568,7 @@ pub(in crate::backend::scm::shim) mod windows {
         let exe = folder.join("host.exe");
         std::fs::write(&exe, b"x").unwrap();
 
-        let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&exe) else {
+        let Err(Error::FolderUnsafe { path, .. }) = enabled().check(&exe) else {
             panic!("a file in a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&folder));
@@ -799,7 +799,7 @@ pub(in crate::backend::scm::shim) mod windows {
         let dir = tempfile::tempdir().unwrap();
         let target = world_writable_folder(dir.path());
 
-        let Err(Error::ShimFolderUnsafe { path, account, right }) = enabled().check(&target) else {
+        let Err(Error::FolderUnsafe { path, account, right }) = enabled().check(&target) else {
             panic!("a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&target));

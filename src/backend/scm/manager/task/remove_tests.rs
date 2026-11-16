@@ -96,6 +96,30 @@ fn uninstall_of_an_idle_disarmed_task_disables_it_before_it_deletes_it() {
     assert!(!records_dir.exists());
 }
 
+/// Task Scheduler's folder for goetia's tasks that cannot be removed once the last task is deleted is
+/// not the task's: the task and its records are gone, so the uninstall is done, and it warns.
+#[skuld::test]
+fn a_folder_left_after_the_delete_does_not_fail_the_uninstall() {
+    let (_dir, records_dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Err(Error::TaskFolderKept {
+            task: PATH.to_owned(),
+            folder: r"\Goetia".to_owned(),
+            source: Box::new(io::Error::other("refused")),
+        }));
+    let mut machine = Machine::new(&fake, &[]);
+
+    scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .unwrap();
+
+    assert!(!records_dir.exists(), "the records go with the task");
+    fake.finish();
+}
+
 /// What the shim could not end is a daemon that may run: the uninstall fails, with the task registered
 /// and disabled, so that re-running it is the retry and nothing starts it meanwhile.
 #[skuld::test]
@@ -505,6 +529,8 @@ fn a_crash_between_removal_and_creation_reads_as_absent_and_install_finishes() {
     let (_other, new_runs) = {
         let dir = tempfile::tempdir().unwrap();
         let runs = Runs::of(dir.path(), &id());
+        // Made plainly: naming Administrators as an owner needs an elevated token.
+        std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join("nightly")).unwrap();
         (dir, runs)
     };
     scm.task_write_with(&old, &new, None, &new_runs, |_| {

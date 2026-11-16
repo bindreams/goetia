@@ -8,13 +8,18 @@ use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL};
 
 use super::*;
-use crate::backend::scm::shim::acl::{Ace, ObjectSecurity, read_object};
+use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
 use crate::elevation::test_support::process_user_sid;
+use crate::testing::groups::{Group, scm_group};
 
 const FULL: u32 = 0x1F_01FF;
 const MODIFY: u32 = 0x13_01BF;
 const INHERITED_BY_FILES_AND_FOLDERS: u8 = 0x03;
+const OBJECT_INHERIT: u8 = 0x01;
+const INHERIT_ONLY: u8 = 0x08;
+const ADD_SUBDIRECTORY: u32 = 0x4;
+const DELETE_CHILD: u32 = 0x40;
 
 fn id() -> Id {
     Id::try_from("frpc").unwrap()
@@ -32,12 +37,20 @@ fn record(n: u8, started: u64) -> RunRecord {
     }
 }
 
+/// The task's directory made plainly in `dir`, then given the permissions an install gives it for
+/// `principal`. A directory that exists has only its permissions set, which needs no elevation; making
+/// it with Administrators as its owner does, and is the tests of the `scm` group.
+fn made_for(runs: &Runs, principal: &crate::backend::scm::sid::Sid) {
+    fs::create_dir_all(&runs.dir).unwrap();
+    runs.ensure(principal).unwrap();
+}
+
 /// A task's directory, made for the account this test runs as, in a directory that is removed with
 /// `dir` (after `runs` and anything declared later).
 fn fixture() -> (TempDir, Runs) {
     let dir = tempfile::tempdir().unwrap();
     let runs = Runs::of(dir.path(), &id());
-    runs.ensure(&process_user_sid()).unwrap();
+    made_for(&runs, &process_user_sid());
     (dir, runs)
 }
 
@@ -70,7 +83,7 @@ fn a_record_is_whole_whatever_the_length_of_its_path() {
         let dir = tempfile::tempdir().unwrap();
         let id = Id::try_from("x".repeat(length).as_str()).unwrap();
         let runs = Runs::of(dir.path(), &id);
-        runs.ensure(&process_user_sid()).unwrap();
+        made_for(&runs, &process_user_sid());
         let written = record(1, 5);
 
         runs.write(&written).unwrap();
@@ -316,14 +329,31 @@ fn security_of(dir: &Path) -> ObjectSecurity {
     read_object(&file, dir.to_path_buf()).unwrap()
 }
 
-fn inherited_ace(trustee: crate::backend::scm::sid::Sid, mask: u32) -> Ace {
+fn ace(trustee: crate::backend::scm::sid::Sid, mask: u32, flags: u8) -> Ace {
     Ace {
         trustee,
         mask,
-        flags: INHERITED_BY_FILES_AND_FOLDERS,
+        flags,
         allow: true,
         conditional: false,
     }
+}
+
+fn inherited_ace(trustee: crate::backend::scm::sid::Sid, mask: u32) -> Ace {
+    ace(trustee, mask, INHERITED_BY_FILES_AND_FOLDERS)
+}
+
+/// What the directory's DACL is for `principal`: SYSTEM and Administrators have full control of it and
+/// of what is in it; the principal may modify the files made in it (an entry that only files inherit),
+/// and has, on the directory itself, what that is without adding a subdirectory and with deleting
+/// entries, so that a principal that replaces another can prune what the other wrote.
+fn dacl_for(principal: crate::backend::scm::sid::Sid) -> Vec<Ace> {
+    sorted(vec![
+        inherited_ace(system(), FULL),
+        inherited_ace(administrators(), FULL),
+        ace(principal.clone(), MODIFY, OBJECT_INHERIT | INHERIT_ONLY),
+        ace(principal, (MODIFY & !ADD_SUBDIRECTORY) | DELETE_CHILD, 0),
+    ])
 }
 
 fn entries_of(dir: &Path) -> Vec<Ace> {
@@ -341,19 +371,34 @@ fn sorted(mut entries: Vec<Ace>) -> Vec<Ace> {
     entries
 }
 
+/// Making the directory names Administrators as its owner, which only an elevated token may.
 #[skuld::test]
-fn the_directory_is_created_with_a_protected_dacl_naming_the_principal() {
-    let (_dir, runs) = fixture();
-    let me = process_user_sid();
+fn the_directory_is_made_owned_by_administrators_with_a_protected_dacl_naming_the_principal(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+    fs::create_dir_all(runs.dir.parent().unwrap()).unwrap();
 
-    assert_eq!(
-        entries_of(&runs.dir),
-        sorted(vec![
-            inherited_ace(system(), FULL),
-            inherited_ace(administrators(), FULL),
-            inherited_ace(me, MODIFY),
-        ])
-    );
+    runs.ensure(&process_user_sid()).unwrap();
+
+    assert_eq!(security_of(&runs.dir).owner, administrators());
+    assert_eq!(entries_of(&runs.dir), dacl_for(process_user_sid()));
+}
+
+#[skuld::test]
+fn a_directory_that_is_there_gets_a_protected_dacl_naming_the_principal() {
+    let (_dir, runs) = fixture();
+
+    assert_eq!(entries_of(&runs.dir), dacl_for(process_user_sid()));
+    // What lets the account that replaces another prune what the other wrote, and keeps it from
+    // making a subdirectory.
+    let own = entries_of(&runs.dir)
+        .into_iter()
+        .find(|ace| ace.trustee == process_user_sid() && ace.flags == 0)
+        .expect("the principal's entry for the directory itself");
+    assert_ne!(own.mask & DELETE_CHILD, 0);
+    assert_eq!(own.mask & ADD_SUBDIRECTORY, 0);
 }
 
 #[skuld::test]
@@ -366,16 +411,38 @@ fn ensure_for_another_principal_rewrites_the_dacl() {
 
     runs.ensure(&users).unwrap();
 
-    assert_eq!(
-        entries_of(&runs.dir),
-        sorted(vec![
-            inherited_ace(system(), FULL),
-            inherited_ace(administrators(), FULL),
-            inherited_ace(users, MODIFY),
-        ])
-    );
+    assert_eq!(entries_of(&runs.dir), dacl_for(users));
     assert_eq!(runs.read(&first.instance).unwrap(), Some(first));
     runs.write(&record(2, 2)).unwrap();
+}
+
+/// The DACL call changes the directory and nothing it holds: the files made in it keep their trustees
+/// and masks, and a hard link in it, whose target is one file that lives elsewhere, leaves that file's
+/// permissions as they were. A call that applies the new DACL to what inherits it (`SetNamedSecurityInfo`,
+/// `SetSecurityInfo`) rewrites both.
+#[skuld::test]
+fn a_change_of_principal_leaves_what_is_in_the_directory_and_a_hard_links_target_alone() {
+    let (dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let kept = runs.dir.join(file_of(&instance(1)));
+    let elsewhere = tempfile::tempdir_in(dir.path()).unwrap();
+    let target = elsewhere.path().join("target.txt");
+    fs::write(&target, b"x").unwrap();
+    fs::hard_link(&target, runs.dir.join("link.json")).unwrap();
+    let entries_of_file = |path: &Path| {
+        security_of(path)
+            .dacl
+            .expect("a DACL")
+            .into_iter()
+            .map(|ace| (ace.trustee, ace.mask, ace.allow))
+            .collect::<Vec<_>>()
+    };
+    let (record_before, target_before) = (entries_of_file(&kept), security_of(&target));
+
+    runs.ensure(&sid_from_parts(5, &[32, 545])).unwrap();
+
+    assert_eq!(entries_of_file(&kept), record_before, "a record in the directory");
+    assert_eq!(security_of(&target), target_before, "the target of a hard link in it");
 }
 
 #[skuld::test]
@@ -384,7 +451,7 @@ fn a_task_has_records_to_remove_while_its_directory_is_there() {
     let runs = Runs::of(dir.path(), &id());
     assert!(!runs.is_present());
 
-    runs.ensure(&process_user_sid()).unwrap();
+    made_for(&runs, &process_user_sid());
     assert!(runs.is_present());
 
     runs.remove_all().unwrap();
@@ -399,4 +466,81 @@ fn ensure_is_repeatable() {
     runs.ensure(&process_user_sid()).unwrap();
 
     assert!(runs.read(&instance(1)).unwrap().is_some());
+}
+
+// the folders above the directory =====================================================================================
+
+fn enabled() -> FolderCheck {
+    FolderCheck::new(CheckPermissions::Enable)
+}
+
+fn disabled() -> FolderCheck {
+    FolderCheck::new(CheckPermissions::Disable)
+}
+
+/// A `Goetia` folder that was there before goetia made one is refused when an account that is not
+/// trusted owns it (the folder here is the test account's own), and nothing is made in it: a
+/// standard user can create it in `%ProgramData%`, and put a link in it.
+#[skuld::test]
+fn a_goetia_folder_that_is_there_and_is_not_safe_is_refused_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+    let goetia = dir.path().join("Goetia");
+    fs::create_dir(&goetia).unwrap();
+
+    let refused = runs.ensure_roots(&enabled()).unwrap_err();
+
+    let Error::FolderUnsafe { path, .. } = &refused else {
+        panic!("expected a refusal, got {refused:?}");
+    };
+    assert_eq!(path, &goetia);
+    assert_eq!(
+        fs::read_dir(&goetia).unwrap().count(),
+        0,
+        "nothing was made in the folder that was refused"
+    );
+}
+
+/// `Goetia\runs` is goetia's alone to make, so one that is there and is not as goetia makes it (its
+/// owner, protection and entries) is refused, naming it, and left as it is.
+#[skuld::test]
+fn a_runs_folder_that_is_there_and_is_not_as_wanted_is_refused_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+    let root = dir.path().join("Goetia").join("runs");
+    fs::create_dir_all(&root).unwrap();
+
+    let refused = runs.ensure_roots(&disabled()).unwrap_err();
+
+    let Error::FolderNotAsMade { path } = &refused else {
+        panic!("expected a refusal, got {refused:?}");
+    };
+    assert_eq!(path, &root);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "nothing was made in it");
+}
+
+/// Making the folders names Administrators as their owner, which only an elevated token may.
+#[skuld::test]
+fn the_folders_are_made_goetia_inheriting_and_runs_as_wanted_and_a_second_call_adopts_them(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+    let goetia = dir.path().join("Goetia");
+
+    runs.ensure_roots(&disabled()).unwrap();
+
+    let made = security_of(&goetia);
+    assert_eq!(
+        made.owner,
+        administrators(),
+        "named, whatever the creator's own default"
+    );
+    assert!(
+        !made.protected,
+        "it inherits what %ProgramData% gives, as the services' logs folder does"
+    );
+    let wanted = Descriptor::for_folder().unwrap().wanted().unwrap();
+    assert!(is_as_wanted(&security_of(&goetia.join("runs")), &wanted));
+    runs.ensure_roots(&disabled()).unwrap();
 }

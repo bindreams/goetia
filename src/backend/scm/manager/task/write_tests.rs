@@ -49,10 +49,19 @@ fn snapshot_of(spec: &DaemonSpec, armed: bool) -> TaskSnapshot {
     TaskSnapshot::new(id(), Ok(blob(spec)), registered_task(spec, armed))
 }
 
-/// The spec's task, and the temporary `%ProgramData%` its run records go under.
+/// The spec's task, and the temporary `%ProgramData%` its run records go under. Nothing is made.
 fn records() -> (TempDir, Runs) {
     let dir = tempfile::tempdir().unwrap();
     let runs = Runs::of(dir.path(), &id());
+    (dir, runs)
+}
+
+/// [`records`] with the task's directory made plainly, for a write that gets as far as making it. Making
+/// it as an install does names Administrators as its owner, which needs an elevated token (a test of the
+/// `scm` group makes it); a directory that is there has only its permissions set.
+fn made_records() -> (TempDir, Runs) {
+    let (dir, runs) = records();
+    std::fs::create_dir_all(records_dir(&dir)).unwrap();
     (dir, runs)
 }
 
@@ -84,7 +93,7 @@ fn root() -> TaskAccount {
 
 #[skuld::test]
 fn install_of_a_task_creates_it_disarmed() {
-    let (dir, runs) = records();
+    let (_dir, runs) = made_records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
@@ -95,7 +104,6 @@ fn install_of_a_task_creates_it_disarmed() {
 
     assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
     assert_eq!(fake.calls(), [register_call(&spec, false, root(), None, false)]);
-    assert!(records_dir(&dir).is_dir(), "the record directory is made with the task");
     fake.finish();
 }
 
@@ -103,7 +111,7 @@ fn install_of_a_task_creates_it_disarmed() {
 fn reinstall_keeps_the_armed_state() {
     let spec = task_spec(Some("30 3 * * *"));
     for armed in [true, false] {
-        let (_dir, runs) = records();
+        let (_dir, runs) = made_records();
         let fake = Fake::new();
         fake.on_register(Ok(Registration::Created));
         let installed = snapshot_of(&spec, armed);
@@ -163,7 +171,7 @@ fn reinstall_of_an_identical_task_writes_nothing() {
 #[skuld::test]
 fn a_changed_task_is_updated_in_place_over_the_installed_one() {
     let spec = task_spec(Some("30 3 * * *"));
-    let (_dir, runs) = records();
+    let (_dir, runs) = made_records();
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let installed = snapshot_of(&spec, false);
@@ -203,7 +211,7 @@ fn trustees_of(dir: &std::path::Path) -> Vec<Sid> {
 /// records: the directory's permissions are rewritten by every write, an update included.
 #[skuld::test]
 fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
-    let (dir, runs) = records();
+    let (dir, runs) = made_records();
     let spec = task_spec(Some("30 3 * * *"));
     let me = process_user_sid();
     // `Users` has this test's account among its members, so the directory is still the test's to remove.
@@ -279,7 +287,7 @@ fn a_real_account_needs_its_password_and_the_batch_right_before_any_write() {
 /// scheduler untouched.
 #[skuld::test]
 fn install_of_a_real_user_task_grants_the_batch_right_before_the_first_write() {
-    let (_dir, runs) = records();
+    let (_dir, runs) = made_records();
     let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
@@ -333,14 +341,22 @@ fn acquisition_precedes_the_first_register_call() {
 #[skuld::test]
 fn a_raced_create_and_a_raced_update_are_raced() {
     let spec = task_spec(Some("30 3 * * *"));
-    let (_dir, runs) = records();
+    let (_dir, runs) = made_records();
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Raced))
         .on_register(Ok(Registration::Raced));
     let scm = scm(&fake);
 
+    // The test's own account, which a second write names again: the directory's permissions are set by
+    // opening it, which an account that the first write left out has no right to.
     let created = scm
-        .task_write_with(&spec, &definition(&spec), None, &runs, prepared(system(), None))
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            None,
+            &runs,
+            prepared(process_user_sid(), None),
+        )
         .unwrap();
     let updated = scm
         .task_write_with(
@@ -348,7 +364,7 @@ fn a_raced_create_and_a_raced_update_are_raced() {
             &definition(&spec),
             Some(&snapshot_of(&spec, false)),
             &runs,
-            prepared(system(), None),
+            prepared(process_user_sid(), None),
         )
         .unwrap();
 
@@ -359,7 +375,7 @@ fn a_raced_create_and_a_raced_update_are_raced() {
 #[skuld::test]
 fn a_failed_registration_is_the_installs_error() {
     let spec = task_spec(Some("30 3 * * *"));
-    let (_dir, runs) = records();
+    let (_dir, runs) = made_records();
     let fake = Fake::new();
     fake.on_register(Err(Error::os("register", std::io::Error::other("denied"))));
 
@@ -654,7 +670,7 @@ fn a_task_that_runs_is_not_changed_into_a_service() {
 /// runs.
 #[skuld::test]
 fn a_gate_that_fails_leaves_the_task_untouched() {
-    let (dir, runs) = records();
+    let (dir, runs) = made_records();
     runs.ensure(&process_user_sid()).unwrap();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
@@ -686,7 +702,7 @@ fn a_gate_that_fails_leaves_the_task_untouched() {
 
 #[skuld::test]
 fn a_task_is_removed_after_the_gate_and_before_the_service_is_created() {
-    let (dir, runs) = records();
+    let (dir, runs) = made_records();
     runs.ensure(&process_user_sid()).unwrap();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
@@ -811,7 +827,7 @@ fn prepared_alice() -> impl FnOnce(&TaskAccount) -> Result<Prepared> {
 
 #[skuld::test]
 fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered() {
-    let (dir, runs) = records();
+    let (_dir, runs) = made_records();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
@@ -830,7 +846,6 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
                     [],
                     "the scheduler is asked nothing before the service goes"
                 );
-                assert!(records_dir(&dir).is_dir(), "the record directory is made first");
                 retired.set(true);
                 Ok(())
             },
