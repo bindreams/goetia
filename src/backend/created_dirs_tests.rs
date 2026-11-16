@@ -42,6 +42,14 @@ impl Layout {
         self.base().join("outside")
     }
 
+    /// A root that cannot be opened: below a regular file, so that opening it says `ENOTDIR`, which
+    /// is not "not there".
+    pub(crate) fn broken_root(&self) -> PathBuf {
+        let file = self.base().join("a-file");
+        fs::write(&file, b"x").unwrap();
+        file.join("root")
+    }
+
     /// A guard that treats `system` as its only root.
     fn dirs(&self) -> CreatedDirs {
         CreatedDirs::under(vec![self.system()])
@@ -516,23 +524,49 @@ fn create_stops_at_a_symlink_loop(#[fixture(root_dirs)] _root: &()) {
     );
 }
 
-/// Only a root that is not there is not a root: one that cannot be opened for another reason says so.
+/// One rule for a root that cannot be opened (a missing one is no root, and is not this): a path under a
+/// root that opens is under a root, whatever the other roots do; a root that cannot be opened matters
+/// only when no root that opens holds the path, and then its error is the answer, as goetia cannot tell.
 #[skuld::test(labels = [ELEVATED])]
-fn create_fails_when_a_root_cannot_be_opened_for_a_reason_other_than_not_being_there(#[fixture(root_dirs)] _root: &()) {
+fn create_decides_by_the_roots_that_open_and_fails_with_the_root_that_does_not_only_when_they_do_not_hold_the_path(
+    #[fixture(root_dirs)] _root: &(),
+) {
     let layout = Layout::new();
-    let file = layout.outside().join("file");
-    fs::write(&file, b"x").unwrap();
-    let mut dirs = CreatedDirs::under(vec![file.clone(), layout.system()]);
+    let broken = layout.broken_root();
+    let held = layout.system().join("a");
+    let not_held = layout.outside().join("a");
 
-    let err = dirs
-        .create(&layout.system().join("a"), None)
-        .expect_err("a root that is a file cannot be searched");
-
+    // A broken root alone.
+    let err = CreatedDirs::under(vec![broken.clone()])
+        .create(&held, None)
+        .expect_err("goetia cannot tell");
     assert!(
         std::error::Error::source(&err).is_some_and(|source| source.to_string().contains("Not a directory"))
-            && err.to_string().contains(file.to_str().unwrap()),
+            && err.to_string().contains(broken.to_str().unwrap()),
         "{err:?}"
     );
+
+    // Next to a root that holds the path: under a root, in either order.
+    for roots in [vec![broken.clone(), layout.system()], vec![layout.system(), broken.clone()]] {
+        let mut dirs = CreatedDirs::under(roots);
+        dirs.create(&held, None).expect("under the root that opens");
+        assert!(held.is_dir());
+    }
+
+    // Next to a root that does not hold it.
+    let err = CreatedDirs::under(vec![broken.clone(), layout.system()])
+        .create(&not_held, None)
+        .expect_err("goetia cannot tell");
+    assert!(
+        std::error::Error::source(&err).is_some_and(|source| source.to_string().contains("Not a directory"))
+            && err.to_string().contains(broken.to_str().unwrap()),
+        "{err:?}"
+    );
+    assert!(!not_held.exists());
+
+    // All fine: outside is outside.
+    let err = layout.dirs().create(&not_held, None).expect_err("outside every root");
+    assert!(refusal(&err).contains("create it first"), "{err:?}");
 }
 
 /// A path that exists whole is used as it is, wherever it is: the roots are opened only when a
