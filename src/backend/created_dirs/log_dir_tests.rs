@@ -40,28 +40,29 @@ fn refused_by(dirs: &CreatedDirs, logs: &Path) -> String {
 /// bits of the mode then read as the ACL's mask.
 #[cfg(target_os = "linux")]
 fn name_the_stranger_in_the_acl(path: &Path) {
-    set_posix_acl(path, &[(0x02, 7, STRANGER), (0x10, 7, NO_ID)]);
+    set_posix_acl(path, Some(7));
 }
 
 /// Give `path` an access ACL that lets nobody but its owner write it: the stranger may read it, and the
 /// mask has no write.
 #[cfg(target_os = "linux")]
 fn give_an_acl_that_lets_nobody_write(path: &Path) {
-    set_posix_acl(path, &[(0x02, 5, STRANGER), (0x10, 5, NO_ID)]);
+    set_posix_acl(path, Some(5));
 }
 
+/// Set the access ACL of `path` to the owner's (rwx), the group's and others' (r-x), and with
+/// `stranger` the stranger's permissions and a mask of the same. Entries are kept in the order the kernel
+/// requires: by tag.
 #[cfg(target_os = "linux")]
-const NO_ID: u32 = u32::MAX;
-
-/// Set the access ACL of `path` to the owner's, the group's (r-x) and others' (r-x), and `named`: entries
-/// of (tag, permissions, id).
-#[cfg(target_os = "linux")]
-fn set_posix_acl(path: &Path, named: &[(u16, u16, u32)]) {
+fn set_posix_acl(path: &Path, stranger: Option<u16>) {
+    const NO_ID: u32 = u32::MAX;
+    let mut entries = vec![(0x01u16, 7u16, NO_ID)]; // ACL_USER_OBJ
+    entries.extend(stranger.map(|perm| (0x02, perm, STRANGER))); // ACL_USER
+    entries.push((0x04, 5, NO_ID)); // ACL_GROUP_OBJ
+    entries.extend(stranger.map(|perm| (0x10, perm, NO_ID))); // ACL_MASK
+    entries.push((0x20, 5, NO_ID)); // ACL_OTHER
     let mut acl = 2u32.to_le_bytes().to_vec(); // POSIX_ACL_XATTR_VERSION
-    let owner = (0x01u16, 7u16, NO_ID); // ACL_USER_OBJ
-    let group = (0x04, 5, NO_ID); // ACL_GROUP_OBJ
-    let other = (0x20, 5, NO_ID); // ACL_OTHER
-    for (tag, perm, id) in [owner].into_iter().chain(named.iter().copied()).chain([group, other]) {
+    for (tag, perm, id) in entries {
         acl.extend([tag.to_le_bytes().as_slice(), &perm.to_le_bytes(), &id.to_le_bytes()].concat());
     }
     let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
@@ -101,10 +102,10 @@ fn name_the_stranger_in_the_acl(path: &Path) {
     chmod_plus_a(path, "everyone allow add_file");
 }
 
-/// Give `path` an extended ACL that lets nobody write it: the deny-only entry some system directories carry.
+/// Give `path` an extended ACL that lets nobody write it: an entry that allows listing.
 #[cfg(target_os = "macos")]
 fn give_an_acl_that_lets_nobody_write(path: &Path) {
-    chmod_plus_a(path, "everyone deny delete");
+    chmod_plus_a(path, "everyone allow list");
 }
 
 #[cfg(target_os = "macos")]
@@ -357,7 +358,10 @@ fn an_ancestor_that_carries_an_acl_is_refused_though_its_mode_and_its_acl_let_no
     let why = refused(&dir.join("app.log"));
 
     assert!(
-        why.contains(&format!("{} carries an ACL, which goetia does not evaluate", ancestor.display())),
+        why.contains(&format!(
+            "{} carries an ACL, which goetia does not evaluate",
+            ancestor.display()
+        )),
         "{why}"
     );
 }
@@ -374,7 +378,10 @@ fn an_ancestor_that_carries_an_acl_is_refused_though_it_is_sticky(#[fixture(root
 
     let why = refused(&dir.join("app.log"));
 
-    assert!(why.contains(ancestor.to_str().unwrap()) && why.contains("carries an ACL"), "{why}");
+    assert!(
+        why.contains(ancestor.to_str().unwrap()) && why.contains("carries an ACL"),
+        "{why}"
+    );
 }
 
 /// An ACL the mode already says (what `setfacl -m u::rwx,g::r-x,o::r-x` leaves) is no ACL: the kernel
@@ -387,7 +394,7 @@ fn an_ancestor_whose_posix_acl_is_only_its_mode_is_not_one(#[fixture(root_dirs)]
     let dir = ancestor.join("app");
     fs::create_dir_all(&dir).unwrap();
     chmod(&ancestor, 0o755);
-    set_posix_acl(&ancestor, &[]);
+    set_posix_acl(&ancestor, None);
 
     check(&dir.join("app.log")).unwrap();
 }
@@ -413,7 +420,6 @@ fn an_ancestor_whose_acl_names_an_account_is_refused_though_its_group_bits_allow
     let why = refused(&dir.join("app.log"));
 
     assert!(why.contains(var_log.to_str().unwrap()) && why.contains("ACL"), "{why}");
-
 }
 
 /// The log's own directory is refused for a group that can write it, and an ACL says whom it is.
