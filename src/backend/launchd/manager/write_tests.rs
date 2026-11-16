@@ -15,13 +15,16 @@ use super::super::{
 use super::*;
 use crate::backend::InstalledService as _;
 use crate::backend::Settle as _;
+use crate::backend::account::Account;
 use crate::backend::bounded;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
+use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::Step;
-use crate::spec::{TaskSpec, User};
+use crate::spec::{ServiceSpec, TaskSpec, User};
 use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::root_dirs;
+use crate::testing::service_fields;
 use crate::testing::task;
 
 // Fixtures ============================================================================================================
@@ -653,6 +656,61 @@ fn an_update_whose_directories_are_refused_sends_launchd_nothing() {
     fake.assert_spent("a refused update sends nothing");
     assert_eq!(text_at(&tree, true, ID), old.job);
     assert_eq!(text_at(&tree, true, &timer_name()), old.timer.unwrap());
+}
+
+/// What `plan_parent_dirs` makes of a service that logs to `logs` and runs as `uid`, with `system` as its
+/// one root. No account is looked up: the plan is given it.
+fn planned_for(uid: u32, logs: &Path, system: PathBuf) -> Result<()> {
+    let mut fields = service_fields(service_spec());
+    fields.common.logs = Some(logs.to_path_buf());
+    let spec = DaemonSpec::from(ServiceSpec::new(fields).unwrap());
+    let account = Account {
+        name: if uid == 0 { "root" } else { "daemon" }.to_string(),
+        uid: nix::unistd::Uid::from_raw(uid),
+        gid: nix::unistd::Gid::from_raw(uid),
+    };
+    plan_parent_dirs(&spec, &account, &CreatedDirs::under(vec![system])).map(|_| ())
+}
+
+/// launchd opens `StandardOutPath` as the job's user, which for a job that runs as root is root: it
+/// follows a symlink there, as systemd's `append:` does, so a log directory an account can write is
+/// refused for such a job, with every refusal about the directories before anything is made.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_directory_an_account_can_write_is_refused_for_a_job_that_runs_as_root(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("logs");
+    std::fs::create_dir(&dir).unwrap();
+    give_to_a_stranger(&dir);
+
+    let e = planned_for(0, &dir.join("out.log"), layout.system()).expect_err("an account can write the directory");
+
+    let Error::DirectoryRefused { why, .. } = &e else {
+        panic!("expected a refused directory, got {e:?}");
+    };
+    assert!(why.contains(dir.to_str().unwrap()) && why.contains("launchd"), "{why}");
+}
+
+/// A job that runs as another user has its log opened as that user: what the user can do with the
+/// directory it can do through its own open, so nothing is refused.
+#[skuld::test(labels = [ELEVATED])]
+fn the_same_log_directory_is_accepted_for_a_job_that_runs_as_another_user(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("logs");
+    std::fs::create_dir(&dir).unwrap();
+    give_to_a_stranger(&dir);
+
+    planned_for(1, &dir.join("out.log"), layout.system()).expect("launchd opens the log as the job's user");
+}
+
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_directory_only_root_can_change_is_accepted_for_a_job_that_runs_as_root(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("logs");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(layout.system(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    planned_for(0, &dir.join("out.log"), layout.system()).expect("only root can change it");
 }
 
 /// uid 0 is handed nothing: a directory made for a task that runs as root keeps the group it was made
