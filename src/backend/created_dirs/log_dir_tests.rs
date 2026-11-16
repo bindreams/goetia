@@ -214,7 +214,7 @@ fn a_directory_of_its_own_is_suggested_only_under_a_root(#[fixture(root_dirs)] _
     let why = refused(&dir.join("app.log"));
 
     assert!(!why.contains("such as"), "no root to make it under: {why}");
-    assert!(why.contains("journal"), "{why}");
+    assert!(why.contains("drop `logs:`"), "{why}");
     assert!(why.contains("under"), "{why}");
 }
 
@@ -241,7 +241,7 @@ fn a_skipped_root_leaves_the_log_refusal_to_the_roots_that_remain(#[fixture(root
     );
 
     let why = refused_by(&roots(), &not_held);
-    assert!(!why.contains("such as") && why.contains("journal"), "{why}");
+    assert!(!why.contains("such as") && why.contains("drop `logs:`"), "{why}");
     assert!(
         why.contains(layout.system().to_str().unwrap()) && !why.contains(broken.to_str().unwrap()),
         "lists the roots that exist: {why}"
@@ -268,7 +268,7 @@ fn a_root_that_cannot_be_read_leaves_the_log_refused_with_the_generic_advice_and
         &dir.join("app.log"),
     );
 
-    assert!(!why.contains("such as") && why.contains("journal"), "{why}");
+    assert!(!why.contains("such as") && why.contains("drop `logs:`"), "{why}");
     assert!(
         why.contains(&format!(
             "under {}; {} could not be read: Permission denied (os error 13)",
