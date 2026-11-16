@@ -619,7 +619,7 @@ fn under_root_returns_what_it_read_stopping_at_the_root_that_holds_the_path(#[fi
     assert!(read.holds);
     assert_eq!(
         read.existing,
-        [holder.clone()],
+        std::slice::from_ref(&holder),
         "the roots after the holder are not read"
     );
     assert_eq!(
