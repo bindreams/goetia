@@ -1445,7 +1445,7 @@ fn with_stop_action(spec: DaemonSpec, stop_action: StopAction) -> DaemonSpec {
 
 fn written(signal: &str, timeout: Option<u64>) -> StopAction {
     StopAction {
-        send_signal: StopSignal::parse(signal).unwrap(),
+        send_signal: signal.parse::<StopSignal>().unwrap(),
         timeout: timeout.map(Duration::from_secs),
     }
 }
@@ -1478,7 +1478,7 @@ fn a_hosted_service_takes_every_signal_windows_can_send() {
         "ctrl-break",
         "wm-close",
     ] {
-        let send_signal = StopSignal::parse(signal).unwrap();
+        let send_signal = signal.parse::<StopSignal>().unwrap();
         let spec = with_stop_action(
             simple_spec(),
             StopAction {

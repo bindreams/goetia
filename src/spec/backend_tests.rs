@@ -451,7 +451,7 @@ fn the_native_backend_refuses_a_signal_it_cannot_send_wherever_the_manifest_wrot
     assert!(BackendKind::Launchd.refuse(&ctrl_c).is_err());
     assert!(BackendKind::Scm.refuse(&ctrl_c).is_ok());
 
-    let native = with_stop(Shaped::Parsed(StopSignal::parse("sigusr1").unwrap()), Shaped::Absent);
+    let native = with_stop(Shaped::Parsed("sigusr1".parse::<StopSignal>().unwrap()), Shaped::Absent);
     assert!(BackendKind::Systemd.refuse(&native).is_ok());
     assert!(BackendKind::Launchd.refuse(&native).is_err());
     assert!(BackendKind::Scm.refuse(&native).is_err());

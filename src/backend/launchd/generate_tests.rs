@@ -1326,7 +1326,7 @@ fn the_timer_job_has_no_exit_time_out() {
 #[skuld::test]
 fn a_signal_launchd_does_not_send_is_refused_and_never_turned_into_sigterm() {
     for signal in ["interrupt", "quit", "sigusr1", "ctrl-c", "ctrl-break", "wm-close"] {
-        let send_signal = StopSignal::parse(signal).unwrap();
+        let send_signal = signal.parse::<StopSignal>().unwrap();
         let spec = with_stop_action(StopAction {
             send_signal,
             timeout: StopAction::default_timeout(send_signal),

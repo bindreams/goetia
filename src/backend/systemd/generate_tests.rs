@@ -1363,7 +1363,7 @@ fn each_signal_is_the_one_systemd_names() {
         ("sigrtmin+3", "SIGRTMIN+3"),
         ("sigrtmax-14", "SIGRTMAX-14"),
     ] {
-        let send_signal = StopSignal::parse(signal).unwrap();
+        let send_signal = signal.parse::<StopSignal>().unwrap();
         let spec = with_stop_action(StopAction {
             send_signal,
             timeout: StopAction::default_timeout(send_signal),
@@ -1434,7 +1434,7 @@ fn a_stop_action_survives_the_blob_and_the_unit_regenerates_byte_for_byte() {
             timeout: Some(Duration::from_secs(7)),
         },
         StopAction {
-            send_signal: StopSignal::parse("sigusr2").unwrap(),
+            send_signal: "sigusr2".parse::<StopSignal>().unwrap(),
             timeout: None,
         },
     ] {

@@ -805,11 +805,11 @@ fn every_stop_action_round_trips_for_a_service_and_a_task() {
             timeout: None,
         },
         StopAction {
-            send_signal: StopSignal::parse("sigusr1").unwrap(),
+            send_signal: "sigusr1".parse::<StopSignal>().unwrap(),
             timeout: Some(Duration::from_secs(86_400)),
         },
         StopAction {
-            send_signal: StopSignal::parse("SIGRTMAX-3").unwrap(),
+            send_signal: "SIGRTMAX-3".parse::<StopSignal>().unwrap(),
             timeout: Some(Duration::from_secs(90)),
         },
         StopAction {
@@ -847,7 +847,7 @@ fn the_stop_action_is_written_as_a_signal_name_and_whole_seconds() {
     let patient = with_stop_action(
         task_with(None),
         StopAction {
-            send_signal: StopSignal::parse("sigusr1").unwrap(),
+            send_signal: "sigusr1".parse::<StopSignal>().unwrap(),
             timeout: None,
         },
     );
@@ -882,7 +882,7 @@ fn a_blob_whose_stop_action_no_manifest_could_write_is_invalid() {
         ),
         (
             "a signal in the wrong case",
-            serde_json::json!({"send_signal": "Quit", "timeout_secs": 30}),
+            serde_json::json!({"send_signal": "Terminate", "timeout_secs": 30}),
         ),
         (
             "a zero timeout",

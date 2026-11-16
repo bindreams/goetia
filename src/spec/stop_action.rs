@@ -143,23 +143,20 @@ enum Native {
     RtMax(u8),
 }
 
-/// systemd's names for the Linux signals (`signal_to_string`), each with its `SIG` prefix.
-const NATIVE_SIGNALS: [&str; 31] = [
+/// systemd's names for the Linux signals (`signal_to_string`) that have no portable name, each with its `SIG`
+/// prefix. `SIGTERM`, `SIGINT`, `SIGQUIT` and `SIGKILL` are the portable signals ([`portable_by_native_name`]).
+const NATIVE_SIGNALS: [&str; 27] = [
     "SIGHUP",
-    "SIGINT",
-    "SIGQUIT",
     "SIGILL",
     "SIGTRAP",
     "SIGABRT",
     "SIGBUS",
     "SIGFPE",
-    "SIGKILL",
     "SIGUSR1",
     "SIGSEGV",
     "SIGUSR2",
     "SIGPIPE",
     "SIGALRM",
-    "SIGTERM",
     "SIGSTKFLT",
     "SIGCHLD",
     "SIGCONT",
@@ -215,15 +212,10 @@ impl fmt::Display for StopSignal {
 impl std::str::FromStr for StopSignal {
     type Err = String;
 
-    /// Read the manifest's spelling: a portable or Windows name (lowercase), or a native signal of
-    /// systemd (any case, `SIG` prefix required). The error says what was expected.
+    /// Read the manifest's spelling: a portable or Windows name (lowercase), the portable signals by
+    /// their native names (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGKILL`: any case, `SIG` optional), or a
+    /// native signal of systemd (any case, `SIG` prefix required). The error says what was expected.
     fn from_str(text: &str) -> Result<StopSignal, String> {
-        StopSignal::parse(text)
-    }
-}
-
-impl StopSignal {
-    pub(crate) fn parse(text: &str) -> Result<StopSignal, String> {
         Ok(match text {
             "terminate" => StopSignal::Terminate,
             "interrupt" => StopSignal::Interrupt,
@@ -232,15 +224,32 @@ impl StopSignal {
             "ctrl-c" => StopSignal::CtrlC,
             "ctrl-break" => StopSignal::CtrlBreak,
             "wm-close" => StopSignal::WmClose,
-            other => StopSignal::Native(NativeSignal::parse(other).ok_or_else(|| {
-                format!(
-                    "`send-signal` is `{other}`; expected `terminate`, `interrupt`, `quit`, `kill`, `ctrl-c`, \
-                     `ctrl-break`, `wm-close`, or a signal systemd knows (`sigusr1`, `SIGRTMIN+3`)"
-                )
-            })?),
+            other => match portable_by_native_name(other) {
+                Some(signal) => signal,
+                None => StopSignal::Native(NativeSignal::parse(other).ok_or_else(|| {
+                    format!(
+                        "`send-signal` is `{other}`; expected `terminate`, `interrupt`, `quit`, `kill`, `ctrl-c`,                          `ctrl-break`, `wm-close`, or a signal systemd knows (`sigusr1`, `SIGRTMIN+3`)"
+                    )
+                })?),
+            },
         })
     }
+}
 
+/// The portable signal a native name (`SIGTERM`, `term`, `Sigint`) stands for: the same signal as its
+/// portable name, so every rule for that one applies.
+fn portable_by_native_name(text: &str) -> Option<StopSignal> {
+    let upper = text.to_ascii_uppercase();
+    match upper.strip_prefix("SIG").unwrap_or(&upper) {
+        "TERM" => Some(StopSignal::Terminate),
+        "INT" => Some(StopSignal::Interrupt),
+        "QUIT" => Some(StopSignal::Quit),
+        "KILL" => Some(StopSignal::Kill),
+        _ => None,
+    }
+}
+
+impl StopSignal {
     /// Why `backend` cannot send this signal, or `None`. Where a platform cannot, the value is
     /// refused rather than turned into another signal.
     pub(crate) fn defect(self, backend: BackendKind) -> Option<String> {
@@ -287,7 +296,7 @@ impl NativeSignal {
         let index = NATIVE_SIGNALS
             .iter()
             .position(|known| known.strip_prefix("SIG") == Some(name))?;
-        Some(NativeSignal(Native::Named(u8::try_from(index).expect("a table of 31"))))
+        Some(NativeSignal(Native::Named(u8::try_from(index).expect("a table of 27"))))
     }
 }
 
@@ -419,7 +428,7 @@ impl Written {
 
 /// An authored `send-signal:` into a [`StopSignal`]. `pub(crate)`: see `resolve::parse_restart`.
 pub(crate) fn parse_stop_signal(id: &Id, raw: &str) -> Result<StopSignal, Error> {
-    StopSignal::parse(raw).map_err(|message| invalid(id, &message))
+    raw.parse::<StopSignal>().map_err(|message| invalid(id, &message))
 }
 
 /// An authored `timeout:` into a [`Duration`] of whole seconds from `1s` to `24h`.

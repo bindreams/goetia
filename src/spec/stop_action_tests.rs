@@ -24,7 +24,7 @@ fn the_portable_and_windows_names_parse() {
         ("ctrl-break", StopSignal::CtrlBreak),
         ("wm-close", StopSignal::WmClose),
     ] {
-        assert_eq!(StopSignal::parse(text), Ok(signal), "{text}");
+        assert_eq!(text.parse::<StopSignal>(), Ok(signal), "{text}");
         assert_eq!(signal.to_string(), text);
     }
 }
@@ -43,17 +43,40 @@ fn a_native_signal_reads_in_any_case_and_is_written_as_systemd_names_it() {
         ("sigrtmax-14", "SIGRTMAX-14"),
         ("sigrtmax-30", "SIGRTMAX-30"),
     ] {
-        let signal = StopSignal::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        let signal = text.parse::<StopSignal>().unwrap_or_else(|e| panic!("{text}: {e}"));
         assert!(matches!(signal, StopSignal::Native(_)), "{text}");
         assert_eq!(signal.to_string(), written, "{text}");
-        assert_eq!(StopSignal::parse(written), Ok(signal), "{text} round trip");
+        assert_eq!(written.parse::<StopSignal>(), Ok(signal), "{text} round trip");
+    }
+}
+
+/// The four portable signals have one meaning wherever they are written: `SIGTERM` is `terminate`, so
+/// every rule for `terminate` applies to it, and it is never a native signal only systemd accepts.
+#[skuld::test]
+fn the_portable_signals_by_their_native_names_are_the_portable_values() {
+    for (names, signal) in [
+        (["SIGTERM", "sigterm", "TERM", "Term"], StopSignal::Terminate),
+        (["SIGINT", "sigint", "INT", "Int"], StopSignal::Interrupt),
+        (["SIGQUIT", "sigquit", "QUIT", "Quit"], StopSignal::Quit),
+        (["SIGKILL", "sigkill", "KILL", "Kill"], StopSignal::Kill),
+    ] {
+        for name in names {
+            assert_eq!(name.parse::<StopSignal>(), Ok(signal), "{name}");
+        }
+    }
+    for backend in [BackendKind::Launchd, BackendKind::Scm] {
+        assert_eq!(
+            "SIGTERM".parse::<StopSignal>().unwrap().defect(backend),
+            None,
+            "{backend}"
+        );
     }
 }
 
 #[skuld::test]
 fn every_native_name_systemd_has_parses() {
     for name in NATIVE_SIGNALS {
-        assert_eq!(StopSignal::parse(name).unwrap().to_string(), name);
+        assert_eq!(name.parse::<StopSignal>().unwrap().to_string(), name);
     }
 }
 
@@ -74,7 +97,7 @@ fn a_typo_is_an_error_naming_the_choices_and_never_a_signal() {
         "sigrtmin+999",
         "",
     ] {
-        let message = StopSignal::parse(text).expect_err(text);
+        let message = text.parse::<StopSignal>().expect_err(text);
         assert!(message.contains(&format!("`{text}`")), "{text}: {message}");
         assert!(
             message.contains("`terminate`") && message.contains("sigusr1"),
@@ -86,7 +109,7 @@ fn a_typo_is_an_error_naming_the_choices_and_never_a_signal() {
 #[skuld::test]
 fn each_platform_refuses_the_signals_it_cannot_send() {
     use StopSignal::*;
-    let native = StopSignal::parse("sigusr1").unwrap();
+    let native = "sigusr1".parse::<StopSignal>().unwrap();
     let all = [Terminate, Interrupt, Quit, Kill, CtrlC, CtrlBreak, WmClose, native];
     let accepted = |backend| -> Vec<StopSignal> { all.into_iter().filter(|s| s.defect(backend).is_none()).collect() };
 
@@ -181,7 +204,7 @@ fn kill_defaults_to_no_timeout_and_every_other_signal_to_thirty_seconds() {
         "wm-close",
         "sigusr1",
     ] {
-        let signal = StopSignal::parse(signal).unwrap();
+        let signal = signal.parse::<StopSignal>().unwrap();
         assert_eq!(
             StopAction::default_timeout(signal),
             Some(Duration::from_secs(30)),

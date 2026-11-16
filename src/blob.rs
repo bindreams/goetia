@@ -445,7 +445,9 @@ impl WireStopAction {
     /// cannot be written, and the field rules refuse the rest ([`ServiceSpec::new`]).
     fn into_stop_action(self, id: &Id) -> Result<StopAction, Error> {
         Ok(StopAction {
-            send_signal: StopSignal::parse(&self.send_signal)
+            send_signal: self
+                .send_signal
+                .parse::<StopSignal>()
                 .map_err(|message| invalid(id, &format!("blob `stop_action`: {message}")))?,
             timeout: self.timeout_secs.map(Duration::from_secs),
         })

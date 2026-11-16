@@ -356,7 +356,7 @@ fn no_timeout_renders_as_null_and_kill_as_itself() {
     let patient = with_stop_action(
         spec_fixture(),
         StopAction {
-            send_signal: StopSignal::parse("sigusr1").unwrap(),
+            send_signal: "sigusr1".parse::<StopSignal>().unwrap(),
             timeout: None,
         },
     );
@@ -419,7 +419,7 @@ fn the_rendered_stop_action_reads_back_as_a_manifest_would(#[fixture(temp_dir)] 
         {
             continue;
         }
-        let send_signal = StopSignal::parse(signal).unwrap();
+        let send_signal = signal.parse::<StopSignal>().unwrap();
         let stop_action = StopAction {
             send_signal,
             timeout: timeout.map(Duration::from_secs),
