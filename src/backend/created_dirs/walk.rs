@@ -30,26 +30,45 @@ pub(super) struct Walk {
 }
 
 impl Walk {
-    /// Whether one of `roots` is among the directories the path resolved through. They are opened
-    /// here, and only here: a path that exists whole is used wherever it is, so what a root is does
-    /// not matter until a component is missing. A root that is not there (`ENOENT`, `ENOTDIR` or
-    /// `ELOOP` opening it) holds nothing and is skipped; any other failure to open it is the answer,
-    /// for goetia cannot tell, and names the root.
-    pub(super) fn under_root(&self, roots: &[PathBuf]) -> io::Result<bool> {
-        let search = search_directory();
+    /// Whether one of `roots` is among the directories the path resolved through, `spec` being the
+    /// path the walk was asked about. Every root is read, in any order, and one that holds the path is
+    /// the answer. They are opened here, and only here: a path that exists whole is used wherever it is,
+    /// so what a root is does not matter until a component is missing. A root that is not there (see
+    /// [`open_root`]) holds nothing and is skipped. Any other failure to open one is kept, and fails the
+    /// install, naming the root and `spec`, only if no root holds the path: goetia cannot tell.
+    pub(super) fn under_root(&self, roots: &[PathBuf], spec: &Path) -> Result<bool> {
+        let mut failed = None;
         for root in roots {
-            match open(root.as_path(), search, Mode::empty()).and_then(|fd| fstat(&fd)) {
-                Ok(stat) if self.chain.contains(&(stat.st_dev, stat.st_ino)) => return Ok(true),
-                Ok(_) | Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => {}
+            match open_root(root) {
+                Ok(Some(id)) if self.chain.contains(&id) => return Ok(true),
+                Ok(_) => {}
                 Err(errno) => {
-                    return Err(io::Error::new(
-                        io::Error::from(errno).kind(),
-                        format!("{} (reading the root {})", errno.desc(), root.display()),
-                    ));
+                    failed.get_or_insert_with(|| {
+                        Error::os_at(
+                            format!("open the root {} to check whether it holds", root.display()),
+                            spec,
+                            io::Error::from(errno),
+                        )
+                    });
                 }
             }
         }
-        Ok(false)
+        failed.map_or(Ok(false), Err)
+    }
+}
+
+/// `roots` as an install can use them: those that are there, or whose state could not be read.
+pub(super) fn existing_roots(roots: &[PathBuf]) -> impl Iterator<Item = &PathBuf> {
+    roots.iter().filter(|root| !matches!(open_root(root), Ok(None)))
+}
+
+/// The device and inode of `root`, or `None` if it is not there: it, or a directory above it, is
+/// missing or a file (`ENOENT`, `ENOTDIR`), or it is a symlink loop (`ELOOP`).
+fn open_root(root: &Path) -> std::result::Result<Option<(libc::dev_t, libc::ino_t)>, Errno> {
+    match open(root, search_directory(), Mode::empty()).and_then(|fd| fstat(&fd)) {
+        Ok(stat) => Ok(Some((stat.st_dev, stat.st_ino))),
+        Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => Ok(None),
+        Err(errno) => Err(errno),
     }
 }
 

@@ -37,7 +37,8 @@ use crate::error::{Error, Result};
 /// daemon's id.
 ///
 /// Whether the log's directory is under a root is asked here only when the suggestion depends on it, of a
-/// directory that exists (`plan` asks it of one that does not): a root that cannot be read fails the check.
+/// directory that exists (`plan` asks it of one that does not). A root that cannot be read leaves the
+/// refusal with the advice that does not depend on the roots.
 pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, created: &CreatedDirs) -> Result<()> {
     let Some(dir) = logs.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
@@ -61,7 +62,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
         };
         let kind = if step.is_link() { "symlink" } else { "directory" };
         let advice = match logs.file_name() {
-            Some(file) if leaf && ancestor_passes && created.under_a_root(&plan.found, dir)? => {
+            Some(file) if leaf && ancestor_passes && matches!(plan.found.under_root(&created.roots, dir), Ok(true)) => {
                 format!(
                     "use a directory of its own, such as {}, or one that only root can change",
                     dir.join(app).join(file).display()
