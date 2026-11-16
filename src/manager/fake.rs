@@ -552,7 +552,8 @@ impl Fake {
     }
 
     /// Test-only seeding: every write at `id` makes something besides the entry, as a systemd write
-    /// makes a directory, so its scope is asked whether the definition stands when it is settled.
+    /// makes a directory, so its scope is asked whether the definition stands when it is settled
+    /// after a write that did not land (a write that landed is not read back).
     pub fn seed_write_makes_something(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.write_makes.insert(id.to_string());
@@ -819,11 +820,12 @@ pub struct FakeScope {
 
 impl crate::backend::Settle for FakeScope {
     /// Asks the standing only if a write made something (see [`Settle`](crate::backend::Settle)),
-    /// which is then settled.
+    /// as `CreatedDirs` settles: what was made is settled by `Yes` or
+    /// `Unknown`, and after `No` it stays, so the next settle asks again.
     fn settle(&mut self, standing: impl FnOnce() -> Standing) {
         self.state.lock().expect("Fake mutex poisoned").settles += 1;
-        if std::mem::take(&mut self.made) {
-            standing();
+        if self.made && !matches!(standing(), Standing::No) {
+            self.made = false;
         }
     }
 }

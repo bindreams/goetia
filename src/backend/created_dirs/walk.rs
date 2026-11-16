@@ -32,21 +32,83 @@ pub(super) struct Walk {
 impl Walk {
     /// Whether one of `roots` is among the directories the path resolved through. They are opened
     /// here, and only here: a path that exists whole is used wherever it is, so what a root is does
-    /// not matter until a component is missing. A root that is not there is no root; one that cannot
-    /// be opened for any other reason is an error.
-    pub(super) fn under_root(&self, roots: &[PathBuf]) -> Result<bool> {
+    /// not matter until a component is missing. A root that is not there is no root. The rule is one, for
+    /// every caller: a root that opens and holds the path is a root the path is under, whatever the other
+    /// roots do; a root that cannot be opened for another reason matters only when none that opens holds
+    /// the path, since then goetia cannot tell (see [`RootCheck`]).
+    pub(super) fn under_root(&self, roots: &[PathBuf]) -> RootCheck {
         let search = search_directory();
-        let mut under = false;
+        let mut unopened = Vec::new();
         for root in roots {
-            let fd = match open(root.as_path(), search, Mode::empty()) {
-                Ok(fd) => fd,
-                Err(Errno::ENOENT) => continue,
-                Err(e) => return Err(Error::os_at("open", root, e)),
-            };
-            let stat = fstat(&fd).map_err(|e| Error::os_at("stat", root, e))?;
-            under |= self.chain.contains(&(stat.st_dev, stat.st_ino));
+            let read = open(root.as_path(), search, Mode::empty())
+                .map_err(|e| ("open", e))
+                .and_then(|fd| fstat(&fd).map_err(|e| ("stat", e)));
+            match read {
+                Ok(stat) if self.chain.contains(&(stat.st_dev, stat.st_ino)) => {
+                    return RootCheck {
+                        under: true,
+                        unopened: Vec::new(),
+                    };
+                }
+                Ok(_) | Err((_, Errno::ENOENT)) => {}
+                Err((what, errno)) => unopened.push(Unopened {
+                    root: root.clone(),
+                    what,
+                    errno,
+                }),
+            }
         }
-        Ok(under)
+        RootCheck { under: false, unopened }
+    }
+}
+
+/// What [`Walk::under_root`] found.
+pub(super) struct RootCheck {
+    /// A root that opens holds the path.
+    pub(super) under: bool,
+    /// Where the path is not under such a root, the roots that could not be opened, in order: none of
+    /// them is known not to hold it.
+    pub(super) unopened: Vec<Unopened>,
+}
+
+impl RootCheck {
+    /// Whether the path is under a root. If none that opens holds it and one could not be opened, that
+    /// root's error: goetia cannot tell.
+    pub(super) fn into_result(self) -> Result<bool> {
+        match self.unopened.into_iter().next() {
+            Some(unopened) if !self.under => Err(unopened.error()),
+            _ => Ok(self.under),
+        }
+    }
+
+    /// What the roots that could not be opened said, for a note on a refusal; empty if there are none.
+    pub(super) fn note(&self) -> Option<String> {
+        (!self.unopened.is_empty()).then(|| {
+            self.unopened
+                .iter()
+                .map(|unopened| {
+                    format!(
+                        "could not read the root {}: {}",
+                        unopened.root.display(),
+                        unopened.errno.desc()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+}
+
+/// A root that could not be opened, and what the OS said.
+pub(super) struct Unopened {
+    pub(super) root: PathBuf,
+    what: &'static str,
+    errno: Errno,
+}
+
+impl Unopened {
+    fn error(self) -> Error {
+        Error::os_at(self.what, self.root, self.errno)
     }
 }
 

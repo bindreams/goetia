@@ -547,7 +547,10 @@ fn create_decides_by_the_roots_that_open_and_fails_with_the_root_that_does_not_o
     );
 
     // Next to a root that holds the path: under a root, in either order.
-    for roots in [vec![broken.clone(), layout.system()], vec![layout.system(), broken.clone()]] {
+    for roots in [
+        vec![broken.clone(), layout.system()],
+        vec![layout.system(), broken.clone()],
+    ] {
         let mut dirs = CreatedDirs::under(roots);
         dirs.create(&held, None).expect("under the root that opens");
         assert!(held.is_dir());

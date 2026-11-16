@@ -1,6 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
 use std::os::unix::fs::{PermissionsExt as _, lchown, symlink};
+use std::path::PathBuf;
 
 use super::*;
 use crate::backend::created_dirs::CreatedDirs;
@@ -231,7 +231,10 @@ fn an_unopenable_root_is_read_by_the_roots_that_open_and_never_hides_the_refusal
 
     // Next to a root that holds the directory: under a root, the suggestion appears, and the broken
     // root is not mentioned.
-    for roots in [vec![broken.clone(), layout.system()], vec![layout.system(), broken.clone()]] {
+    for roots in [
+        vec![broken.clone(), layout.system()],
+        vec![layout.system(), broken.clone()],
+    ] {
         let why = refused_by(&CreatedDirs::under(roots), &held);
         assert!(why.contains(suggestion.to_str().unwrap()), "{why}");
         assert!(!why.contains(&note), "{why}");

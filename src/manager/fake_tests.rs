@@ -993,7 +993,7 @@ fn a_service_retyped_to_a_task_never_reports_a_failed_state() {
     assert_eq!(fake.status(&id).unwrap().common().state, State::Stopped);
 }
 
-// The install scope =====================================================================================================
+// The install scope ===================================================================================================
 
 /// The scope settles as `CreatedDirs` does: what a write made is cleared only by a standing that is
 /// `Yes` or `Unknown`, and stays after `No`, so that the next settle (of a write that made nothing)
@@ -1023,5 +1023,8 @@ fn the_scope_keeps_what_a_write_made_after_no_and_clears_it_after_yes_or_unknown
 
     let mut scope = made();
     assert!(asked(&mut scope, Standing::Unknown("unread".into())));
-    assert!(!asked(&mut scope, Standing::Yes), "Unknown cleared it, as CreatedDirs keeps");
+    assert!(
+        !asked(&mut scope, Standing::Yes),
+        "Unknown cleared it, as CreatedDirs keeps"
+    );
 }

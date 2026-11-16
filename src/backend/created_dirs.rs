@@ -68,7 +68,7 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
 #[cfg(target_os = "linux")]
 pub(crate) use log_dir::refuse_writable_log_dir;
-use walk::{End, Step, Walk, open_beneath, walk};
+use walk::{End, Step, Unopened, Walk, open_beneath, walk};
 
 use super::account::describe_uid;
 use super::{Settle, Standing};
@@ -223,12 +223,12 @@ impl CreatedDirs {
     pub(crate) fn plan(&self, dir: &Path) -> Result<Plan> {
         let found = walk(dir)?;
         if matches!(found.end, End::Missing { .. }) {
-            if !found.under_root(&self.roots)? {
+            if !found.under_root(&self.roots).into_result()? {
                 return Err(Error::DirectoryRefused {
                     path: dir.to_path_buf(),
                     why: format!(
                         "it does not exist and is not under {}; create it first",
-                        self.roots_text()
+                        self.roots_text(&[]).unwrap_or_default()
                     ),
                 });
             }
@@ -242,15 +242,19 @@ impl CreatedDirs {
         Ok(Plan { found })
     }
 
-    fn roots_text(&self) -> String {
-        match self.roots.as_slice() {
-            [] => "any of the places goetia makes directories in".to_string(),
-            roots => roots
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
+    /// The roots but `unopened`, for what is said of where a directory is made. `None` if every root
+    /// was one of them.
+    fn roots_text(&self, unopened: &[Unopened]) -> Option<String> {
+        if self.roots.is_empty() {
+            return Some("any of the places goetia makes directories in".to_string());
         }
+        let opened: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|root| unopened.iter().all(|u| u.root != **root))
+            .map(|root| root.display().to_string())
+            .collect();
+        (!opened.is_empty()).then(|| opened.join(", "))
     }
 
     /// Make what the plans say is missing, root's, each under the directory its plan holds, then hand
@@ -273,7 +277,6 @@ impl CreatedDirs {
         let End::Missing { holder, missing } = found.end else {
             return Ok(());
         };
-        let last = missing.len() - 1;
         let (first_path, first_name) = &missing[0];
         let mut dir = match self.pending_top(&holder, first_path, first_name)? {
             Some(top) => self.reach(top, hand_to)?,
@@ -286,7 +289,7 @@ impl CreatedDirs {
             };
         }
         match hand_to {
-            Some(owner) => self.hand_to_one_owner(dir, owner, &missing[last].0),
+            Some(owner) => self.hand_to_one_owner(dir, owner),
             None => Ok(()),
         }
     }
@@ -430,13 +433,13 @@ impl CreatedDirs {
 
     /// A later plan names the directory at `dir`, which an earlier plan of this call made, and hands the
     /// deepest directory of its path to `owner`.
-    fn hand_to_one_owner(&mut self, dir: usize, owner: Owner, path: &Path) -> Result<()> {
+    fn hand_to_one_owner(&mut self, dir: usize, owner: Owner) -> Result<()> {
         let ours = &mut self.made[dir];
         match ours.hand {
             // Every plan of one install names one account.
             Some(first) if first != owner => {
                 return Err(Error::DirectoryRefused {
-                    path: path.to_path_buf(),
+                    path: ours.path.clone(),
                     why: format!(
                         "it is, or lies above, a directory this install made for another path of the spec, which is \
                          to be handed to {}, and this path is to be handed to {}: one directory has one owner",
@@ -451,7 +454,7 @@ impl CreatedDirs {
             // plan that hands nothing over has passed through it since.
             None if ours.plan_owner.is_none() || ours.passed => {
                 return Err(Error::DirectoryRefused {
-                    path: path.to_path_buf(),
+                    path: ours.path.clone(),
                     why: format!(
                         "it is, or lies above, a directory that another path of the spec, which is not handed to an \
                          account, made or passes through, and this path is to be handed to {}: keep the two paths \
