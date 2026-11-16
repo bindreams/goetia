@@ -275,7 +275,8 @@ impl std::str::FromStr for StopSignal {
                 Some(signal) => signal,
                 None => StopSignal::Native(NativeSignal::parse(other).ok_or_else(|| {
                     format!(
-                        "`send-signal` is `{other}`; expected `terminate`, `interrupt`, `quit`, `kill`, `ctrl-c`,                          `ctrl-break`, `wm-close`, or a signal systemd knows (`sigusr1`, `SIGRTMIN+3`)"
+                        "`send-signal` is `{other}`; expected `terminate`, `interrupt`, `quit`, `kill`, `ctrl-c`, \
+                        `ctrl-break`, `wm-close`, or a signal systemd knows (`sigusr1`, `SIGRTMIN+3`)"
                     )
                 })?),
             },
@@ -379,18 +380,21 @@ fn scm_refusals(daemon: ScmDaemon, written: Written) -> StopRefusals {
     let signal = match daemon {
         ScmDaemon::Task if written.send_signal => Some(refusal(
             StopField::SendSignal,
-            "a task on Windows is stopped by Task Scheduler, which decides the signal; set `stop-action`              under `backend-specific` for systemd and launchd instead",
+            "a task on Windows is stopped by Task Scheduler, which decides the signal; set `stop-action` \
+            under `backend-specific` for systemd and launchd instead",
         )),
         ScmDaemon::NativeService if written.send_signal => Some(refusal(
             StopField::SendSignal,
-            "a `protocol: native` service on Windows is stopped by SCM's own stop, which the service              handles itself, so there is no signal to choose; `timeout` still applies",
+            "a `protocol: native` service on Windows is stopped by SCM's own stop, which the service \
+            handles itself, so there is no signal to choose; `timeout` still applies",
         )),
         _ => None,
     };
     let timeout = match daemon {
         ScmDaemon::Task if written.timeout => Some(refusal(
             StopField::Timeout,
-            "a task on Windows is stopped by Task Scheduler, which decides how long it waits; set              `stop-action` under `backend-specific` for systemd and launchd instead",
+            "a task on Windows is stopped by Task Scheduler, which decides how long it waits; set \
+            `stop-action` under `backend-specific` for systemd and launchd instead",
         )),
         _ => None,
     };

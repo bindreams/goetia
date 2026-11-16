@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::spec::raw::RawSpec;
+use crate::spec::test_support::assert_no_run_of_spaces;
 
 fn raw(yaml: &str) -> Result<Option<RawStopAction>, yaml_serde::Error> {
     RawSpec::parse(&format!("id: d\ncommand: [/x]\n{yaml}")).map(|spec| spec.stop_action)
@@ -298,6 +299,20 @@ fn windows_refuses_what_it_decides_itself() {
         on(action("sigusr1", Some(5)), DaemonKind::Service, Protocol::Plain),
         [StopField::SendSignal]
     );
+}
+
+/// A message reads as prose: a string literal's line continuation must not leave a run of spaces.
+#[skuld::test]
+fn a_refusal_message_has_no_run_of_spaces() {
+    let mut messages = vec!["sigfoo".parse::<StopSignal>().unwrap_err()];
+    for (kind, protocol) in [(DaemonKind::Task, Protocol::Plain), (DaemonKind::Service, Protocol::Native)] {
+        let refusals = action("quit", Some(5)).refuse(BackendKind::Scm, kind, protocol);
+        messages.extend([refusals.signal, refusals.timeout].into_iter().flatten());
+    }
+    assert_eq!(messages.len(), 4, "{messages:?}");
+    for message in messages {
+        assert_no_run_of_spaces(&message);
+    }
 }
 
 #[skuld::test]
