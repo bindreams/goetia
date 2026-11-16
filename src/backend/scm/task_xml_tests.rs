@@ -699,6 +699,32 @@ fn a_schedule_that_never_fires_has_a_trigger_and_can_be_armed() {
     assert!(TaskXml::armed(&armed));
 }
 
+// The executables =====================================================================================================
+
+/// The sweep asks what every task runs, whether or not the task is goetia's, so the XML alone answers.
+#[skuld::test]
+fn executables_names_the_command_of_every_exec_action() {
+    let exe = r"C:\Program Files\Goetia\goetia-shim.exe";
+    let one = readback(&spec(), &host_at(exe, &["--service-host"]), DAILY_AT_0330);
+    assert_eq!(TaskXml::executables(&one).unwrap(), [exe]);
+
+    let two = one.replace(
+        "</Actions>",
+        r"<Exec><Command> C:\other\tool.exe </Command></Exec></Actions>",
+    );
+    assert_eq!(TaskXml::executables(&two).unwrap(), [exe, r"C:\other\tool.exe"]);
+
+    let none = one
+        .replace("<Exec>", "<ComHandler>")
+        .replace("</Exec>", "</ComHandler>");
+    assert_eq!(TaskXml::executables(&none).unwrap(), Vec::<String>::new());
+}
+
+#[skuld::test]
+fn executables_of_xml_that_cannot_be_read_is_an_error() {
+    assert!(TaskXml::executables("<Task><Actions>").is_err());
+}
+
 // The generator's entry ===============================================================================================
 
 #[skuld::test]

@@ -96,9 +96,10 @@
 
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
-// The verbs that call the boundary land with the next tasks of slice 5; until then only the tests and
-// the `testing` exports reach it.
-#[allow(dead_code, reason = "the task verbs, its callers, come next")]
+// What reads Task Scheduler is in use. `register`, `delete`, `run` and `stop`, and what only they need,
+// land with the write and run verbs of slice 5, and until then are reached by tests and the `testing`
+// exports.
+#[allow(dead_code, reason = "the task verbs that write and run, its callers, come next")]
 pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;
@@ -117,14 +118,14 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, TaskApi};
+use self::task::{Com, Purpose, TaskApi, TaskSnapshot, combined, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
     carried, end_on_incomplete_stop, end_process,
 };
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
-use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HeldProcess, HoldOutcome, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
@@ -159,7 +160,6 @@ pub struct Scm {
     shim: Option<Box<dyn ShimProvider>>,
     folders: FolderCheck,
     /// Task Scheduler: the real one, unless an in-crate test put a [`TaskApi`] in its place.
-    #[allow(dead_code, reason = "the task verbs, its readers, come next")]
     tasks: Box<dyn TaskApi>,
 }
 
@@ -189,7 +189,7 @@ impl Scm {
 
     /// This manager over `tasks` in place of the real Task Scheduler, for in-crate tests, as
     /// [`with_shim`](Self::with_shim) puts a provider in place of the stock host.
-    #[allow(dead_code, reason = "the tests of the task verbs, its callers, come next")]
+    #[cfg(test)]
     pub(crate) fn with_tasks(self, tasks: Box<dyn TaskApi>) -> Self {
         Self { tasks, ..self }
     }
@@ -294,6 +294,32 @@ impl ScmSnapshot {
     }
 }
 
+/// What `read` saw at a marked id, in whichever of the two stores holds it: an id is one namespace
+/// across the SCM and Task Scheduler, and an id goetia marked in both reads as the service (see
+/// [`task::which`]).
+// As `ReadOutcome::Marked`, a whole snapshot per variant, one per daemon per verb; same call.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum WindowsSnapshot {
+    Service(ScmSnapshot),
+    Task(TaskSnapshot),
+}
+
+impl InstalledService for WindowsSnapshot {
+    fn id(&self) -> &Id {
+        match self {
+            WindowsSnapshot::Service(snapshot) => snapshot.id(),
+            WindowsSnapshot::Task(snapshot) => snapshot.id(),
+        }
+    }
+
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
+        match self {
+            WindowsSnapshot::Service(snapshot) => snapshot.blob(),
+            WindowsSnapshot::Task(snapshot) => snapshot.blob(),
+        }
+    }
+}
+
 /// The service half of every verb: what the Windows backend does for an id the SCM holds.
 impl Scm {
     /// For `protocol: plain`: the install flow has rendered the definition already, so every refusal
@@ -314,9 +340,7 @@ impl Scm {
         }
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
-        if let Ok(referenced) = referenced_hosts() {
-            let _ = shim.sweep(&referenced, &self.folders);
-        }
+        self.sweep_before_install(shim);
         let provided = shim.provide(&self.folders)?;
         let rendered = HostCommand {
             exe: desired.executable.clone(),
@@ -472,7 +496,7 @@ impl Scm {
             return Ok(());
         };
         let _lock = InstallLock::acquire()?;
-        shim.sweep(&referenced_hosts()?, &self.folders)
+        shim.sweep(&referenced_hosts(&*self.tasks)?, &self.folders)
             .map_err(|failure| *failure.error)
     }
 
@@ -559,9 +583,15 @@ impl Scm {
     }
 }
 
+/// The refusal every verb gives a task until the write and run sides of the task half land: a task is
+/// read, listed and reported, but nothing installs one yet, so none reaches a verb that changes it.
+fn task_verbs_pending(id: &Id) -> Error {
+    crate::backend::cannot_run_tasks("the Windows service manager", id)
+}
+
 impl Backend for Scm {
-    type Definition = ScmRegistration;
-    type Snapshot = ScmSnapshot;
+    type Definition = WindowsDefinition;
+    type Snapshot = WindowsSnapshot;
     /// The install lock, which `protocol: plain` holds until its install ends: what places, repairs
     /// and deletes shim files, for this process and every other, takes it.
     type InstallScope = Option<InstallLock>;
@@ -571,10 +601,13 @@ impl Backend for Scm {
     fn begin_install(
         &self,
         spec: &DaemonSpec,
-        desired: &ScmRegistration,
+        desired: &WindowsDefinition,
         _reservation: &mut (),
     ) -> Result<Option<InstallLock>> {
-        self.service_begin_install(spec, desired)
+        match desired {
+            WindowsDefinition::Service(desired) => self.service_begin_install(spec, desired),
+            WindowsDefinition::Task(_) => Err(task_verbs_pending(&spec.common().id)),
+        }
     }
 
     /// SCM sends its requests through the OS, with no thread or file of ours to run out.
@@ -582,103 +615,168 @@ impl Backend for Scm {
         Ok(())
     }
 
-    fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
-        self.service_render(spec)
+    fn render(&self, spec: &DaemonSpec) -> Result<WindowsDefinition> {
+        match spec {
+            DaemonSpec::Service(_) => self.service_render(spec).map(WindowsDefinition::Service),
+            DaemonSpec::Task(_) => self.task_render(spec),
+        }
     }
 
-    fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
-        self.service_regenerate(spec, snapshot)
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &WindowsSnapshot) -> Result<WindowsDefinition> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => {
+                self.service_regenerate(spec, snapshot).map(WindowsDefinition::Service)
+            }
+            WindowsSnapshot::Task(snapshot) => self.task_regenerate(spec, snapshot),
+        }
     }
 
-    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
-        self.service_render_for_install(spec)
+    /// A task is refused as before until the write side lands: its install would otherwise place the
+    /// shim file before it fails.
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<WindowsDefinition> {
+        match spec {
+            DaemonSpec::Service(_) => self.service_render_for_install(spec).map(WindowsDefinition::Service),
+            DaemonSpec::Task(_) => Err(task_verbs_pending(&spec.common().id)),
+        }
     }
 
-    fn read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
-        self.service_read(id)
+    fn read(&self, id: &Id) -> Result<ReadOutcome<WindowsSnapshot>> {
+        which(self.service_read(id)?, || self.task_read(id), Purpose::Verb)
     }
 
-    fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
-        self.service_installed(snapshot)
+    /// A service's install reads what is at its id with Task Scheduler's failure to be read set
+    /// aside: a machine whose Task Scheduler is unusable still installs a new service.
+    fn read_for_install(&self, spec: &DaemonSpec) -> Result<ReadOutcome<WindowsSnapshot>> {
+        let id = &spec.common().id;
+        let purpose = match spec {
+            DaemonSpec::Service(_) => Purpose::ServiceInstall,
+            DaemonSpec::Task(_) => Purpose::Verb,
+        };
+        which(self.service_read(id)?, || self.task_read(id), purpose)
+    }
+
+    fn installed(&self, snapshot: &WindowsSnapshot) -> Result<InstalledDefinition<WindowsDefinition>> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => {
+                self.service_installed(snapshot).map(|installed| InstalledDefinition {
+                    definition: WindowsDefinition::Service(installed.definition),
+                    external: installed.external,
+                })
+            }
+            WindowsSnapshot::Task(snapshot) => self.task_installed(snapshot),
+        }
     }
 
     fn write(
         &self,
         spec: &DaemonSpec,
-        definition: &ScmRegistration,
+        definition: &WindowsDefinition,
         _outcome: &Outcome,
-        snapshot: Option<&ScmSnapshot>,
+        snapshot: Option<&WindowsSnapshot>,
         _scope: &mut Option<InstallLock>,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
-        self.service_write(spec, definition, snapshot)
+        match (definition, snapshot) {
+            (WindowsDefinition::Service(definition), None) => self.service_write(spec, definition, None),
+            (WindowsDefinition::Service(definition), Some(WindowsSnapshot::Service(snapshot))) => {
+                self.service_write(spec, definition, Some(snapshot))
+            }
+            _ => Err(task_verbs_pending(&spec.common().id)),
+        }
     }
 
-    fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
-        self.service_live_status(snapshot)
+    fn live_status(&self, snapshot: &WindowsSnapshot) -> Result<Status> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_live_status(snapshot),
+            WindowsSnapshot::Task(snapshot) => self.task_live_status(snapshot),
+        }
     }
 
-    fn scan(&self) -> Scan<ScmSnapshot> {
-        self.service_scan()
+    /// A task's run state is its listing and the liveness of what it lists, and nothing else, so that
+    /// a part of its status that can fail cannot refuse a run.
+    fn task_state(&self, snapshot: &WindowsSnapshot) -> Result<State> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => Ok(self.service_live_status(snapshot)?.common().state),
+            WindowsSnapshot::Task(snapshot) => Ok(self.task_run_state(snapshot)),
+        }
     }
 
-    fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
-        self.service_uninstall(snapshot)
+    fn scan(&self) -> Scan<WindowsSnapshot> {
+        combined(self.service_scan(), &*self.tasks)
+    }
+
+    fn uninstall(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_uninstall(snapshot),
+            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+        }
     }
 
     fn uninstall_absent(&self, _id: &Id) -> Result<()> {
         self.service_uninstall_absent()
     }
 
-    fn enable(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
-        self.service_enable(snapshot)
+    fn enable(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_enable(snapshot),
+            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+        }
     }
 
-    fn disable(&self, snapshot: ScmSnapshot) -> Result<()> {
-        self.service_disable(snapshot)
+    fn disable(&self, snapshot: WindowsSnapshot) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_disable(snapshot),
+            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+        }
     }
 
-    fn start(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
-        self.service_start(snapshot, budget)
+    fn start(&self, snapshot: WindowsSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_start(snapshot, budget),
+            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+        }
     }
 
-    fn request_start_after_stop(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
-        self.service_request_start_after_stop(snapshot)
+    fn request_start_after_stop(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_request_start_after_stop(snapshot),
+            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+        }
     }
 
-    fn stop(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
-        self.service_stop(snapshot, budget)
+    fn stop(&self, snapshot: WindowsSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_stop(snapshot, budget),
+            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+        }
     }
 
-    fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
-        self.service_kill(snapshot)
+    fn kill(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_kill(snapshot),
+            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+        }
     }
 
-    /// Interim: SCM installs no task yet, so no id reaches here as one.
+    /// Interim: no task runs yet.
     fn begin_run(
         &self,
-        snapshot: ScmSnapshot,
+        snapshot: WindowsSnapshot,
         _reservation: &mut (),
         _notes: &mut dyn std::io::Write,
     ) -> Result<std::convert::Infallible> {
-        Err(crate::backend::cannot_run_tasks(
-            "the Windows service manager",
-            &snapshot.into_id(),
-        ))
+        Err(task_verbs_pending(snapshot.id()))
     }
 }
 
-/// The service registration `build` makes for `spec`. This backend installs only services until its
-/// task half lands, so a task is refused here, before the host is asked, as it always was.
+/// The service registration `build` makes for `spec`. A task is refused here, before the host is
+/// asked, as it always was: [`Scm::task_render`] builds a task's definition.
 fn service_registration(
     spec: &DaemonSpec,
     build: impl FnOnce() -> Result<generate::WindowsDefinition>,
 ) -> Result<ScmRegistration> {
     if let DaemonSpec::Task(_) = spec {
-        return Err(crate::backend::cannot_run_tasks(
-            "the Windows service manager",
-            &spec.common().id,
-        ));
+        return Err(task_verbs_pending(&spec.common().id));
     }
     match build()? {
         generate::WindowsDefinition::Service(registration) => Ok(registration),
@@ -1574,6 +1672,15 @@ fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
 }
 
 impl Scm {
+    /// The sweep an install makes before it provides its host: `shim`'s files that no service, task or
+    /// process references. A reference read that fails, or a sweep that cannot delete a file, is not
+    /// the install's failure: the file is not what the install needs, and the next sweep finds it.
+    fn sweep_before_install(&self, shim: &dyn ShimProvider) {
+        if let Ok(referenced) = referenced_hosts(&*self.tasks) {
+            let _ = shim.sweep(&referenced, &self.folders);
+        }
+    }
+
     /// The folder of the provider, as an uninstall tells it: [`ProviderFolder::None`] without a
     /// provider or for one that sweeps no folder, its normalised `folder()`, and
     /// [`ProviderFolder::Unknown`] when that fails, which is not the absence of a provider: the
@@ -1691,7 +1798,7 @@ impl Scm {
             return finish(failures, false);
         }
         // After the wait: what has exited no longer references its file.
-        let referenced = match referenced_hosts() {
+        let referenced = match referenced_hosts(&*self.tasks) {
             Ok(referenced) => referenced,
             Err(e) => {
                 failures.push(e.into());

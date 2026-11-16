@@ -378,6 +378,17 @@ pub(in crate::backend::scm) mod system {
         Ok(())
     }
 
+    /// Whether the process with `pid` is running: `false` for one that does not exist or whose
+    /// object is signalled, `true` for one that opens and is not. Any other failure to open it is
+    /// the error, never "running". For a pid a manager's own handle keeps from being reused (a task's
+    /// instance, held by Task Scheduler while it lists it), so the answer is about that process.
+    pub(in crate::backend::scm) fn is_running(pid: u32) -> io::Result<bool> {
+        match open_process_with(pid, PROCESS_SYNCHRONIZE)? {
+            None => Ok(false),
+            Some(process) => has_exited(&process).map(|exited| !exited),
+        }
+    }
+
     /// Whether the process behind `process`, held with `SYNCHRONIZE`, has exited.
     pub(in crate::backend::scm) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
         // SAFETY: `process` is a live handle with `PROCESS_SYNCHRONIZE`.

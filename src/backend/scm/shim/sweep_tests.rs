@@ -867,4 +867,98 @@ mod windows {
         assert_eq!(unexpanded(&wide_null_cut("C:\\a\\b.exe")), r"C:\a\b.exe");
         assert_eq!(unexpanded(&wide_null_cut("\0tail")), "");
     }
+
+    // What the tasks reference ----------------------------------------------------------------------------------------
+
+    mod tasks {
+        use std::io;
+
+        use super::super::system::task_hosts;
+        use super::super::unreferenced;
+        use super::super::*;
+        use crate::backend::scm::manager::task::api::Registered;
+        use crate::backend::scm::manager::task::fake::Fake;
+        use crate::backend::scm::test_support::{registered_task, task_host, task_spec};
+        use crate::error::Error;
+
+        fn broken() -> Error {
+            Error::os("read the task", io::Error::other("denied"))
+        }
+
+        /// A shim file a task runs is referenced, so the sweep keeps it: the task is the only thing
+        /// that names it.
+        #[skuld::test]
+        fn referenced_hosts_names_a_tasks_action_executable() {
+            let host = task_host().exe;
+            let fake = Fake::new();
+            fake.on_names(Ok(vec!["nightly".to_owned()]))
+                .on_get(Ok(Some(registered_task(&task_spec(None), false))));
+
+            let hosts = task_hosts(&fake).unwrap();
+
+            assert!(hosts.contains(&normalise(&host)), "{hosts:?}");
+            assert!(
+                unreferenced(&[normalise(&host)], &hosts).is_empty(),
+                "a shim file a task references is not swept"
+            );
+        }
+
+        /// A task that is not goetia's is read by its XML alone: what it runs is referenced all the same.
+        #[skuld::test]
+        fn a_tasks_executable_is_named_whether_or_not_the_task_is_goetias() {
+            let fake = Fake::new();
+            fake.on_names(Ok(vec!["theirs".to_owned()])).on_get(Ok(Some(Registered {
+                xml: r"<Task><Actions><Exec><Command>C:\their\tool.exe</Command></Exec></Actions></Task>".to_owned(),
+                data: String::new(),
+            })));
+
+            let hosts = task_hosts(&fake).unwrap();
+
+            assert!(hosts.contains(&normalise(Path::new(r"C:\their\tool.exe"))), "{hosts:?}");
+        }
+
+        #[skuld::test]
+        fn a_task_that_is_gone_since_it_was_listed_and_a_name_that_is_no_id_reference_nothing() {
+            let fake = Fake::new();
+            fake.on_names(Ok(vec!["gone".to_owned(), "not an id!".to_owned()]))
+                .on_get(Ok(None));
+
+            assert!(task_hosts(&fake).unwrap().is_empty());
+        }
+
+        /// A read that failed or did not finish says nothing of what the unread tasks reference, which
+        /// must not be taken for nothing.
+        #[skuld::test]
+        fn a_failed_task_read_fails_the_reference_read() {
+            let fake = Fake::new();
+            fake.on_names(Err(broken()));
+            assert!(task_hosts(&fake).is_err(), "the enumeration failed");
+
+            let fake = Fake::new();
+            fake.on_names(Ok(vec!["nightly".to_owned()])).on_get(Err(broken()));
+            assert!(task_hosts(&fake).is_err(), "a task could not be read");
+
+            let fake = Fake::new();
+            fake.on_names(Ok(vec!["nightly".to_owned()]))
+                .on_get(Ok(Some(Registered {
+                    xml: "<Task><Actions>".to_owned(),
+                    data: String::new(),
+                })));
+            assert!(task_hosts(&fake).is_err(), "a task's XML could not be read");
+        }
+
+        /// Every task is tried: one that fails does not hide the one after it, and both are reported.
+        #[skuld::test]
+        fn every_failed_task_is_reported() {
+            let fake = Fake::new();
+            fake.on_names(Ok(vec!["one".to_owned(), "two".to_owned()]))
+                .on_get(Err(broken()))
+                .on_get(Err(broken()));
+
+            let said = task_hosts(&fake).unwrap_err().report().to_string();
+
+            assert!(said.contains("`one`") && said.contains("`two`"), "{said}");
+            fake.finish();
+        }
+    }
 }

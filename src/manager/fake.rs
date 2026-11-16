@@ -184,6 +184,8 @@ struct Store {
     externals: BTreeMap<String, ExternalConfig>,
     writes: usize,
     calls: Vec<(&'static str, String)>,
+    /// The id of every `read_for_install`, kept apart from `calls`: a read is no request to the manager.
+    install_reads: Vec<String>,
     prepared: Vec<(Vec<Step>, Budget)>,
     /// What a run of each task does, by id; absent means a clean exit and no output.
     run_scripts: BTreeMap<String, RunScript>,
@@ -629,6 +631,13 @@ impl Fake {
         state.calls.clone()
     }
 
+    /// The id of every read an install or a preview made of what is installed, in order: reads made
+    /// for an install of a spec, which a backend may answer differently from a verb's.
+    pub fn install_reads(&self) -> Vec<String> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.install_reads.clone()
+    }
+
     /// How many writes were attempted, the raced ones included.
     pub fn writes(&self) -> usize {
         let state = self.state.lock().expect("Fake mutex poisoned");
@@ -866,6 +875,13 @@ impl crate::backend::Backend for Fake {
     fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.read(id)
+    }
+
+    /// Recorded (see [`Fake::install_reads`]), then what `read` answers: the fake has one store.
+    fn read_for_install(&self, spec: &DaemonSpec) -> Result<ReadOutcome<Artifact>> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.install_reads.push(spec.common().id.as_str().to_string());
+        state.read(&spec.common().id)
     }
 
     fn installed(&self, snapshot: &Artifact) -> Result<InstalledDefinition<String>> {

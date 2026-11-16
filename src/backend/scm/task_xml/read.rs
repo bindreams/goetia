@@ -82,6 +82,19 @@ impl TaskXml {
         })
     }
 
+    /// The program of every `Exec` action of `xml`, as written. Read from the XML alone, so it names
+    /// what any task in the folder runs, goetia's or not.
+    pub(crate) fn executables(xml: &str) -> Result<Vec<String>, Error> {
+        let document = document(xml)?;
+        let Some(actions) = child(document.root_element(), "Actions") else {
+            return Ok(Vec::new());
+        };
+        Ok(elements(actions)
+            .filter(|action| action.tag_name().name() == "Exec")
+            .filter_map(|exec| child(exec, "Command").map(text))
+            .collect())
+    }
+
     /// Whether every trigger of `xml` is enabled. A task with no trigger is not armed, and neither
     /// is XML that cannot be read.
     pub(crate) fn armed(xml: &str) -> bool {

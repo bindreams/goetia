@@ -103,6 +103,15 @@ pub(crate) trait Backend {
     /// established.
     fn read(&self, id: &Id) -> Result<ReadOutcome<Self::Snapshot>>;
 
+    /// What is at `spec`'s id, as an install of `spec` must judge it: [`Self::read`] unless a store
+    /// that cannot be read matters less to this install than to a verb. SCM holds an id in two
+    /// stores, and a machine whose Task Scheduler is unusable still installs a new service. Called
+    /// only by [`flow::install`] and [`flow::preview`], beside [`Self::render_for_install`], whose
+    /// install-only pattern it follows.
+    fn read_for_install(&self, spec: &DaemonSpec) -> Result<ReadOutcome<Self::Snapshot>> {
+        self.read(&spec.common().id)
+    }
+
     /// The definition as installed, and the configuration applied to it from outside, read for a
     /// service `read` found marked.
     fn installed(&self, snapshot: &Self::Snapshot) -> Result<InstalledDefinition<Self::Definition>>;
@@ -290,6 +299,18 @@ pub(crate) struct Unnamed<B> {
     pub body: B,
 }
 
+impl<S> ReadOutcome<S> {
+    /// The same outcome with a marked snapshot turned into another by `make`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn map<T>(self, make: impl FnOnce(S) -> T) -> ReadOutcome<T> {
+        match self {
+            Self::Absent => ReadOutcome::Absent,
+            Self::Foreign { recovery } => ReadOutcome::Foreign { recovery },
+            Self::Marked(snapshot) => ReadOutcome::Marked(make(snapshot)),
+        }
+    }
+}
+
 impl<B> ReadOutcome<Unnamed<B>> {
     /// The outcome at `id`, with a marked artifact made into the snapshot `make` builds.
     pub(crate) fn named<S>(self, id: &Id, make: impl FnOnce(Id, Decoded, B) -> S) -> ReadOutcome<S> {
@@ -314,6 +335,15 @@ pub(crate) enum ScanEntry<S> {
 }
 
 impl<S> ScanEntry<S> {
+    /// The same entry with a marked snapshot turned into another by `make`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn map<T>(self, make: impl FnOnce(S) -> T) -> ScanEntry<T> {
+        match self {
+            Self::Read(read) => ScanEntry::Read(read.map(make)),
+            Self::Misnamed { blob, name } => ScanEntry::Misnamed { blob, name },
+        }
+    }
+
     /// `found` at `name`: named an id where it is one, and otherwise [`Self::Misnamed`] if it is
     /// marked.
     pub(crate) fn of<B>(name: &str, found: ReadOutcome<Unnamed<B>>, make: impl FnOnce(Id, Decoded, B) -> S) -> Self {

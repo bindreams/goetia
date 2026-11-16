@@ -183,7 +183,7 @@ pub(crate) fn install<B: Backend>(
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
     loop {
-        let found = classify(b, b.read(&spec.common().id)?);
+        let found = classify(b, b.read_for_install(spec)?);
         let outcome = decide::decide(
             &found.ownership,
             &desired_text,
@@ -220,7 +220,7 @@ pub(crate) fn install<B: Backend>(
 /// to let a user decide about.
 pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
     let desired = b.render_for_install(spec)?.to_string();
-    let found = classify(b, b.read(&spec.common().id)?);
+    let found = classify(b, b.read_for_install(spec)?);
     Ok(decide::decide(
         &found.ownership,
         &desired,

@@ -41,3 +41,32 @@ pub(crate) fn blob_of(protocol: crate::spec::Protocol) -> crate::blob::Blob {
         ),
     }
 }
+
+/// The task `nightly`, which runs `schedule` (`None`: nothing starts it).
+#[cfg(windows)]
+pub(crate) fn task_spec(schedule: Option<&str>) -> crate::spec::DaemonSpec {
+    crate::testing::task("nightly", vec![crate::spec::test_support::program("job")], schedule)
+}
+
+/// The shim host a task runs.
+#[cfg(windows)]
+pub(crate) fn task_host() -> crate::shim::HostCommand {
+    crate::shim::HostCommand {
+        exe: crate::spec::test_support::abs("Program Files/Goetia/goetia-shim.exe"),
+        args: vec!["--service-host".to_owned()],
+    }
+}
+
+/// What Task Scheduler holds for `spec` run through [`task_host`]: the XML goetia registers, its
+/// triggers enabled or not, and the blob as its `Data`.
+#[cfg(windows)]
+pub(crate) fn registered_task(
+    spec: &crate::spec::DaemonSpec,
+    armed: bool,
+) -> crate::backend::scm::manager::task::api::Registered {
+    let definition = crate::backend::scm::task_xml::TaskXml::new(spec, task_host()).unwrap();
+    crate::backend::scm::manager::task::api::Registered {
+        xml: definition.to_xml(armed),
+        data: crate::blob::metadata_text(spec),
+    }
+}

@@ -696,7 +696,7 @@ fn render_names_the_previewed_host_verbatim() {
     let (provider, _) = FakeProvider::new(host.clone(), host.clone());
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
-    let reg = mgr.render(&simple_daemon()).unwrap();
+    let reg = mgr.service_render(&simple_daemon()).unwrap();
 
     assert_eq!((reg.executable, reg.arguments), (host.exe, host.args));
 }
@@ -1082,7 +1082,7 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     let (provider, calls) = FakeProvider::new(command(r"C:\elsewhere\host.exe"), command(r"C:\elsewhere\host.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
-    let reg = mgr.regenerate(&spec, &snapshot).unwrap();
+    let reg = mgr.service_regenerate(&spec, &snapshot).unwrap();
 
     assert_eq!(reg.executable, PathBuf::from(r"C:\Program Files\App\app.exe"));
     assert_eq!(reg.arguments, ["--service-host"]);
@@ -1495,6 +1495,60 @@ fn a_command_line_with_nothing_before_its_nul_has_no_executable() {
             cmdline.escape_debug()
         );
     }
+}
+
+// Task Scheduler that cannot be read ==================================================================================
+
+fn unusable_task_scheduler() -> crate::backend::scm::manager::task::fake::Fake {
+    let fake = crate::backend::scm::manager::task::fake::Fake::new();
+    fake.on_names(Err(Error::os(
+        "list the tasks",
+        std::io::Error::other("the Schedule service stopped"),
+    )));
+    fake
+}
+
+/// What an install sweeps is files nothing references, and a Task Scheduler that cannot say what its tasks
+/// run says nothing of that: the sweep is skipped, and the install goes on without it.
+#[skuld::test]
+fn install_ignores_a_failed_sweep() {
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let fake = unusable_task_scheduler();
+    let scm = Scm::with_shim(provider, CheckPermissions::Disable).with_tasks(Box::new(fake.clone()));
+
+    scm.sweep_before_install(scm.provider().unwrap());
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        Vec::<&str>::new(),
+        "nothing is swept when what is referenced is unknown"
+    );
+    fake.finish();
+}
+
+/// A stated limit: an uninstall cannot know which shim files a task references while Task Scheduler is
+/// unusable, so it reports the file it left rather than sweep what a task may still run.
+#[skuld::test]
+fn a_service_uninstall_with_an_unusable_task_scheduler_reports_the_leftover_shim_file() {
+    let id = Id::try_from("frpc").unwrap();
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let fake = unusable_task_scheduler();
+    let scm = Scm::with_shim(provider, CheckPermissions::Disable).with_tasks(Box::new(fake.clone()));
+    let host = PathBuf::from(format!(r"C:\app\goetia-shim-{SHIM_HEX}.exe"));
+
+    let said = scm
+        .finish_uninstall(&id, Ok(host), HoldOutcome::NoProcess)
+        .expect_err("the cleanup could not finish")
+        .report()
+        .to_string();
+
+    assert!(
+        said.contains("`frpc` was deleted, but the shim files it used were not cleaned up"),
+        "{said}"
+    );
+    assert!(said.contains("the Schedule service stopped"), "{said}");
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "nothing was swept");
+    fake.finish();
 }
 
 // apply refuses an account that is no user ============================================================================

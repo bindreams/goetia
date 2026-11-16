@@ -31,6 +31,19 @@ fn unresolvable(user: &str) -> String {
 
 // install =============================================================================================================
 
+/// What an install of `spec` judges is read for that install, not as a verb reads it: a backend that
+/// holds an id in two stores reads each as the install needs.
+#[skuld::test]
+fn install_and_preview_read_what_is_at_the_id_as_an_install_of_the_spec_judges_it() {
+    let fake = Fake::new();
+
+    fake.preview_install(&mk("frpc")).unwrap();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    // The install reads again only if its write raced: it did not.
+    assert_eq!(fake.install_reads(), ["frpc", "frpc"]);
+}
+
 #[skuld::test]
 fn install_retries_a_raced_write_until_it_lands() {
     let fake = Fake::new();

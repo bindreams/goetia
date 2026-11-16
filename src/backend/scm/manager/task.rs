@@ -4,12 +4,21 @@
 //! legs.
 
 pub(crate) mod api;
+mod classify;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod cleanup;
 pub(crate) mod clock;
 mod com;
 #[cfg(test)]
 pub(crate) mod fake;
+mod live;
+mod read;
+mod status;
 
 pub(crate) use api::TaskApi;
+pub(in crate::backend::scm) use classify::{Purpose, which};
 pub(crate) use com::Com;
+pub(crate) use read::TaskSnapshot;
+pub(in crate::backend::scm) use read::combined;
+
+use crate::backend::scm::instance::TaskPath;
