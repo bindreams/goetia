@@ -31,6 +31,7 @@ fn as_user(verb: &str, id: &Id, account: &str, host: &ServiceAccountHost, comman
 
 #[track_caller]
 fn assert_succeeded(what: &str, output: &Output) {
+    eprintln!("DBG {what}: stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     assert!(
         output.status.success(),
         "{what} failed: stdout={} stderr={}",
@@ -161,13 +162,16 @@ fn a_task_installed_again_as_another_user_still_records_and_prunes(#[fixture(scm
         "run".to_owned(),
     ];
 
+    eprintln!("DBG users made, installing as first");
     assert_succeeded(
         "install as the first user",
         &as_user("install", id, &first, &host, &command),
     );
+    eprintln!("DBG running as first");
     let exit = mgr
         .run(id, &mut Vec::new())
         .unwrap_or_else(|e| panic!("run as {first}: {}", e.report()));
+    eprintln!("DBG ran: {exit:?}");
     assert_eq!(exit, Exit::Code(0), "a recorded run of the first user");
     let first_records = record_files(id);
     assert_eq!(first_records.len(), 1, "{first_records:?}");
@@ -176,12 +180,19 @@ fn a_task_installed_again_as_another_user_still_records_and_prunes(#[fixture(scm
         "install as the second user",
         &as_user("install", id, &second, &host, &command),
     );
+    eprintln!("DBG starting as second");
     // `start`, not `run`: a `run` waits holding a pin on the records, and a write prunes nothing then.
     mgr.start(id, Budget::DEFAULT)
         .unwrap_or_else(|e| panic!("start as {second}: {}", e.report()));
+    eprintln!("DBG started; waiting for the prune; first records {first_records:?}");
 
+    let mut last = Vec::new();
     kill::until(|| {
         let now = record_files(id);
+        if now != last {
+            eprintln!("DBG records now {now:?}");
+            last = now.clone();
+        }
         now.len() == 1 && now != first_records
     });
 }

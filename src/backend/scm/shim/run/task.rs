@@ -95,6 +95,7 @@ pub(super) fn run(id: &str) -> ! {
 /// code.
 pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs: Option<&Runs>, own_pid: u32) -> u32 {
     let log = &*supervisor.log;
+    log.warning(id, &format!("DBG task mode starts as pid {own_pid}"));
     let (spec, path) = match own_spec(id, api) {
         Ok(read) => read,
         Err(stop) => {
@@ -217,7 +218,7 @@ fn own_instance(
     loop {
         match read() {
             Ok(Some(own)) => return OwnInstanceOutcome::Listed(own),
-            Ok(None) => {}
+            Ok(None) => log.warning(id, &format!("DBG own pid {own_pid} is not listed yet")),
             Err(e) => {
                 log.failure(
                     id,

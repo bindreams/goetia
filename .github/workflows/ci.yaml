@@ -49,8 +49,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        toolchain: [floor, stable]
+        os: [windows-latest]
+        toolchain: [stable]
 
     steps:
       - name: Checkout
@@ -116,7 +116,7 @@ jobs:
           set -euo pipefail
 
           nextest="$(command -v cargo-nextest)"
-          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail)
+          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail -E 'binary(scm_integration) & test(task_accounts)')
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             mkdir -p target/nextest-extract
             "$nextest" "${args[@]}" --extract-to target/nextest-extract --extract-overwrite
@@ -125,6 +125,16 @@ jobs:
             sudo --preserve-env=GOETIA_TEST_SCM_CONSENT,GOETIA_TEST_SYSTEMD_CONSENT,GOETIA_TEST_LAUNCHD_CONSENT \
               "$nextest" "${args[@]}"
           fi
+
+      - name: Dump what the shims logged
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem C:\ProgramData\Goetia -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          icacls C:\ProgramData\Goetia
+          Get-ChildItem C:\ProgramData\Goetia\logs -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { "=== $($_.FullName)"; Get-Content $_.FullName }
+          Get-WinEvent -FilterHashtable @{ProviderName='Goetia'} -MaxEvents 200 -ErrorAction SilentlyContinue | ForEach-Object { "$($_.TimeCreated) $($_.Message)" }
+          Get-Process | Where-Object { $_.ProcessName -like 'goetia*' -or $_.ProcessName -like 'scm_integration*' } | Format-Table Id, ProcessName, StartTime
 
       # See `tests/support/mod.rs::record_probe`.
       - name: Upload probe results
