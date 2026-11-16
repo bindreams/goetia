@@ -20,7 +20,7 @@ use goetia::backend::launchd::manager::Launchd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, ServiceManager, State};
-use goetia::spec::{DaemonKind, Id};
+use goetia::spec::{DaemonKind, DaemonSpec, Id, StopAction, StopSignal, TaskFields, TaskSpec};
 use goetia::testing::task;
 
 use crate::launchd::{
@@ -592,6 +592,62 @@ fn stop_of_a_task_that_ignores_sigterm_times_out_and_kill_ends_it(#[fixture(laun
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.common.state, State::Running, "{status:?}");
     mgr.kill(&task_id).expect("kill");
+    let status = task_status(&mgr, &task_id);
+    assert_eq!(status.common.state, State::Idle, "{status:?}");
+    assert_eq!(status.last_result, Some(Exit::Signal(9)), "{status:?}");
+}
+
+/// `task` with the stop action `send_signal` and `timeout` say.
+fn stopping_as(task: DaemonSpec, send_signal: StopSignal, timeout: Option<Duration>) -> DaemonSpec {
+    let DaemonSpec::Task(task) = task else {
+        unreachable!("a task")
+    };
+    TaskSpec::new(TaskFields {
+        stop_action: StopAction { send_signal, timeout },
+        ..task.into_fields()
+    })
+    .map(DaemonSpec::from)
+    .expect("a task with a stop action")
+}
+
+/// A run that ignores SIGTERM is sent SIGKILL when the `timeout` of its stop action is over, and `stop`
+/// returns once it is gone.
+#[skuld::test]
+fn stop_of_a_task_that_ignores_sigterm_ends_it_after_its_timeout(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let task_id = id_of(&id);
+    let mut held = Held::ignoring_sigterm();
+    let mgr = Launchd::new();
+    let spec = stopping_as(
+        task(&id, held.command.clone(), None),
+        StopSignal::Terminate,
+        Some(StopAction::MIN_TIMEOUT),
+    );
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&task_id, Budget::DEFAULT).expect("start");
+    held.wait_started();
+
+    mgr.stop(&task_id, Budget::Unbounded).expect("a stop that ends the run");
+
+    let status = task_status(&mgr, &task_id);
+    assert_eq!(status.common.state, State::Idle, "{status:?}");
+    assert_eq!(status.last_result, Some(Exit::Signal(9)), "{status:?}");
+}
+
+/// `send-signal: kill` ends a run that ignores SIGTERM at once: the stop sends SIGKILL, and no SIGTERM.
+#[skuld::test]
+fn stop_of_a_task_with_send_signal_kill_ends_a_run_that_ignores_sigterm(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let task_id = id_of(&id);
+    let mut held = Held::ignoring_sigterm();
+    let mgr = Launchd::new();
+    let spec = stopping_as(task(&id, held.command.clone(), None), StopSignal::Kill, None);
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&task_id, Budget::DEFAULT).expect("start");
+    held.wait_started();
+
+    mgr.stop(&task_id, Budget::Unbounded).expect("a stop that ends the run");
+
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.common.state, State::Idle, "{status:?}");
     assert_eq!(status.last_result, Some(Exit::Signal(9)), "{status:?}");

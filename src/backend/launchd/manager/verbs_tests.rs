@@ -17,7 +17,7 @@ use crate::backend::Backend as _;
 use crate::backend::bounded::{self, Capture, Finished};
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::launchd::generate::timer_label;
-use crate::spec::DaemonKind;
+use crate::spec::{DaemonKind, DaemonSpec, StopAction, StopSignal, TaskFields, TaskSpec};
 
 // Fixtures ============================================================================================================
 
@@ -57,13 +57,43 @@ fn sigterm_ending(mut run: Held) -> Entry {
     })
 }
 
+/// The SIGKILL a stop sends: at once for `send-signal: kill`, after the `timeout` for a run that ignores
+/// SIGTERM.
+fn sigkill() -> Entry {
+    reply(&["kill", "SIGKILL", &target()], exited(0, "", ""))
+}
+
+/// A SIGKILL that ends `run`, as the real one would.
+fn sigkill_ending(mut run: Held) -> Entry {
+    sigkill().then(move || {
+        run.finish();
+    })
+}
+
 fn kickstart() -> Entry {
     reply(&["kickstart", &target()], exited(0, "", ""))
 }
 
 /// The snapshot `read` makes of an installed task, its two plists in the enabled or the staging directory.
 fn task_snapshot(tree: &Tree, enabled: bool) -> Plist {
-    let plists = plists_of(&task_spec(Some(SCHEDULE)));
+    task_snapshot_of(tree, enabled, &task_spec(Some(SCHEDULE)))
+}
+
+/// A task that stops as `action` says.
+fn task_spec_stopping(action: StopAction) -> DaemonSpec {
+    let DaemonSpec::Task(task) = task_spec(Some(SCHEDULE)) else {
+        unreachable!("a task spec")
+    };
+    TaskSpec::new(TaskFields {
+        stop_action: action,
+        ..task.into_fields()
+    })
+    .map(DaemonSpec::from)
+    .expect("a task with a stop action")
+}
+
+fn task_snapshot_of(tree: &Tree, enabled: bool, spec: &DaemonSpec) -> Plist {
+    let plists = plists_of(spec);
     tree.put(enabled, ID, &plists.job);
     tree.put(
         enabled,
@@ -83,6 +113,18 @@ fn stopping(fake: &Fake, budget: Budget) -> Result<()> {
     let mgr = launchd_over(fake.clone());
     let mut held = reserved(&mgr, Step::Stop);
     mgr.stop(task_snapshot(&tree, false), budget, &mut held)
+}
+
+/// `stop` of a task that stops as `action` says, over `fake`.
+fn stopping_as(fake: &Fake, budget: Budget, action: StopAction) -> Result<()> {
+    let tree = Tree::new();
+    let mgr = launchd_over(fake.clone());
+    let mut held = reserved(&mgr, Step::Stop);
+    mgr.stop(
+        task_snapshot_of(&tree, false, &task_spec_stopping(action)),
+        budget,
+        &mut held,
+    )
 }
 
 fn calls_of(fake: &Fake, verb: &str) -> Vec<Vec<String>> {
@@ -601,6 +643,114 @@ fn stop_under_a_bounded_budget_expires_into_wait_timeout_and_leaves_the_signal()
 
     assert_wait_timeout(&e);
     fake.assert_spent("the signal was sent, and nothing after it");
+}
+
+/// A stop that ignores SIGTERM for as long as the `timeout` is escalated: SIGKILL is sent when it is over,
+/// and the stop returns once the run is gone. The `timeout` is the grace the user configured, as it is
+/// for systemd's `TimeoutStopSec=`.
+#[skuld::test]
+fn stop_sends_sigkill_to_a_run_that_ignores_sigterm_for_the_timeout() {
+    let run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        sigterm(),
+        // The pass after the timeout reads the same run, and ends it.
+        print(&running(pid)),
+        print(&running(pid)),
+        sigkill_ending(run),
+        print(IDLE),
+    ]);
+    let action = StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(StopAction::MIN_TIMEOUT),
+    };
+
+    stopping_as(&fake, Budget::Unbounded, action).expect("a stop that ends the run");
+
+    fake.assert_spent("SIGTERM, then the timeout, then SIGKILL");
+    assert_eq!(
+        calls_of(&fake, "kill"),
+        [
+            ["kill", "SIGTERM", target().as_str()],
+            ["kill", "SIGKILL", target().as_str()]
+        ]
+    );
+}
+
+/// `send-signal: kill` sends SIGKILL at once, and no SIGTERM.
+#[skuld::test]
+fn stop_with_send_signal_kill_sends_sigkill_at_once() {
+    let run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        sigkill_ending(run),
+        print(IDLE),
+    ]);
+    let action = StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    };
+
+    stopping_as(&fake, Budget::Unbounded, action).expect("a stop that ends the run");
+
+    fake.assert_spent("read, confirm, SIGKILL, and the read that finds no process");
+    assert_eq!(calls_of(&fake, "kill"), [["kill", "SIGKILL", target().as_str()]]);
+}
+
+/// A run that ends within the `timeout` is not sent SIGKILL.
+#[skuld::test]
+fn stop_of_a_run_that_answers_sigterm_in_time_sends_no_sigkill() {
+    let run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        sigterm_ending(run),
+        print(IDLE),
+    ]);
+    let action = StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(StopAction::MIN_TIMEOUT),
+    };
+
+    stopping_as(&fake, Budget::Unbounded, action).expect("a stop");
+
+    fake.assert_spent("SIGTERM ended the run");
+    assert_eq!(calls_of(&fake, "kill").len(), 1);
+}
+
+/// The SIGKILL is for the run whose `timeout` ran out. A run that began after that one was told to stop
+/// is a new run, with a `timeout` of its own: it is sent SIGTERM.
+#[skuld::test]
+fn the_sigkill_is_for_the_run_whose_timeout_ran_out_and_not_for_the_next() {
+    let first = Held::new(0);
+    let second = Held::new(0);
+    let (a, b) = (first.pid(), second.pid());
+    let fake = Fake::new([
+        print(&running(a)),
+        print(&running(a)),
+        sigterm(),
+        // `print` shows another run by the time the timeout's pass reads: the first is not the job's any more.
+        print(&running(b)),
+        print(&running(b)),
+        sigterm_ending(second),
+        print(IDLE),
+    ]);
+    let action = StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(StopAction::MIN_TIMEOUT),
+    };
+
+    stopping_as(&fake, Budget::Unbounded, action).expect("a stop that ends the second run");
+    drop(first);
+
+    fake.assert_spent("each run was told to stop once");
+    assert_eq!(calls_of(&fake, "kill").len(), 2);
+    assert!(calls_of(&fake, "kill").iter().all(|call| call[1] == "SIGTERM"));
 }
 
 /// `Immediate` waits for no exit: the signal is sent and the stop returns.
