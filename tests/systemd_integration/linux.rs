@@ -530,13 +530,13 @@ fn reporting_after(id: &str, restart: Restart, delay: Duration, listener: &suppo
 }
 
 /// After `kill`, `start` sees the restart the policy made, or makes it now, and returns `Ok`: also while
-/// the unit is in `auto-restart`. The delay is an hour, longer than any runner takes between the kill and
-/// the start; `start` ends it.
+/// the unit is in `auto-restart`, which the delay of a few seconds keeps it in for as long as a kill and a
+/// start take.
 #[skuld::test]
 fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
     let listener = support::ConnectBack::listen();
-    let spec = reporting_after(guard.id(), Restart::Always, Duration::from_secs(3600), &listener);
+    let spec = reporting_after(guard.id(), Restart::Always, Duration::from_secs(5), &listener);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
