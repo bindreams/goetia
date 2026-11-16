@@ -59,9 +59,9 @@ fn an_account_with_no_entry_refuses_the_install_before_it_makes_the_cwd_it_would
 }
 
 /// A uid with no entry is the number, as it is to systemd: the directory is made and the account is
-/// not looked up further.
+/// not looked up further. It is the account's once the unit stands, and root's until then.
 #[skuld::test(labels = [ELEVATED])]
-fn a_uid_with_no_entry_is_handed_the_cwd_as_a_number() {
+fn a_uid_with_no_entry_is_handed_the_cwd_as_a_number_once_the_unit_stands() {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
@@ -71,8 +71,34 @@ fn a_uid_with_no_entry_is_handed_the_cwd_as_a_number() {
         &mut created,
     )
     .unwrap();
+    assert_eq!(fs::metadata(&cwd).unwrap().uid(), 0, "root's until the unit stands");
+    created.settle(|| Standing::Yes);
 
     assert_eq!(fs::metadata(&cwd).unwrap().uid(), 4_242_424);
+}
+
+/// A write that fails after the directories are made leaves none an account could have written into:
+/// they are root's when the guard takes them back.
+#[skuld::test(labels = [ELEVATED])]
+fn a_failed_install_never_hands_the_cwd_to_the_account() {
+    let layout = Layout::new();
+    let cwd = layout.system().join("work");
+    let mut created = CreatedDirs::under(vec![layout.system()]);
+
+    ensure_parent_dirs(
+        &spec(User::Id(AccountId::Uid(4_242_424)), Some(&cwd), None),
+        &mut created,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::metadata(&cwd).unwrap().uid(),
+        0,
+        "the write that follows has not stood yet: the account owns nothing"
+    );
+    created.settle(|| Standing::No);
+    drop(created);
+
+    assert!(!cwd.exists(), "taken back while still root's");
 }
 
 /// uid 0 is root whichever way the spec spells it: nothing is handed over, so a log in the `cwd` is

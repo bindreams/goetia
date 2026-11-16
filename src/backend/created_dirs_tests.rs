@@ -108,7 +108,7 @@ fn create_leaves_a_directory_that_exists_as_found_wherever_it_is_and_whoever_own
     let mut dirs = layout.dirs();
 
     dirs.create(&dir, Some(stranger_owner())).unwrap();
-    dirs.hand_over().unwrap();
+    dirs.settle(|| Standing::Yes);
 
     assert_eq!((mode(&dir), owner_of(&dir)), before);
 }
@@ -542,7 +542,7 @@ fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
 // Handing over --------------------------------------------------------------------------------------------------------
 
 #[skuld::test(labels = [ELEVATED])]
-fn hand_over_gives_the_deepest_directory_to_the_owner_and_no_other() {
+fn settle_hands_over_the_deepest_directory_to_the_owner_and_no_other() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
@@ -551,9 +551,9 @@ fn hand_over_gives_the_deepest_directory_to_the_owner_and_no_other() {
     assert_eq!(
         owner_of(&layout.system().join("a/b")).0,
         0,
-        "nothing is handed before hand_over"
+        "nothing is handed before the definition stands"
     );
-    dirs.hand_over().unwrap();
+    dirs.settle(|| Standing::Yes);
 
     assert_eq!(owner_of(&layout.system().join("a/b")), (STRANGER, STRANGER));
     assert_eq!(owner_of(&layout.system().join("a")), (0, owner_of(&layout.system()).1));
@@ -582,7 +582,7 @@ fn create_for_asks_for_the_owner_only_when_a_directory_is_handed_over() {
     assert_eq!(asked.get(), 1, "a directory made earlier is marked now");
     dirs.create_for(&layout.system().join("c"), owner).unwrap();
     assert_eq!(asked.get(), 2);
-    dirs.hand_over().unwrap();
+    dirs.settle(|| Standing::Yes);
 
     assert_eq!(owner_of(&layout.system().join("a")).0, STRANGER);
     assert_eq!(owner_of(&layout.system().join("c")).0, STRANGER);
@@ -590,12 +590,12 @@ fn create_for_asks_for_the_owner_only_when_a_directory_is_handed_over() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn hand_over_without_an_owner_leaves_everything_roots() {
+fn settle_without_an_owner_leaves_everything_roots() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
     dirs.create(&layout.system().join("a/b"), None).unwrap();
-    dirs.hand_over().unwrap();
+    dirs.settle(|| Standing::Yes);
 
     assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
 }
@@ -609,7 +609,7 @@ fn a_directory_made_as_an_intermediate_is_handed_over_when_a_later_path_names_it
 
     dirs.create(&layout.system().join("a/b"), None).unwrap();
     dirs.create(&layout.system().join("a"), Some(stranger_owner())).unwrap();
-    dirs.hand_over().unwrap();
+    dirs.settle(|| Standing::Yes);
 
     assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
     assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
@@ -708,23 +708,6 @@ fn drop_leaves_a_directory_it_could_not_identify() {
     assert!(victim.is_dir());
 }
 
-#[skuld::test(labels = [ELEVATED])]
-fn drop_removes_a_handed_directory_that_is_still_empty_and_leaves_one_the_account_wrote_to() {
-    let layout = Layout::new();
-    let mut dirs = layout.dirs();
-    dirs.create(&layout.system().join("empty"), Some(stranger_owner()))
-        .unwrap();
-    dirs.create(&layout.system().join("used"), Some(stranger_owner()))
-        .unwrap();
-    dirs.hand_over().unwrap();
-    fs::write(layout.system().join("used/data"), b"x").unwrap();
-
-    drop(dirs);
-
-    assert!(!layout.system().join("empty").exists());
-    assert!(layout.system().join("used/data").is_file());
-}
-
 // Settling ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test(labels = [ELEVATED])]
@@ -775,6 +758,68 @@ fn settle_keeps_and_hands_over_the_directories_when_the_read_did_not_complete() 
     drop(dirs);
 
     assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
+}
+
+/// A directory `verify` refused, or one that could not be opened to be judged, was never shown to be
+/// the one that was made: keeping what stands hands it to nobody, and says it is left.
+#[skuld::test(labels = [ELEVATED])]
+fn keep_leaves_a_directory_that_was_not_verified_and_names_it() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    dirs.create(&layout.system().join("refused"), Some(stranger_owner()))
+        .unwrap();
+    dirs.create(&layout.system().join("unopened"), Some(stranger_owner()))
+        .unwrap();
+    dirs.create(&layout.system().join("verified"), Some(stranger_owner()))
+        .unwrap();
+    dirs.made[0].ready = false;
+    dirs.made[1].held = None;
+    dirs.made[1].ready = false;
+
+    let notes = dirs.keep();
+
+    assert_eq!(owner_of(&layout.system().join("refused")).0, 0);
+    assert_eq!(owner_of(&layout.system().join("unopened")).0, 0);
+    assert_eq!(owner_of(&layout.system().join("verified")).0, STRANGER);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[0].contains(&layout.system().join("refused").display().to_string()),
+        "{notes:?}"
+    );
+    assert!(
+        notes[1].contains(&layout.system().join("unopened").display().to_string()),
+        "{notes:?}"
+    );
+}
+
+#[skuld::test(labels = [ELEVATED])]
+fn an_unknown_standing_hands_over_only_what_was_verified() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    dirs.create(&layout.system().join("refused"), Some(stranger_owner()))
+        .unwrap();
+    dirs.made[0].ready = false;
+
+    dirs.settle(|| Standing::Unknown("could not read the unit".to_string()));
+    drop(dirs);
+
+    assert_eq!(owner_of(&layout.system().join("refused")).0, 0);
+}
+
+#[skuld::test(labels = [ELEVATED])]
+fn a_panic_hands_over_only_what_was_verified() {
+    let layout = Layout::new();
+    let path = layout.system().join("refused");
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut dirs = layout.dirs();
+        dirs.create(&path, Some(stranger_owner())).unwrap();
+        dirs.made[0].ready = false;
+        panic!("after the definition may have been written");
+    }));
+
+    assert!(unwound.is_err());
+    assert_eq!(owner_of(&path).0, 0);
 }
 
 #[skuld::test(labels = [ELEVATED])]

@@ -14,6 +14,7 @@ use super::super::{
 };
 use super::*;
 use crate::backend::InstalledService as _;
+use crate::backend::Settle as _;
 use crate::backend::bounded;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::decide::{self, ExternalConfig, Ownership};
@@ -621,6 +622,46 @@ fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
     assert!(cwd.is_dir(), "the directory the spec names was made");
 }
 
+/// The directory a task's account is to own is root's until the definition stands: a write that fails
+/// after it was made leaves nothing the account could have written into.
+#[skuld::test(labels = [ELEVATED])]
+fn the_cwd_is_the_accounts_only_once_the_definition_stands() {
+    require_elevated();
+    let tree = Tree::new();
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("handed-cwd");
+    // `daemon` is uid 1, an account every macOS host has that is not root.
+    let DaemonSpec::Task(task) = task_spec(Some(SCHEDULE)) else {
+        unreachable!("`task_spec` builds a task");
+    };
+    let mut fields = task.into_fields();
+    fields.common.cwd = Some(cwd.clone());
+    fields.common.user = User::Name("daemon".to_string());
+    let spec = DaemonSpec::from(TaskSpec::new(fields).unwrap());
+    let rendered = manager(&Fake::new([])).render(&spec).unwrap();
+    tree.put(false, ID, &rendered.job);
+    tree.put(false, &timer_name(), rendered.timer.as_deref().unwrap());
+    let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+
+    rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect("an update with nothing to change");
+    let owner = |path: &std::path::Path| std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(path).unwrap());
+    assert_eq!(owner(&cwd), 0, "root's until the definition stands");
+    created.settle(|| crate::backend::Standing::Yes);
+
+    assert_eq!(owner(&cwd), 1, "the account's once it stands");
+}
+
 /// A timer label launchd holds with no plist of ours (removed by hand, or a stranger's) is booted out
 /// first; a refusal for a run in flight then has nothing to load it from, and goes out as is, loading no
 /// path that is not there.
@@ -753,12 +794,19 @@ fn a_print_that_failed_is_worded_as_a_failed_read() {
     assert_eq!(text_at(&tree, false, ID), old.job);
 }
 
-/// A refused update has created none of the new spec's directories.
-#[skuld::test]
+/// A refused update has created none of the new spec's directories: the `cwd` is one the install could
+/// make, so the refusal for a run in flight is what leaves it missing.
+#[skuld::test(labels = [ELEVATED])]
 fn a_refused_update_creates_none_of_the_specs_directories() {
+    require_elevated();
     let tree = Tree::new();
     installed(&tree, &task_spec(Some(SCHEDULE)), false);
-    let cwd = tree.dir(false).join("new-cwd");
+    // Under `/tmp`, which root owns on every host: directories are made only where root's own are.
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("new-cwd");
     let DaemonSpec::Task(task) = command("/bin/false") else {
         unreachable!("`command` builds a task");
     };
@@ -771,8 +819,26 @@ fn a_refused_update_creates_none_of_the_specs_directories() {
         print(job_label(), LOADED, BUSY),
     ]);
 
-    rewrite(&tree, &fake, &spec).expect_err("a run is in flight");
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+    let e = rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect_err("a run is in flight");
 
+    assert!(
+        matches!(
+            e,
+            Error::LoadedJob {
+                kind: DaemonKind::Task,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
     assert!(!cwd.exists(), "the refusal came first");
 }
 

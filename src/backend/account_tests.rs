@@ -67,6 +67,25 @@ fn as_number_takes_a_uid_or_a_number_with_no_entry_as_it_is() {
     }
 }
 
+/// Only decimal digits with no sign and no leading zero are a uid: whether systemd's `User=` reads
+/// `+4242424` or `04242424` as 4242424 is not known, so they are names, and no account has them.
+#[skuld::test]
+fn as_number_takes_only_the_canonical_spelling_of_a_number() {
+    for spelling in [
+        "+4242424",
+        "04242424",
+        "004242424",
+        "00",
+        "-4242424",
+        "4242424 ",
+        "４２４２４２４",
+    ] {
+        let err = resolve_account(&User::Name(spelling.to_string()), Unlisted::AsNumber)
+            .expect_err("not the canonical spelling of a number");
+        assert!(matches!(err, Error::AccountLookup { .. }), "{spelling:?}: {err:?}");
+    }
+}
+
 #[skuld::test]
 fn a_uid_with_an_entry_takes_the_entrys_group_either_way() {
     for unlisted in [Unlisted::Refuse, Unlisted::AsNumber] {

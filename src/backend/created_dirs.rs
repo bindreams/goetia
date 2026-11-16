@@ -19,7 +19,10 @@
 //!   then made `0755`. A parent that another can write (Debian's `/var/log` is `root:syslog 0775`) can
 //!   at most swap in an empty directory of root's, which that group could already remove.
 //! - **Handing over.** Only the deepest directory of a path, and only where the daemon's account has
-//!   to write it ([`Owner`]), is given to the account, once everything is made.
+//!   to write it ([`Owner`]), is given to the account, and only once the definition that names it
+//!   stands ([`settle`](Settle::settle) or a panic's keep). Until then every directory is root's, so
+//!   an install that fails leaves none an account could write into. Only a directory that was
+//!   verified when it was made is handed over.
 //!
 //! An install that fails, or leaves a definition other than the one it wrote, removes what it made,
 //! deepest first, by descriptor: an entry is unlinked only if it is still the directory that was made
@@ -121,7 +124,6 @@ struct Made {
     hand: Option<Owner>,
     /// Judged and given its mode: only such a directory is handed over.
     ready: bool,
-    handed: bool,
 }
 
 #[derive(Debug)]
@@ -149,12 +151,11 @@ fn fd_of<'a>(made: &'a [Made], parent: &'a Parent) -> Option<BorrowedFd<'a>> {
 }
 
 impl Made {
-    /// Give it to its owner, if it has one and is ready, once.
-    fn hand_over(&mut self) -> Result<()> {
-        if let (Some(owner), Some(held), true, false) = (self.hand, &self.held, self.ready, self.handed) {
+    /// Give it to its owner, if it has one.
+    fn hand_over(&self) -> Result<()> {
+        if let (Some(owner), Some(held)) = (self.hand, &self.held) {
             fchown(&held.dir, Some(owner.uid), owner.gid)
                 .map_err(|e| Error::os_at(format!("hand over to uid {}", owner.uid), &self.path, e))?;
-            self.handed = true;
         }
         Ok(())
     }
@@ -267,7 +268,6 @@ impl CreatedDirs {
                         held,
                         hand: if last { hand_to } else { None },
                         ready: false,
-                        handed: false,
                     });
                     self.verify(index, &stat?)?;
                     parent = Parent::Made(index);
@@ -318,12 +318,11 @@ impl CreatedDirs {
         Ok(())
     }
 
-    /// The directories marked for an owner that [`hand_over`](Self::hand_over) has yet to give it.
+    /// The directories marked for an owner that a settle that keeps them will give it.
     #[cfg(target_os = "linux")]
     pub(crate) fn to_hand_over(&self) -> Vec<PendingHandOver> {
         self.made
             .iter()
-            .filter(|made| !made.handed)
             .filter_map(|made| {
                 let held = made.held.as_ref()?;
                 Some(PendingHandOver {
@@ -336,25 +335,27 @@ impl CreatedDirs {
             .collect()
     }
 
-    /// Unmark every directory, so that nothing is handed over by [`hand_over`](Self::hand_over) or by a
-    /// settle that keeps them: for an install the log check refused, which hands nothing to anyone.
+    /// Unmark every directory, so that a settle that keeps them hands nothing over: for an install the
+    /// log check refused, whose definition may stand all the same when its standing cannot be read.
     #[cfg(target_os = "linux")]
     pub(crate) fn withhold_hand_over(&mut self) {
         self.made.iter_mut().for_each(|made| made.hand = None);
     }
 
-    /// Give every directory marked for an owner to it. The account can enter what it owns, so this is
-    /// the last thing done to them: nothing is made inside after it.
-    pub(crate) fn hand_over(&mut self) -> Result<()> {
-        self.made.iter_mut().try_for_each(Made::hand_over)
-    }
-
-    /// Hand over what is marked and not yet handed, and let go of all of it: the directories stay. A
-    /// step that fails is reported, and the rest still go.
-    fn keep(&mut self) {
-        for made in &mut self.made {
-            if let Err(e) = made.hand_over() {
-                report(format_args!(
+    /// Hand over what is marked, and let go of all of it: the directories stay. Only a directory that
+    /// was verified when it was made is handed over; one that was not (refused, or never opened) is left
+    /// as it is. What did not go as it should is returned for the caller to report, and the rest still
+    /// go.
+    fn keep(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for made in &self.made {
+            if !made.ready {
+                notes.push(format!(
+                    "{}, which the install created, was never verified: it is left behind, and not handed over",
+                    made.path.display()
+                ));
+            } else if let Err(e) = made.hand_over() {
+                notes.push(format!(
                     "could not hand {} over, which the install created and keeps: {}",
                     made.path.display(),
                     e.report()
@@ -362,6 +363,14 @@ impl CreatedDirs {
             }
         }
         self.made.clear();
+        notes
+    }
+
+    /// [`keep`](Self::keep), reporting what it returns.
+    fn keep_and_report(&mut self) {
+        for note in self.keep() {
+            report(format_args!("{note}"));
+        }
     }
 
     /// Remove `self.made[index]` from its parent if the name still refers to the directory that was
@@ -439,11 +448,11 @@ impl Settle for CreatedDirs {
             return;
         }
         match standing() {
-            Standing::Yes => self.keep(),
+            Standing::Yes => self.keep_and_report(),
             Standing::No => {}
             Standing::Unknown(reason) => {
                 report(format_args!("{reason}; keeping the directories the install created"));
-                self.keep();
+                self.keep_and_report();
             }
         }
     }
@@ -456,7 +465,7 @@ impl Drop for CreatedDirs {
     /// a failed report is ignored: this never panics.
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.keep();
+            self.keep_and_report();
         } else {
             self.undo();
         }

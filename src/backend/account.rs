@@ -67,9 +67,9 @@ pub(crate) fn resolve_account(user: &User, unlisted: Unlisted) -> Result<Account
                 detail: format!("look up user `{name}`"),
                 source: Some(e.into()),
             })?;
-            match (found, unlisted, name.parse::<u32>()) {
+            match (found, unlisted, canonical_uid(name)) {
                 (Some(found), ..) => Ok(found.into()),
-                (None, Unlisted::AsNumber, Ok(uid)) => Ok(Account::number(uid)),
+                (None, Unlisted::AsNumber, Some(uid)) => Ok(Account::number(uid)),
                 (None, ..) => Err(Error::AccountLookup {
                     detail: format!("no such user `{name}` on this host"),
                     source: None,
@@ -81,6 +81,13 @@ pub(crate) fn resolve_account(user: &User, unlisted: Unlisted) -> Result<Account
             source: None,
         }),
     }
+}
+
+/// `name` as a uid, if it is the canonical decimal spelling of one: digits only, no sign, and no
+/// leading zero except `0` itself. Any other spelling is a name, which no account may have.
+fn canonical_uid(name: &str) -> Option<u32> {
+    let canonical = name.bytes().all(|b| b.is_ascii_digit()) && (name == "0" || !name.starts_with('0'));
+    canonical.then(|| name.parse().ok()).flatten()
 }
 
 fn by_uid(uid: u32, unlisted: Unlisted) -> Result<Account> {

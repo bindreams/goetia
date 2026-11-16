@@ -459,7 +459,8 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 /// Make `cwd` itself and the parent of `logs` (a file path; launchd creates the log file but not
-/// its directory) where they are missing, world-readable and searchable, and hand each to `account`.
+/// its directory) where they are missing, world-readable and searchable, and mark each for `account`,
+/// which `settle` hands it to once the definition stands.
 /// launchd opens the log and enters `cwd` as the job's user, so a non-root daemon whose
 /// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a missing
 /// `WorkingDirectory` refuses the job outright.
@@ -474,7 +475,7 @@ fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut Creat
     {
         created.create(parent, Some(owner))?;
     }
-    created.hand_over()
+    Ok(())
 }
 
 /// Build a `0644` named temp file in `dir` (so a later hard-link persist stays on one filesystem)
