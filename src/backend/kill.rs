@@ -163,16 +163,16 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             Ok(KillOutcome::Ended)
         }
         Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
-        Ok(Hold::NoProcess) => Ok(KillOutcome::NotRunning),
+        Ok(None) => Ok(KillOutcome::NotRunning),
         // The process held is not the service's, or was gone: it is not signalled, and a manager may
         // still report its pid for a moment, so the kill waits for the record as after a signal.
-        Ok(Hold::Ended { pid, held }) => {
+        Ok(Some(Hold::Ended { pid, held })) => {
             wait_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, held.as_ref(), d)
             })?;
             Ok(KillOutcome::Ended)
         }
-        Ok(Hold::Held { pid, process }) => {
+        Ok(Some(Hold::Held { pid, process })) => {
             target.terminate(&process).map_err(|e| not_signalled(pid, e))?;
             wait_saying(target, &waiting_notice(id, pid, None), |t, d| t.await_exit(&process, d))
                 .map_err(|e| signalled_but(pid, e))?;
@@ -185,11 +185,9 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
     }
 }
 
-/// What one look at the service's process came to.
+/// What holding a process the manager reported came to.
 #[derive(Debug)]
 pub(crate) enum Hold<P> {
-    /// The manager reports the service with no process.
-    NoProcess,
     /// The service's process, opened, and confirmed by a second read of the manager.
     Held { pid: u32, process: P },
     /// The process `pid` the manager reported is not the service's: it was gone before it could be
@@ -201,44 +199,53 @@ pub(crate) enum Hold<P> {
 }
 
 /// The service's process and its pid, opened and held, once: what everything that acts on a service's
-/// process starts from.
+/// process starts from. `None` when the manager reports the service with no process.
 ///
 /// A process gone before the open is waited for in the manager until `deadline`, which ends as
-/// [`HoldError::Expired`]; that is the hold's only wait. A service that moved on is [`Hold::Ended`].
+/// [`HoldError::Expired`]; that is the only wait, and [`hold_pid`] makes none. A service that moved on
+/// is [`Hold::Ended`].
 pub(crate) fn hold_once<T: KillTarget>(
     target: &mut T,
     deadline: Deadline,
-) -> std::result::Result<Hold<T::Process>, HoldError> {
+) -> std::result::Result<Option<Hold<T::Process>>, HoldError> {
     let Some(pid) = target.service_pid().map_err(HoldError::Read)? else {
-        return Ok(Hold::NoProcess);
+        return Ok(None);
     };
-    hold_pid(target, pid, deadline)
+    match hold_open(target, pid)? {
+        Some(hold) => Ok(Some(hold)),
+        // The process is gone, and the manager may not yet have recorded it.
+        None => match target.await_recorded(pid, None, deadline).map_err(HoldError::Read)? {
+            Waited::Confirmed => Ok(Some(Hold::Ended { pid, held: None })),
+            Waited::Expired => Err(HoldError::Expired { pid }),
+        },
+    }
 }
 
 /// [`hold_once`] for a `pid` the caller has read from the manager itself, as a caller does that sets up
 /// something on the pid (a watch) before it holds it. The manager is asked only whether it still vouches
-/// for `pid`, and the answer is never [`Hold::NoProcess`].
-pub(crate) fn hold_pid<T: KillTarget>(
-    target: &mut T,
-    pid: u32,
-    deadline: Deadline,
-) -> std::result::Result<Hold<T::Process>, HoldError> {
+/// for `pid`.
+///
+/// It never waits for the manager to record the end of a process that is gone: that is [`Hold::Ended`], with
+/// no read of the manager made for it, so a caller that paces its own next read does not read twice.
+/// [`HoldError::Expired`] is never its error.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn hold_pid<T: KillTarget>(target: &mut T, pid: u32) -> std::result::Result<Hold<T::Process>, HoldError> {
+    Ok(hold_open(target, pid)?.unwrap_or(Hold::Ended { pid, held: None }))
+}
+
+/// [`hold_pid`], with `None` for a process that was gone before it could be opened: the one case in which
+/// the manager may not yet have recorded the end, and the only one [`hold_once`] waits for.
+fn hold_open<T: KillTarget>(target: &mut T, pid: u32) -> std::result::Result<Option<Hold<T::Process>>, HoldError> {
     let process = match target.open(pid) {
         Ok(Some(process)) => process,
-        // The process is gone and the manager has not yet recorded it.
-        Ok(None) => {
-            return match target.await_recorded(pid, None, deadline).map_err(HoldError::Read)? {
-                Waited::Confirmed => Ok(Hold::Ended { pid, held: None }),
-                Waited::Expired => Err(HoldError::Expired { pid }),
-            };
-        }
+        Ok(None) => return Ok(None),
         // A pid that cannot be opened is a refusal only while the manager still says it is the service's.
         Err(e) => {
             return match target.service_pid() {
                 Ok(Some(now)) if now == pid => Err(HoldError::Refused(e)),
                 // The manager has moved on: the pid was a process that exited, or somebody else's,
                 // and `e` is superseded by that.
-                Ok(_) => Ok(Hold::Ended { pid, held: None }),
+                Ok(_) => Ok(Some(Hold::Ended { pid, held: None })),
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => Err(HoldError::Read(io::Error::new(
                     read.kind(),
@@ -247,24 +254,25 @@ pub(crate) fn hold_pid<T: KillTarget>(
             };
         }
     };
-    if target.confirm(pid, &process).map_err(HoldError::Read)? {
-        Ok(Hold::Held { pid, process })
+    Ok(Some(if target.confirm(pid, &process).map_err(HoldError::Read)? {
+        Hold::Held { pid, process }
     } else {
-        Ok(Hold::Ended {
+        Hold::Ended {
             pid,
             held: Some(process),
-        })
-    }
+        }
+    }))
 }
 
-/// Why [`hold_once`] could not hold the service's process.
+/// Why [`hold_once`] or [`hold_pid`] could not hold the service's process.
 #[derive(Debug)]
 pub(crate) enum HoldError {
     /// The manager vouches for the pid, and the process cannot be opened.
     Refused(io::Error),
     /// The manager could not be read, so what the service runs is not known.
     Read(io::Error),
-    /// The manager still reported `pid`, whose process is gone, when the deadline ran out.
+    /// [`hold_once`] only: the manager still reported `pid`, whose process is gone, when the deadline ran
+    /// out.
     Expired { pid: u32 },
 }
 

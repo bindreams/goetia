@@ -169,6 +169,52 @@ fn timed_out_accepts_a_zero_length_bound() {
     }
 }
 
+// timed_out_stopping ==================================================================================================
+
+/// What a launchd task's stop that ran out of budget says of the signals it sent, by what it had sent: a wait
+/// that ended while the run still had its grace, or after the grace and before goetia could send SIGKILL, says
+/// nothing will end the run and what does; one that ended after SIGKILL went out says it was sent, and that the
+/// run is still there.
+#[skuld::test]
+fn a_stop_that_ran_out_says_which_signal_it_sent_and_what_ends_the_run() {
+    let say = |escalation| match timed_out_stopping("frpc", Budget::Bounded(Duration::from_secs(3)), escalation) {
+        crate::Error::WaitTimeout {
+            id,
+            awaited: "stopped",
+            waited,
+            recovery,
+        } => {
+            assert_eq!((id.as_str(), waited), ("frpc", Duration::from_secs(3)));
+            recovery
+        }
+        other => panic!("expected Error::WaitTimeout, got {other:?}"),
+    };
+
+    let pending = say(Escalation::Pending);
+    assert!(
+        pending.contains("SIGTERM") && pending.contains("sends SIGKILL after that only while it waits"),
+        "{pending}"
+    );
+    assert!(pending.contains("`goetia daemon kill frpc` ends it"), "{pending}");
+
+    let spent = say(Escalation::Spent);
+    assert!(
+        spent.contains("did not answer it") && spent.contains("before goetia sent SIGKILL"),
+        "{spent}"
+    );
+    assert!(spent.contains("`goetia daemon kill frpc` ends it"), "{spent}");
+
+    let sent = say(Escalation::Sent);
+    assert!(
+        sent.contains("was sent SIGKILL") && sent.contains("has not exited"),
+        "{sent}"
+    );
+    assert!(
+        !sent.contains("goetia daemon kill"),
+        "nothing is left for `kill` to send: {sent}"
+    );
+}
+
 // process_timed_out ===================================================================================================
 
 /// A stop that SCM confirmed, with a process that outlived the budget: the service is stopped, and

@@ -1,6 +1,7 @@
 //! The identity read of a manager's report, over real children: a zombie is the held process, a
 //! reaped one is gone, and a live process the manager reports under another pid's hold is another.
 
+use std::os::unix::process::ExitStatusExt as _;
 use std::process::{Child, Command, Stdio};
 
 use super::*;
@@ -70,6 +71,22 @@ fn a_wait_for_a_running_process_expires_at_its_deadline_and_confirms_once_it_has
     terminate(&held).expect("signal the child");
     assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
     assert_eq!(await_exit(&held, Budget::Immediate.start()).unwrap(), Waited::Confirmed);
+}
+
+/// The request to exit is SIGTERM to the process held and nothing else: the process ends of that signal (a
+/// default `sleep` does), and one that already ended or was reaped is success.
+#[skuld::test]
+fn a_request_to_exit_ends_the_process_held_with_sigterm_and_is_success_for_one_that_ended() {
+    let mut run = Sleeper::spawn();
+    let held = run.held();
+
+    request_exit(&held).expect("signal the child");
+
+    assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
+    request_exit(&held).expect("a zombie");
+    let status = run.0.wait().expect("reap the child");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    request_exit(&held).expect("a process reaped");
 }
 
 /// A process that exited before the signal, whether it is a zombie or already reaped, is success: the

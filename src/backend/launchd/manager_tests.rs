@@ -1452,12 +1452,10 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     })
     .map(DaemonSpec::from)
     .unwrap();
-    // `spare` is the calls a step counts for the other kind: a task's `stop` pass is longer than a
-    // service's bootout and its wait (see `needs`), and a reservation is made before the kind is known.
-    let exhausted = |reservation: &Reservation, spare: usize| {
+    let exhausted = |reservation: &Reservation| {
         assert_eq!(
             bounded::test_hook::left(reservation),
-            (0, spare * Role::COUNTED_FILES),
+            (0, 0),
             "the sequence reserved more than its steps spent"
         );
     };
@@ -1492,7 +1490,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     backend::Backend::stop(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held).expect("restart's stop");
     backend::Backend::start(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held)
         .expect("restart's start");
-    exhausted(&held, STOP_CALLS - SERVICE_STOP_CALLS);
+    exhausted(&held);
     script.assert_driven("restart");
 
     // `install --start`: the start's reservation is made first, and the install reserves for itself;
@@ -1504,7 +1502,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     backend::Backend::start(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held)
         .expect("install --start's start");
-    exhausted(&held, 0);
+    exhausted(&held);
     script.assert_driven("install --start");
 
     // `status` counts nothing and is handed no reservation: it makes its own files, over a real child
@@ -1675,8 +1673,8 @@ fn a_stop_waits_until_the_old_instance_is_gone() {
         script.assert_spent(&format!("{budget:?}: the wait for the old instance"));
         assert_eq!(
             bounded::test_hook::left(&held),
-            (0, (STOP_CALLS - SERVICE_STOP_CALLS) * Role::COUNTED_FILES),
-            "{budget:?}: the wait's three reads are one counted call, its files kept; the rest is a task's pass"
+            (0, 0),
+            "{budget:?}: the wait's three reads are one counted call, its files kept"
         );
     }
 }

@@ -1272,7 +1272,7 @@ const SERVICE_INSTALL_REQUESTS: usize = 1;
 const TASK_INSTALL_REQUESTS: usize = 4;
 const INSTALL_REQUESTS: usize = max(SERVICE_INSTALL_REQUESTS, TASK_INSTALL_REQUESTS);
 const START_REQUESTS: usize = 5;
-/// A service's `stop` is a `bootout`; a task's, one pass of its loop, is a SIGTERM.
+/// A service's `stop` is a `bootout`; a task's passes make no request: they signal through a hold.
 const STOP_REQUESTS: usize = 1;
 /// A task's `uninstall`: the timer's `bootout` and the job's.
 const TASK_UNINSTALL_REQUESTS: usize = 2;
@@ -1300,10 +1300,10 @@ const INSTALL_CALLS: usize = max(SERVICE_INSTALL_CALLS, TASK_INSTALL_CALLS);
 const START_CALLS: usize = START_REQUESTS + 6 + 2;
 /// A service's `stop`: the `bootout` and its wait.
 const SERVICE_STOP_CALLS: usize = STOP_REQUESTS + 1;
-/// One pass of a task's `stop`, the longest: the read of the job, the confirmation of the process held
-/// (its `procinfo`, with the reads that go with it, one call's files), and the SIGTERM. A pass that waits for a
-/// queued start's pid is shorter: the read, and the wait.
-const TASK_STOP_CALLS: usize = 3;
+/// One pass of a task's `stop`, the longest: the read of the job, and the confirmation of the process held
+/// (its `procinfo`, with the reads that go with it, one call's files). A pass that waits for a queued
+/// start's pid is shorter: the read, and the wait.
+const TASK_STOP_CALLS: usize = 2;
 const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
 /// A task's `uninstall`: the two reads of which labels launchd holds, then both `bootout`s and their
 /// waits.

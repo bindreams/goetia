@@ -132,10 +132,21 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
     }
 }
 
-/// [`timed_out`] for a `stop` of a launchd task whose wait ended while the run still had its
-/// `stop-action` `timeout` to answer SIGTERM: goetia sends the SIGKILL after it only while it waits, so
-/// the error says nothing will, and what ends the run.
-pub fn timed_out_inside_grace(id: &str, budget: Budget) -> crate::Error {
+/// What a launchd task's `stop` had sent the run it was waiting for when its wait ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escalation {
+    /// SIGTERM, and the wait ended while the run still had the `stop-action` `timeout` to answer it.
+    Pending,
+    /// SIGTERM, and the run did not answer it within the `timeout`; the wait ended before SIGKILL was sent.
+    Spent,
+    /// SIGKILL, and the run is still there.
+    Sent,
+}
+
+/// [`timed_out`] for a `stop` of a launchd task, which says what it had sent the run: goetia sends SIGKILL
+/// after the SIGTERM's `timeout` only while it waits, so a wait that ended before it was sent says nothing
+/// will, and what ends the run; one that ended after it was sent says that.
+pub fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> crate::Error {
     match timed_out(id, "stopped", budget) {
         crate::Error::WaitTimeout {
             id,
@@ -143,11 +154,18 @@ pub fn timed_out_inside_grace(id: &str, budget: Budget) -> crate::Error {
             waited,
             recovery,
         } => crate::Error::WaitTimeout {
-            recovery: format!(
-                "{recovery} The run was sent SIGTERM and has the `stop-action` timeout to answer it; goetia \
-                 sends SIGKILL after that only while it waits, so with this wait ended nothing will: \
-                 `goetia daemon kill {id}` ends it."
-            ),
+            recovery: match sent {
+                Escalation::Pending => format!(
+                    "{recovery} The run was sent SIGTERM and has the `stop-action` timeout to answer it; goetia \
+                     sends SIGKILL after that only while it waits, so with this wait ended nothing will: \
+                     `goetia daemon kill {id}` ends it."
+                ),
+                Escalation::Spent => format!(
+                    "{recovery} The run was sent SIGTERM and did not answer it within the `stop-action` timeout; \
+                     this wait ended before goetia sent SIGKILL, and nothing will: `goetia daemon kill {id}` ends it."
+                ),
+                Escalation::Sent => format!("{recovery} The run was sent SIGKILL and has not exited yet."),
+            },
             id,
             awaited,
             waited,

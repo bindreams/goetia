@@ -659,7 +659,7 @@ fn a_record_the_manager_does_not_make_by_the_deadline_expires_the_hold() {
 fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
 
-    let Ok(Hold::Held { pid, process }) = hold_once(&mut target, Budget::Unbounded.start()) else {
+    let Ok(Some(Hold::Held { pid, process })) = hold_once(&mut target, Budget::Unbounded.start()) else {
         panic!("a held process");
     };
 
@@ -667,6 +667,32 @@ fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
     drop(process);
     assert_eq!(target.log().last().map(String::as_str), Some("close 100"));
+}
+
+/// A service the manager reports with no process is not held: there is nothing to hold, and it is read once.
+#[skuld::test]
+fn a_service_with_no_process_is_not_held() {
+    let mut target = Scripted::new([None], []);
+
+    let hold = hold_once(&mut target, Budget::Unbounded.start()).expect("a read");
+
+    assert!(hold.is_none(), "{hold:?}");
+    assert_eq!(target.log(), steps(["service_pid"]));
+}
+
+/// A process gone before it could be opened is waited for in the manager, until the deadline: once the
+/// manager has recorded it, it is [`Hold::Ended`].
+#[skuld::test]
+fn a_process_gone_before_the_open_is_ended_once_the_manager_records_it() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone]);
+
+    let hold = hold_once(&mut target, Budget::Unbounded.start()).expect("a record");
+
+    assert!(matches!(hold, Some(Hold::Ended { pid: 100, held: None })), "{hold:?}");
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "await_recorded 100 unheld"])
+    );
 }
 
 // A pid already read --------------------------------------------------------------------------------------------------
@@ -677,7 +703,7 @@ fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
 fn a_pid_the_caller_read_is_held_without_reading_the_manager_for_it() {
     let mut target = Scripted::new([Some(100)], [Open::Found]);
 
-    let Ok(Hold::Held { pid, process }) = hold_pid(&mut target, 100, Budget::Unbounded.start()) else {
+    let Ok(Hold::Held { pid, process }) = hold_pid(&mut target, 100) else {
         panic!("a held process");
     };
 
@@ -686,11 +712,26 @@ fn a_pid_the_caller_read_is_held_without_reading_the_manager_for_it() {
     drop(process);
 }
 
+/// A pid whose process is gone is [`Hold::Ended`] with no read of the manager made for it: a caller that
+/// paces its own next read (a launchd stop, whose deadline is spent) does not read twice, and a gone
+/// process is never an error of that read.
+#[skuld::test]
+fn a_pid_the_caller_read_whose_process_is_gone_is_ended_with_no_read_of_the_manager() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone])
+        .failing_recorded()
+        .failing_read(1);
+
+    let hold = hold_pid(&mut target, 100).expect("an ended process, not a read error");
+
+    assert!(matches!(hold, Hold::Ended { pid: 100, held: None }), "{hold:?}");
+    assert_eq!(target.log(), steps(["open 100"]), "the manager is not read");
+}
+
 /// The failed-open rule is the one `hold_once` has: a refusal only while the manager still names the pid.
 #[skuld::test]
 fn an_open_that_failed_on_a_pid_the_caller_read_is_a_refusal_only_while_the_manager_names_it() {
     let mut named = Scripted::new([Some(100)], [Open::Fails]);
-    let error = hold_pid(&mut named, 100, Budget::Unbounded.start()).expect_err("a refusal");
+    let error = hold_pid(&mut named, 100).expect_err("a refusal");
     assert!(
         matches!(&error, HoldError::Refused(e) if e.to_string() == "access denied"),
         "{error:?}"
@@ -699,7 +740,7 @@ fn an_open_that_failed_on_a_pid_the_caller_read_is_a_refusal_only_while_the_mana
 
     for moved_off in [Some(200), None] {
         let mut gone = Scripted::new([moved_off], [Open::Fails]);
-        let hold = hold_pid(&mut gone, 100, Budget::Unbounded.start()).expect("an ended process, not a refusal");
+        let hold = hold_pid(&mut gone, 100).expect("an ended process, not a refusal");
         assert!(
             matches!(hold, Hold::Ended { pid: 100, held: None }),
             "{moved_off:?}: {hold:?}"

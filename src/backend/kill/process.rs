@@ -77,6 +77,16 @@ pub(crate) fn terminate(process: &Process) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
+/// `SIGTERM` through the hold, the request to exit that [`terminate`] is the force of: only to the process
+/// opened, never to a later holder of its pid, and not to its children. A process that has exited is
+/// success; the refusal an exiting process gives on macOS is settled as for [`terminate`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn request_exit(process: &Process) -> io::Result<()> {
+    settle_kill(process.terminate(), || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
+        .map(|_| ())
+        .map_err(io::Error::other)
+}
+
 /// Block until the process has exited or `deadline` passes, [`Waited::Expired`] then. It is a zombie
 /// by then, not necessarily reaped or recorded.
 pub(crate) fn await_exit(process: &Process, deadline: Deadline) -> io::Result<Waited> {
