@@ -353,6 +353,11 @@ impl Scm {
 
     /// Every run of the task ended ([`stop_runs`]), and then read in its record: a stop whose shim could
     /// not end the program's tree is a failed stop. `operation` is the verb, which a denial names.
+    ///
+    /// A budget that waits holds a [`Pin`](crate::backend::scm::runs::Pin) from before the first `Stop`
+    /// is sent until every record is read: the shims write as their runs end, and without it the write
+    /// of a later run prunes the record of an earlier one before it is read. A task whose record
+    /// directory is gone has no records to keep.
     pub(super) fn task_stop_with<P: Processes>(
         &self,
         operation: &'static str,
@@ -361,6 +366,15 @@ impl Scm {
         runs: &Runs,
         processes: &mut P,
     ) -> Result<()> {
+        let _pin = if budget.waits() {
+            match runs.pin() {
+                Ok(pin) => Some(pin),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(Error::os(format!("pin the run records of `{id}`"), e)),
+            }
+        } else {
+            None
+        };
         let stopped = stop_runs(&*self.tasks, operation, id, budget, processes)?;
         check_stopped(id, runs, &stopped)
     }

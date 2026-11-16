@@ -254,6 +254,53 @@ fn stop_and_kill_end_every_live_instance() {
     fake.finish();
 }
 
+/// The records are read after every run ended, and the shims write them as they end: the second run's
+/// write prunes the first's `IncompleteStop` unless the stop holds a pin from before its first `Stop`.
+#[skuld::test]
+fn a_later_runs_write_does_not_prune_an_earlier_runs_incomplete_stop_before_it_is_read() {
+    let (dir, _path, runs) = records();
+    let fake = Fake::new();
+    for _ in 0..5 {
+        fake.on_instances(two());
+    }
+    fake.on_stop(Ok(())).on_stop(Ok(()));
+    let mut machine = Machine::new(&fake, &[100, 200]);
+    let shim = Runs::of(dir.path(), &id());
+    machine.on_exit = Box::new(move |pid| {
+        let record = match pid {
+            100 => record(1, RunOutcome::IncompleteStop),
+            _ => record(2, RunOutcome::Stopped),
+        };
+        shim.write(&record).unwrap();
+    });
+
+    let failed = stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap_err();
+
+    let report = failed.report().to_string();
+    assert!(report.contains("could not end the program's process tree"), "{report}");
+}
+
+/// With the pin released, the records the stop read are pruned by the next write as ever.
+#[skuld::test]
+fn the_stops_pin_is_released_when_it_returns() {
+    let (dir, path, runs) = records();
+    let fake = Fake::new();
+    fake.on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_stop(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
+
+    let pins = std::fs::read_dir(&path)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
+        .count();
+    assert_eq!(pins, 0);
+    drop(dir);
+}
+
 #[skuld::test]
 fn an_instance_that_cannot_be_opened_fails_the_stop_before_any_stop_is_sent() {
     let (_dir, _path, runs) = records();
