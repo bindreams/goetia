@@ -38,8 +38,8 @@ struct State {
 struct Unindexed {
     cursor: String,
     field: String,
-    /// A query that matched on `field` has withheld the entry.
-    withheld: bool,
+    /// An entry at `cursor` has passed through a query, delivered or withheld.
+    met: bool,
 }
 
 /// What one follower delivers.
@@ -125,25 +125,23 @@ impl Fake {
         self.state.lock().unwrap().unindexed.push(Unindexed {
             cursor: cursor.to_string(),
             field: field.to_string(),
-            withheld: false,
+            met: false,
         });
         self
     }
 
-    /// Panics unless every [`Fake::unindexed`] pair withheld an entry from a query that matched on its
-    /// field: a cursor that matches no entry tests nothing.
+    /// Panics unless the cursor of every [`Fake::unindexed`] named a scripted entry that a query
+    /// went through. Whether the field withheld it is not asked: the code under test may issue no
+    /// query on that field, which is the point of such a test.
     pub(in crate::backend::systemd::manager) fn assert_spent(&self) {
         let state = self.state.lock().unwrap();
-        let idle: Vec<(&str, &str)> = state
+        let unmet: Vec<&str> = state
             .unindexed
             .iter()
-            .filter(|u| !u.withheld)
-            .map(|u| (u.cursor.as_str(), u.field.as_str()))
+            .filter(|u| !u.met)
+            .map(|u| u.cursor.as_str())
             .collect();
-        assert!(
-            idle.is_empty(),
-            "unindexed (cursor, field) that withheld nothing: {idle:?}"
-        );
+        assert!(unmet.is_empty(), "unindexed cursors that met no entry: {unmet:?}");
     }
 
     fn script(self, script: Script) -> Fake {
@@ -215,9 +213,9 @@ impl Fake {
                 let cursor = entry.get("__CURSOR");
                 let mut seen = true;
                 for u in &mut state.unindexed {
-                    if Some(u.cursor.as_str()) == cursor && matches.iter().any(|m| m.is(&u.field)) {
-                        u.withheld = true;
-                        seen = false;
+                    if Some(u.cursor.as_str()) == cursor {
+                        u.met = true;
+                        seen &= !matches.iter().any(|m| m.is(&u.field));
                     }
                 }
                 seen
