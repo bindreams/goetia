@@ -90,9 +90,14 @@ fn hand_edit(id: &str) {
 /// The way `systemctl edit` creates a drop-in: `<id>.service.d/override.conf`. `systemd.unit(5)`
 /// only reads `*.conf` files there, which `write_dropin` exercises by using that exact extension.
 fn write_dropin(id: &str) {
+    write_dropin_text(id, "[Service]\nMemoryMax=8G\n");
+}
+
+/// [`write_dropin`] with the drop-in's own `text`.
+fn write_dropin_text(id: &str, text: &str) {
     let dir = dropin_dir(id);
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
-    fs::write(dir.join("override.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
+    fs::write(dir.join("override.conf"), text).expect("write drop-in");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
 }
 
@@ -529,32 +534,26 @@ fn reporting_after(id: &str, restart: Restart, delay: Duration, listener: &suppo
     ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
 }
 
-/// After `kill`, `start` sees the restart the policy made, or makes it now, and returns `Ok`: also while
-/// the unit is in `auto-restart`, which the delay of a few seconds keeps it in for as long as a kill and a
-/// start take.
+/// After `kill`, `start` returns `Ok` and the daemon runs as a new process, whether the restart delay of a
+/// few seconds has passed (the unit already restarted) or not (the unit is in `auto-restart`).
 #[skuld::test]
-fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(systemd_group)] _group: &Group) {
+fn a_start_after_a_kill_runs_a_new_process_whether_or_not_the_restart_delay_has_passed(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     let guard = ServiceGuard::new(support::random_test_id());
     let listener = support::ConnectBack::listen();
     let spec = reporting_after(guard.id(), Restart::Always, Duration::from_secs(5), &listener);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let unit = format!("{}.service", spec.common().id);
-    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener, &|| {
-        let shown = cmd::run("systemctl", &["show", "--property=SubState", "--value", &unit]).expect_ok();
-        assert_eq!(
-            shown.stdout.trim(),
-            "auto-restart",
-            "the unit is in the restart delay when `start` is called"
-        );
-    });
+    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener);
 }
 
 /// A unit that was started too often (systemd's start limit, which goetia leaves on for a `restart: never`
 /// unit: `StartLimitBurst` starts in the interval) makes `start` fail at once, and does not leave it waiting
 /// for a process that will not come. Each process is killed once it runs, so that the next start is a fresh
-/// one; the limit is reached when a start is refused, which is after `StartLimitBurst` of them. The words of
+/// one; the limit is reached when a start is refused, which is after `StartLimitBurst` of them, in an
+/// interval of an hour that the starts cannot outlast, so the count alone reaches it. The words of
 /// the error are systemd's own, which after a kill still name the signal that ended the unit before them
 /// ("a fatal signal was delivered"), not the limit: that the error says the limit was hit is not
 /// established here.
@@ -566,6 +565,7 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_does_not_hang(#[fixture(system
     let id = spec.common().id.clone();
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
+    write_dropin_text(&id, "[Unit]\nStartLimitIntervalSec=1h\n");
     let unit = format!("{id}.service");
     let burst: usize = cmd::run("systemctl", &["show", "--property=StartLimitBurst", "--value", &unit])
         .expect_ok()

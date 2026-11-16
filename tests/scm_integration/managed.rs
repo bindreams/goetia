@@ -369,7 +369,7 @@ fn a_start_after_a_kill_sees_the_restart(#[fixture(scm_group)] _group: &Group) {
     .unwrap();
     mgr.install(&spec, false).expect("install");
 
-    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &started, &|| {});
+    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &started);
 }
 
 #[skuld::test]

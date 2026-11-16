@@ -3,23 +3,17 @@
 //! failure: there is `ControlService(STOP)` and nothing else. The service's process is read from SCM
 //! and terminated directly, and what makes that safe is a **held handle**: the process is opened and
 //! kept open, SCM is asked **again** whether it is still the service's, and only then is it
-//! terminated through that same handle. While the handle is open its pid cannot be reused, so a pid
-//! SCM confirms after the open is the process held, never a stranger that took the number.
+//! terminated through that same handle.
 //!
-//! That last step rests on a premise about SCM, which Microsoft does not document: a pid SCM still
-//! reports cannot have been freed and reissued to a stranger. This relies on SCM holding its own
-//! handle to the service's process for as long as it reports that process's pid. SCM learns of the
-//! exit through that handle, so the process object outlives the exit until SCM has handled it, and
-//! measured, it records `STOPPED` with pid 0 before letting go: 250 terminated services, 13,546
-//! tight-loop samples of `QueryServiceStatusEx` and `OpenProcess`, and not one reported pid whose
-//! process was gone (windows-latest, run 40119307045).
+//! That rests on a premise about SCM, which Microsoft does not document: a pid SCM still reports
+//! cannot have been freed and reissued to a stranger, because SCM holds its own handle to the
+//! service's process for as long as it reports that process's pid. Measured: SCM records `STOPPED`
+//! with pid 0 before letting go.
 //!
 //! The handle is opened here and not through `cosca::Process`, which does not enable
 //! `SeDebugPrivilege`: without it a `LocalService` service's process is refused `PROCESS_TERMINATE`.
 //!
-//! The wait for SCM to record an exit is [`await_scm_released`], over [`ScmRelease`], unit-tested with
-//! a script in `kill_tests.rs`; `SystemKillTarget` drives the real SCM and
-//! `OpenProcess`/`TerminateProcess`.
+//! The wait for SCM to record an exit is [`await_scm_released`], over [`ScmRelease`].
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
@@ -45,15 +39,14 @@ pub trait ScmRelease: KillTarget {
     /// Register to be woken when SCM records the service `STOPPED`. A first registration on a fresh
     /// handle made while the service is already `STOPPED` wakes at once; one made on any other state
     /// does not wake until the next entry into `STOPPED`, and neither does a re-arm with the same
-    /// context and buffer on the same handle, whatever the state (P27 a). So the caller reads the
+    /// context and buffer on the same handle, whatever the state. So the caller reads the
     /// service after every arm, as [`await_scm_released`] does, and does not rely on a wake.
     ///
     /// SCM allows one registration per service handle, and the buffer it reports into cannot be
     /// reused until the registration has been woken or cancelled, so this is called only with none
     /// outstanding: after an [`Self::await_release`] or a [`Self::cancel_release`].
     ///
-    /// SCM refused to watch a marked service it recorded `STOPPED` (round 8: a re-arm whose mask
-    /// excludes `STOPPED`); that is [`ReleaseWatch::Stopped`], with nothing registered, as is a service
+    /// SCM refused to watch a marked service it recorded `STOPPED`; that is [`ReleaseWatch::Stopped`], with nothing registered, as is a service
     /// found deleted. A marked service refused in any other state is an error: nothing will wake the
     /// wait.
     ///
@@ -102,7 +95,7 @@ pub(crate) fn hold_service_process<T: KillTarget>(
 /// every arm: a release that landed between an earlier read and the arm would never wake it.
 ///
 /// After a wake the pid is read before anything arms again, and only a pid still shown arms: SCM
-/// refuses to watch a marked service it recorded `STOPPED` (round 8), and the wake was that record. An
+/// refuses to watch a marked service it recorded `STOPPED`, and the wake was that record. An
 /// arm it does refuse ([`ReleaseWatch::Stopped`]) is the release itself.
 ///
 /// Ends at `deadline` as [`Waited::Expired`], with no registration left outstanding.
@@ -215,7 +208,6 @@ pub(in crate::backend::scm) mod system {
     const PROCESS_ACCESS: u32 = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
 
     impl SystemKillTarget {
-        /// A target whose process is opened with the rights to terminate it and to wait for its exit.
         pub fn new(service: Service, id: String) -> Self {
             Self {
                 service,
@@ -280,7 +272,6 @@ pub(in crate::backend::scm) mod system {
     }
 
     impl KillTarget for SystemKillTarget {
-        /// Opened with the rights to terminate it and to wait for its exit.
         type Process = Held;
 
         fn service_pid(&mut self) -> io::Result<Option<u32>> {
@@ -312,7 +303,6 @@ pub(in crate::backend::scm) mod system {
         }
 
         fn await_exit(&mut self, process: &Held, deadline: Deadline) -> io::Result<Waited> {
-            // The state machine says why a wait that lasts blocks.
             wait_exit(&process.handle, deadline, || {})
         }
 
@@ -372,8 +362,7 @@ pub(in crate::backend::scm) mod system {
     }
 
     /// Ask the process behind `process`, an [`open_process_with`] handle with `PROCESS_TERMINATE`, to
-    /// terminate, and do not wait: a process that is exiting or has exited is success, which the caller
-    /// waits on the handle for as it needs.
+    /// terminate, and do not wait: a process that is exiting or has exited is success.
     pub(super) fn request_termination(process: &OwnedHandle) -> io::Result<()> {
         // Exit code `1`: SCM sees a failure, the same as for a crash.
         // SAFETY: `process` is a live handle with `PROCESS_TERMINATE`.
@@ -382,16 +371,14 @@ pub(in crate::backend::scm) mod system {
         }
         let e = io::Error::last_os_error();
         // `TerminateProcess` on a process that is already terminating fails with `ERROR_ACCESS_DENIED`
-        // while its handle is not yet signalled. A denial on a handle opened with `PROCESS_TERMINATE`
-        // is therefore taken to mean 'terminating'.
+        // while its handle is not yet signalled.
         if e.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
             return Err(e);
         }
         Ok(())
     }
 
-    /// Whether the process behind `process`, held with `SYNCHRONIZE`, has exited. A zero-timeout
-    /// poll reads the state; it is not a wait.
+    /// Whether the process behind `process`, held with `SYNCHRONIZE`, has exited.
     pub(in crate::backend::scm) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
         // SAFETY: `process` is a live handle with `PROCESS_SYNCHRONIZE`.
         match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {

@@ -433,14 +433,8 @@ fn waited_out(
     Ok(Finished::Exited { status, capture })
 }
 
-/// How long a child, or a process held through `cosca::Process`, whose kill was refused with `EPERM`
-/// is given to be seen exited (macOS). A failure bound on another process, not a wait for it to do
-/// anything. One seen exited is [`Finished::Expired`], whether it exited in the refusal window or
-/// refused the kill for another reason and then finished: goetia cannot tell them apart. One not seen
-/// exited is a lost wait: for
-/// [`wait_bounded`] an error naming the bound, the child dropped (its drop tears the contained tree
-/// down); for a [`Left::kill`] a warning on stderr that it could not be killed, its child handed to
-/// its [`Reaper`] with its tree not torn down.
+/// How long a kill refused with `EPERM` (macOS) is given to be seen exited: a failure bound on another
+/// process, not a wait for it to do anything. See [`settle_kill`].
 ///
 /// What runs a bounded call ([`wait_bounded`], [`Left::kill`]) past its deadline:
 /// - each kill refused with `EPERM` (macOS), by up to this plus one re-read. launchd's `end_if_held`
@@ -496,6 +490,12 @@ fn kill_root(child: &cosca::Child, bound: Duration) -> Result<KillRootOutcome, c
 /// it in that window, before `ESRCH`). Only `EPERM` is waited on, for `bound`: see
 /// [`EXIT_AFTER_REFUSED_KILL`]. Everywhere else, and for every other error, the refusal is returned
 /// at once.
+///
+/// One seen exited is [`Finished::Expired`], whether it exited in the refusal window or refused the kill
+/// for another reason and then finished: goetia cannot tell them apart. One not seen exited is a lost
+/// wait: [`wait_bounded`] returns an error naming the bound and drops the child (its drop tears the
+/// contained tree down); [`Left::kill`] warns on stderr that it could not be killed and hands the child
+/// to its [`Reaper`] with its tree not torn down.
 pub(crate) fn settle_kill(
     sent: Result<(), cosca::error::Error>,
     alive: impl Fn() -> Liveness,

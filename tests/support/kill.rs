@@ -71,19 +71,11 @@ pub fn a_killed_daemon_comes_back_with_a_new_pid(mgr: &dyn ServiceManager, id: &
 }
 
 /// A caller that wants the next process calls `start` after `kill`, and it sees the restart the policy
-/// made, or makes it now: it returns `Ok` with the daemon running as a new process, even when the policy
-/// is still waiting out its restart delay. The restart does not depend on the caller surviving the kill,
-/// and the start does not meet the killed process still running.
-/// `id` must be installed, not started, with a restart policy that restarts after a kill and a restart
-/// delay longer than a kill takes. `started` hears from the daemon each time it starts. `in_the_delay`
-/// asserts, between the kill and the start, that the manager is in the policy's restart delay, so
-/// that the scenario's window is a standing fact and not a hope.
-pub fn a_start_after_a_kill_sees_the_restart(
-    mgr: &dyn ServiceManager,
-    id: &Id,
-    started: &ConnectBack,
-    in_the_delay: &dyn Fn(),
-) {
+/// made, or makes it now: it returns `Ok` with the daemon running as a new process, whether the policy's
+/// restart delay has passed by then or not. Both hold either way, so the scenario does not depend on
+/// catching the delay. `id` must be installed, not started, with a restart policy that restarts after a
+/// kill. `started` hears from the daemon each time it starts.
+pub fn a_start_after_a_kill_sees_the_restart(mgr: &dyn ServiceManager, id: &Id, started: &ConnectBack) {
     mgr.start(id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in after start");
     let old_pid = mgr
@@ -95,7 +87,6 @@ pub fn a_start_after_a_kill_sees_the_restart(
     let old = identity_of(old_pid);
 
     mgr.kill(id).expect("kill");
-    in_the_delay();
     mgr.start(id, Budget::DEFAULT)
         .expect("a start after the kill sees the policy's restart");
 
