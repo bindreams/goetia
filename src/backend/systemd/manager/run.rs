@@ -22,7 +22,11 @@
 //!   entry), and the lines of its stream are the output; the marker is not shown. Nothing bounds the
 //!   read at the next run's Starting entry: a run's lines can land after it.
 //! - The terminal entry can precede most of a chatty run's output, so once the run has ended the
-//!   output's follower is stopped, the journal is synced, and the rest of the stream is read.
+//!   output's follower is stopped, the journal is synced, and the rest of the unit's lines is read
+//!   after the last line of the stream shown. Follower and rest share [`stdout_query`] and must stay
+//!   identical: journald can store a line twice across a rotation, indexed under some fields only
+//!   (knowledge base: "journald can store a stdout line twice across a journal file rotation"), so a
+//!   `_STREAM_ID=` rest would show a copy or not by where the follower stopped.
 //! - journald's rate limit can drop the marker. Then, and only after the terminal entry, the sync
 //!   and one more read of the unit's lines, the run shows a note, and its exit is still the run's.
 //! - A task with a `logs` file writes the marker there too, as the first line of each run. The file
@@ -479,7 +483,7 @@ const NO_MARKER: &str = "note: the marker line of this run is not in the journal
      journald.conf.d drop-in and restart systemd-journald\n";
 
 /// Where a run's output is in the journal: the lines of the stream its marker line is in, which is
-/// found among the unit's stdout lines after the cursor of the run's Starting entry.
+/// found among the unit's stdout lines after where the journal ended before the run was requested.
 pub(crate) struct JournalOutput {
     unit: String,
     /// The run's `INVOCATION_ID`, which its marker line names.
@@ -493,8 +497,8 @@ pub(crate) struct JournalOutput {
 
 impl JournalOutput {
     /// Copies the run's output to `out` until the run has ended, which is when `ended` is closed:
-    /// each line as it is written, then, once the follower is stopped and the journal synced, the
-    /// lines of the stream it had not yet delivered. The marker line is not shown.
+    /// each line of the stream as it is written, then, once the follower is stopped and the journal
+    /// synced, the stream's lines it had not yet delivered. The marker line is not shown.
     ///
     /// A run whose marker is not in the journal after all that (journald's rate limit dropped it)
     /// shows a note instead of lines ([`NO_MARKER`]); that is no failure. Any other failure ends the
@@ -550,7 +554,8 @@ impl JournalOutput {
     }
 }
 
-/// `_SYSTEMD_UNIT=<unit> _TRANSPORT=stdout`: the unit's own lines, of every run it has.
+/// `_SYSTEMD_UNIT=<unit> _TRANSPORT=stdout`: the unit's own lines, of every run it has. A run's output
+/// is followed and read after by this query alone (see the module doc).
 fn stdout_query(unit: &str) -> Vec<Match> {
     vec![Match::new("_SYSTEMD_UNIT", unit), Match::new("_TRANSPORT", "stdout")]
 }
@@ -607,9 +612,9 @@ fn live(selection: &mut Selection, follower: &mut dyn Follower, out: &mut dyn Wr
     Ok(())
 }
 
-/// What the run wrote that the follower had not delivered, after the journal is synced: the rest of
-/// the marker's stream after its last line shown, or, when the follower never met the marker, the
-/// unit's lines after `from` searched for it once more. With none, the note ([`NO_MARKER`]).
+/// What the run wrote that the follower had not delivered, after the journal is synced: `query`'s
+/// lines after the stream's last line shown or, when the follower never met the marker, after `from`,
+/// searched for the marker once more. With none, the note ([`NO_MARKER`]).
 fn rest(
     journal: &dyn Journal,
     query: &[Match],
@@ -620,15 +625,8 @@ fn rest(
     exit_recorded: bool,
 ) -> Result<()> {
     journal.sync()?;
-    let entries = match &selection.found {
-        Some((stream, last)) => journal.read_after(
-            Scope::Output,
-            &[Match::new("_STREAM_ID", stream.as_str())],
-            Some(last),
-            draws,
-        )?,
-        None => journal.read_after(Scope::Output, query, from, draws)?,
-    };
+    let after = selection.found.as_ref().map_or(from, |(_, last)| Some(last));
+    let entries = journal.read_after(Scope::Output, query, after, draws)?;
     let mut text = Vec::new();
     for entry in &entries {
         selection.take(entry, &mut text)?;

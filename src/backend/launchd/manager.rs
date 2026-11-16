@@ -65,7 +65,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -74,22 +74,25 @@ use std::{fs, io};
 
 use cosca::Process;
 
+use crate::backend::account::{Account, resolve_account};
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
+use crate::backend::created_dirs::{CreatedDirs, Planned, refuse_writable_log_dir};
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service, process};
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::task::enabled_in;
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
-    self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, WriteOutcome,
+    self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Standing,
+    WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Occupant, PutBackFound, Reason, Result, carried};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
-use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Restart, StopAction, User};
+use crate::spec::{DaemonKind, DaemonSpec, Id, Restart, StopAction};
 
 pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
@@ -443,68 +446,15 @@ impl InstalledService for Plist {
 
 // Account resolution ==================================================================================================
 
-/// A platform account resolved from [`crate::spec::User`]: the [`Identity`] a generator needs, plus
-/// the uid/gid `install` needs to hand a `cwd`/`logs` directory to its owner.
-#[derive(Debug)]
-struct Account {
-    name: String,
-    uid: nix::unistd::Uid,
-    gid: nix::unistd::Gid,
-}
-
+/// The [`Identity`] a generator needs of an account. Every account here is resolved by name: `launchd.plist(5)`
+/// does not say whether `UserName` accepts a numeric string, so a uid goes through a passwd lookup too, and
+/// one with no entry is an error.
 impl Account {
     fn identity(&self) -> Identity {
         Identity {
             user: self.name.clone(),
         }
     }
-}
-
-impl From<nix::unistd::User> for Account {
-    fn from(u: nix::unistd::User) -> Self {
-        Account {
-            name: u.name,
-            uid: u.uid,
-            gid: u.gid,
-        }
-    }
-}
-
-/// Resolve a [`User`] to a real macOS account, always by *name*: `launchd.plist(5)` does not say
-/// whether `UserName` accepts a numeric string, so every case, `User::Id(AccountId::Uid(_))`
-/// included, goes through a passwd lookup.
-fn resolve_account(user: &User) -> Result<Account> {
-    match user {
-        User::Root => account_from_uid(0),
-        User::Name(name) => nix::unistd::User::from_name(name)
-            .map_err(|e| Error::AccountLookup {
-                detail: format!("look up user `{name}`"),
-                source: Some(e.into()),
-            })?
-            .map(Account::from)
-            .ok_or_else(|| Error::AccountLookup {
-                detail: format!("no such user `{name}` on this host"),
-                source: None,
-            }),
-        User::Id(AccountId::Uid(uid)) => account_from_uid(*uid),
-        User::Id(AccountId::Sid(sid)) => Err(Error::AccountLookup {
-            detail: format!("user `{{id: {sid}}}` names a Windows SID, which is not meaningful on macOS"),
-            source: None,
-        }),
-    }
-}
-
-fn account_from_uid(uid: u32) -> Result<Account> {
-    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .map_err(|e| Error::AccountLookup {
-            detail: format!("look up uid {uid}"),
-            source: Some(e.into()),
-        })?
-        .map(Account::from)
-        .ok_or_else(|| Error::AccountLookup {
-            detail: format!("no such uid {uid} on this host"),
-            source: None,
-        })
 }
 
 // Writing the plist ===================================================================================================
@@ -517,71 +467,50 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).map_err(|e| Error::os_at("chmod", dir, e))
 }
 
-/// Create `cwd` itself and the parent of `logs` (a file path; launchd creates the log file but not
-/// its directory), both world-readable and searchable. Each component created is handed to
-/// `account`, so a non-root daemon can write there. Otherwise a non-root daemon whose
-/// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a
-/// missing `WorkingDirectory` refuses the job outright.
-fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account) -> Result<()> {
-    if let Some(cwd) = &spec.common().cwd {
-        ensure_dir_owned_by(cwd, account)?;
+/// What `prepare_parent_dirs` would make, read and judged, nothing made: `cwd` itself and the parent of
+/// `logs` (a file path; launchd creates the log file but not its directory), each with the account it
+/// is to be handed to, which root is not.
+/// launchd opens the log and enters `cwd` as the job's user, so a non-root daemon whose
+/// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a missing
+/// `WorkingDirectory` refuses the job outright. A job that runs as root opens its log as root, which
+/// follows a symlink there, so its log's directory is judged for what an account can do with it
+/// (`refuse_writable_log_dir`); a job that runs as another user opens it as that user and is not.
+/// Every refusal is here, before anything is made or anything else is changed.
+fn plan_parent_dirs(spec: &DaemonSpec, account: &Account, created: &CreatedDirs) -> Result<Planned> {
+    let owner = account.owner()?;
+    let common = spec.common();
+    let parent_of_logs = common
+        .logs
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let cwd = common.cwd.as_deref().map(|cwd| created.plan(cwd)).transpose()?;
+    let log = parent_of_logs.map(|parent| created.plan(parent)).transpose()?;
+    if let (true, Some(log), Some(logs)) = (account.uid.is_root(), &log, &common.logs) {
+        refuse_writable_log_dir(logs, log, common.id.as_str(), created)?;
     }
-    if let Some(logs) = &spec.common().logs
-        && let Some(parent) = logs.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        ensure_dir_owned_by(parent, account)?;
-    }
-    Ok(())
+    Ok(cwd.into_iter().chain(log).map(|plan| (plan, owner)).collect())
 }
 
-/// Create `dir` and every missing ancestor, `chmod`ing `0755` and `chown`ing to `account` only the
-/// components this call itself creates. `dir` is an arbitrary absolute path a spec author supplied
-/// (`spec::resolve` guarantees only that it's absolute), so doing that to a path that already
-/// exists would hand ownership of, and strip the mode from, whatever happened to be there
-/// (`/var/log`, a user's home directory, ...). A path that already exists — of any kind, a dangling
-/// symlink included — is left untouched, and so is one a concurrent install creates first.
-fn ensure_dir_owned_by(dir: &Path, account: &Account) -> Result<()> {
-    create_owned(&missing_components(dir)?, account)
+/// Make `cwd` itself and the parent of `logs` where they are missing, world-readable and searchable,
+/// and hand each to `account` before this returns: the job can run as soon as the write that follows
+/// loads it. Both are judged before either is made: see `plan_parent_dirs`.
+fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
+    let plans = plan_parent_dirs(spec, account, created)?;
+    created.make(plans)
 }
 
-/// The components of `dir` that do not exist, outermost first. A dangling symlink exists.
-fn missing_components(dir: &Path) -> Result<Vec<&Path>> {
-    let mut missing = Vec::new();
-    let mut cursor = dir;
-    loop {
-        match fs::symlink_metadata(cursor) {
-            Ok(_) => break,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                missing.push(cursor);
-                match cursor.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
-                    _ => break,
-                }
-            }
-            Err(e) => return Err(Error::os_at("stat", cursor, e)),
-        }
+/// What a read of the id says of whether `desired`'s job is the one that stands: the plist is what
+/// names the directories, so a task's timer is not compared.
+fn plist_standing(read: Result<ReadOutcome<Plist>>, desired: &Plists) -> Standing {
+    match read {
+        Ok(ReadOutcome::Marked(plist)) => match &plist.job {
+            Some(job) if job.text == desired.job => Standing::Yes,
+            _ => Standing::No,
+        },
+        Ok(_) => Standing::No,
+        Err(e) => Standing::Unknown(format!("could not read the plist: {}", e.report())),
     }
-    missing.reverse();
-    Ok(missing)
-}
-
-/// `mkdir` each of `missing` (outermost first), then `chmod` and `chown` it. `AlreadyExists` means
-/// another install created it after the walk: not ours, so left alone.
-fn create_owned(missing: &[&Path], account: &Account) -> Result<()> {
-    for path in missing {
-        match fs::DirBuilder::new().mode(0o755).create(path) {
-            Ok(()) => {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-                    .map_err(|e| Error::os_at("chmod", *path, e))?;
-                nix::unistd::chown(*path, Some(account.uid), Some(account.gid))
-                    .map_err(|e| Error::os_at(format!("chown to {}", account.name), *path, e))?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(Error::os_at("create directory", *path, e)),
-        }
-    }
-    Ok(())
 }
 
 /// Build a `0644` named temp file in `dir` (so a later hard-link persist stays on one filesystem)
@@ -1497,12 +1426,17 @@ impl Launchd {
 impl backend::Backend for Launchd {
     type Definition = Plists;
     type Snapshot = Plist;
-    type InstallScope = ();
+    type InstallScope = CreatedDirs;
     type Reservation = Reservation;
     type Run = run::Run;
 
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &Plists, _reservation: &mut Reservation) -> Result<()> {
-        Ok(())
+    fn begin_install(
+        &self,
+        _spec: &DaemonSpec,
+        _desired: &Plists,
+        _reservation: &mut Reservation,
+    ) -> Result<CreatedDirs> {
+        Ok(CreatedDirs::default())
     }
 
     /// Makes every reaper and temp file `steps` can draw now, so that no step fails for want of one
@@ -1565,11 +1499,18 @@ impl backend::Backend for Launchd {
         desired: &Plists,
         outcome: &Outcome,
         snapshot: Option<&Plist>,
-        _scope: &mut (),
+        created: &mut CreatedDirs,
         reservation: &mut Reservation,
     ) -> Result<WriteOutcome> {
         if spec.kind() == DaemonKind::Task || snapshot.is_some_and(Plist::has_two_plists) {
-            return self.write_task(DIRS, spec, desired, outcome, snapshot, reservation);
+            return self.write_task(
+                DIRS,
+                spec,
+                desired,
+                outcome,
+                snapshot,
+                write::Scope { created, reservation },
+            );
         }
         // Resolved again: `render` kept only the plist, which names the account, and launchd
         // resolves that name at launch too.
@@ -1588,7 +1529,7 @@ impl backend::Backend for Launchd {
                 // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
                 // plist is written the rerun would read `UpToDate` and never look.
                 let target = staging_path(spec.common().id.as_str());
-                prepare_parent_dirs(spec, &account)?;
+                prepare_parent_dirs(spec, &account, created)?;
                 let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
                 let loaded = never_expires(self.launchctl.is_loaded(
                     spec.common().id.as_str(),
@@ -1618,7 +1559,7 @@ impl backend::Backend for Launchd {
                 {
                     return Err(refuse::loaded_refusal(&spec.common().id, DaemonKind::Service));
                 }
-                prepare_parent_dirs(spec, &account)?;
+                prepare_parent_dirs(spec, &account, created)?;
                 let target = job.location.path.as_path();
                 // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
                 // `disable` may have moved it since, and writing here would put a plist in both
@@ -1649,6 +1590,12 @@ impl backend::Backend for Launchd {
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
         }
         Ok(WriteOutcome::Done)
+    }
+
+    /// Whether the job's plist, read as `read` reads it, is `desired`'s: the plist is what names the
+    /// directories. A timer's names none.
+    fn standing(&self, spec: &DaemonSpec, desired: &Plists) -> Standing {
+        plist_standing(self.read(&spec.common().id), desired)
     }
 
     fn live_status(&self, snapshot: &Plist) -> Result<Status> {

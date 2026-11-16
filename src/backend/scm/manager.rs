@@ -134,7 +134,8 @@ use crate::backend::scm::shim::sweep::{
 use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
 use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
-    Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Settle, Standing, Unnamed,
+    WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
@@ -277,6 +278,11 @@ impl ScmSnapshot {
     }
 }
 
+/// The lock makes nothing an install would take back.
+impl Settle for Option<InstallLock> {
+    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {}
+}
+
 impl Backend for Scm {
     type Definition = ScmRegistration;
     type Snapshot = ScmSnapshot;
@@ -391,6 +397,11 @@ impl Backend for Scm {
     ) -> Result<WriteOutcome> {
         apply(definition, written_user(&spec.common().user), snapshot.is_none())?;
         Ok(WriteOutcome::Done)
+    }
+
+    /// The install scope makes nothing besides the service, so there is nothing to keep or take back.
+    fn standing(&self, _spec: &DaemonSpec, _definition: &ScmRegistration) -> Standing {
+        Standing::Yes
     }
 
     fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {

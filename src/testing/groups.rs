@@ -20,6 +20,10 @@ pub struct Group(());
 /// The switch of the tests that need `SeDebugPrivilege`, which an unelevated Windows host lacks.
 pub(crate) const DEBUG_PRIVILEGE: &str = "GOETIA_TEST_DEBUG_PRIVILEGE";
 
+/// The switch of the tests that make directories root owns and give files to other uids, which need
+/// root. They change nothing outside their own temporary directory, so there is no consent variable.
+pub(crate) const ROOT_DIRS: &str = "GOETIA_TEST_ROOT_DIRS";
+
 /// A group's variable and what its tests do (for the consent message).
 struct Spec {
     env: &'static str,
@@ -61,13 +65,14 @@ fn read_group(group_var: &str, var: &impl Fn(&str) -> Option<String>) -> Result<
     Ok((switch(group_var, var)?, switch(&format!("{group_var}_CONSENT"), var)?))
 }
 
-/// Every variable of every group goetia knows, and the [`DEBUG_PRIVILEGE`] switch, whether or not
+/// Every variable of every group goetia knows, and the [`DEBUG_PRIVILEGE`] and [`ROOT_DIRS`] switches, whether or not
 /// this OS has tests that use them. `Err` names the first invalid one.
 pub(crate) fn validate_all(var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
     [SCM, SYSTEMD, LAUNCHD]
         .iter()
         .try_for_each(|spec| read_group(spec.env, &var).map(drop))?;
-    switch(DEBUG_PRIVILEGE, &var).map(drop)
+    switch(DEBUG_PRIVILEGE, &var)?;
+    switch(ROOT_DIRS, &var).map(drop)
 }
 
 /// [`validate_all`] on this process's environment.
@@ -204,6 +209,21 @@ switched!(
         process_var,
         "this token does not hold SeDebugPrivilege; run with a token that does (an elevated one usually does)",
         crate::backend::scm::kill::holds_debug_privilege,
+    )
+);
+
+#[cfg(all(unix, test))]
+switched!(
+    /// Fixture of the tests that make directories root owns: they need root, and change nothing outside
+    /// their own temporary directory.
+    root_dirs,
+    root_dirs_enabled,
+    ROOT_DIRS;
+    () = need(
+        ROOT_DIRS,
+        process_var,
+        "this process is not root; run the elevated tests as root (in a container, a VM or CI)",
+        || Ok(cosca::elevation::is_elevated()),
     )
 );
 

@@ -938,16 +938,17 @@ fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     assert_eq!(
         journal.followed(),
         [(stdout_query("x.service"), Some("c1".to_string()))],
-        "the unit's own lines after the run's Starting entry"
+        "the unit's own lines after where the journal ended before the request"
     );
     assert_eq!(
         journal.read_after_calls(),
-        [(call(&["_STREAM_ID=s1"]), Some("c6".to_string()))],
-        "what is left is read from the stream, after the stream's last line shown"
+        [(stdout_query("x.service"), Some("c6".to_string()))],
+        "what is left is read through the unit's lines, after the stream's last line shown"
     );
 }
 
-/// After the run's end the rest is read by the stream, so an entry of another stream is not shown.
+/// The rest is read through the unit's lines and the run's stream is picked out of them, so an entry of
+/// another stream is not shown.
 #[skuld::test]
 fn the_rest_of_the_stream_shows_only_the_stream() {
     let journal = JournalFake::new(Vec::new())
@@ -962,6 +963,37 @@ fn the_rest_of_the_stream_shows_only_the_stream() {
 
     result.expect("the stream");
     assert_eq!(String::from_utf8(out).unwrap(), "mine\nalso mine\n");
+}
+
+/// A copy of a line journald stored twice across a file rotation is indexed under the unit's fields
+/// and not `_STREAM_ID`. Both reads go through the unit's lines, so where the follower stopped does
+/// not decide whether it shows.
+#[skuld::test]
+fn a_copy_indexed_by_the_unit_and_not_by_the_stream_is_shown_in_the_live_part_and_in_the_rest() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(vec![
+            marker("c2", "s1", "inv"),
+            line("c3", "s1", "a"),
+            line("c4", "s1", "b"),
+            line("c5", "s1", "b"),
+        ])
+        .then_reads(vec![line("c6", "s1", "c"), line("c7", "s1", "c")])
+        .unindexed("c4", "_STREAM_ID")
+        .unindexed("c6", "_STREAM_ID");
+
+    let (result, out) = shown_after_the_end(&journal);
+
+    result.expect("the stream");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "a
+b
+b
+c
+c
+"
+    );
+    journal.assert_spent();
 }
 
 /// The marker is the first line of its stream only: the same text again is the program's.
@@ -991,7 +1023,8 @@ fn a_run_that_printed_nothing_shows_nothing_and_no_note() {
 }
 
 /// A marker the follower had not delivered when the run ended is found by the final read of the
-/// unit's lines after the run's Starting entry, and the run's lines are the stream's from there.
+/// unit's lines after where the journal ended before the request, and the run's lines are the
+/// stream's from there.
 #[skuld::test]
 fn a_marker_the_follower_did_not_deliver_is_found_by_the_final_read() {
     let log = Log::default();

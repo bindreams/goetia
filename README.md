@@ -528,23 +528,91 @@ was ever the problem. Set `cwd`, or write the argument absolute.
 
 (`cwd` and `logs` are resolved against the manifest's directory too.)
 
-## Directories: `install` prepares, it does not check
+## Directories: `install` makes them under system roots
 
-`install` creates a `cwd` and the parent directory of `logs` if they are
-missing. A directory that already exists is not checked or changed: `install`
-is not a start, and you may still be preparing it. On systemd an existing log
-directory is never a problem for the account, because systemd opens the log
-file as root before dropping privileges; a `cwd` the account cannot traverse
-fails at `start` with `200/CHDIR`. A missing directory fails at `start` too,
-which is why `install` creates it. The backends differ in what they create
-and what they refuse:
+`install` makes a `cwd` and the parent directory of `logs` if they are missing, but only under the places
+the platform keeps a daemon's state and logs (the _roots_): `/var/log`, `/var/lib` and `/var/cache` on
+Linux; `/var/log`, `/Library/Logs` and `/Library/Application Support` on macOS. A missing directory
+anywhere else (`/opt/app/logs`, a home directory, a Homebrew prefix) is an error that names the path and
+the roots: create it first. A directory that already exists is used as it is, wherever it is and whoever
+owns it, since `install` is not a start and you may still be preparing it.
 
-- **systemd** creates every missing component and gives each one it created
-  to a non-root `user`. A path that exists but is not a directory is refused.
-- **launchd** creates every missing component and gives each one it created
-  to a non-root `user`. An existing path of any kind, a dangling symlink
-  included, is accepted, so a file where a directory belongs surfaces at
-  `start`.
+- **What it makes.** Every missing component, owned by root, `0755`. It makes a directory only where every
+  directory on the way (resolved, so `..` and links count) is root's: a path through a directory an
+  account owns is refused, which includes a directory an earlier install handed to its account (a second
+  daemon's `cwd` below it). A symlink on the way is judged by the directory that holds it, not by its
+  owner, since only whoever can write that directory can replace the link. The exception is a holder that
+  is sticky and that a group or everyone can write (like `/tmp`), where the owner of an entry can delete
+  it and make another: a symlink there that root does not own is refused. The path is judged as written,
+  every directory it names included (one it leaves through `..` too), because the service manager
+  resolves it by name when it starts.
+- **Who gets what.** Only the deepest directory of a path is handed over, and only where the daemon's
+  account has to write it: `cwd` goes to a non-root `user` (and its primary group) on both backends; the
+  log directory goes to it on launchd, which opens the log as that user. On systemd the log directory
+  stays root's: systemd opens `append:` as root before it drops privileges, and a directory an account can
+  write lets it plant a symlink there and make root append to any file. A daemon that writes other files
+  beside its log needs a `cwd` for them.
+- **A directory appears only in its final state.** `install` makes the first missing component of a path
+  beside where it will be, under a temporary name (`.goetia-` and a random one), and the rest inside it;
+  it hands over what is to be handed over, and last renames the tree into place with a rename that
+  replaces nothing. All of this is done before the write that can start the definition, so a run that
+  follows finds its directories as they are to stay, and an install stopped at any point leaves no
+  half-made directory at the path. A path that something else made after `install` looked fails the
+  install and is left untouched, and running the install again uses it. Two installs running at once whose
+  new paths share a missing parent may therefore fail one of them; a re-run succeeds (see
+  [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not)). A file system
+  that cannot rename a directory without replacing what is at the name (Linux's `RENAME_NOREPLACE`,
+  macOS's `RENAME_EXCL`) fails it with an error that says so.
+- **What is judged, and when.** The checks above judge the paths as they are when `install` runs. A change
+  made during or after it, by hand or by another goetia command running at the same time, is not judged;
+  see [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
+- **The log directory of a job whose log root opens.** On systemd that is every daemon (it opens `append:`
+  as root, before it drops privileges); on launchd it is a job whose `user` is root (uid 0, by any
+  spelling), since launchd opens `StandardOutPath` as the job's user. A launchd job that runs as another
+  user has its log opened as that user, and its log's directory is not judged. For such a log, `install`
+  refuses a `logs` whose directory, or any directory on the way to it, a user other than root can change
+  (owned by another user, or writable by everyone), and names who. Above the log's own directory, the
+  group of a directory root owns is trusted, as systemd's own `LogsDirectory=` trusts it: Debian and Ubuntu
+  ship `/var/log` as `root:syslog 0775`, and `/var/log/<app>/app.log` is accepted there; macOS ships
+  `/Library/Logs` as `root:admin 0775`. goetia does not evaluate ACLs: a directory on the way that carries
+  one, whatever it grants, is refused, with an error that names it. That is a POSIX ACL that is more than
+  the mode, an NFSv4 or CIFS ACL, or a macOS extended ACL (`chmod +a`), on any directory of the path
+  including the one a missing log directory is made in. A directory whose ACL lets nobody write is
+  refused too (a macOS directory with a deny-only entry, a POSIX ACL whose mask has no write): move the
+  log, or remove the ACL. The ACL is read from the directory the path resolved to, which needs no read
+  permission on it; a read that fails refuses the log, with the reason (on Linux it goes through
+  `/proc/self/fd`, so where `/proc` is not mounted the log is refused, and the error says so). An NFSv4 or CIFS file system
+  always has one, so a log on it is refused. The log's own directory is judged strictly: a group that can
+  write it is refused too, so `/var/log/app.log` is refused on Debian and Ubuntu, and the error suggests `/var/log/<app>/app.log` where
+  `install` would make that directory (it is under the places above); anywhere else it says to use a
+  directory only root can change, or to drop `logs:` (on systemd, to log to the journal). The sticky bit
+  excuses a directory everyone can write above the log's, which it keeps others from renaming, but not the
+  log's own directory, where it does not keep them from making an entry (a symlink at the log's name). A
+  symlink on the way is judged by the directory that holds it, as for any path (above): where that
+  directory is sticky and a group or everyone can write it, a symlink that root does not own is refused too,
+  since its owner can replace it. A log that already exists is refused when it is a symlink or an account's
+  file. A log in or under the `cwd` that is to be handed to the account is refused. All of this is judged
+  before any directory is made and covers a directory that already exists, except that a log directory that
+  is the `cwd`, or in it, is found when `install` reaches the `cwd` (on a file system that ignores case two
+  names can be one directory), and what it made is then taken back.
+- **A path that is not a directory** (a file, or a symlink that leads nowhere) is refused by both
+  backends.
+- **An account with no passwd entry.** On launchd a `user` with no passwd entry is an error. On systemd a
+  `user` that is a number (a uid, or a name written `"1000"`: digits only, no sign, no leading zero) is that
+  uid, as systemd reads `User=`, and is never looked up as the name of an account made of digits. `install`
+  refuses 65535 and 4294967295 on every install, before it makes anything: systemd does not load a unit that
+  names them. A `user` that is a name is looked up only when `install` makes a `cwd` to hand to it: one that
+  does not exist yet, with no `cwd` or one that exists, installs as it did. A uid with no passwd entry is
+  accepted like a name not created yet, and its `cwd` is handed to the number, with the group left as it was
+  made. Until the account exists every start of the unit fails with `217/USER`. uid 0, by any spelling, is
+  root and is handed nothing, on both backends.
+- **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
+  still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
+  (the unit or plist cannot be read back): it then says so and keeps them, since removing them could
+  break a definition that stands. A directory that has gained content (the account's own
+  writing, in one handed to it) is left, and named, and so are the directories above it.
+- **An install stopped abruptly** (power loss, `SIGKILL`) may leave a `.goetia-*` directory beside the
+  path, holding only the empty directories it was making. Nothing uses it, and `rm -r` removes it.
 - **scm** creates nothing.
 
 ## Per-backend overrides
@@ -1716,6 +1784,11 @@ On Windows, some tests need a token holding `SeDebugPrivilege` (an elevated Admi
 usually does) but change no system state, so they have a switch and no consent:
 `GOETIA_TEST_DEBUG_PRIVILEGE` unset or `1` runs them, and they **fail** on a token without the
 privilege; `0` ignores them.
+
+On Linux and macOS, the tests of the directories `install` makes need root (they make directories root owns
+and give files to other uids) but change nothing outside their own temporary directory under `/tmp`, so
+they too have a switch and no consent: `GOETIA_TEST_ROOT_DIRS` unset or `1` runs them, and they **fail**
+when the process is not root; `0` ignores them.
 
 ## License
 
