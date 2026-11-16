@@ -524,52 +524,60 @@ fn create_stops_at_a_symlink_loop(#[fixture(root_dirs)] _root: &()) {
     );
 }
 
-/// One rule for a root that cannot be opened (a missing one is no root, and is not this): a path under a
-/// root that opens is under a root, whatever the other roots do; a root that cannot be opened matters
-/// only when no root that opens holds the path, and then its error is the answer, as goetia cannot tell.
+/// A root whose path runs through a regular file (`ENOTDIR`) is not a root, like one that is not there:
+/// it is skipped, whatever the other roots are, and when no other holds the path the path is outside.
 #[skuld::test(labels = [ELEVATED])]
-fn create_decides_by_the_roots_that_open_and_fails_with_the_root_that_does_not_only_when_they_do_not_hold_the_path(
-    #[fixture(root_dirs)] _root: &(),
-) {
+fn create_skips_a_root_below_a_regular_file(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let broken = layout.broken_root();
     let held = layout.system().join("a");
-    let not_held = layout.outside().join("a");
 
-    // A broken root alone.
-    let err = CreatedDirs::under(vec![broken.clone()])
-        .create(&held, None)
-        .expect_err("goetia cannot tell");
-    assert!(
-        std::error::Error::source(&err).is_some_and(|source| source.to_string().contains("Not a directory"))
-            && err.to_string().contains(broken.to_str().unwrap()),
-        "{err:?}"
-    );
-
-    // Next to a root that holds the path: under a root, in either order.
     for roots in [
         vec![broken.clone(), layout.system()],
         vec![layout.system(), broken.clone()],
     ] {
         let mut dirs = CreatedDirs::under(roots);
-        dirs.create(&held, None).expect("under the root that opens");
+        dirs.create(&held, None).expect("under the root that holds it");
         assert!(held.is_dir());
+        drop(dirs);
+        assert!(!held.exists(), "taken back");
     }
 
-    // Next to a root that does not hold it.
-    let err = CreatedDirs::under(vec![broken.clone(), layout.system()])
-        .create(&not_held, None)
-        .expect_err("goetia cannot tell");
-    assert!(
-        std::error::Error::source(&err).is_some_and(|source| source.to_string().contains("Not a directory"))
-            && err.to_string().contains(broken.to_str().unwrap()),
-        "{err:?}"
-    );
-    assert!(!not_held.exists());
-
-    // All fine: outside is outside.
-    let err = layout.dirs().create(&not_held, None).expect_err("outside every root");
+    let err = CreatedDirs::under(vec![broken])
+        .create(&held, None)
+        .expect_err("no root holds it");
     assert!(refusal(&err).contains("create it first"), "{err:?}");
+}
+
+/// Any other failure to open a root is goetia's to report, not a root to skip: the install fails, naming
+/// the root and the path being judged, even where a later root would have held the path.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn create_fails_with_a_root_it_cannot_read_naming_the_root_and_the_path(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    fs::set_permissions(layout.base(), fs::Permissions::from_mode(0o711)).unwrap();
+    let locked = layout.system().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = locked.join("root");
+    let path = layout.system().join("a");
+    let mut dirs = CreatedDirs::under(vec![unreadable.clone(), layout.system()]);
+
+    let err = {
+        let _as_a_stranger = Fsuid::set(STRANGER);
+        dirs.create(&path, None).expect_err("the root cannot be read")
+    };
+
+    let Error::Os { path: at, .. } = &err else {
+        panic!("expected an OS error, got {err:?}")
+    };
+    assert_eq!(at.as_deref(), Some(path.as_path()), "{err:?}");
+    let source = std::error::Error::source(&err).expect("the OS error").to_string();
+    assert!(
+        source.contains(unreadable.to_str().unwrap()) && source.contains("Permission denied"),
+        "{source}"
+    );
+    assert!(!path.exists());
 }
 
 /// A path that exists whole is used as it is, wherever it is: the roots are opened only when a
@@ -591,13 +599,18 @@ fn create_uses_a_path_that_exists_whatever_state_the_roots_are_in(#[fixture(root
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn create_ignores_a_root_that_does_not_exist(#[fixture(root_dirs)] _root: &()) {
+fn create_skips_a_root_that_does_not_exist(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
-    let mut dirs = CreatedDirs::under(vec![layout.base().join("nowhere"), layout.system()]);
+    let nowhere = layout.base().join("nowhere");
+    let mut dirs = CreatedDirs::under(vec![nowhere.clone(), layout.system()]);
 
     dirs.create(&layout.system().join("a"), None).unwrap();
 
     assert!(layout.system().join("a").is_dir());
+    let err = CreatedDirs::under(vec![nowhere])
+        .create(&layout.system().join("b"), None)
+        .expect_err("no root holds it");
+    assert!(refusal(&err).contains("create it first"), "{err:?}");
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -1337,6 +1350,28 @@ fn a_later_plan_that_hands_a_made_directory_to_another_owner_is_an_error(#[fixtu
     );
     drop(dirs);
     assert!(!layout.system().join("a").exists(), "nothing is left");
+}
+
+/// The refusal names the path of the plan that asks, in the spelling its spec wrote, not the earlier
+/// plan's spelling of the same directory.
+#[skuld::test(labels = [ELEVATED])]
+fn the_refusal_of_a_second_owner_names_the_path_the_asking_plan_wrote(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    symlink(".", layout.system().join("link")).unwrap();
+    let mut dirs = layout.dirs();
+    let first = dirs.plan(&layout.system().join("a")).unwrap();
+    let again_path = layout.system().join("link/a");
+    let again = dirs.plan(&again_path).unwrap();
+    let other = Owner::new(Uid::from_raw(STRANGER + 1), None).unwrap();
+
+    let err = dirs
+        .make(vec![(first, Some(stranger_owner())), (again, Some(other))])
+        .expect_err("one directory has one owner");
+
+    let Error::DirectoryRefused { path, .. } = &err else {
+        panic!("expected a refused directory, got {err:?}")
+    };
+    assert_eq!(path, &again_path);
 }
 
 #[skuld::test(labels = [ELEVATED])]

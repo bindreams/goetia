@@ -204,14 +204,12 @@ fn a_directory_of_its_own_is_suggested_only_under_a_root(#[fixture(root_dirs)] _
     assert!(why.contains("under"), "{why}");
 }
 
-/// A root that cannot be opened (here, one below a regular file) is read by the one rule `plan` reads it
-/// by: a root that opens and holds the log's directory decides, and the suggestion appears; otherwise the
-/// refusal still comes first, carries the root's error in a note, and advises only the roots that opened.
+/// A root below a regular file is skipped, as `plan` skips it: a log directory under a remaining root is
+/// judged under it, and one outside every root is not told to make a directory of its own.
 #[skuld::test(labels = [ELEVATED])]
-fn an_unopenable_root_is_read_by_the_roots_that_open_and_never_hides_the_refusal(#[fixture(root_dirs)] _root: &()) {
+fn a_skipped_root_leaves_the_log_refusal_to_the_roots_that_remain(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     let broken = layout.broken_root();
-    let note = format!("could not read the root {}", broken.display());
     let logs_in = |parent: PathBuf| {
         let dir = parent.join("opt/logs");
         fs::create_dir_all(&dir).unwrap();
@@ -220,40 +218,13 @@ fn an_unopenable_root_is_read_by_the_roots_that_open_and_never_hides_the_refusal
     };
     let held = logs_in(layout.system());
     let not_held = logs_in(layout.outside());
-    let suggestion = held.parent().unwrap().join("app/app.log");
+    let roots = || CreatedDirs::under(vec![broken.clone(), layout.system()]);
 
-    // A broken root alone.
-    let why = refused_by(&CreatedDirs::under(vec![broken.clone()]), &held);
-    assert!(why.contains("can be changed by"), "{why}");
-    assert!(why.contains(&note) && why.contains("Not a directory"), "{why}");
+    let why = refused_by(&roots(), &held);
+    assert!(why.contains(held.parent().unwrap().join("app/app.log").to_str().unwrap()), "{why}");
+
+    let why = refused_by(&roots(), &not_held);
     assert!(!why.contains("such as") && why.contains("journal"), "{why}");
-    assert!(!why.contains("a missing one is made under"), "no root opened: {why}");
-
-    // Next to a root that holds the directory: under a root, the suggestion appears, and the broken
-    // root is not mentioned.
-    for roots in [
-        vec![broken.clone(), layout.system()],
-        vec![layout.system(), broken.clone()],
-    ] {
-        let why = refused_by(&CreatedDirs::under(roots), &held);
-        assert!(why.contains(suggestion.to_str().unwrap()), "{why}");
-        assert!(!why.contains(&note), "{why}");
-    }
-
-    // Next to a root that does not hold it: the error is told, and only the root that opened is advised.
-    let why = refused_by(&CreatedDirs::under(vec![broken.clone(), layout.system()]), &not_held);
-    assert!(why.contains(&note) && why.contains("Not a directory"), "{why}");
-    assert!(!why.contains("such as") && why.contains("journal"), "{why}");
-    assert!(
-        why.contains(&format!("a missing one is made under {})", layout.system().display())),
-        "{why}"
-    );
-
-    // All fine: under the root, suggested; outside it, not, and nothing is told of a root.
-    let why = refused_by(&CreatedDirs::under(vec![layout.system()]), &held);
-    assert!(why.contains(suggestion.to_str().unwrap()), "{why}");
-    let why = refused_by(&CreatedDirs::under(vec![layout.system()]), &not_held);
-    assert!(!why.contains("such as") && !why.contains("could not read"), "{why}");
 }
 
 /// Trusting the group of a root-owned ancestor does not trust everyone, or an account.
