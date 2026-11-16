@@ -51,8 +51,7 @@ use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
 use crate::spec::{
-    BackendKind, DaemonSpec, Id, Protocol, Restart, ScmDaemon, ServiceSpec, User, Written, invalid, scm_defect,
-    scm_restart_delay, windows_builtin,
+    BackendKind, DaemonKind, DaemonSpec, Id, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin,
 };
 
 // Metadata field names ================================================================================================
@@ -194,23 +193,6 @@ fn resolve_host(
     if hosted(spec) { host().map(Some) } else { Ok(None) }
 }
 
-/// Refuse the `stop-action` of a service that Windows cannot honour: a signal it has no equivalent of,
-/// and a signal for a `protocol: native` service, which handles SCM's own stop itself. `resolve` refuses
-/// both in a manifest; a spec from a blob arrives here. The stop action is carried in the blob.
-///
-/// Until the shim asks for the stop, Windows still ends a service at once whatever it says (the README).
-fn refuse_stop_action(service: &ServiceSpec) -> Result<(), Error> {
-    let id = &service.common.id;
-    service.stop_action.send_signal.refuse(BackendKind::Scm, id)?;
-    match scm_defect(
-        ScmDaemon::of_service(service.protocol),
-        Written::of(&service.stop_action),
-    ) {
-        Some((_, message)) => Err(invalid(id, &message)),
-        None => Ok(()),
-    }
-}
-
 /// [`registration`] for a `host` already resolved by [`resolve_host`].
 fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
     debug_assert_eq!(
@@ -219,7 +201,11 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
         "a hosted spec's host is resolved before it is built, and only a hosted spec's"
     );
     let s = refuse_task(spec)?;
-    refuse_stop_action(s)?;
+    // `resolve` refuses what Windows cannot do with a stop action in a manifest; a spec from a blob arrives
+    // here. Until the shim asks for the stop, Windows still ends a service at once whatever it says (the README).
+    s.stop_action
+        .refuse(BackendKind::Scm, DaemonKind::Service, s.protocol)
+        .into_result(&s.common.id)?;
     // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
     // for a hosted one.
     let (executable, arguments, environment) = match host {

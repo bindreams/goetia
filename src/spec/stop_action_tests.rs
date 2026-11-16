@@ -238,34 +238,104 @@ fn a_timeout_a_manifest_could_not_write_is_a_defect_wherever_it_came_from() {
     assert_eq!(StopAction::default().defect(), None);
 }
 
-// Windows =============================================================================================================
+// Refusals ============================================================================================================
+
+fn action(signal: &str, timeout: Option<u64>) -> StopAction {
+    StopAction {
+        send_signal: signal.parse().unwrap(),
+        timeout: timeout.map(Duration::from_secs),
+    }
+}
+
+/// The leaves `action` is refused for on `backend`, for a daemon of `kind` and `protocol`.
+fn refused_leaves(action: StopAction, backend: BackendKind, kind: DaemonKind, protocol: Protocol) -> Vec<StopField> {
+    let refusals = action.refuse(backend, kind, protocol);
+    [
+        (StopField::SendSignal, refusals.clone().only(true, false)),
+        (StopField::Timeout, refusals.only(false, true)),
+    ]
+    .into_iter()
+    .filter(|(_, refusals)| refusals.clone().first().is_some())
+    .map(|(field, _)| field)
+    .collect()
+}
 
 #[skuld::test]
 fn windows_refuses_what_it_decides_itself() {
-    let written = |send_signal, timeout| Written { send_signal, timeout };
+    let on = |action, kind, protocol| refused_leaves(action, BackendKind::Scm, kind, protocol);
+    let both = action("quit", Some(5));
 
-    // A task: Task Scheduler decides both; the signal is reported first.
-    let (field, message) = scm_defect(ScmDaemon::Task, written(true, true)).unwrap();
+    // A task: Task Scheduler decides both. Each leaf is refused on its own, and the signal is first.
+    assert_eq!(
+        on(both, DaemonKind::Task, Protocol::Plain),
+        [StopField::SendSignal, StopField::Timeout]
+    );
+    let (field, message) = both
+        .refuse(BackendKind::Scm, DaemonKind::Task, Protocol::Plain)
+        .first()
+        .unwrap();
     assert_eq!(field, StopField::SendSignal);
     assert!(
         message.contains("`stop-action.send-signal`") && message.contains("backend-specific"),
         "{message}"
     );
     assert_eq!(
-        scm_defect(ScmDaemon::Task, written(false, true)).unwrap().0,
-        StopField::Timeout
+        on(action("terminate", Some(5)), DaemonKind::Task, Protocol::Plain),
+        [StopField::Timeout]
     );
-    assert_eq!(scm_defect(ScmDaemon::Task, written(false, false)), None);
+    assert_eq!(on(StopAction::default(), DaemonKind::Task, Protocol::Plain), []);
 
     // A native service handles SCM's stop itself: a signal is refused, a timeout is not.
+    assert_eq!(on(both, DaemonKind::Service, Protocol::Native), [StopField::SendSignal]);
     assert_eq!(
-        scm_defect(ScmDaemon::NativeService, written(true, false)).unwrap().0,
-        StopField::SendSignal
+        on(action("terminate", Some(5)), DaemonKind::Service, Protocol::Native),
+        []
     );
-    assert_eq!(scm_defect(ScmDaemon::NativeService, written(false, true)), None);
 
-    // A plain service takes both.
-    assert_eq!(scm_defect(ScmDaemon::PlainService, written(true, true)), None);
+    // A plain service takes both, but not a signal Windows has none of.
+    assert_eq!(on(action("ctrl-c", None), DaemonKind::Service, Protocol::Plain), []);
+    assert_eq!(
+        on(action("sigusr1", Some(5)), DaemonKind::Service, Protocol::Plain),
+        [StopField::SendSignal]
+    );
+}
+
+#[skuld::test]
+fn launchd_refuses_a_wait_over_its_cap_and_a_wait_without_a_limit() {
+    let on = |action| refused_leaves(action, BackendKind::Launchd, DaemonKind::Service, Protocol::Plain);
+    assert_eq!(on(action("terminate", Some(61))), [StopField::Timeout]);
+    assert_eq!(on(action("terminate", None)), [StopField::Timeout]);
+    assert_eq!(on(action("terminate", Some(60))), []);
+    // `kill` waits for nothing.
+    assert_eq!(on(action("kill", None)), []);
+    assert_eq!(on(action("quit", Some(5))), [StopField::SendSignal]);
+}
+
+#[skuld::test]
+fn systemd_refuses_only_a_signal_it_does_not_have_whatever_the_daemon_is() {
+    for (kind, protocol) in [
+        (DaemonKind::Service, Protocol::Plain),
+        (DaemonKind::Service, Protocol::Native),
+        (DaemonKind::Task, Protocol::Plain),
+    ] {
+        let on = |action| refused_leaves(action, BackendKind::Systemd, kind, protocol);
+        assert_eq!(on(action("ctrl-break", Some(86_400))), [StopField::SendSignal]);
+        assert_eq!(on(action("sigusr1", Some(86_400))), []);
+        assert_eq!(on(action("terminate", None)), []);
+    }
+}
+
+#[skuld::test]
+fn a_refusal_becomes_the_generators_error_for_the_daemon_it_names() {
+    let refusals = action("quit", Some(5)).refuse(BackendKind::Launchd, DaemonKind::Service, Protocol::Plain);
+    let err = refusals.into_result(&id()).unwrap_err().to_string();
+    assert!(err.contains("`send-signal: quit` is refused on launchd"), "{err}");
+    assert!(
+        StopAction::default()
+            .refuse(BackendKind::Launchd, DaemonKind::Service, Protocol::Plain)
+            .into_result(&id())
+            .is_ok()
+    );
 }
 
 #[skuld::test]

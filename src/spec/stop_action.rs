@@ -7,9 +7,10 @@
 //!   timeout: 30s                # whole seconds, 1s to 24h; `null` waits as long as the platform allows
 //! ```
 //!
-//! `send-signal` is one of the portable names `terminate`, `interrupt`, `quit` and `kill`, a Windows
-//! name (`ctrl-c`, `ctrl-break`, `wm-close`) or a native signal of systemd (`sigusr1`, `SIGRTMIN+3`,
-//! any case; a typo is an error, never a silent `SIGTERM`). `kill` sends nothing to answer and waits
+//! `send-signal` is one of the portable names `terminate`, `interrupt`, `quit` and `kill` (also read as
+//! `SIGTERM`, `SIGINT`, `SIGQUIT` and `SIGKILL`, any case, `SIG` optional), a Windows name (`ctrl-c`,
+//! `ctrl-break`, `wm-close`) or a native signal of systemd (`sigusr1`, `SIGRTMIN+3`, any case; a typo is
+//! an error, never a silent `SIGTERM`). `kill` sends nothing to answer and waits
 //! for nothing: its `timeout` is `null`, and any other value is refused.
 //!
 //! [`RawStopAction`] is what is read: both forms, and each leaf as text, so `${VAR}` can be
@@ -25,7 +26,7 @@ use serde::{Deserialize, Deserializer};
 
 use super::backend::BackendKind;
 use super::resolve::invalid;
-use super::{Id, Protocol};
+use super::{DaemonKind, Id, Protocol};
 use crate::error::Error;
 
 // Resolved ============================================================================================================
@@ -81,18 +82,64 @@ impl StopAction {
 }
 
 impl StopAction {
-    /// What `backend`'s generator refuses of this stop action, as the error of `id`: a signal the
-    /// backend cannot send ([`StopSignal::refuse`]) and, on launchd, a wait it cannot give
-    /// ([`launchd_timeout_defect`]). A spec from a blob arrives at a generator without `resolve`.
-    /// Windows is judged by its own generator, which also needs what the manifest wrote.
-    pub(crate) fn refuse(&self, backend: BackendKind, id: &Id) -> Result<(), Error> {
-        self.send_signal.refuse(backend, id)?;
+    /// What `backend` cannot honour of this stop action for a daemon of `kind` and `protocol`, leaf by
+    /// leaf: the one judgement, which `resolve` and every generator share. `resolve` judges a manifest's
+    /// values once they are settled; a generator judges a spec from a blob, which `resolve` never saw.
+    ///
+    /// - every backend: a signal it cannot send ([`StopSignal::defect`]);
+    /// - launchd: a wait it cannot give ([`launchd_timeout_defect`]);
+    /// - Windows: a stop that Task Scheduler (a task) or SCM (a `protocol: native` service) decides
+    ///   itself, so a leaf that differs from the default is a request it cannot honour ([`Written`]).
+    pub(crate) fn refuse(&self, backend: BackendKind, kind: DaemonKind, protocol: Protocol) -> StopRefusals {
+        let mut refusals = StopRefusals {
+            signal: self.send_signal.defect(backend),
+            timeout: None,
+        };
         match backend {
-            BackendKind::Launchd => match launchd_timeout_defect(self.send_signal, self.timeout) {
-                Some(message) => Err(invalid(id, &message)),
-                None => Ok(()),
-            },
-            BackendKind::Systemd | BackendKind::Scm => Ok(()),
+            BackendKind::Systemd => {}
+            BackendKind::Launchd => refusals.timeout = launchd_timeout_defect(self.send_signal, self.timeout),
+            BackendKind::Scm => {
+                let windows = scm_refusals(ScmDaemon::of(kind, protocol), Written::of(self));
+                refusals.signal = refusals.signal.or(windows.signal);
+                refusals.timeout = windows.timeout;
+            }
+        }
+        refusals
+    }
+}
+
+/// What a backend refuses of each leaf of a stop action ([`StopAction::refuse`]), as the message that
+/// says why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StopRefusals {
+    signal: Option<String>,
+    timeout: Option<String>,
+}
+
+impl StopRefusals {
+    /// Only the refusals of the leaves that are in play: a sweep of what an override wrote judges
+    /// that, and not a base's value, which the override is not answerable for.
+    pub(crate) fn only(self, send_signal: bool, timeout: bool) -> Self {
+        StopRefusals {
+            signal: self.signal.filter(|_| send_signal),
+            timeout: self.timeout.filter(|_| timeout),
+        }
+    }
+
+    /// The refusal to report: the signal's, else the timeout's.
+    pub(crate) fn first(self) -> Option<(StopField, String)> {
+        match (self.signal, self.timeout) {
+            (Some(message), _) => Some((StopField::SendSignal, message)),
+            (None, Some(message)) => Some((StopField::Timeout, message)),
+            (None, None) => None,
+        }
+    }
+
+    /// [`StopRefusals::first`] as the error of `id`'s generator.
+    pub(crate) fn into_result(self, id: &Id) -> Result<(), Error> {
+        match self.first() {
+            Some((_, message)) => Err(invalid(id, &message)),
+            None => Ok(()),
         }
     }
 }
@@ -253,33 +300,21 @@ impl StopSignal {
     /// Why `backend` cannot send this signal, or `None`. Where a platform cannot, the value is
     /// refused rather than turned into another signal.
     pub(crate) fn defect(self, backend: BackendKind) -> Option<String> {
-        let signal = self;
         let (accepts, only) = match backend {
             BackendKind::Systemd => (
-                !matches!(signal, StopSignal::CtrlC | StopSignal::CtrlBreak | StopSignal::WmClose),
+                !matches!(self, StopSignal::CtrlC | StopSignal::CtrlBreak | StopSignal::WmClose),
                 "systemd does not have it",
             ),
             BackendKind::Launchd => (
-                matches!(signal, StopSignal::Terminate | StopSignal::Kill),
+                matches!(self, StopSignal::Terminate | StopSignal::Kill),
                 "launchd sends only SIGTERM (and SIGKILL after the timeout)",
             ),
             BackendKind::Scm => (
-                !matches!(signal, StopSignal::Native(_)),
+                !matches!(self, StopSignal::Native(_)),
                 "Windows has no native signal; it has `ctrl-c`, `ctrl-break` and `wm-close`",
             ),
         };
-        (!accepts).then(|| format!("`send-signal: {signal}` is refused on {backend}: {only}"))
-    }
-}
-
-impl StopSignal {
-    /// [`StopSignal::defect`] as the error of `id`'s generator: what a spec from a blob, which
-    /// `resolve` never saw, meets.
-    pub(crate) fn refuse(self, backend: BackendKind, id: &Id) -> Result<(), Error> {
-        match self.defect(backend) {
-            Some(message) => Err(invalid(id, &message)),
-            None => Ok(()),
-        }
+        (!accepts).then(|| format!("`send-signal: {self}` is refused on {backend}: {only}"))
     }
 }
 
@@ -321,7 +356,7 @@ pub(crate) const LAUNCHD_MAX_TIMEOUT: Duration = Duration::from_secs(60);
 /// Why launchd cannot wait `timeout` for a daemon that is asked to stop with `signal`, or `None`: a
 /// wait over [`LAUNCHD_MAX_TIMEOUT`], and no timeout (a wait with no limit) for any signal but `kill`,
 /// which waits for nothing. Refused rather than cut, on every macOS.
-pub(crate) fn launchd_timeout_defect(signal: StopSignal, timeout: Option<Duration>) -> Option<String> {
+fn launchd_timeout_defect(signal: StopSignal, timeout: Option<Duration>) -> Option<String> {
     let cap = "launchd cuts any wait to 60 s (macOS 26.4 and later, measured)";
     match timeout {
         Some(timeout) if timeout > LAUNCHD_MAX_TIMEOUT => Some(format!(
@@ -335,32 +370,31 @@ pub(crate) fn launchd_timeout_defect(signal: StopSignal, timeout: Option<Duratio
     }
 }
 
-/// Why Windows cannot honour a `stop-action` the manifest wrote, or `None`. A task is stopped by
-/// Task Scheduler, and a `protocol: native` service by SCM's own stop: in neither does goetia send a
-/// signal, so a `send-signal` is refused; Task Scheduler also bounds the wait itself, so a task
-/// refuses a `timeout` too. `written` says what the manifest wrote of the two.
-///
-/// Returns the field the refusal is about and the reason.
-pub(crate) fn scm_defect(daemon: ScmDaemon, written: Written) -> Option<(StopField, String)> {
-    let (field, reason) = match daemon {
-        ScmDaemon::Task if written.send_signal => (
+/// What Windows cannot honour of a `stop-action` that `written` says differs from the default. A task
+/// is stopped by Task Scheduler, and a `protocol: native` service by SCM's own stop: in neither does
+/// goetia send a signal, so a `send-signal` is refused; Task Scheduler also bounds the wait itself, so
+/// a task refuses a `timeout` too.
+fn scm_refusals(daemon: ScmDaemon, written: Written) -> StopRefusals {
+    let refusal = |field: StopField, reason: &str| format!("`stop-action.{}`: {reason}", field.leaf());
+    let signal = match daemon {
+        ScmDaemon::Task if written.send_signal => Some(refusal(
             StopField::SendSignal,
-            "a task on Windows is stopped by Task Scheduler, which decides the signal; set `stop-action` \
-             under `backend-specific` for systemd and launchd instead",
-        ),
-        ScmDaemon::Task if written.timeout => (
-            StopField::Timeout,
-            "a task on Windows is stopped by Task Scheduler, which decides how long it waits; set \
-             `stop-action` under `backend-specific` for systemd and launchd instead",
-        ),
-        ScmDaemon::NativeService if written.send_signal => (
+            "a task on Windows is stopped by Task Scheduler, which decides the signal; set `stop-action`              under `backend-specific` for systemd and launchd instead",
+        )),
+        ScmDaemon::NativeService if written.send_signal => Some(refusal(
             StopField::SendSignal,
-            "a `protocol: native` service on Windows is stopped by SCM's own stop, which the service \
-             handles itself, so there is no signal to choose; `timeout` still applies",
-        ),
-        _ => return None,
+            "a `protocol: native` service on Windows is stopped by SCM's own stop, which the service              handles itself, so there is no signal to choose; `timeout` still applies",
+        )),
+        _ => None,
     };
-    Some((field, format!("`stop-action.{}`: {reason}", field.leaf())))
+    let timeout = match daemon {
+        ScmDaemon::Task if written.timeout => Some(refusal(
+            StopField::Timeout,
+            "a task on Windows is stopped by Task Scheduler, which decides how long it waits; set              `stop-action` under `backend-specific` for systemd and launchd instead",
+        )),
+        _ => None,
+    };
+    StopRefusals { signal, timeout }
 }
 
 /// A leaf of `stop-action`.
@@ -379,19 +413,20 @@ impl StopField {
     }
 }
 
-/// The kinds of Windows daemon [`scm_defect`] tells apart.
+/// The kinds of Windows daemon [`scm_refusals`] tells apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScmDaemon {
+enum ScmDaemon {
     Task,
     NativeService,
     PlainService,
 }
 
 impl ScmDaemon {
-    pub(crate) fn of_service(protocol: Protocol) -> Self {
-        match protocol {
-            Protocol::Plain => ScmDaemon::PlainService,
-            Protocol::Native => ScmDaemon::NativeService,
+    fn of(kind: DaemonKind, protocol: Protocol) -> Self {
+        match (kind, protocol) {
+            (DaemonKind::Task, _) => ScmDaemon::Task,
+            (DaemonKind::Service, Protocol::Plain) => ScmDaemon::PlainService,
+            (DaemonKind::Service, Protocol::Native) => ScmDaemon::NativeService,
         }
     }
 }
@@ -407,19 +442,10 @@ impl Written {
     /// What a resolved `action` shows of the manifest: a leaf that is the default may or may not have
     /// been written, and counts as not.
     pub(crate) fn of(action: &StopAction) -> Self {
-        Self::of_leaves(Some(action.send_signal), Some(action.timeout))
-    }
-
-    /// [`Written::of`] for leaves not all known yet: `None` is a value a `$` still holds (an absent
-    /// leaf is its default, not `None`). A leaf that is not known is not judged, nor is a `timeout`
-    /// while the `send_signal` that sets its default is not.
-    pub(crate) fn of_leaves(send_signal: Option<StopSignal>, timeout: Option<Option<Duration>>) -> Self {
         let default = StopAction::default();
         Written {
-            send_signal: send_signal.is_some_and(|signal| signal != default.send_signal),
-            timeout: send_signal
-                .zip(timeout)
-                .is_some_and(|(signal, timeout)| timeout != StopAction::default_timeout(signal)),
+            send_signal: action.send_signal != default.send_signal,
+            timeout: action.timeout != StopAction::default_timeout(action.send_signal),
         }
     }
 }

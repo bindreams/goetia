@@ -457,18 +457,16 @@ fn shape_stop_action(
             parse_stop_timeout(id, text).map(Some)
         })?,
     };
-    if let (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(_))) = (&signal, &timeout)
-        && timeout_from_base
-    {
-        return Ok((signal, Shaped::Parsed(None)));
-    }
-    if let (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(timeout))) = (&signal, &timeout) {
-        return Err(Refused::at(
+    match (&signal, &timeout) {
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(_))) if timeout_from_base => {
+            Ok((signal, Shaped::Parsed(None)))
+        }
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(timeout))) => Err(Refused::at(
             Field::StopTimeout,
             invalid(id, &kill_with_timeout(*timeout)),
-        ));
+        )),
+        _ => Ok((signal, timeout)),
     }
-    Ok((signal, timeout))
 }
 
 /// Keep the parse in the shape phase, deferring exactly the values [`Substitution::defers`] names:

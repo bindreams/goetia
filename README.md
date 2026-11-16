@@ -231,7 +231,9 @@ entry that writes only `timeout` keeps the base's `send-signal`.
 | `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close` posts `WM_CLOSE`) |
 
 A value a platform cannot send is refused, naming the platform, and never turned
-into another signal: `sigterrm` is an error, not a `SIGTERM`. A native signal is
+into another signal: `sigterrm` is an error, not a `SIGTERM`. `SIGTERM`, `SIGINT`,
+`SIGQUIT` and `SIGKILL` (any case, `SIG` optional) are `terminate`, `interrupt`,
+`quit` and `kill`, with every rule of those. Any other native signal is
 checked against the names systemd knows (`SIGHUP` to `SIGSYS`, `SIGRTMIN` to
 `SIGRTMIN+30`, `SIGRTMAX-30` to `SIGRTMAX`: systemd takes an offset of 0 to
 `SIGRTMAX - SIGRTMIN`, which is 30 with glibc), on every host.

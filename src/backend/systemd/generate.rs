@@ -25,8 +25,8 @@ use crate::backend::{Identity, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
 use crate::spec::{
-    BackendKind, DaemonFields, DaemonSpec, DayRule, Restart, Schedule, ServiceSpec, StopAction, StopSignal, TaskSpec,
-    systemd_defect, systemd_raw_value_defect,
+    BackendKind, DaemonFields, DaemonKind, DaemonSpec, DayRule, Protocol, Restart, Schedule, ServiceSpec, StopAction,
+    StopSignal, TaskSpec, systemd_defect, systemd_raw_value_defect,
 };
 
 // Generation ==========================================================================================================
@@ -110,7 +110,10 @@ fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
 /// A service's unit, up to the `[X-Goetia]` section.
 fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&service.common, id)?;
-    service.stop_action.refuse(BackendKind::Systemd, &service.common.id)?;
+    service
+        .stop_action
+        .refuse(BackendKind::Systemd, DaemonKind::Service, service.protocol)
+        .into_result(&service.common.id)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
@@ -155,7 +158,9 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 /// look like a guarantee.
 fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&task.common, id)?;
-    task.stop_action.refuse(BackendKind::Systemd, &task.common.id)?;
+    task.stop_action
+        .refuse(BackendKind::Systemd, DaemonKind::Task, Protocol::Plain)
+        .into_result(&task.common.id)?;
     refuse_env_sh_resets(&task.common, &RESET_BY_SH, "a task")?;
     let mut out = String::new();
 
@@ -231,7 +236,7 @@ fn stop_lines(stop_action: &StopAction) -> String {
         StopSignal::Quit => "SIGQUIT".to_string(),
         StopSignal::Kill => "SIGKILL".to_string(),
         StopSignal::Native(signal) => signal.to_string(),
-        // Refused by `StopSignal::refuse` before this is reached.
+        // Refused by `StopAction::refuse` before this is reached.
         StopSignal::CtrlC | StopSignal::CtrlBreak | StopSignal::WmClose => {
             unreachable!("a Windows signal is refused before the unit is written")
         }

@@ -44,7 +44,7 @@ use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
-use super::stop_action::{ScmDaemon, StopField, Written, launchd_timeout_defect, scm_defect};
+use super::stop_action::StopField;
 use super::vars::is_valid_name;
 use super::{
     AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, StopAction, StopSignal, User, Warning,
@@ -263,60 +263,40 @@ impl BackendKind {
 
 // stop-action's refusals ==============================================================================================
 
-/// What `backend` cannot honour of the `stop-action` `spec` carries: the signal it cannot send, on
-/// launchd a wait it cannot give, and on Windows a stop Task Scheduler or a native service decides itself. `only` limits the verdict to
-/// what an override supplied (see [`Supplied`]); `None` judges whatever the merged spec holds.
+/// What `backend` cannot honour of the `stop-action` `spec` carries ([`StopAction::refuse`]). `only` limits
+/// the verdict to what an override supplied (see [`Supplied`]); `None` judges whatever the merged spec holds.
 ///
-/// A value a `$` still holds is not judged: a later pass knows it.
+/// A value a `$` still holds is not judged: a later pass knows it. A signal that is held leaves nothing to
+/// judge; a timeout, type or protocol that is held is judged as the value that refuses nothing.
 fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Supplied>) -> Result<(), Refused> {
-    let signal_in_play = only.is_none_or(|supplied| supplied.stop_signal);
-    let timeout_in_play = only.is_none_or(|supplied| supplied.stop_timeout);
-
-    if let Shaped::Parsed(signal) = &spec.stop_signal
-        && signal_in_play
-        && let Some(defect) = signal.defect(backend)
-    {
-        return Err(Refused::at(Field::StopSignal, invalid(&spec.id, &defect)));
-    }
-    // The leaves as resolve will settle them: an absent one is its default, a deferred one is not known.
+    // The leaves as resolve will settle them: an absent one is its default.
     let signal = match &spec.stop_signal {
-        Shaped::Parsed(signal) => Some(*signal),
-        Shaped::Absent => Some(StopAction::default().send_signal),
-        Shaped::Deferred => None,
-    };
-    let timeout = match (&spec.stop_timeout, signal) {
-        (Shaped::Parsed(timeout), _) => Some(*timeout),
-        (Shaped::Absent, Some(signal)) => Some(StopAction::default_timeout(signal)),
-        (Shaped::Absent, None) | (Shaped::Deferred, _) => None,
-    };
-    if backend == BackendKind::Launchd
-        && timeout_in_play
-        && let (Some(signal), Some(timeout)) = (signal, timeout)
-        && let Some(defect) = launchd_timeout_defect(signal, timeout)
-    {
-        return Err(Refused::at(Field::StopTimeout, invalid(&spec.id, &defect)));
-    }
-    if backend != BackendKind::Scm {
-        return Ok(());
-    }
-    let kind = match &spec.daemon_type {
-        Shaped::Parsed(kind) => *kind,
-        Shaped::Absent => DaemonKind::Service,
-        // Not known yet: a later pass judges it.
+        Shaped::Parsed(signal) => *signal,
+        Shaped::Absent => StopAction::default().send_signal,
         Shaped::Deferred => return Ok(()),
     };
-    let daemon = match (kind, &spec.protocol) {
-        (DaemonKind::Task, _) => ScmDaemon::Task,
-        (DaemonKind::Service, Shaped::Parsed(protocol)) => ScmDaemon::of_service(*protocol),
-        (DaemonKind::Service, Shaped::Absent) => ScmDaemon::PlainService,
-        (DaemonKind::Service, Shaped::Deferred) => return Ok(()),
+    let timeout = match &spec.stop_timeout {
+        Shaped::Parsed(timeout) => *timeout,
+        Shaped::Absent | Shaped::Deferred => StopAction::default_timeout(signal),
     };
-    let known = Written::of_leaves(signal, timeout);
-    let written = Written {
-        send_signal: signal_in_play && known.send_signal,
-        timeout: timeout_in_play && known.timeout,
+    let kind = match &spec.daemon_type {
+        Shaped::Parsed(kind) => *kind,
+        Shaped::Absent | Shaped::Deferred => DaemonKind::Service,
     };
-    match scm_defect(daemon, written) {
+    let protocol = match (&spec.daemon_type, &spec.protocol) {
+        (Shaped::Deferred, _) | (_, Shaped::Absent | Shaped::Deferred) => Protocol::Plain,
+        (_, Shaped::Parsed(protocol)) => *protocol,
+    };
+    let refusals = StopAction {
+        send_signal: signal,
+        timeout,
+    }
+    .refuse(backend, kind, protocol)
+    .only(
+        only.is_none_or(|supplied| supplied.stop_signal),
+        only.is_none_or(|supplied| supplied.stop_timeout),
+    );
+    match refusals.first() {
         Some((leaf, defect)) => {
             let field = match leaf {
                 StopField::SendSignal => Field::StopSignal,

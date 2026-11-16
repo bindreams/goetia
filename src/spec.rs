@@ -37,8 +37,8 @@ pub use user::{AccountId, User};
 // `windows_only_account` stays out of this line: only `BackendKind::error` reads it, inside
 // `spec::backend`.
 pub(crate) use backend::{scm_restart_delay, systemd_defect, systemd_raw_value_defect, windows_builtin};
-// Read by the generators, which refuse what their platform cannot do with a stop action.
-pub(crate) use stop_action::{ScmDaemon, Written, scm_defect};
+// Read by `diff`, which renders what a stop action writes.
+pub(crate) use stop_action::Written;
 // Named from `generate_tests.rs` alone.
 #[cfg(test)]
 pub(crate) use backend::MAX_SC_ACTION_DELAY;

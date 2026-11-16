@@ -21,7 +21,10 @@ use super::calendar::{self, Entry};
 use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{BackendKind, DaemonFields, DaemonSpec, Id, Restart, Schedule, StopAction, StopSignal, TaskSpec};
+use crate::spec::{
+    BackendKind, DaemonFields, DaemonKind, DaemonSpec, Id, Protocol, Restart, Schedule, StopAction, StopSignal,
+    TaskSpec,
+};
 
 // Metadata comment ====================================================================================================
 
@@ -484,7 +487,9 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     let mut dict = String::new();
     match spec {
         DaemonSpec::Service(s) => {
-            s.stop_action.refuse(BackendKind::Launchd, &s.common.id)?;
+            s.stop_action
+                .refuse(BackendKind::Launchd, DaemonKind::Service, s.protocol)
+                .into_result(&s.common.id)?;
             push_job_head(&mut dict, &s.common, id, &s.common.command);
 
             push_keep_alive(&mut dict, INDENT, s.restart);
@@ -499,7 +504,9 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
             push_logs(&mut dict, &s.common);
         }
         DaemonSpec::Task(task) => {
-            task.stop_action.refuse(BackendKind::Launchd, &task.common.id)?;
+            task.stop_action
+                .refuse(BackendKind::Launchd, DaemonKind::Task, Protocol::Plain)
+                .into_result(&task.common.id)?;
             let argv = task_argv(task)?;
             push_job_head(&mut dict, &task.common, id, &argv);
 
