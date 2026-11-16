@@ -390,11 +390,17 @@ const TIMER_SUFFIX: &str = "@timer";
 /// The owner's choice of value for `timeout: null` is pending; this is the one constant to change.
 pub(crate) const NO_EXIT_TIMEOUT: u64 = 2_147_483_647;
 
-/// `ExitTimeOut` of `stop_action`: its timeout in whole seconds, [`NO_EXIT_TIMEOUT`] for none, and `0`
-/// for `kill`, which launchd answers with SIGTERM and SIGKILL at once (measured, 0.03 s).
+/// The `ExitTimeOut` of `kill`: launchd sends SIGTERM, and SIGKILL one second later. Not `0`, which
+/// `launchd.plist(5)` documents as no limit: it ends the job at once on macOS 15 and 26 (measured),
+/// but macOS 14 cannot be measured (GitHub no longer has a runner for it), and a `kill` that never
+/// kills is worse than one that waits a second.
+const KILL_EXIT_TIMEOUT: u64 = 1;
+
+/// `ExitTimeOut` of `stop_action`: its timeout in whole seconds, [`NO_EXIT_TIMEOUT`] for none, and
+/// [`KILL_EXIT_TIMEOUT`] for `kill`.
 fn exit_time_out(stop_action: &StopAction) -> u64 {
     match (stop_action.send_signal, stop_action.timeout) {
-        (StopSignal::Kill, _) => 0,
+        (StopSignal::Kill, _) => KILL_EXIT_TIMEOUT,
         (_, Some(timeout)) => timeout.as_secs(),
         (_, None) => NO_EXIT_TIMEOUT,
     }

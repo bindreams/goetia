@@ -225,7 +225,7 @@ entry that writes only `timeout` keeps the base's `send-signal`.
 | `terminate` (default)              | `SIGTERM`              | SIGTERM            | Ctrl+C                                   |
 | `interrupt`                        | `SIGINT`               | refused            | Ctrl+C                                   |
 | `quit`                             | `SIGQUIT`              | refused            | Ctrl+Break                               |
-| `kill`                             | `SIGKILL`              | `ExitTimeOut` of 0 | ends the daemon at once                  |
+| `kill`                             | `SIGKILL`              | `ExitTimeOut` of 1 | ends the daemon at once                  |
 | `sigusr1`, `SIGRTMIN+3`, ...       | that signal (any case) | refused            | refused                                  |
 | `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close` posts `WM_CLOSE`) |
 
@@ -251,9 +251,12 @@ records the end as it does.
   26.4 and later cap the wait at 60 s**, so any `timeout` over `60s`, `null`
   included, waits 60 s there. launchd sends `SIGTERM` to the job's whole process
   group, but `SIGKILL` only to the job's process, so a descendant that ignores
-  `SIGTERM` outlives a stop. `kill` writes an `ExitTimeOut` of `0`, which ends
-  the job at once on macOS 26 (measured); `launchd.plist(5)` documents `0` as
-  no limit, and earlier releases are not measured.
+  `SIGTERM` outlives a stop. `kill` writes an `ExitTimeOut` of `1`: launchd
+  sends `SIGTERM`, and `SIGKILL` a second later. `0`, which `launchd.plist(5)`
+  documents as no limit, ends the job at once on macOS 15.7 (Intel) and 26
+  (measured), but macOS 14, which goetia supports, could not be measured:
+  GitHub no longer offers a runner for it. `1` does not depend on what `0` does
+  there.
 - **Windows** reads, checks and records the field, and does not apply it yet:
   the shim still ends the daemon at once on every stop, `stop`, `restart` and
   `uninstall` included, whatever `stop-action` says. A task is stopped by Task

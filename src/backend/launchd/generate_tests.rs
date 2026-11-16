@@ -1257,14 +1257,15 @@ fn no_timeout_is_the_largest_value_launchd_reads() {
     assert_eq!(NO_EXIT_TIMEOUT, i32::MAX as u64);
 }
 
-/// Measured: `ExitTimeOut` 0 sends SIGTERM and then SIGKILL at once (0.03 s).
+/// `ExitTimeOut` 0 is documented as no limit, and measured as SIGKILL at once on macOS 15 and 26, but
+/// macOS 14 cannot be measured: 1 is SIGKILL after a second on every release.
 #[skuld::test]
-fn kill_is_an_exit_time_out_of_zero() {
+fn kill_is_an_exit_time_out_of_one_second() {
     let spec = with_stop_action(StopAction {
         send_signal: StopSignal::Kill,
         timeout: None,
     });
-    assert_eq!(exit_time_out(&spec), 0);
+    assert_eq!(exit_time_out(&spec), 1);
 }
 
 #[skuld::test]
@@ -1283,7 +1284,7 @@ fn a_task_has_the_same_exit_time_out_as_a_service() {
                 send_signal: StopSignal::Kill,
                 timeout: None,
             },
-            0,
+            1,
         ),
     ] {
         let task = TaskSpec::new(TaskFields {

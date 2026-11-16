@@ -705,6 +705,37 @@ fn a_daemon_that_ignores_the_stop_signal_is_ended_after_the_timeout(#[fixture(la
     assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 
+/// `kill` on a daemon that ignores `SIGTERM` ends it a second after the stop (`ExitTimeOut` 1), well
+/// inside a bound shorter than launchd's own 5 s default.
+#[skuld::test]
+fn a_kill_stop_ends_a_daemon_that_ignores_sigterm(#[fixture(launchd_group)] _group: &Group) {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let spec = ServiceSpec::new(ServiceFields {
+        stop_action: StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None,
+        },
+        ..service_fields(base_spec(
+            &id,
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "trap '' TERM; exec /bin/sleep 300".to_string(),
+            ],
+        ))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(4)))
+        .expect("stop");
+
+    assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
+}
+
 // kill ================================================================================================================
 
 /// The test binary as a daemon that reports in on every start, under `restart`.
