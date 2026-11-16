@@ -171,7 +171,7 @@ impl CreatedDirs {
     }
 
     /// Make `dir` and every missing ancestor, root's, and have the deepest of them handed to `hand_to`
-    /// by [`hand_over`](Self::hand_over). A path that exists whole is used as it is, and a directory
+    /// by a [`settle`](Settle::settle) that keeps it. A path that exists whole is used as it is, and a directory
     /// this guard made as an ancestor of another path is the one handed over if `dir` names it. A
     /// missing component needs the path to lead through a root and every directory and link on the
     /// way to be root's.
