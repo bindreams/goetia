@@ -175,23 +175,28 @@ fn assert_profile_loaded(id: &str, before: usize) {
         return;
     }
     // Names what the log holds instead, and goes on: the test fails at its end.
-    MISSING_67.store(true, Ordering::SeqCst);
-    let channel = "Microsoft-Windows-User Profile Service/Operational";
-    for args in [
-        vec!["qe", channel, "/c:12", "/rd:true", "/f:text"],
-        vec!["gl", channel],
-        vec!["gli", channel],
+    if MISSING_67.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let profile_list = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+    for (program, args) in [
+        ("wevtutil.exe", vec!["qe", "System", "/c:25", "/rd:true", "/f:text"]),
+        ("wevtutil.exe", vec!["qe", "Application", "/c:25", "/rd:true", "/f:text"]),
+        ("sc.exe", vec!["queryex", "ProfSvc"]),
+        ("reg.exe", vec!["query", "HKU"]),
+        ("reg.exe", vec!["query", profile_list]),
     ] {
-        let out = Command::new("wevtutil.exe")
-            .args(&args)
-            .output()
-            .expect("spawn wevtutil");
+        let out = Command::new(program).args(&args).output().expect("spawn");
         eprintln!(
-            "[probe] {id} wevtutil {args:?}:\n{}{}",
+            "[probe] {id} {program} {args:?}:\n{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    eprintln!(
+        "[probe] {id} C:\\Users: {:?}",
+        std::fs::read_dir(r"C:\Users").map(|d| d.map(|e| e.map(|e| e.file_name())).collect::<Vec<_>>())
+    );
 }
 
 /// Set when a round's logon logged no new event 67.
