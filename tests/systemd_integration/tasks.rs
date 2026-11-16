@@ -164,10 +164,14 @@ fn counted(count: u32) -> Vec<u8> {
     (1..=count).flat_map(|n| format!("{n}\n").into_bytes()).collect()
 }
 
-/// The stdout lines of `id`'s newest run, as the journal stores them: the entries of the stream the
-/// unit's newest stdout entry is in (a run has one `_STREAM_ID`, and a run is over when `run` has
-/// returned). `run` shows the journal as stored, which journald can store with a line twice across
-/// a file rotation (systemd/systemd#29016), so this, and not `seq`'s text, is what `run` is compared
+/// The stdout lines of `id`'s newest run, as the journal stores them and as `run` reads them: the
+/// entries of the stream the unit's newest stdout entry is in (a run has one `_STREAM_ID`, and a run
+/// is over when `run` has returned), read through the same query as `run`'s live follower (the
+/// unit's stdout entries, `_SYSTEMD_UNIT=` and `_TRANSPORT=stdout`) from the stream's marker on.
+/// Journald can store a line twice across a file rotation, in a copy that is indexed under some
+/// fields and not others (systemd/systemd#29016; knowledge base: "journald can store a stdout line
+/// twice across a journal file rotation", d95f1aa), so a read of the stream's own `_STREAM_ID=` can
+/// show once what this and `run` show twice. This, and not `seq`'s text, is what `run` is compared
 /// with. Without the stream's first line, the `goetia-run` marker the unit's wrapper prints, which
 /// `run` does not show.
 fn newest_stream_text(id: &str) -> Vec<u8> {
@@ -176,18 +180,20 @@ fn newest_stream_text(id: &str) -> Vec<u8> {
     let stream = field(newest.first().expect("a run wrote a stdout line"), "_STREAM_ID")
         .expect("a stdout entry has a stream")
         .to_string();
-    let lines: Vec<String> = journal(&[&format!("_STREAM_ID={stream}")])
-        .iter()
-        .map(|entry| field(entry, "MESSAGE").expect("a line of the run is text").to_string())
-        .collect();
-    let (marker, output) = lines.split_first().expect("a stream has its marker");
+    let marker = journal(&[&format!("_STREAM_ID={stream}")])
+        .into_iter()
+        .next()
+        .expect("a stream has its marker");
+    let text = field(&marker, "MESSAGE").expect("the marker is text");
     assert!(
-        marker.starts_with("goetia-run "),
-        "the stream starts with the marker: {marker}"
+        text.starts_with("goetia-run "),
+        "the stream starts with the marker: {text}"
     );
-    output
+    let cursor = field(&marker, "__CURSOR").expect("an entry has a cursor");
+    journal(&[&format!("--after-cursor={cursor}"), &unit, "_TRANSPORT=stdout"])
         .iter()
-        .flat_map(|line| format!("{line}\n").into_bytes())
+        .filter(|entry| field(entry, "_STREAM_ID") == Some(stream.as_str()))
+        .flat_map(|entry| format!("{}\n", field(entry, "MESSAGE").expect("a line of the run is text")).into_bytes())
         .collect()
 }
 
