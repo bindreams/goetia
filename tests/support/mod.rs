@@ -37,7 +37,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
+#[cfg(unix)]
+use goetia::spec::{DaemonSpec, ServiceSpec, StopAction};
 pub use goetia::testing::groups::{Group, launchd_group, scm_group, systemd_group};
+#[cfg(unix)]
+use goetia::testing::service_fields;
 #[cfg(windows)]
 pub use goetia::testing::wide_null;
 pub use goetia::testing::{base_fields, cleanup};
@@ -80,6 +84,16 @@ pub fn stock_shim_manager() -> goetia::backend::scm::manager::Scm {
 #[cfg(unix)]
 pub fn require_system_dir(dir: &std::path::Path) {
     assert!(dir.is_dir(), "the system directory {} is missing", dir.display());
+}
+
+/// `base`, a service, run as `command` and stopping by `stop_action`: the daemon the stop-action tests of
+/// the launchd and systemd suites start.
+#[cfg(unix)]
+pub fn stopping_by(base: DaemonSpec, command: Vec<String>, stop_action: StopAction) -> DaemonSpec {
+    let mut fields = service_fields(base);
+    fields.common.command = command;
+    fields.stop_action = stop_action;
+    ServiceSpec::new(fields).map(DaemonSpec::from).unwrap()
 }
 
 /// Test ids are `goetia-test-<random>`. Random rather than derived from the

@@ -673,16 +673,6 @@ fn start_stop_status_reflect_reality(#[fixture(launchd_group)] _group: &Group) {
 
 // stop-action =========================================================================================================
 
-/// `base_spec` as a daemon that stops by `stop_action`.
-fn stopping_by(id: &str, command: Vec<String>, stop_action: StopAction) -> DaemonSpec {
-    ServiceSpec::new(ServiceFields {
-        stop_action,
-        ..service_fields(base_spec(id, command))
-    })
-    .map(DaemonSpec::from)
-    .unwrap()
-}
-
 /// A daemon that ignores `SIGTERM` (an ignored signal stays ignored across `exec`) is ended once its
 /// `ExitTimeOut` has passed, and the stop reports stopped: the timeout is the grace, not a wait that
 /// fails. The `ExitTimeOut` itself is pinned by the generator's tests; this is what launchd does with it.
@@ -694,8 +684,8 @@ fn a_daemon_that_ignores_the_stop_signal_is_ended_after_the_timeout(#[fixture(la
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
     let timeout = Duration::from_secs(2);
-    let spec = stopping_by(
-        &id,
+    let spec = support::stopping_by(
+        sleepy(&id),
         listener.sh_after("trap '' TERM", "exec /bin/sleep 300"),
         StopAction {
             send_signal: StopSignal::Terminate,
@@ -722,8 +712,8 @@ fn a_kill_stop_ends_a_daemon_that_ignores_sigterm(#[fixture(launchd_group)] _gro
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
-    let spec = stopping_by(
-        &id,
+    let spec = support::stopping_by(
+        sleepy(&id),
         listener.sh_after("trap '' TERM", "exec /bin/sleep 300"),
         StopAction {
             send_signal: StopSignal::Kill,
