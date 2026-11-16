@@ -366,6 +366,13 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
         if let Some(RawTimeout::Text(text)) = &mut stop_action.timeout {
             substitute(text, Field::StopTimeout, vars, &mut from_env)?;
         }
+        // Only says whether a `null` timeout was a `kill`'s: text that does not substitute is not that, and is
+        // not this pass's to refuse. Its `.env` is no part of what the signal's errors blame.
+        if let Some(text) = &mut stop_action.base_signal {
+            if substitute(text, Field::StopSignal, vars, &mut BTreeSet::new()).is_err() {
+                stop_action.base_signal = None;
+            }
+        }
     }
 
     Ok(from_env)
@@ -479,6 +486,7 @@ pub(super) fn spec_would_change(raw: &RawSpec) -> bool {
         .any(|field| field.as_deref().is_some_and(would_substitution_change))
         || stop_action.as_ref().is_some_and(|action| {
             action.send_signal.as_deref().is_some_and(would_substitution_change)
+                || action.base_signal.as_deref().is_some_and(would_substitution_change)
                 || matches!(&action.timeout, Some(RawTimeout::Text(text)) if would_substitution_change(text))
         })
         || command.iter().flatten().any(|arg| would_substitution_change(arg))

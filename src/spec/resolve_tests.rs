@@ -3497,6 +3497,15 @@ fn stop_action_of(yaml: &str) -> StopAction {
     }
 }
 
+/// [`stop_action_of`] with `native` named.
+fn stop_action_as(native: BackendKind, yaml: &str) -> StopAction {
+    let (spec, _) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {yaml}: {e}"));
+    match spec {
+        DaemonSpec::Service(service) => service.stop_action,
+        DaemonSpec::Task(task) => task.stop_action,
+    }
+}
+
 fn seconds(n: u64) -> Option<Duration> {
     Some(Duration::from_secs(n))
 }
@@ -3857,6 +3866,49 @@ fn a_substituted_kill_in_an_override_does_not_inherit_the_bases_timeout(#[fixtur
             timeout: None
         }
     );
+}
+
+/// The mirror of the `kill` override: a base `kill` has `timeout: null` because it waits for nothing, and
+/// that is not a wait for the override's other signal, which takes its own default.
+#[skuld::test]
+fn an_override_with_another_signal_does_not_inherit_a_kill_bases_null_timeout() {
+    let base = format!("{SERVICE}stop-action: {{send-signal: kill, timeout: null}}\n");
+    for &native in HOST_BACKENDS {
+        let yaml = format!("{base}backend-specific:\n  {native}:\n    stop-action: terminate\n");
+        assert_eq!(stop_action_as(native, &yaml), StopAction::default(), "{native}");
+    }
+}
+
+/// The signal that makes the base a `kill`, or the override's other signal, is only known once `.env` is
+/// substituted.
+#[skuld::test]
+fn a_substituted_kill_does_not_hand_its_null_timeout_to_another_signal(#[fixture(temp_dir)] dir: &Path) {
+    let cases = [
+        (
+            "stop-action: {send-signal: '${B}', timeout: null}\nbackend-specific:\n  NATIVE:\n    stop-action: terminate\n",
+            "B=kill\n",
+        ),
+        (
+            "stop-action: {send-signal: kill, timeout: null}\nbackend-specific:\n  NATIVE:\n    stop-action: '${S}'\n",
+            "S=terminate\n",
+        ),
+        (
+            "stop-action: {send-signal: '${B}', timeout: null}\nbackend-specific:\n  NATIVE:\n    stop-action: '${S}'\n",
+            "B=kill\nS=terminate\n",
+        ),
+    ];
+    for &native in HOST_BACKENDS {
+        for (manifest, env) in cases {
+            let yaml = format!("{SERVICE}{}", manifest.replace("NATIVE", &native.to_string()));
+            write_fixture(dir, &yaml, Some(env));
+            let (spec, _) = resolve_as(parse_manifest(&yaml), dir, Some(native))
+                .unwrap_or_else(|e| panic!("{native}: {manifest}: {e}"));
+            let DaemonSpec::Service(service) = spec else {
+                panic!("a service")
+            };
+            assert_eq!(service.stop_action, StopAction::default(), "{native}: {manifest}");
+        }
+    }
 }
 
 #[skuld::test]

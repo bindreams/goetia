@@ -520,6 +520,7 @@ fn an_override_lays_its_leaves_over_the_base() {
             send_signal: Some("interrupt".to_string()),
             timeout: Some(RawTimeout::Null),
             timeout_from_base: true,
+            base_signal: Some("quit".to_string()),
         }
     );
     assert_eq!(signal_only.over(&None), signal_only);

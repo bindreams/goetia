@@ -436,7 +436,8 @@ fn resolve_shape(
 /// `stop-action`'s two leaves, shaped like any other field. A `null` timeout is a value, not an
 /// absence: it parses to `None` (no timeout) and needs no substitution. A timeout beside `kill`, once
 /// both are known, is refused, since `kill` ends the daemon at once; but a base's timeout that an
-/// override's `kill` merely leaves in place is not the override's to refuse, and is dropped.
+/// override's `kill` merely leaves in place is not the override's to refuse, and is dropped. So is a
+/// base `kill`'s `null`, which an override's other signal does not take: it has the signal's default.
 fn shape_stop_action(
     id: &Id,
     action: RawStopAction,
@@ -457,6 +458,20 @@ fn shape_stop_action(
             parse_stop_timeout(id, text).map(Some)
         })?,
     };
+    if timeout_from_base && matches!(timeout, Shaped::Parsed(None)) && !matches!(signal, Shaped::Deferred) {
+        // A base signal that does not parse is the base's to refuse, so it is no `kill` here.
+        let base_signal = match action.base_signal {
+            Some(text) => shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal)
+                .unwrap_or(Shaped::Absent),
+            None => Shaped::Absent,
+        };
+        match (&signal, base_signal) {
+            (Shaped::Parsed(StopSignal::Kill), _) => {}
+            (_, Shaped::Parsed(StopSignal::Kill)) => return Ok((signal, Shaped::Absent)),
+            (_, Shaped::Deferred) => return Ok((signal, Shaped::Deferred)),
+            _ => {}
+        }
+    }
     match (&signal, &timeout) {
         (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(_))) if timeout_from_base => {
             Ok((signal, Shaped::Parsed(None)))
