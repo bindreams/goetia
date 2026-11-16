@@ -241,6 +241,7 @@ fn run_of_a_service_is_not_a_task(
         restart: Restart::Never,
         restart_delay: None,
         protocol: Protocol::Native,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .expect("a task's fields make a valid service");

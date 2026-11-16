@@ -22,7 +22,7 @@ use std::io::Write;
 use std::time::SystemTime;
 
 use crate::error::{Error, Reason, Result};
-use crate::spec::{DaemonKind, DaemonSpec, Id};
+use crate::spec::{DaemonKind, DaemonSpec, Id, StopAction};
 
 // ServiceManager ======================================================================================================
 
@@ -282,6 +282,11 @@ pub trait ServiceManager {
     /// [`Error::Kept`]: crate::Error::Kept
     fn kind(&self, id: &Id) -> Result<DaemonKind>;
 
+    /// What a stop of `id` asks of it, read from the definition goetia installed it with, and nothing
+    /// else of its status: the CLI's default wait for `stop` and `restart` is built on it. The gate and
+    /// the errors are [`Self::kind`]'s.
+    fn stop_action(&self, id: &Id) -> Result<StopAction>;
+
     /// Every id this backend could account for. A foreign (unmarked)
     /// service at some id is never included; see [`Installed`] for what
     /// happens when a marked one exists but its blob will not decode, and
@@ -355,6 +360,10 @@ pub trait Sequence {
 // Installed / Status / State ==========================================================================================
 
 /// One entry from [`ServiceManager::list`].
+// `Ours` embeds a full `DaemonSpec` and its status; boxing it would ripple into every match arm of the
+// 90 sites that read one, and `list` builds one per daemon, never in a hot loop. Same call as
+// `decide::Ownership`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Installed {
     /// A Goetia-marked service whose blob decoded successfully.

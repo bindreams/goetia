@@ -17,7 +17,9 @@ use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, conformance};
-use goetia::spec::{AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use goetia::spec::{
+    AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
+};
 use goetia::testing::service_fields;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
@@ -2675,4 +2677,132 @@ fn a_retyped_daemon_keeps_nothing_of_the_old_kind_that_still_acts(#[fixture(syst
     );
     let active = cmd::run("systemctl", &["is-active", &format!("{id}.timer")]);
     assert!(!active.ok(), "the timer is not running: {active}");
+}
+
+// stop-action =========================================================================================================
+
+/// `stop_action` on `mk`'s daemon, run as `script` under `sh`.
+fn stopping_by(id: &str, script: &str, stop_action: StopAction) -> DaemonSpec {
+    let mut spec = service_fields(mk(id));
+    spec.common.command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+    spec.stop_action = stop_action;
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
+}
+
+/// One property of the unit as `systemctl show` reports it.
+fn show_property(id: &str, name: &str) -> String {
+    let unit = format!("{id}.service");
+    let run = cmd::run("systemctl", &["show", "--value", &format!("--property={name}"), &unit]).expect_ok();
+    run.stdout.trim().to_string()
+}
+
+#[skuld::test]
+fn the_units_stop_signal_and_timeout_are_what_systemd_runs(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let usr1 = "sigusr1".parse::<StopSignal>().unwrap();
+    let spec = stopping_by(
+        guard.id(),
+        "exec /bin/sleep infinity",
+        StopAction {
+            send_signal: usr1,
+            timeout: Some(Duration::from_secs(7)),
+        },
+    );
+    Systemd::new().install(&spec, false).expect("install");
+
+    // SIGUSR1 is 10 on Linux, which is how systemd reports it.
+    assert_eq!(show_property(guard.id(), "KillSignal"), "10");
+    assert_eq!(show_property(guard.id(), "TimeoutStopUSec"), "7s");
+}
+
+#[skuld::test]
+fn no_timeout_is_an_infinite_stop_timeout_for_systemd(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = stopping_by(
+        guard.id(),
+        "exec /bin/sleep infinity",
+        StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: None,
+        },
+    );
+    Systemd::new().install(&spec, false).expect("install");
+
+    assert_eq!(show_property(guard.id(), "TimeoutStopUSec"), "infinity");
+    assert_eq!(show_property(guard.id(), "KillSignal"), "15");
+}
+
+/// A daemon that saves and exits on the signal it is asked with ends cleanly: `stop` returns `Ok`, and
+/// the unit's result is `success`, not a kill.
+#[skuld::test]
+fn a_daemon_that_answers_the_stop_signal_ends_cleanly(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = stopping_by(
+        guard.id(),
+        "trap 'exit 0' USR1; /bin/sleep infinity & wait",
+        StopAction {
+            send_signal: "sigusr1".parse::<StopSignal>().unwrap(),
+            timeout: Some(Duration::from_secs(30)),
+        },
+    );
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+
+    assert_eq!(show_property(guard.id(), "Result"), "success");
+    assert_eq!(show_property(guard.id(), "ExecMainStatus"), "0");
+}
+
+/// A daemon that ignores the stop signal is killed once the timeout has passed, and the stop reports
+/// stopped: the timeout is the grace, not a wait that fails.
+#[skuld::test]
+fn a_daemon_that_ignores_the_stop_signal_is_killed_after_the_timeout(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = stopping_by(
+        guard.id(),
+        "trap '' TERM; exec /bin/sleep infinity",
+        StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: Some(Duration::from_secs(2)),
+        },
+    );
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(60)))
+        .expect("stop");
+
+    let status = mgr.status(&spec.common().id).expect("status");
+    assert_ne!(status.common().state, State::Running, "{status:?}");
+    assert_eq!(show_property(guard.id(), "Result"), "timeout");
+}
+
+/// `kill` ends the daemon at once, however it traps: no grace to wait out.
+#[skuld::test]
+fn kill_ends_a_daemon_that_ignores_everything_at_once(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = stopping_by(
+        guard.id(),
+        "trap '' TERM INT; exec /bin/sleep infinity",
+        StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None,
+        },
+    );
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+
+    let status = mgr.status(&spec.common().id).expect("status");
+    assert_ne!(status.common().state, State::Running, "{status:?}");
 }

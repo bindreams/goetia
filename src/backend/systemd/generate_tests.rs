@@ -7,7 +7,8 @@ use std::time::Duration;
 use super::*;
 use crate::decide::{ExternalConfig, Outcome, Ownership, decide};
 use crate::spec::{
-    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Schedule, ServiceFields, ServiceSpec, TaskFields, TaskSpec, User,
+    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Schedule, ServiceFields, ServiceSpec, StopAction, StopSignal,
+    TaskFields, TaskSpec, User,
 };
 
 // Fixtures ============================================================================================================
@@ -36,6 +37,7 @@ fn full_spec() -> DaemonSpec {
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
         protocol: Protocol::Native,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -61,6 +63,7 @@ fn minimal_spec() -> DaemonSpec {
         restart: Restart::Never,
         restart_delay: None,
         protocol: Protocol::Plain,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -96,6 +99,8 @@ fn unit_snapshot_full() {
          User=svc-frpc\n\
          Restart=always\n\
          RestartSec=2.5\n\
+         KillSignal=SIGTERM\n\
+         TimeoutStopSec=30s\n\
          StandardOutput=append:{logs}\n\
          StandardError=append:{logs}\n\
          \n\
@@ -131,6 +136,8 @@ fn unit_snapshot_minimal() {
          ExecStart={exec}\n\
          User=0\n\
          Restart=no\n\
+         KillSignal=SIGTERM\n\
+         TimeoutStopSec=30s\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n\
@@ -462,6 +469,7 @@ fn percent_is_doubled_in_every_value() {
         restart: Restart::OnFailure,
         restart_delay: None,
         protocol: Protocol::Plain,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap();
@@ -639,6 +647,8 @@ fn no_directive_ends_in_a_line_continuation_and_the_unit_stays_in_order() {
                 "Environment",
                 "User",
                 "Restart",
+                "KillSignal",
+                "TimeoutStopSec",
                 "StandardOutput",
                 "StandardError",
                 "WantedBy",
@@ -948,6 +958,7 @@ fn full_task(schedule_text: Option<&str>) -> DaemonSpec {
     TaskSpec::new(TaskFields {
         common: service_fields(full_spec()).common,
         schedule: schedule_text.map(schedule),
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -957,6 +968,7 @@ fn task_with(change: impl FnOnce(&mut DaemonFields)) -> DaemonSpec {
     let mut fields = TaskFields {
         common: service_fields(minimal_spec()).common,
         schedule: Some(schedule("30 3 * * *")),
+        stop_action: Default::default(),
     };
     change(&mut fields.common);
     TaskSpec::new(fields).map(DaemonSpec::from).unwrap()
@@ -1007,6 +1019,8 @@ fn task_unit_is_oneshot_with_no_start_limit_restart_or_install() {
          Environment=RUST_LOG=info\n\
          Environment=URL=http://x/a%%20b\n\
          User=svc-frpc\n\
+         KillSignal=SIGTERM\n\
+         TimeoutStopSec=30s\n\
          StandardOutput=append:{logs}\n\
          StandardError=append:{logs}\n\
          \n\
@@ -1291,4 +1305,143 @@ fn a_value_no_encoding_carries_is_refused_for_a_task_too() {
     };
     assert_eq!(daemon, "frpc");
     assert!(message.contains("`command[0]`"), "{message}");
+}
+
+// Stop action =========================================================================================================
+
+fn with_stop_action(stop_action: StopAction) -> DaemonSpec {
+    with_fields(|f| f.stop_action = stop_action)
+}
+
+fn stop_lines(spec: &DaemonSpec) -> (String, String) {
+    let text = unit(spec, &minimal_identity()).unwrap();
+    (
+        line_of(&text, "KillSignal=").to_string(),
+        line_of(&text, "TimeoutStopSec=").to_string(),
+    )
+}
+
+#[skuld::test]
+fn every_unit_writes_the_stop_signal_and_the_stop_timeout() {
+    // Written for the default too, so that the unit never depends on systemd's own (90 s) default.
+    assert_eq!(
+        stop_lines(&minimal_spec()),
+        ("KillSignal=SIGTERM".to_string(), "TimeoutStopSec=30s".to_string())
+    );
+    for spec in [full_task(Some("30 3 * * *")), full_task(None)] {
+        let text = unit(&spec, &full_identity()).unwrap();
+        assert_eq!(line_of(&text, "KillSignal="), "KillSignal=SIGTERM");
+        assert_eq!(line_of(&text, "TimeoutStopSec="), "TimeoutStopSec=30s");
+    }
+}
+
+#[skuld::test]
+fn the_stop_lines_sit_in_the_service_section_before_the_log_lines() {
+    let spec = with_fields(|f| {
+        f.common.logs = Some(abs("var/log/frpc.log"));
+        f.restart = Restart::Always;
+        f.restart_delay = Some(Duration::from_secs(2));
+    });
+    let text = unit(&spec, &minimal_identity()).unwrap();
+    let position = |key: &str| text.find(key).unwrap_or_else(|| panic!("no `{key}` in:\n{text}"));
+    assert!(position("RestartSec=") < position("KillSignal="));
+    assert!(position("KillSignal=") < position("TimeoutStopSec="));
+    assert!(position("TimeoutStopSec=") < position("StandardOutput="));
+    assert!(position("[Service]") < position("KillSignal="));
+    assert!(position("TimeoutStopSec=") < position("[Install]"));
+}
+
+#[skuld::test]
+fn each_signal_is_the_one_systemd_names() {
+    for (signal, written) in [
+        ("terminate", "SIGTERM"),
+        ("interrupt", "SIGINT"),
+        ("quit", "SIGQUIT"),
+        ("kill", "SIGKILL"),
+        ("sigusr1", "SIGUSR1"),
+        ("SigHup", "SIGHUP"),
+        ("sigrtmin+3", "SIGRTMIN+3"),
+        ("sigrtmax-14", "SIGRTMAX-14"),
+    ] {
+        let send_signal = StopSignal::parse(signal).unwrap();
+        let spec = with_stop_action(StopAction {
+            send_signal,
+            timeout: StopAction::default_timeout(send_signal),
+        });
+        assert_eq!(stop_lines(&spec).0, format!("KillSignal={written}"), "{signal}");
+    }
+}
+
+#[skuld::test]
+fn the_timeout_is_whole_seconds_and_no_timeout_is_infinity() {
+    for (timeout, written) in [
+        (Some(1), "TimeoutStopSec=1s"),
+        (Some(90), "TimeoutStopSec=90s"),
+        (Some(86_400), "TimeoutStopSec=86400s"),
+        (None, "TimeoutStopSec=infinity"),
+    ] {
+        let spec = with_stop_action(StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: timeout.map(Duration::from_secs),
+        });
+        assert_eq!(stop_lines(&spec).1, written);
+    }
+}
+
+#[skuld::test]
+fn kill_is_a_sigkill_with_no_timeout() {
+    let spec = with_stop_action(StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    });
+    assert_eq!(
+        stop_lines(&spec),
+        ("KillSignal=SIGKILL".to_string(), "TimeoutStopSec=infinity".to_string())
+    );
+}
+
+#[skuld::test]
+fn a_signal_only_windows_has_is_refused_naming_the_field() {
+    for signal in [StopSignal::CtrlC, StopSignal::CtrlBreak, StopSignal::WmClose] {
+        let spec = with_stop_action(StopAction {
+            send_signal: signal,
+            timeout: Some(Duration::from_secs(30)),
+        });
+        let err = unit(&spec, &minimal_identity()).unwrap_err();
+        assert!(
+            matches!(&err, Error::Invalid { message, .. } if message.contains(&format!("`send-signal: {signal}` is refused on systemd"))),
+            "{signal}: {err:?}"
+        );
+        let task = TaskSpec::new(TaskFields {
+            common: service_fields(minimal_spec()).common,
+            schedule: None,
+            stop_action: StopAction {
+                send_signal: signal,
+                timeout: Some(Duration::from_secs(30)),
+            },
+        })
+        .map(DaemonSpec::from)
+        .unwrap();
+        assert!(unit(&task, &minimal_identity()).is_err(), "{signal} for a task");
+    }
+}
+
+#[skuld::test]
+fn a_stop_action_survives_the_blob_and_the_unit_regenerates_byte_for_byte() {
+    for stop_action in [
+        StopAction {
+            send_signal: StopSignal::Quit,
+            timeout: Some(Duration::from_secs(7)),
+        },
+        StopAction {
+            send_signal: StopSignal::parse("sigusr2").unwrap(),
+            timeout: None,
+        },
+    ] {
+        let spec = with_stop_action(stop_action);
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        let extracted = extract(&text).unwrap().expect("a goetia unit");
+        assert_eq!(extracted.spec, spec);
+        assert_eq!(unit(&extracted.spec, &minimal_identity()).unwrap(), text);
+    }
 }

@@ -260,9 +260,13 @@ fn verbs(fake: &Fake) -> Vec<String> {
 fn task_logging_to(path: &Path) -> DaemonSpec {
     let mut common = base_fields(ID, vec!["/bin/true".to_string()]).common;
     common.logs = Some(path.to_path_buf());
-    TaskSpec::new(TaskFields { common, schedule: None })
-        .unwrap_or_else(|e| panic!("not a valid task: {e}"))
-        .into()
+    TaskSpec::new(TaskFields {
+        common,
+        schedule: None,
+        stop_action: Default::default(),
+    })
+    .unwrap_or_else(|e| panic!("not a valid task: {e}"))
+    .into()
 }
 
 /// The snapshot `read` makes of an installed task that logs to `logs`, or to nothing.

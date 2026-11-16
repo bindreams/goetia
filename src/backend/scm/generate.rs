@@ -50,7 +50,10 @@ use crate::backend::{Identity, cannot_run_tasks};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Id, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin};
+use crate::spec::{
+    BackendKind, DaemonSpec, Id, Protocol, Restart, ScmDaemon, ServiceSpec, User, Written, scm_defect,
+    scm_restart_delay, windows_builtin,
+};
 
 // Metadata field names ================================================================================================
 
@@ -149,7 +152,8 @@ pub struct FailureActions {
 ///
 /// - a `protocol: native` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
-///   could only run on-failure semantics.
+///   could only run on-failure semantics;
+/// - a `stop-action` Windows cannot honour ([`refuse_stop_action`]).
 pub fn registration(
     spec: &DaemonSpec,
     id: &Identity,
@@ -189,6 +193,29 @@ fn resolve_host(
     if hosted(spec) { host().map(Some) } else { Ok(None) }
 }
 
+/// Refuse the `stop-action` of a service that Windows cannot honour: a signal it has no equivalent of,
+/// and a signal for a `protocol: native` service, which handles SCM's own stop itself. `resolve` refuses
+/// both in a manifest; a spec from a blob arrives here. The stop action is carried in the blob.
+///
+/// Until the shim asks for the stop, Windows still ends a service at once whatever it says (the README).
+fn refuse_stop_action(service: &ServiceSpec) -> Result<(), Error> {
+    let defect = service.stop_action.send_signal.defect(BackendKind::Scm).or_else(|| {
+        scm_defect(
+            ScmDaemon::of_service(service.protocol),
+            Written::of(&service.stop_action),
+        )
+        .map(|(_, defect)| defect)
+    });
+    match defect {
+        Some(message) => Err(Error::Invalid {
+            daemon: service.common.id.to_string(),
+            message,
+            source: None,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// [`registration`] for a `host` already resolved by [`resolve_host`].
 fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
     debug_assert_eq!(
@@ -197,6 +224,7 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
         "a hosted spec's host is resolved before it is built, and only a hosted spec's"
     );
     let s = refuse_task(spec)?;
+    refuse_stop_action(s)?;
     // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
     // for a hosted one.
     let (executable, arguments, environment) = match host {

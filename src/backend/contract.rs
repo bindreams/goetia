@@ -20,7 +20,7 @@ use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
 use crate::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step, flow};
-use crate::spec::{DaemonKind, DaemonSpec, Id};
+use crate::spec::{DaemonKind, DaemonSpec, Id, StopAction};
 
 /// A marked artifact's metadata as `read` decoded it, or the failure kept in its place. Shared, so
 /// every verb that reports the failure hands out the one error.
@@ -441,6 +441,10 @@ impl<B: Backend> ServiceManager for B {
 
     fn kind(&self, id: &Id) -> Result<DaemonKind> {
         flow::kind_of(&flow::owned(self, id)?)
+    }
+
+    fn stop_action(&self, id: &Id) -> Result<StopAction> {
+        flow::stop_action_of(&flow::owned(self, id)?)
     }
 
     fn list(&self) -> Result<Vec<Installed>> {

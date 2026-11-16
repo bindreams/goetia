@@ -92,6 +92,7 @@ pub fn base_fields(id: &str, command: Vec<String>) -> ServiceFields {
         restart: Restart::Never,
         restart_delay: None,
         protocol: Protocol::Native,
+        stop_action: Default::default(),
     }
 }
 
@@ -116,9 +117,13 @@ pub fn task(id: &str, command: Vec<String>, schedule: Option<&str>) -> DaemonSpe
         };
         Schedule::parse(text, &seed).unwrap_or_else(|e| panic!("`{text}` is not a valid schedule: {e}"))
     });
-    TaskSpec::new(TaskFields { common, schedule })
-        .unwrap_or_else(|e| panic!("`{id}` is not a valid task: {e}"))
-        .into()
+    TaskSpec::new(TaskFields {
+        common,
+        schedule,
+        stop_action: Default::default(),
+    })
+    .unwrap_or_else(|e| panic!("`{id}` is not a valid task: {e}"))
+    .into()
 }
 
 /// Whether `schedule` names the minute whose civil fields are given: `weekday` is 0 to 6, Sunday 0.

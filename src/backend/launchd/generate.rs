@@ -21,7 +21,7 @@ use super::calendar::{self, Entry};
 use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{DaemonFields, DaemonSpec, Id, Restart, Schedule, TaskSpec};
+use crate::spec::{BackendKind, DaemonFields, DaemonSpec, Id, Restart, Schedule, StopAction, StopSignal, TaskSpec};
 
 // Metadata comment ====================================================================================================
 
@@ -382,6 +382,37 @@ pub(crate) fn id_of_timer_stem(stem: &str) -> Option<&str> {
 
 const TIMER_SUFFIX: &str = "@timer";
 
+/// The `ExitTimeOut` that stands for no timeout: launchd's largest integer of 32 bits, which it
+/// honours and, since macOS 26.4, cuts to its own cap of 60 s. A larger one (int64 and uint32 max
+/// measured) is read as unset, which waits 5 s: see the KB note "macOS launchd - ExitTimeOut
+/// 9223372036854775807 and 4294967295 are read as unset, 2147483647 is honoured and cut to 60".
+///
+/// The owner's choice of value for `timeout: null` is pending; this is the one constant to change.
+pub(crate) const NO_EXIT_TIMEOUT: u64 = 2_147_483_647;
+
+/// `ExitTimeOut` of `stop_action`: its timeout in whole seconds, [`NO_EXIT_TIMEOUT`] for none, and `0`
+/// for `kill`, which launchd answers with SIGTERM and SIGKILL at once (measured, 0.03 s).
+fn exit_time_out(stop_action: &StopAction) -> u64 {
+    match (stop_action.send_signal, stop_action.timeout) {
+        (StopSignal::Kill, _) => 0,
+        (_, Some(timeout)) => timeout.as_secs(),
+        (_, None) => NO_EXIT_TIMEOUT,
+    }
+}
+
+/// Refuse a signal launchd cannot send ([`StopSignal::defect`]): its only one is SIGTERM, and
+/// another is never turned into it. `resolve` refuses it in a manifest; a spec from a blob arrives here.
+fn refuse_stop_signal(common: &DaemonFields, stop_action: &StopAction) -> Result<(), Error> {
+    match stop_action.send_signal.defect(BackendKind::Launchd) {
+        Some(message) => Err(Error::Invalid {
+            daemon: common.id.to_string(),
+            message,
+            source: None,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Render `spec` as launchd plists for the already-resolved account `id`: a service gives its plist;
 /// a task gives its job and, when it has a schedule, the timer that kickstarts it.
 ///
@@ -468,6 +499,7 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     let mut dict = String::new();
     match spec {
         DaemonSpec::Service(s) => {
+            refuse_stop_signal(&s.common, &s.stop_action)?;
             push_job_head(&mut dict, &s.common, id, &s.common.command);
 
             push_keep_alive(&mut dict, INDENT, s.restart);
@@ -478,9 +510,11 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
                 push_key_integer(&mut dict, INDENT, "ThrottleInterval", round_up_seconds(delay));
             }
 
+            push_key_integer(&mut dict, INDENT, "ExitTimeOut", exit_time_out(&s.stop_action));
             push_logs(&mut dict, &s.common);
         }
         DaemonSpec::Task(task) => {
+            refuse_stop_signal(&task.common, &task.stop_action)?;
             let argv = task_argv(task)?;
             push_job_head(&mut dict, &task.common, id, &argv);
 
@@ -488,6 +522,7 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
             // for 10 s after the last one. launchd treats 0 as 1 (measured), so 1 says what happens.
             push_key_integer(&mut dict, INDENT, "ThrottleInterval", 1);
 
+            push_key_integer(&mut dict, INDENT, "ExitTimeOut", exit_time_out(&task.stop_action));
             push_logs(&mut dict, &task.common);
         }
     }

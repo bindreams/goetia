@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use similar::{ChangeTag, TextDiff};
 use yaml_serde::{Mapping, Value};
 
-use crate::spec::{AccountId, DaemonSpec, Protocol, Restart, User};
+use crate::spec::{AccountId, DaemonSpec, Protocol, Restart, StopAction, User, Written};
 
 /// Renders the artifact-level diff shown on `Conflict`/exit code 5: a
 /// unified text diff between the artifact installed on disk (`was`) and
@@ -60,6 +60,9 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
         ("name", Value::from(common.name.clone())),
         ("user", user_value(&common.user)),
     ];
+    if let Some(stop_action) = stop_action_value(spec.stop_action()) {
+        fields.push(("stop-action", stop_action));
+    }
     if let Some(cwd) = &common.cwd {
         fields.push(("cwd", Value::from(cwd.display().to_string())));
     }
@@ -156,6 +159,26 @@ fn env_value(env: &BTreeMap<String, String>) -> Mapping {
     env.iter()
         .map(|(k, v)| (Value::from(k.clone()), Value::from(v.clone())))
         .collect()
+}
+
+/// `stop-action`'s canonical form with the leaves that differ from the default, and `None` for the
+/// default: like every other field, a rendered spec is a manifest that resolves to it, and a default
+/// is the absence of the leaf (a Windows task refuses a `stop-action` it was not given by default).
+/// No timeout is the `null` a manifest writes for it.
+fn stop_action_value(action: &StopAction) -> Option<Value> {
+    let written = Written::of(action);
+    let mut mapping = Mapping::new();
+    if written.send_signal {
+        mapping.insert(Value::from("send-signal"), Value::from(action.send_signal.to_string()));
+    }
+    if written.timeout {
+        let timeout = match action.timeout {
+            Some(timeout) => Value::from(humantime::format_duration(timeout).to_string()),
+            None => Value::Null,
+        };
+        mapping.insert(Value::from("timeout"), timeout);
+    }
+    (!mapping.is_empty()).then_some(Value::Mapping(mapping))
 }
 
 fn restart_key(restart: Restart) -> &'static str {

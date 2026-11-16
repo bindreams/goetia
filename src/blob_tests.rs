@@ -27,6 +27,7 @@ fn full_spec() -> DaemonSpec {
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
         protocol: Protocol::Native,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -46,6 +47,7 @@ fn minimal_spec() -> DaemonSpec {
         restart: Restart::Never,
         restart_delay: None,
         protocol: Protocol::Plain,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -71,6 +73,7 @@ fn golden_spec() -> DaemonSpec {
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
         protocol: Protocol::Native,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -88,6 +91,7 @@ fn base_wire_spec() -> WireService {
         restart_delay: None,
         logs: Some(abs("var/log/frpc.log").to_string_lossy().into_owned()),
         kind: WireKind::Simple,
+        stop_action: WireStopAction::default(),
     }
 }
 
@@ -146,6 +150,7 @@ fn task_on(hostname: &str, schedule: Option<&str>) -> DaemonSpec {
             logs: None,
         },
         schedule,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -162,7 +167,7 @@ fn tampered(encoded: &str, edit: impl FnOnce(&mut serde_json::Map<String, Value>
 fn task_blob_golden() {
     let program = serde_json::to_string(&program("backup")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[3]}},"minute":{{"restricted":true,"values":[30]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"30 3 * * *"}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[3]}},"minute":{{"restricted":true,"values":[30]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"30 3 * * *"}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
     );
     let spec = task_with(Some("30 3 * * *"));
 
@@ -175,7 +180,7 @@ fn task_blob_with_h_golden() {
     // `build-host`, `nightly`: `H H` resolves to minute 13, hour 2 (the vectors in the spec).
     let program = serde_json::to_string(&program("backup")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[2]}},"minute":{{"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[2]}},"minute":{{"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
     );
     let spec = task_with(Some("H H * * *"));
 
@@ -305,7 +310,7 @@ fn blob_wire_names_are_pinned() {
     // intentional (a rename in `DaemonSpec` should not silently do this).
     let program = serde_json::to_string(&program("frpc")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program},"-c","frpc.toml"],"cwd":null,"env":{{"RUST_LOG":"info","URL":"http://x/a%20b"}},"id":"frpc","kind":"managed","logs":null,"name":"Frpc Tunnel","restart":"always","restart_delay":{{"nanos":500000000,"secs":2}},"user":{{"kind":"name","name":"svc-frpc"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":1,"spec":{{"command":[{program},"-c","frpc.toml"],"cwd":null,"env":{{"RUST_LOG":"info","URL":"http://x/a%20b"}},"id":"frpc","kind":"managed","logs":null,"name":"Frpc Tunnel","restart":"always","restart_delay":{{"nanos":500000000,"secs":2}},"stop_action":{{"send_signal":"terminate","timeout_secs":30}},"user":{{"kind":"name","name":"svc-frpc"}}}},"version":"0.1.0"}}"#
     );
     assert_eq!(encode_with_version(&golden_spec(), "0.1.0"), BASE64.encode(expected));
 }
@@ -743,5 +748,165 @@ fn assert_object_keys_sorted(value: &OrderedValue) {
             }
         }
         OrderedValue::Other => {}
+    }
+}
+
+// Stop action =========================================================================================================
+
+fn with_stop_action(spec: DaemonSpec, stop_action: StopAction) -> DaemonSpec {
+    match spec {
+        DaemonSpec::Service(service) => {
+            let mut fields = service.into_fields();
+            fields.stop_action = stop_action;
+            ServiceSpec::new(fields).map(DaemonSpec::from).unwrap()
+        }
+        DaemonSpec::Task(task) => {
+            let mut fields = task.into_fields();
+            fields.stop_action = stop_action;
+            TaskSpec::new(fields).map(DaemonSpec::from).unwrap()
+        }
+    }
+}
+
+fn spec_object(encoded: &str) -> Value {
+    let value: Value = serde_json::from_slice(&BASE64.decode(encoded).unwrap()).unwrap();
+    value["spec"].clone()
+}
+
+#[skuld::test]
+fn every_stop_action_round_trips_for_a_service_and_a_task() {
+    let actions = [
+        StopAction::default(),
+        StopAction {
+            send_signal: StopSignal::Quit,
+            timeout: Some(Duration::from_secs(1)),
+        },
+        StopAction {
+            send_signal: StopSignal::Interrupt,
+            timeout: None,
+        },
+        StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None,
+        },
+        StopAction {
+            send_signal: StopSignal::parse("sigusr1").unwrap(),
+            timeout: Some(Duration::from_secs(86_400)),
+        },
+        StopAction {
+            send_signal: StopSignal::parse("SIGRTMAX-3").unwrap(),
+            timeout: Some(Duration::from_secs(90)),
+        },
+        StopAction {
+            send_signal: StopSignal::CtrlBreak,
+            timeout: Some(Duration::from_secs(5)),
+        },
+        StopAction {
+            send_signal: StopSignal::WmClose,
+            timeout: None,
+        },
+    ];
+    for stop_action in actions {
+        for base in [minimal_spec(), task_with(Some("30 3 * * *"))] {
+            let spec = with_stop_action(base, stop_action);
+            let blob = decode(&encode(&spec)).unwrap_or_else(|e| panic!("{stop_action:?}: {e}"));
+            assert_eq!(blob.spec, spec, "{stop_action:?}");
+        }
+    }
+}
+
+#[skuld::test]
+fn the_stop_action_is_written_as_a_signal_name_and_whole_seconds() {
+    let quit = with_stop_action(
+        minimal_spec(),
+        StopAction {
+            send_signal: StopSignal::Quit,
+            timeout: Some(Duration::from_secs(45)),
+        },
+    );
+    assert_eq!(
+        spec_object(&encode(&quit))["stop_action"],
+        serde_json::json!({"send_signal": "quit", "timeout_secs": 45})
+    );
+    // No timeout is a `null`, written, so an older reader's default cannot be mistaken for it.
+    let patient = with_stop_action(
+        task_with(None),
+        StopAction {
+            send_signal: StopSignal::parse("sigusr1").unwrap(),
+            timeout: None,
+        },
+    );
+    assert_eq!(
+        spec_object(&encode(&patient))["stop_action"],
+        serde_json::json!({"send_signal": "SIGUSR1", "timeout_secs": null})
+    );
+    assert_eq!(
+        spec_object(&encode(&minimal_spec()))["stop_action"],
+        serde_json::json!({"send_signal": "terminate", "timeout_secs": 30})
+    );
+}
+
+#[skuld::test]
+fn a_blob_written_before_stop_action_reads_as_the_default() {
+    for spec in [minimal_spec(), task_with(Some("30 3 * * *"))] {
+        let old = tampered(&encode(&spec), |object| {
+            assert!(object.remove("stop_action").is_some());
+        });
+        let blob = decode(&old).expect("a blob without `stop_action` is an old blob, not a damaged one");
+        assert_eq!(blob.spec, spec);
+        assert_eq!(blob.schema, SCHEMA);
+    }
+}
+
+#[skuld::test]
+fn a_blob_whose_stop_action_no_manifest_could_write_is_invalid() {
+    let cases: [(&str, Value); 6] = [
+        (
+            "an unknown signal",
+            serde_json::json!({"send_signal": "sigterrm", "timeout_secs": 30}),
+        ),
+        (
+            "a signal in the wrong case",
+            serde_json::json!({"send_signal": "Quit", "timeout_secs": 30}),
+        ),
+        (
+            "a zero timeout",
+            serde_json::json!({"send_signal": "terminate", "timeout_secs": 0}),
+        ),
+        (
+            "a timeout over a day",
+            serde_json::json!({"send_signal": "terminate", "timeout_secs": 86_401}),
+        ),
+        (
+            "a timeout beside kill",
+            serde_json::json!({"send_signal": "kill", "timeout_secs": 5}),
+        ),
+        (
+            "an unwritable signal",
+            serde_json::json!({"send_signal": "", "timeout_secs": null}),
+        ),
+    ];
+    for (what, stop_action) in cases {
+        let encoded = tampered(&encode(&minimal_spec()), |object| {
+            object.insert("stop_action".to_string(), stop_action.clone());
+        });
+        let err = decode(&encoded).expect_err(what);
+        assert!(matches!(err, Error::Invalid { .. }), "{what}: {err:?}");
+    }
+}
+
+#[skuld::test]
+fn a_blob_with_a_malformed_stop_action_member_is_refused() {
+    for stop_action in [
+        serde_json::json!({"send_signal": "terminate", "timeout_secs": 30, "extra": 1}),
+        serde_json::json!({"send_signal": 15, "timeout_secs": 30}),
+        serde_json::json!({"send_signal": "terminate", "timeout_secs": "30s"}),
+        serde_json::json!("terminate"),
+    ] {
+        let encoded = tampered(&encode(&minimal_spec()), |object| {
+            object.insert("stop_action".to_string(), stop_action.clone());
+        });
+        let err = decode(&encoded).expect_err(&stop_action.to_string());
+        assert!(matches!(err, Error::Blob { .. }), "{stop_action}: {err:?}");
     }
 }

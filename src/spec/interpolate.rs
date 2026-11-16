@@ -63,6 +63,7 @@ use std::collections::BTreeSet;
 
 use super::field::Field;
 use super::raw::RawSpec;
+use super::stop_action::RawTimeout;
 use super::user::{AccountId, RawUser};
 use super::vars::Vars;
 use crate::error::{Error, Result};
@@ -331,6 +332,7 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
         daemon_type,
         protocol,
         schedule,
+        stop_action,
         backend_specific,
     } = raw;
     debug_assert!(backend_specific.is_empty(), "interpolation runs on merged specs only");
@@ -359,6 +361,12 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
     substitute_option(daemon_type, Field::Type, vars, &mut from_env)?;
     substitute_option(protocol, Field::Protocol, vars, &mut from_env)?;
     substitute_option(schedule, Field::Schedule, vars, &mut from_env)?;
+    if let Some(stop_action) = stop_action {
+        substitute_option(&mut stop_action.send_signal, Field::StopSignal, vars, &mut from_env)?;
+        if let Some(RawTimeout::Text(text)) = &mut stop_action.timeout {
+            substitute(text, Field::StopTimeout, vars, &mut from_env)?;
+        }
+    }
 
     Ok(from_env)
 }
@@ -381,6 +389,7 @@ pub(super) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
         daemon_type,
         protocol,
         schedule,
+        stop_action,
         backend_specific,
     } = raw;
     debug_assert!(
@@ -419,6 +428,14 @@ pub(super) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
     if let Some(schedule) = schedule {
         check_grammar(schedule, "schedule")?;
     }
+    if let Some(stop_action) = stop_action {
+        if let Some(signal) = &stop_action.send_signal {
+            check_grammar(signal, "stop-action.send-signal")?;
+        }
+        if let Some(RawTimeout::Text(text)) = &stop_action.timeout {
+            check_grammar(text, "stop-action.timeout")?;
+        }
+    }
     Ok(())
 }
 
@@ -453,12 +470,17 @@ pub(super) fn spec_would_change(raw: &RawSpec) -> bool {
         daemon_type,
         protocol,
         schedule,
+        stop_action,
         backend_specific: _,
     } = raw;
 
     [name, cwd, logs, restart, restart_delay, daemon_type, protocol, schedule]
         .iter()
         .any(|field| field.as_deref().is_some_and(would_substitution_change))
+        || stop_action.as_ref().is_some_and(|action| {
+            action.send_signal.as_deref().is_some_and(would_substitution_change)
+                || matches!(&action.timeout, Some(RawTimeout::Text(text)) if would_substitution_change(text))
+        })
         || command.iter().flatten().any(|arg| would_substitution_change(arg))
         || env.values().any(|value| would_substitution_change(value))
         || user_would_change(user)

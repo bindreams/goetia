@@ -21,7 +21,9 @@ use goetia::backend::launchd::generate;
 use goetia::backend::launchd::manager::{ENABLED_DIR, Launchd, STAGING_DIR};
 use goetia::decide::Outcome;
 use goetia::manager::{self, Budget, Installed, ServiceManager, State};
-use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use goetia::spec::{
+    DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
+};
 use goetia::testing::service_fields;
 
 use crate::support::cleanup::{DirGuard, FileGuard};
@@ -666,6 +668,40 @@ fn start_stop_status_reflect_reality(#[fixture(launchd_group)] _group: &Group) {
     assert!(running.common().pid.is_some(), "a running job should report a pid");
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
+}
+
+// stop-action =========================================================================================================
+
+/// A daemon that ignores `SIGTERM` (an ignored signal stays ignored across `exec`) is ended once its
+/// `ExitTimeOut` has passed, and the stop reports stopped: the timeout is the grace, not a wait that
+/// fails. The `ExitTimeOut` itself is pinned by the generator's tests; this is what launchd does with it.
+#[skuld::test]
+fn a_daemon_that_ignores_the_stop_signal_is_ended_after_the_timeout(#[fixture(launchd_group)] _group: &Group) {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let spec = ServiceSpec::new(ServiceFields {
+        stop_action: StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: Some(Duration::from_secs(2)),
+        },
+        ..service_fields(base_spec(
+            &id,
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "trap '' TERM; exec /bin/sleep 300".to_string(),
+            ],
+        ))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(90)))
+        .expect("stop");
+
     assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 

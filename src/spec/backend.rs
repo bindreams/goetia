@@ -44,8 +44,9 @@ use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
+use super::stop_action::{ScmDaemon, StopField, Written, scm_defect};
 use super::vars::is_valid_name;
-use super::{AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, User, Warning};
+use super::{AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, StopSignal, User, Warning};
 use crate::error::Error;
 
 /// One of the three service-manager backends a `backend-specific:` entry
@@ -156,6 +157,10 @@ pub(crate) struct ShapedSpec {
     pub(crate) daemon_type: Shaped<DaemonKind>,
     pub(crate) protocol: Shaped<Protocol>,
     pub(crate) schedule: Shaped<Schedule>,
+    /// `stop-action`'s `send-signal`.
+    pub(crate) stop_signal: Shaped<StopSignal>,
+    /// `stop-action`'s `timeout`, `Parsed(None)` for the `null` that means no timeout.
+    pub(crate) stop_timeout: Shaped<Option<Duration>>,
 }
 
 // Advisories and rejections ===========================================================================================
@@ -181,12 +186,14 @@ impl BackendKind {
     /// resolve. Called for the native backend only.
     ///
     /// systemd: every value of the manifest that [`systemd_defect`] lists, which its generator
-    /// refuses too, but for the paths ([`BackendKind::refuse_path`]).
+    /// refuses too, but for the paths ([`BackendKind::refuse_path`]). Every backend: a `stop-action`
+    /// it cannot honour ([`stop_action_refusal`]).
     pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Refused> {
         match self {
-            BackendKind::Systemd => systemd_refusal(spec),
-            BackendKind::Launchd | BackendKind::Scm => Ok(()),
+            BackendKind::Systemd => systemd_refusal(spec)?,
+            BackendKind::Launchd | BackendKind::Scm => {}
         }
+        stop_action_refusal(self, spec, None)
     }
 
     /// [`BackendKind::refuse`] for one path as it is joined to the manifest directory `base_dir`,
@@ -209,10 +216,21 @@ impl BackendKind {
     /// Values that are wrong for this backend by construction, on any
     /// host. Reads **only** the fields `supplied` marks. See `Supplied`.
     /// While `substitution` is pending, a value a substitution may change is not judged.
-    pub(super) fn error(self, spec: &ShapedSpec, supplied: &Supplied, substitution: Substitution) -> Result<(), Error> {
-        if !supplied.user {
-            return Ok(());
+    pub(super) fn error(
+        self,
+        spec: &ShapedSpec,
+        supplied: &Supplied,
+        substitution: Substitution,
+    ) -> Result<(), Refused> {
+        if supplied.user {
+            self.user_error(spec, substitution)
+                .map_err(|err| Refused::at(Field::User, err))?;
         }
+        stop_action_refusal(self, spec, Some(supplied))
+    }
+
+    /// [`BackendKind::error`]'s verdict on a `user` the override supplied.
+    fn user_error(self, spec: &ShapedSpec, substitution: Substitution) -> Result<(), Error> {
         match self {
             BackendKind::Scm => match &spec.user {
                 // A numeric uid is never a Windows account.
@@ -238,6 +256,54 @@ impl BackendKind {
                 _ => Ok(()),
             },
         }
+    }
+}
+
+// stop-action's refusals ==============================================================================================
+
+/// What `backend` cannot honour of the `stop-action` `spec` carries: the signal it cannot send, and
+/// on Windows a stop Task Scheduler or a native service decides itself. `only` limits the verdict to
+/// what an override supplied (see [`Supplied`]); `None` judges whatever the merged spec holds.
+///
+/// A value a `$` still holds is not judged: a later pass knows it.
+fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Supplied>) -> Result<(), Refused> {
+    let signal_in_play = only.is_none_or(|supplied| supplied.stop_signal);
+    let timeout_in_play = only.is_none_or(|supplied| supplied.stop_timeout);
+
+    if let Shaped::Parsed(signal) = &spec.stop_signal
+        && signal_in_play
+        && let Some(defect) = signal.defect(backend)
+    {
+        return Err(Refused::at(Field::StopSignal, invalid(&spec.id, &defect)));
+    }
+    if backend != BackendKind::Scm {
+        return Ok(());
+    }
+    let kind = match &spec.daemon_type {
+        Shaped::Parsed(kind) => *kind,
+        Shaped::Absent => DaemonKind::Service,
+        // Not known yet: a later pass judges it.
+        Shaped::Deferred => return Ok(()),
+    };
+    let daemon = match (kind, &spec.protocol) {
+        (DaemonKind::Task, _) => ScmDaemon::Task,
+        (DaemonKind::Service, Shaped::Parsed(protocol)) => ScmDaemon::of_service(*protocol),
+        (DaemonKind::Service, Shaped::Absent) => ScmDaemon::PlainService,
+        (DaemonKind::Service, Shaped::Deferred) => return Ok(()),
+    };
+    let written = Written {
+        send_signal: signal_in_play && !matches!(spec.stop_signal, Shaped::Absent),
+        timeout: timeout_in_play && !matches!(spec.stop_timeout, Shaped::Absent),
+    };
+    match scm_defect(daemon, written) {
+        Some((leaf, defect)) => {
+            let field = match leaf {
+                StopField::SendSignal => Field::StopSignal,
+                StopField::Timeout => Field::StopTimeout,
+            };
+            Err(Refused::at(field, invalid(&spec.id, &defect)))
+        }
+        None => Ok(()),
     }
 }
 

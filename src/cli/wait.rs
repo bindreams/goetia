@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use clap::Args as ClapArgs;
 
-use crate::error::Chain;
+use crate::error::{Chain, Error, Result};
 use crate::manager::Budget;
+use crate::spec::{StopAction, StopSignal};
 
 /// The flag pair every waiting verb flattens in.
 ///
@@ -17,11 +18,13 @@ use crate::manager::Budget;
 /// argument counts as present, which would make `--timeout` indistinguishable
 /// from its absence, and [`dispatch`](super::dispatch)'s `install` refusal
 /// needs that distinction (see [`Self::was_given`]). Clap therefore cannot
-/// render `[default: 10s]`, so the help text states the default in words.
+/// render `[default: 10s]`, so the help text states the default in words, and `stop` and
+/// `restart` take theirs from the daemon ([`Self::stop_budget`]).
 #[derive(ClapArgs, Debug, Default)]
 pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
-    /// state asked for. Defaults to 10s. `--timeout 0` issues the request
+    /// state asked for. Defaults to 10s; for `stop` and `restart`, the daemon's own stop timeout
+    /// plus 10s (see `stop-action` in the README). `--timeout 0` issues the request
     /// and returns without waiting, establishing nothing. On macOS, a stop and
     /// some starts and installs also wait for launchd to remove a job; see the
     /// README. Write a compound duration unspaced (`2m30s`), or quote it as
@@ -50,10 +53,37 @@ impl WaitArgs {
         }
     }
 
+    /// [`Self::budget`] for a verb that stops a daemon (`stop`, `restart`), whose default wait is the
+    /// daemon's own: its stop timeout plus the teardown margin, unbounded for no timeout, and what it
+    /// always was ([`Budget::DEFAULT`]) for `kill`, which sends nothing to answer. `stop_action` reads it,
+    /// and is not asked when a flag was given. A definition that will not decode has none to read, and
+    /// the stop does not need it: the previous default. Any other error is the verb's own, found early.
+    pub fn stop_budget(&self, stop_action: impl FnOnce() -> Result<StopAction>) -> Result<Budget> {
+        if self.was_given() {
+            return Ok(self.budget());
+        }
+        match stop_action() {
+            Ok(stop_action) => Ok(default_stop_budget(&stop_action)),
+            Err(e) if matches!(e.cause(), Error::Kept(_)) => Ok(Budget::DEFAULT),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Whether either flag was actually given, which [`Self::budget`] cannot
     /// say: the default budget is what *no* flag means.
     pub fn was_given(&self) -> bool {
         self.no_timeout || self.timeout.is_some()
+    }
+}
+
+/// The default wait of a verb that stops a daemon with `stop_action`: see [`WaitArgs::stop_budget`].
+fn default_stop_budget(stop_action: &StopAction) -> Budget {
+    if stop_action.send_signal == StopSignal::Kill {
+        return Budget::DEFAULT;
+    }
+    match stop_action.longest_stop() {
+        Some(longest) => Budget::Bounded(longest),
+        None => Budget::Unbounded,
     }
 }
 

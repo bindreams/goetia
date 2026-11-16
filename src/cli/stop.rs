@@ -5,7 +5,7 @@ use std::io::Write;
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::support::{IdVerbCall, run_id_verb};
+use super::support::{WordedVerbCall, run_worded_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::Result;
 use crate::manager::ServiceManager;
@@ -26,15 +26,18 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let budget = args.wait.budget();
-    run_id_verb(
-        IdVerbCall {
+    run_worded_verb(
+        WordedVerbCall {
             subcommand: "daemon stop",
             ids: &args.ids,
             get_manager,
             is_elevated,
-            verb: &|mgr, id| mgr.stop(id, budget),
-            verb_past_tense: wait::reported(budget, "stopped", "stop requested"),
+            // The wait is each daemon's own, so the word follows it.
+            verb: &|mgr, id| {
+                let budget = args.wait.stop_budget(|| mgr.stop_action(id))?;
+                mgr.stop(id, budget)?;
+                Ok(wait::reported(budget, "stopped", "stop requested"))
+            },
             absent_is_success: false,
         },
         out,

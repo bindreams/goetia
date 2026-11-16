@@ -18,6 +18,7 @@ mod overrides;
 mod raw;
 mod resolve;
 mod schedule;
+mod stop_action;
 mod user;
 mod vars;
 
@@ -28,6 +29,7 @@ pub use backend::BackendKind;
 pub(crate) use resolve::invalid;
 pub use resolve::load;
 pub use schedule::{CronField, DayRule, HashSeed, Schedule};
+pub use stop_action::{NativeSignal, StopAction, StopSignal};
 pub use user::{AccountId, User};
 
 // Read by `crate::backend::scm::generate` and `crate::backend::systemd::generate`, which cannot see through the
@@ -35,6 +37,8 @@ pub use user::{AccountId, User};
 // `windows_only_account` stays out of this line: only `BackendKind::error` reads it, inside
 // `spec::backend`.
 pub(crate) use backend::{scm_restart_delay, systemd_defect, systemd_raw_value_defect, windows_builtin};
+// Read by the generators, which refuse what their platform cannot do with a stop action.
+pub(crate) use stop_action::{ScmDaemon, Written, scm_defect};
 // Named from `generate_tests.rs` alone.
 #[cfg(test)]
 pub(crate) use backend::MAX_SC_ACTION_DELAY;
@@ -135,6 +139,7 @@ pub struct ServiceFields {
     pub restart: Restart,
     pub restart_delay: Option<Duration>,
     pub protocol: Protocol,
+    pub stop_action: StopAction,
 }
 
 /// A service goetia has checked: it passed every field rule. Only [`ServiceSpec::new`] makes one;
@@ -155,6 +160,7 @@ impl ServiceSpec {
     /// the field.
     pub fn new(fields: ServiceFields) -> Result<ServiceSpec, Error> {
         resolve::check_fields(&fields.common)?;
+        resolve::check_stop_action(&fields.common.id, &fields.stop_action)?;
         Ok(ServiceSpec(fields))
     }
 
@@ -180,6 +186,7 @@ impl std::ops::Deref for ServiceSpec {
 pub struct TaskFields {
     pub common: DaemonFields,
     pub schedule: Option<Schedule>,
+    pub stop_action: StopAction,
 }
 
 /// A task goetia has checked: it passed every field rule. Only [`TaskSpec::new`] makes one; fields
@@ -192,6 +199,7 @@ impl TaskSpec {
     /// the field.
     pub fn new(fields: TaskFields) -> Result<TaskSpec, Error> {
         resolve::check_fields(&fields.common)?;
+        resolve::check_stop_action(&fields.common.id, &fields.stop_action)?;
         Ok(TaskSpec(fields))
     }
 
@@ -223,6 +231,14 @@ impl DaemonSpec {
         match self {
             DaemonSpec::Service(service) => &service.common,
             DaemonSpec::Task(task) => &task.common,
+        }
+    }
+
+    /// What a stop of this daemon asks of it.
+    pub fn stop_action(&self) -> &StopAction {
+        match self {
+            DaemonSpec::Service(service) => &service.stop_action,
+            DaemonSpec::Task(task) => &task.stop_action,
         }
     }
 

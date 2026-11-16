@@ -196,6 +196,78 @@ daemons are several manifests, each installed with its own
 `goetia daemon install -f <file>`; manifests in one directory share its
 `.env`.
 
+### `stop-action`
+
+`stop-action` says how a stop asks the daemon to exit, and how long the manager
+waits for it to. Both forms below mean the same; the second spells out the
+defaults:
+
+```yaml
+stop-action: terminate # short form of:
+stop-action:
+  send-signal: terminate # the default
+  timeout: 30s # whole seconds, 1s to 24h; `null` for no timeout
+```
+
+Either key may be left out, and `stop-action: {}` is the default. A stop sends
+`send-signal`; a daemon that has not exited after `timeout` is ended by the
+manager. `timeout: null` is the one `null` a manifest may write, and means no
+timeout: the manager waits as long as the platform allows. A `timeout` that is
+not a whole number of seconds, or is under `1s` or over `24h`, is refused.
+`stop-action` applies to a service and to a task alike (a task's stop ends the
+run in flight), and can be set per backend, leaf by leaf: a `backend-specific`
+entry that writes only `timeout` keeps the base's `send-signal`.
+
+`send-signal` is one of:
+
+| Value                              | systemd                | launchd            | Windows                                  |
+| ---------------------------------- | ---------------------- | ------------------ | ---------------------------------------- |
+| `terminate` (default)              | `SIGTERM`              | SIGTERM            | Ctrl+C                                   |
+| `interrupt`                        | `SIGINT`               | refused            | Ctrl+C                                   |
+| `quit`                             | `SIGQUIT`              | refused            | Ctrl+Break                               |
+| `kill`                             | `SIGKILL`              | `ExitTimeOut` of 0 | ends the daemon at once                  |
+| `sigusr1`, `SIGRTMIN+3`, ...       | that signal (any case) | refused            | refused                                  |
+| `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close` posts `WM_CLOSE`) |
+
+A value a platform cannot send is refused, naming the platform, and never turned
+into another signal: `sigterrm` is an error, not a `SIGTERM`. A native signal is
+checked against the names systemd knows (`SIGHUP` to `SIGSYS`, `SIGRTMIN` to
+`SIGRTMIN+15`, `SIGRTMAX-14` to `SIGRTMAX`), on every host.
+
+`kill` has nothing to answer and nothing to wait for: its `timeout` is `null`,
+and any other value is refused. `quit` ends a systemd unit as failed, since
+`SIGQUIT` dumps core, where Windows records the stop as clean: each platform
+records the end as it does.
+
+- **systemd** writes `KillSignal=` and `TimeoutStopSec=` into every unit
+  (`infinity` for `null`), and sends `SIGKILL` after the timeout.
+- **launchd** writes `ExitTimeOut`. launchd sends `SIGTERM` and nothing else,
+  and `SIGKILL` once `ExitTimeOut` is over. `timeout: null` writes `2147483647`,
+  the largest value launchd reads: a larger one (measured: `9223372036854775807`
+  and `4294967295`) is read as unset, and the job is killed after 5 s. **macOS
+  26.4 and later cap the wait at 60 s**, so any `timeout` over `60s`, `null`
+  included, waits 60 s there. launchd sends `SIGTERM` to the job's whole process
+  group, but `SIGKILL` only to the job's process, so a descendant that ignores
+  `SIGTERM` outlives a stop.
+- **Windows** reads, checks and records the field, and does not apply it yet:
+  the shim still ends the daemon at once on every stop, `stop`, `restart` and
+  `uninstall` included, whatever `stop-action` says. A task is stopped by Task
+  Scheduler, which decides the signal and the wait, so a task refuses
+  `stop-action`; set it under `backend-specific` for systemd and launchd. A
+  `protocol: native` service handles SCM's own stop itself, so it refuses
+  `send-signal`; its `timeout` still sets the wait of `stop` and `restart`.
+
+`goetia daemon stop` and `restart` wait for the daemon's `timeout` plus 10 s
+(the stop's own teardown), unbounded for `null`, and as before (`10s`) for
+`kill`. `--timeout` and `--no-timeout` override it, and a daemon whose
+definition cannot be read gets the old default. `goetia daemon show` prints the
+leaves that differ from the default.
+
+**Upgrading.** A stop used to wait 90 s on systemd (its own default), 5 s on
+launchd and nothing on Windows; the default is now `30s` on systemd and launchd
+for a daemon installed by this version. A daemon installed by an older goetia
+keeps its old unit until `goetia daemon install` writes it again.
+
 ## Interpolation
 
 Fields of `goetia.yaml` may reference variables defined in a `.env` file
@@ -356,7 +428,8 @@ permissions protect the secret.
 Writing `null` is an error wherever a manifest value is expected — as the
 word itself, as `~`, as an empty value (`name:` with nothing after it), or
 with an explicit tag (`!!null "null"`). Omit the key instead; that is what
-selects the default.
+selects the default. The one exception is `stop-action`'s `timeout`, where
+`null` is a value: no timeout.
 
 An empty _value_ and an empty _string_ are different things, and only the
 first is a `null`. `name:` with nothing after it is YAML's null and is
@@ -474,9 +547,10 @@ backend-specific:
 
 Every field but the daemon's id and `type` is overridable: `name`, `command`,
 `cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `protocol`,
-`schedule`. A scalar or list
+`schedule`, `stop-action`. A scalar or list
 field replaces the base value outright; `env` merges key by key, the
-override winning where both set the same key. An unknown backend key is an
+override winning where both set the same key, and `stop-action` merges
+leaf by leaf. An unknown backend key is an
 error naming it, as is a repeated one.
 
 The two document-wide rules reach in here unchanged, and mean the same thing
@@ -911,11 +985,11 @@ Any other source of the shim implements `goetia::shim::ShimProvider`.
 `daemon start`, `daemon stop`, `daemon restart` and `daemon install --start`
 share one pair of flags:
 
-| Flag                   | Meaning                                       |
-| ---------------------- | --------------------------------------------- |
-| `--timeout <DURATION>` | Wait up to `DURATION`. The default is `10s`.  |
-| `--timeout 0`          | Issue the request and return without waiting. |
-| `--no-timeout`         | Wait indefinitely.                            |
+| Flag                   | Meaning                                                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `--timeout <DURATION>` | Wait up to `DURATION`. The default is `10s`; for `stop` and `restart`, the daemon's [`stop-action`](#stop-action) timeout plus `10s`. |
+| `--timeout 0`          | Issue the request and return without waiting.                                                                                         |
+| `--no-timeout`         | Wait indefinitely.                                                                                                                    |
 
 On macOS, launchd keeps a job's label until the job's process has exited, and
 goetia does not load a job over one that is still going away. So on macOS:

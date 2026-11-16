@@ -796,6 +796,7 @@ fn install_twice_is_up_to_date_for_both_kinds(#[fixture(scm_group)] _group: &Gro
                 protocol: kind,
                 restart: Restart::OnFailure,
                 restart_delay: Some(Duration::from_secs(3)),
+                stop_action: Default::default(),
             }
         })
         .map(DaemonSpec::from)

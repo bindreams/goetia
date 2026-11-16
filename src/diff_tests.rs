@@ -7,7 +7,8 @@ use skuld::temp_dir;
 use super::*;
 use crate::spec::test_support::{abs, program};
 use crate::spec::{
-    DaemonFields, DaemonSpec, HashSeed, Protocol, Restart, Schedule, ServiceFields, ServiceSpec, TaskFields, TaskSpec,
+    DaemonFields, DaemonSpec, HashSeed, Protocol, Restart, Schedule, ServiceFields, ServiceSpec, StopAction,
+    StopSignal, TaskFields, TaskSpec,
 };
 use crate::testing::{base_fields, service_fields};
 
@@ -151,6 +152,7 @@ fn task_fixture_on(hostname: &str, schedule: Option<&str>) -> DaemonSpec {
     TaskSpec::new(TaskFields {
         common: base.common,
         schedule,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -299,4 +301,142 @@ fn render_yaml_resolves_back_to_the_task(#[fixture(temp_dir)] dir: &Path) {
 
         assert_eq!(resolved_from_rendering(&spec, dir), spec, "{schedule:?}");
     }
+}
+
+// Stop action =========================================================================================================
+
+fn with_stop_action(spec: DaemonSpec, stop_action: StopAction) -> DaemonSpec {
+    match spec {
+        DaemonSpec::Service(service) => ServiceSpec::new(ServiceFields {
+            stop_action,
+            ..service.into_fields()
+        })
+        .map(DaemonSpec::from)
+        .unwrap(),
+        DaemonSpec::Task(task) => TaskSpec::new(TaskFields {
+            stop_action,
+            ..task.into_fields()
+        })
+        .map(DaemonSpec::from)
+        .unwrap(),
+    }
+}
+
+/// A default is the absence of the key, as for every field: a rendered spec is a manifest, and a
+/// Windows task or native service refuses a `stop-action` it was written.
+#[skuld::test]
+fn the_default_stop_action_renders_no_key() {
+    for spec in [spec_fixture(), task_fixture(None)] {
+        assert!(!rendered_keys(&spec).contains_key("stop-action"));
+    }
+}
+
+#[skuld::test]
+fn only_the_leaves_that_differ_from_the_default_are_rendered() {
+    let render = |send_signal, timeout| {
+        let spec = with_stop_action(spec_fixture(), StopAction { send_signal, timeout });
+        rendered_keys(&spec)["stop-action"].as_mapping().unwrap().clone()
+    };
+    let only_signal = render(StopSignal::Quit, Some(Duration::from_secs(30)));
+    assert_eq!(only_signal.len(), 1);
+    assert_eq!(only_signal["send-signal"].as_str(), Some("quit"));
+
+    let only_timeout = render(StopSignal::Terminate, Some(Duration::from_secs(120)));
+    assert_eq!(only_timeout.len(), 1);
+    assert_eq!(only_timeout["timeout"].as_str(), Some("2m"));
+
+    // `kill`'s own default is no timeout, so `kill` alone is the whole entry.
+    let kill = render(StopSignal::Kill, None);
+    assert_eq!(kill.len(), 1);
+    assert_eq!(kill["send-signal"].as_str(), Some("kill"));
+}
+
+#[skuld::test]
+fn no_timeout_renders_as_null_and_kill_as_itself() {
+    let patient = with_stop_action(
+        spec_fixture(),
+        StopAction {
+            send_signal: StopSignal::parse("sigusr1").unwrap(),
+            timeout: None,
+        },
+    );
+    let keys = rendered_keys(&patient);
+    let action = keys["stop-action"].as_mapping().unwrap();
+    assert_eq!(action["send-signal"].as_str(), Some("SIGUSR1"));
+    assert!(action["timeout"].is_null(), "{action:?}");
+
+    let kill = with_stop_action(
+        task_fixture(None),
+        StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None,
+        },
+    );
+    assert_eq!(
+        rendered_keys(&kill)["stop-action"].as_mapping().unwrap()["send-signal"].as_str(),
+        Some("kill")
+    );
+}
+
+#[skuld::test]
+fn spec_diff_shows_a_changed_stop_action() {
+    let was = spec_fixture();
+    let now = with_stop_action(
+        spec_fixture(),
+        StopAction {
+            send_signal: StopSignal::Quit,
+            timeout: Some(Duration::from_secs(90)),
+        },
+    );
+    let diff = spec_diff(&was, &now);
+    assert!(diff.contains("+stop-action:"), "{diff}");
+    assert!(diff.contains("+  send-signal: quit"), "{diff}");
+    assert!(diff.contains("+  timeout: 1m 30s"), "{diff}");
+
+    let later = with_stop_action(
+        spec_fixture(),
+        StopAction {
+            send_signal: StopSignal::Quit,
+            timeout: None,
+        },
+    );
+    let diff = spec_diff(&now, &later);
+    assert!(
+        diff.contains("-  timeout: 1m 30s") && diff.contains("+  timeout: null"),
+        "{diff}"
+    );
+}
+
+/// What `show` prints is what a manifest may say: it reads back to the same action. Only the signals
+/// every native backend can send are written, so the test is the same on every host.
+#[skuld::test]
+fn the_rendered_stop_action_reads_back_as_a_manifest_would(#[fixture(temp_dir)] dir: &Path) {
+    for (signal, timeout) in [("terminate", Some(90)), ("terminate", None), ("kill", None)] {
+        let send_signal = StopSignal::parse(signal).unwrap();
+        let stop_action = StopAction {
+            send_signal,
+            timeout: timeout.map(Duration::from_secs),
+        };
+        let rendered = render_yaml(&with_stop_action(spec_fixture(), stop_action));
+        let manifest = format!(
+            "id: frpc\ncommand: ['{}']\n{}",
+            program("frpc"),
+            stop_action_block(&rendered)
+        );
+        std::fs::write(dir.join("goetia.yaml"), manifest).unwrap();
+
+        let (spec, _) = crate::spec::load(dir).unwrap_or_else(|e| panic!("{rendered}: {e}"));
+        let DaemonSpec::Service(service) = spec else {
+            panic!("a service")
+        };
+        assert_eq!(service.stop_action, stop_action, "{rendered}");
+    }
+}
+
+/// The `stop-action:` entry of `rendered`, with its indented lines.
+fn stop_action_block(rendered: &str) -> String {
+    let mut lines = rendered.lines().skip_while(|line| !line.starts_with("stop-action:"));
+    let mut block = vec![lines.next().expect("a stop-action entry").to_string()];
+    block.extend(lines.take_while(|line| line.starts_with(' ')).map(str::to_string));
+    block.join("\n") + "\n"
 }

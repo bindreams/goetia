@@ -2,8 +2,9 @@
 //! typed parse has already accepted.
 //!
 //! An explicit `null` is an error wherever a manifest value is expected:
-//! the nine daemon fields, the daemon `id` itself, the keys and the values
-//! of `env`, the elements of `command`, and `user`'s `name` and `id`.
+//! the twelve daemon fields, the daemon `id` itself, the keys and the values
+//! of `env`, the elements of `command`, and `user`'s `name` and `id`. The one
+//! exception is `stop-action`'s `timeout`, where `null` means no timeout.
 //! `env: {A: ""}`, `env: {}` and `command: [/bin/frpc, ""]` stay legal —
 //! only `null` is refused, not emptiness — and a *quoted* `"null"` is
 //! ordinary text everywhere.
@@ -96,6 +97,9 @@ enum Slot {
     User,
     UserName,
     UserId,
+    StopAction,
+    /// `stop-action`'s `timeout`, where `null` is a value: no timeout.
+    StopTimeout,
 }
 
 impl Slot {
@@ -129,6 +133,9 @@ impl Slot {
             Slot::User => "an explicit `null` is not a user; omit the `user:` key instead",
             Slot::UserName => "an explicit `null` is not a username; omit the `user:` key instead",
             Slot::UserId => NULL_ACCOUNT_ID,
+            Slot::StopAction => "an explicit `null` is not a stop action; omit the `stop-action:` key instead",
+            // The one `null` a manifest may write.
+            Slot::StopTimeout => return None,
         })
     }
 
@@ -141,6 +148,8 @@ impl Slot {
             (Slot::Document | Slot::Override, "env") => Slot::Env,
             (Slot::Document | Slot::Override, "command") => Slot::Command,
             (Slot::Document | Slot::Override, "user") => Slot::User,
+            (Slot::Document | Slot::Override, "stop-action") => Slot::StopAction,
+            (Slot::StopAction, "timeout") => Slot::StopTimeout,
             (Slot::Env, _) => Slot::EnvValue,
             (Slot::User, "name") => Slot::UserName,
             (Slot::User, "id") => Slot::UserId,
