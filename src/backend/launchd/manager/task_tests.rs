@@ -7,12 +7,12 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use super::super::manager_tests::launchd_over;
-use super::super::{Dirs, scan_in};
+use super::super::{Dirs, plist_standing, scan_in};
 use super::*;
 use crate::backend::client::fake::{Fake, exited, reply};
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::task::{IN_BOTH, JOB_MISSING};
-use crate::backend::{Backend as _, Identity, InstalledService as _, Scan, ScanEntry};
+use crate::backend::{Backend as _, Identity, InstalledService as _, Scan, ScanEntry, Standing};
 use crate::manager::Installed;
 use crate::spec::ServiceSpec;
 use crate::testing::{base_fields, task};
@@ -257,6 +257,61 @@ fn read_matches_the_table() {
     tree.put(true, &timer_stem(), &timer);
     let e = tree.read().err().expect("a timer in both directories is an error");
     assert!(matches!(e, Error::AmbiguousInstall { .. }), "{e}");
+}
+
+/// Whether a failed install keeps its directories rests on this mapping: the job's plist is the one
+/// written (`Yes`), is not (`No`), or cannot be told (`Unknown`).
+#[skuld::test]
+fn the_job_plist_read_back_is_what_was_written_or_is_not_or_cannot_be_told() {
+    let service = plists_of(&service_spec());
+    let task = plists_of(&task_spec(Some("30 3 * * *")));
+    let timer = task.timer.clone().expect("a scheduled task has a timer");
+    let other_task = plists_of(&task_spec(Some("45 4 * * *")));
+
+    // Yes: the job, for a service and for a task, whether or not the task's timer is there or the
+    // one that was written.
+    let tree = Tree::new();
+    tree.put(true, ID, &service.job);
+    assert!(matches!(plist_standing(tree.read(), &service), Standing::Yes));
+    for timer_text in [None, Some(timer.as_str()), Some(other_task.timer.as_deref().unwrap())] {
+        let tree = Tree::new();
+        tree.put(false, ID, &task.job);
+        if let Some(text) = timer_text {
+            tree.put(false, &timer_stem(), text);
+        }
+        assert!(
+            matches!(plist_standing(tree.read(), &task), Standing::Yes),
+            "{timer_text:?}"
+        );
+    }
+
+    // No: nothing there, a stranger's plist, a job that is another's, a job with no plist beside its
+    // timer, and one whose metadata will not decode.
+    let no = |tree: &Tree, desired: &Plists, what: &str| {
+        assert!(matches!(plist_standing(tree.read(), desired), Standing::No), "{what}");
+    };
+    no(&Tree::new(), &task, "absent");
+    let tree = Tree::new();
+    tree.put(true, ID, "<plist/>");
+    no(&tree, &task, "foreign");
+    let tree = Tree::new();
+    tree.put(true, ID, &other_task.job);
+    no(&tree, &task, "another job");
+    let tree = Tree::new();
+    tree.put(true, &timer_stem(), &timer);
+    no(&tree, &task, "a timer alone");
+    let tree = Tree::new();
+    tree.put(true, ID, damaged(&task.job));
+    no(&tree, &task, "damaged");
+
+    // Unknown: the read did not complete, here for a job in both directories.
+    let tree = Tree::new();
+    tree.put(false, ID, &task.job);
+    tree.put(true, ID, &task.job);
+    match plist_standing(tree.read(), &task) {
+        Standing::Unknown(reason) => assert!(reason.contains("could not read the plist"), "{reason}"),
+        other => panic!("expected an unknown standing, got {other:?}"),
+    }
 }
 
 /// A binary plist is not goetia's, however small, whichever slot it is in.
