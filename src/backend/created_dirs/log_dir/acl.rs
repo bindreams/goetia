@@ -113,12 +113,12 @@ pub(super) fn has_acl(dir: BorrowedFd<'_>) -> io::Result<bool> {
     }
 }
 
-/// What `acl_get_fd_np`'s error says: `ENOENT`, no ACL on the file, and `ENOTSUP` (`EOPNOTSUPP` is the same
-/// value), a file system that has none, are `false`; any other is the error.
+/// What `acl_get_fd_np`'s error says: `ENOENT`, no ACL on the file, and `ENOTSUP` or `EOPNOTSUPP` (distinct on
+/// macOS), a file system that has none, are `false`; any other is the error.
 #[cfg(target_os = "macos")]
 fn no_acl_or_error(e: io::Error) -> io::Result<bool> {
     match e.raw_os_error() {
-        Some(libc::ENOENT | libc::ENOTSUP) => Ok(false),
+        Some(libc::ENOENT | libc::ENOTSUP | libc::EOPNOTSUPP) => Ok(false),
         _ => Err(e),
     }
 }
