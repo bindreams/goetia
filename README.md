@@ -439,13 +439,15 @@ owns it, since `install` is not a start and you may still be preparing it.
   log directory goes to it on launchd, which opens the log as that user. On systemd the log directory
   stays root's: systemd opens `append:` as root before it drops privileges, and a directory an account can
   write lets it plant a symlink there and make root append to any file. A daemon that writes other files
-  beside its log needs a `cwd` for them.
+  beside its log needs a `cwd` for them. The hand-over is done before the write that can start the
+  definition, so a run that follows finds its directories as they are to stay.
 - **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory or symlink on
   the way to it, a user other than root can change (owned by another user, or writable by a group or by
   everyone), and names who. The sticky bit excuses a writable directory above the log's, which it keeps
   others from renaming, but not the log's own directory, where it does not keep them from making an
-  entry (a symlink at the log's name). A log in or under the `cwd` that is to be handed to the account is
-  refused before anything is handed over. This covers a directory that already exists. Debian
+  entry (a symlink at the log's name). A log that already exists is refused when it is a symlink or an
+  account's file. A log in or under the `cwd` that is to be handed to the account is refused. All of this
+  is judged before any directory is made, and covers a directory that already exists. Debian
   and Ubuntu ship `/var/log` as `root:syslog 0775`, and the group can rename what is inside it, so there
   no log under `/var/log` is accepted, however deep; keep it under another root such as `/var/lib`, or in
   a directory only root can change.
@@ -458,8 +460,9 @@ owns it, since `install` is not a start and you may still be preparing it.
   installs as it did. uid 0, by any spelling, is root and is handed nothing.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
-  (the unit or plist cannot be read back): it then says so, hands over what it would have handed over, and
-  keeps them, since removing them could break a definition that stands.
+  (the unit or plist cannot be read back): it then says so and keeps them, since removing them could
+  break a definition that stands. A directory it handed to the account that the account has since
+  written into is left, and named.
 - **A limit.** An install killed between making `cwd` and handing it over leaves a root-owned `cwd`. The
   next install uses it as it is, and the daemon cannot write it: remove the directory and run `install`
   again.

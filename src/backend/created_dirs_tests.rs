@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::testing::elevation::{ELEVATED, require_elevated};
 
 /// A uid no account has, to own what a test makes foreign.
-pub(super) const STRANGER: u32 = 4242;
+pub(crate) const STRANGER: u32 = 4242;
 
 /// These tests make root-owned directories, which is what the code under test accepts, so they run
 /// as root: CI's elevated test step does.
@@ -45,7 +45,7 @@ impl Layout {
         self.base().join("system")
     }
 
-    pub(super) fn outside(&self) -> PathBuf {
+    pub(crate) fn outside(&self) -> PathBuf {
         self.base().join("outside")
     }
 
@@ -55,7 +55,7 @@ impl Layout {
     }
 }
 
-pub(super) fn give_to_a_stranger(path: &Path) {
+pub(crate) fn give_to_a_stranger(path: &Path) {
     chown(path, Some(Uid::from_raw(STRANGER)), Some(Gid::from_raw(STRANGER))).unwrap();
 }
 
@@ -78,6 +78,40 @@ fn refusal(err: &Error) -> String {
 
 pub(super) fn stranger_owner() -> Owner {
     Owner::new(Uid::from_raw(STRANGER), Some(Gid::from_raw(STRANGER))).unwrap()
+}
+
+/// `plan` and `make` of one path, in one call: the production callers plan every path before they make
+/// any, which is what the ordering tests below do by hand.
+pub(crate) trait Create {
+    fn create(&mut self, dir: &Path, hand_to: Option<Owner>) -> Result<()>;
+}
+
+impl Create for CreatedDirs {
+    fn create(&mut self, dir: &Path, hand_to: Option<Owner>) -> Result<()> {
+        let plan = self.plan(dir)?;
+        self.make(vec![(plan, hand_to)])
+    }
+}
+
+/// The file-system uid of this thread, put back on drop. Setting one that is not root's takes away
+/// the capabilities that let root change another's files and write where it has no permission.
+#[cfg(target_os = "linux")]
+struct Fsuid(libc::uid_t);
+
+#[cfg(target_os = "linux")]
+impl Fsuid {
+    fn set(uid: libc::uid_t) -> Self {
+        // SAFETY: `setfsuid` takes and returns an id and touches only this thread's credentials.
+        Self(unsafe { libc::setfsuid(uid) } as libc::uid_t)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Fsuid {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe { libc::setfsuid(self.0) };
+    }
 }
 
 // Creating ------------------------------------------------------------------------------------------------------------
@@ -412,12 +446,12 @@ fn create_uses_a_component_that_appeared_after_the_walk_and_makes_what_is_below_
     let layout = Layout::new();
     let raced = layout.system().join("a");
     let leaf = raced.join("b");
-    let found = walk(&leaf).unwrap();
+    let mut dirs = layout.dirs();
+    let found = dirs.plan(&leaf).unwrap();
     fs::create_dir(&raced).unwrap();
     fs::set_permissions(&raced, fs::Permissions::from_mode(0o700)).unwrap();
-    let mut dirs = layout.dirs();
 
-    dirs.make(found, || Ok(None)).unwrap();
+    dirs.make(vec![(found, None)]).unwrap();
 
     assert_eq!(mode(&raced), 0o700, "the other install's directory is untouched");
     assert_eq!(mode(&leaf), 0o755);
@@ -430,12 +464,12 @@ fn create_uses_a_component_that_appeared_after_the_walk_and_makes_what_is_below_
 fn create_refuses_a_component_that_appeared_after_the_walk_for_an_account() {
     let layout = Layout::new();
     let raced = layout.system().join("a");
-    let found = walk(&raced.join("b")).unwrap();
+    let mut dirs = layout.dirs();
+    let found = dirs.plan(&raced.join("b")).unwrap();
     fs::create_dir(&raced).unwrap();
     give_to_a_stranger(&raced);
-    let mut dirs = layout.dirs();
 
-    let err = dirs.make(found, || Ok(None)).expect_err("an account owns it now");
+    let err = dirs.make(vec![(found, None)]).expect_err("an account owns it now");
 
     assert!(refusal(&err).contains(&format!("uid {STRANGER}")));
     assert!(!raced.join("b").exists());
@@ -444,11 +478,12 @@ fn create_refuses_a_component_that_appeared_after_the_walk_for_an_account() {
 #[skuld::test(labels = [ELEVATED])]
 fn create_does_not_descend_into_a_symlink_planted_after_the_walk() {
     let layout = Layout::new();
-    let found = walk(&layout.system().join("a/b")).unwrap();
-    symlink(layout.outside(), layout.system().join("a")).unwrap();
     let mut dirs = layout.dirs();
+    let found = dirs.plan(&layout.system().join("a/b")).unwrap();
+    symlink(layout.outside(), layout.system().join("a")).unwrap();
 
-    dirs.make(found, || Ok(None)).expect_err("a symlink is not a directory");
+    dirs.make(vec![(found, None)])
+        .expect_err("a symlink is not a directory");
 
     assert_eq!(fs::read_dir(layout.outside()).unwrap().count(), 0);
 }
@@ -506,21 +541,6 @@ fn a_made_directory_in_a_setgid_parent_is_accepted_and_given_0755() {
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
 fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
-    /// The file-system uid of this thread, put back on drop.
-    struct Fsuid(libc::uid_t);
-    impl Fsuid {
-        fn set(uid: libc::uid_t) -> Self {
-            // SAFETY: `setfsuid` takes and returns an id and touches only this thread's credentials.
-            Self(unsafe { libc::setfsuid(uid) } as libc::uid_t)
-        }
-    }
-    impl Drop for Fsuid {
-        fn drop(&mut self) {
-            // SAFETY: as in `set`.
-            unsafe { libc::setfsuid(self.0) };
-        }
-    }
-
     let layout = Layout::new();
     let parent = layout.system().join("open");
     fs::create_dir(&parent).unwrap();
@@ -539,21 +559,69 @@ fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
     assert!(!parent.join("new").exists(), "the undo removes a refused directory");
 }
 
+// Planning ------------------------------------------------------------------------------------------------------------
+
+/// A plan reads and judges, and makes nothing: what it refuses is refused before any directory is.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn a_plan_makes_nothing_and_says_whether_make_would() {
+    let layout = Layout::new();
+    let dirs = layout.dirs();
+
+    let missing = dirs.plan(&layout.system().join("a/b/c")).unwrap();
+    let existing = dirs.plan(&layout.system()).unwrap();
+
+    assert!(missing.makes());
+    assert!(!existing.makes());
+    assert!(!layout.system().join("a").exists());
+    assert!(dirs.made.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn a_plan_is_at_or_under_another_when_it_goes_on_from_the_same_directory_by_the_same_names() {
+    let layout = Layout::new();
+    let dirs = layout.dirs();
+    let plan = |path: &str| dirs.plan(&layout.system().join(path)).unwrap();
+
+    assert!(plan("a/b/c").is_at_or_under(&plan("a/b")));
+    assert!(plan("a/b").is_at_or_under(&plan("a/b")));
+    assert!(plan("a").is_at_or_under(&plan("a")));
+    assert!(!plan("a").is_at_or_under(&plan("a/b")), "above is not under");
+    assert!(!plan("a/c").is_at_or_under(&plan("a/b")), "beside is not under");
+    assert!(!plan("ab").is_at_or_under(&plan("a")), "a name is not a prefix of one");
+    assert!(
+        !dirs.plan(&layout.system()).unwrap().is_at_or_under(&plan("a")),
+        "an existing directory is under nothing that is yet to be made"
+    );
+}
+
+/// Two plans that reach the same missing directories from different directories above them are at or
+/// under each other by where they resolve, not by their text: here through a link.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn a_plan_is_judged_by_where_it_resolves_not_by_its_text() {
+    let layout = Layout::new();
+    symlink(layout.system(), layout.outside().join("link")).unwrap();
+    let dirs = layout.dirs();
+
+    let direct = dirs.plan(&layout.system().join("a")).unwrap();
+    let through_link = dirs.plan(&layout.outside().join("link/a/b")).unwrap();
+
+    assert!(through_link.is_at_or_under(&direct));
+}
+
 // Handing over --------------------------------------------------------------------------------------------------------
 
+/// The definition can go live as soon as the write that follows starts: what is to be the account's is
+/// the account's when `make` returns, and nothing but the deepest directory of a path is.
 #[skuld::test(labels = [ELEVATED])]
-fn settle_hands_over_the_deepest_directory_to_the_owner_and_no_other() {
+fn make_hands_over_the_deepest_directory_to_the_owner_and_no_other_before_it_returns() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
     dirs.create(&layout.system().join("a/b"), Some(stranger_owner()))
         .unwrap();
-    assert_eq!(
-        owner_of(&layout.system().join("a/b")).0,
-        0,
-        "nothing is handed before the definition stands"
-    );
-    dirs.settle(|| Standing::Yes);
 
     assert_eq!(owner_of(&layout.system().join("a/b")), (STRANGER, STRANGER));
     assert_eq!(owner_of(&layout.system().join("a")), (0, owner_of(&layout.system()).1));
@@ -561,58 +629,79 @@ fn settle_hands_over_the_deepest_directory_to_the_owner_and_no_other() {
     assert_eq!(mode(&layout.system().join("a/b")), 0o755);
 }
 
-/// The owner is looked up when a directory is to be handed over, and not otherwise: never for a path
-/// that exists whole, once for one made now or made earlier and marked now.
 #[skuld::test(labels = [ELEVATED])]
-fn create_for_asks_for_the_owner_only_when_a_directory_is_handed_over() {
-    let layout = Layout::new();
-    let mut dirs = layout.dirs();
-    let asked = std::cell::Cell::new(0);
-    let owner = || {
-        asked.set(asked.get() + 1);
-        Ok(Some(stranger_owner()))
-    };
-    fs::create_dir(layout.system().join("existing")).unwrap();
-
-    dirs.create_for(&layout.system().join("existing"), owner).unwrap();
-    assert_eq!(asked.get(), 0, "an existing path is handed nothing");
-
-    dirs.create(&layout.system().join("a/b"), None).unwrap();
-    dirs.create_for(&layout.system().join("a"), owner).unwrap();
-    assert_eq!(asked.get(), 1, "a directory made earlier is marked now");
-    dirs.create_for(&layout.system().join("c"), owner).unwrap();
-    assert_eq!(asked.get(), 2);
-    dirs.settle(|| Standing::Yes);
-
-    assert_eq!(owner_of(&layout.system().join("a")).0, STRANGER);
-    assert_eq!(owner_of(&layout.system().join("c")).0, STRANGER);
-    assert_eq!(owner_of(&layout.system().join("existing")).0, 0);
-}
-
-#[skuld::test(labels = [ELEVATED])]
-fn settle_without_an_owner_leaves_everything_roots() {
+fn make_without_an_owner_leaves_everything_roots() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
 
     dirs.create(&layout.system().join("a/b"), None).unwrap();
-    dirs.settle(|| Standing::Yes);
 
     assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
 }
 
-/// `cwd` may be an ancestor of the log directory, or the other way about: a directory made as an
-/// intermediate is the one handed over when a later path names it.
+/// `cwd` may be an ancestor of the log directory, or the other way about: a directory an earlier plan
+/// made is the one handed over when a later plan names it.
 #[skuld::test(labels = [ELEVATED])]
-fn a_directory_made_as_an_intermediate_is_handed_over_when_a_later_path_names_it() {
+fn a_directory_an_earlier_plan_made_is_handed_over_when_a_later_plan_names_it() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
+    let below = dirs.plan(&layout.system().join("a/b")).unwrap();
+    let named = dirs.plan(&layout.system().join("a")).unwrap();
 
-    dirs.create(&layout.system().join("a/b"), None).unwrap();
-    dirs.create(&layout.system().join("a"), Some(stranger_owner())).unwrap();
-    dirs.settle(|| Standing::Yes);
+    dirs.make(vec![(below, None), (named, Some(stranger_owner()))]).unwrap();
 
     assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
     assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
+}
+
+/// A hand-over that fails is the install's error, never a warning: the directory it was for is taken
+/// back with the rest while it is still empty. (An `fchown` that fails for root is made by taking away
+/// its capability, which `setfsuid` does for the thread.)
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn a_hand_over_that_fails_is_an_error_and_the_guard_removes_what_was_made() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let plan = dirs.plan(&layout.system().join("a/b")).unwrap();
+    dirs.make_missing(plan.found, Some(stranger_owner())).unwrap();
+
+    let result = {
+        let _fs = Fsuid::set(STRANGER);
+        dirs.hand_over()
+    };
+
+    let err = result.expect_err("an account may not give a directory away");
+    assert!(err.to_string().contains("hand over"), "{err}");
+    assert_eq!(owner_of(&layout.system().join("a/b")).0, 0);
+    drop(dirs);
+    assert!(!layout.system().join("a").exists());
+}
+
+/// What an account has written into a directory it was handed is its own: the undo does not empty it,
+/// and says it is left.
+#[skuld::test(labels = [ELEVATED])]
+fn undo_leaves_a_handed_directory_the_account_has_written_into_and_names_it() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    dirs.create(&layout.system().join("a"), Some(stranger_owner())).unwrap();
+    fs::write(layout.system().join("a/data"), b"x").unwrap();
+
+    let left = dirs.remove(0).expect_err("it holds a file");
+    assert!(left.contains("handed"), "{left}");
+    drop(dirs);
+
+    assert_eq!(fs::read(layout.system().join("a/data")).unwrap(), b"x");
+}
+
+/// One that was not handed over and has content stays without a word, as before.
+#[skuld::test(labels = [ELEVATED])]
+fn undo_leaves_a_directory_that_was_not_handed_over_and_gained_content_without_a_word() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    dirs.create(&layout.system().join("a"), None).unwrap();
+    fs::write(layout.system().join("a/data"), b"x").unwrap();
+
+    dirs.remove(0).expect("not a failure");
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -721,20 +810,6 @@ fn settle_keeps_every_directory_when_the_definition_stands() {
     assert!(layout.system().join("a/b/c").is_dir());
 }
 
-/// A failure between making a directory and handing it over must not leave it root's for good when
-/// the definition that names it stands.
-#[skuld::test(labels = [ELEVATED])]
-fn settle_hands_over_a_directory_that_never_was_when_the_definition_stands() {
-    let layout = Layout::new();
-    let mut dirs = layout.dirs();
-    dirs.create(&layout.system().join("a"), Some(stranger_owner())).unwrap();
-
-    dirs.settle(|| Standing::Yes);
-    drop(dirs);
-
-    assert_eq!(owner_of(&layout.system().join("a")), (STRANGER, STRANGER));
-}
-
 #[skuld::test(labels = [ELEVATED])]
 fn settle_takes_the_directories_back_when_the_definition_does_not_stand() {
     let layout = Layout::new();
@@ -749,7 +824,7 @@ fn settle_takes_the_directories_back_when_the_definition_does_not_stand() {
 /// An unreadable definition may stand: removing what it names could break it, so the directories
 /// stay, handed over, as an install that stands leaves them.
 #[skuld::test(labels = [ELEVATED])]
-fn settle_keeps_and_hands_over_the_directories_when_the_read_did_not_complete() {
+fn settle_keeps_the_directories_when_the_read_did_not_complete() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
     dirs.create(&layout.system().join("a"), Some(stranger_owner())).unwrap();
@@ -761,26 +836,20 @@ fn settle_keeps_and_hands_over_the_directories_when_the_read_did_not_complete() 
 }
 
 /// A directory `verify` refused, or one that could not be opened to be judged, was never shown to be
-/// the one that was made: keeping what stands hands it to nobody, and says it is left.
+/// the one that was made: keeping what stands says it is left.
 #[skuld::test(labels = [ELEVATED])]
 fn keep_leaves_a_directory_that_was_not_verified_and_names_it() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
-    dirs.create(&layout.system().join("refused"), Some(stranger_owner()))
-        .unwrap();
-    dirs.create(&layout.system().join("unopened"), Some(stranger_owner()))
-        .unwrap();
-    dirs.create(&layout.system().join("verified"), Some(stranger_owner()))
-        .unwrap();
+    dirs.create(&layout.system().join("refused"), None).unwrap();
+    dirs.create(&layout.system().join("unopened"), None).unwrap();
+    dirs.create(&layout.system().join("verified"), None).unwrap();
     dirs.made[0].ready = false;
     dirs.made[1].held = None;
     dirs.made[1].ready = false;
 
     let notes = dirs.keep();
 
-    assert_eq!(owner_of(&layout.system().join("refused")).0, 0);
-    assert_eq!(owner_of(&layout.system().join("unopened")).0, 0);
-    assert_eq!(owner_of(&layout.system().join("verified")).0, STRANGER);
     assert_eq!(notes.len(), 2, "{notes:?}");
     assert!(
         notes[0].contains(&layout.system().join("refused").display().to_string()),
@@ -793,36 +862,6 @@ fn keep_leaves_a_directory_that_was_not_verified_and_names_it() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn an_unknown_standing_hands_over_only_what_was_verified() {
-    let layout = Layout::new();
-    let mut dirs = layout.dirs();
-    dirs.create(&layout.system().join("refused"), Some(stranger_owner()))
-        .unwrap();
-    dirs.made[0].ready = false;
-
-    dirs.settle(|| Standing::Unknown("could not read the unit".to_string()));
-    drop(dirs);
-
-    assert_eq!(owner_of(&layout.system().join("refused")).0, 0);
-}
-
-#[skuld::test(labels = [ELEVATED])]
-fn a_panic_hands_over_only_what_was_verified() {
-    let layout = Layout::new();
-    let path = layout.system().join("refused");
-
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut dirs = layout.dirs();
-        dirs.create(&path, Some(stranger_owner())).unwrap();
-        dirs.made[0].ready = false;
-        panic!("after the definition may have been written");
-    }));
-
-    assert!(unwound.is_err());
-    assert_eq!(owner_of(&path).0, 0);
-}
-
-#[skuld::test(labels = [ELEVATED])]
 fn settle_does_not_ask_when_nothing_was_made() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
@@ -831,7 +870,7 @@ fn settle_does_not_ask_when_nothing_was_made() {
 }
 
 #[skuld::test(labels = [ELEVATED])]
-fn drop_keeps_and_hands_over_the_directories_while_a_panic_unwinds() {
+fn drop_keeps_the_directories_while_a_panic_unwinds() {
     let layout = Layout::new();
     let path = layout.system().join("a");
 
@@ -842,5 +881,9 @@ fn drop_keeps_and_hands_over_the_directories_while_a_panic_unwinds() {
     }));
 
     assert!(unwound.is_err());
-    assert_eq!(owner_of(&path), (STRANGER, STRANGER));
+    assert_eq!(
+        owner_of(&path),
+        (STRANGER, STRANGER),
+        "kept, as handed over when it was made"
+    );
 }

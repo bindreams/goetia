@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use super::*;
 use crate::backend::created_dirs::CreatedDirs;
@@ -10,9 +10,19 @@ fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// The check on what exists, planned with no root to make anything under.
+fn check(logs: &Path) -> Result<()> {
+    checked(&CreatedDirs::under(Vec::new()), logs)
+}
+
+fn checked(dirs: &CreatedDirs, logs: &Path) -> Result<()> {
+    let plan = dirs.plan(logs.parent().unwrap())?;
+    refuse_writable_log_dir(logs, &plan)
+}
+
 /// The reason of a refusal.
 fn refused(logs: &Path) -> String {
-    match refuse_writable_log_dir(logs, &[]) {
+    match check(logs) {
         Err(Error::DirectoryRefused { why, .. }) => why,
         other => panic!("expected a refusal of {}, got {other:?}", logs.display()),
     }
@@ -26,7 +36,7 @@ fn a_log_directory_only_root_can_change_is_accepted() {
     chmod(&dir, 0o755);
     chmod(&layout.system(), 0o755);
 
-    refuse_writable_log_dir(&dir.join("app.log"), &[]).unwrap();
+    check(&dir.join("app.log")).unwrap();
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -64,7 +74,7 @@ fn an_ancestor_everyone_can_write_is_accepted_when_it_is_sticky() {
     fs::create_dir_all(&dir).unwrap();
     chmod(&ancestor, 0o1777);
 
-    refuse_writable_log_dir(&dir.join("app.log"), &[]).unwrap();
+    check(&dir.join("app.log")).unwrap();
 }
 
 /// The sticky bit keeps others from renaming what is there, not from making an entry: whoever can
@@ -119,14 +129,24 @@ fn a_symlink_root_owns_to_a_safe_directory_is_followed() {
     fs::create_dir(&real).unwrap();
     symlink(&real, layout.system().join("link")).unwrap();
 
-    refuse_writable_log_dir(&layout.system().join("link/app.log"), &[]).unwrap();
+    check(&layout.system().join("link/app.log")).unwrap();
 }
 
+/// A directory that is to be made is root's: it is judged by the one it is made in.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_directory_that_does_not_exist_is_an_error_not_an_acceptance() {
+fn a_log_directory_that_is_to_be_made_is_judged_by_the_directory_it_is_made_in() {
     let layout = Layout::new();
+    let dirs = CreatedDirs::under(vec![layout.system()]);
+    let logs = layout.system().join("new/deeper/app.log");
 
-    refuse_writable_log_dir(&layout.system().join("missing/app.log"), &[]).expect_err("nothing to check");
+    checked(&dirs, &logs).unwrap();
+
+    chmod(&layout.system(), 0o777);
+    let Err(Error::DirectoryRefused { why, .. }) = checked(&dirs, &logs) else {
+        panic!("a directory everyone can write is refused")
+    };
+    assert!(why.contains(layout.system().to_str().unwrap()), "{why}");
+    assert!(!layout.system().join("new").exists(), "the check makes nothing");
 }
 
 // The last component --------------------------------------------------------------------------------------------------
@@ -173,43 +193,70 @@ fn a_log_in_the_root_directory_or_beside_a_dotdot_is_accepted() {
     let layout = Layout::new();
     fs::create_dir(layout.system().join("x")).unwrap();
 
-    refuse_writable_log_dir(Path::new("/app.log"), &[]).unwrap();
-    refuse_writable_log_dir(&layout.system().join("x/../app.log"), &[]).unwrap();
+    check(Path::new("/app.log")).unwrap();
+    check(&layout.system().join("x/../app.log")).unwrap();
+}
+
+// The log itself ------------------------------------------------------------------------------------------------------
+
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_that_is_absent_or_a_file_root_owns_is_accepted() {
+    let layout = Layout::new();
+    let logs = layout.system().join("app.log");
+
+    check(&logs).unwrap();
+
+    fs::write(&logs, b"x").unwrap();
+    check(&logs).unwrap();
+}
+
+/// Root's open follows a link at the log's name to wherever it leads.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_that_is_a_symlink_is_refused_whoever_owns_it_and_wherever_it_leads() {
+    let layout = Layout::new();
+    let logs = layout.system().join("app.log");
+
+    symlink(layout.outside().join("target"), &logs).unwrap();
+    let why = refused(&logs);
+    assert!(why.contains("symlink") && why.contains(logs.to_str().unwrap()), "{why}");
+
+    fs::remove_file(&logs).unwrap();
+    fs::write(layout.outside().join("target"), b"x").unwrap();
+    symlink(layout.outside().join("target"), &logs).unwrap();
+    assert!(refused(&logs).contains("symlink"), "a link to a file that exists");
+}
+
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_an_account_owns_is_refused_naming_the_account() {
+    let layout = Layout::new();
+    let logs = layout.system().join("app.log");
+    fs::write(&logs, b"x").unwrap();
+    give_to_a_stranger(&logs);
+
+    let why = refused(&logs);
+
+    assert!(
+        why.contains(logs.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
+        "{why}"
+    );
 }
 
 // What the install is about to hand over ------------------------------------------------------------------------------
 
-/// The directory `cwd` is handed to an account after the check, so the check reads it as the
-/// account's: a log in it, or under it, is refused, and says why.
+/// The directory `cwd` is handed to an account once everything is made, so a log in it, or under it,
+/// is refused, and says why.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_under_the_directory_about_to_be_handed_to_an_account_is_refused_before_the_hand_over() {
+fn the_refusal_of_a_log_in_the_directory_to_be_handed_names_the_directory_and_the_account() {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
-    let mut dirs = CreatedDirs::under(vec![layout.system()]);
-    dirs.create(&cwd.join("out"), None).unwrap();
-    dirs.create(&cwd, Some(stranger_owner())).unwrap();
 
-    let at = |logs: &Path| match refuse_writable_log_dir(logs, &dirs.to_hand_over()) {
-        Err(Error::DirectoryRefused { why, .. }) => why,
-        other => panic!("expected a refusal of {}, got {other:?}", logs.display()),
+    let Error::DirectoryRefused { why, .. } = log_in_handed_dir(&cwd.join("app.log"), &cwd, stranger_owner()) else {
+        panic!("a directory is refused")
     };
-    for logs in [cwd.join("out/app.log"), cwd.join("app.log")] {
-        let why = at(&logs);
-        assert!(why.contains(cwd.to_str().unwrap()) && why.contains("hand"), "{why}");
-        assert!(why.contains(&format!("uid {STRANGER}")), "{why}");
-    }
-    assert_eq!(fs::metadata(&cwd).unwrap().uid(), 0, "nothing was handed over");
-}
 
-#[skuld::test(labels = [ELEVATED])]
-fn a_log_beside_the_directory_about_to_be_handed_is_accepted() {
-    let layout = Layout::new();
-    let mut dirs = CreatedDirs::under(vec![layout.system()]);
-    dirs.create(&layout.system().join("logs"), None).unwrap();
-    dirs.create(&layout.system().join("work"), Some(stranger_owner()))
-        .unwrap();
-
-    refuse_writable_log_dir(&layout.system().join("logs/app.log"), &dirs.to_hand_over()).unwrap();
+    assert!(why.contains(cwd.to_str().unwrap()) && why.contains("hand"), "{why}");
+    assert!(why.contains(&format!("uid {STRANGER}")), "{why}");
+    assert!(!why.contains("  "), "{why}");
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -220,21 +267,6 @@ fn the_refusal_text_has_no_runs_of_spaces() {
     chmod(&dir, 0o777);
 
     let why = refused(&dir.join("app.log"));
-
-    assert!(!why.contains("  "), "{why}");
-}
-
-#[skuld::test(labels = [ELEVATED])]
-fn the_hand_over_refusal_text_has_no_runs_of_spaces() {
-    let layout = Layout::new();
-    let cwd = layout.system().join("work");
-    let mut dirs = CreatedDirs::under(vec![layout.system()]);
-    dirs.create(&cwd, Some(stranger_owner())).unwrap();
-
-    let why = match refuse_writable_log_dir(&cwd.join("app.log"), &dirs.to_hand_over()) {
-        Err(Error::DirectoryRefused { why, .. }) => why,
-        other => panic!("expected a refusal, got {other:?}"),
-    };
 
     assert!(!why.contains("  "), "{why}");
 }

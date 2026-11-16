@@ -1,11 +1,11 @@
 use std::fs;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, symlink};
 use std::path::Path;
 
 use super::*;
 use crate::backend::Settle as _;
 use crate::backend::Standing;
-use crate::backend::created_dirs::created_dirs_tests::Layout;
+use crate::backend::created_dirs::created_dirs_tests::{Layout, STRANGER, give_to_a_stranger};
 use crate::error::Error;
 use crate::spec::{AccountId, ServiceSpec};
 use crate::testing::elevation::ELEVATED;
@@ -59,9 +59,10 @@ fn an_account_with_no_entry_refuses_the_install_before_it_makes_the_cwd_it_would
 }
 
 /// A uid with no entry is the number, as it is to systemd: the directory is made and the account is
-/// not looked up further. It is the account's once the unit stands, and root's until then.
+/// not looked up further. It is the account's when this returns: the unit can run as soon as the write
+/// that follows starts.
 #[skuld::test(labels = [ELEVATED])]
-fn a_uid_with_no_entry_is_handed_the_cwd_as_a_number_once_the_unit_stands() {
+fn a_uid_with_no_entry_is_handed_the_cwd_as_a_number_before_the_write_starts() {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
@@ -71,16 +72,14 @@ fn a_uid_with_no_entry_is_handed_the_cwd_as_a_number_once_the_unit_stands() {
         &mut created,
     )
     .unwrap();
-    assert_eq!(fs::metadata(&cwd).unwrap().uid(), 0, "root's until the unit stands");
-    created.settle(|| Standing::Yes);
 
     assert_eq!(fs::metadata(&cwd).unwrap().uid(), 4_242_424);
 }
 
-/// A write that fails after the directories are made leaves none an account could have written into:
-/// they are root's when the guard takes them back.
+/// A write that fails after the directories are made takes them back, handed over as they were: the
+/// account has not been able to write in one, since the unit it is for never stood.
 #[skuld::test(labels = [ELEVATED])]
-fn a_failed_install_never_hands_the_cwd_to_the_account() {
+fn a_failed_install_takes_back_the_cwd_it_handed_over() {
     let layout = Layout::new();
     let cwd = layout.system().join("work");
     let mut created = CreatedDirs::under(vec![layout.system()]);
@@ -90,15 +89,10 @@ fn a_failed_install_never_hands_the_cwd_to_the_account() {
         &mut created,
     )
     .unwrap();
-    assert_eq!(
-        fs::metadata(&cwd).unwrap().uid(),
-        0,
-        "the write that follows has not stood yet: the account owns nothing"
-    );
     created.settle(|| Standing::No);
     drop(created);
 
-    assert!(!cwd.exists(), "taken back while still root's");
+    assert!(!cwd.exists());
 }
 
 /// uid 0 is root whichever way the spec spells it: nothing is handed over, so a log in the `cwd` is
@@ -118,26 +112,115 @@ fn uid_zero_is_root_and_is_handed_nothing() {
     }
 }
 
-/// A log the check refused under a `cwd` this install made is never handed over: a later `settle` that
-/// keeps the directories (an unknown standing) leaves the `cwd` root's, not the account's.
+/// A log the check refuses leaves nothing made, whatever the refusal is for, and whether the directory
+/// it is in is to be made or not: no directory is made until every path is judged.
 #[skuld::test(labels = [ELEVATED])]
-fn a_log_the_check_refused_under_a_new_cwd_leaves_the_cwd_root_s_whatever_settles_it() {
+fn nothing_is_made_when_the_log_check_refuses() {
     let layout = Layout::new();
-    let cwd = layout.system().join("work");
-    let logs = cwd.join("out.log");
+    let owned = layout.system().join("owned");
+    fs::create_dir(&owned).unwrap();
+    give_to_a_stranger(&owned);
+    let planted = layout.system().join("planted");
+    fs::create_dir(&planted).unwrap();
+    symlink(layout.outside(), planted.join("out.log")).unwrap();
+    let user = || User::Id(AccountId::Uid(4_242_424));
+    let work = layout.system().join("work");
+    let new_logs = layout.system().join("newlogs");
+
+    for (name, logs) in [
+        ("a log directory an account owns", owned.join("out.log")),
+        ("a log that is a symlink", planted.join("out.log")),
+        ("a log in the cwd to be handed", work.join("out.log")),
+        ("a log under the cwd to be handed", work.join("sub/out.log")),
+    ] {
+        let mut created = CreatedDirs::under(vec![layout.system()]);
+
+        let err = ensure_parent_dirs(&spec(user(), Some(&work), Some(&logs)), &mut created).expect_err(name);
+
+        assert!(matches!(err, Error::DirectoryRefused { .. }), "{name}: {err:?}");
+        assert!(!work.exists(), "{name}: the cwd was made");
+    }
+    // The log's own directory, to be made, goes with it.
+    let mut created = CreatedDirs::under(vec![layout.system()]);
+    let logs = new_logs.join("out.log");
+    let err = ensure_parent_dirs(&spec(user(), Some(&owned.join("w")), Some(&logs)), &mut created)
+        .expect_err("a cwd under a directory an account owns is refused as the plan of it");
+    assert!(matches!(err, Error::DirectoryRefused { .. }), "{err:?}");
+    assert!(!new_logs.exists(), "the log directory was made");
+}
+
+/// A log the check refuses is refused whatever the account is: it comes before the account is looked up.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_the_check_refuses_comes_before_the_account_is_looked_up() {
+    let layout = Layout::new();
+    let owned = layout.system().join("owned");
+    fs::create_dir(&owned).unwrap();
+    give_to_a_stranger(&owned);
     let mut created = CreatedDirs::under(vec![layout.system()]);
 
     let err = ensure_parent_dirs(
-        &spec(User::Id(AccountId::Uid(4_242_424)), Some(&cwd), Some(&logs)),
+        &spec(
+            no_entry(),
+            Some(&layout.system().join("work")),
+            Some(&owned.join("out.log")),
+        ),
+        &mut created,
+    )
+    .expect_err("the log directory is an account's");
+
+    assert!(matches!(err, Error::DirectoryRefused { .. }), "{err:?}");
+}
+
+/// The log in a `cwd` that is to be the account's is refused, naming it and the account.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_in_the_cwd_to_be_handed_is_refused_naming_the_directory() {
+    let layout = Layout::new();
+    let cwd = layout.system().join("work");
+    let mut created = CreatedDirs::under(vec![layout.system()]);
+
+    let err = ensure_parent_dirs(
+        &spec(
+            User::Id(AccountId::Uid(STRANGER)),
+            Some(&cwd),
+            Some(&cwd.join("out.log")),
+        ),
         &mut created,
     )
     .expect_err("a log in the directory that is to be the account's");
-    assert!(matches!(err, Error::DirectoryRefused { .. }), "{err:?}");
-    created.settle(|| Standing::Unknown("could not read the unit".to_string()));
 
-    assert_eq!(
-        fs::metadata(&cwd).unwrap().uid(),
-        0,
-        "the refused directory was handed over"
+    let Error::DirectoryRefused { why, .. } = err else {
+        panic!("{err:?}")
+    };
+    assert!(
+        why.contains(cwd.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
+        "{why}"
     );
+}
+
+/// A log directory beside the `cwd` that is handed over is accepted, and a log directory above it too.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_beside_or_above_the_cwd_to_be_handed_is_accepted() {
+    let layout = Layout::new();
+    for (cwd, logs) in [("work", "logs/out.log"), ("a/work", "a/out.log")] {
+        let mut created = CreatedDirs::under(vec![layout.system()]);
+
+        ensure_parent_dirs(
+            &spec(
+                User::Id(AccountId::Uid(STRANGER)),
+                Some(&layout.system().join(cwd)),
+                Some(&layout.system().join(logs)),
+            ),
+            &mut created,
+        )
+        .unwrap_or_else(|e| panic!("{cwd} {logs}: {e}"));
+
+        assert_eq!(fs::metadata(layout.system().join(cwd)).unwrap().uid(), STRANGER);
+        assert_eq!(
+            fs::metadata(layout.system().join(logs).parent().unwrap())
+                .unwrap()
+                .uid(),
+            0
+        );
+        created.settle(|| Standing::No);
+    }
 }

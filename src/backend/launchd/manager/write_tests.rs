@@ -622,10 +622,11 @@ fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
     assert!(cwd.is_dir(), "the directory the spec names was made");
 }
 
-/// The directory a task's account is to own is root's until the definition stands: a write that fails
-/// after it was made leaves nothing the account could have written into.
+/// The directory a task's account is to own is the account's by the time the write that can load the
+/// definition starts: a job that runs then finds its `cwd` in its final state. One a failed install
+/// made is taken back while it is still empty.
 #[skuld::test(labels = [ELEVATED])]
-fn the_cwd_is_the_accounts_only_once_the_definition_stands() {
+fn the_cwd_is_the_accounts_before_the_definition_can_run() {
     require_elevated();
     let tree = Tree::new();
     let root = tempfile::Builder::new()
@@ -656,10 +657,11 @@ fn the_cwd_is_the_accounts_only_once_the_definition_stands() {
     )
     .expect("an update with nothing to change");
     let owner = |path: &std::path::Path| std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(path).unwrap());
-    assert_eq!(owner(&cwd), 0, "root's until the definition stands");
-    created.settle(|| crate::backend::Standing::Yes);
+    assert_eq!(owner(&cwd), 1, "the account's when the directories are made");
 
-    assert_eq!(owner(&cwd), 1, "the account's once it stands");
+    created.settle(|| crate::backend::Standing::No);
+    drop(created);
+    assert!(!cwd.exists(), "taken back with the definition that never stood");
 }
 
 /// A timer label launchd holds with no plist of ours (removed by hand, or a stranger's) is booted out

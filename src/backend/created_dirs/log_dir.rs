@@ -8,61 +8,85 @@
 
 use std::path::Path;
 
+use std::os::fd::AsFd as _;
+
 use nix::sys::stat::SFlag;
 use nix::unistd::{Gid, Group};
 
-use super::PendingHandOver;
-use super::walk::{End, Step, walk};
+use super::walk::{End, Entry, Step, entry};
+use super::{Owner, Plan};
 use crate::backend::account::describe_uid;
 use crate::error::{Error, Result};
 
-/// Refuse a log at `logs` whose directory, or any directory or symlink on the way to it, a user other
-/// than root can change: owned by another, or writable by a group or by everyone. An ancestor that
-/// everyone can write is accepted when it is sticky, which keeps others from renaming root's entries;
-/// the log's own directory is not, since the sticky bit does not keep them from making an entry in it.
-/// `handing` are the directories about to be handed to an account, which are its own from then on: a
-/// log in one of them, or under it, is refused. Names the writer.
-pub(crate) fn refuse_writable_log_dir(logs: &Path, handing: &[PendingHandOver]) -> Result<()> {
+/// Refuse a log at `logs`, whose directory `dir` was planned as `plan`, that root's open could be led
+/// astray in, before anything is made: a directory or symlink on the way to the log's directory that a
+/// user other than root can change (owned by another, or writable by a group or by everyone), or a log
+/// that is already there as a symlink or as another user's file. An ancestor that everyone can write is
+/// accepted when it is sticky, which keeps others from renaming root's entries; the log's own
+/// directory is not, since the sticky bit does not keep them from making an entry in it. A directory
+/// that is to be made is root's. Names the writer.
+pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan) -> Result<()> {
     let Some(dir) = logs.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
     };
-    let walked = walk(dir)?;
-    let End::Whole(end) = walked.end else {
-        return Err(Error::os_at(
-            "stat",
-            dir,
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        ));
-    };
-    for step in &walked.trail {
+    for step in &plan.found.trail {
         // The log lands in the directory the path resolves to, whatever step the walk reached it by:
         // `.` and `..`, or a link to either, bring it back to one it has passed.
-        let leaf = !step.link && step.stat.st_dev == end.st_dev && step.stat.st_ino == end.st_ino;
+        let leaf = !step.link
+            && matches!(&plan.found.end, End::Whole { stat, .. }
+                if step.stat.st_dev == stat.st_dev && step.stat.st_ino == stat.st_ino);
+        let Some(who) = writer(step, leaf) else { continue };
         let kind = if step.link { "the symlink" } else { "the directory" };
-        let handed = handing
-            .iter()
-            .find(|pending| !step.link && pending.dev == step.stat.st_dev && pending.ino == step.stat.st_ino);
-        let reason = match (handed, writer(step, leaf)) {
-            (Some(pending), _) => format!(
-                "{kind} {} will belong to {}, to whom this install hands {} once it has made every directory, \
-                 who could",
-                step.at.display(),
-                describe_uid(pending.owner.uid.as_raw()),
-                pending.path.display(),
-            ),
-            (None, Some(who)) => format!("{kind} {} can be changed by {who}, who could", step.at.display()),
-            (None, None) => continue,
-        };
         return Err(Error::DirectoryRefused {
             path: dir.to_path_buf(),
             why: format!(
-                "{reason} make root's open of the log (systemd opens it before it drops privileges, and follows \
-                 a symlink) write any file; use a log directory that only root can change, under directories \
-                 only root can change"
+                "{kind} {} can be changed by {who}, who could {LED_ASTRAY}",
+                step.at.display()
             ),
         });
     }
+    // Only root can have left what is in a directory only root can change, but an account may own it
+    // all the same, and a link there is followed by the open.
+    if let (End::Whole { dir: held, .. }, Some(name)) = (&plan.found.end, logs.file_name()) {
+        let why = match entry(held.as_fd(), name).map_err(|e| Error::os_at("stat", logs, e))? {
+            Some(Entry::Link(..)) => format!(
+                "{} is a symlink, and root's open of the log (systemd opens it before it drops privileges) \
+                follows it to wherever it leads; remove it, or use a log that is not a link",
+                logs.display()
+            ),
+            Some(found) if found.uid() != 0 => format!(
+                "{} is owned by {}, not root, and root's open of the log (systemd opens it before it drops \
+                privileges) would append to it; use a log file that root owns",
+                logs.display(),
+                describe_uid(found.uid())
+            ),
+            _ => return Ok(()),
+        };
+        return Err(Error::DirectoryRefused {
+            path: dir.to_path_buf(),
+            why,
+        });
+    }
     Ok(())
+}
+
+/// What a directory root's open of the log passes through must not let an account do.
+const LED_ASTRAY: &str = "make root's open of the log (systemd opens it before it drops privileges, and follows a \
+                          symlink) write any file; use a log directory that only root can change, under \
+                          directories only root can change";
+
+/// The refusal of a log in `cwd`, or under it, which the install is about to make and hand to `owner`:
+/// from then on it is the account's.
+pub(crate) fn log_in_handed_dir(logs: &Path, cwd: &Path, owner: Owner) -> Error {
+    Error::DirectoryRefused {
+        path: logs.parent().unwrap_or(logs).to_path_buf(),
+        why: format!(
+            "the directory {} will belong to {}, to whom this install hands it once it has made every \
+            directory, who could {LED_ASTRAY}",
+            cwd.display(),
+            describe_uid(owner.uid.as_raw()),
+        ),
+    }
 }
 
 /// Who besides root can change what `step` passed, if anyone: its owner, or the group or everyone

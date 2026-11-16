@@ -2010,6 +2010,29 @@ fn install_refuses_a_log_under_the_cwd_it_hands_to_the_account(#[fixture(systemd
     assert!(!base.exists(), "the failed install removed what it made");
 }
 
+/// root's open of the log follows a link at its name: an existing one is refused, and the refusal comes
+/// before any directory is made, so the `cwd` the install would have made is not there.
+#[skuld::test]
+fn install_refuses_a_log_that_is_a_symlink_and_makes_nothing(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = under_root("/var/lib", &id, "linked");
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let log = base.join("out.log");
+    std::os::unix::fs::symlink(base.join("target"), &log).expect("plant the link");
+    let cwd = base.join("work");
+    let spec = nobody_spec(guard.id(), Some(&cwd), Some(&log));
+
+    let err = Systemd::new().install(&spec, false).expect_err("the log is a symlink");
+
+    let why = refused_directory(&err, guard.id());
+    assert!(why.contains("symlink"), "{why}");
+    assert!(!cwd.exists(), "the cwd was made before the log was judged");
+}
+
 #[skuld::test]
 fn install_accepts_preexisting_dirs_the_target_account_cannot_write(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -2081,7 +2104,7 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_g
 }
 
 /// A spec whose `logs` parent is `logs_parent` and whose `cwd` lies under a regular file, so the
-/// install makes what is missing of the former and then fails on the latter.
+/// install fails on the latter while judging it, before it makes what is missing of the former.
 fn spec_failing_on_cwd_after_logs_parent(id: &str, base: &Path, logs_parent: &Path) -> DaemonSpec {
     let file = base.join("file");
     fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
@@ -2092,7 +2115,9 @@ fn spec_failing_on_cwd_after_logs_parent(id: &str, base: &Path, logs_parent: &Pa
 }
 
 #[skuld::test]
-fn a_failed_install_removes_the_directories_it_made(#[fixture(systemd_group)] _group: &Group) {
+fn an_install_refused_on_its_cwd_makes_none_of_the_directories_it_would_have_made(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     let id = support::random_test_id();
     // Creation order: see the module doc of `support::service_guard`.
     let base = under_root("/var/lib", &id, "undo-made");
@@ -2107,12 +2132,14 @@ fn a_failed_install_removes_the_directories_it_made(#[fixture(systemd_group)] _g
         .expect_err("the cwd is under a file");
     support::assert_failed_on_a_path_under_a_file(&err);
 
-    assert!(!base.join("a").exists(), "the failed install left {}", made.display());
+    assert!(!base.join("a").exists(), "the refused install made {}", made.display());
     assert!(base.is_dir(), "a directory that existed before must stay");
 }
 
 #[skuld::test]
-fn a_failed_install_removes_a_new_directory_in_one_that_existed_before(#[fixture(systemd_group)] _group: &Group) {
+fn an_install_refused_on_its_cwd_makes_no_new_directory_in_one_that_existed_before(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     let id = support::random_test_id();
     // Creation order: see the module doc of `support::service_guard`.
     let base = under_root("/var/lib", &id, "undo-preexisting");
@@ -2128,7 +2155,7 @@ fn a_failed_install_removes_a_new_directory_in_one_that_existed_before(#[fixture
         .expect_err("the cwd is under a file");
     support::assert_failed_on_a_path_under_a_file(&err);
 
-    assert!(!made.exists(), "the failed install left {}", made.display());
+    assert!(!made.exists(), "the refused install made {}", made.display());
     assert!(existing.is_dir(), "a directory that existed before must stay");
 }
 

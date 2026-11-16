@@ -44,11 +44,26 @@ impl Walk {
         }
         Ok(under)
     }
+
+    /// Whether the path this walk resolved, which does not exist yet, is at or under the one `outer`
+    /// resolved, which does not either: both go on from the same existing directory, and `outer`'s
+    /// missing names are the first of this one's.
+    #[cfg(target_os = "linux")]
+    pub(super) fn is_at_or_under_missing(&self, outer: &Walk) -> bool {
+        let (End::Missing { missing: own, .. }, End::Missing { missing: other, .. }) = (&self.end, &outer.end) else {
+            return false;
+        };
+        self.chain.last() == outer.chain.last()
+            && own.len() >= other.len()
+            && own.iter().zip(other).all(|(a, b)| a.1 == b.1)
+    }
 }
 
 pub(super) enum End {
-    /// The path exists and is a directory, or a symlink to one: that directory.
-    Whole(FileStat),
+    /// The path exists and is a directory, or a symlink to one: that directory, held open. Only the
+    /// Linux log check reads it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Whole { dir: OwnedFd, stat: FileStat },
     /// The deepest directory that exists, held open, and the components below it that do not, each
     /// with its path, outermost first.
     Missing {
@@ -265,11 +280,13 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
         // A link as the last component is walked to its target like one in the middle, so that every
         // directory its target is under reaches the trail.
         if queue.is_empty() && !matches!(found, Entry::Link(..)) {
-            let stat = require_directory(cur.as_fd(), &name, &found, &so_far)?;
+            let Entry::Dir(dir, stat) = found else {
+                return Err(Error::NotADirectory { path: so_far });
+            };
             trail.push(Step { at, stat, link: false });
             chain.push(id_of(&stat));
             return Ok(Walk {
-                end: End::Whole(stat),
+                end: End::Whole { dir, stat },
                 trail,
                 chain,
             });
@@ -306,7 +323,8 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
     // Nothing is missing when the path ended in `..`, or in a link to `/`, or is `/`: the directory
     // the walk is in is the one the path names.
     let end = if missing.is_empty() {
-        End::Whole(fstat(&cur).map_err(|e| Error::os_at("stat", &shown, e))?)
+        let stat = fstat(&cur).map_err(|e| Error::os_at("stat", &shown, e))?;
+        End::Whole { dir: cur, stat }
     } else {
         End::Missing { holder: cur, missing }
     };
