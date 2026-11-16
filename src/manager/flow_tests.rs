@@ -189,25 +189,20 @@ fn an_install_that_ends_up_to_date_settles_what_an_earlier_write_made() {
     assert_eq!(fake.settles(), 2, "after the raced write, and on the exit that stands");
 }
 
-/// A write that is known to have landed settles its scope as standing without reading the definition
-/// back, which could only fail and warn about a definition that was just written. A raced write does
-/// not know, and asks.
+/// The scope settles after every write, the raced ones included, and asks whether the definition stands
+/// only if something was made (see `Settle`): the fake's scope makes nothing, so it never asks.
 #[skuld::test]
-fn an_install_asks_whether_the_definition_stands_only_after_a_write_that_raced() {
+fn an_install_settles_after_every_write_and_a_scope_that_made_nothing_is_never_asked() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
     assert_eq!(fake.settles(), 1);
-    assert_eq!(fake.standings(), 0, "a write that landed is known to stand");
+    assert_eq!(fake.standings(), 0);
 
     let fake = Fake::new();
     fake.seed_write_races("frpc", 2);
     fake.install(&mk("frpc"), false).unwrap();
     assert_eq!(fake.settles(), 3);
-    assert_eq!(
-        fake.standings(),
-        2,
-        "each raced write asks, the one that landed does not"
-    );
+    assert_eq!(fake.standings(), 0, "a scope that made nothing has nothing to keep or take back");
 }
 
 /// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.

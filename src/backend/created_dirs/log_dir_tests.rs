@@ -3,7 +3,7 @@ use std::os::unix::fs::{PermissionsExt as _, lchown, symlink};
 
 use super::*;
 use crate::backend::created_dirs::CreatedDirs;
-use crate::backend::created_dirs::created_dirs_tests::{Layout, STRANGER, give_to_a_stranger};
+use crate::backend::created_dirs::created_dirs_tests::{Fsuid, Layout, STRANGER, give_to_a_stranger};
 use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::root_dirs;
 
@@ -47,12 +47,24 @@ fn name_the_stranger_in_the_acl(path: &Path) {
     ] {
         acl.extend([tag.to_le_bytes().as_slice(), &perm.to_le_bytes(), &id.to_le_bytes()].concat());
     }
-    rustix::fs::setxattr(path, "system.posix_acl_access", &acl, rustix::fs::XattrFlags::empty()).unwrap_or_else(|e| {
-        panic!(
-            "set a POSIX ACL on {}: {e} (the file system under /tmp needs ACLs)",
-            path.display()
+    let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: both strings are NUL-terminated and `acl` is the length it is given with, all for this call.
+    let set = unsafe {
+        libc::setxattr(
+            path_c.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
         )
-    });
+    };
+    assert_eq!(
+        set,
+        0,
+        "set a POSIX ACL on {}: {} (the file system under /tmp needs ACLs)",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -274,6 +286,29 @@ fn a_log_directory_whose_acl_names_an_account_is_refused_with_no_directory_of_it
     assert!(
         !why.contains("such as"),
         "a directory made inside would be refused as an ancestor too: {why}"
+    );
+}
+
+/// Whether an ancestor's group is trusted is the one thing the ACL decides, so it is read there. A
+/// directory whose ACL cannot be read (here, one this account may search and not open) is a log refused
+/// for that reason, never trusted or distrusted on a guess.
+#[skuld::test(labels = [ELEVATED])]
+fn an_ancestor_whose_acl_cannot_be_read_refuses_the_log_saying_so(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    chmod(&layout.base(), 0o711);
+    chmod(&layout.system(), 0o755);
+    let ancestor = layout.system().join("shared");
+    let dir = ancestor.join("logs");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&dir, 0o755);
+    chmod(&ancestor, 0o731);
+    let _as_a_stranger = Fsuid::set(STRANGER);
+
+    let why = refused(&dir.join("app.log"));
+
+    assert!(
+        why.contains(ancestor.to_str().unwrap()) && why.contains("ACL") && why.contains("Permission denied"),
+        "{why}"
     );
 }
 

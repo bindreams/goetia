@@ -100,11 +100,11 @@ impl Create for CreatedDirs {
 /// The file-system uid of this thread, put back on drop. Setting one that is not root's takes away
 /// the capabilities that let root change another's files and write where it has no permission.
 #[cfg(target_os = "linux")]
-struct Fsuid(libc::uid_t);
+pub(crate) struct Fsuid(libc::uid_t);
 
 #[cfg(target_os = "linux")]
 impl Fsuid {
-    fn set(uid: libc::uid_t) -> Self {
+    pub(crate) fn set(uid: libc::uid_t) -> Self {
         // SAFETY: `setfsuid` takes and returns an id and touches only this thread's credentials.
         Self(unsafe { libc::setfsuid(uid) } as libc::uid_t)
     }
@@ -645,10 +645,20 @@ fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_
         let err = dirs.make(vec![(found, None)]).expect_err("the name is taken");
 
         let why = refusal(&err);
-        assert!(
-            why.contains("appeared while the install ran") && why.contains("running the install again"),
+        assert!(why.contains("appeared while the install ran"), "{kind}: {err:?}");
+        // Only a root-owned directory is one the install uses when it is run again.
+        assert_eq!(
+            why.contains("running the install again uses it"),
+            kind == "a root-owned directory",
             "{kind}: {err:?}"
         );
+        let says = match kind {
+            "a stranger's directory" => "owned by uid 4242",
+            "a file" => "a file",
+            "a symlink to a directory" => "a symlink",
+            _ => "directory",
+        };
+        assert!(why.contains(says) && why.contains("cannot use") == (kind != "a root-owned directory"), "{kind}: {err:?}");
         drop(dirs);
         assert_eq!(leftovers(&layout.system()), Vec::<String>::new(), "{kind}");
         assert_eq!(fs::read_dir(layout.outside()).unwrap().count(), 0, "{kind}");
@@ -664,6 +674,29 @@ fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_
             assert_eq!(owner_of(&raced), (STRANGER, STRANGER));
         }
     }
+}
+
+/// An existing directory is used as it is found, whatever stands above it: a group-writable ancestor is
+/// judged by its mode, and the walk reads nothing more of it (its POSIX ACL is read by the log check
+/// alone, which needs it). One that this account cannot read, as a directory on NFS or FUSE may not be,
+/// still lets an install that worked before work.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn create_uses_an_existing_directory_below_a_group_writable_one_that_cannot_be_read(
+    #[fixture(root_dirs)] _root: &(),
+) {
+    let layout = Layout::new();
+    fs::set_permissions(layout.base(), fs::Permissions::from_mode(0o711)).unwrap();
+    let shared = layout.outside().join("shared");
+    let cwd = shared.join("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o755)).unwrap();
+    // Group-writable, and others may search it but not open it for reading.
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o731)).unwrap();
+    let mut dirs = layout.dirs();
+    let _as_a_stranger = Fsuid::set(STRANGER);
+
+    dirs.create(&cwd, None).expect("an existing path is used as it is");
 }
 
 /// What stands at the final name is a directory this same install made: the spec names one directory
