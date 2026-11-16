@@ -5,7 +5,7 @@
 //! and execute; the DACL is protected, so nothing it would inherit is added. A folder has the same,
 //! inherited by what is made in it. `Descriptor` holds them as SDDL, the one place the spec's
 //! permissions are written down, and [`is_as_wanted`] compares what a file has with them.
-//! `Descriptor` also makes the folders, never adopting one that exists ([`Descriptor::create_each`]).
+//! `Descriptor` also makes the folders, never adopting one that exists (`Descriptor::create_each`).
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use super::{Ace, ObjectSecurity};
