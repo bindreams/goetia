@@ -35,7 +35,7 @@ pub(in crate::backend::systemd::manager) fn task_spec(id: &str, command: &str, s
     task(id, vec![command.to_string()], schedule)
 }
 
-fn service_spec(id: &str) -> DaemonSpec {
+pub(in crate::backend::systemd::manager) fn service_spec(id: &str) -> DaemonSpec {
     ServiceSpec::new(base_fields(id, vec!["/bin/true".to_string()]))
         .map(DaemonSpec::from)
         .expect("a service")
@@ -355,18 +355,31 @@ fn start_of_a_service_still_waits_as_its_budget_says() {
 #[skuld::test]
 fn stop_and_kill_address_the_service_unit() {
     let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
-    let fake = gate_then([enqueued("stop", 8), reply(&["kill"], exited(0, "", ""))]);
+    let fake = gate_then([
+        enqueued("stop", 8),
+        reply(
+            &["show"],
+            exited(
+                0,
+                "MainPID=0
+LoadState=loaded
+",
+                "",
+            ),
+        ),
+    ]);
     let mgr = over(&fake);
     let mut held = Backend::reserve(&mgr, &[Step::Stop], Budget::Unbounded).expect("reserve");
 
     Backend::stop(&mgr, fragment(&spec), Budget::Unbounded, &mut held).expect("stop");
-    Backend::kill(&mgr, fragment(&spec), &mut held).expect("kill");
+    let killed = Backend::kill(&mgr, fragment(&spec), &mut held);
 
+    assert!(matches!(killed, Err(Error::NotRunning { .. })), "{killed:?}");
     assert_eq!(
         without_gate(&fake),
         [
             call(&["stop", "--show-transaction", "--", "x.service"]),
-            call(&["kill", "--kill-who=main-fail", "--signal=SIGKILL", "--", "x.service"]),
+            call(&["show", "--property", "MainPID,LoadState", "--", "x.service"]),
         ]
     );
 }

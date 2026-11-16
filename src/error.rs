@@ -18,7 +18,7 @@ pub(crate) use report::Chain;
 pub(crate) use report::Sink;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
-pub(crate) use within::within;
+pub(crate) use within::{carried, within};
 
 use report::Report;
 

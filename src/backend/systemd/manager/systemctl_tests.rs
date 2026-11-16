@@ -78,7 +78,7 @@ fn chroot_no_mount() -> Host {
 }
 
 /// `systemctl` over `client`, on a booted host.
-fn on_booted(client: impl Client + 'static) -> Systemctl {
+pub(in crate::backend::systemd::manager) fn on_booted(client: impl Client + 'static) -> Systemctl {
     Systemctl::new(Box::new(client), booted)
 }
 
@@ -792,7 +792,6 @@ fn every_path() -> Vec<Way> {
         Way::request("restart", |s: &Systemctl| {
             s.request_restart_impl("x", &mut Held::default())
         }),
-        Way::request("kill", |s: &Systemctl| s.kill_impl("x", &mut Held::default())),
         Way::request("enable timer", |s: &Systemctl| {
             s.enable_timer("x", &mut Held::default())
         }),
@@ -1755,84 +1754,4 @@ fn every_probe_switches_colour_off() {
     let colours = "c() { [ \"$SYSTEMD_COLORS\" = 0 ] && echo \"$1\" || printf '\\033[0;1;39m%s\\033[0m\\n' \"$1\"; }; ";
     let script = format!("{colours}[ \"$1\" = show ] && c 257 || c 'systemd 257'");
     assert!(real_sh(&script, "systemctl").supported(&mut Held::default()).is_ok());
-}
-
-// kill ================================================================================================================
-
-/// `kill` over `x`, with `rest` standing in for what systemd answers it: the calls it made, too.
-fn kill_with(rest: Entry) -> (Result<()>, Vec<Vec<String>>) {
-    let fake = gate_then([rest]);
-    let result = on_booted(fake.clone()).kill_impl("x", &mut Held::default());
-    (result, fake.calls())
-}
-
-/// The argv is pinned: see `KILL_ARGS` for why each flag.
-#[skuld::test]
-fn kill_runs_the_pinned_argv() {
-    let (result, calls) = kill_with(reply(&["kill"], exited(0, "", "")));
-
-    result.unwrap();
-    assert_eq!(
-        calls[2],
-        ["kill", "--kill-who=main-fail", "--signal=SIGKILL", "--", "x.service"]
-    );
-}
-
-/// An id may start with `-`; without `--` systemctl would read `-h.service` as `-h` and print its
-/// help, exit `0`, and signal nobody.
-#[skuld::test]
-fn kill_of_an_id_starting_with_a_dash_names_the_unit_after_the_terminator() {
-    let fake = gate_then([reply(&["kill"], exited(0, "", ""))]);
-
-    on_booted(fake.clone()).kill_impl("-h", &mut Held::default()).unwrap();
-
-    assert_eq!(
-        fake.calls()[2],
-        ["kill", "--kill-who=main-fail", "--signal=SIGKILL", "--", "-h.service"]
-    );
-}
-
-/// Both of systemd's no-process answers (see `no_process`) are `NotRunning`.
-#[skuld::test]
-fn kill_of_a_unit_with_no_main_process_is_not_running() {
-    for said in [
-        "Failed to kill unit x.service: Unit x.service not loaded.\n",
-        "Failed to kill unit x.service: No main process to kill\n",
-    ] {
-        let (result, _) = kill_with(reply(&["kill"], exited(1, "", said)));
-        let e = result.expect_err(said);
-        assert!(matches!(&e, Error::NotRunning { id } if id == "x"), "{said}: {e:?}");
-    }
-}
-
-/// Any other refusal is a failure of the request, with systemd's words: never read as "nothing
-/// was running".
-#[skuld::test]
-fn kill_refused_for_any_other_reason_is_a_plain_failure() {
-    let denied = reply(
-        &["kill"],
-        exited(1, "", "Failed to kill unit x.service: Access denied\n"),
-    );
-    let e = kill_with(denied).0.expect_err("refused");
-    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
-    let msg = e.report().to_string();
-    assert!(msg.contains("`systemctl kill x.service` failed"), "{msg}");
-    assert!(msg.contains("Access denied"), "{msg}");
-}
-
-/// A different unit's absence is not this one's: the not-loaded answer has to name the unit asked
-/// about.
-#[skuld::test]
-fn a_not_loaded_answer_about_another_unit_is_a_plain_failure() {
-    let other = reply(
-        &["kill"],
-        exited(1, "", "Failed to kill unit x.service: Unit y.service not loaded.\n"),
-    );
-    let e = kill_with(other).0.expect_err("not this unit's absence");
-    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
-}
-
-#[skuld::test]
-fn kill_that_systemd_took_succeeds() {
-    kill_with(reply(&["kill"], exited(0, "", ""))).0.unwrap();
 }
