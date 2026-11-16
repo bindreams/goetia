@@ -74,6 +74,14 @@ try {
         "--- $k, run times in [$dayText, $next)"
         & $Script:Exe runtimes "$Script:TaskFolder\$k" $dayText $next 1000 | Where-Object { $_ -match '^(t |count|duplicates)' }
     }
+    # The same triggers over a long window, as M2 and the earlier probe listed them: D is listed twice here for the
+    # cases that duplicate, and once above.
+    $to = $d.AddDays(60).ToString('yyyy-MM-dd')
+    $from = $d.AddDays(-1).ToString('yyyy-MM-dd')
+    foreach ($k in $cases.Keys) {
+        "--- $k, run times in [$from, $to): the lines of D, then the summary"
+        & $Script:Exe runtimes "$Script:TaskFolder\$k" $from $to 100000 | Where-Object { $_ -match "^(t $dayText|count|weekdays)" }
+    }
     Remove-Item Env:\TSPROBE_ALL
 
     # The marker is due after every case's trigger: its line proves the cases' minute has passed.
