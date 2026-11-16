@@ -1,6 +1,6 @@
 //! What a test that registered a task removes when it ends. Exported as `testing::remove_task`.
 
-use super::verbs::{Processes, System, stop_runs};
+use super::verbs::{Processes, System, gone, stop_runs};
 use super::{Com, TaskApi};
 use crate::backend::scm::instance::TaskPath;
 use crate::backend::scm::shim::lock::InstallLock;
@@ -32,7 +32,7 @@ fn remove_task_with<P: Processes, L>(
     let path = TaskPath::of(id);
     // So that a scheduled fire starts no run the delete would leave behind. Best effort, as an uninstall's
     // first step is not: a task that cannot be disabled (or is not there) is deleted all the same.
-    let _ = tasks.set_enabled(&path, false);
+    warn_left_behind(disable_problem(&path, tasks.set_enabled(&path, false)));
     // A shim that outlives its task has nothing to stop it. A run that cannot be ended, or that does not
     // end in time, is warned of, and the task is deleted all the same.
     if let Err(e) = stop_runs(tasks, "cleanup", id, Budget::Bounded(CLEANUP_BOUND), processes) {
@@ -59,6 +59,18 @@ fn remove_task_with<P: Processes, L>(
             .filter(|e| !matches!(e, Error::TaskFolderKept { .. }))
             .map(|e| format!("delete the task `{}`: {}", path.as_str(), e.report()))
     }));
+}
+
+/// What a failed disable of the task at `path` says, or `None` for one that went through or found no
+/// task.
+fn disable_problem(path: &TaskPath, disabled: Result<()>) -> Option<String> {
+    disabled.err().filter(|e| !gone(e)).map(|e| {
+        format!(
+            "disable the task `{}` (a scheduled fire can still start a run): {}",
+            path.as_str(),
+            e.report()
+        )
+    })
 }
 
 #[cfg(test)]

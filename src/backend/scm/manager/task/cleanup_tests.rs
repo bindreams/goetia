@@ -165,6 +165,25 @@ fn a_folder_left_after_the_delete_is_no_failed_delete() {
     fake.finish();
 }
 
+/// A disable that failed for any reason but a task that is not there is told: the task may still fire
+/// while the guard waits for its runs.
+#[skuld::test]
+fn a_disable_that_failed_is_told_unless_the_task_is_not_there() {
+    let path = TaskPath::of(&id());
+
+    assert_eq!(disable_problem(&path, Ok(())), None);
+    assert_eq!(
+        disable_problem(&path, Err(Error::NotInstalled { id: "nightly".into() })),
+        None
+    );
+    let told = disable_problem(
+        &path,
+        Err(Error::os("disable the task", std::io::Error::other("denied"))),
+    )
+    .expect("a failure is told");
+    assert!(told.contains(PATH) && told.contains("denied"), "{told}");
+}
+
 /// Disabling is best effort: a task that is not there, or that cannot be disabled, is still deleted, and
 /// nothing panics.
 #[skuld::test]
