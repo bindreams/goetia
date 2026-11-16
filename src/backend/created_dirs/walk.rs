@@ -80,9 +80,8 @@ fn open_system_root(root: &Path) -> std::result::Result<Option<(libc::dev_t, lib
 }
 
 pub(super) enum End {
-    /// The path exists and is a directory, or a symlink to one: that directory, held open. Only the
-    /// Linux log check reads it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// The path exists and is a directory, or a symlink to one: that directory, held open. The log check
+    /// reads it.
     Whole { dir: OwnedFd, stat: FileStat },
     /// The deepest directory that exists, held open, and the components below it that do not, each
     /// with its path, outermost first.
@@ -99,9 +98,8 @@ pub(super) struct Step {
     /// For a symlink, the directory that holds it, as the walk read it. `None` for a directory.
     pub(super) holder: Option<FileStat>,
     /// For a directory, the descriptor the walk read it through, so that what is read of it later is
-    /// the directory that was judged, not a name looked up again. `None` for a symlink. Only the Linux
-    /// log check reads it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// the directory that was judged, not a name looked up again. `None` for a symlink. The log check
+    /// reads it.
     pub(super) dir: Option<OwnedFd>,
 }
 
@@ -172,14 +170,12 @@ pub(super) enum Entry {
     Dir(OwnedFd, FileStat),
     /// A symlink and where it points.
     Link(FileStat, OsString),
-    /// Anything else. Only the Linux log check reads what it was.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Anything else. The log check reads what it was.
     Other(FileStat),
 }
 
 impl Entry {
-    /// Only the Linux log check reads it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// The log check reads it.
     pub(super) fn uid(&self) -> libc::uid_t {
         match self {
             Entry::Dir(_, stat) | Entry::Link(stat, _) | Entry::Other(stat) => stat.st_uid,

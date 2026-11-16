@@ -18,8 +18,8 @@
 //!   exception is a holder that is sticky and that a group or everyone can write (`/tmp`), where the
 //!   owner of an entry can delete it and make another: a link there is refused unless root owns it.
 //!   Modes are otherwise not judged: a root-owned directory others can write is accepted (the
-//!   administrator's exposure). Where writability matters the caller judges it: for a log systemd
-//!   opens as root, `refuse_writable_log_dir` (Linux).
+//!   administrator's exposure). Where writability matters the caller judges it: for a log that
+//!   root opens (systemd's `append:`, a launchd job that runs as root), `refuse_writable_log_dir`.
 //! - **Making.** The first missing component of a path is made beside where it will be, under a
 //!   temporary name (`.goetia-` and a random one), and the rest inside it under their final names. A
 //!   later path whose missing part starts at the same component of the same directory is made in that
@@ -52,7 +52,6 @@
 //! directories above any of these. An install stopped abruptly (power loss, `SIGKILL`) leaves at most
 //! a temporary tree beside the path, which nothing uses.
 
-#[cfg(target_os = "linux")]
 mod log_dir;
 mod walk;
 
@@ -70,7 +69,6 @@ use nix::fcntl::{AtFlags, OFlag};
 use nix::sys::stat::{FileStat, Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
-#[cfg(target_os = "linux")]
 pub(crate) use log_dir::refuse_writable_log_dir;
 use walk::{End, RootsRead, Step, Walk, open_beneath, walk};
 

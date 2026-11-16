@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::backend::created_dirs::CreatedDirs;
-use crate::backend::created_dirs::created_dirs_tests::{Fsuid, Layout, STRANGER, give_to_a_stranger};
+#[cfg(target_os = "linux")]
+use crate::backend::created_dirs::created_dirs_tests::Fsuid;
+use crate::backend::created_dirs::created_dirs_tests::{Layout, STRANGER, give_to_a_stranger};
 use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::root_dirs;
 
@@ -36,6 +38,7 @@ fn refused_by(dirs: &CreatedDirs, logs: &Path) -> String {
 
 /// Give `path` an access ACL that names the stranger, as `setfacl -m u:4242:rwx` leaves it: the group
 /// bits of the mode then read as the ACL's mask.
+#[cfg(target_os = "linux")]
 fn name_the_stranger_in_the_acl(path: &Path) {
     const NO_ID: u32 = u32::MAX;
     let mut acl = 2u32.to_le_bytes().to_vec(); // POSIX_ACL_XATTR_VERSION
@@ -77,6 +80,17 @@ fn a_log_directory_only_root_can_change_is_accepted(#[fixture(root_dirs)] _root:
     chmod(&layout.system(), 0o755);
 
     check(&dir.join("app.log")).unwrap();
+}
+
+/// Give `path` an extended ACL, as `chmod +a` leaves it, which any directory that has one is judged by.
+#[cfg(target_os = "macos")]
+fn name_the_stranger_in_the_acl(path: &Path) {
+    let status = std::process::Command::new("/bin/chmod")
+        .args(["+a", "everyone allow add_file"])
+        .arg(path)
+        .status()
+        .expect("run chmod");
+    assert!(status.success(), "chmod +a on {}: {status}", path.display());
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -316,6 +330,7 @@ fn an_ancestor_whose_acl_names_an_account_is_refused_though_its_group_bits_allow
     fs::create_dir_all(&dir).unwrap();
     chmod(&var_log, 0o775);
     name_the_stranger_in_the_acl(&var_log);
+    #[cfg(target_os = "linux")]
     assert_eq!(
         fs::metadata(&var_log).unwrap().permissions().mode() & 0o070,
         0o070,
@@ -352,11 +367,13 @@ fn a_log_directory_whose_acl_names_an_account_is_refused_with_no_directory_of_it
     );
 }
 
-/// Whether an ancestor's group is trusted is the one thing the ACL decides, so it is read there. A
-/// directory whose ACL cannot be read (here, one this account may search and not open) is a log refused
-/// for that reason, never trusted or distrusted on a guess.
+/// Whether an ancestor's group is trusted is the one thing the ACL decides, so it is read there, through
+/// the descriptor the walk holds and not by opening the directory again: a directory that root may
+/// search and not read (here, one this account may search and not open; an NFS export that squashes
+/// root, a FUSE file system) has its ACL read all the same, and its group is trusted when it has none.
+#[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn an_ancestor_whose_acl_cannot_be_read_refuses_the_log_saying_so(#[fixture(root_dirs)] _root: &()) {
+fn an_ancestor_that_cannot_be_opened_for_reading_is_judged_by_its_acl_all_the_same(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     chmod(&layout.base(), 0o711);
     chmod(&layout.system(), 0o755);
@@ -367,12 +384,7 @@ fn an_ancestor_whose_acl_cannot_be_read_refuses_the_log_saying_so(#[fixture(root
     chmod(&ancestor, 0o731);
     let _as_a_stranger = Fsuid::set(STRANGER);
 
-    let why = refused(&dir.join("app.log"));
-
-    assert!(
-        why.contains(ancestor.to_str().unwrap()) && why.contains("ACL") && why.contains("Permission denied"),
-        "{why}"
-    );
+    check(&dir.join("app.log")).unwrap();
 }
 
 #[skuld::test(labels = [ELEVATED])]

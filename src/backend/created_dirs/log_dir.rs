@@ -1,28 +1,32 @@
-//! The check systemd's `append:` needs of a log's directory.
+//! The check a log's directory needs where root opens the log: systemd's `append:`, and a launchd job
+//! that runs as root. A job that runs as another user is opened as that user, and needs no check.
 //!
 //! systemd opens an `append:` log as root, before it drops to the daemon's account, and follows a
-//! symlink there (measured on systemd 255). So whoever can write the log's directory can plant a link
-//! at the log's name before the first start, and whoever can write an ancestor of it can rename the
-//! directory away and make one of their own. The directory is therefore refused while an account other
-//! than root can change it, as it is when install runs. A symlink on the way is judged by the
-//! directory that holds it, which the walk passed too: its owner cannot change where it leads. Where
-//! that directory is sticky and a group or everyone can write it (`/tmp`), the owner of an entry can
-//! delete it and make another, so a link there is refused unless root owns it.
+//! symlink there (measured on systemd 255); launchd opens `StandardOutPath` as the job's user, and
+//! follows one the same way. So whoever can write the log's directory can plant a link at the log's
+//! name before the first start, and whoever can write an ancestor of it can rename the directory away
+//! and make one of their own. The directory is therefore refused while an account other than root can
+//! change it, as it is when install runs. A symlink on the way is judged by the directory that holds
+//! it, which the walk passed too: its owner cannot change where it leads. Where that directory is
+//! sticky and a group or everyone can write it (`/tmp`), the owner of an entry can delete it and make
+//! another, so a link there is refused unless root owns it.
 //!
 //! The group of a directory root owns is trusted above the log's own directory, as systemd's
 //! `LogsDirectory=` trusts it: Debian and Ubuntu ship `/var/log` as `root:syslog 0775`, and
-//! `/var/log/<app>/app.log` is accepted under it. The log's own directory is not trusted so, since a
-//! group member there can plant a link at the log's name. Only the group is trusted, not the accounts
-//! an ACL names: where a directory has an access ACL its group bits are the ACL's mask, so one that
-//! can be written is judged as writable by others.
+//! `/var/log/<app>/app.log` is accepted under it; macOS ships `/Library/Logs` as `root:admin 0775`.
+//! The log's own directory is not trusted so, since a group member there can plant a link at the log's
+//! name. Only the group is trusted, not the accounts an ACL names: where a directory has an ACL (see
+//! [`acl`]) its group bits are the ACL's mask, so one that can be written is judged as writable by
+//! others.
 
 use std::io;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
+use std::os::fd::AsFd as _;
 use std::path::Path;
 
-use nix::fcntl::{OFlag, openat};
-use nix::sys::stat::{Mode, SFlag};
+use nix::sys::stat::SFlag;
 use nix::unistd::{Gid, Group};
+
+mod acl;
 
 use super::walk::{End, Entry, Step, entry};
 use super::{CreatedDirs, Plan, roots_text};
@@ -53,7 +57,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
             path: dir.to_path_buf(),
             why: format!(
                 "whether the group of {} may be trusted is not known, as its access ACL could not be read ({e}); \
-                 use a log directory under directories only root can change, or drop `logs:` to log to the journal",
+                 use a log directory under directories only root can change, or {WITHOUT_THE_LOG}",
                 step.at.display()
             ),
         })?;
@@ -71,14 +75,14 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
             }
             _ => format!(
                 "use a log directory that only root can change, under directories only root can change (a missing \
-                 one is made under {}), or drop `logs:` to log to the journal",
+                 one is made under {}), or {WITHOUT_THE_LOG}",
                 roots_text(&roots)
             ),
         };
         return Err(Error::DirectoryRefused {
             path: dir.to_path_buf(),
             why: format!(
-                "the {kind} {} can be changed by {who}, who could {LED_ASTRAY}; {advice}",
+                "the {kind} {} can be changed by {who}, who could make root's open of the log ({ROOT_OPENS}) write any file; {advice}",
                 step.at.display()
             ),
         });
@@ -87,13 +91,13 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
     if let (End::Whole { dir: held, .. }, Some(name)) = (&plan.found.end, logs.file_name()) {
         let why = match entry(held.as_fd(), name).map_err(|e| Error::os_at("stat", logs, e))? {
             Some(Entry::Link(..)) => format!(
-                "{} is a symlink, and root's open of the log (systemd opens it before it drops privileges) \
+                "{} is a symlink, and root's open of the log ({ROOT_OPENS}) \
                 follows it to wherever it leads; remove it, or use a log that is not a link",
                 logs.display()
             ),
             Some(found) if found.uid() != 0 => format!(
-                "{} is owned by {}, not root, and root's open of the log (systemd opens it before it drops \
-                privileges) would append to it; use a log file that root owns",
+                "{} is owned by {}, not root, and root's open of the log ({ROOT_OPENS}) \
+                would append to it; use a log file that root owns",
                 logs.display(),
                 describe_uid(found.uid())
             ),
@@ -107,9 +111,17 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
     Ok(())
 }
 
-/// What a directory root's open of the log passes through must not let an account do.
-const LED_ASTRAY: &str = "make root's open of the log (systemd opens it before it drops privileges, and follows a \
-                          symlink) write any file";
+/// Who opens the log as root, in the words of a refusal.
+#[cfg(target_os = "linux")]
+const ROOT_OPENS: &str = "systemd opens it before it drops privileges, and follows a symlink";
+#[cfg(target_os = "macos")]
+const ROOT_OPENS: &str = "launchd opens it as the job's user, root, and follows a symlink";
+
+/// What a daemon can do instead of a refused log.
+#[cfg(target_os = "linux")]
+const WITHOUT_THE_LOG: &str = "drop `logs:` to log to the journal";
+#[cfg(target_os = "macos")]
+const WITHOUT_THE_LOG: &str = "drop `logs:`";
 
 /// Who can change what a step passed, and whether the same directory would be accepted as an ancestor.
 struct Writer {
@@ -157,7 +169,7 @@ fn writer(step: &Step, leaf: bool) -> io::Result<Option<Writer>> {
         return Ok(None);
     }
     let acl = match &step.dir {
-        Some(dir) => has_access_acl(dir.as_fd())?,
+        Some(dir) => acl::has_acl(dir.as_fd())?,
         None => false,
     };
     if acl {
@@ -176,37 +188,6 @@ fn writer(step: &Step, leaf: bool) -> io::Result<Option<Writer>> {
         },
         ancestor_passes: true,
     }))
-}
-
-/// Whether the directory `dir` has an access ACL: an extended attribute that exists only where the ACL
-/// has an entry beyond the mode's own. `fgetxattr` refuses an `O_PATH` descriptor, so the directory is
-/// opened again through it, which is the same directory, not a name looked up again. No ACL, and a file
-/// system that has none, are `false`; any other error is the file system's to say.
-fn has_access_acl(dir: BorrowedFd<'_>) -> io::Result<bool> {
-    let again = openat(
-        dir,
-        ".",
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    // SAFETY: `again` is open and the name is NUL-terminated for the call; a null buffer of size 0 asks
-    // only whether the attribute is there.
-    let size = unsafe {
-        libc::fgetxattr(
-            again.as_raw_fd(),
-            c"system.posix_acl_access".as_ptr(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if size >= 0 {
-        return Ok(true);
-    }
-    let e = io::Error::last_os_error();
-    match e.raw_os_error() {
-        Some(libc::ENODATA | libc::EOPNOTSUPP) => Ok(false),
-        _ => Err(e),
-    }
 }
 
 #[cfg(test)]
