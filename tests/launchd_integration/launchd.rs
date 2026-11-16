@@ -673,66 +673,75 @@ fn start_stop_status_reflect_reality(#[fixture(launchd_group)] _group: &Group) {
 
 // stop-action =========================================================================================================
 
+/// `base_spec` as a daemon that stops by `stop_action`.
+fn stopping_by(id: &str, command: Vec<String>, stop_action: StopAction) -> DaemonSpec {
+    ServiceSpec::new(ServiceFields {
+        stop_action,
+        ..service_fields(base_spec(id, command))
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
 /// A daemon that ignores `SIGTERM` (an ignored signal stays ignored across `exec`) is ended once its
 /// `ExitTimeOut` has passed, and the stop reports stopped: the timeout is the grace, not a wait that
 /// fails. The `ExitTimeOut` itself is pinned by the generator's tests; this is what launchd does with it.
+/// The daemon reports in after its `trap`, so the stop meets a run that ignores `SIGTERM`: the wait
+/// lasts the timeout, and only a kill ends the run after it.
 #[skuld::test]
 fn a_daemon_that_ignores_the_stop_signal_is_ended_after_the_timeout(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
-    let spec = ServiceSpec::new(ServiceFields {
-        stop_action: StopAction {
+    let listener = ConnectBack::listen();
+    let timeout = Duration::from_secs(2);
+    let spec = stopping_by(
+        &id,
+        listener.sh_after("trap '' TERM", "exec /bin/sleep 300"),
+        StopAction {
             send_signal: StopSignal::Terminate,
-            timeout: Some(Duration::from_secs(2)),
+            timeout: Some(timeout),
         },
-        ..service_fields(base_spec(
-            &id,
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "trap '' TERM; exec /bin/sleep 300".to_string(),
-            ],
-        ))
-    })
-    .map(DaemonSpec::from)
-    .unwrap();
+    );
     let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to be ignoring SIGTERM");
 
+    let stopping = std::time::Instant::now();
     mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(90)))
         .expect("stop");
 
+    assert!(stopping.elapsed() >= timeout, "the run was ended before its timeout");
     assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 
 /// `kill` on a daemon that ignores `SIGTERM` ends it a second after the stop (`ExitTimeOut` 1), well
-/// inside a bound shorter than launchd's own 5 s default.
+/// inside a bound shorter than launchd's own 5 s default. The daemon reports in after its `trap`, so the
+/// wait lasts that second, and only a kill ends the run after it.
 #[skuld::test]
 fn a_kill_stop_ends_a_daemon_that_ignores_sigterm(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
-    let spec = ServiceSpec::new(ServiceFields {
-        stop_action: StopAction {
+    let listener = ConnectBack::listen();
+    let spec = stopping_by(
+        &id,
+        listener.sh_after("trap '' TERM", "exec /bin/sleep 300"),
+        StopAction {
             send_signal: StopSignal::Kill,
             timeout: None,
         },
-        ..service_fields(base_spec(
-            &id,
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "trap '' TERM; exec /bin/sleep 300".to_string(),
-            ],
-        ))
-    })
-    .map(DaemonSpec::from)
-    .unwrap();
+    );
     let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to be ignoring SIGTERM");
 
+    let stopping = std::time::Instant::now();
     mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(4)))
         .expect("stop");
 
+    assert!(
+        stopping.elapsed() >= Duration::from_secs(1),
+        "the run was ended before the one second `kill` gives it"
+    );
     assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 
@@ -1318,17 +1327,7 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixtur
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
     // `trap '' TERM` first, then the report: once the listener has accepted, SIGTERM is ignored.
-    let spec = base_spec(
-        &id,
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "trap '' TERM; \"$0\" \"$@\"; while :; do /bin/sleep 1; done".to_string(),
-            support::current_exe_str(),
-            support::sentinel::CONNECT_BACK.to_string(),
-            listener.port().to_string(),
-        ],
-    );
+    let spec = base_spec(&id, listener.sh_after("trap '' TERM", "while :; do /bin/sleep 1; done"));
     let _guard = Guard::install(&mgr, &spec);
     // The generator writes no `ExitTimeOut`, so the staged plist gets one before the job is loaded.
     let staged = staging_path(&id);

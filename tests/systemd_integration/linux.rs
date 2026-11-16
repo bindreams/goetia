@@ -2681,10 +2681,10 @@ fn a_retyped_daemon_keeps_nothing_of_the_old_kind_that_still_acts(#[fixture(syst
 
 // stop-action =========================================================================================================
 
-/// `stop_action` on `mk`'s daemon, run as `script` under `sh`.
-fn stopping_by(id: &str, script: &str, stop_action: StopAction) -> DaemonSpec {
+/// `stop_action` on `mk`'s daemon, run as `command`.
+fn stopping_by(id: &str, command: Vec<String>, stop_action: StopAction) -> DaemonSpec {
     let mut spec = service_fields(mk(id));
-    spec.common.command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+    spec.common.command = command;
     spec.stop_action = stop_action;
     ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
 }
@@ -2703,7 +2703,7 @@ fn the_units_stop_signal_and_timeout_are_what_systemd_runs(#[fixture(systemd_gro
     let usr1 = "sigusr1".parse::<StopSignal>().unwrap();
     let spec = stopping_by(
         guard.id(),
-        "exec /bin/sleep infinity",
+        support::tasks::sh("exec /bin/sleep infinity"),
         StopAction {
             send_signal: usr1,
             timeout: Some(Duration::from_secs(7)),
@@ -2722,7 +2722,7 @@ fn no_timeout_is_an_infinite_stop_timeout_for_systemd(#[fixture(systemd_group)] 
     let guard = ServiceGuard::new(&id);
     let spec = stopping_by(
         guard.id(),
-        "exec /bin/sleep infinity",
+        support::tasks::sh("exec /bin/sleep infinity"),
         StopAction {
             send_signal: StopSignal::Terminate,
             timeout: None,
@@ -2740,9 +2740,10 @@ fn no_timeout_is_an_infinite_stop_timeout_for_systemd(#[fixture(systemd_group)] 
 fn a_daemon_that_answers_the_stop_signal_ends_cleanly(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
+    let listener = support::ConnectBack::listen();
     let spec = stopping_by(
         guard.id(),
-        "trap 'exit 0' USR1; /bin/sleep infinity & wait",
+        listener.sh_after("trap 'exit 0' USR1", "/bin/sleep infinity & wait"),
         StopAction {
             send_signal: "sigusr1".parse::<StopSignal>().unwrap(),
             timeout: Some(Duration::from_secs(30)),
@@ -2751,6 +2752,7 @@ fn a_daemon_that_answers_the_stop_signal_ends_cleanly(#[fixture(systemd_group)] 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to have installed its trap");
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
@@ -2764,9 +2766,10 @@ fn a_daemon_that_answers_the_stop_signal_ends_cleanly(#[fixture(systemd_group)] 
 fn a_daemon_that_ignores_the_stop_signal_is_killed_after_the_timeout(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
+    let listener = support::ConnectBack::listen();
     let spec = stopping_by(
         guard.id(),
-        "trap '' TERM; exec /bin/sleep infinity",
+        listener.sh_after("trap '' TERM", "exec /bin/sleep infinity"),
         StopAction {
             send_signal: StopSignal::Terminate,
             timeout: Some(Duration::from_secs(2)),
@@ -2775,6 +2778,7 @@ fn a_daemon_that_ignores_the_stop_signal_is_killed_after_the_timeout(#[fixture(s
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to be ignoring SIGTERM");
 
     mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(60)))
         .expect("stop");
@@ -2791,7 +2795,7 @@ fn kill_ends_a_daemon_that_ignores_everything_at_once(#[fixture(systemd_group)] 
     let guard = ServiceGuard::new(&id);
     let spec = stopping_by(
         guard.id(),
-        "trap '' TERM INT; exec /bin/sleep infinity",
+        support::tasks::sh("trap '' TERM INT; exec /bin/sleep infinity"),
         StopAction {
             send_signal: StopSignal::Kill,
             timeout: None,

@@ -33,6 +33,21 @@ impl ConnectBack {
         self.port
     }
 
+    /// A `sh` command that runs `setup`, reports in to this listener, then runs `rest`. Once
+    /// [`Self::accept`] returns, `setup` (a `trap`, say) is in place, so a signal sent after it meets it:
+    /// a `Type=exec` or launchd start returns before `sh` has run its first command.
+    #[cfg(unix)]
+    pub fn sh_after(&self, setup: &str, rest: &str) -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("{setup}; \"$0\" \"$@\"; {rest}"),
+            super::current_exe_str(),
+            super::sentinel::CONNECT_BACK.to_string(),
+            self.port.to_string(),
+        ]
+    }
+
     /// Whether the daemon has already reported in.
     ///
     /// Only meaningful after a synchronous barrier — `launchctl bootout`, a
