@@ -411,7 +411,14 @@ fn spec_diff_shows_a_changed_stop_action() {
 /// every native backend can send are written, so the test is the same on every host.
 #[skuld::test]
 fn the_rendered_stop_action_reads_back_as_a_manifest_would(#[fixture(temp_dir)] dir: &Path) {
-    for (signal, timeout) in [("terminate", Some(90)), ("terminate", None), ("kill", None)] {
+    for (signal, timeout) in [("terminate", Some(45)), ("terminate", None), ("kill", None)] {
+        // launchd refuses a wait with no limit, which is its own tests' to judge.
+        if timeout.is_none()
+            && signal != "kill"
+            && crate::spec::BackendKind::native() == Some(crate::spec::BackendKind::Launchd)
+        {
+            continue;
+        }
         let send_signal = StopSignal::parse(signal).unwrap();
         let stop_action = StopAction {
             send_signal,

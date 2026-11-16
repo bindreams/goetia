@@ -3529,13 +3529,18 @@ fn the_short_and_canonical_forms_resolve_alike() {
 
 #[skuld::test]
 fn a_timeout_is_taken_as_written_and_null_is_no_timeout() {
-    for (line, timeout) in [
-        ("stop-action: {timeout: 5s}", seconds(5)),
-        ("stop-action: {timeout: 1m 30s}", seconds(90)),
-        ("stop-action: {timeout: 24h}", seconds(86_400)),
-        ("stop-action: {timeout: null}", None),
-        ("stop-action: {send-signal: terminate, timeout: ~}", None),
+    // The last column: launchd, which would be the native backend, refuses it (its own tests judge that).
+    for (line, timeout, over_launchds_cap) in [
+        ("stop-action: {timeout: 5s}", seconds(5), false),
+        ("stop-action: {timeout: 1m}", seconds(60), false),
+        ("stop-action: {timeout: 1m 30s}", seconds(90), true),
+        ("stop-action: {timeout: 24h}", seconds(86_400), true),
+        ("stop-action: {timeout: null}", None, true),
+        ("stop-action: {send-signal: terminate, timeout: ~}", None, true),
     ] {
+        if over_launchds_cap && BackendKind::native() == Some(BackendKind::Launchd) {
+            continue;
+        }
         let action = stop_action_of(&format!("{SERVICE}{line}\n"));
         assert_eq!(action.timeout, timeout, "{line}");
         assert_eq!(action.send_signal, StopSignal::Terminate, "{line}");
@@ -3771,7 +3776,7 @@ fn the_base_timeout_is_judged_for_launchd_only_when_launchd_is_the_native_backen
 #[skuld::test]
 fn an_override_writes_the_native_backends_leaves_over_the_bases() {
     let native = BackendKind::native().expect("the tests run where there is a service manager");
-    let base = format!("{SERVICE}stop-action: {{timeout: 90s}}\n");
+    let base = format!("{SERVICE}stop-action: {{timeout: 45s}}\n");
     let overridden = |line: &str| {
         stop_action_of(&format!(
             "{base}backend-specific:\n  {native}:\n    stop-action: {line}\n"
@@ -3779,8 +3784,10 @@ fn an_override_writes_the_native_backends_leaves_over_the_bases() {
     };
 
     assert_eq!(overridden("{timeout: 5s}").timeout, seconds(5));
-    assert_eq!(overridden("terminate").timeout, seconds(90), "the base's timeout stays");
-    assert_eq!(overridden("{timeout: null}").timeout, None);
+    assert_eq!(overridden("terminate").timeout, seconds(45), "the base's timeout stays");
+    if native != BackendKind::Launchd {
+        assert_eq!(overridden("{timeout: null}").timeout, None);
+    }
 
     // Another backend's override is not this host's.
     let other = if native == BackendKind::Systemd {
@@ -3789,13 +3796,13 @@ fn an_override_writes_the_native_backends_leaves_over_the_bases() {
         "systemd"
     };
     let yaml = format!("{base}backend-specific:\n  {other}:\n    stop-action: {{timeout: 5s}}\n");
-    assert_eq!(stop_action_of(&yaml).timeout, seconds(90));
+    assert_eq!(stop_action_of(&yaml).timeout, seconds(45));
 }
 
 #[skuld::test]
 fn an_override_that_sends_kill_does_not_inherit_the_bases_timeout() {
     // The base is the native backend's to judge too, so it is a signal every backend sends.
-    let base = format!("{SERVICE}stop-action: {{send-signal: terminate, timeout: 90s}}\n");
+    let base = format!("{SERVICE}stop-action: {{send-signal: terminate, timeout: 45s}}\n");
     for backend in BackendKind::ALL {
         let yaml = format!("{base}backend-specific:\n  {backend}:\n    stop-action: kill\n");
         if let Err(err) = resolve_yaml(&yaml) {
@@ -3817,7 +3824,7 @@ fn an_override_that_sends_kill_does_not_inherit_the_bases_timeout() {
 
 #[skuld::test]
 fn an_override_that_sends_kill_and_writes_a_timeout_is_still_refused() {
-    let base = format!("{SERVICE}stop-action: {{timeout: 90s}}\n");
+    let base = format!("{SERVICE}stop-action: {{timeout: 45s}}\n");
     for (backend, msg) in refused_per_backend(&base, "stop-action: {send-signal: kill, timeout: 5s}") {
         assert!(
             msg.starts_with(&format!(
