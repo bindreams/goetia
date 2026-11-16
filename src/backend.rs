@@ -14,6 +14,7 @@ pub(crate) mod bounded;
 #[cfg(unix)]
 pub(crate) mod client;
 mod contract;
+pub(crate) mod kill;
 pub mod launchd;
 pub mod scm;
 pub(crate) mod standby;

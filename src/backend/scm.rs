@@ -39,3 +39,5 @@ pub mod wait;
 pub(crate) mod wait;
 #[cfg(windows)]
 pub(crate) mod wide;
+#[cfg(windows)]
+pub(crate) mod win32;

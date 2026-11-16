@@ -592,8 +592,8 @@ fn stop_of_a_task_that_ignores_sigterm_times_out_and_kill_ends_it(#[fixture(laun
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.common.state, State::Running, "{status:?}");
     mgr.kill(&task_id).expect("kill");
-    kill::until(|| task_status(&mgr, &task_id).common.state == State::Idle);
     let status = task_status(&mgr, &task_id);
+    assert_eq!(status.common.state, State::Idle, "{status:?}");
     assert_eq!(status.last_result, Some(Exit::Signal(9)), "{status:?}");
 }
 

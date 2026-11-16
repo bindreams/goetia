@@ -1365,7 +1365,7 @@ stderr:
     );
     assert_eq!(
         out,
-        "frpc: kill delivered
+        "frpc: process ended, recorded by the manager
 "
     );
     assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Failed);
@@ -1460,7 +1460,7 @@ stderr:
     );
     assert_eq!(
         out,
-        "alpha: kill delivered
+        "alpha: process ended, recorded by the manager
 "
     );
     assert!(err.contains("beta"), "{err}");
@@ -4671,6 +4671,45 @@ fn a_failed_json_write_is_reported_as_one_escaped_line() {
     assert_eq!(
         String::from_utf8(err).unwrap(),
         "error: failed to write the --json document to stdout: disk\\u{a}error: forged\\u{202e}\n"
+    );
+}
+
+/// The failure under a write error's own text is printed too, and escaped with the rest of the line.
+#[skuld::test]
+fn a_failed_json_write_prints_the_cause_of_the_error_escaped() {
+    #[derive(Debug)]
+    struct Context(std::io::Error);
+    impl std::fmt::Display for Context {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the pipe")
+        }
+    }
+    impl std::error::Error for Context {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    struct Refusing;
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(Context(std::io::Error::other(
+                "cause\nerror: forged\u{202e}",
+            ))))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let cli = Cli::try_parse_from(["goetia", "--json", "daemon", "list"]).unwrap();
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Fake::new())) };
+    let mut err = Vec::new();
+
+    let code = cli::dispatch(&cli, &get_manager, &never_elevated, &no_host, &mut Refusing, &mut err);
+
+    assert_eq!(code, 1);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "error: failed to write the --json document to stdout: the pipe: cause\\u{a}error: forged\\u{202e}\n"
     );
 }
 

@@ -26,6 +26,21 @@ fn sh(script: &str) -> cosca::Command {
     command("/bin/sh", &["-c", script]).unwrap()
 }
 
+/// A refused spawn prints its cause, whichever side of the exec it fell on.
+#[skuld::test]
+fn a_spawn_error_prints_the_cause_of_the_refusal() {
+    let refusal = || cosca::error::Error::Io(within("make the pipe", io::Error::other("the cause")));
+
+    assert_eq!(
+        SpawnError::NotRun(refusal()).to_string(),
+        "an I/O operation failed: make the pipe: the cause"
+    );
+    assert_eq!(
+        SpawnError::MayHaveRun(refusal()).to_string(),
+        "an I/O operation failed: make the pipe: the cause"
+    );
+}
+
 // wait_bounded, through `command` =====================================================================================
 
 #[skuld::test]
@@ -514,6 +529,90 @@ fn a_kill_refused_with_eperm_is_returned_at_once_off_macos() {
     assert!(
         matches!(&error, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
         "{error:?}"
+    );
+}
+
+/// [`settle_kill`] is [`kill_root`] for a signal sent by anyone through anything and a liveness read
+/// of anything, so a signal to a process held through `cosca::Process` settles as a child's does. A
+/// signal that went through, and a refusal other than `EPERM`, read nothing.
+#[skuld::test]
+fn a_sent_signal_and_a_refusal_other_than_eperm_are_settled_without_reading_liveness() {
+    let never = || -> Liveness { panic!("liveness was read") };
+
+    assert!(matches!(
+        settle_kill(Ok(()), never, Duration::from_millis(50)),
+        Ok(KillRootOutcome::Sent)
+    ));
+    let refused = settle_kill(
+        Err(io::Error::from_raw_os_error(libc::EACCES).into()),
+        never,
+        Duration::from_millis(50),
+    )
+    .expect_err("the kill is refused");
+    assert!(
+        matches!(&refused, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EACCES)),
+        "{refused:?}"
+    );
+}
+
+/// `EPERM` is a real refusal off macOS: returned as it came, with nothing read.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn an_eperm_is_settled_at_once_off_macos() {
+    let never = || -> Liveness { panic!("liveness was read") };
+
+    let refused = settle_kill(Err(eperm()), never, Duration::from_millis(50)).expect_err("the kill is refused");
+
+    assert!(
+        matches!(&refused, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
+        "{refused:?}"
+    );
+}
+
+/// On macOS an `EPERM` is the answer of a process that is exiting, and the process read `Dead` is the
+/// kill's end, however many reads it took to see it. One still `Alive` at the bound is a refusal.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_eperm_is_settled_by_what_the_process_is_read_to_be_on_macos() {
+    let reads = std::cell::Cell::new(0);
+    let exiting = || {
+        reads.set(reads.get() + 1);
+        if reads.get() < 3 {
+            Liveness::Alive
+        } else {
+            Liveness::Dead
+        }
+    };
+
+    let ended = settle_kill(Err(eperm()), exiting, EXIT_AFTER_REFUSED_KILL).expect("the process exited");
+
+    assert!(matches!(ended, KillRootOutcome::ExitedAfterRefusal), "{ended:?}");
+    assert_eq!(reads.get(), 3);
+    let refused = settle_kill(Err(eperm()), || Liveness::Alive, Duration::from_millis(50)).expect_err("still running");
+    assert!(
+        cosca::error::Report::new(&refused)
+            .to_string()
+            .contains("the process was still running"),
+        "{refused:?}"
+    );
+}
+
+/// The warning prints the cause of the refusal, not only the refusal's own text. A refusal other than
+/// `EPERM` is returned at once on every platform.
+#[skuld::test]
+fn the_warning_for_a_left_request_that_cannot_be_ended_prints_the_cause() {
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    let _refused = test_hook::kill_fails(|_| {
+        cosca::error::Error::Io(within("send the kill", io::Error::other("the signal was refused")))
+    });
+
+    let warning = end_left(&child.child, Duration::from_millis(50)).expect("the child could not be ended");
+
+    assert!(
+        warning.ends_with(
+            "could not kill a request left running: an I/O operation failed: send the kill: the signal was refused"
+        ),
+        "{warning}"
     );
 }
 

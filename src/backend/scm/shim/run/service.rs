@@ -13,10 +13,11 @@ use crate::backend::scm::exit_status::{
 };
 use crate::backend::scm::manager::read_spec_blob;
 use crate::backend::scm::wide::wide_null;
+use crate::backend::scm::win32::winapi_io;
 use crate::blob::Blob;
-use crate::error::Error;
+use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Restart};
-use cosca::error::{ChildFate, Report};
+use cosca::error::ChildFate;
 use cosca::{Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
@@ -47,7 +48,7 @@ pub(crate) fn run() -> ! {
     // Every host reaches here, and this read is what keeps its version marker in the linked binary.
     std::hint::black_box(&marker::MARKER);
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
-        Log::real().failure(TABLE_NAME, &format!("connect to the SCM dispatcher: {e}"));
+        Log::real().failure(TABLE_NAME, &dispatcher_failure(e));
         exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
     exit::end_when_dispatched()
@@ -83,7 +84,7 @@ fn run_service(id: &str, log: Arc<Log>) {
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
-            log.failure(id, &format!("register SCM control handler: {e}"));
+            log.failure(id, &format!("register SCM control handler: {}", Chain(&e)));
             exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
         }
     };
@@ -267,7 +268,7 @@ fn report_running(log: &Log, id: &str, handle: StatusHandle) {
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
         let e = std::io::Error::last_os_error();
-        log.failure(id, &format!("report SERVICE_RUNNING to SCM: {e}"));
+        log.failure(id, &format!("report SERVICE_RUNNING to SCM: {}", Chain(&e)));
     }
 }
 
@@ -277,7 +278,7 @@ fn report_stopping(log: &Log, id: &str, handle: StatusHandle) {
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
         let e = std::io::Error::last_os_error();
-        log.failure(id, &format!("report SERVICE_STOP_PENDING to SCM: {e}"));
+        log.failure(id, &format!("report SERVICE_STOP_PENDING to SCM: {}", Chain(&e)));
     }
 }
 
@@ -290,12 +291,17 @@ fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<(
     Ok(())
 }
 
+fn dispatcher_failure(e: windows_service::Error) -> String {
+    format!("connect to the SCM dispatcher: {}", Chain(&winapi_io(e)))
+}
+
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash
 /// (1067) and may apply the restart policy, even after a commanded stop; exits without a report were
 /// measured from `START_PENDING`, after `RUNNING` and after connecting, not from `STOP_PENDING`.
 fn stopped_report_failure(e: &std::io::Error) -> String {
     format!(
-        "report SERVICE_STOPPED to SCM: {e}; the shim exits anyway; SCM is expected to record 1067 (a crash) and may apply the restart policy"
+        "report SERVICE_STOPPED to SCM: {}; the shim exits anyway; SCM is expected to record 1067 (a crash) and may apply the restart policy",
+        Chain(e)
     )
 }
 
@@ -453,11 +459,14 @@ fn require_job_object(
 const NO_EXIT_CODE: &str = "child exited with no reportable exit code";
 
 fn exit_status_unavailable(e: &cosca::error::Error) -> String {
-    format!("query child exit status: {}", Report::new(e))
+    format!("query child exit status: {}", Chain(e))
 }
 
 fn thread_refused(command: &[String], e: &std::io::Error) -> String {
-    format!("make the thread that waits on {command:?}: {e}; it was not spawned, so nothing of this daemon is running")
+    format!(
+        "make the thread that waits on {command:?}: {}; it was not spawned, so nothing of this daemon is running",
+        Chain(e)
+    )
 }
 
 fn not_job_contained(command: &[String], containment: Containment) -> String {
@@ -467,7 +476,7 @@ fn not_job_contained(command: &[String], containment: Containment) -> String {
 }
 
 fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
-    format!("spawn {command:?}: {}", Report::new(e))
+    format!("spawn {command:?}: {}", Chain(e))
 }
 
 fn spawn_failed_daemon_may_run(command: &[String], e: &cosca::error::Error) -> String {
@@ -518,8 +527,9 @@ const NO_LOG_FILE: &str =
 
 fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
     format!(
-        "open log file {}: {e} (this daemon's output will not be captured; it is still being run)",
-        path.display()
+        "open log file {}: {} (this daemon's output will not be captured; it is still being run)",
+        path.display(),
+        Chain(e)
     )
 }
 
@@ -527,9 +537,12 @@ fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
 /// release, where the daemon then runs with that stream unredirected.
 fn stdio_set<T, E: std::error::Error + 'static>(log: &Log, id: &str, assigned: Result<T, E>) {
     if let Err(e) = assigned {
-        let e = Report::new(&e);
-        debug_assert!(false, "a stdio assignment build_command expects to succeed failed: {e}");
-        log.failure(id, &format!("redirect the daemon's output: {e}"));
+        debug_assert!(
+            false,
+            "a stdio assignment build_command expects to succeed failed: {}",
+            Chain(&e)
+        );
+        log.failure(id, &format!("redirect the daemon's output: {}", Chain(&e)));
     }
 }
 

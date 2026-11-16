@@ -19,6 +19,8 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
+use crate::error::Chain;
+
 /// While alive, the calling thread runs with the caller's `SeDebugPrivilege` enabled, if the caller
 /// holds it. Dropping restores the thread's earlier token.
 pub(super) struct DebugPrivilege {
@@ -64,7 +66,7 @@ impl Drop for DebugPrivilege {
                 // The thread keeps the privileged token, so this is said in release builds too.
                 let e = io::Error::last_os_error();
                 eprintln!("{}", restore_notice(&e));
-                debug_assert!(false, "SetThreadToken: {e}");
+                debug_assert!(false, "SetThreadToken: {}", Chain(&e));
             }
         }
     }
@@ -72,7 +74,10 @@ impl Drop for DebugPrivilege {
 
 /// The warning for a thread token that could not be put back.
 fn restore_notice(e: &io::Error) -> String {
-    format!("warning: SetThreadToken failed to restore the thread's token after enabling SeDebugPrivilege: {e}")
+    format!(
+        "warning: SetThreadToken failed to restore the thread's token after enabling SeDebugPrivilege: {}",
+        Chain(e)
+    )
 }
 
 /// Impersonate a privileged copy of the thread's effective token. `Ok(Some(previous))` when
