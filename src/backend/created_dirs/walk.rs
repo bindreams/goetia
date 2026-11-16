@@ -10,8 +10,12 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, open, openat, readlinkat};
-use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
+#[cfg(not(target_os = "linux"))]
+use nix::fcntl::AtFlags;
+use nix::fcntl::{OFlag, open, openat, readlinkat};
+#[cfg(not(target_os = "linux"))]
+use nix::sys::stat::fstatat;
+use nix::sys::stat::{FileStat, Mode, SFlag, fstat};
 
 use crate::error::{Error, Result};
 
@@ -93,10 +97,14 @@ pub(super) enum Entry {
     Dir(OwnedFd, FileStat),
     /// A symlink and where it points.
     Link(FileStat, OsString),
+    /// Anything else. Only the Linux log check reads what it was.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Other(FileStat),
 }
 
 impl Entry {
+    /// Only the Linux log check reads it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) fn uid(&self) -> libc::uid_t {
         match self {
             Entry::Dir(_, stat) | Entry::Link(stat, _) | Entry::Other(stat) => stat.st_uid,
@@ -163,23 +171,6 @@ pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<
             }
         }
         _ => Ok(Some(Entry::Other(named))),
-    }
-}
-
-/// The last component of a path exists, as `found` in `parent`: it must be a directory or a symlink
-/// that resolves to one, which is returned.
-pub(super) fn require_directory(parent: BorrowedFd<'_>, name: &OsStr, found: &Entry, path: &Path) -> Result<FileStat> {
-    let not_a_directory = || Error::NotADirectory {
-        path: path.to_path_buf(),
-    };
-    match found {
-        Entry::Dir(_, stat) => Ok(*stat),
-        Entry::Link(..) => match fstatat(parent, name, AtFlags::empty()) {
-            Ok(stat) if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFDIR => Ok(stat),
-            Ok(_) => Err(not_a_directory()),
-            Err(e) => Err(Error::os_at("stat", path, e)),
-        },
-        Entry::Other(_) => Err(not_a_directory()),
     }
 }
 

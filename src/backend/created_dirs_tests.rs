@@ -68,6 +68,17 @@ fn owner_of(path: &Path) -> (u32, u32) {
     (meta.uid(), meta.gid())
 }
 
+/// The temporary directories an install leaves in `dir`.
+fn leftovers(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".goetia-"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// The text of a refusal, which the tests read for what it names.
 fn refusal(err: &Error) -> String {
     match err {
@@ -501,40 +512,40 @@ fn create_uses_a_path_that_ends_in_dotdot_as_the_directory_it_names() {
     assert!(!layout.outside().join("deep/new").exists());
 }
 
-/// A component another install creates after the walk is not ours: it is used as it is, and what is
-/// made below it is.
+/// What an install made is put in place by a rename that replaces nothing, so a directory that is at the
+/// final name by then, whoever made it and whoever owns it, is not the install's: it fails, the other
+/// directory is untouched, and the guard leaves nothing of its own beside it.
 #[skuld::test(labels = [ELEVATED])]
-fn create_uses_a_component_that_appeared_after_the_walk_and_makes_what_is_below_it() {
-    let layout = Layout::new();
-    let raced = layout.system().join("a");
-    let leaf = raced.join("b");
-    let mut dirs = layout.dirs();
-    let found = dirs.plan(&leaf).unwrap();
-    fs::create_dir(&raced).unwrap();
-    fs::set_permissions(&raced, fs::Permissions::from_mode(0o700)).unwrap();
+fn make_fails_when_the_final_name_appeared_after_the_walk_and_leaves_that_directory_untouched() {
+    for stranger in [false, true] {
+        let layout = Layout::new();
+        let raced = layout.system().join("a");
+        let mut dirs = layout.dirs();
+        let found = dirs.plan(&raced.join("b")).unwrap();
+        fs::create_dir(&raced).unwrap();
+        fs::set_permissions(&raced, fs::Permissions::from_mode(0o700)).unwrap();
+        if stranger {
+            give_to_a_stranger(&raced);
+        }
+        let before = owner_of(&raced);
 
-    dirs.make(vec![(found, None)]).unwrap();
+        let err = dirs.make(vec![(found, None)]).expect_err("the name is taken");
 
-    assert_eq!(mode(&raced), 0o700, "the other install's directory is untouched");
-    assert_eq!(mode(&leaf), 0o755);
-    drop(dirs);
-    assert!(raced.is_dir(), "the undo does not remove what it did not make");
-    assert!(!leaf.exists());
-}
-
-#[skuld::test(labels = [ELEVATED])]
-fn create_refuses_a_component_that_appeared_after_the_walk_for_an_account() {
-    let layout = Layout::new();
-    let raced = layout.system().join("a");
-    let mut dirs = layout.dirs();
-    let found = dirs.plan(&raced.join("b")).unwrap();
-    fs::create_dir(&raced).unwrap();
-    give_to_a_stranger(&raced);
-
-    let err = dirs.make(vec![(found, None)]).expect_err("an account owns it now");
-
-    assert!(refusal(&err).contains(&format!("uid {STRANGER}")));
-    assert!(!raced.join("b").exists());
+        assert!(refusal(&err).contains("exists"), "{err:?}");
+        drop(dirs);
+        assert_eq!(
+            mode(&raced),
+            0o700,
+            "stranger {stranger}: the other directory is untouched"
+        );
+        assert_eq!(owner_of(&raced), before, "stranger {stranger}");
+        assert_eq!(
+            fs::read_dir(&raced).unwrap().count(),
+            0,
+            "stranger {stranger}: nothing was put in it"
+        );
+        assert_eq!(leftovers(&layout.system()), Vec::<String>::new(), "stranger {stranger}");
+    }
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -618,10 +629,10 @@ fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
 
         let err = result.expect_err("the directory belongs to another uid");
         assert!(refusal(&err).contains(&format!("uid {STRANGER}")), "{err:?}");
-        assert!(parent.join("new").is_dir(), "it was made");
+        assert_eq!(leftovers(&parent).len(), 1, "it was made, under a temporary name");
         fs::set_permissions(&parent, fs::Permissions::from_mode(parent_after)).unwrap();
         drop(dirs);
-        assert!(!parent.join("new").exists(), "{parent_after:o}: left");
+        assert_eq!(leftovers(&parent), Vec::<String>::new(), "{parent_after:o}: left");
     }
 }
 
@@ -661,6 +672,38 @@ fn make_hands_over_the_deepest_directory_to_the_owner_and_no_other_before_it_ret
     assert_eq!(mode(&layout.system().join("a/b")), 0o755);
 }
 
+/// A `cwd` and a log directory inside it, both handed to the account, and a second path of its own: every
+/// directory is at its name in its final state when `make` returns, and no temporary one is left.
+#[skuld::test(labels = [ELEVATED])]
+fn nested_directories_appear_in_their_final_state_and_leave_no_temporary_directory() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let logs = dirs.plan(&layout.system().join("x/y/logs")).unwrap();
+    let cwd = dirs.plan(&layout.system().join("x/y")).unwrap();
+    let other = dirs.plan(&layout.system().join("z/w")).unwrap();
+    dirs.make(vec![
+        (logs, Some(stranger_owner())),
+        (cwd, Some(stranger_owner())),
+        (other, None),
+    ])
+    .unwrap();
+
+    for (made, uid) in [
+        ("x", 0),
+        ("x/y", STRANGER),
+        ("x/y/logs", STRANGER),
+        ("z", 0),
+        ("z/w", 0),
+    ] {
+        let path = layout.system().join(made);
+        assert_eq!(mode(&path), 0o755, "{made}");
+        assert_eq!(owner_of(&path).0, uid, "{made}");
+    }
+    assert_eq!(leftovers(&layout.system()), Vec::<String>::new());
+    drop(dirs);
+    assert!(!layout.system().join("x").exists() && !layout.system().join("z").exists());
+}
+
 #[skuld::test(labels = [ELEVATED])]
 fn make_without_an_owner_leaves_everything_roots() {
     let layout = Layout::new();
@@ -691,7 +734,14 @@ fn a_directory_an_earlier_plan_made_without_an_owner_is_never_handed_over_by_a_l
         why.contains(&format!("uid {STRANGER}")) && why.contains("another"),
         "{why}"
     );
-    assert_eq!(owner_of(&layout.system().join("a")).0, 0, "nothing was handed over");
+    let temporary = leftovers(&layout.system());
+    assert_eq!(temporary.len(), 1, "{temporary:?}");
+    assert_eq!(
+        owner_of(&layout.system().join(&temporary[0])).0,
+        0,
+        "nothing was handed over"
+    );
+    assert!(!layout.system().join("a").exists());
     drop(dirs);
     assert!(
         !layout.system().join("a").exists(),
@@ -733,17 +783,23 @@ fn a_make_whose_hand_over_fails_is_an_error_and_the_guard_removes_every_director
 
     let err = result.expect_err("root without the right to give a directory away cannot hand one over");
     assert!(err.to_string().contains("hand over"), "{err}");
-    for made in ["logs/x", "a/b"] {
-        assert_eq!(
-            owner_of(&layout.system().join(made)).0,
-            0,
-            "{made} was made, and is root's"
+    for made in ["logs", "a"] {
+        assert!(
+            !layout.system().join(made).exists(),
+            "{made} is not at its name until everything is made and handed over"
         );
     }
+    assert_eq!(
+        leftovers(&layout.system()).len(),
+        2,
+        "what was made is beside, under temporary names"
+    );
     drop(dirs);
-    for made in ["logs", "a"] {
-        assert!(!layout.system().join(made).exists(), "the guard left {made}");
-    }
+    assert_eq!(
+        leftovers(&layout.system()),
+        Vec::<String>::new(),
+        "the guard took them back"
+    );
 }
 
 /// What an account has written into a directory it was handed is its own: the undo does not empty it,
@@ -1017,59 +1073,26 @@ fn keep_leaves_a_directory_that_was_not_verified_and_names_it() {
     );
 }
 
-/// A directory that is ready, marked for an owner and not yet handed (a `make` that stopped before it
-/// handed anything over) is handed over when what stands is kept, whether the definition's standing is
-/// unknown or the thread is unwinding from a panic.
+/// A `make` that did not finish (a panic unwinding out of it) leaves its trees at their temporary names,
+/// which nothing uses: keeping what stands names each, and the final names are never there.
 #[skuld::test(labels = [ELEVATED])]
-fn keep_hands_over_a_ready_directory_marked_for_an_owner() {
-    let layout = Layout::new();
-    let made_but_not_handed = |dirs: &mut CreatedDirs, name: &str| {
-        let plan = dirs.plan(&layout.system().join(name)).unwrap();
-        dirs.make_missing(plan.found, Some(stranger_owner())).unwrap();
-        assert_eq!(
-            owner_of(&layout.system().join(name)).0,
-            0,
-            "{name} is made and not handed"
-        );
-    };
-
-    let mut dirs = layout.dirs();
-    made_but_not_handed(&mut dirs, "unknown");
-    dirs.settle(|| Standing::Unknown("could not read the unit".to_string()));
-    drop(dirs);
-    assert_eq!(owner_of(&layout.system().join("unknown")), (STRANGER, STRANGER));
-
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut dirs = layout.dirs();
-        made_but_not_handed(&mut dirs, "panicking");
-        panic!("after the definition may have been written");
-    }));
-    assert!(unwound.is_err());
-    assert_eq!(owner_of(&layout.system().join("panicking")), (STRANGER, STRANGER));
-}
-
-/// One that cannot be handed over is kept root's and named, with what the hand-over said.
-#[cfg(target_os = "linux")]
-#[skuld::test(labels = [ELEVATED])]
-fn keep_names_a_directory_it_cannot_hand_over() {
+fn keep_leaves_a_tree_that_was_not_put_in_place_and_names_it() {
     let layout = Layout::new();
     let mut dirs = layout.dirs();
-    let plan = dirs.plan(&layout.system().join("a")).unwrap();
+    let plan = dirs.plan(&layout.system().join("a/b")).unwrap();
     dirs.make_missing(plan.found, Some(stranger_owner())).unwrap();
 
-    let notes = {
-        let _no_chown = WithoutChown::new();
-        dirs.keep()
-    };
+    let notes = dirs.keep();
 
+    let temporary = leftovers(&layout.system());
+    assert_eq!(temporary.len(), 1, "{temporary:?}");
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
-        notes[0].contains(&layout.system().join("a").display().to_string())
-            && notes[0].contains(&format!("uid {STRANGER}"))
-            && notes[0].contains("root"),
+        notes[0].contains(&temporary[0]) && notes[0].contains(&layout.system().join("a").display().to_string()),
         "{notes:?}"
     );
-    assert_eq!(owner_of(&layout.system().join("a")).0, 0);
+    assert!(!layout.system().join("a").exists());
+    assert!(layout.system().join(&temporary[0]).join("b").is_dir());
 }
 
 #[skuld::test(labels = [ELEVATED])]

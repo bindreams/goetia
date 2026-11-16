@@ -443,8 +443,18 @@ owns it, since `install` is not a start and you may still be preparing it.
   log directory goes to it on launchd, which opens the log as that user. On systemd the log directory
   stays root's: systemd opens `append:` as root before it drops privileges, and a directory an account can
   write lets it plant a symlink there and make root append to any file. A daemon that writes other files
-  beside its log needs a `cwd` for them. The hand-over is done before the write that can start the
-  definition, so a run that follows finds its directories as they are to stay.
+  beside its log needs a `cwd` for them.
+- **A directory appears only in its final state.** `install` makes the first missing component of a path
+  beside where it will be, under a temporary name (`.goetia-` and a random one), and the rest inside it;
+  it hands over what is to be handed over, and last renames the tree into place with a rename that
+  replaces nothing. All of this is done before the write that can start the definition, so a run that
+  follows finds its directories as they are to stay, and an install stopped at any point leaves no
+  half-made directory at the path. A path that something else made after `install` looked fails the
+  install and is left untouched. A file system that cannot rename a directory without replacing what is at
+  the name (Linux's `RENAME_NOREPLACE`, macOS's `RENAME_EXCL`) fails it with an error that says so.
+- **What is judged, and when.** The checks above judge the paths as they are when `install` runs. A change
+  made during or after it, by hand or by another goetia command running at the same time, is not judged;
+  see [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
 - **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory or symlink on
   the way to it, a user other than root can change (owned by another user, or writable by a group or by
   everyone), and names who. The sticky bit excuses a writable directory above the log's, which it keeps
@@ -469,12 +479,10 @@ owns it, since `install` is not a start and you may still be preparing it.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
   (the unit or plist cannot be read back): it then says so and keeps them, since removing them could
-  break a definition that stands. It hands over, first, any directory it made for the account and had not
-  yet given to it, and names one it cannot. A directory that has gained content (the account's own
+  break a definition that stands. A directory that has gained content (the account's own
   writing, in one handed to it) is left, and named, and so are the directories above it.
-- **A limit.** An install killed between making `cwd` and handing it over leaves a root-owned `cwd`. The
-  next install uses it as it is, and the daemon cannot write it: remove the directory and run `install`
-  again.
+- **An install stopped abruptly** (power loss, `SIGKILL`) may leave a `.goetia-*` directory beside the
+  path, holding only the empty directories it was making. Nothing uses it, and `rm -r` removes it.
 - **scm** creates nothing.
 
 ## Per-backend overrides

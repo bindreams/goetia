@@ -4,7 +4,7 @@
 //! symlink there (measured on systemd 255). So whoever can write the log's directory can plant a link
 //! at the log's name before the first start, and whoever can write an ancestor of it can rename the
 //! directory away and make one of their own. The directory is therefore refused while an account other
-//! than root can change it, however it came to be so.
+//! than root can change it, as it is when install runs.
 
 use std::path::Path;
 
