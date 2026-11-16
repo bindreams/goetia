@@ -1,23 +1,33 @@
-//! Whether a directory has an access control list, which makes its group bits not say who can write it.
-//!
-//! The group bits of a directory with an ACL are the ACL's mask: a group-write bit says an account the ACL
-//! names can write the directory, not that its group can. So the group of such a directory is not
-//! trusted. The directory is read through the descriptor the walk holds, never opened again by name or
-//! for reading, so that what is judged is the directory the walk passed, and a root that may search a
+//! Whether a directory carries an ACL, which goetia does not evaluate: a log root opens must have none
+//! on its path. The directory is read through the descriptor the walk holds, never opened again by name
+//! or for reading, so that what is judged is the directory the walk passed, and a root that may search a
 //! directory and not read it (an NFS export that squashes root, a FUSE file system) still reads its ACL.
 
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
-/// The extended attributes a file system keeps an ACL in, by the names the Linux kernel gives them. The
-/// first exists only where a POSIX ACL has an entry beyond the mode's own; the others (NFSv4, CIFS) exist
-/// wherever the file system keeps one, and a directory with one is judged as having an ACL: its group
-/// bits are not the group's.
+/// The extended attributes a file system keeps an ACL in, by the names the Linux kernel gives them. Each
+/// exists only where the file system keeps an ACL that is more than the mode:
+/// - `system.posix_acl_access`: a POSIX ACL with an entry beyond the mode's own (`set_posix_acl` in
+///   `fs/posix_acl.c` keeps none for one the mode says), `XATTR_NAME_POSIX_ACL_ACCESS` in
+///   `include/uapi/linux/xattr.h`;
+/// - `system.nfs4_acl`: the NFS client's, `XATTR_NAME_NFSV4_ACL` in `fs/nfs/nfs4proc.c`;
+/// - `system.nfs4_acl_xdr`: the NFSv4 ACL of ZFS, `NFS41ACL_XATTR` in `module/os/linux/zfs/zpl_xattr.c` of
+///   TrueNAS's OpenZFS fork (`truenas/zfs`); upstream OpenZFS does not have it;
+/// - `system.cifs_acl`: the CIFS client's, `CIFS_XATTR_CIFS_ACL` in `fs/smb/client/xattr.c`; the
+///   client's `system.smb3_acl` is the same handler under another name.
+///
+/// A directory with any of them is refused whatever the ACL grants.
 #[cfg(target_os = "linux")]
-const ACL_ATTRIBUTES: &[&std::ffi::CStr] = &[c"system.posix_acl_access", c"system.nfs4_acl", c"system.cifs_acl"];
+const ACL_ATTRIBUTES: &[&std::ffi::CStr] = &[
+    c"system.posix_acl_access",
+    c"system.nfs4_acl",
+    c"system.nfs4_acl_xdr",
+    c"system.cifs_acl",
+];
 
-/// Whether `dir` has an ACL: any of [`ACL_ATTRIBUTES`] is on it. No ACL, and a file system that has none,
-/// are `false`; any other error is the file system's to say.
+/// Whether `dir` carries an ACL: any of [`ACL_ATTRIBUTES`] is on it. No ACL, and a file system that has
+/// none, are `false`; any other error is the file system's to say.
 ///
 /// `fgetxattr` refuses an `O_PATH` descriptor, which the walk holds; the descriptor is read as
 /// `/proc/self/fd/<n>`, which names the same directory and needs no read permission on it.
@@ -69,7 +79,7 @@ unsafe extern "C" {
     fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
 }
 
-/// Whether `dir` has an extended ACL, read through the descriptor. A directory with none is `false`; any
+/// Whether `dir` carries an extended ACL, of any entry, read through the descriptor. A directory with none is `false`; any
 /// other error is the file system's to say.
 #[cfg(target_os = "macos")]
 pub(super) fn has_acl(dir: BorrowedFd<'_>) -> io::Result<bool> {

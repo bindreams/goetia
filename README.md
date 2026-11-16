@@ -471,13 +471,16 @@ owns it, since `install` is not a start and you may still be preparing it.
   (owned by another user, or writable by everyone), and names who. Above the log's own directory, the
   group of a directory root owns is trusted, as systemd's own `LogsDirectory=` trusts it: Debian and Ubuntu
   ship `/var/log` as `root:syslog 0775`, and `/var/log/<app>/app.log` is accepted there; macOS ships
-  `/Library/Logs` as `root:admin 0775`. Only the group is trusted, not the accounts an ACL names: where a
-  directory has an ACL its group bits are the ACL's mask, so one that can be written is judged as writable
-  by everyone (refused unless it is sticky). The ACL is read from the directory the path resolved to, which
-  needs no read permission on it: on Linux a POSIX, NFSv4 or CIFS ACL (an NFSv4 or CIFS file system always
-  has one, so a group-writable directory there is judged as writable by everyone), on macOS an extended ACL
-  (`chmod +a`). The log's own directory is judged strictly: a group that can write it is refused too, so
-  `/var/log/app.log` is refused on Debian and Ubuntu, and the error suggests `/var/log/<app>/app.log` where
+  `/Library/Logs` as `root:admin 0775`. goetia does not evaluate ACLs: a directory on the way that carries
+  one, whatever it grants, is refused, with an error that names it. That is a POSIX ACL that is more than
+  the mode, an NFSv4 or CIFS ACL, or a macOS extended ACL (`chmod +a`), on any directory of the path
+  including the one a missing log directory is made in. A directory whose ACL lets nobody write is
+  refused too (a macOS directory with a deny-only entry, a POSIX ACL whose mask has no write): move the
+  log, or remove the ACL. The ACL is read from the directory the path resolved to, which needs no read
+  permission on it; a read that fails refuses the log, with the reason (on Linux it goes through
+  `/proc/self/fd`, so where `/proc` is not mounted the log is refused, and the error says so). An NFSv4 or CIFS file system
+  always has one, so a log on it is refused. The log's own directory is judged strictly: a group that can
+  write it is refused too, so `/var/log/app.log` is refused on Debian and Ubuntu, and the error suggests `/var/log/<app>/app.log` where
   `install` would make that directory (it is under the places above); anywhere else it says to use a
   directory only root can change, or to drop `logs:` (on systemd, to log to the journal). The sticky bit
   excuses a directory everyone can write above the log's, which it keeps others from renaming, but not the
