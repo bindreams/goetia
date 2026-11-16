@@ -24,17 +24,11 @@ enum Open {
     Fails,
 }
 
-/// What terminating an opened process does.
-enum Terminate {
-    Done,
-}
-
-/// What SCM answers each `service_pid`, and what each `open` and `terminate` do.
+/// What SCM answers each `service_pid`, and what each `open` does.
 struct Scripted {
     /// Front to back; the last answer repeats.
     pids: VecDeque<Option<u32>>,
     opens: VecDeque<Open>,
-    terminates: VecDeque<Terminate>,
     /// Which `service_pid` calls, counted from 1, fail instead of answering.
     failing_reads: Vec<usize>,
     reads: usize,
@@ -56,15 +50,10 @@ struct Scripted {
 }
 
 impl Scripted {
-    fn new<const P: usize, const O: usize, const T: usize>(
-        pids: [Option<u32>; P],
-        opens: [Open; O],
-        terminates: [Terminate; T],
-    ) -> Self {
+    fn new<const P: usize, const O: usize>(pids: [Option<u32>; P], opens: [Open; O]) -> Self {
         Self {
             pids: pids.into(),
             opens: opens.into(),
-            terminates: terminates.into(),
             failing_reads: Vec::new(),
             reads: 0,
             failing_arm: false,
@@ -157,9 +146,7 @@ impl KillTarget for Scripted {
 
     fn terminate(&mut self, process: &Held) -> io::Result<()> {
         self.log.borrow_mut().push(format!("terminate {}", process.pid));
-        match self.terminates.pop_front().expect("a scripted terminate") {
-            Terminate::Done => Ok(()),
-        }
+        Ok(())
     }
 
     fn await_exit(&mut self, process: &Held, _deadline: Deadline) -> io::Result<Waited> {
@@ -234,7 +221,7 @@ fn steps<const N: usize>(steps: [&str; N]) -> Vec<String> {
 /// termination.
 #[skuld::test]
 fn holding_a_service_with_no_process_holds_nothing() {
-    let mut target = Scripted::new([None], [], []);
+    let mut target = Scripted::new([None], []);
 
     assert!(hold_service_process(&mut target, unbounded()).unwrap().is_none());
     assert_eq!(target.log(), steps(["service_pid"]));
@@ -242,7 +229,7 @@ fn holding_a_service_with_no_process_holds_nothing() {
 
 #[skuld::test]
 fn holding_keeps_the_process_once_scm_confirms_its_pid() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
 
     let (pid, process) = hold_service_process(&mut target, unbounded())
         .unwrap()
@@ -256,7 +243,7 @@ fn holding_keeps_the_process_once_scm_confirms_its_pid() {
 
 #[skuld::test]
 fn holding_follows_the_service_when_it_restarts_between_the_open_and_the_confirmation() {
-    let mut target = Scripted::new([Some(100), Some(200), Some(200)], [Open::Found, Open::Found], []);
+    let mut target = Scripted::new([Some(100), Some(200), Some(200)], [Open::Found, Open::Found]);
 
     let (pid, _process) = hold_service_process(&mut target, unbounded())
         .unwrap()
@@ -280,7 +267,7 @@ fn holding_follows_the_service_when_it_restarts_between_the_open_and_the_confirm
 /// A pid that cannot be opened is the caller's to see only while SCM still says it is the service's.
 #[skuld::test]
 fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails]);
 
     let error = hold_service_process(&mut target, unbounded()).expect_err("a refused open");
 
@@ -294,7 +281,7 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
 /// held and no registration left outstanding.
 #[skuld::test]
 fn a_release_scm_does_not_make_by_the_deadline_expires_the_hold() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Gone]).expiring_release();
 
     let error = hold_service_process(&mut target, spent()).expect_err("an expired hold");
 
@@ -314,7 +301,7 @@ fn a_release_scm_does_not_make_by_the_deadline_expires_the_hold() {
 
 #[skuld::test]
 fn an_arm_that_expires_expires_the_hold_with_nothing_to_cancel() {
-    let mut target = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
+    let mut target = Scripted::new([Some(100)], [Open::Gone]).expiring_arm();
 
     let error = hold_service_process(&mut target, spent()).expect_err("an expired hold");
 
@@ -326,8 +313,8 @@ fn an_arm_that_expires_expires_the_hold_with_nothing_to_cancel() {
 /// only, and what an expiry means is its caller's to say.
 #[skuld::test]
 fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
-    let mut release = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
-    let mut arm = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
+    let mut release = Scripted::new([Some(100), Some(100)], [Open::Gone]).expiring_release();
+    let mut arm = Scripted::new([Some(100)], [Open::Gone]).expiring_arm();
 
     for target in [&mut release, &mut arm] {
         let outcome = hold_if_possible(target, spent()).expect("an expiry is an outcome, not a failure");
@@ -341,7 +328,7 @@ fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
 /// wait for it was possible.
 #[skuld::test]
 fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails]);
 
     let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
 
@@ -354,7 +341,7 @@ fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
 
 #[skuld::test]
 fn a_service_with_no_process_is_no_process_to_hold_if_possible() {
-    let mut target = Scripted::new([None], [], []);
+    let mut target = Scripted::new([None], []);
 
     let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
 
@@ -363,7 +350,7 @@ fn a_service_with_no_process_is_no_process_to_hold_if_possible() {
 
 #[skuld::test]
 fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
 
     let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
 
@@ -374,8 +361,8 @@ fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
 /// uninstall fails with nothing changed, whether the read was the first or the one after a refusal.
 #[skuld::test]
 fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {
-    let mut first = Scripted::new([Some(100)], [], []).failing_read(1);
-    let mut after_refusal = Scripted::new([Some(100), Some(100)], [Open::Fails], []).failing_read(2);
+    let mut first = Scripted::new([Some(100)], []).failing_read(1);
+    let mut after_refusal = Scripted::new([Some(100), Some(100)], [Open::Fails]).failing_read(2);
 
     for target in [&mut first, &mut after_refusal] {
         let error = hold_if_possible(target, unbounded()).expect_err("an SCM read failure");
@@ -388,7 +375,7 @@ fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {
 /// it does for every one, which SCM, having let go, answers at once.
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
-    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []);
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone]);
 
     assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
@@ -412,7 +399,7 @@ fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
 /// kill that worked.
 #[skuld::test]
 fn a_wake_that_shows_scm_let_go_of_the_pid_arms_nothing_again() {
-    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []).unwatchable_from(1);
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone]).unwatchable_from(1);
 
     assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
@@ -433,7 +420,7 @@ fn a_wake_that_shows_scm_let_go_of_the_pid_arms_nothing_again() {
 /// pid is not read again, and nothing waits on a registration that does not exist.
 #[skuld::test]
 fn a_service_scm_will_not_watch_and_shows_stopped_is_released() {
-    let mut target = Scripted::new([Some(100), None], [Open::Gone], []).unwatchable_from(0);
+    let mut target = Scripted::new([Some(100), None], [Open::Gone]).unwatchable_from(0);
 
     assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
@@ -446,12 +433,8 @@ fn a_service_scm_will_not_watch_and_shows_stopped_is_released() {
 /// The same for the arm after a wake that still shows the pid.
 #[skuld::test]
 fn a_re_arm_scm_refuses_on_a_stopped_service_is_the_release() {
-    let mut target = Scripted::new(
-        [Some(100), Some(100), Some(100), Some(100), None],
-        [Open::Found],
-        [Terminate::Done],
-    )
-    .unwatchable_from(1);
+    let mut target =
+        Scripted::new([Some(100), Some(100), Some(100), Some(100), None], [Open::Found]).unwatchable_from(1);
 
     assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
@@ -480,7 +463,6 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
     let mut target = Scripted::new(
         [Some(100), Some(100), Some(100), Some(100), Some(100), None],
         [Open::Found],
-        [Terminate::Done],
     );
 
     assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
@@ -511,7 +493,7 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
 /// to wait for, and the new process is not the kill's to touch.
 #[skuld::test]
 fn a_kill_is_done_when_scm_reports_a_new_pid() {
-    let mut target = Scripted::new([Some(100), Some(100), Some(200)], [Open::Found], [Terminate::Done]);
+    let mut target = Scripted::new([Some(100), Some(100), Some(200)], [Open::Found]);
 
     assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
@@ -549,7 +531,7 @@ fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str, kind: io::Error
 /// The read after the termination: the kill cannot say SCM has let go, but the process is gone.
 #[skuld::test]
 fn a_failed_read_after_the_termination_says_the_signal_was_delivered() {
-    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_read(3);
+    let mut target = Scripted::new([Some(100)], [Open::Found]).failing_read(3);
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
@@ -571,7 +553,7 @@ fn a_failed_read_after_the_termination_says_the_signal_was_delivered() {
 
 #[skuld::test]
 fn a_failed_registration_after_the_termination_says_the_signal_was_delivered() {
-    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_arm();
+    let mut target = Scripted::new([Some(100)], [Open::Found]).failing_arm();
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
@@ -581,7 +563,7 @@ fn a_failed_registration_after_the_termination_says_the_signal_was_delivered() {
 /// A process that was never terminated by this kill keeps the plain error: it is not a terminated one.
 #[skuld::test]
 fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() {
-    let mut target = Scripted::new([Some(100)], [Open::Gone], []).failing_arm();
+    let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_arm();
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
