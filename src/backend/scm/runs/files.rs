@@ -32,12 +32,14 @@ pub(super) fn rename_over(file: &File, to: &Path) -> io::Result<()> {
     let name: Vec<u16> = std::path::absolute(to)?.as_os_str().encode_wide().collect();
     let name_bytes = name.len() * size_of::<u16>();
     let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let total = header + name_bytes;
+    // The whole struct and then the name, not only up to the name's end: a buffer cut at the end of the
+    // name came out with garbage after the new name, or was refused, for one length of path in eight.
+    let total = size_of::<FILE_RENAME_INFO>() + name_bytes;
     // 8-byte alignment for `FILE_RENAME_INFO`, whose name runs on past its declared end.
     let mut buffer = vec![0u64; total.div_ceil(size_of::<u64>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFO`: room for its
-    // header and the name after it, which is copied in at the name's own offset.
+    // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFO`: room for the
+    // struct and for the name, which is copied in at the name's own offset.
     unsafe {
         (*info).Anonymous.ReplaceIfExists = true;
         (*info).FileNameLength = name_bytes as u32;

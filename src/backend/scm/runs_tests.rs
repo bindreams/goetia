@@ -61,6 +61,28 @@ fn instances_kept(runs: &Runs, wanted: &[InstanceId]) -> Vec<bool> {
 
 // write and read ======================================================================================================
 
+/// The rename names the record whole for every length of its path: it once left garbage after the name
+/// (or was refused) for one length in eight, and the tests' own directory fixes the length of the rest.
+/// Eight ids in a row reach every length modulo eight, in any directory.
+#[skuld::test]
+fn a_record_is_whole_whatever_the_length_of_its_path() {
+    for length in 1..=8 {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Id::try_from("x".repeat(length).as_str()).unwrap();
+        let runs = Runs::of(dir.path(), &id);
+        runs.ensure(&process_user_sid()).unwrap();
+        let written = record(1, 5);
+
+        runs.write(&written).unwrap();
+
+        assert_eq!(
+            runs.read(&written.instance).unwrap(),
+            Some(written),
+            "an id of {length}"
+        );
+    }
+}
+
 #[skuld::test]
 fn a_record_round_trips_by_its_instance() {
     let (_dir, runs) = fixture();
