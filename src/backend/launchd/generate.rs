@@ -507,7 +507,9 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
             push_logs(&mut dict, &s.common);
         }
         DaemonSpec::Task(task) => {
-            task.stop_action.send_signal.refuse(BackendKind::Launchd, &task.common.id)?;
+            task.stop_action
+                .send_signal
+                .refuse(BackendKind::Launchd, &task.common.id)?;
             let argv = task_argv(task)?;
             push_job_head(&mut dict, &task.common, id, &argv);
 

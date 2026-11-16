@@ -500,7 +500,11 @@ fn windows_refuses_a_stop_action_on_a_task() {
     assert!(BackendKind::Scm.refuse(&task(Shaped::Absent, Shaped::Absent)).is_ok());
     // A leaf written as the default is not a request.
     let thirty = || Shaped::Parsed(Some(Duration::from_secs(30)));
-    assert!(BackendKind::Scm.refuse(&task(Shaped::Parsed(StopSignal::Terminate), thirty())).is_ok());
+    assert!(
+        BackendKind::Scm
+            .refuse(&task(Shaped::Parsed(StopSignal::Terminate), thirty()))
+            .is_ok()
+    );
     assert!(BackendKind::Scm.refuse(&task(Shaped::Absent, thirty())).is_ok());
     // The default timeout of `kill` is none, so `null` beside it asks for nothing more.
     let refused = BackendKind::Scm.refuse(&task(Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(None)));

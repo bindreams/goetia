@@ -46,7 +46,9 @@ use super::overrides::Supplied;
 use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
 use super::stop_action::{ScmDaemon, StopField, Written, scm_defect};
 use super::vars::is_valid_name;
-use super::{AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, StopAction, StopSignal, User, Warning};
+use super::{
+    AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, StopAction, StopSignal, User, Warning,
+};
 use crate::error::Error;
 
 /// One of the three service-manager backends a `backend-specific:` entry

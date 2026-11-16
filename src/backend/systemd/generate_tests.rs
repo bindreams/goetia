@@ -1315,7 +1315,9 @@ fn with_stop_action(stop_action: StopAction) -> DaemonSpec {
 
 fn stop_lines(spec: &DaemonSpec) -> (String, Option<String>) {
     let text = unit(spec, &minimal_identity()).unwrap();
-    let timeout = text.contains("TimeoutStopSec=").then(|| line_of(&text, "TimeoutStopSec=").to_string());
+    let timeout = text
+        .contains("TimeoutStopSec=")
+        .then(|| line_of(&text, "TimeoutStopSec=").to_string());
     (line_of(&text, "KillSignal=").to_string(), timeout)
 }
 
