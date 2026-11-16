@@ -184,7 +184,9 @@ impl fmt::Display for WindowsDefinition {
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics;
 /// - for a task, a virtual service account, a `%` in the host's path or arguments (Task Scheduler
-///   expands it), and a schedule that needs more than 48 triggers.
+///   expands it), a schedule whose day-of-month and day-of-week fields are both restricted (an AND, or
+///   an either-or whose two triggers would coincide: see `triggers::compile`), and a schedule that
+///   needs more than 48 triggers.
 pub fn registration(
     spec: &DaemonSpec,
     id: &Identity,

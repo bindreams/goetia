@@ -16,9 +16,9 @@ use std::fmt;
 
 use cosca::quote::windows::join_wide;
 
-use crate::backend::launchd::generate::xml_escape;
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::triggers::{Repeat, Trigger, compile};
+use crate::backend::xml_escape;
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;

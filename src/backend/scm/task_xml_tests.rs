@@ -612,6 +612,83 @@ fn a_task_with_no_schedule_has_no_triggers_and_is_never_armed() {
     assert_eq!(installed.to_string(), task.to_string());
 }
 
+/// Triggers goetia does not write, added by hand: neither has a `StartBoundary` or an `Enabled`.
+const HAND_ADDED: &str = r#"<Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2000-01-01T03:30:00</StartBoundary>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+    <LogonTrigger>
+      <UserId>S-1-5-21-1-2-3-1001</UserId>
+    </LogonTrigger>
+    <BootTrigger />
+  </Triggers>"#;
+
+#[skuld::test]
+fn a_trigger_with_no_start_boundary_is_armed_and_disarmed_like_any_other() {
+    let spec = spec();
+    let xml = readback(&spec, &host(), HAND_ADDED);
+    assert!(TaskXml::armed(&xml), "no flag is enabled");
+
+    let disarmed = TaskXml::with_armed(&xml, false).expect("a hand-added trigger does not stop `disable`");
+    assert!(!TaskXml::armed(&disarmed));
+    let document = Document::parse(&disarmed).unwrap();
+    let flags: Vec<_> = node_at(&document, "Task/Triggers")
+        .unwrap()
+        .children()
+        .filter(Node::is_element)
+        .map(|trigger| {
+            let flag = trigger.children().find(|child| child.tag_name().name() == "Enabled");
+            (
+                trigger.tag_name().name().to_owned(),
+                flag.map(|flag| flag.text().unwrap().to_owned()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            ("CalendarTrigger".to_owned(), Some("false".to_owned())),
+            ("LogonTrigger".to_owned(), Some("false".to_owned())),
+            ("BootTrigger".to_owned(), Some("false".to_owned())),
+        ]
+    );
+    assert!(
+        disarmed.contains("<UserId>S-1-5-21-1-2-3-1001</UserId>"),
+        "the hand edit is kept"
+    );
+
+    let armed = TaskXml::with_armed(&disarmed, true).unwrap();
+    assert!(TaskXml::armed(&armed));
+    // The hand-added triggers are drift, whatever their flags.
+    let installed = TaskXml::parse(&armed, &data_of(&spec)).unwrap();
+    assert!(installed.to_string().contains("Unrecognised:"), "{installed}");
+}
+
+#[skuld::test]
+fn a_repetition_trigger_reads_back_in_task_schedulers_order() {
+    // Task Scheduler's order inside the schedule: `Months` before `Weeks` and `DaysOfWeek`; a duration
+    // it kept as it was given, in hours and minutes.
+    let spec = spec_of(User::Root, Some("*/15 9-17 * 3-5 1-5"));
+    let triggers = r#"<Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2000-01-01T09:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT15M</Interval>
+        <Duration>PT8H45M</Duration>
+      </Repetition>
+      <ScheduleByMonthDayOfWeek>
+        <Months><March /><April /><May /></Months>
+        <Weeks><Week>1</Week><Week>2</Week><Week>3</Week><Week>4</Week><Week>Last</Week></Weeks>
+        <DaysOfWeek><Monday /><Tuesday /><Wednesday /><Thursday /><Friday /></DaysOfWeek>
+      </ScheduleByMonthDayOfWeek>
+    </CalendarTrigger>
+  </Triggers>"#;
+    let installed = TaskXml::parse(&readback(&spec, &host(), triggers), &data_of(&spec)).unwrap();
+    assert_eq!(installed.to_string(), built(&spec).to_string());
+    assert!(!installed.to_string().contains("Unrecognised"), "{installed}");
+}
+
 #[skuld::test]
 fn a_schedule_that_never_fires_has_a_trigger_and_can_be_armed() {
     let spec = spec_of(User::Root, Some("0 0 31 4,6 *"));

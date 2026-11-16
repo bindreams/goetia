@@ -117,14 +117,7 @@ impl TaskXml {
                     Some(value) => (value.range(), armed.to_string()),
                     None => (flag.range(), format!("<Enabled>{armed}</Enabled>")),
                 }),
-                None if !armed => {
-                    let after = ["EndBoundary", "StartBoundary"]
-                        .into_iter()
-                        .find_map(|name| child(trigger, name))
-                        .ok_or_else(|| Error::blob("a trigger of the task has no `StartBoundary`"))?;
-                    let end = after.range().end;
-                    edits.push((end..end, "<Enabled>false</Enabled>".to_owned()));
-                }
+                None if !armed => edits.push(insert_flag(xml, trigger)),
                 None => {}
             }
         }
@@ -135,6 +128,37 @@ impl TaskXml {
             out.replace_range(range, &text);
         }
         Ok(out)
+    }
+}
+
+/// The edit that gives `trigger`, which states no `Enabled`, the flag `false`: after its boundary
+/// when it has one, otherwise first among its children, or as its only child when it has none (a
+/// self-closing element is opened for it). Any trigger type, one goetia did not write included,
+/// takes it: Task Scheduler's own readbacks place a trigger's common children in different orders.
+fn insert_flag(xml: &str, trigger: Node<'_, '_>) -> (Range<usize>, String) {
+    let flag = "<Enabled>false</Enabled>";
+    if let Some(boundary) = ["EndBoundary", "StartBoundary"]
+        .into_iter()
+        .find_map(|name| child(trigger, name))
+    {
+        let end = boundary.range().end;
+        return (end..end, flag.to_owned());
+    }
+    if let Some(first) = trigger.first_child() {
+        let start = first.range().start;
+        return (start..start, flag.to_owned());
+    }
+    let range = trigger.range();
+    let source = &xml[range.clone()];
+    match source.strip_suffix("/>") {
+        Some(open) => {
+            let name = &source[1..][..source[1..].find(|c: char| c.is_whitespace() || c == '/').unwrap_or(0)];
+            (range, format!("{}>{flag}</{name}>", open.trim_end()))
+        }
+        None => {
+            let close = range.start + source.rfind("</").unwrap_or(source.len());
+            (close..close, flag.to_owned())
+        }
     }
 }
 

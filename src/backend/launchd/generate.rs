@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::calendar::{self, Entry};
-use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets};
+use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets, xml_escape};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Restart, Schedule, TaskSpec};
@@ -107,31 +107,6 @@ pub(crate) fn without_metadata(text: &str) -> String {
 }
 
 // XML rendering =======================================================================================================
-
-/// Escape the three characters XML element content cannot contain unescaped. Applied to every
-/// emitted value (argv, paths, environment keys and values, the account name), since
-/// `ServiceSpec::new` does not reject `&`/`<`/`>`.
-///
-/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them. `ServiceSpec::new`
-/// rejects them (and the other Unicode noncharacters); this panics on them as a backstop rather
-/// than emit XML no parser can load.
-pub(crate) fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        assert!(
-            !matches!(c, '\u{FFFE}' | '\u{FFFF}'),
-            "value contains {c:?} (U+FFFE/U+FFFF), which XML 1.0 cannot represent at all; \
-             ServiceSpec::new must reject this upstream, before it ever reaches a generator"
-        );
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            other => out.push(other),
-        }
-    }
-    out
-}
 
 /// `ServiceSpec::new` refuses a `cwd` or `logs` that is not valid UTF-8, so a `DaemonSpec`'s are
 /// valid. Panic on a violation rather than let `to_string_lossy` substitute U+FFFD and emit a
