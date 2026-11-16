@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::os::unix::fs::{PermissionsExt as _, lchown, symlink};
 
 use super::*;
 use crate::backend::created_dirs::CreatedDirs;
@@ -114,7 +114,7 @@ fn a_symlink_an_account_owns_in_a_directory_only_root_can_write_is_followed() {
     fs::create_dir(&real).unwrap();
     let link = layout.system().join("link");
     symlink(&real, &link).unwrap();
-    std::os::unix::fs::lchown(&link, Some(STRANGER), Some(STRANGER)).unwrap();
+    lchown(&link, Some(STRANGER), Some(STRANGER)).unwrap();
 
     check(&link.join("app.log")).unwrap();
 }
@@ -136,6 +136,36 @@ fn a_symlink_in_a_directory_an_account_can_write_is_refused_naming_the_directory
         why.contains(holder.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
         "{why}"
     );
+}
+
+/// In a sticky directory a group or everyone can write (`/tmp`), the owner of an entry can delete it and
+/// make another: a link an account owns there is refused though the directory is an ancestor the sticky
+/// bit excuses. A link root owns there is followed, and so is an account's where only root can write.
+#[skuld::test(labels = [ELEVATED])]
+fn a_symlink_an_account_owns_in_a_sticky_directory_others_can_write_is_refused() {
+    for writable in [0o1777, 0o1775] {
+        let layout = Layout::new();
+        let real = layout.system().join("real");
+        fs::create_dir(&real).unwrap();
+        let sticky = layout.system().join("tmp");
+        fs::create_dir(&sticky).unwrap();
+        chmod(&sticky, writable);
+        let link = sticky.join("link");
+        symlink(&real, &link).unwrap();
+        lchown(&link, Some(STRANGER), Some(STRANGER)).unwrap();
+
+        let why = refused(&link.join("app.log"));
+        assert!(
+            why.contains(link.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
+            "{writable:o}: {why}"
+        );
+
+        chmod(&sticky, 0o1755);
+        check(&link.join("app.log")).unwrap_or_else(|e| panic!("only root can write it: {e}"));
+        chmod(&sticky, writable);
+        lchown(&link, Some(0), Some(0)).unwrap();
+        check(&link.join("app.log")).unwrap_or_else(|e| panic!("root's link: {e}"));
+    }
 }
 
 #[skuld::test(labels = [ELEVATED])]

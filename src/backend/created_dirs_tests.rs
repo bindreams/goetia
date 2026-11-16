@@ -385,6 +385,44 @@ fn create_makes_below_a_symlink_an_account_owns_when_only_root_can_write_its_hol
     assert!(layout.system().join("real/new").is_dir());
 }
 
+/// In a sticky directory a group or everyone can write (`/tmp`), the owner of an entry can delete it and
+/// make another, so a link there that an account owns can be made to lead anywhere: it is refused. A link
+/// root owns there, or an account's in a directory only root can write, is followed.
+#[skuld::test(labels = [ELEVATED])]
+fn create_refuses_to_make_below_a_symlink_an_account_owns_in_a_sticky_directory_others_can_write() {
+    for writable in [0o1777, 0o1775] {
+        let layout = Layout::new();
+        let real = layout.system().join("real");
+        fs::create_dir(&real).unwrap();
+        let sticky = layout.system().join("tmp");
+        fs::create_dir(&sticky).unwrap();
+        fs::set_permissions(&sticky, fs::Permissions::from_mode(writable)).unwrap();
+        let link = sticky.join("link");
+        symlink(&real, &link).unwrap();
+        std::os::unix::fs::lchown(&link, Some(STRANGER), Some(STRANGER)).unwrap();
+        let mut dirs = layout.dirs();
+
+        let err = dirs
+            .create(&link.join("new"), None)
+            .expect_err("the account can replace its own link in a sticky directory");
+
+        let why = refusal(&err);
+        assert!(
+            why.contains(link.to_str().unwrap()) && why.contains(&format!("uid {STRANGER}")),
+            "{writable:o}: {why}"
+        );
+        assert!(!real.join("new").exists());
+
+        fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1755)).unwrap();
+        dirs.create(&link.join("new"), None)
+            .expect("only root can write the holder");
+        fs::set_permissions(&sticky, fs::Permissions::from_mode(writable)).unwrap();
+        std::os::unix::fs::lchown(&link, Some(0), Some(0)).unwrap();
+        dirs.create(&link.join("new/deeper"), None).expect("root's link");
+        assert!(real.join("new/deeper").is_dir());
+    }
+}
+
 #[skuld::test(labels = [ELEVATED])]
 fn create_refuses_to_make_anything_below_a_dangling_link() {
     let layout = Layout::new();
@@ -736,6 +774,16 @@ fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest() {
         let err = result.expect_err("the directory belongs to another uid");
         assert!(refusal(&err).contains(&format!("uid {STRANGER}")), "{err:?}");
         assert_eq!(leftovers(&parent).len(), 1, "it was made, under a temporary name");
+        // It names the path the spec wrote, and says where the directory was while it was judged.
+        let Error::DirectoryRefused { path, why } = &err else {
+            unreachable!("`refusal` read it")
+        };
+        assert_eq!(path, &parent.join("new"));
+        let temporary = parent.join(&leftovers(&parent)[0]);
+        assert!(
+            why.ends_with(&format!("(while it was being made at {})", temporary.display())),
+            "{why}"
+        );
         fs::set_permissions(&parent, fs::Permissions::from_mode(parent_after)).unwrap();
         drop(dirs);
         assert_eq!(leftovers(&parent), Vec::<String>::new(), "{parent_after:o}: left");
@@ -912,6 +960,48 @@ fn a_plan_that_hands_nothing_over_and_one_that_hands_a_directory_over_may_not_sh
                 Vec::<String>::new(),
                 "{kept} {kept_first}: the guard took back what was made"
             );
+        }
+    }
+}
+
+/// A plan that hands nothing over and passes through or ends at a directory that another plan hands over
+/// is a conflict whatever the order of the plans, also when a third plan made the directory and the one
+/// that hands it over comes after the one that does not.
+#[skuld::test(labels = [ELEVATED])]
+fn a_directory_a_plan_hands_over_is_refused_when_one_that_hands_nothing_over_passed_it_in_any_order() {
+    const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    // The plans: `a/b/c` handed over (it makes `a/b`), `kept` handed to no one, and `a/b` handed over.
+    for kept in ["a/b", "a/b/e"] {
+        for order in ORDERS {
+            let layout = Layout::new();
+            let mut dirs = layout.dirs();
+            let mut plans = [
+                (
+                    dirs.plan(&layout.system().join("a/b/c")).unwrap(),
+                    Some(stranger_owner()),
+                ),
+                (dirs.plan(&layout.system().join(kept)).unwrap(), None),
+                (dirs.plan(&layout.system().join("a/b")).unwrap(), Some(stranger_owner())),
+            ]
+            .map(Some);
+            let ordered: Vec<_> = order.into_iter().map(|index| plans[index].take().unwrap()).collect();
+
+            let err = dirs
+                .make(ordered)
+                .expect_err("`a/b` cannot be root's for one path and the account's for another");
+
+            let Error::DirectoryRefused { path, why } = &err else {
+                panic!("{kept} {order:?}: {err:?}")
+            };
+            assert_eq!(path, &layout.system().join("a/b"), "{kept} {order:?}: {why}");
+            assert!(why.contains(&format!("uid {STRANGER}")), "{kept} {order:?}: {why}");
+            drop(dirs);
+            assert_eq!(
+                leftovers(&layout.system()),
+                Vec::<String>::new(),
+                "{kept} {order:?}: the guard took back what was made"
+            );
+            assert!(!layout.system().join("a").exists(), "{kept} {order:?}");
         }
     }
 }
