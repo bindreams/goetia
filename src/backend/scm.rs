@@ -12,6 +12,10 @@ pub mod manager;
 pub mod parameters;
 pub(crate) mod shim;
 pub(crate) mod sid;
+// Pure, like `instance`: builds and is tested on every host; the Windows backend's task verbs, which
+// read and arm an installed definition, come next.
+#[allow(dead_code, reason = "off Windows nothing reads it; on it, the task verbs come next")]
+pub(crate) mod task_xml;
 #[cfg(test)]
 pub(crate) mod test_support;
 // Pure, like `instance`: builds and is tested on every host; only the Windows backend will use it.

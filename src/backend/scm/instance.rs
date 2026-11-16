@@ -44,6 +44,16 @@ impl PartialEq for TaskPath {
 
 impl Eq for TaskPath {}
 
+/// The account a task runs as: the XML's principal and the registration's logon type, kept in one
+/// value so they cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskAccount {
+    /// `SYSTEM`, `LocalService` or `NetworkService`, by well-known SID: no password.
+    Service(String),
+    /// A user account, which logs on with its password.
+    User(String),
+}
+
 /// The identity of one run of a task: the GUID Task Scheduler gives its instance, as its 16
 /// digit-pairs in the order the GUID is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

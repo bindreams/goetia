@@ -9,8 +9,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::api::{Instance, Registered, Registration, Started, TaskAccount, TaskApi, TaskInfo};
-use crate::backend::scm::instance::{InstanceId, TaskPath};
+use super::api::{Instance, Registered, Registration, Started, TaskApi, TaskInfo};
+use crate::backend::scm::instance::{InstanceId, TaskAccount, TaskPath};
 use crate::error::Result;
 
 /// One call on the boundary, with the arguments it was made with.

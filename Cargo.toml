@@ -99,6 +99,8 @@ humantime = "2"
 # The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
 # costs one fast pass.
 memchr = "2"
+# A task's installed XML is read back as Task Scheduler wrote it (`backend::scm::task_xml`).
+roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `EmbeddedStockShim` (SHA-256 of the stock shim's bytes) and `spec::schedule` (`H`).

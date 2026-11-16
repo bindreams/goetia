@@ -346,7 +346,9 @@ impl Backend for Scm {
 
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::registration(spec, &identity, &|| self.provider()?.preview())
+        service_registration(spec, || {
+            generate::registration(spec, &identity, &|| self.provider()?.preview())
+        })
     }
 
     /// Keeps the host command a `protocol: plain` service is installed with, so that a host another
@@ -355,20 +357,24 @@ impl Backend for Scm {
     /// never read.
     fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::registration(spec, &identity, &|| {
-            let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
-                id: snapshot.id().as_str().to_string(),
-                source: Box::new(e),
-            })?;
-            let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
-            Ok(HostCommand { exe, args })
+        service_registration(spec, || {
+            generate::registration(spec, &identity, &|| {
+                let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
+                    id: snapshot.id().as_str().to_string(),
+                    source: Box::new(e),
+                })?;
+                let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
+                Ok(HostCommand { exe, args })
+            })
         })
     }
 
     /// The host is previewed once, for the check and the registration alike.
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::install_registration(spec, &identity, &|| self.provider()?.preview())
+        service_registration(spec, || {
+            generate::install_registration(spec, &identity, &|| self.provider()?.preview())
+        })
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
@@ -581,6 +587,24 @@ impl Backend for Scm {
             "the Windows service manager",
             &snapshot.into_id(),
         ))
+    }
+}
+
+/// The service registration `build` makes for `spec`. This backend installs only services until its
+/// task half lands, so a task is refused here, before the host is asked, as it always was.
+fn service_registration(
+    spec: &DaemonSpec,
+    build: impl FnOnce() -> Result<generate::WindowsDefinition>,
+) -> Result<ScmRegistration> {
+    if let DaemonSpec::Task(_) = spec {
+        return Err(crate::backend::cannot_run_tasks(
+            "the Windows service manager",
+            &spec.common().id,
+        ));
+    }
+    match build()? {
+        generate::WindowsDefinition::Service(registration) => Ok(registration),
+        generate::WindowsDefinition::Task(_) => unreachable!("a service spec is built as a service"),
     }
 }
 

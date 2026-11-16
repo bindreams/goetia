@@ -12,7 +12,7 @@ use windows::Win32::Foundation::SYSTEMTIME;
 use windows::Win32::System::Variant::VariantTimeToSystemTime;
 
 use super::clock::local_to_system;
-use crate::backend::scm::instance::{InstanceId, TaskPath};
+use crate::backend::scm::instance::{InstanceId, TaskAccount, TaskPath};
 use crate::error::Result;
 
 /// One run of a task that Task Scheduler lists. A listing is not proof the run is alive: the entry
@@ -51,16 +51,6 @@ pub(crate) struct Started {
     pub id: InstanceId,
     /// `None` for a `Run` that started nothing: an action that cannot start still returns a GUID.
     pub pid: Option<u32>,
-}
-
-/// The account a task runs as: the XML's principal and the registration's logon type, kept in one
-/// value so they cannot disagree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TaskAccount {
-    /// `SYSTEM`, `LocalService` or `NetworkService`: no password.
-    Service(String),
-    /// A user account, which logs on with its password.
-    User(String),
 }
 
 /// How a [`TaskApi::register`] went.

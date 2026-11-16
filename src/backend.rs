@@ -79,7 +79,9 @@ pub(crate) fn refuse_day_fields_and(id: &crate::spec::Id, manager: &str, text: &
     )
 }
 
-/// What a generator answers for a task until its backend's task support lands.
+/// What a backend answers for a task until its task support lands: only the Windows service manager,
+/// whose task half is still to come, is left to say it.
+#[cfg(windows)]
 pub(crate) fn cannot_run_tasks(backend: &str, id: &crate::spec::Id) -> crate::error::Error {
     crate::spec::invalid(id, &format!("{backend} cannot run tasks yet"))
 }

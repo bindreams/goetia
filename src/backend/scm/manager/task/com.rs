@@ -22,10 +22,10 @@ use windows::Win32::System::TaskScheduler::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{BSTR, HRESULT, IUnknown};
 
-use super::api::{Instance, Registered, Registration, Started, TaskAccount, TaskApi, TaskInfo, ole_date};
+use super::api::{Instance, Registered, Registration, Started, TaskApi, TaskInfo, ole_date};
 #[cfg(any(test, feature = "testing"))]
 use super::clock::{local_to_system, system_to_local};
-use crate::backend::scm::instance::{InstanceId, TASK_FOLDER, TaskPath};
+use crate::backend::scm::instance::{InstanceId, TASK_FOLDER, TaskAccount, TaskPath};
 use crate::error::{Error, Result};
 
 /// Task Scheduler itself, reached through COM.
