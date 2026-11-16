@@ -59,6 +59,17 @@ impl StopAction {
         }
     }
 
+    /// The action the leaves a manifest wrote make: a leaf it did not write is its default, and the
+    /// default timeout depends on the signal. `resolve` and the judgement of a pass that still holds a
+    /// substitution both read the leaves this way.
+    pub(crate) fn from_leaves(send_signal: Option<StopSignal>, timeout: Option<Option<Duration>>) -> StopAction {
+        let send_signal = send_signal.unwrap_or(StopAction::default().send_signal);
+        StopAction {
+            send_signal,
+            timeout: timeout.unwrap_or_else(|| StopAction::default_timeout(send_signal)),
+        }
+    }
+
     /// The longest a stop of this action takes, from the request to the manager's record: the `timeout`
     /// and the [`TEARDOWN_MARGIN`](Self::TEARDOWN_MARGIN); `None` where there is no timeout.
     pub fn longest_stop(&self) -> Option<Duration> {
@@ -123,6 +134,16 @@ impl StopRefusals {
         StopRefusals {
             signal: self.signal.filter(|_| send_signal),
             timeout: self.timeout.filter(|_| timeout),
+        }
+    }
+
+    /// The timeout refusal that holds for a signal that is not known as it does for a `kill` (`self`),
+    /// and no signal refusal: what holds for every signal the pending one could become, since a refusal
+    /// of a timeout depends on the signal only as `kill` or not.
+    pub(crate) fn holding_for_every_signal(self, kill: StopRefusals) -> Self {
+        StopRefusals {
+            signal: None,
+            timeout: self.timeout.filter(|_| kill.timeout.is_some()),
         }
     }
 

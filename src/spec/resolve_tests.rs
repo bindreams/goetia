@@ -3757,6 +3757,20 @@ fn launchd_refuses_a_timeout_over_its_cap_and_no_timeout_in_its_own_override_fro
     }
 }
 
+/// launchd's cap holds for every signal, so a signal a `${VAR}` has not yet supplied does not hide it from
+/// a host that is not launchd.
+#[skuld::test]
+fn launchds_cap_is_refused_from_any_host_beside_a_signal_not_yet_substituted() {
+    let yaml = format!("{SERVICE}backend-specific:\n  launchd:\n    stop-action: {{send-signal: '${{S}}', timeout: 90s}}\n");
+    for &native in HOST_BACKENDS.iter().filter(|b| **b != BackendKind::Launchd) {
+        let msg = resolve_yaml_as(native, &yaml).expect_err("90s is over launchd's cap").to_string();
+        assert!(
+            msg.starts_with("daemon `frpc`: backend-specific.launchd: `stop-action.timeout") && msg.contains("60 s"),
+            "{native}: {msg}"
+        );
+    }
+}
+
 #[skuld::test]
 fn launchd_takes_a_timeout_up_to_its_cap_and_kill_with_no_wait() {
     for line in [

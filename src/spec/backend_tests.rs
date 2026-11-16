@@ -561,6 +561,38 @@ fn launchd_refuses_a_wait_over_its_cap_and_a_wait_without_a_limit() {
     }
 }
 
+/// A signal a `$` still holds is any signal, so only what holds for every signal is judged: a timeout a
+/// backend refuses whatever the signal is, not a `null` that `kill` takes.
+#[skuld::test]
+fn a_pending_signal_does_not_skip_the_refusals_every_signal_has() {
+    let ninety = || Shaped::Parsed(Some(Duration::from_secs(90)));
+    let refused = BackendKind::Launchd
+        .refuse(&with_stop(Shaped::Deferred, ninety()))
+        .unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopTimeout));
+    assert!(Error::from(refused).to_string().contains("60 s"));
+
+    // Task Scheduler decides how long a task waits, so any timeout is a request it cannot honour.
+    let task = |timeout| ShapedSpec {
+        daemon_type: Shaped::Parsed(DaemonKind::Task),
+        ..with_stop(Shaped::Deferred, timeout)
+    };
+    let refused = BackendKind::Scm
+        .refuse(&task(Shaped::Parsed(Some(Duration::from_secs(5)))))
+        .unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopTimeout));
+    // No timeout is the default of every signal; a signal is not judged.
+    assert!(BackendKind::Scm.refuse(&task(Shaped::Absent)).is_ok());
+
+    // What no backend refuses stays unjudged.
+    assert!(BackendKind::Systemd.refuse(&with_stop(Shaped::Deferred, ninety())).is_ok());
+    assert!(
+        BackendKind::Launchd
+            .refuse(&with_stop(Shaped::Deferred, Shaped::Parsed(Some(Duration::from_secs(60)))))
+            .is_ok()
+    );
+}
+
 #[skuld::test]
 fn launchd_judges_only_the_timeout_an_override_wrote() {
     let long = with_stop(Shaped::Absent, Shaped::Parsed(Some(Duration::from_secs(90))));

@@ -266,18 +266,13 @@ impl BackendKind {
 /// What `backend` cannot honour of the `stop-action` `spec` carries ([`StopAction::refuse`]). `only` limits
 /// the verdict to what an override supplied (see [`Supplied`]); `None` judges whatever the merged spec holds.
 ///
-/// A value a `$` still holds is not judged: a later pass knows it. A signal that is held leaves nothing to
-/// judge; a timeout, type or protocol that is held is judged as the value that refuses nothing.
+/// A value a `$` still holds is judged as far as every value it could become is refused alike: a type or
+/// protocol that is held as the value that refuses nothing, a timeout that is held as its default, and a
+/// signal that is held only by what is refused of the timeout whatever the signal is.
 fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Supplied>) -> Result<(), Refused> {
-    // The leaves as resolve will settle them: an absent one is its default.
-    let signal = match &spec.stop_signal {
-        Shaped::Parsed(signal) => *signal,
-        Shaped::Absent => StopAction::default().send_signal,
-        Shaped::Deferred => return Ok(()),
-    };
     let timeout = match &spec.stop_timeout {
-        Shaped::Parsed(timeout) => *timeout,
-        Shaped::Absent | Shaped::Deferred => StopAction::default_timeout(signal),
+        Shaped::Parsed(timeout) => Some(*timeout),
+        Shaped::Absent | Shaped::Deferred => None,
     };
     let kind = match &spec.daemon_type {
         Shaped::Parsed(kind) => *kind,
@@ -287,11 +282,15 @@ fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Su
         (Shaped::Deferred, _) | (_, Shaped::Absent | Shaped::Deferred) => Protocol::Plain,
         (_, Shaped::Parsed(protocol)) => *protocol,
     };
-    let refusals = StopAction {
-        send_signal: signal,
-        timeout,
+    let judge = |signal: Option<StopSignal>| {
+        StopAction::from_leaves(signal, timeout).refuse(backend, kind, protocol)
+    };
+    let refusals = match &spec.stop_signal {
+        Shaped::Parsed(signal) => judge(Some(*signal)),
+        Shaped::Absent => judge(None),
+        // Any signal but `kill` has the same refusals of a timeout.
+        Shaped::Deferred => judge(Some(StopSignal::Terminate)).holding_for_every_signal(judge(Some(StopSignal::Kill))),
     }
-    .refuse(backend, kind, protocol)
     .only(
         only.is_none_or(|supplied| supplied.stop_signal),
         only.is_none_or(|supplied| supplied.stop_timeout),

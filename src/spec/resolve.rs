@@ -620,10 +620,10 @@ fn settled_stop_action(
     signal: Shaped<StopSignal>,
     timeout: Shaped<Option<Duration>>,
 ) -> Result<StopAction, Error> {
-    let send_signal = settled(id, "stop-action.send-signal", signal)?.unwrap_or(StopAction::default().send_signal);
-    let timeout =
-        settled(id, "stop-action.timeout", timeout)?.unwrap_or_else(|| StopAction::default_timeout(send_signal));
-    Ok(StopAction { send_signal, timeout })
+    Ok(StopAction::from_leaves(
+        settled(id, "stop-action.send-signal", signal)?,
+        settled(id, "stop-action.timeout", timeout)?,
+    ))
 }
 
 /// A defect of this crate, not of any manifest: something an earlier step ruled out happened. An
