@@ -121,6 +121,31 @@ fn a_write_leaves_no_partial_record_and_removes_a_leftover_temp() {
 
 // pruning =============================================================================================================
 
+/// A prune whose first listing is taken, then a pin and a record that is newer than it appear, as
+/// they can between any two steps of a prune. Listing records before pins is what makes the pin
+/// visible whenever a record newer than it is: a prune that read the pins first would not see this
+/// pin, and would delete the record the pin is waiting for.
+#[skuld::test]
+fn a_prune_reads_the_records_before_the_pins() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let pin = std::cell::RefCell::new(None);
+
+    runs.prune_listing(&instance(1), || {
+        let listing = runs.entries();
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            *pin.borrow_mut() = Some(runs.pin().unwrap());
+            runs.write(&record(2, 2)).unwrap();
+        }
+        listing
+    });
+
+    assert_eq!(calls.get(), 2, "the records, then the pins");
+    assert!(runs.read(&instance(2)).unwrap().is_some());
+}
+
 #[skuld::test]
 fn a_write_in_flight_keeps_its_temp_file_from_a_prune() {
     let (_dir, runs) = fixture();
@@ -240,6 +265,22 @@ fn remove_all_clears_the_directory_and_its_pins() {
 
     assert!(!runs.dir.exists());
     runs.remove_all().unwrap();
+}
+
+#[skuld::test]
+fn remove_all_while_a_run_holds_a_pin_removes_the_directory_and_the_pins_reader_is_told_why() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let pin = runs.pin().unwrap();
+
+    runs.remove_all().unwrap();
+
+    assert!(!runs.dir.exists());
+    let error = runs.appeared(&pin).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let text = error.to_string();
+    assert!(text.contains("uninstalled"), "{text}");
+    assert!(text.contains(&runs.dir.display().to_string()), "{text}");
 }
 
 // the directory's permissions =========================================================================================

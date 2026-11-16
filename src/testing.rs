@@ -50,6 +50,14 @@ pub fn spawn_contained(program: &str, args: &[&str]) -> cosca::Child {
         .unwrap_or_else(|e| panic!("cannot spawn `{program}`: {e}"))
 }
 
+/// The machine's `%ProgramData%`, as the library locates it for the shim's log and the run records.
+/// A machine that cannot name it fails the calling test.
+#[cfg(windows)]
+pub fn program_data() -> PathBuf {
+    crate::backend::scm::folder::program_data()
+        .unwrap_or_else(|e| panic!("cannot locate %ProgramData%: {}", e.report()))
+}
+
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
 /// a test never takes a placeholder for a SID.
 #[cfg(windows)]

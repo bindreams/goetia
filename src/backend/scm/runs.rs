@@ -166,9 +166,22 @@ impl Runs {
     }
 
     /// The records that are not in `pin`'s listing, the earliest `started` first (ties by instance).
+    ///
+    /// A directory that is gone is a task uninstalled while its `run` waited ([`Runs::remove_all`]):
+    /// an error of kind `NotFound` that says so.
     pub(crate) fn appeared(&self, pin: &Pin) -> io::Result<Vec<RunRecord>> {
+        let entries = self.entries().map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "the run records in {} are gone: the task was uninstalled while a run waited for it",
+                    self.dir.display()
+                ),
+            ),
+            _ => e,
+        })?;
         let mut appeared = Vec::new();
-        for entry in self.entries()? {
+        for entry in entries {
             let Entry::Record(instance) = entry else { continue };
             if pin.listing.contains(&instance) {
                 continue;
@@ -183,7 +196,10 @@ impl Runs {
     }
 
     /// Removes the directory and everything in it, pins too: the task is uninstalled. A directory
-    /// that is not there is already removed.
+    /// that is not there is already removed. Uninstalling stops the task first; a `run` that still
+    /// waits then is the user's own concurrent action, and does not hold the removal up: the
+    /// directory goes at once (a pin's holder keeps its open handle, which no longer names a file),
+    /// and that `run`'s next [`Runs::appeared`] fails saying so.
     pub(crate) fn remove_all(&self) -> io::Result<()> {
         match fs::remove_dir_all(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -192,13 +208,23 @@ impl Runs {
     }
 
     /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record
-    /// but `own` and every temp file. The directory is listed first, so a pin taken after the listing
-    /// has everything listed in its own, and only what was listed is removed. A file that cannot be
-    /// removed now (a write in flight holds its temp file) is for the next write.
+    /// but `own` and every temp file. A file that cannot be removed now (a write in flight holds its
+    /// temp file) is for the next write.
     fn prune(&self, own: &InstanceId) {
-        let Ok(entries) = self.entries() else { return };
+        self.prune_listing(own, || self.entries());
+    }
+
+    /// [`Runs::prune`] over `list`, which is called twice: the first listing decides what may be
+    /// deleted, the second what is pinned. **That order keeps a waiting reader's records.** A record
+    /// written after a pin was taken is in the first listing only if the pin already existed, so the
+    /// second shows it; a pin taken after the first listing has every record of the first in its own
+    /// listing. One listing would rest on the order a directory read returns a pin and a record in,
+    /// which is not promised; pins read first would miss a pin taken between the two.
+    fn prune_listing(&self, own: &InstanceId, list: impl Fn() -> io::Result<Vec<Entry>>) {
+        let Ok(entries) = list() else { return };
+        let Ok(pins) = list() else { return };
         let mut held = false;
-        for entry in &entries {
+        for entry in &pins {
             if let Entry::Pin(path) = entry {
                 held |= files::is_held(path);
             }

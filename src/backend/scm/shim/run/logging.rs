@@ -15,13 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use super::os::{Channels, Real, Severity};
+use super::service::TABLE_NAME;
 use crate::backend::scm::folder::program_data;
+use crate::error::Result;
 
 /// The shim's failure log: composes the two channels for one service run. One shim serves one
 /// service, so one daemon log path.
 pub(crate) struct Log {
     channels: Arc<dyn Channels>,
-    default_dir: PathBuf,
+    /// `None` when the machine's `%ProgramData%` could not be located: there is then no default file.
+    default_dir: Option<PathBuf>,
     daemon_log: OnceLock<PathBuf>,
 }
 
@@ -30,30 +33,53 @@ impl Log {
     pub(crate) fn new(channels: Arc<dyn Channels>, default_dir: PathBuf) -> Log {
         Log {
             channels,
-            default_dir,
+            default_dir: Some(default_dir),
             daemon_log: OnceLock::new(),
         }
     }
 
     /// The production log: the real channels, defaulting to `%ProgramData%\Goetia\logs\`
-    /// ([`program_data`]). A machine that cannot name its `%ProgramData%` leaves the file channels
-    /// with `C:\ProgramData`, which fails to open where it is not there, and the Event Log still
-    /// gets every line.
+    /// ([`program_data`]).
     pub(crate) fn real() -> Log {
-        let program_data = program_data().unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"));
-        Log::new(Arc::new(Real), program_data.join("Goetia").join("logs"))
+        Log::from_program_data(Arc::new(Real), program_data())
+    }
+
+    /// A log over `channels` for the `%ProgramData%` that `found` says. When it was not found there
+    /// is no default file, since no other place is the machine's: failures go to the daemon's own log
+    /// once [`Log::set_daemon_log`] names one, and to the Event Log. The first Event Log line says
+    /// why there is no default file.
+    pub(crate) fn from_program_data(channels: Arc<dyn Channels>, found: Result<PathBuf>) -> Log {
+        match found {
+            Ok(program_data) => Log::new(channels, program_data.join("Goetia").join("logs")),
+            Err(e) => {
+                let log = Log {
+                    channels,
+                    default_dir: None,
+                    daemon_log: OnceLock::new(),
+                };
+                log.failure(
+                    TABLE_NAME,
+                    &format!(
+                        "no log file: the machine's %ProgramData% could not be located: {}",
+                        e.report()
+                    ),
+                );
+                log
+            }
+        }
     }
 
     /// `<default dir>\<id>.log` — derivable from `id` alone. This is where a failure goes before
     /// the spec is decoded or when the daemon's log cannot be opened, and the daemon's own log when
-    /// `goetia.yaml` sets no `logs:` ([`Log::daemon_log_path`]).
-    pub(crate) fn default_log_path(&self, id: &str) -> PathBuf {
-        self.default_dir.join(format!("{id}.log"))
+    /// `goetia.yaml` sets no `logs:` ([`Log::daemon_log_path`]). `None` when the machine's
+    /// `%ProgramData%` could not be located.
+    pub(crate) fn default_log_path(&self, id: &str) -> Option<PathBuf> {
+        self.default_dir.as_ref().map(|dir| dir.join(format!("{id}.log")))
     }
 
     /// The daemon's log: `logs` from its spec, or [`Log::default_log_path`] when unset.
-    pub(crate) fn daemon_log_path(&self, id: &str, logs: Option<&Path>) -> PathBuf {
-        logs.map_or_else(|| self.default_log_path(id), Path::to_path_buf)
+    pub(crate) fn daemon_log_path(&self, id: &str, logs: Option<&Path>) -> Option<PathBuf> {
+        logs.map(Path::to_path_buf).or_else(|| self.default_log_path(id))
     }
 
     /// From now on, failures go to `path` (see [`Log::daemon_log_path`]) instead of the default.
@@ -85,10 +111,12 @@ impl Log {
     fn report(&self, id: &str, severity: Severity, message: &str) {
         let line = failure_line(id, message);
         eprintln!("{line}");
-        let default = self.default_log_path(id);
-        let _ = log_destinations(self.daemon_log.get().map(PathBuf::as_path), default)
-            .iter()
-            .any(|path| self.channels.append(path, &line).is_ok());
+        let daemon_log = self.daemon_log.get().map(PathBuf::as_path);
+        let files = match self.default_log_path(id) {
+            Some(default) => log_destinations(daemon_log, default),
+            None => daemon_log.map(Path::to_path_buf).into_iter().collect(),
+        };
+        let _ = files.iter().any(|path| self.channels.append(path, &line).is_ok());
         self.channels.event_log(severity, &line);
     }
 }

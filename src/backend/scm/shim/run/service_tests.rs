@@ -48,6 +48,11 @@ const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.
 /// A `protocol: plain` daemon. Nothing runs it: the `Fake` states what happens to it, and opens its
 /// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
+    spec_logging_to(Some(PathBuf::from(DAEMON_LOG)))
+}
+
+/// [`spec`], with the `logs:` that is given.
+fn spec_logging_to(logs: Option<PathBuf>) -> DaemonSpec {
     let command = [
         POWERSHELL,
         "-NoProfile",
@@ -60,7 +65,7 @@ fn spec() -> DaemonSpec {
         ServiceFields {
             common: DaemonFields {
                 name: "goetia-shim launch test".to_string(),
-                logs: Some(PathBuf::from(DAEMON_LOG)),
+                logs,
                 ..base.common
             },
             restart: Restart::Always,
@@ -307,6 +312,33 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     drop(launched);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert!(daemon.dropped());
+}
+
+#[skuld::test]
+fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new();
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+    let log = Arc::new(Log::from_program_data(
+        fake.channels(),
+        Err(crate::error::Error::os(
+            "locate %ProgramData%",
+            std::io::Error::other("x"),
+        )),
+    ));
+    // What `from_program_data` said of itself.
+    assert_eq!(fake.take_failures().len(), 1);
+
+    let launched = launch(&spec_logging_to(None), &Supervisor::new(fake.os(), log), ID);
+
+    assert!(launched.is_ok(), "a daemon with nowhere to log was not run");
+    assert_one_failure(&fake.take_failures(), ID, NO_LOG_FILE);
+    assert_eq!(fake.calls(Op::Spawn), 1);
+
+    // The un-handed waiter ends on drop; consume its end.
+    drop(launched);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
 // run_daemon ==========================================================================================================

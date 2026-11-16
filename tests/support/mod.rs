@@ -88,12 +88,10 @@ pub fn random_test_id() -> String {
     format!("goetia-test-{:016x}", rand::rng().random::<u64>())
 }
 
-/// The host's `%ProgramData%`.
+/// The host's `%ProgramData%`, as the library locates it.
 #[cfg(windows)]
 pub fn program_data() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("%ProgramData% is not set on this host"))
+    goetia::testing::program_data()
 }
 
 /// Where the shim of service `id` writes a failure it reports before it has read the daemon's

@@ -96,7 +96,9 @@ fn run_service(id: &str, log: Arc<Log>) {
         }
     };
 
-    log.set_daemon_log(log.daemon_log_path(id, blob.spec.common().logs.as_deref()));
+    if let Some(path) = log.daemon_log_path(id, blob.spec.common().logs.as_deref()) {
+        log.set_daemon_log(path);
+    }
     log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
     let reported = run_daemon(
         &blob.spec,
@@ -509,6 +511,11 @@ fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running
     ))
 }
 
+/// Said when the daemon has no `logs:` and the machine's `%ProgramData%` could not be located, so no
+/// default log file exists either.
+const NO_LOG_FILE: &str =
+    "no log file for this daemon's output (no `logs:`, and no default log directory); it is still being run";
+
 fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
     format!(
         "open log file {}: {e} (this daemon's output will not be captured; it is still being run)",
@@ -537,8 +544,11 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
     cmd.envs(spec.common().env.clone());
     cmd.contain();
 
-    let log_path = log.daemon_log_path(id, spec.common().logs.as_deref());
-    match os.open_log(&log_path) {
+    let opened = match log.daemon_log_path(id, spec.common().logs.as_deref()) {
+        Some(path) => os.open_log(&path).map_err(|e| log_open_failed(&path, &e)),
+        None => Err(NO_LOG_FILE.to_string()),
+    };
+    match opened {
         Ok(file) => {
             // Merges are resolved in a second pass at spawn time (`cosca`'s
             // `resolve_stdio`), not by `Command::fd` consulting whatever is
@@ -552,8 +562,8 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
             stdio_set(log, id, cmd.stdout(Stdio::from_file(file)));
             stdio_set(log, id, cmd.stderr(Stdio::merge(Fd::STDOUT)));
         }
-        Err(e) => {
-            log.failure(id, &log_open_failed(&log_path, &e));
+        Err(message) => {
+            log.failure(id, &message);
             // Same reasoning as above, for `Stdio::null()`.
             stdio_set(log, id, cmd.stdout(Stdio::null()));
             stdio_set(log, id, cmd.stderr(Stdio::null()));

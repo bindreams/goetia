@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard};
+use crate::error::Error;
 
 const LINE: &str = "goetia-shim[svc]: the line";
 
@@ -96,8 +97,56 @@ fn daemon_log_path_is_the_spec_s_logs_or_the_default() {
 
     assert_eq!(
         (log.daemon_log_path("svc", Some(set)), log.daemon_log_path("svc", None)),
-        (set.to_path_buf(), Path::new("logs").join("svc.log"))
+        (Some(set.to_path_buf()), Some(Path::new("logs").join("svc.log")))
     );
+}
+
+#[skuld::test]
+fn a_machine_that_cannot_name_program_data_has_no_default_file_and_the_event_log_says_why_first() {
+    let fake = FakeGuard::new();
+    let cause = Error::os("locate %ProgramData%", std::io::Error::other("no such known folder"));
+    let why = cause.report().to_string();
+
+    let log = Log::from_program_data(fake.channels(), Err(cause));
+
+    let first = fake.take_channel_calls();
+    let [ChannelCall::EventLog { severity, line }] = first.as_slice() else {
+        panic!("the only call is the Event Log's, with nothing appended to a file: {first:?}");
+    };
+    assert_eq!(*severity, Severity::Error);
+    assert!(line.contains(&why), "{line}");
+    assert!(line.contains("no log file"), "{line}");
+    let set = Path::new(r"D:\logs\mine.log");
+    assert_eq!(
+        (
+            log.default_log_path("svc"),
+            log.daemon_log_path("svc", None),
+            log.daemon_log_path("svc", Some(set))
+        ),
+        (None, None, Some(set.to_path_buf()))
+    );
+    log.failure("svc", "the line");
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![reported()],
+        "a failure goes to the Event Log alone"
+    );
+}
+
+#[skuld::test]
+fn a_log_with_no_default_file_still_writes_the_daemons_own() {
+    let fake = FakeGuard::new();
+    let log = Log::from_program_data(
+        fake.channels(),
+        Err(Error::os("locate %ProgramData%", std::io::Error::other("x"))),
+    );
+    fake.take_channel_calls();
+    let daemon = Path::new("daemon").join("svc.log");
+    log.set_daemon_log(daemon.clone());
+
+    log.failure("svc", "the line");
+
+    assert_eq!(fake.take_channel_calls(), vec![appended(&daemon, true), reported()]);
 }
 
 #[skuld::test]
@@ -165,6 +214,6 @@ fn program_data_is_the_known_folder_and_logging_uses_it() {
     );
     assert_eq!(
         Log::real().default_log_path("svc"),
-        program_data.join("Goetia").join("logs").join("svc.log")
+        Some(program_data.join("Goetia").join("logs").join("svc.log"))
     );
 }
