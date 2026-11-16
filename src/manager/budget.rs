@@ -48,6 +48,15 @@ impl Budget {
         self.start_at(Instant::now())
     }
 
+    /// This budget with `by` added to a bound: what a verb reports having waited when part of its wait was
+    /// not counted against it ([`Deadline::extended`]). `Immediate` and `Unbounded` have no bound to move.
+    pub fn extended(self, by: Duration) -> Budget {
+        match self {
+            Budget::Bounded(d) => Budget::Bounded(d.saturating_add(by)),
+            other => other,
+        }
+    }
+
     /// [`Self::start`] as of `now`, so a test can hold the instant fixed.
     fn start_at(self, now: Instant) -> Deadline {
         match self {
@@ -189,6 +198,13 @@ impl Deadline {
     /// not an invented timeout.
     pub fn at(&self) -> Option<Instant> {
         self.0
+    }
+
+    /// This deadline moved `by` later: for a wait that is not the caller's to spend, which then does not
+    /// count against the budget. A deadline too far for the platform's clock never expires, as in
+    /// [`Budget::start`].
+    pub fn extended(self, by: Duration) -> Deadline {
+        Deadline(self.0.and_then(|at| at.checked_add(by)))
     }
 
     /// Time left until expiry, saturating at `Duration::ZERO` rather than

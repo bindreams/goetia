@@ -341,3 +341,37 @@ fn millis_ceil_of_the_largest_duration_saturates_without_panicking() {
     // Pins the saturation as a clamp at the top, not a blanket answer.
     assert_eq!(millis_ceil(Duration::from_millis(u32::MAX as u64 - 2)), u32::MAX - 2);
 }
+
+// Extension ===========================================================================================================
+
+/// A wait that is not the caller's to spend moves the end of the budget by exactly its length: the
+/// deadline and the budget a timeout reports move together, and a budget that does not end stays so.
+#[skuld::test]
+fn a_wait_that_is_not_counted_extends_the_deadline_and_the_budget_by_its_length() {
+    let now = Instant::now();
+    let by = Duration::from_secs(3);
+
+    let deadline = Budget::Bounded(Duration::from_secs(10)).start_at(now).extended(by);
+
+    assert_eq!(deadline.at(), Some(now + Duration::from_secs(13)));
+    assert_eq!(
+        Budget::Bounded(Duration::from_secs(10)).extended(by),
+        Budget::Bounded(Duration::from_secs(13))
+    );
+    assert_eq!(Budget::Unbounded.start_at(now).extended(by).at(), None);
+    assert_eq!(Budget::Unbounded.extended(by), Budget::Unbounded);
+    assert_eq!(Budget::Immediate.extended(by), Budget::Immediate);
+}
+
+/// A zero bound has run out when the wait began, and the wait is not counted: it has run out when the
+/// wait ends, not `by` after.
+#[skuld::test]
+fn a_zero_bound_extended_by_a_wait_has_run_out_when_the_wait_ends() {
+    let began = Instant::now();
+    let by = Duration::from_millis(50);
+    let ends = began + by;
+
+    let deadline = Budget::Bounded(Duration::ZERO).start_at(began).extended(by);
+
+    assert_eq!(deadline.remaining_at(ends), Some(Duration::ZERO));
+}

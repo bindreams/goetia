@@ -2487,7 +2487,7 @@ fn procinfo_naming(pid: u32) -> Entry {
 }
 
 /// `procinfo` of a pid no job owns.
-fn procinfo_not_naming(pid: u32) -> Entry {
+pub(super) fn procinfo_not_naming(pid: u32) -> Entry {
     reply(
         &["procinfo", &pid.to_string()],
         exited(
