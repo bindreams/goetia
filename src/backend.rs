@@ -10,10 +10,14 @@
 //! [`DaemonSpec`]: crate::spec::DaemonSpec
 
 #[cfg(unix)]
+pub(crate) mod account;
+#[cfg(unix)]
 pub(crate) mod bounded;
 #[cfg(unix)]
 pub(crate) mod client;
 mod contract;
+#[cfg(unix)]
+pub(crate) mod created_dirs;
 pub(crate) mod kill;
 pub mod launchd;
 pub mod scm;
@@ -25,7 +29,7 @@ mod unreaped;
 
 pub(crate) use contract::{
     Backend, Decoded, InstalledDefinition, InstalledService, Marker, NativeRestart, OutputSource, ReadOutcome,
-    RunHandle, Scan, ScanEntry, Unnamed, WriteOutcome,
+    RunHandle, Scan, ScanEntry, Settle, Standing, Unnamed, WriteOutcome,
 };
 
 /// A platform account, already resolved from [`crate::spec::User`] by the

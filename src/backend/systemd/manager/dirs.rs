@@ -1,135 +1,105 @@
-//! Creating and owning the parent directories `logs` and `cwd` need, which a unit fails at start without. Only path
-//! components a call actually creates are touched; an already-existing directory's mode and
-//! ownership are left alone.
+//! The parent directories `logs` and `cwd` need, which a unit fails at start without, made by
+//! [`CreatedDirs`] and judged for the one thing systemd does as root with them.
 
-use std::fs;
-use std::io;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
-use std::process::Command;
 
+use nix::unistd::Uid;
+
+use crate::backend::account::{find_uid, resolve_account};
+use crate::backend::created_dirs::{CreatedDirs, Owner, refuse_writable_log_dir};
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, DaemonSpec, User};
 
-/// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself.
-/// Runs while still elevated.
-pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
-    if let Some(logs) = &spec.common().logs
-        && let Some(parent) = logs.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        ensure_dir(parent, &spec.common().user)?;
+/// Make the parent of `logs` and `cwd` where they are missing, refuse a log that root's `append:` open
+/// could be led astray in, and hand `cwd` to a non-root account, all before this returns: the unit can
+/// run as soon as the write that follows starts, and finds every directory as it is to be. systemd opens
+/// the file before it drops privileges and follows a symlink, so a directory an account can write is a
+/// way for it to make root append to any file. The log directory is therefore never handed over, a log
+/// in or under `cwd` is refused (it is to be the account's), and so is an existing directory the
+/// account can write, and an existing log that is a link or the account's.
+///
+/// Everything is judged first, on what [`CreatedDirs::plan`] read, and nothing is made until it all
+/// passes, except one thing only what is made can show: a log's directory that is `cwd`, or in it, is
+/// found when [`CreatedDirs::make`] reaches `cwd` (a file system that ignores case makes two names
+/// one directory), and what was made is then taken back. Runs while still elevated.
+///
+/// A `user` that is a number systemd will never run is refused where the definition is rendered for an
+/// install (see [`numeric_uid`]), not here. Here an account is looked up only when `cwd` is to be made
+/// and handed to it: an install that hands nothing over does not need it to exist yet (`sysusers` or a
+/// package may make it later), and an unknown name then fails before anything is made. A uid with no
+/// passwd entry is handed the directory by number, with the group left as it was made.
+pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -> Result<()> {
+    let common = spec.common();
+    let logs_parent = common
+        .logs
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let log = logs_parent.map(|parent| created.plan(parent)).transpose()?;
+    let cwd = common.cwd.as_deref().map(|cwd| created.plan(cwd)).transpose()?;
+
+    if let (Some(logs), Some(log)) = (&common.logs, &log) {
+        refuse_writable_log_dir(logs, log, common.id.as_str(), created)?;
     }
-    if let Some(cwd) = &spec.common().cwd {
-        ensure_dir(cwd, &spec.common().user)?;
-    }
-    Ok(())
+    let owner = match &cwd {
+        Some(cwd) if cwd.makes() => owner_of(&common.user)?,
+        _ => None,
+    };
+
+    created.make(
+        log.map(|log| (log, None))
+            .into_iter()
+            .chain(cwd.map(|cwd| (cwd, owner)))
+            .collect(),
+    )
 }
 
-/// Create `dir` (and any missing parents), `chmod`ing and `chown`ing only the path components this
-/// call actually creates. `spec.cwd`/`logs` are user-supplied absolute paths with no restriction to a
-/// Goetia-owned root, so reassigning mode/ownership unconditionally — including when `dir` or an
-/// ancestor already existed — would let a manifest silently widen or reassign an arbitrary existing
-/// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed (or
-/// that a concurrent, racing install created first — see the loop below) is left exactly as it was;
-/// only a non-directory at that path is an error.
-pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
-    let mut missing = Vec::new();
-    let mut cursor = dir;
-    loop {
-        match fs::symlink_metadata(cursor) {
-            Ok(_) => break,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                missing.push(cursor);
-                match cursor.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
-                    _ => break,
-                }
-            }
-            Err(e) => return Err(Error::os_at("stat", cursor, e)),
-        }
-    }
-
-    let owner = chown_target(user);
-    // Whether *this call* is the one that actually created `dir` itself (as opposed to every
-    // ancestor above it, or `dir` already existing, or a concurrent racing install creating it
-    // first — see the `AlreadyExists` arm below). Only then do the post-loop checks get skipped:
-    // anything else means this call did not create `dir`, which is exactly the condition the
-    // do-not-touch-an-existing-directory rule above is about.
-    let mut created_dir = false;
-    // Outermost-first, so each `create_dir` always has an existing parent.
-    for path in missing.into_iter().rev() {
-        // The mode is set atomically with creation (`DirBuilder`, not a separate `set_permissions`
-        // after a default `mkdir`) so the directory is never briefly `0777`-minus-umask — under a
-        // permissive umask (e.g. `000`, common in some CI/root contexts) a plain `create_dir` +
-        // later `chmod` would leave it world-writable for the duration in between, letting any local
-        // user plant a file or symlink in what is about to become a daemon's `cwd`/log directory.
-        // `mkdir`'s mode argument is itself still umask-masked, so the explicit `chmod` after
-        // creation remains necessary to guarantee exactly 0755 regardless of umask — the ordering
-        // change here only ever narrows the window, from "up to 0777" down to "at most 0755".
-        match fs::DirBuilder::new().mode(0o755).create(path) {
-            Ok(()) => {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-                    .map_err(|e| Error::os_at("chmod", path, e))?;
-                if let Some(owner) = &owner {
-                    chown(path, owner)?;
-                }
-                if path == dir {
-                    created_dir = true;
-                }
-            }
-            // Two installs sharing a parent directory (e.g. two daemons both under `logs:
-            // /var/log/goetia/*.log`) can both see this component missing and both race to create
-            // it. The loser must not fail outright — nor may it chmod/chown a component it did not
-            // itself create, per this function's own do-not-touch-existing-dirs rule above.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(Error::os_at("create directory", path, e)),
-        }
-    }
-
-    if !created_dir {
-        let meta = fs::metadata(dir).map_err(|e| Error::os_at("stat", dir, e))?;
-        if !meta.is_dir() {
-            return Err(Error::NotADirectory {
-                path: dir.to_path_buf(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn chown(path: &Path, owner: &str) -> Result<()> {
-    // A bare owner, deliberately with no trailing `:` — `chown owner: path` is what `coreutils`
-    // documents for "also set the group to the owner's login group", but GNU coreutils rejects that
-    // form outright for a *numeric* owner (verified: `chown 65534: /x` fails with "chown: invalid
-    // spec: '65534:'", exit 1, even though uid 65534 has a passwd entry; `chown nobody: /x` and
-    // `chown 65534 /x` both succeed). Since the daemon runs *as* this exact account, owner-bit access
-    // already suffices without also reassigning the group.
-    let output = Command::new("chown")
-        .arg(owner)
-        .arg(path)
-        .output()
-        .map_err(|e| Error::spawn(format!("chown {owner} {}", path.display()), e))?;
-    if !output.status.success() {
-        return Err(Error::command(
-            format!("chown {owner} {}", path.display()),
-            output.status,
-            &output.stderr,
-        ));
-    }
-    Ok(())
-}
-
-/// The account name/uid to `chown` a directory to so a non-root daemon can use it, or `None` for
-/// `User::Root` (directories created by this — already-elevated — process are already root-owned).
-fn chown_target(user: &User) -> Option<String> {
-    match user {
-        User::Root => None,
-        User::Name(name) => Some(name.clone()),
-        User::Id(AccountId::Uid(uid)) => Some(uid.to_string()),
-        // `identity_for` rejects a SID user before `install`/`preview_install` ever reaches
-        // `ensure_parent_dirs`, so a validated `spec.user` reaching this arm is impossible — not a
-        // silently-skipped case.
-        User::Id(AccountId::Sid(_)) => unreachable!("a SID user must already have been rejected by identity_for"),
+/// Whom `cwd` is handed to for `user`. Root, by any spelling (uid 0 is root whatever names it), is
+/// handed nothing: the directory is already root's. A uid that no passwd entry has is handed it by
+/// number, with no group to read, so the group stays as made.
+fn owner_of(user: &User) -> Result<Option<Owner>> {
+    match numeric_uid(user)? {
+        Some(0) => Ok(None),
+        Some(uid) => match find_uid(uid)? {
+            Some(account) => account.owner(),
+            None => Owner::new(Uid::from_raw(uid), None).map(Some),
+        },
+        None if matches!(user, User::Root) => Ok(None),
+        None => resolve_account(user)?.owner(),
     }
 }
+
+/// The uid `user` is, if it is a number: a uid, or a name that is the canonical decimal spelling of
+/// one (digits only, no sign, no leading zero except `0`), which systemd reads as a uid and never looks
+/// up as the name of an account made of digits. Any other spelling is a name, so `None`.
+///
+/// An error for 65535 and 4294967295, which `uid_is_valid` refuses: systemd does not load a unit that
+/// names them (measured on systemd 255). Any other uid is accepted, whether or not a passwd entry has it
+/// yet, as a name is: until the account exists every start of the unit fails with `217/USER`. The
+/// refusal is the spec's, so `render_for_install` makes it, for `preview_install` and `install` alike.
+pub(super) fn numeric_uid(user: &User) -> Result<Option<u32>> {
+    let uid = match user {
+        User::Id(AccountId::Uid(uid)) => *uid,
+        User::Name(name) => match canonical_uid(name) {
+            Some(uid) => uid,
+            None => return Ok(None),
+        },
+        User::Root | User::Id(AccountId::Sid(_)) => return Ok(None),
+    };
+    if uid == 0xFFFF || uid == u32::MAX {
+        return Err(Error::AccountLookup {
+            detail: format!("systemd will not run a unit as uid {uid}: it is not a valid uid"),
+            source: None,
+        });
+    }
+    Ok(Some(uid))
+}
+
+fn canonical_uid(name: &str) -> Option<u32> {
+    let canonical = name.bytes().all(|b| b.is_ascii_digit()) && (name == "0" || !name.starts_with('0'));
+    canonical.then(|| name.parse().ok()).flatten()
+}
+
+#[cfg(test)]
+#[path = "dirs_tests.rs"]
+mod dirs_tests;

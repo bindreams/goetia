@@ -164,6 +164,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             source: std::io::Error::other("x"),
         },
         Error::NotADirectory { path: PathBuf::new() },
+        Error::DirectoryRefused {
+            path: PathBuf::new(),
+            why: String::new(),
+        },
         Error::InstalledUnreadable {
             id: id(),
             source: Box::new(not_installed()),
@@ -780,6 +784,19 @@ fn report_of_a_path_that_is_not_a_directory() {
         .to_string(),
         "/p already exists and is not a directory; goetia cannot use it as a daemon's cwd or as its log directory"
     );
+}
+
+#[skuld::test]
+fn report_of_a_refused_directory_names_the_path_and_why() {
+    let e = Error::DirectoryRefused {
+        path: PathBuf::from("/p"),
+        why: "it is not under a root; create it first".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "refusing /p for a daemon's cwd or log directory: it is not under a root; create it first"
+    );
+    assert!(std::error::Error::source(&e).is_none());
 }
 
 #[skuld::test]
