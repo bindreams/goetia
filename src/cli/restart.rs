@@ -129,8 +129,8 @@ fn leg(requested: Budget, left: Budget) -> Leg {
 /// A bounded budget with nothing left, as the stop leg is handed one: the
 /// least bound there is. It waits, so every backend takes the path of a
 /// bounded stop that ran out (stop issued, then `WaitTimeout`, or `Ok` if
-/// stopped is confirmed after all), never `Immediate`'s, which on launchd
-/// waits for the job to be gone unbounded.
+/// stopped is confirmed after all), never `Immediate`'s, which returns `Ok`
+/// having confirmed nothing.
 const SPENT: Budget = Budget::Bounded(Duration::from_nanos(1));
 
 /// The budget the stop leg is issued under. Always one: the stop goes out

@@ -32,8 +32,10 @@ impl Budget {
     /// under every budget it waits for a queued start's pid and sends the run its
     /// first signal, as every backend's stop is issued. Under `Immediate` it
     /// then returns `Ok`; a zero bound is a bound that has run out, so after
-    /// that signal it sends nothing more, reads `print` once, and returns `Ok`
-    /// if the job is idle, else [`Error::WaitTimeout`](crate::Error::WaitTimeout).
+    /// that signal it sends nothing more, does one reading (`read_up`), and
+    /// returns `Ok` if the job is idle, else
+    /// [`Error::WaitTimeout`](crate::Error::WaitTimeout), a pid launchd has
+    /// not cleared included.
     pub fn waits(self) -> bool {
         !matches!(self, Budget::Immediate | Budget::Bounded(Duration::ZERO))
     }
