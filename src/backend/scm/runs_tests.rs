@@ -26,6 +26,7 @@ const OBJECT_INHERIT: u8 = 0x01;
 const INHERIT_ONLY: u8 = 0x08;
 const ADD_SUBDIRECTORY: u32 = 0x4;
 const DELETE_CHILD: u32 = 0x40;
+const DELETE: u32 = 0x1_0000;
 
 fn id() -> Id {
     Id::try_from("frpc").unwrap()
@@ -927,10 +928,10 @@ fn remove_all_removes_a_directory_at_once_while_a_handle_that_shares_delete_is_o
 }
 
 /// The pause of a directory that is not empty names the smallest path left. A listing that comes back
-/// empty (what was left went in between) pauses all the same, naming the directory: something still holds
-/// the removal back, and a pause with no path would be silent.
+/// empty (what was left went in between) pauses at the pace all the same but names nothing: no handle is
+/// known to hold anything, and a note naming the directory would be false.
 #[skuld::test]
-fn a_directory_that_is_not_empty_pauses_on_what_is_left_and_on_the_directory_when_nothing_is() {
+fn a_directory_that_is_not_empty_pauses_on_what_is_left_and_names_nothing_when_nothing_is() {
     let dir = Path::new(r"C:\runs\frpc");
     let left = [
         Entry::Temp(dir.join("b.json.tmp")),
@@ -942,13 +943,10 @@ fn a_directory_that_is_not_empty_pauses_on_what_is_left_and_on_the_directory_whe
     ];
 
     assert!(matches!(
-        pass_after_not_empty(dir, &left),
+        pass_after_not_empty(&left),
         PassOutcome::Waiting(path) if path == dir.join("a.pin")
     ));
-    assert!(matches!(
-        pass_after_not_empty(dir, &[]),
-        PassOutcome::Waiting(path) if path == dir
-    ));
+    assert!(matches!(pass_after_not_empty(&[]), PassOutcome::Retry));
 }
 
 /// A removal that fails leaves its marker, so that a `run` still backs off: its records are partly gone.
@@ -1037,14 +1035,14 @@ fn inherited_ace(trustee: crate::backend::scm::sid::Sid, mask: u32) -> Ace {
 
 /// What the directory's DACL is for `principal`: SYSTEM and Administrators have full control of it and
 /// of what is in it; the principal may modify the files made in it (an entry that only files inherit),
-/// and has, on the directory itself, what that is without adding a subdirectory and with deleting
-/// entries, so that a principal that replaces another can prune what the other wrote.
+/// and has, on the directory itself, what that is without adding a subdirectory or deleting the directory
+/// and with deleting entries, so that a principal that replaces another can prune what the other wrote.
 fn dacl_for(principal: crate::backend::scm::sid::Sid) -> Vec<Ace> {
     sorted(vec![
         inherited_ace(system(), FULL),
         inherited_ace(administrators(), FULL),
         ace(principal.clone(), MODIFY, OBJECT_INHERIT | INHERIT_ONLY),
-        ace(principal, (MODIFY & !ADD_SUBDIRECTORY) | DELETE_CHILD, 0),
+        ace(principal, (MODIFY & !ADD_SUBDIRECTORY & !DELETE) | DELETE_CHILD, 0),
     ])
 }
 
@@ -1084,13 +1082,18 @@ fn a_directory_that_is_there_gets_a_protected_dacl_naming_the_principal() {
 
     assert_eq!(entries_of(&runs.dir), dacl_for(process_user_sid()));
     // What lets the account that replaces another prune what the other wrote, and keeps it from
-    // making a subdirectory.
+    // making a subdirectory or deleting the directory.
     let own = entries_of(&runs.dir)
         .into_iter()
         .find(|ace| ace.trustee == process_user_sid() && ace.flags == 0)
         .expect("the principal's entry for the directory itself");
     assert_ne!(own.mask & DELETE_CHILD, 0);
     assert_eq!(own.mask & ADD_SUBDIRECTORY, 0);
+    assert_eq!(
+        own.mask & DELETE,
+        0,
+        "the account may not delete or delete-pend its directory"
+    );
 }
 
 #[skuld::test]

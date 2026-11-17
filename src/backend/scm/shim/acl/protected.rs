@@ -105,9 +105,11 @@ mod system {
         /// Administrators have full control of it and of what is made in it; `principal`, the account the
         /// task runs as, may modify the files made in it (`0x1301bf`: read, write, run and delete, but
         /// not change permissions or take ownership; an entry only files inherit) and has, on the
-        /// directory itself, the same without adding a subdirectory (`0x4`) and with deleting entries
-        /// (`0x40`), so that an account that replaces it can prune what it wrote: it holds no entry on
-        /// the files the other made. A SID that is not whole is an error.
+        /// directory itself, the same without adding a subdirectory (`0x4`) and without deleting the
+        /// directory (`DELETE`, `0x10000`), and with deleting entries (`0x40`), so that an account that
+        /// replaces it can prune what it wrote: it holds no entry on the files the other made. Only SYSTEM
+        /// and Administrators can delete, or delete-pend, the directory. A SID that is not whole is an
+        /// error.
         pub(crate) fn for_runs(principal: &Sid) -> Result<Self> {
             let principal = try_sid_display(principal).ok_or_else(|| {
                 Error::os(
@@ -116,7 +118,7 @@ mod system {
                 )
             })?;
             Self::from_sddl(&format!(
-                "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OIIO;0x1301bf;;;{principal})(A;;0x1301fb;;;{principal})"
+                "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OIIO;0x1301bf;;;{principal})(A;;0x1201fb;;;{principal})"
             ))
         }
 

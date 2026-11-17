@@ -168,9 +168,10 @@ mod windows {
         let mut expected = vec![
             allow(system(), FULL, inherit),
             allow(administrators(), FULL, inherit),
-            // The files made in it, and the directory itself without a subdirectory and with delete-child.
+            // The files made in it, and the directory itself without a subdirectory, with delete-child
+            // and without `DELETE` (0x1_0000) on itself.
             allow(me.clone(), 0x13_01BF, OBJECT_INHERIT | INHERIT_ONLY),
-            allow(me, 0x13_01FB, 0),
+            allow(me, 0x12_01FB, 0),
         ];
 
         assert_eq!(wanted.owner, administrators());

@@ -30,7 +30,8 @@ enum Left {
     Disabled,
     /// The task is gone; its run records are not.
     Records,
-    /// There was no task, and nothing was deleted; records an earlier uninstall left are not removed.
+    /// There was no task; run records left for it (by a failed install, an uninstall, or a task deleted
+    /// outside goetia) are not all removed: some may be gone.
     LeftoverRecords,
 }
 
@@ -50,8 +51,8 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
              remove them"
         ),
         Left::LeftoverRecords => format!(
-            "`{id}` is not installed, and the run records an earlier uninstall left could not be removed. Re-run \
-             `goetia daemon uninstall {id}` to remove them"
+            "`{id}` is not installed, and run records left for it could not be removed. Re-run `goetia daemon \
+             uninstall {id}` to remove them"
         ),
     };
     Error::Step {
@@ -99,26 +100,42 @@ impl Scm {
     /// What `uninstall` of an id that is absent does for a task: the run records an `uninstall` that
     /// deleted the task could not remove, and the sweep a service's does.
     pub(in crate::backend::scm) fn task_uninstall_absent(&self, id: &Id) -> Result<()> {
-        self.uninstall_absent_with(id, &Runs::of(&program_data()?, id), InstallLock::acquire)
+        self.uninstall_absent_with(id, &Runs::of(&program_data()?, id), InstallLock::acquire, || {
+            self.service_uninstall_absent()
+        })
     }
 
     /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes
     /// the install lock. The records are removed under it: an install that has just made them holds it,
     /// and would lose them. With no records there is nothing to guard, and nothing is taken. A removal
-    /// that fails says that the id is not installed and that its leftover records remain: nothing was
-    /// deleted.
+    /// that fails says that the id is not installed and that records left for it could not be removed;
+    /// some may be gone by then.
+    ///
+    /// `sweep` runs whether or not the records were removed, after the lock is released. If both fail,
+    /// both errors are kept, the records' first. A `lock` that fails ends the call: the sweep takes the
+    /// same lock.
     pub(super) fn uninstall_absent_with<L>(
         &self,
         id: &Id,
         runs: &Runs,
         lock: impl FnOnce() -> Result<L>,
+        sweep: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        if runs.is_present() {
+        let removed = if runs.is_present() {
             let _lock = lock()?;
             runs.remove_all(waiting_for_records)
-                .map_err(|e| uninstall_failed(id, Left::LeftoverRecords, e))?;
+                .map_err(|e| uninstall_failed(id, Left::LeftoverRecords, e))
+        } else {
+            Ok(())
+        };
+        match (removed, sweep()) {
+            (Ok(()), swept) => swept,
+            (Err(removal), Ok(())) => Err(removal),
+            (Err(first), Err(then)) => Err(Error::Both {
+                first: Box::new(first),
+                then: Box::new(then),
+            }),
         }
-        self.service_uninstall_absent()
     }
 
     /// The task and its records removed, with nothing swept: the caller holds the install lock. See

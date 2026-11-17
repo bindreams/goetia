@@ -478,11 +478,16 @@ fn uninstall_of_an_id_that_is_absent_removes_the_records_under_the_install_lock(
     let locked = Cell::new(false);
 
     scm(&fake)
-        .uninstall_absent_with(&id(), &runs, || {
-            assert!(records_dir.exists(), "the lock is taken before the records go");
-            locked.set(true);
-            Ok(())
-        })
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || {
+                assert!(records_dir.exists(), "the lock is taken before the records go");
+                locked.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
         .unwrap();
 
     assert!(locked.get());
@@ -506,10 +511,15 @@ fn uninstall_of_an_id_that_is_absent_clears_a_marker_left_beside_no_records() {
     let locked = Cell::new(false);
 
     scm(&Fake::new())
-        .uninstall_absent_with(&id(), &runs, || {
-            locked.set(true);
-            Ok(())
-        })
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || {
+                locked.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
         .unwrap();
 
     assert!(locked.get());
@@ -524,7 +534,12 @@ fn uninstall_of_an_id_with_no_records_takes_no_lock() {
     let runs = Runs::of(dir.path(), &id());
 
     scm(&Fake::new())
-        .uninstall_absent_with(&id(), &runs, || -> Result<()> { panic!("there is nothing to guard") })
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || -> Result<()> { panic!("there is nothing to guard") },
+            || Ok(()),
+        )
         .unwrap();
 }
 
@@ -536,12 +551,19 @@ fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_
     crate::backend::scm::test_support::directory_with_a_file(&records_dir.join("pin-odd.pin"));
 
     let failed = scm(&Fake::new())
-        .uninstall_absent_with(&id(), &runs, || -> Result<()> { Ok(()) })
+        .uninstall_absent_with(&id(), &runs, || -> Result<()> { Ok(()) }, || Ok(()))
         .unwrap_err();
 
     let text = failed.to_string();
-    assert!(text.contains("`nightly` is not installed"), "{text}");
+    assert!(
+        text.contains("`nightly` is not installed, and run records left for it could not be removed"),
+        "{text}"
+    );
     assert!(!text.contains("is deleted"), "nothing was deleted: {text}");
+    assert!(
+        !text.contains("earlier uninstall"),
+        "the records may come from a failed install or a task deleted elsewhere: {text}"
+    );
     assert!(
         text.contains("Re-run `goetia daemon uninstall nightly` to remove them"),
         "{text}"
@@ -550,6 +572,56 @@ fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_
         failed.report().to_string().contains("pin-odd.pin"),
         "{}",
         failed.report()
+    );
+}
+
+/// The shim sweep does not depend on the records: a removal that fails does not skip it, and a sweep that
+/// fails too does not hide the records' failure.
+#[skuld::test]
+fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_removed() {
+    let (_dir, records_dir, runs) = records();
+    crate::backend::scm::test_support::directory_with_a_file(&records_dir.join("pin-odd.pin"));
+    let swept = Cell::new(false);
+
+    let failed = scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || -> Result<()> { Ok(()) },
+            || {
+                swept.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+    assert!(swept.get(), "the sweep ran after the records failed");
+    assert!(
+        failed
+            .to_string()
+            .contains("run records left for it could not be removed"),
+        "{failed}"
+    );
+
+    swept.set(false);
+    let both = scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || -> Result<()> { Ok(()) },
+            || {
+                swept.set(true);
+                Err(Error::os("sweep the shim files", io::Error::other("denied")))
+            },
+        )
+        .unwrap_err();
+
+    assert!(swept.get());
+    let said = both.report().to_string();
+    assert!(said.contains("pin-odd.pin"), "the records' failure is kept: {said}");
+    assert!(
+        said.contains("sweep the shim files"),
+        "the sweep's failure is kept: {said}"
     );
 }
 

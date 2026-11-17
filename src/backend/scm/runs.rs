@@ -327,10 +327,10 @@ impl Runs {
     /// SYSTEM or an Administrator can have put one there. Last the directory itself, which a handle that
     /// shares no delete holds (a pause) and which goes at once for any other: not yet empty (a pin being
     /// refused, a file whose delete is pending, what a shim wrote since the listing) pauses it too,
-    /// naming the smallest of the entries left; if none is left by then, it names the directory.
-    /// Every pause names a path. A pause is [`REMOVE_PACE`], then another pass, with no cap: whatever
-    /// holds a file lets go in time, and the user can interrupt the command. A failure ends the removal,
-    /// naming the path and why. A marker left by a removal that died is placed again; an install clears
+    /// naming the smallest of the entries left. If none is left by then, nothing is held: the pause is
+    /// the same, and it names nothing. A pause is [`REMOVE_PACE`], then another pass, with no cap:
+    /// whatever holds a file lets go in time, and the user can interrupt the command. A failure ends the
+    /// removal, naming the path and why. A marker left by a removal that died is placed again; an install clears
     /// it ([`Runs::ensure`]).
     ///
     /// **A limit, stated:** a directory someone placed in the task's directory that a program holds
@@ -343,8 +343,9 @@ impl Runs {
     /// not tell the state that leaves from a refusal: a delete that is pending is not removed. It fails,
     /// naming the path and the error Windows gave, and a re-run finishes once the program has let go.
     ///
-    /// `waiting` is called with the path being waited for, before the pause, and again each time that
-    /// path changes, so the caller can say what is awaited.
+    /// `waiting` is called with the path being held, before the pause, and again each time that path
+    /// changes, so the caller can say what is awaited. A pause with nothing held (see above) makes no
+    /// call.
     pub(crate) fn remove_all(&self, mut waiting: impl FnMut(&Path)) -> Result<()> {
         // The marker first, then the pins: see [`Runs::hold`].
         match fs::OpenOptions::new()
@@ -362,6 +363,7 @@ impl Runs {
         loop {
             match self.remove_pass()? {
                 PassOutcome::Done => return Ok(()),
+                PassOutcome::Retry => thread::sleep(REMOVE_PACE),
                 PassOutcome::Waiting(path) => {
                     if announced.as_ref() != Some(&path) {
                         waiting(&path);
@@ -399,10 +401,11 @@ impl Runs {
     }
 
     /// What follows a directory that was not empty: a second listing says what is left
-    /// ([`pass_after_not_empty`]). The directory can be gone by now, and is then done.
+    /// ([`pass_after_not_empty`]). The directory can be gone by now, and is then done; a listing with
+    /// nothing in it is no hold to name.
     fn wait_for_what_is_left(&self) -> Result<PassOutcome> {
         match self.entries() {
-            Ok(entries) => Ok(pass_after_not_empty(&self.dir, &entries)),
+            Ok(entries) => Ok(pass_after_not_empty(&entries)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => self.remove_marker(),
             Err(e) => Err(Error::os_at("list", &self.dir, e)),
         }
@@ -544,14 +547,20 @@ enum PassOutcome {
     Done,
     /// Something is left, and this is the path of what is waited for.
     Waiting(PathBuf),
+    /// Nothing is known to hold the removal back: what stopped the directory's delete went before the
+    /// listing that was to name it. Another pass follows the pause, and no note is made.
+    Retry,
 }
 
-/// The outcome of a pass whose `remove_dir` found `dir` not empty, given a listing taken after: a pause
-/// naming the smallest path left, by name, so that a pause on the same thing is told once; or, if the
-/// listing is empty (what was left went in between, or something hides it), a pause naming `dir`, which
-/// is what is not removed.
-fn pass_after_not_empty(dir: &Path, left: &[Entry]) -> PassOutcome {
-    PassOutcome::Waiting(left.iter().map(Entry::path).min().unwrap_or(dir).to_path_buf())
+/// The outcome of a pass whose `remove_dir` found the directory not empty, given a listing taken after: a
+/// pause naming the smallest path left, by name, so that a pause on the same thing is told once; or, if
+/// the listing is empty (what was left went in between), a [`PassOutcome::Retry`], since nothing is held
+/// and a note would say otherwise.
+fn pass_after_not_empty(left: &[Entry]) -> PassOutcome {
+    match left.iter().map(Entry::path).min() {
+        Some(path) => PassOutcome::Waiting(path.to_path_buf()),
+        None => PassOutcome::Retry,
+    }
 }
 
 /// Deletes the file `path` ([`files::delete`]); one that is not there is already deleted. A file that
