@@ -78,7 +78,7 @@ pub trait KillTarget {
     /// End `process` by force (SIGKILL, `TerminateProcess`), through the hold and never by pid, and do not
     /// wait for it. A process that has exited or is exiting is success: [`Self::await_exit`] is the wait.
     /// A SIGTERM, which launchd's task stop sends, is outside the trait.
-    fn terminate(&mut self, process: &Self::Process) -> io::Result<()>;
+    fn force_end(&mut self, process: &Self::Process) -> io::Result<()>;
 
     /// Whether the manager still vouches for `pid` as the service's process, read after `pid` was
     /// opened as `process`: the second read of the hold. The default is [`Self::service_pid`] being
@@ -179,7 +179,7 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             Ok(KillOutcome::Ended)
         }
         Ok(Some(Hold::Held { pid, process })) => {
-            target.terminate(&process).map_err(|e| not_signalled(pid, e))?;
+            target.force_end(&process).map_err(|e| not_signalled(pid, e))?;
             wait_saying(target, &waiting_notice(id, pid, None), |t, d| t.await_exit(&process, d))
                 .map_err(|e| signalled_but(pid, e))?;
             wait_saying(target, &recording_notice(id, pid), |t, d| {

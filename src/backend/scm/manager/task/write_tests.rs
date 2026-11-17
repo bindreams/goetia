@@ -1107,7 +1107,7 @@ impl Processes for Running {
         unreachable!("a retype stops nothing: pid {pid} was held")
     }
 
-    fn terminate(&mut self, _: &()) -> std::io::Result<()> {
+    fn force_end(&mut self, _: &()) -> std::io::Result<()> {
         unreachable!("a retype stops nothing")
     }
 

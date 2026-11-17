@@ -144,8 +144,8 @@ impl KillTarget for Scripted {
         }
     }
 
-    fn terminate(&mut self, process: &Held) -> io::Result<()> {
-        self.log.borrow_mut().push(format!("terminate {}", process.pid));
+    fn force_end(&mut self, process: &Held) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("force_end {}", process.pid));
         Ok(())
     }
 
@@ -443,7 +443,7 @@ fn a_re_arm_scm_refuses_on_a_stopped_service_is_the_release() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100",
             "arm_release",
             "service_pid",
@@ -472,7 +472,7 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100",
             "arm_release",
             "service_pid",
@@ -502,7 +502,7 @@ fn a_kill_is_done_when_scm_reports_a_new_pid() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100",
             "arm_release",
             "service_pid",
@@ -542,7 +542,7 @@ fn a_failed_read_after_the_termination_says_the_signal_was_delivered() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100",
             "arm_release",
             "service_pid",

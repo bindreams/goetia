@@ -141,7 +141,7 @@ impl Processes for Machine {
         Ok(self.holdable.contains(&pid).then_some(pid))
     }
 
-    fn terminate(&mut self, held: &u32) -> io::Result<()> {
+    fn force_end(&mut self, held: &u32) -> io::Result<()> {
         self.terminated.push((*held, self.fake.calls().len()));
         Ok(())
     }

@@ -304,7 +304,7 @@ pub(in crate::backend::scm) mod system {
             Held::open(pid)
         }
 
-        fn terminate(&mut self, process: &Held) -> io::Result<()> {
+        fn force_end(&mut self, process: &Held) -> io::Result<()> {
             process.terminate()
         }
 

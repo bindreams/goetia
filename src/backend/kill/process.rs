@@ -51,7 +51,7 @@ impl<R: Reports> KillTarget for Signalling<R> {
         open(pid)
     }
 
-    fn terminate(&mut self, process: &Process) -> io::Result<()> {
+    fn force_end(&mut self, process: &Process) -> io::Result<()> {
         send_signal(process, Signal::Kill)
     }
 
@@ -76,7 +76,7 @@ pub(crate) enum Signal {
     /// only launchd's task stop sends it.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Terminate,
-    /// SIGKILL, the forced end that [`KillTarget::terminate`] is.
+    /// SIGKILL, the forced end that [`KillTarget::force_end`] is.
     Kill,
 }
 
