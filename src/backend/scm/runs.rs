@@ -88,13 +88,13 @@ pub(crate) struct Runs {
     dir: PathBuf,
 }
 
-/// A reader's claim on the records of one task, and what the directory held when it was made. While
-/// it is held no write prunes; dropping it, or the holder ending, releases it.
+/// A reader's claim on the records of one task, and usually what the directory held when it was made.
+/// While it is held no write prunes; dropping it, or the holder ending, releases it.
 pub(crate) struct Pin {
     /// Held open, and deleted when closed.
     _file: fs::File,
-    /// The records that were there already.
-    listing: BTreeSet<InstanceId>,
+    /// The records that were there already, when the pin was made by [`Runs::pin`].
+    listing: Option<BTreeSet<InstanceId>>,
 }
 
 /// What a task's directory holds that is goetia's.
@@ -192,9 +192,7 @@ impl Runs {
     /// Takes a pin, then lists the records there are. Do it before asking for the run whose record
     /// is waited for: whatever [`Runs::appeared`] lists is then newer than the pin.
     pub(crate) fn pin(&self) -> io::Result<Pin> {
-        let mut names = Builder::new();
-        names.prefix("pin-").suffix(PIN).disable_cleanup(true);
-        let (file, _path) = names.make_in(&self.dir, files::create_pin)?.into_parts();
+        let mut pin = self.hold()?;
         let listing = self
             .entries()?
             .into_iter()
@@ -203,16 +201,37 @@ impl Runs {
                 Entry::Temp(_) | Entry::Pin(_) => None,
             })
             .collect();
-        Ok(Pin { _file: file, listing })
+        pin.listing = Some(listing);
+        Ok(pin)
+    }
+
+    /// Takes a pin and lists nothing, for a holder that only keeps the records there are from being
+    /// pruned and reads them by name. [`Runs::appeared`] needs the listing [`Runs::pin`] takes.
+    pub(crate) fn hold(&self) -> io::Result<Pin> {
+        let mut names = Builder::new();
+        names.prefix("pin-").suffix(PIN).disable_cleanup(true);
+        let (file, _path) = names.make_in(&self.dir, files::create_pin)?.into_parts();
+        Ok(Pin {
+            _file: file,
+            listing: None,
+        })
     }
 
     /// The records that are not in `pin`'s listing, the earliest `started` first (ties by instance).
     /// The directory is there: `pin` is a file in it that nothing can delete while it is held.
+    ///
+    /// # Panics
+    ///
+    /// If `pin` was made by [`Runs::hold`], which has no listing to tell what is new by.
     pub(crate) fn appeared(&self, pin: &Pin) -> io::Result<Vec<RunRecord>> {
+        let listing = pin
+            .listing
+            .as_ref()
+            .expect("`appeared` needs a pin made by `Runs::pin`, which lists");
         let mut appeared = Vec::new();
         for entry in self.entries()? {
             let Entry::Record(instance) = entry else { continue };
-            if pin.listing.contains(&instance) {
+            if listing.contains(&instance) {
                 continue;
             }
             // Gone since the listing: a write pruned it, which only happens when nothing waits for it.

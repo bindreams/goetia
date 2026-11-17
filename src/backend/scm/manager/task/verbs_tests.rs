@@ -13,7 +13,10 @@ use crate::backend::scm::manager::WindowsSnapshot;
 use crate::backend::scm::manager::task::api::Started;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::runs::RunOutcome;
+use crate::backend::scm::shim::acl::Descriptor;
+use crate::backend::scm::sid::try_sid_display;
 use crate::backend::scm::test_support::task_spec;
+use crate::elevation::test_support::process_user_sid;
 
 /// A pid no process has: Windows pids are far below it.
 const NO_SUCH_PID: u32 = 0xFFFF_FFFC;
@@ -278,6 +281,74 @@ fn a_later_runs_write_does_not_prune_an_earlier_runs_incomplete_stop_before_it_i
 
     let report = failed.report().to_string();
     assert!(report.contains("could not end the program's process tree"), "{report}");
+    fake.finish();
+}
+
+/// The record directory with no right for the account this test runs as but to read and change its own
+/// permissions, until it is dropped: nothing can be created in it, as for a caller who is not an
+/// Administrator. Dropping restores the entry the directory is made with, so the test's directory can
+/// be removed.
+struct Denied<'a>(&'a std::path::Path);
+
+impl<'a> Denied<'a> {
+    fn new(path: &'a std::path::Path) -> Self {
+        let me = try_sid_display(&process_user_sid()).unwrap();
+        // READ_CONTROL, WRITE_DAC and SYNCHRONIZE (which `CreateFile` adds to every open).
+        Descriptor::from_sddl(&format!("D:P(A;;FA;;;SY)(A;;0x160000;;;{me})"))
+            .unwrap()
+            .set_dacl(path)
+            .unwrap();
+        Denied(path)
+    }
+}
+
+impl Drop for Denied<'_> {
+    fn drop(&mut self) {
+        let restored = Descriptor::for_runs(&process_user_sid()).map(|wanted| wanted.set_dacl(self.0));
+        if !matches!(restored, Ok(Ok(()))) {
+            eprintln!(
+                "warning: could not restore the permissions of {}: {restored:?}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+/// A stop with nothing running has no record to keep, so it needs no pin and does not fail on one, as a
+/// caller who cannot write the record directory cannot take it.
+#[skuld::test]
+fn a_stop_with_nothing_running_does_not_need_the_pin() {
+    let (_dir, path, runs) = records();
+    let _denied = Denied::new(&path);
+    let fake = Fake::new();
+    fake.on_instances(Ok(Vec::new()));
+    let mut machine = Machine::new(&fake, &[]);
+
+    stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
+
+    assert_eq!(fake.calls(), [instances_call()]);
+    fake.finish();
+}
+
+/// A stop of a run it cannot pin the records for is denied like any other verb that is refused what it
+/// needs, and sends no `Stop`: it would end a run whose record it could not keep.
+#[skuld::test]
+fn a_stop_that_cannot_take_the_pin_is_denied_by_name_and_sends_no_stop() {
+    let (_dir, path, runs) = records();
+    let _denied = Denied::new(&path);
+    let fake = Fake::new();
+    fake.on_instances(one(4242)).on_instances(one(4242)).on_instances(one(4242));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    let failed = stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap_err();
+
+    let report = failed.report().to_string();
+    assert!(
+        report.contains("`stop` was denied access to the run records of `nightly`"),
+        "{report}"
+    );
+    assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
+    assert!(machine.waited.is_empty());
 }
 
 /// With the pin released, the records the stop read are pruned by the next write as ever.
@@ -298,6 +369,7 @@ fn the_stops_pin_is_released_when_it_returns() {
         .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
         .count();
     assert_eq!(pins, 0);
+    fake.finish();
     drop(dir);
 }
 

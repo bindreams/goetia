@@ -35,7 +35,7 @@ fn remove_task_with<P: Processes, L>(
     warn_left_behind(disable_problem(&path, tasks.set_enabled(&path, false)));
     // A shim that outlives its task has nothing to stop it. A run that cannot be ended, or that does not
     // end in time, is warned of, and the task is deleted all the same.
-    if let Err(e) = stop_runs(tasks, "cleanup", id, Budget::Bounded(CLEANUP_BOUND), processes) {
+    if let Err(e) = stop_runs(tasks, "cleanup", id, Budget::Bounded(CLEANUP_BOUND), processes, || Ok(())) {
         warn_left_behind(Some(format!(
             "stop the runs of the task `{}`: {}",
             path.as_str(),

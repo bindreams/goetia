@@ -266,12 +266,17 @@ fn await_run<P: Processes>(
 /// fails the call with nothing sent. A run that ended on its own, or that no longer has a process, is
 /// not touched: the listing is no proof of a run, and a pid it no longer names may be a stranger's. A
 /// task that is gone has no runs.
+///
+/// Under a budget that waits, `before_stops` is called once, when there is a run to stop and before the
+/// first `Stop` is sent: a failure is the call's, with nothing sent. It is for what must be in place
+/// before a run ends.
 pub(super) fn stop_runs<P: Processes>(
     tasks: &dyn TaskApi,
     operation: &'static str,
     id: &Id,
     budget: Budget,
     processes: &mut P,
+    before_stops: impl FnOnce() -> Result<()>,
 ) -> Result<Vec<InstanceId>> {
     // First, so the wait is counted from the verb's entry.
     let deadline = budget.start();
@@ -287,6 +292,9 @@ pub(super) fn stop_runs<P: Processes>(
     }
 
     let held = hold_all(tasks, operation, id, &path, live, processes)?;
+    if !held.is_empty() {
+        before_stops()?;
+    }
     send_stops(tasks, &path, held.iter().map(|(instance, _)| instance))?;
     for (instance, process) in &held {
         let mut target = RunTarget::new(tasks, &path, instance.id, &mut *processes);
@@ -354,10 +362,12 @@ impl Scm {
     /// Every run of the task ended ([`stop_runs`]), and then read in its record: a stop whose shim could
     /// not end the program's tree is a failed stop. `operation` is the verb, which a denial names.
     ///
-    /// A budget that waits holds a [`Pin`](crate::backend::scm::runs::Pin) from before the first `Stop`
-    /// is sent until every record is read: the shims write as their runs end, and without it the write
-    /// of a later run prunes the record of an earlier one before it is read. A task whose record
-    /// directory is gone has no records to keep.
+    /// When there is a run to stop and the budget waits, a [`Pin`](crate::backend::scm::runs::Pin) is
+    /// held from before the first `Stop` is sent until every record is read: the shims write as their
+    /// runs end, and without it the write of a later run prunes the record of an earlier one before it
+    /// is read. A task with no run to stop has no records to keep, so it takes none (a caller who is not
+    /// an Administrator cannot); one whose record directory is gone has none either. A pin that is
+    /// refused is a denial, worded as any verb's refusal is.
     pub(super) fn task_stop_with<P: Processes>(
         &self,
         operation: &'static str,
@@ -366,17 +376,25 @@ impl Scm {
         runs: &Runs,
         processes: &mut P,
     ) -> Result<()> {
-        let _pin = if budget.waits() {
-            match runs.pin() {
-                Ok(pin) => Some(pin),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => return Err(Error::os(format!("pin the run records of `{id}`"), e)),
+        let mut pin = None;
+        let stopped = stop_runs(&*self.tasks, operation, id, budget, processes, || {
+            match runs.hold() {
+                Ok(held) => pin = Some(held),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(open_refused(
+                        operation,
+                        &format!("the run records of `{id}`"),
+                        &format!("pin the run records of `{id}`"),
+                        e,
+                    ));
+                }
             }
-        } else {
-            None
-        };
-        let stopped = stop_runs(&*self.tasks, operation, id, budget, processes)?;
-        check_stopped(id, runs, &stopped)
+            Ok(())
+        })?;
+        let checked = check_stopped(id, runs, &stopped);
+        drop(pin);
+        checked
     }
 
     /// `kill` of a task: [`Self::task_kill_with`] over the machine's processes.
