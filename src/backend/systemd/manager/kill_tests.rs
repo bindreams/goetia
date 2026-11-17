@@ -7,7 +7,7 @@ use super::*;
 use crate::backend::Backend;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::kill::process::process_tests::Sleeper;
-use crate::backend::kill::{KillOutcome, KillTarget as _, kill_failed, kill_service};
+use crate::backend::kill::{KillOutcome, KillTarget as _, Signal, kill_failed, kill_service};
 use crate::backend::systemd::manager::Systemd;
 use crate::backend::systemd::manager::systemctl::systemctl_tests::{booted, gate_then, on_booted};
 use crate::backend::systemd::manager::task::task_tests::{fragment, service_spec};
@@ -37,7 +37,7 @@ fn unreaped() -> (Sleeper, Process) {
     let held = process::open(run.pid())
         .expect("open the child")
         .expect("it is running");
-    process::terminate(&held).expect("signal the child");
+    process::signal_through(&held, Signal::Kill).expect("signal the child");
     let waited = process::await_exit(&held, Bound::Unbounded.start()).expect("wait for it to exit");
     assert_eq!(waited, Waited::Confirmed);
     (run, held)

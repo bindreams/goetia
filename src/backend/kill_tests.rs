@@ -157,8 +157,8 @@ impl KillTarget for Scripted {
         }
     }
 
-    fn terminate(&mut self, process: &Held) -> io::Result<()> {
-        self.log.borrow_mut().push(format!("terminate {}", process.pid));
+    fn signal(&mut self, process: &Held, signal: Signal) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("{signal:?} {}", process.pid));
         if self.failing_terminate {
             return Err(io::Error::other("terminate failed"));
         }
@@ -247,7 +247,7 @@ fn the_process_is_held_from_the_open_through_the_waits_and_signalled_before_any_
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "Kill 100",
             "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
@@ -268,7 +268,7 @@ fn a_wait_for_a_process_that_has_not_exited_says_why_before_it_blocks() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "Kill 100",
             "await_exit 100 for the notice",
             "notice frpc: waiting for process 100 to exit",
             "await_exit 100",
@@ -327,7 +327,7 @@ fn a_wait_for_the_manager_to_record_the_exit_says_why_before_it_blocks() {
         (
             "after a signal",
             signalled,
-            vec!["terminate 100", "await_exit 100 for the notice"],
+            vec!["Kill 100", "await_exit 100 for the notice"],
         ),
         ("for an ended process", ended, vec![]),
     ] {
@@ -416,7 +416,7 @@ fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
     let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_eq!(e.to_string(), "manager read failed");
-    assert!(!target.log().iter().any(|call| call.starts_with("terminate")));
+    assert!(!target.log().iter().any(|call| call.starts_with("Kill")));
 }
 
 /// The manager reports another process by the confirmation: it has moved off the one held, which is
@@ -477,7 +477,7 @@ fn a_restart_during_the_kill_is_not_followed() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "Kill 100",
             "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
@@ -590,7 +590,7 @@ fn a_failed_record_wait_after_the_signal_says_the_signal_was_delivered() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "Kill 100",
             "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
@@ -632,7 +632,7 @@ fn a_failed_signal_is_an_error_and_waits_for_nothing() {
     assert!(text.ends_with("terminate failed"), "{text}");
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "service_pid", "terminate 100", "close 100"]),
+        steps(["service_pid", "open 100", "service_pid", "Kill 100", "close 100"]),
         "the process is let go on the error path too"
     );
 }

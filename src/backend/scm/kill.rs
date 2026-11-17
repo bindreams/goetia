@@ -188,7 +188,7 @@ pub(in crate::backend::scm) mod system {
     };
     use crate::manager::budget::Deadline;
 
-    use crate::backend::kill::KillTarget;
+    use crate::backend::kill::{KillTarget, Signal};
 
     use super::privilege::DebugPrivilege;
     use super::{ReleaseWatch, ScmRelease, await_scm_released};
@@ -298,8 +298,15 @@ pub(in crate::backend::scm) mod system {
             Ok(open_process_with(pid, PROCESS_ACCESS)?.map(|handle| Held { handle, pid }))
         }
 
-        fn terminate(&mut self, process: &Held) -> io::Result<()> {
-            process.terminate()
+        /// A process is ended with `TerminateProcess`: there is no request to exit to send first.
+        fn signal(&mut self, process: &Held, signal: Signal) -> io::Result<()> {
+            match signal {
+                Signal::Kill => process.terminate(),
+                Signal::Term => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "a service's process cannot be sent a request to exit, only terminated",
+                )),
+            }
         }
 
         fn await_exit(&mut self, process: &Held, deadline: Deadline) -> io::Result<Waited> {

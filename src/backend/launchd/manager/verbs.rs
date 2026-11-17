@@ -9,6 +9,7 @@
 
 use std::time::{Duration, Instant};
 
+use cosca::Process;
 use cosca::identity::ProcessId;
 
 use super::kill::JobKill;
@@ -16,11 +17,12 @@ use super::task::TaskPrint;
 use super::watch::{Added, Watch};
 use super::{Launchd, Plist, UNLOAD_POLL, Until, never_expires};
 use crate::backend::bounded::{Reservation, Role};
-use crate::backend::kill::process::request_exit;
-use crate::backend::kill::{Hold, KillOutcome, KillTarget as _, Waited, hold_pid, kill_failed, kill_service};
+use crate::backend::kill::{
+    Hold, KillOutcome, KillTarget, Signal, Waited, hold_pid, kill_failed, kill_service,
+};
 use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
-use crate::manager::budget::{self, Deadline, Escalation};
+use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, State, Step, flow};
 use crate::spec::{Id, StopAction, StopSignal};
 
@@ -119,6 +121,48 @@ fn ends_before(a: Deadline, b: Deadline) -> bool {
     }
 }
 
+/// What a launchd task's `stop` had sent the run it was waiting for when its wait ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escalation {
+    /// SIGTERM, and the wait ended while the run still had the `stop-action` `timeout` to answer it.
+    Pending,
+    /// SIGTERM, and the run did not answer it within the `timeout`; the wait ended before SIGKILL was sent.
+    Spent,
+    /// SIGKILL, and the run is still there.
+    Sent,
+}
+
+/// [`timed_out`] for a `stop` of a launchd task, which says what it had sent the run: goetia sends SIGKILL
+/// after the SIGTERM's `timeout` only while it waits, so a wait that ended before it was sent says nothing
+/// will, and what ends the run; one that ended after it was sent says that.
+fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> Error {
+    match budget::timed_out(id, "stopped", budget) {
+        Error::WaitTimeout {
+            id,
+            awaited,
+            waited,
+            recovery,
+        } => Error::WaitTimeout {
+            recovery: match sent {
+                Escalation::Pending => format!(
+                    "{recovery} The run was sent SIGTERM and has the `stop-action` timeout to answer it; goetia \
+                     sends SIGKILL after that only while it waits, so with this wait ended nothing will: \
+                     `goetia daemon kill {id}` ends it."
+                ),
+                Escalation::Spent => format!(
+                    "{recovery} The run was sent SIGTERM and did not answer it within the `stop-action` timeout; \
+                     this wait ended before goetia sent SIGKILL, and nothing will: `goetia daemon kill {id}` ends it."
+                ),
+                Escalation::Sent => format!("{recovery} The run was sent SIGKILL and has not exited yet."),
+            },
+            id,
+            awaited,
+            waited,
+        },
+        other => other,
+    }
+}
+
 /// What a `print` that shows no pid says of the job.
 pub(super) enum Quiet {
     /// A start launchd has accepted and not yet forked: a run is coming.
@@ -198,11 +242,26 @@ impl Launchd {
         budget: Budget,
         reservation: &mut Reservation,
     ) -> Result<()> {
-        let mut course = Course::new(action, budget, Watch::new()?);
+        let course = Course::new(action, budget, Watch::new()?);
+        self.stop_course(id, course, reservation, |reservation| {
+            JobKill::new(&self.launchctl, id.as_str(), reservation)
+        })
+    }
+
+    /// [`Self::stop_task`] over `course`, with the target of each pass made by `target`: the one place
+    /// that decides what signals are sent, over whatever sends them.
+    fn stop_course<T: KillTarget<Process = Process>>(
+        &self,
+        id: &Id,
+        mut course: Course,
+        reservation: &mut Reservation,
+        mut target: impl FnMut(&mut Reservation) -> Result<T>,
+    ) -> Result<()> {
+        let budget = course.counted;
         let mut own: Option<Reservation> = None;
         loop {
             let pass = own.as_mut().unwrap_or(&mut *reservation);
-            match self.stop_pass(id, &mut course, pass)? {
+            match self.stop_pass(id, &mut course, pass, &mut target)? {
                 Pass::Done => return Ok(()),
                 Pass::Again => {}
                 Pass::Queued(waited) => course.extend(waited),
@@ -259,7 +318,13 @@ impl Launchd {
 
     /// One pass of [`Self::stop_task`] over the run `print` shows. `course` is what the stop is held to and
     /// reports having waited, and what it has sent: the waits for queued starts are in its budget.
-    fn stop_pass(&self, id: &Id, course: &mut Course, reservation: &mut Reservation) -> Result<Pass> {
+    fn stop_pass<T: KillTarget<Process = Process>>(
+        &self,
+        id: &Id,
+        course: &mut Course,
+        reservation: &mut Reservation,
+        target: &mut impl FnMut(&mut Reservation) -> Result<T>,
+    ) -> Result<Pass> {
         let name = id.as_str();
         // Unbounded: `print` answers at once, and its body is whole.
         let issuing = Budget::Unbounded.start();
@@ -284,7 +349,7 @@ impl Launchd {
         // The process is held, and only then does launchd confirm that it is the job's: a pid that was
         // read and then reused is a process launchd does not name, and is left alone. Launchd's record of
         // a run that has gone is not waited for here: the next pass reads it, paced.
-        let mut target = JobKill::new(&self.launchctl, name, reservation)?;
+        let mut target = target(reservation)?;
         let held = match hold_pid(&mut target, pid) {
             Ok(Hold::Held { process, .. }) => process,
             Ok(Hold::Ended { .. }) => return Ok(Pass::Behind),
@@ -295,11 +360,11 @@ impl Launchd {
         let grace_end = match course.termed(run) {
             Some(termed) => termed.grace_end,
             None if kills => {
-                target.terminate(&held).map_err(|e| kill_failed(name, e))?;
+                target.signal(&held, Signal::Kill).map_err(|e| kill_failed(name, e))?;
                 None
             }
             None => {
-                request_exit(&held).map_err(|e| kill_failed(name, e))?;
+                target.signal(&held, Signal::Term).map_err(|e| kill_failed(name, e))?;
                 // A run sent SIGTERM has its `timeout` to answer, if the caller waits that long.
                 let grace_end = course.ending.grace.map(|grace| Budget::Bounded(grace).start());
                 course.termed = Some(Termed { run, grace_end });
@@ -319,8 +384,8 @@ impl Launchd {
         }
         if !escalating {
             return Err(match (kills, grace_end) {
-                (true, _) => budget::timed_out_stopping(name, budget, Escalation::Sent),
-                (false, Some(_)) => budget::timed_out_stopping(name, budget, Escalation::Pending),
+                (true, _) => timed_out_stopping(name, budget, Escalation::Sent),
+                (false, Some(_)) => timed_out_stopping(name, budget, Escalation::Pending),
                 (false, None) => budget::timed_out(name, "stopped", budget),
             });
         }
@@ -332,13 +397,13 @@ impl Launchd {
         }
         // A deadline that is spent is the caller's timeout, and nothing is sent after it.
         if deadline.expired() {
-            return Err(budget::timed_out_stopping(name, budget, Escalation::Spent));
+            return Err(timed_out_stopping(name, budget, Escalation::Spent));
         }
-        target.terminate(&held).map_err(|e| kill_failed(name, e))?;
+        target.signal(&held, Signal::Kill).map_err(|e| kill_failed(name, e))?;
         // The wait for the exit is on the hold too: the watch is spent by the wait that ran out.
         match target.await_exit(&held, deadline).map_err(|e| kill_failed(name, e))? {
             Waited::Confirmed => Ok(Pass::Again),
-            Waited::Expired => Err(budget::timed_out_stopping(name, budget, Escalation::Sent)),
+            Waited::Expired => Err(timed_out_stopping(name, budget, Escalation::Sent)),
         }
     }
 }

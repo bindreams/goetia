@@ -39,6 +39,17 @@ pub enum Waited {
     Expired,
 }
 
+/// A signal a [`KillTarget`] sends through its hold on a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// `SIGTERM`: the request to exit, which a process may answer or ignore. Only a launchd task's stop
+    /// sends it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Term,
+    /// `SIGKILL`, or the target's own forced end where it has no signals (SCM's `TerminateProcess`).
+    Kill,
+}
+
 /// How a kill ended, when the manager could be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillOutcome {
@@ -70,9 +81,9 @@ pub trait KillTarget {
     /// Open the process holding `pid`; `None` if there is none.
     fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>>;
 
-    /// Signal `process`, through the hold and never by pid, and do not wait for it. A process that
-    /// has exited or is exiting is success: [`Self::await_exit`] is the wait.
-    fn terminate(&mut self, process: &Self::Process) -> io::Result<()>;
+    /// Send `signal` to `process`, through the hold and never by pid, and do not wait for it. A process
+    /// that has exited or is exiting is success: [`Self::await_exit`] is the wait.
+    fn signal(&mut self, process: &Self::Process, signal: Signal) -> io::Result<()>;
 
     /// Whether the manager still vouches for `pid` as the service's process, read after `pid` was
     /// opened as `process`: the second read of the hold. The default is [`Self::service_pid`] being
@@ -173,7 +184,9 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             Ok(KillOutcome::Ended)
         }
         Ok(Some(Hold::Held { pid, process })) => {
-            target.terminate(&process).map_err(|e| not_signalled(pid, e))?;
+            target
+                .signal(&process, Signal::Kill)
+                .map_err(|e| not_signalled(pid, e))?;
             wait_saying(target, &waiting_notice(id, pid, None), |t, d| t.await_exit(&process, d))
                 .map_err(|e| signalled_but(pid, e))?;
             wait_saying(target, &recording_notice(id, pid), |t, d| {

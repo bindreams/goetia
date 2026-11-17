@@ -68,7 +68,7 @@ fn a_wait_for_a_running_process_expires_at_its_deadline_and_confirms_once_it_has
         await_exit(&held, Budget::Bounded(std::time::Duration::from_millis(50)).start()).unwrap(),
         Waited::Expired
     );
-    terminate(&held).expect("signal the child");
+    signal_through(&held, Signal::Kill).expect("signal the child");
     assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
     assert_eq!(await_exit(&held, Budget::Immediate.start()).unwrap(), Waited::Confirmed);
 }
@@ -80,13 +80,13 @@ fn a_request_to_exit_ends_the_process_held_with_sigterm_and_is_success_for_one_t
     let mut run = Sleeper::spawn();
     let held = run.held();
 
-    request_exit(&held).expect("signal the child");
+    signal_through(&held, Signal::Term).expect("signal the child");
 
     assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
-    request_exit(&held).expect("a zombie");
+    signal_through(&held, Signal::Term).expect("a zombie");
     let status = run.0.wait().expect("reap the child");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
-    request_exit(&held).expect("a process reaped");
+    signal_through(&held, Signal::Term).expect("a process reaped");
 }
 
 /// A process that exited before the signal, whether it is a zombie or already reaped, is success: the
@@ -99,9 +99,9 @@ fn terminating_a_process_that_has_already_exited_is_success() {
     run.0.kill().expect("kill the child");
     assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
 
-    terminate(&held).expect("a zombie");
+    signal_through(&held, Signal::Kill).expect("a zombie");
     run.0.wait().expect("reap the child");
-    terminate(&held).expect("a process reaped");
+    signal_through(&held, Signal::Kill).expect("a process reaped");
 }
 
 /// A process that has exited and not been reaped has no process left to be reported, but the manager
@@ -110,7 +110,7 @@ fn terminating_a_process_that_has_already_exited_is_success() {
 fn a_report_of_an_exited_process_not_yet_reaped_is_the_held_one_and_stale() {
     let mut run = Sleeper::spawn();
     let held = run.held();
-    terminate(&held).expect("signal the child");
+    signal_through(&held, Signal::Kill).expect("signal the child");
     assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
 
     assert!(report_is_stale(Some(&held), run.pid(), names_it).unwrap());
@@ -123,7 +123,7 @@ fn a_report_of_an_exited_process_not_yet_reaped_is_the_held_one_and_stale() {
 fn a_report_of_a_reaped_process_is_stale() {
     let mut run = Sleeper::spawn();
     let held = run.held();
-    terminate(&held).expect("signal the child");
+    signal_through(&held, Signal::Kill).expect("signal the child");
     run.0.wait().expect("reap the child");
 
     assert!(report_is_stale(Some(&held), run.pid(), names_it).unwrap());
@@ -286,7 +286,7 @@ fn a_process_the_manager_shows_and_does_not_name_is_not_confirmed_alive_or_not()
     });
 
     assert!(!target.confirm(run.pid(), &held).unwrap(), "running");
-    terminate(&held).expect("signal the child");
+    signal_through(&held, Signal::Kill).expect("signal the child");
     assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
     assert!(!target.confirm(run.pid(), &held).unwrap(), "exited");
     run.0.wait().expect("reap the child");
