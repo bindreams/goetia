@@ -326,27 +326,30 @@ fn principal_sid(registered: &Registered) -> Result<Sid> {
 
 /// Everything a registration of `definition` needs, before any request: what the machine holds for the
 /// account (`prepare`), and the record directory with permissions that name it. Every write makes it, so
-/// a reinstall as another user can still write its records. The default log names `kept` beside the account:
-/// the account a service that is yet to be retired runs as ([`landed`] follows).
+/// a reinstall as another user can still write its records. The default log is not made: the caller makes it,
+/// when the accounts it names are known.
 fn task_acquire(
     id: &Id,
     definition: &TaskXml,
     runs: &Runs,
-    kept: &[Sid],
     prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
 ) -> Result<Prepared> {
     let prepared = prepare(&definition.account())?;
-    task_records(id, runs, &prepared, kept)?;
+    run_records(id, runs, &prepared)?;
     Ok(prepared)
 }
 
-/// The record directory of `id` with permissions that name the account `prepared` holds, and its default
-/// log, which the account may append to (the shim opens it and never makes it) and so may `kept`: the
-/// accounts a write that changes the account leaves the daemon running as until it lands ([`landed`] follows
-/// it). Nothing is read back from either.
-fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, kept: &[Sid]) -> Result<()> {
+/// The record directory of `id` with permissions that name the account `prepared` holds. Nothing is read back.
+fn run_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
     runs.ensure(&prepared.principal)
-        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
+        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))
+}
+
+/// [`run_records`], and the default log of `id`, which the account may append to (the shim opens it and
+/// never makes it) and so may `kept`: the accounts a write that changes the account leaves the daemon running
+/// as until it lands ([`landed`] follows it). Nothing is read back.
+fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, kept: &[Sid]) -> Result<()> {
+    run_records(id, runs, prepared)?;
     let accounts = [kept, std::slice::from_ref(&prepared.principal)].concat();
     default_log::ensure(runs.program_data(), id, &accounts)
 }
@@ -468,7 +471,8 @@ impl Scm {
     }
 
     /// An install that changes a service into a task: the service is refused while it runs; everything
-    /// the task needs is acquired; the service is stopped and deleted; the task is registered. The task's
+    /// the task needs is acquired; the service is stopped and deleted; the task's default log is made; the task
+    /// is registered. The task's
     /// install holds the lock already. See [`Self::retype_to_service`].
     pub(in crate::backend::scm) fn retype_to_task(
         &self,
@@ -499,10 +503,11 @@ impl Scm {
 
     /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare`, `refuse` (the service runs:
     /// [`Error::RetypeRunning`]) and `retire` (the service is removed). The default log names the task's
-    /// account alone: the service is refused while it runs and gone before the task registers, so no account but
-    /// the task's runs against the log. The order is the contract: `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
-    /// registration, then the default log for the task's account alone ([`landed`]); a refusal or a failed
-    /// acquisition leaves the service untouched.
+    /// account alone: the service is refused while it runs and gone before the log is made, so no account but
+    /// the task's runs against it, and nothing is looked up for the service's. The order is the contract:
+    /// `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the default log, then the
+    /// registration. A refusal, a failed acquisition or a failed retirement leaves the service and its log as
+    /// they were.
     pub(super) fn retype_to_task_with(
         &self,
         spec: &DaemonSpec,
@@ -514,10 +519,10 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
         refuse()?;
-        let prepared = task_acquire(id, definition, runs, &[], prepare)?;
+        let prepared = task_acquire(id, definition, runs, prepare)?;
         retire()?;
-        let wrote = self.task_register(id, definition, false, false, &prepared)?;
-        landed(id, runs, &prepared, wrote)
+        default_log::ensure(runs.program_data(), id, std::slice::from_ref(&prepared.principal))?;
+        self.task_register(id, definition, false, false, &prepared)
     }
 
     /// The sweep of what the removal left: the file a removed service's or task's host named, which

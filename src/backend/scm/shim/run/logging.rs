@@ -24,11 +24,12 @@
 //! permissive than a folder's, so it is the more likely of the two to still work exactly when the
 //! file does not.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::os::{Channels, LogKind, Real, Severity};
-use super::service::TABLE_NAME;
+use super::service::{TABLE_NAME, log_open_failed};
 use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{logs_folder, program_data};
 use crate::error::{Chain, Result};
@@ -40,6 +41,8 @@ pub(crate) struct Log {
     /// `None` when the machine's `%ProgramData%` could not be located: there is then no default file.
     default_dir: Option<PathBuf>,
     daemon_log: OnceLock<PathBuf>,
+    /// The files whose open fault has been told ([`Log::open_failed`]), so a fault in one file is told once.
+    told: Mutex<HashSet<PathBuf>>,
 }
 
 impl Log {
@@ -49,6 +52,7 @@ impl Log {
             channels,
             default_dir: Some(default_dir),
             daemon_log: OnceLock::new(),
+            told: Mutex::default(),
         }
     }
 
@@ -71,6 +75,7 @@ impl Log {
                     channels,
                     default_dir: None,
                     daemon_log: OnceLock::new(),
+                    told: Mutex::default(),
                 };
                 log.failure(
                     TABLE_NAME,
@@ -95,16 +100,19 @@ impl Log {
     /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
     /// ([`Channels::hold_default`]). Call it once, when the shim starts and
     /// knows its `id`, before anything an install can change. A log that cannot be held is told to the Event
-    /// Log, once, with the error: the shim goes on, and each line opens the file by its path.
+    /// Log, once, with the error: the shim goes on, and each line, and the daemon's output, open the file by its
+    /// path. That is the same fault as a failed open of the file that follows, which [`Log::open_failed`] does
+    /// not tell again.
     pub(crate) fn hold_default(&self, id: &str) {
         let Some(path) = self.default_log_path(id) else {
             return;
         };
         if let Err(e) = self.channels.hold_default(&path) {
+            self.first_fault(&path);
             let line = failure_line(
                 id,
                 &format!(
-                    "hold the default log {}: {} (the shim's lines open it for each line instead)",
+                    "hold the default log {}: {} (the shim's lines and the daemon's output open it by its path instead)",
                     path.display(),
                     Chain(&e)
                 ),
@@ -112,6 +120,23 @@ impl Log {
             eprintln!("{line}");
             self.channels.event_log(Severity::Error, &line);
         }
+    }
+
+    /// Tells that the log file `path` could not be opened, with `e`, and that the daemon's output is not captured
+    /// in it, unless a fault in that file was told already ([`Log::hold_default`], or an earlier open): one fault
+    /// is one line, whichever of the shim's uses of the file met it first.
+    pub(crate) fn open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
+        if self.first_fault(path) {
+            self.failure(id, &log_open_failed(path, e));
+        }
+    }
+
+    /// Whether this is the first fault told in `path`; it is recorded as told.
+    fn first_fault(&self, path: &Path) -> bool {
+        self.told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf())
     }
 
     /// The daemon's log and its kind: `logs` from its spec, which is the user's own, unless it is the default

@@ -158,8 +158,8 @@ mod system {
             Self::from_sddl(&sddl)
         }
 
-        /// Opens the file `path` for `READ_CONTROL`, `WRITE_DAC` and attribute reads without following a link at it, making
-        /// it empty with this descriptor when it is not there (`OPEN_ALWAYS`); the flag says it was made,
+        /// Opens the file `path` for `READ_CONTROL`, `WRITE_DAC` and attribute reads without following a link at
+        /// it, making it empty with this descriptor when it is not there (`OPEN_ALWAYS`); the flag says it was made,
         /// and so has the descriptor's permissions already. What is there is not changed:
         /// [`Descriptor::set_dacl_of`] on the handle sets its permissions. The file is shared for everything,
         /// so a shim that holds it open does not stop this.

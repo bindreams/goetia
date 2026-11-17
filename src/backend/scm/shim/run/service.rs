@@ -58,6 +58,7 @@ fn service_main(scm_args: Vec<OsString>) {
     // One `Real` for the run: the supervisor's `Os` and the log's channels share the handle held on the default log.
     let real = Arc::new(Real::default());
     let log = Arc::new(Log::real(Arc::clone(&real)));
+    exit::keep_log(Arc::clone(&log));
     match service_name(&log, &scm_args) {
         Ok(id) => run_service(id, log, real),
         Err(code) => exit::end_process(code),
@@ -588,7 +589,7 @@ fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running
 const NO_LOG_FILE: &str =
     "no log file for this daemon's output (no `logs:`, and no default log directory); it is still being run";
 
-fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
+pub(super) fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
     format!(
         "open log file {}: {} (this daemon's output will not be captured; it is still being run)",
         path.display(),
@@ -624,11 +625,14 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
     cmd.contain();
 
     let logs = spec.common().logs.as_deref();
-    // `Err(None)`: no file, by design.
+    // `Err(None)`: no file, by design, or a failed open that `Log::open_failed` has told.
     let opened = match (spec, logs) {
         (DaemonSpec::Task(_), None) => Err(None),
         (_, logs) => match log.daemon_log(id, logs) {
-            Some((path, kind)) => os.open_log(&path, kind).map_err(|e| Some(log_open_failed(&path, &e))),
+            Some((path, kind)) => os.open_log(&path, kind).map_err(|e| {
+                log.open_failed(id, &path, &e);
+                None
+            }),
             None => Err(Some(NO_LOG_FILE.to_string())),
         },
     };

@@ -1300,8 +1300,9 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
 /// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
 /// account up again), else the one the spec gave as a SID, else the registered name's. `kept` are the accounts
-/// it names beside it, those the service may still run as. Call it once the service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
-/// update is about to give a service that exists.
+/// it names beside it, those the service may still run as. Call it once the service exists (a virtual
+/// account's SID resolves only then) and before it starts, or for the account an update is about to give a
+/// service that exists.
 fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&Sid>, kept: &[Sid]) -> Result<()> {
     if !generate::hosted(spec) {
         return Ok(());

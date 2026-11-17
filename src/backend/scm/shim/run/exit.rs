@@ -18,6 +18,24 @@ use super::service::TABLE_NAME;
 /// What the service thread reports to SCM, for the main thread's exit.
 static EXIT: OnceLock<Reported> = OnceLock::new();
 
+/// The log of the run, which holds the handle on the default log: the process's end reports through it, so a
+/// failure line reaches the log even when an install has taken the account out of its permissions.
+static RUN_LOG: OnceLock<Arc<Log>> = OnceLock::new();
+
+/// Keep `log`, the one the run writes through, for [`end_process`]. Once per process, as the run starts.
+pub(super) fn keep_log(log: Arc<Log>) {
+    let first = RUN_LOG.set(log).is_ok();
+    debug_assert!(first, "the run kept its log twice");
+}
+
+/// The run's log, or a new one where no run began (the dispatcher failed to connect), which holds nothing.
+fn failure_log() -> Arc<Log> {
+    RUN_LOG
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(Log::real(Arc::default())))
+}
+
 /// Record what the service thread is about to report to SCM. Once per process, before `STOPPED`.
 pub(super) fn stopping(reported: Reported) {
     let first = EXIT.set(reported).is_ok();
@@ -33,7 +51,7 @@ pub(super) fn end_process(code: i32) -> ! {
     // SAFETY: the pseudo handle of the current process is always valid.
     if unsafe { TerminateProcess(GetCurrentProcess(), code as u32) } == 0 {
         let e = std::io::Error::last_os_error();
-        Log::real(Arc::default()).failure(
+        failure_log().failure(
             TABLE_NAME,
             &format!("end the shim's process with code {code}: {}", Chain(&e)),
         );

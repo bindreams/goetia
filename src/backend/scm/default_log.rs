@@ -81,7 +81,7 @@ pub(crate) fn refuse_logs_in_folder(program_data: &Path, id: &Id, logs: Option<&
         return Err(Error::Invalid {
             daemon: id.to_string(),
             message: format!(
-                "`logs: {}` is inside goetia's own log folder {}; remove `logs:` to use the default log, or                  name a file elsewhere",
+                "`logs: {}` is inside goetia's own log folder {}; remove `logs:` to use the default log, or name a file elsewhere",
                 logs.display(),
                 folder.display()
             ),

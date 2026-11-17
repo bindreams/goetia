@@ -60,6 +60,7 @@ pub(super) fn run(id: &str) -> ! {
     // One `Real` for the run, as a service's shim has (`service::service_main`).
     let real = Arc::new(Real::default());
     let log = Arc::new(Log::real(Arc::clone(&real)));
+    exit::keep_log(Arc::clone(&log));
     // Held for the whole run, as a service's shim does (`service::run_service`).
     log.hold_default(id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
@@ -263,20 +264,25 @@ fn own_instance(
 // The run -------------------------------------------------------------------------------------------------------------
 
 /// Writes the run's marker as a line of its own into the log, before the program is spawned: the
-/// program's output is appended after it. A failed write is logged and the program runs. A log that
-/// cannot be opened is not said here: the program's own open of the same file, which follows, reports
-/// it, so one fault is one line.
+/// program's output is appended after it. The log is the one the program's output goes to ([`Log::daemon_log`]):
+/// the default log, through the handle the shim holds on it, when `logs` is that. A log that cannot be opened,
+/// and a write that fails, are logged (a log's open fault is told once, [`Log::open_failed`]) and the program runs.
 fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &InstanceId) {
-    let line = format!("{}\n", instance.marker());
-    let Ok(mut file) = supervisor.os.open_log(logs, LogKind::Own) else {
-        return;
+    let log = &*supervisor.log;
+    let (path, kind) = log
+        .daemon_log(id, Some(logs))
+        .unwrap_or_else(|| (logs.to_path_buf(), LogKind::Own));
+    let mut file = match supervisor.os.open_log(&path, kind) {
+        Ok(file) => file,
+        Err(e) => return log.open_failed(id, &path, &e),
     };
+    let line = format!("{}\n", instance.marker());
     if let Err(e) = file.write_all(line.as_bytes()) {
-        supervisor.log.failure(
+        log.failure(
             id,
             &format!(
                 "write the run's marker to {}: {}; a reader cannot find this run's output in it",
-                logs.display(),
+                path.display(),
                 Chain(&e)
             ),
         );

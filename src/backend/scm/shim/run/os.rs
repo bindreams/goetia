@@ -2,6 +2,7 @@
 //! [`Os`], [`Spawned`] and [`Channels`] instead of `cosca`, `std::thread` and the file system.
 //! [`Real`] implements them; tests use `fake::Fake`.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -95,8 +96,9 @@ pub(crate) trait Channels: Send + Sync {
 /// [`Channels`] of a run are the same value, so they share the one handle held on the default log.
 #[derive(Default)]
 pub(crate) struct Real {
-    /// The default log [`Channels::hold_default`] opened, and its path.
-    held: Mutex<Option<(PathBuf, Arc<File>)>>,
+    /// The default logs [`Channels::hold_default`] opened (or a use did), by path: one handle for each, kept for the
+    /// run, so a use of another path never gives up this one.
+    held: Mutex<HashMap<PathBuf, Arc<File>>>,
 }
 
 impl Real {
@@ -106,15 +108,13 @@ impl Real {
     /// two uses at once cannot each open one.
     fn default_log(&self, path: &Path) -> io::Result<Arc<File>> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((held_path, file)) = held.as_ref()
-            && held_path == path
+        if let Some(file) = held.get(path)
             && !default_log::is_deleted(file)?
         {
             return Ok(Arc::clone(file));
         }
-        *held = None;
         let file = Arc::new(default_log::open_for_append(path)?);
-        *held = Some((path.to_path_buf(), Arc::clone(&file)));
+        held.insert(path.to_path_buf(), Arc::clone(&file));
         Ok(file)
     }
 }
