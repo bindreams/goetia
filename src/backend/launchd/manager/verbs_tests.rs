@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::super::manager_tests::{launchd_over, procinfo_not_naming};
 use super::super::task::Shown;
@@ -880,6 +880,49 @@ fn a_run_found_again_keeps_the_grace_that_began_at_its_sigterm() {
     assert_eq!(ended_by(&mut run), Some(libc::SIGKILL), "the run was ended by SIGKILL");
 }
 
+/// What a run is due, by what it has been sent and whether its grace is over: SIGTERM, or SIGKILL for
+/// `send-signal: kill`, first; then SIGKILL only once its grace is over, never twice, and never to another
+/// run on the strength of this one's grace. The grace is a stated deadline here, so no clock decides.
+#[skuld::test]
+fn a_run_is_due_sigkill_once_its_grace_is_over_and_not_before() {
+    let (mine, other) = (Held::new(0), Held::new(0));
+    let identity = |run: &Held| match ProcessId::of(run.pid()) {
+        Resolved::Found(identity) => identity,
+        _ => panic!("the child is running"),
+    };
+    let (mine, other) = (identity(&mine), identity(&other));
+    let course = |action| Course::new(Some(action), Budget::Unbounded, Watch::new().expect("a watch"));
+    let kill = StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    };
+    let (over, pending) = (Budget::Immediate.start(), Budget::Unbounded.start());
+    let termed = |grace_end, killed| {
+        let mut course = course(graced());
+        course.termed = Some(Termed {
+            run: mine,
+            grace_end: Some(grace_end),
+            killed,
+        });
+        course
+    };
+
+    assert_eq!(course(graced()).due(mine), Some(Signal::Term), "its first");
+    assert_eq!(course(kill).due(mine), Some(Signal::Kill), "its first, for `kill`");
+    assert_eq!(termed(pending, false).due(mine), None, "a grace that is not over");
+    assert_eq!(
+        termed(over, false).due(mine),
+        Some(Signal::Kill),
+        "a grace that is over"
+    );
+    assert_eq!(termed(over, true).due(mine), None, "killed once");
+    assert_eq!(
+        termed(over, false).due(other),
+        Some(Signal::Term),
+        "another run has a grace of its own"
+    );
+}
+
 /// A pid that launchd shows and does not name is not signalled at all, SIGTERM included: it is read again.
 #[skuld::test]
 fn a_pid_launchd_shows_and_procinfo_does_not_name_is_sent_nothing() {
@@ -1037,17 +1080,12 @@ fn the_sigkill_is_for_the_run_whose_timeout_ran_out_and_not_for_the_next() {
         send_signal: StopSignal::Terminate,
         timeout: Some(StopAction::MIN_TIMEOUT),
     };
-    let began = Instant::now();
 
     let (result, sent) = stopping_signals(&fake, Budget::Unbounded, action);
 
     result.expect("a stop that ends the second run");
     fake.assert_spent("each run was told to stop once, and the second killed");
     assert_eq!(sent, [Signal::Term, Signal::Term, Signal::Kill]);
-    assert!(
-        began.elapsed() >= StopAction::MIN_TIMEOUT * 2,
-        "each run had its whole timeout"
-    );
     assert_no_label_signal(&fake);
     assert_eq!(
         first.finish(),
