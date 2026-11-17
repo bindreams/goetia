@@ -642,8 +642,7 @@ fn the_output_of_a_virtual_account_service_lands_in_its_default_log(#[fixture(sc
             let written = std::fs::read_to_string(&log).unwrap_or_else(|e| panic!("read {}: {e}", log.display()));
             assert!(
                 written.matches(MARKER).count() >= 2,
-                "the daemon's stdout and stderr are in {}:
-{written}",
+                "the daemon's stdout and stderr are in {}:\n{written}",
                 log.display()
             );
         },

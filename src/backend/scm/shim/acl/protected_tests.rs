@@ -202,7 +202,10 @@ mod windows {
     #[skuld::test]
     fn the_default_log_descriptor_names_the_owner_and_the_account_s_append_alone() {
         let account = users();
-        let wanted = Descriptor::for_default_log(&account).unwrap().wanted().unwrap();
+        let wanted = Descriptor::for_default_log(std::slice::from_ref(&account))
+            .unwrap()
+            .wanted()
+            .unwrap();
 
         assert_eq!(wanted.owner, administrators());
         assert!(wanted.protected);
@@ -220,7 +223,27 @@ mod windows {
 
     #[skuld::test]
     fn the_default_log_descriptor_refuses_bytes_that_are_not_a_sid() {
-        assert!(Descriptor::for_default_log(&vec![1, 2, 3]).is_err());
+        assert!(Descriptor::for_default_log(&[vec![1, 2, 3]]).is_err());
+    }
+
+    /// An account that is changing is named beside the old one, each for append alone.
+    #[skuld::test]
+    fn the_default_log_descriptor_names_each_account_it_is_given() {
+        let (first, second) = (users(), everyone());
+        let wanted = Descriptor::for_default_log(&[first.clone(), second.clone()])
+            .unwrap()
+            .wanted()
+            .unwrap();
+
+        assert_eq!(
+            wanted.dacl,
+            Some(vec![
+                allow(system(), FULL, 0),
+                allow(administrators(), FULL, 0),
+                allow(first, 0x10_0084, 0),
+                allow(second, 0x10_0084, 0)
+            ])
+        );
     }
 
     // What the runs descriptor grants is read back from a real directory by `runs_tests`.

@@ -194,6 +194,24 @@ pub(crate) fn set_reparse_point(dir: &std::path::Path, tag: u32, payload: &[u8])
     assert_ne!(ok, 0, "set the reparse point: {}", std::io::Error::last_os_error());
 }
 
+/// `path` by its 8.3 names where the volume keeps them, and unchanged where it does not.
+#[cfg(windows)]
+pub(crate) fn short(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide = crate::backend::scm::wide::wide_null(path).unwrap();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buf` is `buf.len()` writable units.
+    let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    assert!(
+        0 < len && len < buf.len(),
+        "GetShortPathNameW: {}",
+        std::io::Error::last_os_error()
+    );
+    std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]))
+}
+
 /// Makes the existing empty directory `dir` a mount point (a junction) to the existing `target`, in place:
 /// see [`set_reparse_point`]. `mklink /J` cannot, since it makes the directory.
 #[cfg(windows)]

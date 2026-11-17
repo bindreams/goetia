@@ -44,8 +44,8 @@ fn entries_of(path: &Path) -> Vec<crate::backend::scm::shim::acl::Ace> {
     entries
 }
 
-fn entries_wanted_for(account: &Sid) -> Vec<crate::backend::scm::shim::acl::Ace> {
-    let mut entries = Descriptor::for_default_log(account)
+fn entries_wanted_for(accounts: &[Sid]) -> Vec<crate::backend::scm::shim::acl::Ace> {
+    let mut entries = Descriptor::for_default_log(accounts)
         .unwrap()
         .wanted()
         .unwrap()
@@ -74,7 +74,7 @@ fn a_log_that_is_there_has_its_permissions_set_to_the_account_s_append_and_nothi
 
     let security = read_path(&log).unwrap();
     assert!(security.protected);
-    assert_eq!(entries_of(&log), entries_wanted_for(&me));
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
 }
 
 /// A reinstall as another account takes the old account's entry away and gives the new one its own.
@@ -87,8 +87,47 @@ fn an_account_change_rewrites_the_entry_and_keeps_what_is_in_the_log() {
 
     ensure(dir.path(), &id(), &second).unwrap();
 
-    assert_eq!(entries_of(&log), entries_wanted_for(&second));
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&second)));
     assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what the account wrote is kept");
+}
+
+/// An update that changes the account names the new one before the service changes and the new one alone after
+/// it: in between, the account the service still runs as keeps its entry, and what is in the log is kept.
+#[skuld::test]
+fn an_account_is_admitted_beside_the_old_one_and_then_set_alone() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "kept\n").unwrap();
+    let (first, second) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
+    ensure(dir.path(), &id(), &first).unwrap();
+
+    admit(dir.path(), &id(), &second).unwrap();
+
+    assert!(read_path(&log).unwrap().protected);
+    assert_eq!(entries_of(&log), entries_wanted_for(&[first.clone(), second.clone()]));
+    admit(dir.path(), &id(), &second).unwrap();
+    assert_eq!(
+        entries_of(&log),
+        entries_wanted_for(&[first, second.clone()]),
+        "admitting again changes nothing"
+    );
+
+    ensure(dir.path(), &id(), &second).unwrap();
+
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&second)));
+    assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what is in the log is kept");
+}
+
+/// A link is refused by an admission as by an install, and nothing is set on it.
+#[skuld::test]
+fn a_log_that_is_a_link_is_not_admitted_to() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    set_reparse_point(&log, A_LINK_TAG, b"x");
+
+    let refused = admit(dir.path(), &id(), &process_user_sid()).unwrap_err();
+
+    assert!(refused.report().to_string().contains(&log.display().to_string()));
+    assert!(!read_path(&log).unwrap().protected, "its permissions are as they were");
 }
 
 /// A log that is another name for a file is not goetia's: nothing is set on it, and it is refused naming it.
@@ -118,7 +157,7 @@ fn a_log_with_a_tag_that_is_no_link_has_its_permissions_set() {
 
     ensure(dir.path(), &id(), &me).unwrap();
 
-    assert_eq!(entries_of(&log), entries_wanted_for(&me));
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
 }
 
 /// The folder is an install's, made before the file: where it is not there nothing is made.
@@ -145,7 +184,10 @@ fn a_log_that_is_missing_is_made_empty_with_the_whole_descriptor(#[fixture(scm_g
     ensure(dir.path(), &id(), &me).unwrap();
 
     assert_eq!(fs::metadata(&log).unwrap().len(), 0);
-    let wanted = Descriptor::for_default_log(&me).unwrap().wanted().unwrap();
+    let wanted = Descriptor::for_default_log(std::slice::from_ref(&me))
+        .unwrap()
+        .wanted()
+        .unwrap();
     assert!(is_as_wanted(&read_path(&log).unwrap(), &wanted));
     ensure(dir.path(), &id(), &me).unwrap();
 }
@@ -235,12 +277,21 @@ fn the_install_and_the_shim_refuse_a_link_in_the_same_words() {
 #[skuld::test]
 fn the_shim_appends_to_a_log_with_a_tag_that_is_no_link() {
     let (_dir, log) = program_data_with_logs();
-    fs::write(
-        &log, "first
-",
-    )
-    .unwrap();
+    fs::write(&log, "first\n").unwrap();
     set_reparse_point(&log, A_TAG, b"x");
 
-    open_for_append(&log).expect("a tag that is no link is not refused");
+    let mut file = open_for_append(&log).expect("a tag that is no link is not refused");
+    file.write_all(b"second\n").unwrap();
+    drop(file);
+
+    // A file with a tag is read as itself, as a file with any other tag is.
+    let mut written = String::new();
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&log)
+        .unwrap()
+        .read_to_string(&mut written)
+        .unwrap();
+    assert_eq!(written, "first\nsecond\n");
 }

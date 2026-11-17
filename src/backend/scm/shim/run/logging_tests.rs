@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard};
+use crate::backend::scm::test_support::short;
 use crate::error::Error;
 
 const LINE: &str = "goetia-shim[svc]: the line";
@@ -155,6 +156,38 @@ fn a_path_that_names_the_default_log_in_other_case_or_spelling_is_the_default() 
         assert_eq!(log.kind_of("svc", Path::new(spelled)), LogKind::Default, "{spelled}");
     }
     assert_eq!(log.kind_of("svc", Path::new(r"logs\svc.log.txt")), LogKind::Own);
+}
+
+/// The default log is there by the time the shim runs (an install made it), so another name for the file is
+/// found by Windows's own rules: its trailing dots and spaces are dropped, its case is the stored one, and an
+/// 8.3 alias is the long name. Such a `logs:` is the default log, tried once.
+#[skuld::test]
+fn a_path_that_names_the_existing_default_log_by_windows_s_rules_is_the_default() {
+    let fake = FakeGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let id = "nightly-build";
+    let default = dir.path().join(format!("{id}.log"));
+    std::fs::write(&default, b"").unwrap();
+    let log = Log::new(fake.channels(), dir.path().to_path_buf());
+    let spelled_with = |tail: &str| PathBuf::from(format!("{}{tail}", default.display()));
+
+    for spelled in [
+        spelled_with("."),
+        spelled_with(" "),
+        spelled_with(". ."),
+        PathBuf::from(default.to_string_lossy().to_uppercase()),
+        short(&default),
+    ] {
+        assert_eq!(log.kind_of(id, &spelled), LogKind::Default, "{}", spelled.display());
+        assert_eq!(
+            log_destinations(Some(&spelled), default.clone()),
+            vec![(default.clone(), LogKind::Default)],
+            "{}",
+            spelled.display()
+        );
+    }
+    let other = dir.path().join(format!("{id}.log.txt"));
+    assert_eq!(log.kind_of(id, &other), LogKind::Own);
 }
 
 #[skuld::test]

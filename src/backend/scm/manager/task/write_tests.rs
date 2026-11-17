@@ -713,6 +713,83 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
     assert!(!trustees.contains(&me), "the old account may not");
 }
 
+/// The default log of `dir` as a daemon of the test's own account left it: named for that account alone,
+/// which the test may read the attributes of, as an install's token may of any.
+fn log_of_the_old_account(dir: &TempDir) {
+    crate::backend::scm::default_log::ensure(dir.path(), &id(), &process_user_sid()).unwrap();
+}
+
+/// A change of account never leaves the account the task still runs as without its log. The new account is
+/// named beside the old one before anything is deleted, and set alone only once the task is registered: a
+/// delete that fails leaves the old task, a raced create leaves what the other install made, and either way
+/// both accounts may append until an install that lands corrects it.
+#[skuld::test]
+fn a_change_of_account_that_does_not_land_leaves_both_accounts_their_log() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    for raced in [false, true] {
+        let (dir, runs) = made_records();
+        log_of_the_old_account(&dir);
+        let fake = Fake::new();
+        fake.on_set_enabled(Ok(())).on_instances(Ok(Vec::new()));
+        if raced {
+            fake.on_delete(Ok(true)).on_register(Ok(Registration::Raced));
+        } else {
+            // The failure puts the enabled flag back.
+            fake.on_delete(Err(Error::os("delete", std::io::Error::other("denied"))))
+                .on_set_enabled(Ok(()));
+        }
+
+        let _ = scm(&fake).task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        );
+
+        let trustees = trustees_of(&default_log(&dir));
+        assert!(
+            trustees.contains(&process_user_sid()),
+            "raced={raced}: the old account keeps its log"
+        );
+        assert!(
+            trustees.contains(&users()),
+            "raced={raced}: the new account has its own"
+        );
+    }
+}
+
+/// A change that lands leaves the new account alone.
+#[skuld::test]
+fn a_change_of_account_that_lands_leaves_the_new_account_alone_in_the_log() {
+    let (dir, runs) = made_records();
+    log_of_the_old_account(&dir);
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap();
+
+    let trustees = trustees_of(&default_log(&dir));
+    assert!(trustees.contains(&users()));
+    assert!(!trustees.contains(&process_user_sid()));
+}
+
 // Before any write ====================================================================================================
 
 /// A real account's password is the one thing `password_of` reads, and only for a real account: a value
@@ -1372,5 +1449,49 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
         [register_call(&spec, false, root(), None, false)],
         "a create, disarmed"
     );
+    fake.finish();
+}
+
+/// A service changed into a task keeps the account it still runs as in its log until the task exists: a
+/// `retire` that fails leaves the service, and the log names both accounts; one that lands, and a task
+/// registered, leaves the new account alone.
+#[skuld::test]
+fn a_service_changed_into_a_task_keeps_its_old_account_in_the_log_until_the_task_exists() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let (dir, runs) = made_records();
+    log_of_the_old_account(&dir);
+    let fake = Fake::new();
+
+    let failed = scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            prepared(users(), None),
+            || Ok(()),
+            || Err(Error::os("retire", std::io::Error::other("denied"))),
+        )
+        .unwrap_err();
+
+    assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
+    let trustees = trustees_of(&default_log(&dir));
+    assert!(trustees.contains(&process_user_sid()), "the service keeps its log");
+    assert!(trustees.contains(&users()));
+
+    fake.on_register(Ok(Registration::Created));
+    scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            prepared(users(), None),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+
+    let trustees = trustees_of(&default_log(&dir));
+    assert!(trustees.contains(&users()));
+    assert!(!trustees.contains(&process_user_sid()));
     fake.finish();
 }

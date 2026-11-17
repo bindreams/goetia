@@ -408,6 +408,19 @@ fn a_services_built_in_account_is_its_well_known_sid() {
         (Some(r"NT AUTHORITY\NetworkService"), sid_from_parts(5, &[20])),
         (Some("NetworkService"), sid_from_parts(5, &[20])),
     ] {
-        assert_eq!(service_account_sid(account).unwrap(), sid, "{account:?}");
+        assert_eq!(service_account_sid(account, None).unwrap(), sid, "{account:?}");
     }
+}
+
+/// A spec that gave a SID names that SID, as the logon gate does: the account name it registers is not
+/// looked up again, which could name another account.
+#[skuld::test]
+fn a_service_whose_spec_gave_a_sid_is_that_sid_with_no_lookup() {
+    let users = sid_from_parts(5, &[32, 545]);
+
+    let sid = service_account_sid(Some("no-such-account-goetia"), Some(Written::Sid("S-1-5-32-545")));
+
+    assert_eq!(sid.unwrap(), users);
+    let built_in = service_account_sid(Some("NetworkService"), Some(Written::Name("NetworkService")));
+    assert_eq!(built_in.unwrap(), sid_from_parts(5, &[20]));
 }
