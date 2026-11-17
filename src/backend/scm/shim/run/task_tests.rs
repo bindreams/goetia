@@ -621,11 +621,7 @@ fn an_unreadable_listing_runs_the_program_and_writes_no_record() {
     let code = run.run();
 
     assert_eq!(code, 5, "the program's code is returned all the same");
-    assert_eq!(
-        run.runs.appeared(&pin).unwrap(),
-        vec![],
-        "a record was written for no run"
-    );
+    assert_eq!(pin.appeared().unwrap(), vec![], "a record was written for no run");
     let failures = run.finish();
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
@@ -716,7 +712,7 @@ fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded(
     let code = run_in(ID, &run.supervisor, &api, Some(&run.runs), OWN_PID);
 
     assert_eq!(code, STOPPED);
-    assert_eq!(run.runs.appeared(&pin).unwrap(), vec![]);
+    assert_eq!(pin.appeared().unwrap(), vec![]);
     assert_eq!(run.fake.calls(Op::Spawn), 0);
     let failures = run.fake.take_failures();
     assert_eq!(failures.len(), 1, "{failures:?}");

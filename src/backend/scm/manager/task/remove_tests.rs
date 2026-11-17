@@ -7,7 +7,9 @@ use std::io;
 
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, shim_writes, snapshot_of};
+use super::super::support::{
+    Machine, PATH, id, instance, instance_id, linked_records, record, records, scm, shim_writes, snapshot_of,
+};
 use super::*;
 use crate::backend::ReadOutcome;
 use crate::backend::kill::Waited;
@@ -67,6 +69,34 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
         "its exit is waited for after the stop and before the delete"
     );
     assert!(!records_dir.exists(), "the records go with the task");
+    fake.finish();
+}
+
+/// The account can make the task's records directory a link. The uninstall goes on all the same: the run
+/// is stopped, and the link is deleted with what it points to left as it was.
+#[skuld::test]
+fn uninstall_of_a_task_whose_records_directory_is_a_link_stops_the_run_and_deletes_the_link() {
+    let (_dir, records_dir, runs, target) = linked_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_stop(Ok(()))
+        .on_delete(Ok(true));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .unwrap();
+
+    assert!(fake.calls().contains(&Call::Stop(PATH.to_owned(), instance_id(1))));
+    assert!(std::fs::symlink_metadata(&records_dir).is_err(), "the link is gone");
+    assert!(
+        target.path().join(format!("{}.json", instance_id(1).hex())).exists(),
+        "what it pointed to is as it was"
+    );
     fake.finish();
 }
 
@@ -478,11 +508,16 @@ fn uninstall_of_an_id_that_is_absent_removes_the_records_under_the_install_lock(
     let locked = Cell::new(false);
 
     scm(&fake)
-        .uninstall_absent_with(&id(), &runs, || {
-            assert!(records_dir.exists(), "the lock is taken before the records go");
-            locked.set(true);
-            Ok(())
-        })
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || {
+                assert!(records_dir.exists(), "the lock is taken before the records go");
+                locked.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
         .unwrap();
 
     assert!(locked.get());
@@ -492,6 +527,35 @@ fn uninstall_of_an_id_that_is_absent_removes_the_records_under_the_install_lock(
         [],
         "a manager with no provider has nothing to sweep, and reads no task"
     );
+}
+
+/// The sweep takes the install lock itself, so it runs after the records' removal has let the lock go.
+#[skuld::test]
+fn the_sweep_of_an_absent_id_runs_after_the_install_lock_is_released() {
+    struct Lock<'a>(&'a Cell<bool>);
+    impl Drop for Lock<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let (_dir, _records_dir, runs) = records();
+    let released = Cell::new(false);
+    let swept = Cell::new(false);
+
+    scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || Ok(Lock(&released)),
+            || {
+                assert!(released.get(), "the lock was still held when the sweep began");
+                swept.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert!(swept.get());
 }
 
 /// An uninstall that died after its records' directory went, and before it removed its marker, leaves the
@@ -506,10 +570,15 @@ fn uninstall_of_an_id_that_is_absent_clears_a_marker_left_beside_no_records() {
     let locked = Cell::new(false);
 
     scm(&Fake::new())
-        .uninstall_absent_with(&id(), &runs, || {
-            locked.set(true);
-            Ok(())
-        })
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || {
+                locked.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
         .unwrap();
 
     assert!(locked.get());
@@ -524,7 +593,12 @@ fn uninstall_of_an_id_with_no_records_takes_no_lock() {
     let runs = Runs::of(dir.path(), &id());
 
     scm(&Fake::new())
-        .uninstall_absent_with(&id(), &runs, || -> Result<()> { panic!("there is nothing to guard") })
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || -> Result<()> { panic!("there is nothing to guard") },
+            || Ok(()),
+        )
         .unwrap();
 }
 
@@ -533,22 +607,76 @@ fn uninstall_of_an_id_with_no_records_takes_no_lock() {
 #[skuld::test]
 fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_fails() {
     let (_dir, records_dir, runs) = records();
-    crate::backend::scm::test_support::directory_with_a_file(&records_dir.join("pin-odd.pin"));
+    let _held = crate::backend::scm::test_support::directory_held_open(&records_dir.join("stuck"));
 
     let failed = scm(&Fake::new())
-        .uninstall_absent_with(&id(), &runs, || -> Result<()> { Ok(()) })
+        .uninstall_absent_with(&id(), &runs, || -> Result<()> { Ok(()) }, || Ok(()))
         .unwrap_err();
 
     let text = failed.to_string();
-    assert!(text.contains("`nightly` is deleted"), "{text}");
+    assert!(
+        text.contains("`nightly` is not installed, and run records left for it could not be removed"),
+        "{text}"
+    );
+    assert!(!text.contains("is deleted"), "nothing was deleted: {text}");
+    assert!(
+        !text.contains("earlier uninstall"),
+        "the records may come from a failed install or a task deleted elsewhere: {text}"
+    );
     assert!(
         text.contains("Re-run `goetia daemon uninstall nightly` to remove them"),
         "{text}"
     );
+    assert!(failed.report().to_string().contains("stuck"), "{}", failed.report());
+}
+
+/// The shim sweep does not depend on the records: a removal that fails does not skip it, and a sweep that
+/// fails too does not hide the records' failure.
+#[skuld::test]
+fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_removed() {
+    let (_dir, records_dir, runs) = records();
+    let _held = crate::backend::scm::test_support::directory_held_open(&records_dir.join("stuck"));
+    let swept = Cell::new(false);
+
+    let failed = scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || -> Result<()> { Ok(()) },
+            || {
+                swept.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+    assert!(swept.get(), "the sweep ran after the records failed");
     assert!(
-        failed.report().to_string().contains("pin-odd.pin"),
-        "{}",
-        failed.report()
+        failed
+            .to_string()
+            .contains("run records left for it could not be removed"),
+        "{failed}"
+    );
+
+    swept.set(false);
+    let both = scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || -> Result<()> { Ok(()) },
+            || {
+                swept.set(true);
+                Err(Error::os("sweep the shim files", io::Error::other("denied")))
+            },
+        )
+        .unwrap_err();
+
+    assert!(swept.get());
+    let said = both.report().to_string();
+    assert!(said.contains("stuck"), "the records' failure is kept: {said}");
+    assert!(
+        said.contains("sweep the shim files"),
+        "the sweep's failure is kept: {said}"
     );
 }
 

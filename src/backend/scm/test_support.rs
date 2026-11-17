@@ -85,55 +85,50 @@ pub(crate) fn registered_task(
     }
 }
 
+/// Makes `descriptor`'s DACL, protected, the DACL of the existing file or folder `path`, not following a
+/// link at it: a fixture's permissions.
+#[cfg(windows)]
+pub(crate) fn set_dacl(
+    descriptor: &crate::backend::scm::shim::acl::Descriptor,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+    };
+
+    let object = std::fs::OpenOptions::new()
+        .access_mode(WRITE_DAC | READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    descriptor.set_dacl_of(&object)
+}
+
 /// Makes a directory with a file in it at `path`. Where a file is expected, deleting it as a file fails
 /// for a reason that is no handle and no pending delete, whoever runs it. The tempdir the tests make it
 /// in removes it. A task's records directory names its account without the right to add a subdirectory,
 /// so the directory `path` is in is opened to everyone first.
 #[cfg(windows)]
 pub(crate) fn directory_with_a_file(path: &std::path::Path) {
-    crate::backend::scm::shim::acl::Descriptor::from_sddl("D:P(A;;FA;;;WD)")
-        .unwrap()
-        .set_dacl(path.parent().expect("a path in a directory"))
-        .unwrap();
+    let everyone = crate::backend::scm::shim::acl::Descriptor::from_sddl("D:P(A;;FA;;;WD)").unwrap();
+    set_dacl(&everyone, path.parent().expect("a path in a directory")).unwrap();
     std::fs::create_dir(path).unwrap();
     std::fs::write(path.join("inside"), "").unwrap();
 }
 
-/// The empty directory `path`, made delete-pending as another program does it (a classic delete while a
-/// handle is open, KB D3): it stays until the returned handle is dropped, and Windows answers a listing or a
-/// delete of it with access denied.
+/// A directory at `path` that cannot be removed while the returned handle is open: a file in it is held
+/// without sharing delete, so removing its tree is a sharing violation.
 #[cfg(windows)]
-pub(crate) fn delete_pending_directory(path: &std::path::Path) -> std::fs::File {
+pub(crate) fn directory_held_open(path: &std::path::Path) -> std::fs::File {
     use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::GENERIC_READ;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfo, SetFileInformationByHandle,
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-    let open = |access: u32| {
-        std::fs::OpenOptions::new()
-            .access_mode(access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .unwrap()
-    };
-    let holder = open(GENERIC_READ);
-    let deleter = open(DELETE);
-    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: `deleter` is a live handle opened with `DELETE`; `info` is the struct the class names.
-    let ok = unsafe {
-        SetFileInformationByHandle(
-            deleter.as_raw_handle() as _,
-            FileDispositionInfo,
-            std::ptr::from_ref(&info).cast(),
-            size_of::<FILE_DISPOSITION_INFO>() as u32,
-        )
-    };
-    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
-    holder
+    directory_with_a_file(path);
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path.join("inside"))
+        .unwrap()
 }
 
 /// A file at `path` whose delete is pending: its holder closed it while the returned handle was open on
@@ -153,4 +148,74 @@ pub(crate) fn delete_pending(path: &std::path::Path) -> std::fs::File {
     let reader = std::fs::OpenOptions::new().read(true).open(path).unwrap();
     drop(holder);
     reader
+}
+
+/// Gives the existing empty directory `dir` the reparse tag `tag` with `payload`, as the account that may
+/// add files to it can: it is the same directory, so a handle held on it before is on a
+/// reparse point now.
+#[cfg(windows)]
+pub(crate) fn set_reparse_point(dir: &std::path::Path, tag: u32, payload: &[u8]) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    // The tag, the length of the data, and a reserved field.
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(&tag.to_le_bytes());
+    buffer.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+    buffer.extend_from_slice(&0u16.to_le_bytes());
+    buffer.extend_from_slice(payload);
+    // `FILE_ADD_FILE`, which is what the account has on its directory, and `SYNCHRONIZE`.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x2 | 0x10_0000)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir)
+        .unwrap();
+    let mut returned = 0u32;
+    // SAFETY: `buffer` is readable for the length given; `file` is a live handle; no output is asked for.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr().cast(),
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0, "set the reparse point: {}", std::io::Error::last_os_error());
+}
+
+/// Makes the existing empty directory `dir` a mount point (a junction) to the existing `target`, in place:
+/// see [`set_reparse_point`]. `mklink /J` cannot, since it makes the directory.
+#[cfg(windows)]
+pub(crate) fn make_mount_point(dir: &std::path::Path, target: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    let target = target.canonicalize().unwrap();
+    // `canonicalize` gives `\?\C:\...`; the substitute name is `\??\C:\...` and the print name `C:\...`.
+    let print: Vec<u16> = target.as_os_str().encode_wide().skip(4).collect();
+    let substitute: Vec<u16> = r"\??\".encode_utf16().chain(print.iter().copied()).collect();
+    let bytes = |units: &[u16]| units.iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>();
+    let (substitute, print) = (bytes(&substitute), bytes(&print));
+    let mut payload = Vec::new();
+    // The offsets and lengths of the two names in the buffer that follows, each closed by a NUL unit.
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&u16::try_from(substitute.len()).unwrap().to_le_bytes());
+    payload.extend_from_slice(&u16::try_from(substitute.len() + 2).unwrap().to_le_bytes());
+    payload.extend_from_slice(&u16::try_from(print.len()).unwrap().to_le_bytes());
+    payload.extend_from_slice(&substitute);
+    payload.extend_from_slice(&[0, 0]);
+    payload.extend_from_slice(&print);
+    payload.extend_from_slice(&[0, 0]);
+    set_reparse_point(dir, IO_REPARSE_TAG_MOUNT_POINT, &payload);
 }
