@@ -11,7 +11,7 @@ use goetia::testing::sid_of;
 
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
-use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT, RUN_UNTIL_KILLED};
+use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT, PRINT_WHEN_RELEASED, RUN_UNTIL_KILLED};
 use crate::support::windows_tasks::{ServiceAccountHost, task_spec};
 use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, cleanup, kill, scm_group};
 use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
@@ -337,11 +337,9 @@ fn accounts_of_default_log(id: &Id) -> Vec<Vec<u8>> {
     accounts
 }
 
-fn service_as(id: &Id, host: &ServiceAccountHost, account: &str) -> DaemonSpec {
-    let base = support::base_fields(
-        id.as_str(),
-        vec![host.exe.path_str(), RUN_UNTIL_KILLED.to_owned(), "0".to_owned()],
-    );
+/// The service `id` that runs `command` as `account`.
+fn service_running(id: &Id, account: &str, command: Vec<String>) -> DaemonSpec {
+    let base = support::base_fields(id.as_str(), command);
     ServiceSpec::new(ServiceFields {
         common: DaemonFields {
             user: User::Name(account.to_owned()),
@@ -352,6 +350,15 @@ fn service_as(id: &Id, host: &ServiceAccountHost, account: &str) -> DaemonSpec {
     })
     .map(DaemonSpec::from)
     .expect("a valid service")
+}
+
+/// [`service_running`] a program that runs until it is killed.
+fn service_as(id: &Id, host: &ServiceAccountHost, account: &str) -> DaemonSpec {
+    service_running(
+        id,
+        account,
+        vec![host.exe.path_str(), RUN_UNTIL_KILLED.to_owned(), "0".to_owned()],
+    )
 }
 
 /// What an install names in the default log is computed from the accounts it knows, never read back from the
@@ -393,4 +400,88 @@ fn the_default_log_of_a_service_names_the_registered_account_alone(#[fixture(scm
         [network_service],
         "an account change that landed"
     );
+}
+
+/// Reads the default log of `id`: its lines.
+fn log_lines(id: &Id) -> Vec<String> {
+    default_log_of(id).lines().map(str::to_owned).collect()
+}
+
+/// A service that runs as one account while an install changes it to another: SCM does not restart a service
+/// it updates, so the shim goes on as the first account with the second one the only account in the log's
+/// permissions. The daemon's output and the shim's handle are the ones it opened at its start, so its next line
+/// lands in `<id>.log`; after a restart the second account runs, and its lines land too. The program prints a
+/// line, tells the test, and prints another when the test says, so no line is waited for by time.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_running_service_whose_account_changes_keeps_its_log_and_the_new_account_writes_it_after_a_restart(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    use std::io::Read as _;
+    use std::net::Shutdown;
+
+    let id = &test_id();
+    let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = host.manager();
+    let listener = ConnectBack::listen();
+    let as_account = |account: &str| {
+        service_running(
+            id,
+            account,
+            vec![
+                host.exe.path_str(),
+                PRINT_WHEN_RELEASED.to_owned(),
+                listener.port().to_string(),
+                "run".to_owned(),
+            ],
+        )
+    };
+    // The test releases the program that runs, and reads its answer: the line is in the file once it comes.
+    let release = |mut stream: std::net::TcpStream| {
+        stream.shutdown(Shutdown::Write).expect("release the program");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("the program's answer");
+        assert_eq!(answer, "x");
+    };
+
+    mgr.install(&as_account("LocalService"), false)
+        .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
+    mgr.start(id, Budget::Unbounded)
+        .unwrap_or_else(|e| panic!("start as LocalService: {}", e.report()));
+    let first_run = listener.accept_stream("the program of the service, as LocalService");
+
+    // The account changes under the running service.
+    mgr.install(&as_account("NetworkService"), false)
+        .unwrap_or_else(|e| panic!("install as NetworkService, while it runs: {}", e.report()));
+    let status = mgr.status(id).expect("status");
+    assert_eq!(status.common().state, State::Running, "an install does not restart it");
+    assert_eq!(
+        accounts_of_default_log(id),
+        [sid_of(5, &NETWORK_SERVICE)],
+        "the log names the new account alone"
+    );
+
+    release(first_run);
+    let lines = log_lines(id);
+    assert!(
+        lines.iter().any(|line| line.starts_with("run first "))
+            && lines.iter().any(|line| line.starts_with("run released ")),
+        "the running service's output before and after the change: {lines:?}"
+    );
+
+    // A restart runs it as the new account, which the log names.
+    mgr.stop(id, Budget::DEFAULT)
+        .unwrap_or_else(|e| panic!("stop: {}", e.report()));
+    mgr.start(id, Budget::Unbounded)
+        .unwrap_or_else(|e| panic!("start as NetworkService: {}", e.report()));
+    let second_run = listener.accept_stream("the program of the service, as NetworkService");
+    release(second_run);
+    let lines = log_lines(id);
+    let count = |prefix: &str| lines.iter().filter(|line| line.starts_with(prefix)).count();
+    assert_eq!(
+        (count("run first "), count("run released ")),
+        (2, 2),
+        "both runs' lines: {lines:?}"
+    );
+    assert_eq!(accounts_of_default_log(id), [sid_of(5, &NETWORK_SERVICE)]);
 }

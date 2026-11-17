@@ -33,6 +33,10 @@ const WAIT_FAILED: &str = "the wait failed (fake)";
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
+
+/// What a [`Fake::will_fail_hold`] hold fails with.
+pub(crate) const HOLD_FAILED: &str = "the log could not be held (fake)";
+
 /// A refused [`Spawned::kill`].
 pub(crate) fn kill_refused() -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
@@ -56,7 +60,7 @@ pub(crate) fn wait_failed_with_code(code: i32) -> cosca::error::Error {
 }
 
 /// The default log directory of [`Fake::log`]. The `Fake` writes no file there.
-const FAKE_LOGS: &str = "fake-logs";
+pub(crate) const FAKE_LOGS: &str = "fake-logs";
 
 /// Poison is recovered from: a panicking thread must not make every later call on the `Fake` panic.
 /// Nothing here panics with a lock held.
@@ -335,6 +339,7 @@ struct State {
     /// handle to what was opened, which is what the code under test writes into.
     opened_logs: Vec<(PathBuf, LogKind, File)>,
     append_failures: Vec<PathBuf>,
+    hold_failures: Vec<PathBuf>,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
     processes: Vec<Arc<Proc>>,
@@ -448,6 +453,11 @@ impl Fake {
     /// The next `append` to `path` fails with [`APPEND_FAILED`].
     pub(crate) fn will_fail_append(&self, path: &Path) {
         lock(&self.shared.state).append_failures.push(path.to_path_buf());
+    }
+
+    /// The next `hold_default` of `path` fails with [`HOLD_FAILED`].
+    pub(crate) fn will_fail_hold(&self, path: &Path) {
+        lock(&self.shared.state).hold_failures.push(path.to_path_buf());
     }
 
     // Records ---------------------------------------------------------------------------------------------------------
@@ -567,6 +577,9 @@ impl Fake {
                     "stated append failures never used: {:?}",
                     state.append_failures
                 ));
+            }
+            if !state.hold_failures.is_empty() {
+                problems.push(format!("stated hold failures never used: {:?}", state.hold_failures));
             }
             if !state.open_log_failures.is_empty() {
                 problems.push(format!(
@@ -722,10 +735,17 @@ impl Channels for Fake {
     }
 
     fn hold_default(&self, path: &Path) -> io::Result<()> {
-        lock(&self.shared.state).channel_calls.push(ChannelCall::HoldDefault {
+        let mut state = lock(&self.shared.state);
+        state.channel_calls.push(ChannelCall::HoldDefault {
             path: path.to_path_buf(),
         });
-        Ok(())
+        match state.hold_failures.iter().position(|failing| failing == path) {
+            Some(i) => {
+                state.hold_failures.remove(i);
+                Err(io::Error::other(HOLD_FAILED))
+            }
+            None => Ok(()),
+        }
     }
 
     fn event_log(&self, severity: Severity, line: &str) {

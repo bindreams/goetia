@@ -464,6 +464,127 @@ fn the_shims_own_lines_after_its_account_was_taken_out_land_in_the_held_log(#[fi
     assert_eq!(std::fs::read_to_string(&log).expect("the log"), "the line\n");
 }
 
+/// The daemon's output and the shim's own lines are one handle: the log the shim held at its start is what
+/// [`Os::open_log`] hands the daemon, so an account change that takes the account out of the file's permissions
+/// while the service starts cannot leave the daemon's output without its log. A shim that opened the path
+/// again would be refused.
+#[skuld::test]
+fn the_daemons_output_goes_through_the_handle_the_log_held(#[fixture(temp_dir)] dir: &Path) {
+    let log_file = dir.join("svc.log");
+    let me = sid_display(&process_user_sid());
+    std::fs::write(&log_file, "").expect("the file an install made");
+    permit_only(&log_file, &me);
+    let real = Arc::new(Real::default());
+    let log = Log::new(real.clone(), dir.to_path_buf());
+    log.hold_default("svc");
+
+    withdraw_append(&log_file, &me);
+
+    let mut output = real
+        .open_log(&log_file, LogKind::Default)
+        .expect("the held handle, for the daemon");
+    output
+        .write_all(
+            b"output
+",
+        )
+        .expect("the daemon writes");
+    real.append(&log_file, "the line", LogKind::Default)
+        .expect("a line through the same handle");
+    let reopened = Real::default().open_log(&log_file, LogKind::Default);
+    assert_eq!(
+        reopened.expect_err("a shim that opens the path again").kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    permit_only(&log_file, &me);
+    assert_eq!(
+        std::fs::read_to_string(&log_file).expect("the log"),
+        "output
+the line
+"
+    );
+}
+
+/// The README's recovery deletes `<id>.log` and installs again while a shim may run. The held handle is then
+/// on a file with no name, which no one reads: the next line opens the path, which an install made again, and
+/// holds that file.
+#[skuld::test]
+fn a_held_default_log_that_was_deleted_is_opened_again_for_the_next_line(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("x.log");
+    std::fs::write(
+        &log, "old
+",
+    )
+    .expect("the file an install made");
+    let real = Real::default();
+    real.hold_default(&log).expect("hold the default log");
+    std::fs::remove_file(&log).expect("delete the log");
+    std::fs::write(&log, "").expect("the install makes it again");
+
+    real.append(&log, "first", LogKind::Default)
+        .expect("a line, in the new file");
+    real.append(&log, "second", LogKind::Default)
+        .expect("another, through the handle it holds now");
+
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("the new log"),
+        "first
+second
+"
+    );
+}
+
+/// The same for the daemon's output: a daemon started after the recovery writes the new file.
+#[skuld::test]
+fn the_daemons_output_after_the_held_log_was_deleted_goes_to_the_new_file(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("x.log");
+    std::fs::write(&log, "").expect("the file an install made");
+    let real = Real::default();
+    real.hold_default(&log).expect("hold the default log");
+    std::fs::remove_file(&log).expect("delete the log");
+    std::fs::write(&log, "").expect("the install makes it again");
+
+    let mut output = real.open_log(&log, LogKind::Default).expect("the new file");
+    output
+        .write_all(
+            b"output
+",
+        )
+        .expect("the daemon writes");
+
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("the new log"),
+        "output
+"
+    );
+}
+
+/// A deleted log that no install has made again is not written into the file that has no name, and makes
+/// nothing; once it is made, the next line lands in it.
+#[skuld::test]
+fn a_held_default_log_that_was_deleted_is_not_written_until_it_is_there_again(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("x.log");
+    std::fs::write(&log, "").expect("the file an install made");
+    let real = Real::default();
+    real.hold_default(&log).expect("hold the default log");
+    std::fs::remove_file(&log).expect("delete the log");
+
+    let refused = real
+        .append(&log, "lost", LogKind::Default)
+        .expect_err("nothing is there to write");
+
+    assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+    assert!(!log.exists(), "the shim made the file");
+    std::fs::write(&log, "").expect("the install makes it again");
+    real.append(&log, "the line", LogKind::Default)
+        .expect("the new file, once it is there");
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("the new log"),
+        "the line
+"
+    );
+}
+
 #[skuld::test]
 fn append_appends_rather_than_truncates(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("x.log");

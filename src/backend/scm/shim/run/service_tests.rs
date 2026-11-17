@@ -25,8 +25,8 @@ use windows_sys::Win32::System::Services::{
 use super::*;
 use crate::backend::scm::shim::run::os::LogKind;
 use crate::backend::scm::shim::run::os::fake::{
-    FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, tree_kill_refused,
-    wait_failed, wait_failed_with_code,
+    ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd,
+    tree_kill_refused, wait_failed, wait_failed_with_code,
 };
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
@@ -363,6 +363,39 @@ fn the_daemons_log_has_its_folders_made_only_when_it_is_the_users_own() {
         drop(launched);
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     }
+}
+
+/// A `logs:` equal to the default log as written, which a service installed by an earlier version may carry,
+/// is the default log in everything: its output is opened as the default log, and a failure line goes to it
+/// once, not once as the user's own and once as the default.
+#[skuld::test]
+fn a_logs_equal_to_the_default_log_is_the_default_log_for_output_and_for_failures() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new();
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+    let default = Path::new(FAKE_LOGS).join(format!("{ID}.log"));
+    let spec = spec_logging_to(Some(default.clone()));
+    let supervisor = supervisor(&fake);
+
+    let launched = launch(&spec, &supervisor, ID);
+
+    assert!(launched.is_ok());
+    assert_eq!(fake.opened_log_kind(0), LogKind::Default);
+    assert_eq!(fake.opened_log_path(0), default);
+    drop(launched);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    set_daemon_log(&supervisor.log, ID, &spec);
+    supervisor.log.failure(ID, "the line");
+    let appended: Vec<(PathBuf, LogKind)> = fake
+        .take_channel_calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            ChannelCall::Append { path, kind, .. } => Some((path, kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(appended, vec![(default, LogKind::Default)]);
 }
 
 // run_daemon ==========================================================================================================

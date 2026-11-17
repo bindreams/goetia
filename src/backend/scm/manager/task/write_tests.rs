@@ -1389,7 +1389,7 @@ fn a_service_that_runs_is_not_changed_into_a_task() {
             &definition(&spec),
             &runs,
             |_| panic!("nothing is acquired for a retype that is refused"),
-            || refuse_running(&id(), DaemonKind::Service, State::Running).map(|()| None),
+            || refuse_running(&id(), DaemonKind::Service, State::Running),
             || panic!("the service is not removed"),
         )
         .unwrap_err();
@@ -1427,7 +1427,7 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
                     password,
                 })
             },
-            || Ok(None),
+            || Ok(()),
             || panic!("the service is not removed when what the task needs is missing"),
         )
         .unwrap_err();
@@ -1444,7 +1444,7 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
         &definition(&spec),
         &blocked,
         prepared_alice(),
-        || Ok(None),
+        || Ok(()),
         || panic!("the service is not removed when its record directory cannot be made"),
     );
     assert!(refused.is_err());
@@ -1468,7 +1468,7 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
             &definition(&spec),
             &runs,
             prepared(process_user_sid(), None),
-            || Ok(None),
+            || Ok(()),
             || {
                 assert_eq!(
                     fake.calls(),
@@ -1491,11 +1491,12 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
     fake.finish();
 }
 
-/// A service changed into a task keeps the account it still runs as in its log until the task exists: a
-/// `retire` that fails leaves the service, and the log names that account (what the service is registered as)
-/// and the new one; one that lands, and a task registered, leaves the new account alone.
+/// A service changed into a task names the task's account alone in the default log. The service is refused
+/// while it runs and is gone before the task is registered, so no account but the task's needs the log, and
+/// nothing is looked up for the service's own; what the file held is not carried, whether the retirement
+/// lands or fails.
 #[skuld::test]
-fn a_service_changed_into_a_task_keeps_its_old_account_in_the_log_until_the_task_exists() {
+fn a_service_changed_into_a_task_names_the_tasks_account_alone_in_the_log() {
     let spec = task_spec(Some("30 3 * * *"));
     let (dir, runs) = made_records();
     log_with_an_entry_no_install_names(&dir);
@@ -1507,19 +1508,13 @@ fn a_service_changed_into_a_task_keeps_its_old_account_in_the_log_until_the_task
             &definition(&spec),
             &runs,
             prepared(users(), None),
-            || Ok(Some(local_service())),
+            || Ok(()),
             || Err(Error::os("retire", std::io::Error::other("denied"))),
         )
         .unwrap_err();
 
     assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
-    let trustees = trustees_of(&default_log(&dir));
-    assert!(trustees.contains(&local_service()), "the service keeps its log");
-    assert!(trustees.contains(&users()));
-    assert!(
-        !trustees.contains(&process_user_sid()),
-        "an entry nothing names was carried over"
-    );
+    assert_names_the_task_alone(&dir);
 
     fake.on_register(Ok(Registration::Created));
     scm(&fake)
@@ -1528,13 +1523,23 @@ fn a_service_changed_into_a_task_keeps_its_old_account_in_the_log_until_the_task
             &definition(&spec),
             &runs,
             prepared(users(), None),
-            || Ok(Some(local_service())),
+            || Ok(()),
             || Ok(()),
         )
         .unwrap();
 
-    let trustees = trustees_of(&default_log(&dir));
+    assert_names_the_task_alone(&dir);
+    fake.finish();
+}
+
+/// The default log in `dir` names the task's account, and neither the service's nor an entry nothing names.
+#[track_caller]
+fn assert_names_the_task_alone(dir: &tempfile::TempDir) {
+    let trustees = trustees_of(&default_log(dir));
     assert!(trustees.contains(&users()));
     assert!(!trustees.contains(&local_service()));
-    fake.finish();
+    assert!(
+        !trustees.contains(&process_user_sid()),
+        "an entry nothing names was carried"
+    );
 }

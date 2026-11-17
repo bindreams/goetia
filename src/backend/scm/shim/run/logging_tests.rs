@@ -3,7 +3,7 @@
 //! by the shim integration tests.
 
 use super::*;
-use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard};
+use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard, HOLD_FAILED};
 use crate::error::Error;
 
 const LINE: &str = "goetia-shim[svc]: the line";
@@ -125,6 +125,25 @@ fn the_default_log_is_the_one_of_an_unset_logs_and_every_set_logs_is_the_users_o
     );
 }
 
+/// A `logs:` that an install of an earlier version allowed and that is the default log's path as written is
+/// the default log: opened as the install's file, not as the user's own, which the file's permissions refuse.
+#[skuld::test]
+fn a_logs_equal_to_the_default_path_as_written_is_the_default_log() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+
+    assert_eq!(
+        log.daemon_log("svc", Some(&default)),
+        Some((default.clone(), LogKind::Default))
+    );
+    assert_eq!(
+        log.daemon_log("other", Some(&default)),
+        Some((default, LogKind::Own)),
+        "another daemon's default log is not this one's"
+    );
+}
+
 /// The shim opens its default log once, from its start, and holds it ([`Channels::hold_default`]).
 #[skuld::test]
 fn holding_the_default_log_asks_the_channels_to_hold_the_log_of_the_id() {
@@ -137,6 +156,39 @@ fn holding_the_default_log_asks_the_channels_to_hold_the_log_of_the_id() {
         vec![ChannelCall::HoldDefault {
             path: Path::new("logs").join("svc.log")
         }]
+    );
+}
+
+/// A default log that cannot be held is told to the Event Log, once, with the error and the file: the
+/// daemon's own open of it says the same only for the output, and the shim's lines would otherwise fail
+/// without a word. The shim goes on: each line opens the file by its path.
+#[skuld::test]
+fn a_default_log_that_cannot_be_held_is_reported_to_the_event_log_once_and_lines_still_try_the_path() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+
+    let calls = fake.take_channel_calls();
+    let [
+        ChannelCall::HoldDefault { .. },
+        ChannelCall::EventLog { severity, line },
+    ] = calls.as_slice()
+    else {
+        panic!("a hold, then one line to the Event Log: {calls:?}");
+    };
+    assert_eq!(*severity, Severity::Error);
+    assert!(line.starts_with("goetia-shim[svc]: "), "{line}");
+    assert!(line.contains(&default.display().to_string()), "the file: {line}");
+    assert!(line.contains(HOLD_FAILED), "the error: {line}");
+
+    log.failure("svc", "the line");
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![appended_default(&default, true), reported()],
+        "the shim goes on with the path"
     );
 }
 
@@ -270,7 +322,7 @@ fn program_data_is_the_known_folder_and_logging_uses_it() {
         "the known folder is where the environment says it is, unless a process redirects the variable"
     );
     assert_eq!(
-        Log::real().default_log_path("svc"),
+        Log::real(Arc::default()).default_log_path("svc"),
         Some(program_data.join("Goetia").join("logs").join("svc.log"))
     );
 }

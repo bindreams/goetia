@@ -419,3 +419,75 @@ fn a_logs_elsewhere_is_accepted() {
     }
     assert!(refuse_logs_in_folder(dir.path(), &id(), None).is_ok());
 }
+
+/// `path`, a path on a local drive, as `\localhost\<drive>$\...`: the administrative share of the same
+/// folder, which the system lets an elevated account open. Its canonical form is a UNC path, which has no
+/// text in common with the local one.
+fn through_the_admin_share(path: &Path) -> PathBuf {
+    let text = path.to_str().expect("a UTF-8 path");
+    let (drive, rest) = text.split_once(r":\").expect("a path on a local drive");
+    PathBuf::from(format!(r"\localhost\{drive}$\{rest}"))
+}
+
+/// A folder is the same folder however it is reached. The administrative share of the drive spells the logs
+/// folder in a form whose canonical path starts with another prefix; the check compares what the paths are
+/// (the volume and the file index of the folder and of each folder above the part that exists), so the share's
+/// spelling is in the folder too, and one outside it is not. The test needs the share, which an elevated
+/// account has and CI's runner has, so it is in the `scm` group, and fails, never skips, without it.
+#[skuld::test]
+fn a_logs_spelled_through_the_administrative_share_is_still_in_the_logs_folder(#[fixture(scm_group)] _group: &Group) {
+    let (dir, log) = program_data_with_logs();
+    let folder = log.parent().unwrap().to_path_buf();
+    let goetia = folder.parent().unwrap().to_path_buf();
+    let share = through_the_admin_share(&folder);
+    fs::metadata(&share).unwrap_or_else(|e| {
+        panic!(
+            "this test opens {} (the administrative share of the drive of the temporary directory), which \
+             needs an elevated token and the share ({e}); the `scm` group is off with GOETIA_TEST_SCM=0",
+            share.display()
+        )
+    });
+
+    for exists in [false, true] {
+        if exists {
+            fs::write(&log, "").unwrap();
+        }
+        for named in [
+            share.join("nightly.log"),
+            share.join("sub").join("x.log"),
+            share.clone(),
+        ] {
+            assert!(
+                refusal_of(&dir, &named).is_some(),
+                "exists={exists}: {} was accepted",
+                named.display()
+            );
+        }
+    }
+    let elsewhere = through_the_admin_share(&goetia).join("mine.log");
+    assert_eq!(refusal_of(&dir, &elsewhere), None, "{}", elsewhere.display());
+}
+
+// A deleted log -------------------------------------------------------------------------------------------------------
+
+/// A log that the README's recovery deleted is a file with no name: the handle the shim holds is on it still.
+/// One that was only moved, or that has another name left, is not deleted.
+#[skuld::test]
+fn a_held_log_is_deleted_only_when_no_name_is_left() {
+    let (_dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    let held = open_for_append(&log).unwrap();
+    assert!(!is_deleted(&held).unwrap(), "a file with its name");
+
+    let moved = log.with_file_name("moved.log");
+    fs::rename(&log, &moved).unwrap();
+    assert!(!is_deleted(&held).unwrap(), "a moved file has a name");
+
+    let second = log.with_file_name("second.log");
+    fs::hard_link(&moved, &second).unwrap();
+    fs::remove_file(&moved).unwrap();
+    assert!(!is_deleted(&held).unwrap(), "a name is left");
+
+    fs::remove_file(&second).unwrap();
+    assert!(is_deleted(&held).unwrap(), "no name is left");
+}
