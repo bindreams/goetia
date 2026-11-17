@@ -704,8 +704,12 @@ fn a_crash_between_removal_and_creation_reads_as_absent_and_install_finishes() {
     let (_other, new_runs) = {
         let dir = tempfile::tempdir().unwrap();
         let runs = Runs::of(dir.path(), &id());
-        // Made plainly: naming Administrators as an owner needs an elevated token.
+        // Made plainly: naming Administrators as an owner needs an elevated token. So is the default log
+        // the install sets the permissions of.
         std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join("nightly")).unwrap();
+        let logs = crate::backend::scm::folder::logs_folder(dir.path());
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(crate::backend::scm::default_log::path_in(&logs, "nightly"), "").unwrap();
         (dir, runs)
     };
     scm.task_write_with(&old, &new, None, &new_runs, &mut machine, |_| {
