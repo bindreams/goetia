@@ -29,6 +29,31 @@ pub(crate) fn open_process_token(access: u32) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(process) })
 }
 
+/// The user SID of this process's token.
+pub(crate) fn process_user_sid() -> Sid {
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
+
+    let token = open_process_token(TOKEN_QUERY).expect("the process token");
+    // 8-byte alignment for `TOKEN_USER`, which the buffer holds.
+    let mut buf = vec![0u64; 64];
+    let mut needed = 0;
+    // SAFETY: `token` is live with `TOKEN_QUERY`; `buf` is the size passed.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut needed,
+        )
+    };
+    assert_ne!(ok, 0, "GetTokenInformation: {}", io::Error::last_os_error());
+    // SAFETY: the call filled the buffer with a `TOKEN_USER`, whose `Sid` points into it.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: a valid SID in `buf`, which is live.
+    unsafe { crate::backend::scm::sid::copy_sid(sid) }.expect("the token user is a SID")
+}
+
 /// This process's token, opened to be copied.
 fn process_token() -> io::Result<OwnedHandle> {
     open_process_token(TOKEN_DUPLICATE | TOKEN_QUERY)

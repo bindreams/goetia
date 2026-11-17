@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec};
+use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
 use crate::testing::base_fields;
 use cosca::identity::Liveness;
 use cosca::{Process, Stdio};
@@ -19,6 +20,7 @@ use skuld::temp_dir;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
 use super::*;
+use crate::backend::scm::shim::run::logging::Log;
 use crate::backend::scm::shim::run::os::fake::FakeGuard;
 use crate::backend::scm::shim::run::service::build_command;
 use crate::backend::scm::shim::run::test_support::not_found;
@@ -249,16 +251,120 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     );
 }
 
+/// A task that runs `cmd /c <script>` as root, with the `cwd`, `env` and `logs` given.
+fn task_running(
+    script: &str,
+    cwd: Option<PathBuf>,
+    env: BTreeMap<String, String>,
+    logs: Option<PathBuf>,
+) -> DaemonSpec {
+    let comspec = std::env::var("ComSpec").expect("ComSpec names cmd.exe");
+    let base = base_fields(ID, vec![comspec, "/c".to_string(), script.to_string()]);
+    TaskSpec::new(TaskFields {
+        common: DaemonFields {
+            cwd,
+            env,
+            logs,
+            ..base.common
+        },
+        schedule: None,
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+/// The program's own variables and directory are the spec's, over what the shim inherited: a task
+/// starts in `system32` with the machine's variables, and the spec's `env` replaces one of them and
+/// adds another. The program's output is in the spec's `logs`.
+#[skuld::test]
+fn a_task_programs_env_and_cwd_are_the_specs_over_the_inherited_ones(#[fixture(temp_dir)] dir: &Path) {
+    let cwd = dir.join("goetia-task-cwd");
+    std::fs::create_dir(&cwd).expect("the program's working directory");
+    let logs = dir.join("task.log");
+    // `USERNAME` is there in every session that runs the tests: the spec's value replaces it.
+    let env = BTreeMap::from([
+        ("USERNAME".to_string(), "from-spec".to_string()),
+        ("GOETIA_TEST_VAR".to_string(), "added".to_string()),
+    ]);
+    let spec = task_running(
+        "echo %CD%& echo %USERNAME%& echo %GOETIA_TEST_VAR%",
+        Some(cwd),
+        env,
+        Some(logs.clone()),
+    );
+    let fake = FakeGuard::new();
+    let mut reap = Reap::default();
+
+    let program = reap.hold(
+        Real.spawn(build_command(&spec, &Real, &fake.log(), ID))
+            .expect("spawn the program"),
+    );
+    program.wait().expect("the program exits");
+
+    let log = std::fs::read_to_string(&logs).expect("the program's log");
+    let lines: Vec<&str> = log.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), 3, "{log:?}");
+    assert!(
+        lines[0].ends_with("goetia-task-cwd"),
+        "the program ran outside its `cwd`: {log:?}"
+    );
+    assert_eq!(&lines[1..], ["from-spec", "added"], "{log:?}");
+}
+
+/// A task with no `logs` has its output discarded: no log is made for it, not even the default one a
+/// service gets, and nothing is reported of that.
+#[skuld::test]
+fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] dir: &Path) {
+    let defaults = dir.join("default-logs");
+    let fake = FakeGuard::new();
+    let log = Arc::new(Log::new(fake.channels(), defaults.clone()));
+    let spec = task_running("echo discarded", None, BTreeMap::new(), None);
+    let mut reap = Reap::default();
+
+    let program = reap.hold(
+        Real.spawn(build_command(&spec, &Real, &log, ID))
+            .expect("spawn the program"),
+    );
+    program.wait().expect("the program exits");
+
+    assert!(!defaults.exists(), "a default log was made for a task with no `logs`");
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![],
+        "something was reported of the missing log"
+    );
+}
+
 // Channels ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("Goetia").join("logs").join("x.log");
 
-    Real.append(&path, "the line").expect("append");
+    Real.append(&path, "the line", Parents::Create).expect("append");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("the file was written"),
+        "the line\n"
+    );
+}
+
+/// The shim makes no folder under `Goetia` (an elevated install does): its default log, opened with
+/// [`Parents::Never`], is an append failure when the folder is not there, and nothing is made.
+#[skuld::test]
+fn append_makes_no_directory_when_told_never_to_and_fails_when_it_is_missing(#[fixture(temp_dir)] dir: &Path) {
+    let missing = dir.join("Goetia").join("logs");
+
+    let result = Real.append(&missing.join("x.log"), "the line", Parents::Never);
+
+    assert_eq!(result.expect_err("no folder").kind(), io::ErrorKind::NotFound);
+    assert!(!dir.join("Goetia").exists(), "a folder was made");
+
+    std::fs::create_dir_all(&missing).expect("the folder an install made");
+    Real.append(&missing.join("x.log"), "the line", Parents::Never)
+        .expect("append where the folder is");
+    assert_eq!(
+        std::fs::read_to_string(missing.join("x.log")).expect("the file was written"),
         "the line\n"
     );
 }
@@ -267,8 +373,8 @@ fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] d
 fn append_appends_rather_than_truncates(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("x.log");
 
-    Real.append(&path, "first").expect("append");
-    Real.append(&path, "second").expect("append");
+    Real.append(&path, "first", Parents::Create).expect("append");
+    Real.append(&path, "second", Parents::Create).expect("append");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("the file was written"),
@@ -282,7 +388,7 @@ fn append_fails_and_writes_nothing_when_the_path_cannot_be_opened(#[fixture(temp
     std::fs::write(&file, "x").expect("a regular file to use as a parent");
 
     // A directory cannot be created under a regular file.
-    let result = Real.append(&file.join("x.log"), "lost");
+    let result = Real.append(&file.join("x.log"), "lost", Parents::Create);
 
     assert!(result.is_err());
     assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
@@ -297,11 +403,25 @@ fn open_log_fails_with_the_os_reason_when_the_path_cannot_be_opened(#[fixture(te
 
     // A directory cannot be created under a regular file.
     let refused = Real
-        .open_log(&file.join("daemon.log"))
+        .open_log(&file.join("daemon.log"), Parents::Create)
         .expect_err("a log under a regular file");
 
     assert!(refused.raw_os_error().is_some(), "no OS reason: {refused:?}");
     assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
+}
+
+/// The daemon's default output is opened as the default failure log is: no folder is made for it.
+#[skuld::test]
+fn open_log_makes_no_directory_when_told_never_to(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("Goetia").join("logs").join("daemon.log");
+
+    let refused = Real.open_log(&log, Parents::Never).expect_err("no folder");
+
+    assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+    assert!(!dir.join("Goetia").exists(), "a folder was made");
+    Real.open_log(&log, Parents::Create)
+        .expect("a user's own `logs` parents are made");
+    assert!(log.is_file());
 }
 
 /// Records each `write` call; fails them all when `fail` is set.

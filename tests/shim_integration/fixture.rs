@@ -26,6 +26,10 @@
 //! - `write-log <port> <text>` — connect to `<port>`, write `<text>` to
 //!   both stdout and stderr, then block forever.
 //! - `exit <port> <code>` — connect to `<port>`, then exit with `<code>`.
+//! - `user <port>` — connect to `<port>`, write the SID of the account this process runs as, then
+//!   exit 0.
+//! - `priority <port>` — connect to `<port>`, write this process's priority class (`0x20` is
+//!   normal), then exit 0.
 //! - `exit-on-close <port> <code>` — connect to `<port>`, hold the connection
 //!   open until the test closes its end, then exit with `<code>`. The test
 //!   decides when the daemon exits, so it can inspect the running service
@@ -33,6 +37,8 @@
 
 use std::io::{Read as _, Write as _};
 use std::sync::mpsc;
+
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
 
 use crate::support::sentinel::{connect, open, send_line};
 
@@ -107,6 +113,18 @@ pub fn run_if_requested() -> bool {
             while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
             std::process::exit(code);
         }
+        "user" => {
+            let port: u16 = args[3].parse().expect("port");
+            send_line(port, &own_user_sid());
+            std::process::exit(0);
+        }
+        "priority" => {
+            let port: u16 = args[3].parse().expect("port");
+            // SAFETY: `GetCurrentProcess` is a pseudo-handle that is always valid.
+            let class = unsafe { GetPriorityClass(GetCurrentProcess()) };
+            send_line(port, &format!("{class:#x}"));
+            std::process::exit(0);
+        }
         other => panic!("unknown shim fixture mode: {other}"),
     }
     // Every arm above diverges (`block_forever`/`process::exit`/`panic!`):
@@ -114,6 +132,21 @@ pub fn run_if_requested() -> bool {
     // never returns at all once a recognized mode matched — `main`'s own
     // `if fixture::run_if_requested() { return; }` never actually observes
     // the `true` and it would be dead code to write one.
+}
+
+/// The SID of the account this process runs as, from `whoami /user`: `"<name>","<sid>"` on one line.
+fn own_user_sid() -> String {
+    let output = std::process::Command::new("whoami.exe")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("run whoami");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "whoami: {text} {:?}", output.stderr);
+    text.trim()
+        .rsplit(',')
+        .next()
+        .map(|sid| sid.trim_matches('"').to_string())
+        .expect("whoami prints a SID")
 }
 
 fn block_forever() -> ! {

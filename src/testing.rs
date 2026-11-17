@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::time::SystemTime;
 
 #[cfg(windows)]
 use crate::error::Result;
@@ -48,6 +50,14 @@ pub fn spawn_contained(program: &str, args: &[&str]) -> cosca::Child {
         .unwrap_or_else(|e| panic!("cannot spawn `{program}`: {e}"))
 }
 
+/// The machine's `%ProgramData%`, as the library locates it for the shim's log and the run records.
+/// A machine that cannot name it fails the calling test.
+#[cfg(windows)]
+pub fn program_data() -> PathBuf {
+    crate::backend::scm::folder::program_data()
+        .unwrap_or_else(|e| panic!("cannot locate %ProgramData%: {}", e.report()))
+}
+
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
 /// a test never takes a placeholder for a SID.
 #[cfg(windows)]
@@ -60,6 +70,22 @@ pub fn shown_sid(sid: &[u8]) -> String {
 #[cfg(windows)]
 pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     crate::backend::scm::manager::sid_for_account_name(account_name, None).map(|(sid, _kind)| sid)
+}
+
+/// When Task Scheduler itself says the task `id` runs between `from` and `to`: its `GetRunTimes`, the
+/// oracle the schedule tests compare the cron they translated with.
+#[cfg(windows)]
+pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
+    use crate::backend::scm::instance::TaskPath;
+    crate::backend::scm::manager::task::Com.run_times(&TaskPath::of(id), from, to)
+}
+
+/// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for
+/// about five seconds and then warning. A task that is not there is done. Never panics: it is what a
+/// guard's `Drop` calls.
+#[cfg(windows)]
+pub fn remove_task(id: &Id) {
+    crate::backend::scm::manager::task::cleanup::remove_task(id);
 }
 
 #[cfg(windows)]
@@ -133,6 +159,46 @@ pub fn cron_matches(schedule: &Schedule, minute: u8, hour: u8, day: u8, month: u
     };
     has(minutes, minute) && has(hours, hour) && has(months, month) && day_ok
 }
+
+/// The cron schedules a task's triggers must fire for exactly when the cron says, in three groups: one
+/// time and repeated times a day, times with no single progression, and a weekday that has a fifth
+/// occurrence. The unit tests of the compilation check each against a model of Task Scheduler, and the
+/// Windows integration test checks each against Task Scheduler's own run times.
+pub const FIRING_SCHEDULES: [&[&str]; 3] = [
+    &[
+        "30 3 * * *",
+        "H 3 * * *",
+        "0 9-17 * * 1-5",
+        "*/15 9-17 * * 1-5",
+        "*/7 * * * *",
+        // Days of the month no month has, beside a weekday: the weekdays alone.
+        "0 0 30 2 1",
+        "0 0 */2 * *",
+        "0 0 29-31 * *",
+        "0 0 * 6 1",
+        "0 3 * 3-5 *",
+        "* * * * *",
+        "5,35 */3 * * *",
+    ],
+    &[
+        // A class of minutes over two runs of hours, a lone minute, and hours in no run.
+        "0,15,30,45 9-11,14-16 * * *",
+        "1,2,4,7 0,1,3,5,7,9,11 * * *",
+        "0,15,30,45,7 9-17 * * 1-5",
+        // A step that does not divide 60, in one hour and in all of them.
+        "*/7 3 * * *",
+        "*/7 9-17 * * 1-5",
+        "0,10,20 22,23,0 * * *",
+        "17 */5 * * *",
+        "0 * * * *",
+        "0 0-4,7,9-12,14,17,20-23 * * 1",
+        "0,1 * * * *",
+        "0 0,1,2,3,5,6,8,10,11,13,14,16,17,19,21,22 * * *",
+        "0,1 0,1,2,3,5,6,8,10,11,13,14,16,17,19,21,22 * * *",
+    ],
+    // August 2027 has five Mondays, and so does May 2028: `Last` is the fifth in those months.
+    &["0 0 * 8 1", "0 0 * 5 1"],
+];
 
 /// A [`ShimProvider`] that records the calls it gets (`"preview"`, `"provide"`, `"sweep"`, in
 /// order) and answers with the commands it was given. It touches nothing.

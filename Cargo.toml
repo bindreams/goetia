@@ -99,6 +99,8 @@ humantime = "2"
 # The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
 # costs one fast pass.
 memchr = "2"
+# A task's installed XML is read back as Task Scheduler wrote it (`backend::scm::task_xml`).
+roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `EmbeddedStockShim` (SHA-256 of the stock shim's bytes) and `spec::schedule` (`H`).
@@ -156,7 +158,9 @@ winreg = "0.56"
 # remove a name that holds a NUL by its stated length where `RegDeleteValueW` would stop at it
 # (`manager::registry`); the owner and DACL reads of the shim folder check (`scm::shim::acl`), the
 # protected DACL a shim file is created with, and `%ProgramFiles%` (`SHGetKnownFolderPath`, whose
-# string `CoTaskMemFree` releases: `Win32_System_Com`).
+# string `CoTaskMemFree` releases: `Win32_System_Com`), and the `NtOpenFile` status that tells a file
+# whose delete is pending from one a permission protects (`Wdk_Storage_FileSystem`, `Win32_System_IO`;
+# `scm::runs::files`).
 #
 # The shim (`src/backend/scm/shim/run/`) adds `Win32_System_EventLog`, the
 # version-skew/log-path-denied fallback channel — see
@@ -171,15 +175,28 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authentication_Identity",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
     "Win32_System_EventLog",
+    "Win32_System_IO",
     "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Wdk_System_Registry",
+] }
+# Task Scheduler (`backend::scm::manager::task`): COM through the typed `windows` crate, already in the lock through
+# `cosca` and `skuld`, with only COM features added. `Win32_System_Ole` is what makes `ITaskService::Connect` and
+# `RegisterTask` exist at all; `Win32_System_Time` converts the local civil times of its dates.
+windows = { version = "0.62", features = [
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Time",
+    "Win32_System_Variant",
 ] }
 
 [build-dependencies]

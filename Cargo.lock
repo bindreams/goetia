@@ -372,6 +372,7 @@ dependencies = [
  "memchr",
  "nix",
  "rand",
+ "roxmltree",
  "serde",
  "serde_json",
  "sha2",
@@ -379,6 +380,7 @@ dependencies = [
  "skuld",
  "tempfile",
  "thiserror",
+ "windows",
  "windows-service",
  "windows-sys",
  "winreg",
@@ -739,6 +741,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rustc-hash"

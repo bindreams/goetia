@@ -27,7 +27,6 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
-use super::super::marker;
 use super::exit;
 use super::logging::Log;
 use super::os::{Os, Real, Spawned, spawn_error_code};
@@ -42,11 +41,9 @@ pub(super) const TABLE_NAME: &str = "goetia-shim";
 /// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] records what
 /// every path that reports `STOPPED` reported, and the dispatcher returns once SCM has processed it,
 /// so this ends the process with the record (see [`exit`]); the paths that cannot report one end it
-/// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments: the
-/// service name comes from SCM.
+/// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments itself
+/// (`super::run` did, to choose this mode): the service name comes from SCM.
 pub(crate) fn run() -> ! {
-    // Every host reaches here, and this read is what keeps its version marker in the linked binary.
-    std::hint::black_box(&marker::MARKER);
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
         Log::real().failure(TABLE_NAME, &dispatcher_failure(e));
         exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
@@ -97,7 +94,7 @@ fn run_service(id: &str, log: Arc<Log>) {
         }
     };
 
-    log.set_daemon_log(log.daemon_log_path(id, blob.spec.common().logs.as_deref()));
+    set_daemon_log(&log, id, &blob.spec);
     log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
     let reported = run_daemon(
         &blob.spec,
@@ -109,11 +106,19 @@ fn run_service(id: &str, log: Arc<Log>) {
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
 
-/// Why the shim reads no spec to run, and what it tells SCM.
+/// From now on the shim's failures go to the daemon's own log (the default one when `spec` sets no
+/// `logs`), interleaved with its output. Call right after the spec decodes.
+pub(super) fn set_daemon_log(log: &Log, id: &str, spec: &DaemonSpec) {
+    if let Some(path) = log.daemon_log_path(id, spec.common().logs.as_deref()) {
+        log.set_daemon_log(path);
+    }
+}
+
+/// Why the shim reads no spec to run, and what it reports for it.
 #[derive(Debug)]
-struct SpecStop {
-    message: String,
-    reported: Reported,
+pub(super) struct SpecStop {
+    pub(super) message: String,
+    pub(super) reported: Reported,
 }
 
 /// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker, has an
@@ -306,6 +311,51 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 // One pass ============================================================================================================
 
 /// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
+/// stop, and tell SCM how it ended: [`run_pass`], reported.
+pub(super) fn run_daemon(
+    spec: &DaemonSpec,
+    supervisor: &Supervisor,
+    id: &str,
+    on_running: impl FnOnce(),
+    on_stopping: impl FnOnce(),
+) -> Reported {
+    run_pass(spec, supervisor, id, on_running, on_stopping).reported()
+}
+
+/// How one pass ended, before it is read as anything: what the service tells SCM
+/// ([`PassOutcome::reported`]) and what a task records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassOutcome {
+    /// The daemon exited on its own, with its tree terminated; `None` when its exit status could not
+    /// be had, which is already logged.
+    Exited(Option<i32>),
+    /// A stop was accepted, and the daemon's tree was terminated. It wins over the exit code the
+    /// teardown made the daemon leave, and over a failed wait.
+    Stopped,
+    /// Something of the daemon's tree may still be running, after a stop, a failure, or an exit
+    /// whose tree could not be terminated.
+    IncompleteStop,
+    /// The wait on the daemon failed, with this OS error if it has one, and the tree was terminated.
+    WaitFailed(Option<i32>),
+    /// Launching failed, with what [`launch`] reports for it: a failure of the shim's, or an
+    /// incomplete stop for a daemon that may have started.
+    NotRun(Reported),
+}
+
+impl PassOutcome {
+    /// What the service tells SCM, and what the pass returned before it was an outcome.
+    pub(super) fn reported(self) -> Reported {
+        match self {
+            PassOutcome::Exited(code) => exit_report(code),
+            PassOutcome::Stopped => Reported::Clean,
+            PassOutcome::IncompleteStop => Reported::incomplete_stop(),
+            PassOutcome::WaitFailed(os_error) => Reported::shim_failure(os_error),
+            PassOutcome::NotRun(reported) => reported,
+        }
+    }
+}
+
+/// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
 /// stop, and say how it ended.
 ///
 /// `on_stopping` is called exactly once, after `on_running` and before the daemon's tree is torn
@@ -318,17 +368,23 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 /// non-zero Win32 code or, when no Job Object contains it or cosca cannot say a failed spawn ended
 /// it, the incomplete stop. `start_via_notify` reads both as a failed start under every restart
 /// policy.
-fn run_daemon(
+///
+/// An exited daemon is an outcome only once the tree it left is terminated: a `start` that lands
+/// once SCM reads `STOPPED` must not run beside survivors, and a failure SCM restarts must not
+/// either. If the tree cannot be terminated the outcome is the incomplete stop. "Terminated" is
+/// `send_kill_tree` succeeding on the Job Object `launch` requires: the kill was sent, not waited
+/// out (see `Supervisor::wait_for_child_or_stop`).
+pub(super) fn run_pass(
     spec: &DaemonSpec,
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(),
-) -> Reported {
+) -> PassOutcome {
     let log = &*supervisor.log;
     let (child, waiter) = match launch(spec, supervisor, id) {
         Ok(launched) => launched,
-        Err(reported) => return reported,
+        Err(reported) => return PassOutcome::NotRun(reported),
     };
     on_running();
 
@@ -349,30 +405,33 @@ fn run_daemon(
                     None
                 }
             };
-            end_tree_before_report(supervisor.bus.settle(exit_report(code)), child.as_ref(), log, id)
+            // A stop accepted before this decision wins over a failure: `settle` then says something
+            // other than the candidate. A clean exit and a stop accepted after the wait ended read
+            // alike.
+            let candidate = exit_report(code);
+            let stop_won = supervisor.bus.settle(candidate) != candidate;
+            if !terminate_exited_tree(child.as_ref(), log, id) {
+                PassOutcome::IncompleteStop
+            } else if stop_won {
+                PassOutcome::Stopped
+            } else {
+                PassOutcome::Exited(code)
+            }
         }
         // The failure is already logged; the daemon's tree was terminated, so it is the shim that
-        // failed.
-        WaitOutcome::WaitFailed { os_error } => supervisor.bus.settle(Reported::shim_failure(os_error)),
+        // failed, unless a stop was accepted first.
+        WaitOutcome::WaitFailed { os_error } => {
+            let candidate = Reported::shim_failure(os_error);
+            if supervisor.bus.settle(candidate) == candidate {
+                PassOutcome::WaitFailed(os_error)
+            } else {
+                PassOutcome::Stopped
+            }
+        }
         // `wait_for_child_or_stop` terminated the tree before returning this.
-        WaitOutcome::Stopping => Reported::Clean,
+        WaitOutcome::Stopping => PassOutcome::Stopped,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
-        WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => Reported::incomplete_stop(),
-    }
-}
-
-/// An exited daemon is reported only once the tree it left is terminated, whatever `settled` is: a
-/// `start` that lands once SCM reads `STOPPED` must not run beside survivors, and a failure SCM
-/// restarts must not either. If the tree cannot be terminated, SCM must not restart and the service
-/// must not read as cleanly stopped: the incomplete stop.
-///
-/// "Terminated" is `send_kill_tree` succeeding on the Job Object `launch` requires: the kill was
-/// sent, not waited out (see `Supervisor::wait_for_child_or_stop`).
-fn end_tree_before_report(settled: Reported, child: &dyn Spawned, log: &Log, id: &str) -> Reported {
-    if terminate_exited_tree(child, log, id) {
-        settled
-    } else {
-        Reported::incomplete_stop()
+        WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => PassOutcome::IncompleteStop,
     }
 }
 
@@ -518,6 +577,11 @@ fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running
     ))
 }
 
+/// Said when the daemon has no `logs:` and the machine's `%ProgramData%` could not be located, so no
+/// default log file exists either.
+const NO_LOG_FILE: &str =
+    "no log file for this daemon's output (no `logs:`, and no default log directory); it is still being run";
+
 fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
     format!(
         "open log file {}: {} (this daemon's output will not be captured; it is still being run)",
@@ -542,6 +606,9 @@ fn stdio_set<T, E: std::error::Error + 'static>(log: &Log, id: &str, assigned: R
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
 /// containment, and stdout+stderr merged into the daemon's log file, which `os` opens. `log`
 /// names that file when the spec does not, and reports a failed open or redirect.
+///
+/// A service with no `logs` writes the default log. A task with none sends its output to `NUL`
+/// and says nothing of it: that is what such a task asked for.
 pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str) -> cosca::Command {
     let mut cmd = cosca::run(spec.common().command.iter().cloned());
     if let Some(cwd) = &spec.common().cwd {
@@ -550,8 +617,18 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
     cmd.envs(spec.common().env.clone());
     cmd.contain();
 
-    let log_path = log.daemon_log_path(id, spec.common().logs.as_deref());
-    match os.open_log(&log_path) {
+    let logs = spec.common().logs.as_deref();
+    // `Err(None)`: no file, by design.
+    let opened = match (spec, logs) {
+        (DaemonSpec::Task(_), None) => Err(None),
+        (_, logs) => match log.daemon_log_path(id, logs) {
+            Some(path) => os
+                .open_log(&path, log.parents_of(id, &path))
+                .map_err(|e| Some(log_open_failed(&path, &e))),
+            None => Err(Some(NO_LOG_FILE.to_string())),
+        },
+    };
+    match opened {
         Ok(file) => {
             // Merges are resolved in a second pass at spawn time (`cosca`'s
             // `resolve_stdio`), not by `Command::fd` consulting whatever is
@@ -565,8 +642,10 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
             stdio_set(log, id, cmd.stdout(Stdio::from_file(file)));
             stdio_set(log, id, cmd.stderr(Stdio::merge(Fd::STDOUT)));
         }
-        Err(e) => {
-            log.failure(id, &log_open_failed(&log_path, &e));
+        Err(message) => {
+            if let Some(message) = message {
+                log.failure(id, &message);
+            }
             // Same reasoning as above, for `Stdio::null()`.
             stdio_set(log, id, cmd.stdout(Stdio::null()));
             stdio_set(log, id, cmd.stderr(Stdio::null()));

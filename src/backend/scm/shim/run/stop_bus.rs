@@ -16,6 +16,7 @@
 
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::backend::scm::exit_status::Reported;
 
@@ -185,6 +186,18 @@ impl StopBus {
         g.fate = Fate::Stopped;
         self.cvar.notify_all();
         true
+    }
+
+    /// Waits until a stop has been accepted or `pace` has passed, and says whether one has. The wait
+    /// only paces a loop that re-reads the real condition it waits for between calls; its expiry
+    /// proves nothing.
+    pub(super) fn stopped_within(&self, pace: Duration) -> bool {
+        let g = self.state.lock().expect("StopBus mutex poisoned");
+        let (g, _) = self
+            .cvar
+            .wait_timeout_while(g, pace, |g| g.fate != Fate::Stopped)
+            .expect("StopBus mutex poisoned");
+        g.fate == Fate::Stopped
     }
 
     /// Decide how the run ends when `candidate` is what the daemon's end amounts to. An accepted

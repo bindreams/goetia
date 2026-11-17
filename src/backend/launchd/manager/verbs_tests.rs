@@ -204,9 +204,9 @@ fn a_start_after_an_unwaited_stop_is_refused_while_the_job_still_has_its_run() {
     assert_eq!(
         e.to_string(),
         format!(
-            "`{ID}` still has the run that was sent SIGTERM (pid 4242), and launchd starts no new run of a task \
-             while one is in flight, so no start was issued; `goetia daemon start {ID}` starts one once it has \
-             exited, and `goetia daemon restart {ID}` without `--timeout 0` waits for the exit"
+            "`{ID}` still has the run that was asked to stop (pid 4242), and the service manager starts no new run \
+             of a task while one is in flight, so no start was issued; `goetia daemon start {ID}` starts one once \
+             it has exited, and `goetia daemon restart {ID}` without `--timeout 0` waits for the exit"
         )
     );
     assert!(!e.is_indeterminate(), "nothing was sent");

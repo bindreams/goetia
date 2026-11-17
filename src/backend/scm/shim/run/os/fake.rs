@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 
 use cosca::Containment;
 
-use super::{Channels, Os, Severity, Spawned};
+use super::{Channels, Os, Parents, Severity, Spawned};
 use crate::backend::scm::shim::run::logging::Log;
 
 /// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
@@ -106,8 +106,16 @@ pub(crate) enum WaiterEnd {
 /// One call on the [`Channels`], in the order made.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ChannelCall {
-    Append { path: PathBuf, line: String, ok: bool },
-    EventLog { severity: Severity, line: String },
+    Append {
+        path: PathBuf,
+        line: String,
+        parents: Parents,
+        ok: bool,
+    },
+    EventLog {
+        severity: Severity,
+        line: String,
+    },
 }
 
 // Process -------------------------------------------------------------------------------------------------------------
@@ -320,6 +328,9 @@ struct State {
     spawns: VecDeque<SpawnReply>,
     threads: VecDeque<ThreadReply>,
     open_log_failures: Vec<PathBuf>,
+    /// Every log opened, in order: the path asked for, whether its parents were to be made, and a
+    /// handle to what was opened, which is what the code under test writes into.
+    opened_logs: Vec<(PathBuf, Parents, File)>,
     append_failures: Vec<PathBuf>,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
@@ -442,6 +453,30 @@ impl Fake {
     /// code under test.
     pub(crate) fn calls(&self, op: Op) -> usize {
         lock(&self.shared.state).calls.get(&op).copied().unwrap_or(0)
+    }
+
+    /// The path the `n`th log opened (counting from 0) was asked for.
+    pub(crate) fn opened_log_path(&self, n: usize) -> PathBuf {
+        lock(&self.shared.state).opened_logs[n].0.clone()
+    }
+
+    /// Whether the parents of the `n`th log opened were to be made.
+    pub(crate) fn opened_log_parents(&self, n: usize) -> Parents {
+        lock(&self.shared.state).opened_logs[n].1
+    }
+
+    /// What has been written into the `n`th log opened, whole.
+    pub(crate) fn opened_log_text(&self, n: usize) -> String {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let mut file = lock(&self.shared.state).opened_logs[n]
+            .2
+            .try_clone()
+            .expect("clone the log");
+        file.seek(SeekFrom::Start(0)).expect("rewind the log");
+        let mut text = String::new();
+        file.read_to_string(&mut text).expect("read the log");
+        text
     }
 
     /// Whether thread `n` has ended, without waiting for it. Its end is still read with
@@ -621,7 +656,7 @@ impl Os for Fake {
         spawned
     }
 
-    fn open_log(&self, path: &Path) -> io::Result<File> {
+    fn open_log(&self, path: &Path, parents: Parents) -> io::Result<File> {
         let mut state = lock(&self.shared.state);
         *state.calls.entry(Op::OpenLog).or_default() += 1;
         match state.open_log_failures.iter().position(|failing| failing == path) {
@@ -631,7 +666,11 @@ impl Os for Fake {
             }
             None => {
                 drop(state);
-                tempfile::tempfile()
+                let file = tempfile::tempfile()?;
+                lock(&self.shared.state)
+                    .opened_logs
+                    .push((path.to_path_buf(), parents, file.try_clone()?));
+                Ok(file)
             }
         }
     }
@@ -657,7 +696,7 @@ impl Drop for ThreadExit {
 }
 
 impl Channels for Fake {
-    fn append(&self, path: &Path, line: &str) -> io::Result<()> {
+    fn append(&self, path: &Path, line: &str, parents: Parents) -> io::Result<()> {
         let mut state = lock(&self.shared.state);
         let failing = match state.append_failures.iter().position(|failing| failing == path) {
             Some(i) => {
@@ -669,6 +708,7 @@ impl Channels for Fake {
         state.channel_calls.push(ChannelCall::Append {
             path: path.to_path_buf(),
             line: line.to_string(),
+            parents,
             ok: !failing,
         });
         if failing {

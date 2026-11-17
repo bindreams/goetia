@@ -485,7 +485,7 @@ fn install_refuses_doctored_folder(#[fixture(scm_group)] _group: &Group) {
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
     match mgr.install(&spec, false) {
-        Err(Error::ShimFolderUnsafe { path, account, right }) => {
+        Err(Error::FolderUnsafe { path, account, right }) => {
             assert_eq!(path, doctored.folder);
             assert_eq!(right, goetia::testing::CHANGE_PERMISSIONS_OF);
             assert!(account.ends_with("Users"), "{account}");
@@ -518,7 +518,7 @@ fn install_refuses_a_host_file_users_can_write_to(#[fixture(scm_group)] _group: 
     let standalone = |check| Scm::with_shim(StandaloneShim::new(host.clone(), vec![]), check);
 
     match standalone(CheckPermissions::Enable).install(&spec, false) {
-        Err(Error::ShimFolderUnsafe { path, account, right }) => {
+        Err(Error::FolderUnsafe { path, account, right }) => {
             assert_eq!(path, host);
             assert_eq!(right, goetia::testing::WRITE_TO);
             assert!(account.ends_with("Users"), "{account}");
@@ -546,7 +546,7 @@ fn install_checks_the_folder_before_the_marker(#[fixture(scm_group)] _group: &Gr
 
     // Both checks would refuse this host; the folder's wins.
     match standalone(CheckPermissions::Enable).install(&spec, false) {
-        Err(Error::ShimFolderUnsafe { path, .. }) => assert_eq!(path, folder),
+        Err(Error::FolderUnsafe { path, .. }) => assert_eq!(path, folder),
         other => panic!("the folder check must come first, got {other:?}"),
     }
     // Without it, the marker is what refuses: the folder check was what answered above.
@@ -1321,6 +1321,6 @@ fn uninstall_retry_checks_the_folder_as_the_manager_does(#[fixture(scm_group)] _
 
     let result = mgr.uninstall(&id);
 
-    assert!(matches!(result, Err(Error::ShimFolderUnsafe { .. })), "{result:?}");
+    assert!(matches!(result, Err(Error::FolderUnsafe { .. })), "{result:?}");
     assert!(stray.exists(), "a refused folder is not swept");
 }

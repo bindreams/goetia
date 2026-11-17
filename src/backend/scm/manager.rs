@@ -52,7 +52,7 @@
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
 //! (`ERROR_LOGON_FAILURE`) while `install` has already reported success. See
-//! `identity::grant_service_logon_right`, called before the service is
+//! `identity::grant_logon_right`, called before the service is
 //! created or changed, for every account [`generate::account_needs_password`]
 //! says needs a password — every other account (`LocalSystem`, a built-in, or an
 //! `NT SERVICE\<id>` virtual account) already holds the right, and
@@ -96,6 +96,7 @@
 
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
+pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;
 
@@ -113,13 +114,15 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
     carried, end_on_incomplete_stop, end_process,
 };
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
-use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::scm::folder::{make_goetia_folders, program_data};
+use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HeldProcess, HoldOutcome, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
@@ -143,17 +146,19 @@ use crate::error::{Chain, Error, Reason, Result, terminating_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
-use crate::spec::{AccountId, DaemonSpec, Id, Protocol, User};
+use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Protocol, User};
 
 // Scm =================================================================================================================
 
 /// The Windows service manager. Holds no state of its own — every operation opens exactly the
 /// SCM/registry handles it needs and closes them again — only the source of `protocol: plain`
-/// services' host and the check on the folder it lives in.
+/// services' host, the check on the folder it lives in, and the boundary to Task Scheduler.
 pub struct Scm {
     /// `None` for [`Scm::new`]: no host to provide, and no files of the manager's own to sweep.
     shim: Option<Box<dyn ShimProvider>>,
     folders: FolderCheck,
+    /// Task Scheduler: the real one, unless an in-crate test put a [`TaskApi`] in its place.
+    tasks: Box<dyn TaskApi>,
 }
 
 impl Scm {
@@ -164,6 +169,7 @@ impl Scm {
         Self {
             shim: None,
             folders: FolderCheck::new(CheckPermissions::Enable),
+            tasks: Box::new(Com),
         }
     }
 
@@ -175,7 +181,15 @@ impl Scm {
         Self {
             shim: Some(Box::new(provider)),
             folders: FolderCheck::new(check),
+            tasks: Box::new(Com),
         }
+    }
+
+    /// This manager over `tasks` in place of the real Task Scheduler, for in-crate tests, as
+    /// [`with_shim`](Self::with_shim) puts a provider in place of the stock host.
+    #[cfg(test)]
+    pub(crate) fn with_tasks(self, tasks: Box<dyn TaskApi>) -> Self {
+        Self { tasks, ..self }
     }
 
     /// The provider, or [`Error::NoShimProvider`] for a manager built without one.
@@ -278,20 +292,39 @@ impl ScmSnapshot {
     }
 }
 
+/// What `read` saw at a marked id, in whichever of the two stores holds it: an id is one namespace
+/// across the SCM and Task Scheduler, and an id goetia marked in both reads as the service (see
+/// [`task::which`]).
+// As `ReadOutcome::Marked`, a whole snapshot per variant, one per daemon per verb; same call.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum WindowsSnapshot {
+    Service(ScmSnapshot),
+    Task(TaskSnapshot),
+}
+
 /// The lock makes nothing an install would take back.
 impl Settle for Option<InstallLock> {
     fn settle(&mut self, _standing: impl FnOnce() -> Standing) {}
 }
 
-impl Backend for Scm {
-    type Definition = ScmRegistration;
-    type Snapshot = ScmSnapshot;
-    /// The install lock, which `protocol: plain` holds until its install ends: what places, repairs
-    /// and deletes shim files, for this process and every other, takes it.
-    type InstallScope = Option<InstallLock>;
-    type Reservation = ();
-    type Run = std::convert::Infallible;
+impl InstalledService for WindowsSnapshot {
+    fn id(&self) -> &Id {
+        match self {
+            WindowsSnapshot::Service(snapshot) => snapshot.id(),
+            WindowsSnapshot::Task(snapshot) => snapshot.id(),
+        }
+    }
 
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
+        match self {
+            WindowsSnapshot::Service(snapshot) => snapshot.blob(),
+            WindowsSnapshot::Task(snapshot) => snapshot.blob(),
+        }
+    }
+}
+
+/// The service half of every verb: what the Windows backend does for an id the SCM holds.
+impl Scm {
     /// For `protocol: plain`: the install flow has rendered the definition already, so every refusal
     /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
     /// has come before the lock is taken or the provider writes. The lock is taken and the files
@@ -304,67 +337,71 @@ impl Backend for Scm {
     /// sweep that cannot read what is referenced or cannot delete a file does not fail the install:
     /// the file is not what the install needs, and the next sweep finds it. `protocol: native` has no
     /// host, so nothing is held or checked: its preconditions are `apply`'s, before any write.
-    fn begin_install(
-        &self,
-        spec: &DaemonSpec,
-        desired: &ScmRegistration,
-        _reservation: &mut (),
-    ) -> Result<Option<InstallLock>> {
+    fn service_begin_install(&self, spec: &DaemonSpec, desired: &ScmRegistration) -> Result<Option<InstallLock>> {
         if !generate::hosted(spec) {
             return Ok(None);
         }
-        let shim = self.provider()?;
-        let lock = InstallLock::acquire()?;
-        if let Ok(referenced) = referenced_hosts() {
-            let _ = shim.sweep(&referenced, &self.folders);
-        }
-        let provided = shim.provide(&self.folders)?;
-        let rendered = HostCommand {
+        self.begin_hosted_install(HostCommand {
             exe: desired.executable.clone(),
             args: desired.arguments.clone(),
-        };
+        })
+        .map(Some)
+    }
+
+    /// What an install of a daemon that runs under the shim host does first, for a service and a task
+    /// alike: see [`Self::service_begin_install`]. `rendered` is the host the definition names.
+    fn begin_hosted_install(&self, rendered: HostCommand) -> Result<InstallLock> {
+        let shim = self.provider()?;
+        let lock = InstallLock::acquire()?;
+        // Made here, by an elevated process, for the shim to write in: it runs as the daemon's account
+        // and makes no folder. Always judged, whatever `folders` is: no caller guarantees them.
+        let judge = FolderCheck::new(CheckPermissions::Enable);
+        make_goetia_folders(&program_data()?, |path| judge.check(path))?;
+        self.sweep_before_install(shim);
+        let provided = shim.provide(&self.folders)?;
         let provided = confirm_provided(rendered, provided)?;
         require_absolute(&provided.exe)?;
         self.folders.check(&provided.exe)?;
         marker::verify(&provided.exe)?;
-        Ok(Some(lock))
+        Ok(lock)
     }
 
-    /// SCM sends its requests through the OS, with no thread or file of ours to run out.
-    fn reserve(&self, _steps: &[Step], _budget: Budget) -> Result<()> {
-        Ok(())
-    }
-
-    fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+    fn service_render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::registration(spec, &identity, &|| self.provider()?.preview())
+        service_registration(spec, || {
+            generate::registration(spec, &identity, &|| self.provider()?.preview())
+        })
     }
 
     /// Keeps the host command a `protocol: plain` service is installed with, so that a host another
     /// provider (a moved folder, another goetia version, a standalone host) put there is the same
     /// spec, and no provider is consulted. `protocol: native` has no host, so its snapshot's config is
     /// never read.
-    fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
+    fn service_regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::registration(spec, &identity, &|| {
-            let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
-                id: snapshot.id().as_str().to_string(),
-                source: Box::new(e),
-            })?;
-            let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
-            Ok(HostCommand { exe, args })
+        service_registration(spec, || {
+            generate::registration(spec, &identity, &|| {
+                let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
+                    id: snapshot.id().as_str().to_string(),
+                    source: Box::new(e),
+                })?;
+                let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
+                Ok(HostCommand { exe, args })
+            })
         })
     }
 
     /// The host is previewed once, for the check and the registration alike.
-    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+    fn service_render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::install_registration(spec, &identity, &|| self.provider()?.preview())
+        service_registration(spec, || {
+            generate::install_registration(spec, &identity, &|| self.provider()?.preview())
+        })
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
     /// absent nor goetia's.
-    fn read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
+    fn service_read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
         let scm = open_scm_to_classify(id.as_str())?;
         let service = match scm.open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
             Ok(service) => service,
@@ -376,7 +413,7 @@ impl Backend for Scm {
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
-    fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
+    fn service_installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
         let id = snapshot.id();
         let config = snapshot.config()?;
         let definition = read_live_registration(config, snapshot.service()?, id.as_str(), &snapshot.parameters)?;
@@ -386,25 +423,17 @@ impl Backend for Scm {
         })
     }
 
-    fn write(
+    fn service_write(
         &self,
         spec: &DaemonSpec,
         definition: &ScmRegistration,
-        _outcome: &Outcome,
         snapshot: Option<&ScmSnapshot>,
-        _scope: &mut Option<InstallLock>,
-        _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         apply(definition, written_user(&spec.common().user), snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
-    /// The install scope makes nothing besides the service, so there is nothing to keep or take back.
-    fn standing(&self, _spec: &DaemonSpec, _definition: &ScmRegistration) -> Standing {
-        Standing::Yes
-    }
-
-    fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
+    fn service_live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
         let id = snapshot.id();
         let enabled = snapshot.config()?.start_type == ServiceStartType::AutoStart;
         let (state, pid) = query_live(snapshot.service()?, id.as_str())?;
@@ -415,7 +444,7 @@ impl Backend for Scm {
     /// `SC_MANAGER_ENUMERATE_SERVICE`/`EnumServicesStatusExW` need no more privilege than reading
     /// this key does, and one pass here avoids an `OpenService` round trip per candidate on a host
     /// with hundreds of unrelated services.
-    fn scan(&self) -> Scan<ScmSnapshot> {
+    fn service_scan(&self) -> Scan<ScmSnapshot> {
         let mut entries = Vec::new();
         let mut unreadable: Vec<Unreadable> = Vec::new();
         let incomplete = registry::scan_services(|name, services| {
@@ -452,7 +481,7 @@ impl Backend for Scm {
     /// disabled, before the stop or the wait for one under way (see [`uninstall_locked`]), and once
     /// the service is stopped and deleted the uninstall waits for that process and sweeps the folders
     /// the files can be in: see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
-    fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_uninstall(&self, snapshot: ScmSnapshot) -> Result<()> {
         let plan = plan_uninstall(snapshot.blob(), InstallLock::acquire, || {
             snapshot
                 .config()
@@ -467,36 +496,59 @@ impl Backend for Scm {
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
-        let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
-        let uninstalled = uninstall_locked(&scm, &id, &answer, hold)?;
+        let uninstalled = self.service_remove(&id, &answer, hold)?;
         self.after_uninstall(&id, uninstalled, host)
+    }
+
+    /// The service stopped and deleted, with its process held (`hold`) for the caller to wait for.
+    fn service_remove(&self, id: &Id, answer: &ShimAnswer, hold: bool) -> Result<Uninstalled> {
+        let scm = open_scm_for(id, "uninstall").map_err(|e| uninstall_failed(id, &UninstallFailure::Untouched, e))?;
+        uninstall_locked(&scm, id, answer, hold)
+    }
+
+    /// What an install that changes a service into a task removes first: the service, stopped and
+    /// deleted, under the install lock the install already holds, with nothing swept and no process
+    /// waited for (the install sweeps once the task exists: the new host may be the old one). The
+    /// snapshot's own handle stays open until the install ends, so the record goes with it then.
+    fn service_retire(&self, snapshot: &ScmSnapshot) -> Result<()> {
+        // The lock is held by the caller: nothing is taken here.
+        let plan = plan_uninstall(
+            snapshot.blob(),
+            || Ok(()),
+            || {
+                snapshot
+                    .config()
+                    .map(|config| config.executable_path.to_string_lossy().into_owned())
+            },
+        )?;
+        self.service_remove(snapshot.id(), &plan.answer, false).map(drop)
     }
 
     /// Under the lock, the sweep an `install` makes before it provides, which is how an `uninstall`
     /// that stopped short of its own sweep is retried: by running it again. A manager with no
     /// provider has nothing of its own to sweep, and takes no lock and reads nothing.
-    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+    fn service_uninstall_absent(&self) -> Result<()> {
         let Some(shim) = &self.shim else {
             return Ok(());
         };
         let _lock = InstallLock::acquire()?;
-        shim.sweep(&referenced_hosts()?, &self.folders)
+        shim.sweep(&referenced_hosts(&*self.tasks)?, &self.folders)
             .map_err(|failure| *failure.error)
     }
 
-    fn enable(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_enable(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.id();
         let (_scm, service) = open_existing(id, "enable", ServiceAccess::CHANGE_CONFIG)?;
         set_start_type(&service, ServiceStartType::AutoStart).map_err(|e| Error::os(format!("enable `{id}`"), e))
     }
 
-    fn disable(&self, snapshot: ScmSnapshot) -> Result<()> {
+    fn service_disable(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.id();
         let (_scm, service) = open_existing(id, "disable", ServiceAccess::CHANGE_CONFIG)?;
         set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::os(format!("disable `{id}`"), e))
     }
 
-    fn start(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+    fn service_start(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
         // First, so the wait is counted from the verb's entry. What it bounds is the wait:
         // `start_via_notify` issues the start whatever is left of it.
         let deadline = budget.start();
@@ -510,7 +562,7 @@ impl Backend for Scm {
     /// `super::wait::request_start_after_stop`: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
     /// simple` service reads `RUNNING` until its shim has taken the stop.
-    fn request_start_after_stop(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_request_start_after_stop(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to start it"), e))?;
@@ -531,7 +583,7 @@ impl Backend for Scm {
     /// STOP is sent, the STOP reaches the new process, which goetia does not hold. `stop` can then
     /// return while that process is still exiting, and an `uninstall` right after may leave the shim
     /// file for the next sweep.
-    fn stop(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+    fn service_stop(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
         let deadline = budget.start();
@@ -554,7 +606,7 @@ impl Backend for Scm {
     /// Exit code `1` (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery
     /// actions, as for a crash. For `protocol: plain` the process is `goetia-shim`, whose Job Object
     /// takes the daemon's tree with it.
-    fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn service_kill(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.into_id();
         let (_scm, service) = open_existing(&id, "kill", ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
@@ -565,18 +617,230 @@ impl Backend for Scm {
             }),
         }
     }
+}
 
-    /// Interim: SCM installs no task yet, so no id reaches here as one.
+/// What the read of `spec`'s id is for: only a service's install sets aside a Task Scheduler that
+/// cannot be read, since a machine whose Task Scheduler is unusable still installs a new service.
+fn purpose_of(spec: &DaemonSpec) -> Purpose {
+    match spec {
+        DaemonSpec::Service(_) => Purpose::ServiceInstall,
+        DaemonSpec::Task(_) => Purpose::Verb,
+    }
+}
+
+impl Backend for Scm {
+    type Definition = WindowsDefinition;
+    type Snapshot = WindowsSnapshot;
+    /// The install lock, which `protocol: plain` holds until its install ends: what places, repairs
+    /// and deletes shim files, for this process and every other, takes it.
+    type InstallScope = Option<InstallLock>;
+    type Reservation = ();
+    type Run = TaskRun;
+
+    fn begin_install(
+        &self,
+        spec: &DaemonSpec,
+        desired: &WindowsDefinition,
+        _reservation: &mut (),
+    ) -> Result<Option<InstallLock>> {
+        match desired {
+            WindowsDefinition::Service(desired) => self.service_begin_install(spec, desired),
+            WindowsDefinition::Task(desired) => self.begin_hosted_install(desired.host()).map(Some),
+        }
+    }
+
+    /// SCM sends its requests through the OS, with no thread or file of ours to run out.
+    fn reserve(&self, _steps: &[Step], _budget: Budget) -> Result<()> {
+        Ok(())
+    }
+
+    fn render(&self, spec: &DaemonSpec) -> Result<WindowsDefinition> {
+        match spec {
+            DaemonSpec::Service(_) => self.service_render(spec).map(WindowsDefinition::Service),
+            DaemonSpec::Task(_) => self.task_render(spec),
+        }
+    }
+
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &WindowsSnapshot) -> Result<WindowsDefinition> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => {
+                self.service_regenerate(spec, snapshot).map(WindowsDefinition::Service)
+            }
+            WindowsSnapshot::Task(snapshot) => self.task_regenerate(spec, snapshot),
+        }
+    }
+
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<WindowsDefinition> {
+        match spec {
+            DaemonSpec::Service(_) => self.service_render_for_install(spec).map(WindowsDefinition::Service),
+            DaemonSpec::Task(_) => self.task_render_for_install(spec),
+        }
+    }
+
+    fn read(&self, id: &Id) -> Result<ReadOutcome<WindowsSnapshot>> {
+        which(self.service_read(id)?, || self.task_read(id), Purpose::Verb)
+    }
+
+    /// A service's install reads what is at its id with Task Scheduler's failure to be read set
+    /// aside: a machine whose Task Scheduler is unusable still installs a new service.
+    fn read_for_install(&self, spec: &DaemonSpec) -> Result<ReadOutcome<WindowsSnapshot>> {
+        let id = &spec.common().id;
+        which(self.service_read(id)?, || self.task_read(id), purpose_of(spec))
+    }
+
+    fn installed(&self, snapshot: &WindowsSnapshot) -> Result<InstalledDefinition<WindowsDefinition>> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => {
+                self.service_installed(snapshot).map(|installed| InstalledDefinition {
+                    definition: WindowsDefinition::Service(installed.definition),
+                    external: installed.external,
+                })
+            }
+            WindowsSnapshot::Task(snapshot) => self.task_installed(snapshot),
+        }
+    }
+
+    fn write(
+        &self,
+        spec: &DaemonSpec,
+        definition: &WindowsDefinition,
+        _outcome: &Outcome,
+        snapshot: Option<&WindowsSnapshot>,
+        scope: &mut Option<InstallLock>,
+        _reservation: &mut (),
+    ) -> Result<WriteOutcome> {
+        match (definition, snapshot) {
+            (WindowsDefinition::Service(definition), None) => self.service_write(spec, definition, None),
+            (WindowsDefinition::Service(definition), Some(WindowsSnapshot::Service(snapshot))) => {
+                self.service_write(spec, definition, Some(snapshot))
+            }
+            (WindowsDefinition::Service(definition), Some(WindowsSnapshot::Task(old))) => {
+                self.retype_to_service(spec, definition, old, scope)
+            }
+            (WindowsDefinition::Task(definition), None) => self.task_write(spec, definition, None),
+            (WindowsDefinition::Task(definition), Some(WindowsSnapshot::Task(snapshot))) => {
+                self.task_write(spec, definition, Some(snapshot))
+            }
+            (WindowsDefinition::Task(definition), Some(WindowsSnapshot::Service(old))) => {
+                self.retype_to_task(spec, definition, old, scope)
+            }
+        }
+    }
+
+    /// The install scope makes nothing besides the definition: the lock is released, and the folders an
+    /// elevated install makes are shared by every daemon and are never taken back.
+    fn standing(&self, _spec: &DaemonSpec, _definition: &WindowsDefinition) -> Standing {
+        Standing::Yes
+    }
+
+    fn live_status(&self, snapshot: &WindowsSnapshot) -> Result<Status> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_live_status(snapshot),
+            WindowsSnapshot::Task(snapshot) => self.task_live_status(snapshot),
+        }
+    }
+
+    /// A task's run state is its listing and the liveness of what it lists, and nothing else, so that
+    /// a part of its status that can fail cannot refuse a run.
+    fn task_state(&self, snapshot: &WindowsSnapshot) -> Result<State> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => Ok(self.service_live_status(snapshot)?.common().state),
+            WindowsSnapshot::Task(snapshot) => self.task_run_state(snapshot),
+        }
+    }
+
+    fn scan(&self) -> Scan<WindowsSnapshot> {
+        combined(self.service_scan(), &*self.tasks)
+    }
+
+    fn uninstall(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_uninstall(snapshot),
+            WindowsSnapshot::Task(snapshot) => self.task_uninstall(snapshot),
+        }
+    }
+
+    /// The id is in neither store, so what is left of it is a task's run records, which a task's
+    /// uninstall that could not remove them leaves, and what a service's uninstall leaves to sweep.
+    fn uninstall_absent(&self, id: &Id) -> Result<()> {
+        self.task_uninstall_absent(id)
+    }
+
+    fn enable(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_enable(snapshot),
+            WindowsSnapshot::Task(snapshot) => self.task_enable(&snapshot),
+        }
+    }
+
+    fn disable(&self, snapshot: WindowsSnapshot) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_disable(snapshot),
+            WindowsSnapshot::Task(snapshot) => self.task_disable(&snapshot),
+        }
+    }
+
+    fn start(&self, snapshot: WindowsSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_start(snapshot, budget),
+            WindowsSnapshot::Task(snapshot) => self.task_start(snapshot.id()),
+        }
+    }
+
+    /// A task's start does not depend on what its stop left listed: an ended run that is still listed
+    /// does not stop Task Scheduler from accepting it (L2). A run still alive refuses it
+    /// ([`Error::StillRunning`]), since Task Scheduler would accept the start and begin nothing.
+    fn request_start_after_stop(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_request_start_after_stop(snapshot),
+            WindowsSnapshot::Task(snapshot) => self.task_request_start_after_stop(snapshot.id()),
+        }
+    }
+
+    fn stop(&self, snapshot: WindowsSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_stop(snapshot, budget),
+            WindowsSnapshot::Task(snapshot) => self.task_stop(snapshot.id(), budget),
+        }
+    }
+
+    fn kill(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => self.service_kill(snapshot),
+            WindowsSnapshot::Task(snapshot) => self.task_kill(snapshot.id()),
+        }
+    }
+
+    /// Starts the task and holds the run it began (see [`Scm::task_begin_run_with`]). A service is not
+    /// a task: `run` has refused it before it gets here.
     fn begin_run(
         &self,
-        snapshot: ScmSnapshot,
+        snapshot: WindowsSnapshot,
         _reservation: &mut (),
         _notes: &mut dyn std::io::Write,
-    ) -> Result<std::convert::Infallible> {
-        Err(crate::backend::cannot_run_tasks(
-            "the Windows service manager",
-            &snapshot.into_id(),
-        ))
+    ) -> Result<TaskRun> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => Err(Error::NotATask {
+                id: snapshot.id().to_string(),
+            }),
+            WindowsSnapshot::Task(snapshot) => self.task_begin_run(snapshot),
+        }
+    }
+}
+
+/// The service registration `build` makes for the service `spec`: [`Scm::task_render`] and
+/// [`Scm::task_render_for_install`] build a task's definition.
+fn service_registration(
+    spec: &DaemonSpec,
+    build: impl FnOnce() -> Result<generate::WindowsDefinition>,
+) -> Result<ScmRegistration> {
+    debug_assert!(
+        matches!(spec, DaemonSpec::Service(_)),
+        "a task is not a service's registration"
+    );
+    match build()? {
+        generate::WindowsDefinition::Service(registration) => Ok(registration),
+        generate::WindowsDefinition::Task(_) => unreachable!("a service spec is built as a service"),
     }
 }
 
@@ -885,6 +1149,14 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// start type the service has, rather than resetting it; see `service_info`. `written` is what
 /// [`written_user`] says of the account's spec value.
 fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
+    let password = service_gate(reg, written)?;
+    apply_gated(reg, password, create)
+}
+
+/// What a service of `reg` needs before it is written, which a change of a task into a service sees to
+/// before it removes the task: the account is a user and its right is granted, the password is read,
+/// and the event source is registered. Returns the password to register with. See [`apply`].
+fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Result<Option<String>> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -917,8 +1189,9 @@ fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool
         let user = identity::require_user_account(account, written)?;
         let pw = identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
             account: account.to_string(),
+            kind: DaemonKind::Service,
         })?;
-        identity::grant_service_logon_right(&user)?;
+        identity::grant_logon_right(&user, identity::Right::Service)?;
         Some(pw)
     } else {
         None
@@ -927,7 +1200,12 @@ fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool
     // Here rather than in the shim: it writes under HKLM, and the shim may run as an unprivileged
     // account.
     registry::register_event_source()?;
+    Ok(password)
+}
 
+/// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it
+/// returned.
+fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool) -> Result<()> {
     if create {
         let scm = open_scm(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
         let info = service_info(reg, password, None);
@@ -1109,7 +1387,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
                 "uninstall",
                 &format!("service `{id}`"),
                 &format!("open `{id}` before uninstall"),
-                windows_service::Error::Winapi(e),
+                e,
             );
             return Err(uninstall_failed(id, &UninstallFailure::Untouched, refused));
         }
@@ -1144,7 +1422,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
                 "uninstall",
                 &format!("service `{id}`"),
                 &format!("open `{id}` to delete it"),
-                e,
+                winapi_io(e),
             );
             return Err(uninstall_failed(id, &UninstallFailure::Delete { previous }, refused));
         }
@@ -1360,6 +1638,11 @@ pub(super) fn shim_answer(
 /// provider.
 fn shim_host(image: &str) -> Option<PathBuf> {
     let (exe, _) = split_command_line(image);
+    shim_exe(exe)
+}
+
+/// `exe` itself, when its file name is that of a shim file placed by a provider.
+fn shim_exe(exe: PathBuf) -> Option<PathBuf> {
     let is_shim = exe.file_name()?.to_str().and_then(shim_file) == Some(ShimFile::Current);
     is_shim.then_some(exe)
 }
@@ -1468,6 +1751,15 @@ fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
 }
 
 impl Scm {
+    /// The sweep an install makes before it provides its host: `shim`'s files that no service, task or
+    /// process references. A reference read that fails, or a sweep that cannot delete a file, is not
+    /// the install's failure: the file is not what the install needs, and the next sweep finds it.
+    fn sweep_before_install(&self, shim: &dyn ShimProvider) {
+        if let Ok(referenced) = referenced_hosts(&*self.tasks) {
+            let _ = shim.sweep(&referenced, &self.folders);
+        }
+    }
+
     /// The folder of the provider, as an uninstall tells it: [`ProviderFolder::None`] without a
     /// provider or for one that sweeps no folder, its normalised `folder()`, and
     /// [`ProviderFolder::Unknown`] when that fails, which is not the absence of a provider: the
@@ -1585,7 +1877,7 @@ impl Scm {
             return finish(failures, false);
         }
         // After the wait: what has exited no longer references its file.
-        let referenced = match referenced_hosts() {
+        let referenced = match referenced_hosts(&*self.tasks) {
             Ok(referenced) => referenced,
             Err(e) => {
                 failures.push(e.into());
@@ -1659,7 +1951,7 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
                 "uninstall",
                 &format!("service `{id}`"),
                 &format!("open `{id}` to disable it"),
-                e,
+                winapi_io(e),
             );
             return Err(uninstall_failed(id, &UninstallFailure::Untouched, refused));
         }
@@ -1944,10 +2236,11 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
 /// which says goetia cannot tell whether anything is installed. A denial's message names the verb
 /// and the `target` it was denied.
 ///
-/// `context` is the open, as [`to_error`] takes it.
-fn open_refused(operation: &str, target: &str, context: &str, e: windows_service::Error) -> Error {
-    let access_denied = is_access_denied(&e);
-    let failed = to_error(context, e);
+/// `context` is the open, as [`to_error`] takes it, and `e` its failure: a process's, for a task's run
+/// that a caller who is not an Administrator may not open (see `task::read`).
+fn open_refused(operation: &str, target: &str, context: &str, e: std::io::Error) -> Error {
+    let access_denied = e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    let failed = Error::os(context, e);
     if !access_denied {
         return failed;
     }
@@ -1965,7 +2258,7 @@ fn open_scm_for(id: &Id, operation: &str) -> Result<WinServiceManager> {
             operation,
             "the service manager",
             &format!("open the Service Control Manager to {operation} `{id}`"),
-            e,
+            winapi_io(e),
         )
     })
 }
@@ -1985,7 +2278,7 @@ fn open_existing(id: &Id, operation: &str, access: ServiceAccess) -> Result<(Win
                 operation,
                 &format!("service `{id}`"),
                 &format!("open service `{id}` to {operation} it"),
-                e,
+                winapi_io(e),
             )
         }
     })?;

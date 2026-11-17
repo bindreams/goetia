@@ -167,12 +167,17 @@ pub enum Error {
     #[error("`{variable}` is set but its value is not valid Unicode")]
     InvalidPassword { variable: String },
 
-    /// A real account needs a password that was not given.
+    /// A real account needs a password that was not given: to install, and for a task, to `enable` and
+    /// `disable` it too, which register it again. `kind` is what the account runs.
     #[error(
-        "service account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
-         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD before installing"
+        "{} account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
+         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again",
+        daemon_noun(*kind)
     )]
-    PasswordRequired { account: String },
+    PasswordRequired {
+        account: String,
+        kind: crate::spec::DaemonKind,
+    },
 
     /// goetia cannot confirm the manager or its client is at least its floor; nothing was sent.
     /// The sentences are written from what each source reported.
@@ -221,24 +226,45 @@ pub enum Error {
     )]
     NotADirectory { path: PathBuf },
 
+    /// Task Scheduler deleted a task, and the folder it was in, left empty, could not be removed. The
+    /// task is gone; only the empty folder is left.
+    #[error("the task `{task}` is deleted, but its empty folder `{folder}` could not be removed")]
+    TaskFolderKept {
+        task: String,
+        folder: String,
+        #[source]
+        source: BoxError,
+    },
+
     /// A directory that is a daemon's `cwd`, the directory of its log, or one of their ancestors is
     /// refused: `why` says what is wrong with it and what to do. No OS call failed.
     #[error("refusing {} for a daemon's cwd or log directory: {why}", path.display())]
     DirectoryRefused { path: PathBuf, why: String },
 
-    /// A folder the shim would be written to, one of its ancestors, or the host file itself can be
-    /// modified by an account goetia does not trust, so that account could replace the shim, which
-    /// runs as `LocalSystem`. No OS call failed.
+    /// A folder goetia keeps what runs as `LocalSystem` or what it reads back in (the shim's folder, a
+    /// task's run records), one of its ancestors, or the shim host file itself, can be modified by an
+    /// account goetia does not trust, so that account could replace what is in it. No OS call failed.
     #[error(
-        "refusing to use {} for the shim: {account} can {right} it, so it could replace the shim; fix its \
+        "refusing to use {}: {account} can {right} it, so it could replace what goetia keeps in it; fix its \
          permissions",
         path.display()
     )]
-    ShimFolderUnsafe {
+    FolderUnsafe {
         path: PathBuf,
         account: String,
         right: &'static str,
     },
+
+    /// A folder goetia makes for itself exists and is not as goetia makes it (its owner, whether its
+    /// permissions are inherited, and its entries). It is refused, never repaired: goetia cannot tell
+    /// who made it or what is in it. No OS call failed.
+    #[error(
+        "refusing {}: its owner or permissions are not those goetia gives the folder, so goetia cannot vouch for \
+         it; delete the folder (it holds only the records of finished runs, which the next run writes again) and \
+         run the command again",
+        path.display()
+    )]
+    FolderNotAsMade { path: PathBuf },
 
     /// A file that is to be the shim host has no goetia version marker: it is not a service host
     /// built from this library. No OS call failed.
@@ -506,15 +532,31 @@ pub enum Error {
     #[error("`{id}` is already running: `run` needs an idle task (`goetia daemon stop {id}` ends the run in flight)")]
     AlreadyRunning { id: String },
 
-    /// A start requested right after a stop nobody waited for (`restart --timeout 0` of a launchd task)
-    /// found the run that was sent SIGTERM still alive, and so issued no start: launchd starts no new
-    /// run of a task while one is in flight. Determinate: nothing was sent.
+    /// A start requested right after a stop nobody waited for (`restart --timeout 0` of a launchd or
+    /// Windows task) found the run that was asked to stop still alive, and so issued no start: the
+    /// manager starts no new run of a task while one is in flight (launchd starts nothing and answers
+    /// success; Task Scheduler under `IgnoreNew` accepts the start and begins nothing). Determinate:
+    /// nothing was sent.
     #[error(
-        "`{id}` still has the run that was sent SIGTERM (pid {pid}), and launchd starts no new run of a task \
-         while one is in flight, so no start was issued; `goetia daemon start {id}` starts one once it has \
-         exited, and `goetia daemon restart {id}` without `--timeout 0` waits for the exit"
+        "`{id}` still has the run that was asked to stop (pid {pid}), and the service manager starts no new run \
+         of a task while one is in flight, so no start was issued; `goetia daemon start {id}` starts one once \
+         it has exited, and `goetia daemon restart {id}` without `--timeout 0` waits for the exit"
     )]
     StillRunning { id: String, pid: u32 },
+
+    /// An install that changes a daemon between a service and a task removes the old one first, and
+    /// refuses while it runs. `old` is what is installed. Determinate: nothing was changed.
+    #[error("{}", retype_running(id, *old))]
+    RetypeRunning { id: String, old: crate::spec::DaemonKind },
+
+    /// An install that changes the account a task runs as registers the task again (an update would
+    /// leave it unreadable by the new account), which removes the old registration first, and so it
+    /// refuses while the task runs. Determinate: nothing was changed.
+    #[error(
+        "`{id}` is running, and installing it as another account registers it again, which removes the running \
+         task first: run `goetia daemon stop {id}`, then re-run install"
+    )]
+    AccountChangeRunning { id: String },
 
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
@@ -747,7 +789,9 @@ impl Error {
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
             | Error::DirectoryRefused { .. }
-            | Error::ShimFolderUnsafe { .. }
+            | Error::TaskFolderKept { .. }
+            | Error::FolderUnsafe { .. }
+            | Error::FolderNotAsMade { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider
@@ -768,6 +812,8 @@ impl Error {
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
             | Error::StillRunning { .. }
+            | Error::RetypeRunning { .. }
+            | Error::AccountChangeRunning { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -935,7 +981,9 @@ impl Error {
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
             | Error::DirectoryRefused { .. }
-            | Error::ShimFolderUnsafe { .. }
+            | Error::TaskFolderKept { .. }
+            | Error::FolderUnsafe { .. }
+            | Error::FolderNotAsMade { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider
@@ -958,6 +1006,8 @@ impl Error {
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
             | Error::StillRunning { .. }
+            | Error::RetypeRunning { .. }
+            | Error::AccountChangeRunning { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }
@@ -1339,6 +1389,26 @@ fn loaded_job(id: &str, kind: crate::spec::DaemonKind) -> String {
              has stopped is idle), then re-run install"
         ),
     }
+}
+
+/// What a daemon of `kind` is called in a message.
+fn daemon_noun(kind: crate::spec::DaemonKind) -> &'static str {
+    match kind {
+        crate::spec::DaemonKind::Service => "service",
+        crate::spec::DaemonKind::Task => "task",
+    }
+}
+
+/// The message of [`Error::RetypeRunning`].
+fn retype_running(id: &str, old: crate::spec::DaemonKind) -> String {
+    let (old, new) = match old {
+        crate::spec::DaemonKind::Service => ("service", "task"),
+        crate::spec::DaemonKind::Task => ("task", "service"),
+    };
+    format!(
+        "`{id}` is running as a {old}, and changing it to a {new} removes it first: run `goetia daemon stop {id}`, \
+         then re-run install"
+    )
 }
 
 /// The message of [`Error::LoadedJobInDoubt`].
