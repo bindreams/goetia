@@ -238,12 +238,7 @@ fn a_fifth_weekday_matches_the_schedulers_run_times(#[fixture(scm_group)] _group
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_refused_schedule_writes_nothing(#[fixture(scm_group)] _group: &Group) {
     let mgr = support::stock_shim_manager();
-    for text in [
-        "1,2,4,8,16 * * * *",
-        "0 0 */2 * 1",
-        "0 0 1 * 1",
-        "30 3 1,15 * 1-5",
-    ] {
+    for text in ["1,2,4,8,16 * * * *", "0 0 */2 * 1", "0 0 1 * 1", "30 3 1,15 * 1-5"] {
         let guard = TaskGuard::new();
         let id = &guard.id;
 
