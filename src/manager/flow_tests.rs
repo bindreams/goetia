@@ -1506,7 +1506,7 @@ fn enable_of_a_service_and_of_an_unusable_blob_is_not_judged_by_a_schedule() {
     assert!(fake.is_enabled("odd"), "the unusable blob is enabled");
 }
 
-// The wait of a stop that names none =================================================================================
+// The wait of a stop that names none ==================================================================================
 
 /// The budget the one reservation of the last verb was made under.
 fn reserved_under(fake: &Fake) -> Budget {
