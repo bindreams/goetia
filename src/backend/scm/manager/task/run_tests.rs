@@ -156,6 +156,42 @@ fn a_start_that_named_no_pid_but_whose_own_run_left_a_record_follows_that_record
     );
 }
 
+/// The instance `Run` named, listed live, is the run followed whatever pid `Run` returned and whatever else
+/// is live or recorded: a run that is alive is waited for until its process exits.
+#[skuld::test]
+fn an_instance_listed_live_is_followed_whether_or_not_run_returned_a_pid() {
+    let others = [instance(9, 900), instance(1, 100), instance(8, 800)];
+    let live = Identity::Live {
+        id: instance_id(1),
+        pid: 100,
+    };
+
+    assert_eq!(identify(Some(&unnamed(1)), &others, &[]), live);
+    assert_eq!(identify(Some(&named(1, 4242)), &others, &[]), live);
+    assert_eq!(identify(Some(&unnamed(1)), &[instance(1, 100)], &[]), live);
+}
+
+/// A record can appear while the run's instance is still listed (the shim writes it before the process
+/// is gone): the listing says the run is alive, so it is followed until it exits, and its record is read
+/// then.
+#[skuld::test]
+fn an_instance_listed_live_is_followed_though_its_record_has_appeared() {
+    let own = written(1, 7, RunOutcome::Exited(0));
+    let live = Identity::Live {
+        id: instance_id(1),
+        pid: 100,
+    };
+
+    assert_eq!(
+        identify(Some(&unnamed(1)), &[instance(1, 100)], std::slice::from_ref(&own)),
+        live
+    );
+    assert_eq!(
+        identify(Some(&named(1, 4242)), &[instance(1, 100)], std::slice::from_ref(&own)),
+        live
+    );
+}
+
 #[skuld::test]
 fn a_run_that_started_nothing_is_not_live_and_is_unrecorded() {
     assert_eq!(identify(Some(&unnamed(1)), &[], &[]), Identity::Unrecorded);
