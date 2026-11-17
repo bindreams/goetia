@@ -381,7 +381,6 @@ impl Launchd {
                 Pass::Again => course.first_pass_over(),
                 Pass::Queued(waited) => {
                     course.extend(waited);
-                    lagging = None;
                 }
                 Pass::Behind(shown) if course.counted == Budget::Immediate => {
                     if lagging == Some(shown) {

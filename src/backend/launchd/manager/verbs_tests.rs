@@ -920,15 +920,15 @@ fn a_send_after_the_first_is_refused_once_the_deadline_is_spent() {
     assert_eq!(second.finish(), Some(0), "the run was sent nothing");
 }
 
-/// What the timeout says of a pid launchd shows that is no run of the job's this stop can reach: that it is not
-/// one, and why (the run ended and launchd had not cleared it, or launchd had moved on to another run), and no
-/// word of a signal or of `goetia daemon kill`, which would not help.
+/// What the timeout says of a pid launchd shows that is no run of the job's this stop can reach: that launchd
+/// still showed a process ID, that the process had ended or been replaced, and to stop again; no word of a
+/// signal or of `goetia daemon kill`, which would not help.
 fn assert_uncleared(e: &Error) {
     let Error::WaitTimeout { recovery, .. } = e else {
         panic!("expected a wait timeout, got {e:?}")
     };
     assert!(
-        recovery.contains("not cleared") && recovery.contains("another run") && recovery.contains("daemon stop"),
+        recovery.contains("still showed a process ID") && recovery.contains("daemon stop"),
         "{recovery}"
     );
     assert!(
@@ -937,10 +937,9 @@ fn assert_uncleared(e: &Error) {
     );
 }
 
-/// The wording for a pid launchd shows and this stop cannot reach, which is true for both ways there is one: the
-/// run ended and is not cleared, or launchd has another run.
+/// The wording for a pid launchd shows and this stop cannot reach, as someone who has not read the code reads it.
 #[skuld::test]
-fn the_timeout_of_a_pid_launchd_shows_and_the_stop_cannot_reach_is_true_of_both_ways_it_comes() {
+fn the_uncleared_timeout_says_what_launchd_showed_and_to_stop_again() {
     let budget = Budget::Bounded(Duration::from_secs(3));
     let Error::WaitTimeout { recovery: plain, .. } = budget::timed_out(ID, "stopped", budget) else {
         panic!("a wait timeout")
@@ -953,9 +952,8 @@ fn the_timeout_of_a_pid_launchd_shows_and_the_stop_cannot_reach_is_true_of_both_
     assert_eq!(
         recovery,
         format!(
-            "{plain} Launchd showed a pid that is no run of the job's that this stop can reach: the run ended \
-             and launchd had not cleared it, or launchd had moved on to another run. `goetia daemon stop {ID}` \
-             again returns once launchd shows no process."
+            "{plain} Launchd still showed a process ID for the job when the deadline passed, but that process \
+             had already ended or belonged to a run that replaced it; run `goetia daemon stop {ID}` again."
         )
     );
 }
@@ -1090,6 +1088,27 @@ fn stop_under_immediate_reads_again_while_the_pid_launchd_shows_changes() {
 
         fake.assert_spent(what);
     }
+}
+
+/// A start that forks between two readings of the same pid is a new beginning: the pid shown before it says
+/// nothing of the pid shown after, so the second reading of `a` is read once more, not taken as launchd lagging.
+#[skuld::test]
+fn stop_under_immediate_reads_a_pid_again_after_a_queued_start_forked_between_the_readings() {
+    let mut zombie = Held::new(0);
+    let a = zombie.pid();
+    zombie.exit_unreaped();
+    let fake = Fake::new([
+        print(&running(a)),
+        print(QUEUED),
+        print(QUEUED),
+        print(&running(a)),
+        print(&running(a)),
+        print(IDLE),
+    ]);
+
+    stopping(&fake, Budget::Immediate).expect("a stop that waits for nothing");
+
+    fake.assert_spent("the pid, the queued start and its fork, the pid again, and the reading after it");
 }
 
 /// A later pass can find the run that was sent SIGTERM again: here launchd's lookup did not name the process
