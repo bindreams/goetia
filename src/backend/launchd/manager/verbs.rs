@@ -202,7 +202,7 @@ enum Escalation {
     Sent,
 }
 
-/// [`timed_out`] for a `stop` of a launchd task, which says what it had sent the run: goetia sends SIGKILL
+/// [`budget::timed_out`] for a `stop` of a launchd task, which says what it had sent the run: goetia sends SIGKILL
 /// after the SIGTERM's `timeout` only while it waits, so a wait that ended before it was sent says nothing
 /// will, and what ends the run; one that ended after it was sent says that.
 fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> Error {
