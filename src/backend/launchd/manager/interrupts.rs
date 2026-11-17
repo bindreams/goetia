@@ -302,9 +302,11 @@ impl Drop for Deferred {
 /// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
     WAKE.store(-1, Ordering::SeqCst);
-    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
-        #[cfg(test)]
+    #[cfg(test)]
+    if IN_FLIGHT.load(Ordering::SeqCst) != 0 {
         test_hook::waited();
+    }
+    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
         std::thread::yield_now();
     }
     drop(wake);
@@ -431,18 +433,21 @@ mod test_hook {
         spend(&STEPS, "no step of opening a window may be taken (test hook)")
     }
 
-    /// Whether a close has found a handler counted in and waited for it since [`forget_waits`].
+    /// Whether a close has found a handler counted in and waited for it since [`forget_waits`]. It is
+    /// process-wide, so it is reliable only while every test that opens a window takes `SERIAL`.
     static WAITED: AtomicBool = AtomicBool::new(false);
 
-    /// The close is waiting for a handler: called on each pass of its wait.
+    /// The close found a handler counted in and is about to wait for it.
     pub(super) fn waited() {
         WAITED.store(true, Ordering::SeqCst);
     }
 
+    /// Whether [`waited`] was called since [`forget_waits`]; see [`WAITED`] for when this can be relied on.
     pub(super) fn has_waited() -> bool {
         WAITED.load(Ordering::SeqCst)
     }
 
+    /// Clears [`WAITED`]; see it for when that is reliable.
     pub(super) fn forget_waits() {
         WAITED.store(false, Ordering::SeqCst);
     }

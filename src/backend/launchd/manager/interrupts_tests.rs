@@ -201,10 +201,15 @@ fn readable(fd: RawFd) -> bool {
     ready == 1 && asked.revents & libc::POLLIN != 0
 }
 
-/// Whether `fd` is an open descriptor of this process.
-fn is_open(fd: RawFd) -> bool {
-    // SAFETY: `fcntl` with `F_GETFD` only reads the descriptor's flags.
-    unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+/// What `fd` is, as the device and inode it names, or `None` where it is no open descriptor of this process.
+/// A descriptor number can be reused by another file once its own is closed, so a test that asks whether a
+/// pipe is still open asks for this and compares it with the pipe's own, never whether the number is open.
+fn identity(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
+    // SAFETY: an all-zero `stat` is a valid place for one; `fstat` writes it where `fd` is open.
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        (libc::fstat(fd, &mut stat) == 0).then_some((stat.st_dev, stat.st_ino))
+    }
 }
 
 fn errno() -> i32 {
@@ -486,11 +491,14 @@ fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
 /// that the test holds. The test waits for the closing thread to say that it is waiting for that handler
 /// ([`test_hook::has_waited`]), or to end, which it must not do: a close that does not wait ends without
 /// saying so, and is told apart from one that waits whatever the schedule, as both waits are on a fact.
+/// Once it waits, the descriptor is un-published and the pipe, told by what it is and not by its number, is
+/// still open; after the handler is out, the pipe is closed.
 #[skuld::test]
 fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
     let wake = deferred.wake();
+    let pipe = identity(wake).expect("the read end is open");
     let mut closing = Joined::default();
     let running = Running::enter();
     test_hook::forget_waits();
@@ -504,11 +512,23 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
         }
         std::thread::yield_now();
     }
-    assert!(!closing.ended(), "the closing thread is waiting, not done");
-    assert!(is_open(wake), "a handler is running, so the pipe is still open");
+    if closing.ended() {
+        closing.fail("the closing thread ended while a handler was running");
+    }
+    assert_eq!(
+        WAKE.load(Ordering::SeqCst),
+        -1,
+        "the write end is un-published before the wait"
+    );
+    assert_eq!(
+        identity(wake),
+        Some(pipe),
+        "a handler is running, so the pipe is still open"
+    );
 
     drop(running);
     closing.finish();
+    assert_ne!(identity(wake), Some(pipe), "the pipe is closed once the handler is out");
     before.assert_back();
 }
 
