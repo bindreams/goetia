@@ -13,7 +13,8 @@
 //! pin's holder did not see yet is whatever [`Runs::appeared`] lists: the records written after the
 //! pin's directory listing, which was taken after the pin. **No operation deletes a record while a pin
 //! is held:** a write prunes nothing, and [`Runs::remove_all`] waits for the pins first. A pin made
-//! after that wait began is refused, by the marker the removal places first ([`Runs::hold`]).
+//! after that wait began is refused, by the marker the removal places first ([`Runs::hold`]); so once
+//! the marker is there the pins that exist are final, and the removal waits for those alone.
 //!
 //! **`started` only orders** the records of runs that overlap: no decision compares it to the time.
 //!
@@ -36,7 +37,7 @@ mod files;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -57,10 +58,12 @@ const RECORD: &str = ".json";
 const TEMP: &str = ".json.tmp";
 /// The end of a pin's file name.
 const PIN: &str = ".pin";
-/// The marker file of a removal under way, which a new pin looks for ([`Runs::remove_all`]).
-const REMOVING: &str = ".removing";
-/// The pace of [`Runs::remove_all`]'s re-checks while a pin is held. Each re-check decides; the pace only
-/// keeps the loop from spinning (the shim's re-reads of Task Scheduler's listing run at the same pace).
+/// The end of the name of a removal's marker file, `runs\<id>~removing`, which a new pin looks for
+/// ([`Runs::remove_all`]). An id has no `~`, so no task's directory is named like it.
+const REMOVING: &str = "~removing";
+/// The pace of [`Runs::remove_all`]'s re-checks while a pin is held or the directory is not yet
+/// empty. Each re-check decides; the pace only keeps the loop from spinning (the shim's re-reads of
+/// Task Scheduler's listing run at the same pace).
 const PIN_PACE: Duration = Duration::from_millis(100);
 
 /// How a run ended.
@@ -95,6 +98,8 @@ struct Stored {
 /// The directory of one task's records.
 pub(crate) struct Runs {
     dir: PathBuf,
+    /// The removal's marker, beside `dir` so that it outlasts it: see [`Runs::remove_all`].
+    marker: PathBuf,
 }
 
 /// A reader's claim on the records of one task, and usually what the directory held when it was made.
@@ -116,8 +121,10 @@ enum Entry {
 impl Runs {
     /// The records of task `id` under `program_data`: `<program_data>\Goetia\runs\<id>`.
     pub(crate) fn of(program_data: &std::path::Path, id: &Id) -> Runs {
+        let runs = goetia_folder(program_data).join("runs");
         Runs {
-            dir: goetia_folder(program_data).join("runs").join(id.to_string()),
+            dir: runs.join(id.to_string()),
+            marker: runs.join(format!("{id}{REMOVING}")),
         }
     }
 
@@ -163,10 +170,7 @@ impl Runs {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => permissions.set_dacl(&self.dir),
             made => made,
         }?;
-        match fs::remove_file(self.dir.join(REMOVING)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            Err(_) | Ok(()) => Ok(()),
-        }
+        remove_if_present(&self.marker)
     }
 
     /// Writes the record of a run, replacing one of the same instance, then prunes. The record is
@@ -226,8 +230,9 @@ impl Runs {
     ///
     /// The pin is made first and the removal's marker looked for after, the opposite order of
     /// [`Runs::remove_all`]'s: so either the removal sees this pin and waits, or this finds the marker
-    /// and drops the pin. A pin that finds the marker is refused with an [`io::ErrorKind::NotFound`]
-    /// error, as one in a directory already removed is.
+    /// and drops the pin. A pin that finds the marker is refused with an [`io::ErrorKind::ResourceBusy`]
+    /// error that says the records are being removed. It is not [`io::ErrorKind::NotFound`], which a
+    /// directory already removed gives and which a caller may take as "no records".
     pub(crate) fn hold(&self) -> io::Result<Pin> {
         let mut names = Builder::new();
         names.prefix("pin-").suffix(PIN).disable_cleanup(true);
@@ -236,10 +241,10 @@ impl Runs {
             _file: file,
             listing: None,
         };
-        if self.dir.join(REMOVING).try_exists()? {
+        if self.marker.try_exists()? {
             return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "its run records are being removed: the task is being uninstalled",
+                io::ErrorKind::ResourceBusy,
+                "the task's run records are being removed (uninstall or a change of type)",
             ));
         }
         Ok(pin)
@@ -284,65 +289,82 @@ impl Runs {
     /// uninstalling stops the task first, so that `run` returns soon after; the removal waits for it,
     /// re-checking the pins every [`PIN_PACE`] with no cap, and only then deletes.
     ///
-    /// **A pin cannot be taken in the moment between the check and the delete.** The removal places
-    /// a marker file (`.removing`) before it looks at the pins; a pin is made before it looks for the
-    /// marker ([`Runs::hold`]). Either the pin is there when the removal looks, or the marker is there
-    /// when the pin looks and the pin is dropped. The marker is deleted last, after every other file,
-    /// so that a pin taken during the delete finds it. A file another program holds open (a sharing
-    /// violation) is left, the rest deleted, and the removal goes back to the wait. A marker left by a
-    /// removal that died is placed again and deleted with the directory; an install clears it
+    /// **A pin cannot be taken once the removal has begun.** The removal places a marker file,
+    /// `runs\<id>~removing`, before it looks at the pins; a pin is made before it looks for the marker
+    /// ([`Runs::hold`]). Either the pin is there when the removal looks, or the marker is there when
+    /// the pin looks and the pin is dropped. The marker is beside the directory and goes after it, so
+    /// no pin is accepted at any point of the delete. Only a pin that is about to be refused can be in
+    /// the directory then, for the moment between its creation and its look for the marker: the removal
+    /// finds it where it deletes ([`Runs::delete_all`]) and goes back to the pins.
+    ///
+    /// So each pass of the wait is: every pin is classified ([`scan_pins`]), and one that cannot be
+    /// told about ends the removal, naming it, before anything is deleted; if one is held, the removal
+    /// waits and looks again; otherwise it deletes. A removal that fails after that (a file another
+    /// program holds, with its path) is not waited on: the user closes what holds it and uninstalls
+    /// again. A marker left by a removal that died is placed again; an install clears it
     /// ([`Runs::ensure`]).
     ///
-    /// `waiting` is called once, before the first pause, so the caller can say what is awaited. A pin
-    /// whose state cannot be told is not waited for: the delete reports its own failure.
+    /// `waiting` is called once, before the first pause for a held pin, so the caller can say what is
+    /// awaited.
     pub(crate) fn remove_all(&self, waiting: impl FnOnce()) -> io::Result<()> {
-        let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+        // The marker first, then the pins: see [`Runs::hold`].
+        match fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.marker)
+        {
+            Ok(_) => {}
+            // `runs` is gone: so is everything in it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(at(&self.marker, e)),
+        }
+        self.drain(waiting)?;
+        remove_if_present(&self.marker).map_err(|e| at(&self.marker, e))
+    }
+
+    /// [`Runs::remove_all`] from the marker's placing to the directory's removal. A failure leaves the
+    /// marker, for `run` to keep backing off while records may be partly gone.
+    fn drain(&self, waiting: impl FnOnce()) -> io::Result<()> {
         let mut waiting = Some(waiting);
         loop {
-            // The marker first, then the pins: see [`Runs::hold`].
-            match fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(self.dir.join(REMOVING))
-            {
-                Ok(_) => {}
-                Err(e) if gone(&e) => return Ok(()),
-                Err(e) => return Err(e),
-            }
-            let held = match self.pin_held() {
-                Ok(held) => held,
-                Err(e) if gone(&e) => return Ok(()),
-                Err(e) => return Err(e),
+            let scan = match self.entries().map(|entries| scan_pins(&entries)) {
+                Ok(scan) => scan,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(at(&self.dir, e)),
             };
-            if !held {
-                match self.delete_all_but_marker() {
-                    Ok(false) => match self.remove_marker_and_dir() {
-                        Ok(true) => return Ok(()),
-                        Ok(false) => {}
-                        Err(e) if gone(&e) => return Ok(()),
-                        Err(e) => return Err(e),
-                    },
-                    Ok(true) => {}
-                    Err(e) if gone(&e) => return Ok(()),
-                    Err(e) => return Err(e),
-                }
+            if let Some((pin, e)) = scan.unclassified.into_iter().next() {
+                return Err(at(&pin, e));
             }
-            if let Some(note) = waiting.take() {
-                note();
+            if scan.held {
+                if let Some(note) = waiting.take() {
+                    note();
+                }
+            } else if self.delete_all()? {
+                return Ok(());
             }
             thread::sleep(PIN_PACE);
         }
     }
 
-    /// Deletes every entry of the directory but the marker, and returns whether one is left because a
-    /// handle holds it (a sharing violation). The marker stays until the rest is gone, so that no pin
-    /// is taken while the records are being deleted ([`Runs::hold`]).
-    fn delete_all_but_marker(&self) -> io::Result<bool> {
-        let mut left = false;
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            if entry.file_name() == REMOVING {
+    /// Deletes everything in the directory, and then the directory. No pin is held and none can be
+    /// taken ([`Runs::drain`]), so no pin is deleted here: one still in it is on its way out, a pin
+    /// the marker refuses. Returns `false` when the directory is not empty for that reason, or because
+    /// a deleted file is still open somewhere with its delete pending, for the caller to look again.
+    /// A file that cannot be deleted (held by another program) is an error with its path.
+    ///
+    /// The refused pin is not tested: the moment between its creation and its look at the marker
+    /// cannot be placed from outside without a hook in [`Runs::hold`]. It follows from the order there
+    /// (pin, then marker) and from the marker staying until the directory is gone.
+    fn delete_all(&self) -> io::Result<bool> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(at(&self.dir, e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| at(&self.dir, e))?;
+            if entry.file_name().to_string_lossy().ends_with(PIN) {
                 continue;
             }
             let path = entry.path();
@@ -352,37 +374,16 @@ impl Runs {
                 fs::remove_file(&path)
             };
             match deleted {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) if files::is_sharing_violation(&e) => left = true,
-                Err(e) => return Err(e),
-                Ok(()) => {}
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(at(&path, e)),
+                Err(_) | Ok(()) => {}
             }
-        }
-        Ok(left)
-    }
-
-    /// Removes the marker and then the directory, which holds nothing else. Returns `false` when
-    /// something was put in it since (a pin taken in the moment after the marker went), for the removal
-    /// to go back to its wait.
-    fn remove_marker_and_dir(&self) -> io::Result<bool> {
-        match fs::remove_file(self.dir.join(REMOVING)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            Err(_) | Ok(()) => {}
         }
         match fs::remove_dir(&self.dir) {
             Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty || files::is_sharing_violation(&e) => Ok(false),
-            Err(e) => Err(e),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(false),
+            Err(e) => Err(at(&self.dir, e)),
         }
-    }
-
-    /// Whether some pin in the directory is held. A pin that nothing holds is deleted by the asking
-    /// ([`files::is_held`]); one that cannot be told about is not held.
-    fn pin_held(&self) -> io::Result<bool> {
-        Ok(self
-            .entries()?
-            .iter()
-            .any(|entry| matches!(entry, Entry::Pin(path) if matches!(files::is_held(path), Ok(true)))))
     }
 
     /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record
@@ -417,21 +418,14 @@ impl Runs {
             Ok(pins) => pins,
             Err(e) => return listing(e),
         };
-        let mut problems = Vec::new();
-        let mut held = false;
-        for entry in &pins {
-            if let Entry::Pin(path) = entry {
-                match files::is_held(path) {
-                    Ok(pinned) => held |= pinned,
-                    // Taken as not held, whatever the failure was.
-                    Err(e) => problems.push(format!(
-                        "delete the pin {} to tell whether a run holds it: {e}",
-                        path.display()
-                    )),
-                }
-            }
-        }
-        if held {
+        let scan = scan_pins(&pins);
+        // An unclassified pin is taken as not held, whatever the failure was.
+        let mut problems: Vec<String> = scan
+            .unclassified
+            .iter()
+            .map(|(path, e)| format!("delete the pin {} to tell whether a run holds it: {e}", path.display()))
+            .collect();
+        if scan.held {
             return problems;
         }
         for entry in entries {
@@ -472,6 +466,48 @@ impl Runs {
         }
         Ok(entries)
     }
+}
+
+/// Deletes the file `path`; one that is not there is already deleted.
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        Err(_) | Ok(()) => Ok(()),
+    }
+}
+
+/// `error`, saying which `path` it was about: the OS's own message does not, and the user needs the
+/// file to close or free. The kind is kept.
+fn at(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+/// What [`scan_pins`] found.
+struct PinScan {
+    /// Whether some pin is held by a handle.
+    held: bool,
+    /// The pins whose state could not be told, each with why.
+    unclassified: Vec<(PathBuf, io::Error)>,
+}
+
+/// Classifies every pin of `entries` ([`files::is_held`]): held, stale (deleted by the asking, so no
+/// longer there), or unclassified. Every pin is looked at, so that all that cannot be told about are
+/// returned. The callers decide what an unclassified pin means: [`Runs::remove_all`] ends, since a
+/// delete must not run while a pin may be held; a prune reports it and leaves the rest to the next write.
+fn scan_pins(entries: &[Entry]) -> PinScan {
+    let mut scan = PinScan {
+        held: false,
+        unclassified: Vec::new(),
+    };
+    for entry in entries {
+        if let Entry::Pin(path) = entry {
+            match files::is_held(path) {
+                Ok(held) => scan.held |= held,
+                Err(e) => scan.unclassified.push((path.clone(), e)),
+            }
+        }
+    }
+    scan
 }
 
 fn decode(instance: InstanceId, bytes: &[u8]) -> io::Result<RunRecord> {

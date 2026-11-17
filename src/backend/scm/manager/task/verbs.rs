@@ -366,8 +366,9 @@ impl Scm {
     /// held from before the first `Stop` is sent until every record is read: the shims write as their
     /// runs end, and without it the write of a later run prunes the record of an earlier one before it
     /// is read. A task with no run to stop has no records to keep, so it takes none (a caller who is not
-    /// an Administrator cannot); one whose record directory is gone has none either. A pin that is
-    /// refused is a denial, worded as any verb's refusal is.
+    /// an Administrator cannot); one whose record directory is gone has none either (`NotFound`). Any
+    /// other refusal is an error, worded as any verb's refusal is (a denial for access denied): that
+    /// includes the pin refused because the records are being removed, which is not "no records".
     pub(super) fn task_stop_with<P: Processes>(
         &self,
         operation: &'static str,

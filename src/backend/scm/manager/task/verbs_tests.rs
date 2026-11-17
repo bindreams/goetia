@@ -353,6 +353,33 @@ fn a_stop_that_cannot_take_the_pin_is_denied_by_name_and_sends_no_stop() {
     assert!(machine.waited.is_empty());
 }
 
+/// A stop of a run whose task's records are being removed is an error that says so, and sends no `Stop`:
+/// it is not "no records to keep", which is a directory already gone.
+#[skuld::test]
+fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
+    let (_dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242));
+    let mut machine = Machine::new(&fake, &[4242]);
+    // The removal is under way while a `run` holds a pin, which is what it waits for.
+    let held = runs.pin().unwrap();
+    let mut during = None;
+
+    runs.remove_all(|| {
+        during = Some(stopped(&fake, &mut machine, &runs, Budget::Unbounded));
+        drop(held);
+    })
+    .unwrap();
+
+    let failed = during.expect("the removal waited").unwrap_err();
+    let report = failed.report().to_string();
+    assert!(report.contains("being removed"), "{report}");
+    assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
+    assert!(machine.waited.is_empty());
+}
+
 /// With the pin released, the records the stop read are pruned by the next write as ever.
 #[skuld::test]
 fn the_stops_pin_is_released_when_it_returns() {
