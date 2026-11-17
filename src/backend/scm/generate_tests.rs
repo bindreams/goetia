@@ -134,7 +134,7 @@ fn registration_of_a_service_is_unchanged() {
          Arguments:\n  - \"--service-host\"\n\
          FailureActions:\n  Delay: 1s\n  ResetPeriod: 1day\n  OnNonCrashFailures: true\n\
          Environment:\n\
-         Parameters:\n  Marker: \"goetia\"\n  Schema: \"1\"\n  Spec: {spec_text:?}\n  Version: {version:?}\n",
+         Parameters:\n  Marker: \"goetia\"\n  Schema: \"2\"\n  Spec: {spec_text:?}\n  Version: {version:?}\n",
         exe = shim_path(),
         spec_text = blob::encode(&spec),
         version = crate::version(),

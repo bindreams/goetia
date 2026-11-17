@@ -8,7 +8,7 @@ use std::io;
 use cosca::Process;
 use cosca::identity::{ProcessId, Resolved};
 
-use super::{KillTarget, Signal, Waited};
+use super::{KillTarget, Waited};
 use crate::backend::bounded::{EXIT_AFTER_REFUSED_KILL, settle_kill};
 use crate::manager::budget::Deadline;
 
@@ -51,8 +51,8 @@ impl<R: Reports> KillTarget for Signalling<R> {
         open(pid)
     }
 
-    fn signal(&mut self, process: &Process, signal: Signal) -> io::Result<()> {
-        signal_through(process, signal)
+    fn terminate(&mut self, process: &Process) -> io::Result<()> {
+        terminate(process)
     }
 
     fn await_exit(&mut self, process: &Process, deadline: Deadline) -> io::Result<Waited> {
@@ -69,15 +69,20 @@ pub(crate) fn open(pid: u32) -> io::Result<Option<Process>> {
     Process::open_pid(pid).map_err(io::Error::other)
 }
 
-/// `signal` through the hold: only to the process opened, never to a later holder of its pid, and not
-/// to its children. On macOS a send by audit token refuses an exiting process with `EPERM`, which is
-/// success once the process is read to have exited ([`settle_kill`]), and the refusal otherwise.
-pub(crate) fn signal_through(process: &Process, signal: Signal) -> io::Result<()> {
-    let sent = match signal {
-        Signal::Term => process.terminate(),
-        Signal::Kill => process.kill(),
-    };
-    settle_kill(sent, || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
+/// `SIGKILL` through the hold. On macOS a send by audit token refuses an exiting process with `EPERM`,
+/// which is success once the process is read to have exited ([`settle_kill`]), and the refusal otherwise.
+pub(crate) fn terminate(process: &Process) -> io::Result<()> {
+    settle_kill(process.kill(), || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
+        .map(|_| ())
+        .map_err(io::Error::other)
+}
+
+/// `SIGTERM` through the hold, the request to exit that [`terminate`] is the force of: only to the process
+/// opened, never to a later holder of its pid, and not to its children. A process that has exited is
+/// success; the refusal an exiting process gives on macOS is settled as for [`terminate`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn request_exit(process: &Process) -> io::Result<()> {
+    settle_kill(process.terminate(), || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
         .map(|_| ())
         .map_err(io::Error::other)
 }

@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use super::*;
-use crate::backend::kill::{KillOutcome, Signal, kill_service};
+use crate::backend::kill::{KillOutcome, kill_service};
 use crate::backend::scm::test_support::{spent, unbounded};
 use crate::backend::scm::wait::Waited;
 use crate::manager::budget::Deadline;
@@ -144,8 +144,8 @@ impl KillTarget for Scripted {
         }
     }
 
-    fn signal(&mut self, process: &Held, signal: Signal) -> io::Result<()> {
-        self.log.borrow_mut().push(format!("{signal:?} {}", process.pid));
+    fn terminate(&mut self, process: &Held) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("terminate {}", process.pid));
         Ok(())
     }
 
@@ -443,7 +443,7 @@ fn a_re_arm_scm_refuses_on_a_stopped_service_is_the_release() {
             "service_pid",
             "open 100",
             "service_pid",
-            "Kill 100",
+            "terminate 100",
             "await_exit 100",
             "arm_release",
             "service_pid",
@@ -472,7 +472,7 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
             "service_pid",
             "open 100",
             "service_pid",
-            "Kill 100",
+            "terminate 100",
             "await_exit 100",
             "arm_release",
             "service_pid",
@@ -502,7 +502,7 @@ fn a_kill_is_done_when_scm_reports_a_new_pid() {
             "service_pid",
             "open 100",
             "service_pid",
-            "Kill 100",
+            "terminate 100",
             "await_exit 100",
             "arm_release",
             "service_pid",
@@ -542,7 +542,7 @@ fn a_failed_read_after_the_termination_says_the_signal_was_delivered() {
             "service_pid",
             "open 100",
             "service_pid",
-            "Kill 100",
+            "terminate 100",
             "await_exit 100",
             "arm_release",
             "service_pid",

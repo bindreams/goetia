@@ -134,7 +134,7 @@ fn metadata_text_is_four_lines_and_parses_back() {
     for spec in [full_spec(), minimal_spec()] {
         let text = metadata_text(&spec);
         assert_eq!(text.lines().count(), 4, "{text:?}");
-        assert!(text.starts_with("Marker: goetia\nSchema: 1\nVersion: "), "{text:?}");
+        assert!(text.starts_with("Marker: goetia\nSchema: 2\nVersion: "), "{text:?}");
         assert!(!text.ends_with('\n'), "no trailing line break: {text:?}");
         assert_eq!(parse_metadata_text(&text).unwrap().spec, spec);
     }

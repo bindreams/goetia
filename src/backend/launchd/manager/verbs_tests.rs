@@ -761,30 +761,37 @@ fn a_stop_with_no_time_waits_for_a_queued_start_signals_it_and_reports_the_timeo
 }
 
 /// Once the first signal is sent, a spent deadline sends nothing more, and the pass that finds it spent reads
-/// `print` once: whatever shows a job that is not done (a start launchd accepted, a state that says nothing,
-/// a read that failed) is the timeout.
+/// `print` once. A start launchd accepted is the timeout; no process and a state that is not idle (or a read
+/// that was not whole) is the stop's `StopUnconfirmed`, as in any pass.
 #[skuld::test]
-fn a_stop_whose_deadline_is_spent_after_its_first_signal_reads_once_and_times_out() {
+fn a_stop_whose_deadline_is_spent_after_its_first_signal_reads_once_and_ends_as_the_read_says() {
     let failed = reply(
         &["print", &target()],
-        exited(5, "", "Could not print: 5: Input/output error\n"),
+        exited(5, "", "Could not print: 5: Input/output error
+"),
     );
     let reads = [
-        ("a queued start", print(QUEUED)),
+        ("a queued start", print(QUEUED), true),
         (
             "a state that says nothing",
-            print("\tstate = someday-new-apple-state\n"),
+            print("	state = someday-new-apple-state
+"),
+            false,
         ),
-        ("a read that failed", failed),
+        ("a read that failed", failed, false),
     ];
-    for (what, read) in reads {
+    for (what, read, times_out) in reads {
         let mut run = Held::ignoring_sigterm();
         let pid = run.pid();
         let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid), read]);
 
         let e = stopping_as(&fake, Budget::Bounded(Duration::ZERO), graced()).expect_err(what);
 
-        assert_wait_timeout(&e);
+        if times_out {
+            assert_wait_timeout(&e);
+        } else {
+            assert!(matches!(&e, Error::StopUnconfirmed { .. }), "{what}: {e:?}");
+        }
         fake.assert_spent(what);
         assert_eq!(run.finish(), Some(0), "{what}: SIGTERM, ignored, and nothing more");
     }
@@ -914,6 +921,40 @@ fn a_run_found_again_keeps_the_grace_that_began_at_its_sigterm() {
 
     fake.assert_spent("SIGTERM once, the refused confirmation, then the kill of the same run");
     assert_eq!(ended_by(&mut run), Some(libc::SIGKILL), "the run was ended by SIGKILL");
+}
+
+/// What the timeout of a stop whose deadline is spent says of the run that is up: what the stop did to that run
+/// and no other. The grace is a stated deadline here, so no clock decides.
+#[skuld::test]
+fn a_run_is_said_to_have_been_sent_what_this_stop_sent_it() {
+    let (mine, other) = (Held::new(0), Held::new(0));
+    let identity = |run: &Held| match ProcessId::of(run.pid()) {
+        Resolved::Found(identity) => identity,
+        _ => panic!("the child is running"),
+    };
+    let (mine, other) = (identity(&mine), identity(&other));
+    let (over, pending) = (Budget::Immediate.start(), Budget::Unbounded.start());
+    let course = |grace_end, killed| {
+        let mut course = Course::new(Some(graced()), Budget::Unbounded, Watch::new().expect("a watch"));
+        course.termed = Some(Termed {
+            run: mine,
+            grace_end,
+            killed,
+        });
+        course
+    };
+
+    assert_eq!(course(Some(pending), false).escalation(mine), Some(Escalation::Pending));
+    assert_eq!(course(Some(over), false).escalation(mine), Some(Escalation::Spent));
+    assert_eq!(course(Some(over), true).escalation(mine), Some(Escalation::Sent));
+    assert_eq!(course(None, false).escalation(mine), None, "SIGTERM and no grace to follow it");
+    for killed in [false, true] {
+        assert_eq!(
+            course(Some(over), killed).escalation(other),
+            Some(Escalation::Unsent),
+            "another run was sent nothing, whatever this one was"
+        );
+    }
 }
 
 /// What a run is due, by what it has been sent and whether its grace is over: SIGTERM, or SIGKILL for
@@ -1276,10 +1317,7 @@ fn a_pass_of_a_tasks_stop_spends_what_a_pass_reserves() {
                 .expect("a pass's reservation");
         let mut course = Course::new(Some(graced()), budget, Watch::new().expect("a watch"));
 
-        mgr.stop_pass(&id, &mut course, &mut own, &mut |reservation| {
-            JobKill::new(&mgr.launchctl, id.as_str(), reservation)
-        })
-        .expect("a pass");
+        mgr.stop_pass(&id, &mut course, &mut own).expect("a pass");
 
         fake.assert_spent(what);
         assert_eq!(bounded::test_hook::left(&own), (0, 0), "{what}");
@@ -1289,7 +1327,6 @@ fn a_pass_of_a_tasks_stop_spends_what_a_pass_reserves() {
 /// A signal or a hold that failed is the stop's failure, in the stop's words and not `kill`'s.
 #[skuld::test]
 fn a_failed_send_or_hold_is_the_stops_failure() {
-    use crate::backend::kill::Signal;
     for (doing, said) in [
         (Signal::Term.sending(), "sending SIGTERM"),
         (Signal::Kill.sending(), "sending SIGKILL"),
