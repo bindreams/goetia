@@ -94,6 +94,29 @@ jobs:
       - name: Build test binaries
         run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
 
+      # About 1 in 10 first logons of a new local user blocks for good in the User Profile Service's call
+      # to the Sync Center profile notification handler. Removing its registration avoids it. The subkey
+      # is found by CLSID, so a changed image fails this step. Measurements: the knowledge base's
+      # "Windows - A password-logon task's first start under a new local user can block for good in the
+      # User Profile Service's call to the Sync Center notification handler".
+      - name: Remove the Sync Center profile notification handler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $clsid = 'D63AA156-D534-4BAC-9BF1-55359CF5EC30'
+          $root = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileNotification'
+          $found = @(Get-ChildItem -LiteralPath $root | Where-Object {
+            $key = $_
+            $key.PSChildName -like "*$clsid*" -or
+            @($key.GetValueNames() | Where-Object { "$($key.GetValue($_))" -like "*$clsid*" }).Count -gt 0
+          })
+          if ($found.Count -eq 0) { throw "no subkey of $root names $clsid" }
+          foreach ($key in $found) {
+            Write-Host "removing $($key.Name)"
+            Remove-Item -LiteralPath $key.PSPath -Recurse -Force
+          }
+
       # Hung tests: see the `ci` profile in `.config/nextest.toml`.
       # `--no-tests fail` keeps a build that produced no tests from passing.
       # On Windows the archive is extracted under `target/`, not into the runner account's `%TEMP%`,

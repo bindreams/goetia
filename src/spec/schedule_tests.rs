@@ -339,6 +339,24 @@ fn day_rule_follows_vixie() {
     }
 }
 
+#[skuld::test]
+fn days_say_which_days_the_two_day_fields_name() {
+    use super::DaySelection::{Both, Either, Every, OfMonth, OfWeek};
+    for (line, days) in [
+        ("0 0 * * *", Every),
+        // A restricted field that still matches every value names every day.
+        ("0 0 1-31 * 1-7", Every),
+        ("0 0 1-31 * 1", Every),
+        ("0 0 1 * 0-6", Every),
+        ("0 0 1,15 * *", OfMonth),
+        ("0 0 * * 1-5", OfWeek),
+        ("0 0 1 * 1", Either),
+        ("0 0 */2 * 1", Both),
+    ] {
+        assert_eq!(parse(line).days(), days, "{line:?}");
+    }
+}
+
 const ROUND_TRIP_LINES: &[&str] = &[
     "* * * * *",
     "5 4 3 2 1",

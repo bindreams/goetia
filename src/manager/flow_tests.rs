@@ -31,6 +31,19 @@ fn unresolvable(user: &str) -> String {
 
 // install =============================================================================================================
 
+/// What an install of `spec` judges is read for that install, not as a verb reads it: a backend that
+/// holds an id in two stores reads each as the install needs.
+#[skuld::test]
+fn install_and_preview_read_what_is_at_the_id_as_an_install_of_the_spec_judges_it() {
+    let fake = Fake::new();
+
+    fake.preview_install(&mk("frpc")).unwrap();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    // The install reads again only if its write raced: it did not.
+    assert_eq!(fake.install_reads(), ["frpc", "frpc"]);
+}
+
 #[skuld::test]
 fn install_retries_a_raced_write_until_it_lands() {
     let fake = Fake::new();
@@ -964,7 +977,8 @@ fn a_sequence_refuses_a_step_run_twice() {
 }
 
 /// `restart --timeout 0` prepares `Start` and runs `request_start_after_stop`: a request for a start
-/// spends the step a start does.
+/// spends the step a start does, and that one.
+#[cfg(debug_assertions)]
 #[skuld::test]
 fn a_prepared_start_covers_a_start_requested_after_a_stop() {
     let fake = Fake::new();
@@ -973,7 +987,14 @@ fn a_prepared_start_covers_a_start_requested_after_a_stop() {
     let mut sequence = fake.prepare(&[Step::Stop, Step::Start], Budget::Immediate).unwrap();
 
     sequence.stop(&id, Budget::Immediate).unwrap();
-    sequence.request_start_after_stop(&id).unwrap();
+    let requested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(sequence.request_start_after_stop(&id));
+    }));
+    assert!(requested.is_ok(), "the request drew on no prepared step");
+    let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(sequence.start(&id, Budget::Immediate));
+    }));
+    assert!(again.is_err(), "the request spent the prepared start");
 }
 
 /// A request for a start spends the step made for exactly that before it falls back to `Start`,
@@ -1068,7 +1089,15 @@ fn an_enable_in_a_sequence_spends_no_step() {
     let mut sequence = fake.prepare(&[Step::Start], Budget::DEFAULT).unwrap();
 
     sequence.enable(&id).unwrap();
-    sequence.start(&id, Budget::DEFAULT).unwrap();
+    // The one step is still there for the start: spending it again is what panics.
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(sequence.start(&id, Budget::DEFAULT))
+    }));
+    assert!(first.is_ok(), "enable spent the step the start was prepared for");
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(sequence.start(&id, Budget::DEFAULT))
+    }));
+    assert!(second.is_err(), "the start spent it");
 
     let mut none = fake.prepare(&[], Budget::DEFAULT).unwrap();
     none.enable(&id).unwrap();
@@ -1466,7 +1495,11 @@ fn enable_of_a_service_and_of_an_unusable_blob_is_not_judged_by_a_schedule() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
     fake.seed_unusable("odd");
+    assert!(!fake.is_enabled("frpc") && !fake.is_enabled("odd"));
 
     ServiceManager::enable(&fake, &Id::try_from("frpc").unwrap()).unwrap();
     ServiceManager::enable(&fake, &Id::try_from("odd").unwrap()).unwrap();
+
+    assert!(fake.is_enabled("frpc"), "the service is enabled");
+    assert!(fake.is_enabled("odd"), "the unusable blob is enabled");
 }

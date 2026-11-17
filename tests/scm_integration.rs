@@ -30,6 +30,15 @@ mod kill;
 #[cfg(windows)]
 #[path = "scm_integration/managed.rs"]
 mod managed;
+#[cfg(windows)]
+#[path = "scm_integration/task_accounts.rs"]
+mod task_accounts;
+#[cfg(windows)]
+#[path = "scm_integration/task_schedule.rs"]
+mod task_schedule;
+#[cfg(windows)]
+#[path = "scm_integration/tasks.rs"]
+mod tasks;
 
 fn main() {
     // Dispatched before the harness starts, exactly like
@@ -38,6 +47,10 @@ fn main() {
     // one-shot helper child process (`install_helper`), not a test run.
     #[cfg(windows)]
     {
+        // A task's program: this binary, run by the shim in a mode that connects back or prints.
+        if support::sentinel::run_if_requested() {
+            return;
+        }
         if fixture::run_if_requested() {
             return;
         }

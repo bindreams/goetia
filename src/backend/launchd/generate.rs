@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::calendar::{self, Entry};
-use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets};
+use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets, xml_escape};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Restart, Schedule, TaskSpec};
@@ -31,13 +31,7 @@ const COMMENT_END: &str = "goetia:end -->";
 /// Render the metadata comment carrying `Marker`, `Schema`, `Version`, and `Spec`: byte-exact field
 /// names, per the crate's metadata convention (shared with the systemd `[X-Goetia]` section).
 pub(in crate::backend::launchd) fn metadata_comment(spec: &DaemonSpec) -> String {
-    format!(
-        "{COMMENT_BEGIN}\nMarker: {marker}\nSchema: {schema}\nVersion: {version}\nSpec: {encoded}\n{COMMENT_END}\n",
-        marker = blob::MARKER,
-        schema = blob::SCHEMA,
-        version = crate::version(),
-        encoded = blob::encode(spec),
-    )
+    format!("{COMMENT_BEGIN}\n{}\n{COMMENT_END}\n", blob::metadata_text(spec))
 }
 
 /// Locate every `goetia:begin` / `goetia:end` comment in `text` and return each one's inner
@@ -71,44 +65,6 @@ fn trim_one_line_break(s: &str) -> &str {
     s.strip_suffix("\r\n").or_else(|| s.strip_suffix('\n')).unwrap_or(s)
 }
 
-/// Parse one metadata comment's content (`Marker`/`Schema`/`Version`/`Spec`, one per line, in that
-/// order) and decode the embedded blob. `Schema` and `Version` are discarded: `blob::decode`
-/// re-derives both from `Spec`, and the plain-text copies are for a human reading the artifact.
-fn parse_metadata_block(content: &str) -> Result<Blob, Error> {
-    let mut lines = content.lines();
-
-    let marker = read_field(&mut lines, "Marker")?;
-    let _schema = read_field(&mut lines, "Schema")?;
-    let _version = read_field(&mut lines, "Version")?;
-    let spec = read_field(&mut lines, "Spec")?;
-
-    if lines.next().is_some() {
-        // Our `Spec` never contains whitespace, so a further line is a hand-edit or bit-rot. Reject
-        // it rather than decode a truncated prefix.
-        return Err(Error::blob(
-            "goetia metadata comment has content after `Spec`".to_string(),
-        ));
-    }
-
-    if marker != blob::MARKER {
-        return Err(Error::blob(format!(
-            "goetia metadata comment names marker `{marker}`, expected `{}`",
-            blob::MARKER
-        )));
-    }
-
-    blob::decode(spec)
-}
-
-fn read_field<'a>(lines: &mut std::str::Lines<'a>, name: &str) -> Result<&'a str, Error> {
-    let line = lines
-        .next()
-        .ok_or_else(|| Error::blob(format!("goetia metadata comment is missing `{name}`")))?;
-    let prefix = format!("{name}: ");
-    line.strip_prefix(prefix.as_str())
-        .ok_or_else(|| Error::blob(format!("goetia metadata comment: expected `{name}: ...`, got `{line}`")))
-}
-
 /// Extract the metadata blob embedded in a generated plist, if any.
 ///
 /// - No `goetia:begin`/`goetia:end` comment: `Ok(None)`, a foreign plist.
@@ -119,7 +75,7 @@ pub fn extract(plist_text: &str) -> Result<Option<Blob>, Error> {
     let blocks = find_metadata_blocks(plist_text)?;
     match blocks.as_slice() {
         [] => Ok(None),
-        [only] => parse_metadata_block(only).map(Some),
+        [only] => blob::parse_metadata_text(only).map(Some),
         _ => Err(Error::blob(format!(
             "plist carries {} goetia metadata comments, expected at most one",
             blocks.len()
@@ -151,31 +107,6 @@ pub(crate) fn without_metadata(text: &str) -> String {
 }
 
 // XML rendering =======================================================================================================
-
-/// Escape the three characters XML element content cannot contain unescaped. Applied to every
-/// emitted value (argv, paths, environment keys and values, the account name), since
-/// `ServiceSpec::new` does not reject `&`/`<`/`>`.
-///
-/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them. `ServiceSpec::new`
-/// rejects them (and the other Unicode noncharacters); this panics on them as a backstop rather
-/// than emit XML no parser can load.
-fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        assert!(
-            !matches!(c, '\u{FFFE}' | '\u{FFFF}'),
-            "value contains {c:?} (U+FFFE/U+FFFF), which XML 1.0 cannot represent at all; \
-             ServiceSpec::new must reject this upstream, before it ever reaches a generator"
-        );
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            other => out.push(other),
-        }
-    }
-    out
-}
 
 /// `ServiceSpec::new` refuses a `cwd` or `logs` that is not valid UTF-8, so a `DaemonSpec`'s are
 /// valid. Panic on a violation rather than let `to_string_lossy` substitute U+FFFD and emit a

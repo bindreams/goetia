@@ -21,14 +21,19 @@ pub struct WorldReadableExe {
 
 impl WorldReadableExe {
     pub fn new(id: &str) -> Self {
-        let path = program_data().join(format!("{id}.exe"));
+        Self::of(&std::env::current_exe().expect("locate the test binary"), id)
+    }
+
+    /// [`Self::new`] for another executable, `source` (the shim, for a task a service account runs),
+    /// named `name`.
+    pub fn of(source: &std::path::Path, name: &str) -> Self {
+        let path = program_data().join(format!("{name}.exe"));
         let guard = Self {
             _remove: cleanup::FileGuard::new(path.clone()),
             path,
         };
-        let exe = std::env::current_exe().expect("locate the test binary");
-        std::fs::copy(&exe, &guard.path)
-            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", exe.display(), guard.path.display()));
+        std::fs::copy(source, &guard.path)
+            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", source.display(), guard.path.display()));
 
         let path_str = guard.path_str();
         cmd::run("icacls", &[&path_str, "/grant", "*S-1-1-0:(RX)"]).expect_ok();

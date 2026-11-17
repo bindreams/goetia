@@ -164,7 +164,7 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
 #[skuld::test]
 fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
     for (raw, denied) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
-        let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
+        let e = std::io::Error::from_raw_os_error(raw);
         let err = open_refused("enable", "service `x`", "open service `x` to enable it", e);
 
         assert!(
@@ -696,7 +696,7 @@ fn render_names_the_previewed_host_verbatim() {
     let (provider, _) = FakeProvider::new(host.clone(), host.clone());
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
-    let reg = mgr.render(&simple_daemon()).unwrap();
+    let reg = mgr.service_render(&simple_daemon()).unwrap();
 
     assert_eq!((reg.executable, reg.arguments), (host.exe, host.args));
 }
@@ -1082,7 +1082,7 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     let (provider, calls) = FakeProvider::new(command(r"C:\elsewhere\host.exe"), command(r"C:\elsewhere\host.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
-    let reg = mgr.regenerate(&spec, &snapshot).unwrap();
+    let reg = mgr.service_regenerate(&spec, &snapshot).unwrap();
 
     assert_eq!(reg.executable, PathBuf::from(r"C:\Program Files\App\app.exe"));
     assert_eq!(reg.arguments, ["--service-host"]);
@@ -1252,7 +1252,7 @@ fn a_failed_disable_claims_only_that_the_service_was_not_deleted() {
 
 #[skuld::test]
 fn a_denied_service_manager_open_is_named_as_the_managers() {
-    let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
     let report = open_refused(
         "uninstall",
         "the service manager",
@@ -1497,6 +1497,75 @@ fn a_command_line_with_nothing_before_its_nul_has_no_executable() {
     }
 }
 
+// Task Scheduler that cannot be read ==================================================================================
+
+fn unusable_task_scheduler() -> crate::backend::scm::manager::task::fake::Fake {
+    let fake = crate::backend::scm::manager::task::fake::Fake::new();
+    fake.on_names(Err(Error::os(
+        "list the tasks",
+        std::io::Error::other("the Schedule service stopped"),
+    )));
+    fake
+}
+
+/// Only a service's install sets Task Scheduler's failure aside: a task's own install needs the store.
+#[skuld::test]
+fn only_a_services_install_reads_with_task_scheduler_unusable_set_aside() {
+    assert_eq!(purpose_of(&simple_daemon()), Purpose::ServiceInstall);
+    assert_eq!(purpose_of(&daemon_spec(Restart::Never)), Purpose::ServiceInstall);
+    assert_eq!(
+        purpose_of(&crate::testing::task(
+            "nightly",
+            vec![r"C:\bin\job.exe".to_string()],
+            None
+        )),
+        Purpose::Verb
+    );
+}
+
+/// What an install sweeps is files nothing references, and a Task Scheduler that cannot say what its tasks
+/// run says nothing of that: the sweep is skipped, and the install goes on without it.
+#[skuld::test]
+fn install_ignores_a_failed_sweep() {
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let fake = unusable_task_scheduler();
+    let scm = Scm::with_shim(provider, CheckPermissions::Disable).with_tasks(Box::new(fake.clone()));
+
+    scm.sweep_before_install(scm.provider().unwrap());
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        Vec::<&str>::new(),
+        "nothing is swept when what is referenced is unknown"
+    );
+    fake.finish();
+}
+
+/// A stated limit: an uninstall cannot know which shim files a task references while Task Scheduler is
+/// unusable, so it reports the file it left rather than sweep what a task may still run.
+#[skuld::test]
+fn a_service_uninstall_with_an_unusable_task_scheduler_reports_the_leftover_shim_file() {
+    let id = Id::try_from("frpc").unwrap();
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let fake = unusable_task_scheduler();
+    let scm = Scm::with_shim(provider, CheckPermissions::Disable).with_tasks(Box::new(fake.clone()));
+    let host = PathBuf::from(format!(r"C:\app\goetia-shim-{SHIM_HEX}.exe"));
+
+    let said = scm
+        .finish_uninstall(&id, Ok(host), HoldOutcome::NoProcess)
+        .expect_err("the cleanup could not finish")
+        .report()
+        .to_string();
+
+    assert!(
+        said.contains("`frpc` was deleted, but the shim files it used were not cleaned up"),
+        "{said}"
+    );
+    assert!(said.contains("the Schedule service stopped"), "{said}");
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "nothing was swept");
+    fake.finish();
+}
+
 // apply refuses an account that is no user ============================================================================
 
 /// `apply` looks the account up, and refuses one that is no user, before it asks for the password: asking
@@ -1514,5 +1583,27 @@ fn apply_refuses_an_account_that_is_no_user_before_the_password(#[fixture(env)] 
         );
         let err = apply(&dummy_reg(Some(name)), Some(identity::Written::Name(name)), true).expect_err(name);
         assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");
+    }
+}
+
+/// `run` refuses a service before it asks for a run, so a service that reaches `begin_run` is a
+/// mistake of the caller: it is not a task.
+#[skuld::test]
+fn begin_run_of_a_service_is_not_a_task() {
+    let snapshot = ScmSnapshot::new(
+        Id::try_from("frpc").unwrap(),
+        Ok(blob_of(crate::spec::Protocol::Native)),
+        (Parameters::default(), None),
+    );
+
+    match crate::backend::Backend::begin_run(
+        &Scm::new(),
+        WindowsSnapshot::Service(snapshot),
+        &mut (),
+        &mut Vec::new(),
+    ) {
+        Err(Error::NotATask { id }) => assert_eq!(id, "frpc"),
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("a service began a run"),
     }
 }

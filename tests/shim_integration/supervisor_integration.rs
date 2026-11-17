@@ -18,7 +18,7 @@ use winreg::enums::KEY_WRITE;
 use crate::common::{
     LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, fixture_command, manager, recorded_exit, scm_status, simple_spec,
 };
-use crate::support::registry::{parameters_key, service_key};
+use crate::support::registry::parameters_key;
 use crate::support::{self, ConnectBack, Group, scm_group};
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
@@ -161,7 +161,7 @@ fn stop_kills_the_whole_process_tree(#[fixture(scm_group)] _group: &Group) {
 /// `/FO CSV` quotes each field, so a literal `"<pid>"` substring is
 /// unambiguous for the range of pids a test process ever reports (never
 /// contained inside another field like an image name).
-fn pid_is_alive(pid: &str) -> bool {
+pub(crate) fn pid_is_alive(pid: &str) -> bool {
     let out = support::cmd::run("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
     out.ok() && out.stdout.contains(&format!("\"{pid}\""))
 }
@@ -176,11 +176,8 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log(#[fixture(scm_group)] _gr
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
-    // The only test that redirects `%ProgramData%`: a decode failure is the one report that
-    // cannot reach the daemon's log. The edit follows the test's one install, which it never repeats.
-    service_key(&id, KEY_WRITE)
-        .set_value("Environment", &vec![format!("ProgramData={}", logs.path().display())])
-        .expect("write Environment");
+    // A decode failure is the one report that cannot reach the daemon's log; it goes to the default
+    // one under the machine's `%ProgramData%`, which `_guard` removes.
     corrupt_spec_value(&id);
 
     let err = mgr
@@ -203,7 +200,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log(#[fixture(scm_group)] _gr
         "an undecodable blob is a refusal: {status:?}"
     );
 
-    let fallback_log = support::shim_default_log(logs.path(), &id);
+    let fallback_log = support::shim_default_log(&support::program_data(), &id);
     let logged = std::fs::read_to_string(&fallback_log)
         .unwrap_or_else(|e| panic!("read the fallback log {}: {e}", fallback_log.display()));
     assert!(
