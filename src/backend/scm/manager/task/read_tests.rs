@@ -126,6 +126,7 @@ fn the_host_a_task_is_regenerated_with_is_the_installed_actions_not_a_providers(
     let registered = Registered {
         xml: definition.to_xml(false),
         data: crate::blob::metadata_text(&spec),
+        enabled: Some(true),
     };
     let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
 
@@ -147,6 +148,7 @@ fn a_task_whose_xml_cannot_be_read_is_unreadable_not_a_bad_spec() {
         Registered {
             xml: "<Task><Actions>".to_owned(),
             data: crate::blob::metadata_text(&spec),
+            enabled: Some(true),
         },
     );
     let scm = Scm::new();
@@ -162,6 +164,7 @@ fn a_task_without_goetias_data_is_foreign() {
     fake.on_get(Ok(Some(Registered {
         xml: "<Task/>".to_owned(),
         data: String::new(),
+        enabled: Some(true),
     })));
 
     assert!(matches!(
@@ -178,6 +181,7 @@ fn a_task_whose_blob_will_not_decode_is_marked_all_the_same() {
     fake.on_get(Ok(Some(Registered {
         xml: "<Task/>".to_owned(),
         data: crate::blob::metadata_text(&spec).replace("Spec: ", "Spec: !"),
+        enabled: Some(true),
     })));
 
     let ReadOutcome::Marked(snapshot) = scm(&fake).task_read(&id()).unwrap() else {
@@ -368,6 +372,7 @@ fn foreign_task() -> Registered {
     Registered {
         xml: "<Task/>".to_owned(),
         data: String::new(),
+        enabled: Some(true),
     }
 }
 

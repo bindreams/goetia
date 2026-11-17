@@ -23,6 +23,7 @@ fn task() -> TaskSnapshot {
         Registered {
             xml: String::new(),
             data: String::new(),
+            enabled: Some(true),
         },
     )
 }

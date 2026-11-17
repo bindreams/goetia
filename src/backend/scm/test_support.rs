@@ -81,6 +81,7 @@ pub(crate) fn registered_task(
     crate::backend::scm::manager::task::api::Registered {
         xml: definition.to_xml(armed),
         data: crate::blob::metadata_text(spec),
+        enabled: Some(true),
     }
 }
 

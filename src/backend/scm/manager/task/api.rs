@@ -34,6 +34,9 @@ pub(crate) struct Registered {
     pub xml: String,
     /// The task's `Data` element, byte for byte.
     pub data: String,
+    /// The task's own flag, as Task Scheduler says it (`IRegisteredTask.Enabled`), which is what
+    /// [`TaskApi::set_enabled`] changes. `None` if the read of it failed: nothing is then known of it.
+    pub enabled: Option<bool>,
 }
 
 /// Task Scheduler's own record of a task's runs.

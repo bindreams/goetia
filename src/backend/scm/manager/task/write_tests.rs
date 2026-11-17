@@ -354,6 +354,7 @@ fn a_stored_principal_that_cannot_be_read_is_an_account_change() {
     let no_principal = Registered {
         xml: installed.xml.replace("<UserId>S-1-5-20</UserId>", ""),
         data: installed.data.clone(),
+        enabled: Some(true),
     };
     assert_ne!(no_principal.xml, installed.xml, "the principal is gone");
     let fake = Fake::new();
@@ -599,42 +600,42 @@ fn an_enabled_flag_that_cannot_be_put_back_is_reported_with_the_failure() {
     fake.finish();
 }
 
-/// A task found disabled is disabled already: nothing is disabled, and nothing is enabled if the write
-/// fails (what is put back is what was found).
+/// A task found disabled, or whose flag Task Scheduler did not say (`None`), is not disabled, and is not
+/// enabled if the write fails: what is put back is what was found, and nothing is known of an unread flag.
+/// The flag is Task Scheduler's own: the XML says nothing of it here, which reads as enabled.
 #[skuld::test]
-fn a_task_found_disabled_is_left_disabled_by_a_write_that_fails() {
-    let old = as_service("LocalService");
-    let new = as_service("NetworkService");
-    let installed = registered_task(&old, true);
-    let found = Registered {
-        xml: installed
-            .xml
-            .replacen("<Settings>", "<Settings><Enabled>false</Enabled>", 1),
-        data: installed.data.clone(),
-    };
-    assert!(!TaskXml::task_enabled(&found.xml), "the task's own flag is false");
-    let (_dir, runs) = made_records();
-    let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new()))
-        .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))));
+fn a_task_found_disabled_or_unread_is_left_as_it_was_by_a_write_that_fails() {
+    for found_flag in [Some(false), None] {
+        let old = as_service("LocalService");
+        let new = as_service("NetworkService");
+        let found = Registered {
+            enabled: found_flag,
+            ..registered_task(&old, true)
+        };
+        let (_dir, runs) = made_records();
+        let fake = Fake::new();
+        fake.on_instances(Ok(Vec::new()))
+            .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))));
 
-    let failed = scm(&fake)
-        .task_write_with(
-            &new,
-            &definition(&new),
-            Some(&TaskSnapshot::new(id(), Ok(blob(&old)), found)),
-            &runs,
-            &mut Running(vec![]),
-            prepared(users(), None),
-        )
-        .unwrap_err();
+        let failed = scm(&fake)
+            .task_write_with(
+                &new,
+                &definition(&new),
+                Some(&TaskSnapshot::new(id(), Ok(blob(&old)), found)),
+                &runs,
+                &mut Running(vec![]),
+                prepared(users(), None),
+            )
+            .unwrap_err();
 
-    assert!(failed.to_string().contains("delete"), "{failed}");
-    assert_eq!(
-        fake.calls(),
-        [Call::Instances(PATH.to_owned()), Call::Delete(PATH.to_owned())]
-    );
-    fake.finish();
+        assert!(failed.to_string().contains("delete"), "{found_flag:?}: {failed}");
+        assert_eq!(
+            fake.calls(),
+            [Call::Instances(PATH.to_owned()), Call::Delete(PATH.to_owned())],
+            "{found_flag:?}"
+        );
+        fake.finish();
+    }
 }
 
 // The record directory ------------------------------------------------------------------------------------------------
@@ -899,6 +900,7 @@ fn hand_edited(registered: &Registered) -> Registered {
             .xml
             .replace("<Priority>5</Priority>", "<Priority>6</Priority>"),
         data: registered.data.clone(),
+        enabled: registered.enabled,
     }
 }
 
@@ -918,6 +920,7 @@ fn enable_then_disable_flip_only_the_flags_and_keep_a_hand_edit() {
     let armed = Registered {
         xml: TaskXml::with_armed(&registered.xml, true).unwrap(),
         data: registered.data.clone(),
+        enabled: registered.enabled,
     };
     scm.task_set_armed_with(&TaskSnapshot::new(id(), Ok(blob(&spec)), armed.clone()), false, || {
         panic!("a service account reads no password")
@@ -1051,6 +1054,7 @@ fn the_account_of_a_task_whose_blob_will_not_decode_is_its_stored_principal() {
     let broken = Registered {
         xml: registered.xml.clone(),
         data: registered.data.replace("Spec: ", "Spec: !"),
+        enabled: registered.enabled,
     };
     assert_eq!(
         stored_account(&broken).unwrap(),

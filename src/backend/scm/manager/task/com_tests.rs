@@ -253,6 +253,7 @@ fn a_task_that_went_during_get_s_read_is_none_and_any_other_failure_is_not() {
     let read = Registered {
         xml: "<Task/>".to_owned(),
         data: "d".to_owned(),
+        enabled: Some(true),
     };
 
     assert_eq!(unless_gone(Ok(read.clone())).unwrap(), Some(read));

@@ -374,6 +374,7 @@ impl TaskApi for Com {
                     Ok(Registered {
                         xml,
                         data: data.to_string(),
+                        enabled: task.Enabled().ok().map(|enabled| enabled.as_bool()),
                     })
                 }
             };

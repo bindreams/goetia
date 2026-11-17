@@ -58,6 +58,7 @@ fn data_of(spec: &DaemonSpec) -> Registered {
     Registered {
         xml: String::new(),
         data: crate::blob::metadata_text(spec),
+        enabled: Some(true),
     }
 }
 
@@ -221,6 +222,7 @@ fn a_task_that_is_gone_or_not_goetias_is_refused_and_nothing_runs() {
             Ok(Some(Registered {
                 xml: String::new(),
                 data: "an administrator's note".to_string(),
+                enabled: Some(true),
             })),
             "the task's Data holds no Goetia marker: this task was not created by `goetia daemon install`".to_string(),
         ),

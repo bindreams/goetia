@@ -230,6 +230,7 @@ fn uninstall_of_a_task_whose_blob_will_not_decode_needs_nothing_of_it() {
         crate::backend::scm::manager::task::api::Registered {
             xml: registered.xml,
             data: registered.data.replace("Spec: ", "Spec: !"),
+            enabled: registered.enabled,
         },
     );
     let fake = Fake::new();

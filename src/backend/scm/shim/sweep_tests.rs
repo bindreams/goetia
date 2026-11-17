@@ -910,6 +910,7 @@ mod windows {
             fake.on_names(Ok(vec!["theirs".to_owned()])).on_get(Ok(Some(Registered {
                 xml: r"<Task><Actions><Exec><Command>C:\their\tool.exe</Command></Exec></Actions></Task>".to_owned(),
                 data: String::new(),
+                enabled: Some(true),
             })));
 
             let hosts = task_hosts(&fake).unwrap();
@@ -943,6 +944,7 @@ mod windows {
                 .on_get(Ok(Some(Registered {
                     xml: "<Task><Actions>".to_owned(),
                     data: String::new(),
+                    enabled: Some(true),
                 })));
             assert!(task_hosts(&fake).is_err(), "a task's XML could not be read");
         }

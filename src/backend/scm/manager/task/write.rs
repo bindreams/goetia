@@ -208,7 +208,8 @@ impl Scm {
     /// delete would start a run as the old account that nothing waits for. Then, in order, nothing runs
     /// ([`Error::AccountChangeRunning`]), the record directory is made, the task is deleted, and created
     /// with the armed state it had. A failure after the disable puts the flag back as it was found (a task
-    /// found disabled is not touched), and a flag that cannot be put back is reported with the failure.
+    /// found disabled, or whose flag was not read, is not touched), and a flag that cannot be put back is
+    /// reported with the failure.
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
@@ -219,7 +220,9 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = old.id();
         let path = TaskPath::of(id);
-        let disabled = TaskXml::task_enabled(&old.registered().xml)
+        // Task Scheduler's own flag, as it said it when the task was read: a flag it did not say, or that
+        // is off, is left alone and so is never put back.
+        let disabled = old.registered().enabled == Some(true)
             && match self.tasks.set_enabled(&path, false) {
                 Ok(()) => true,
                 // The task is gone: there is nothing to put back.
