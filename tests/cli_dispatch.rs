@@ -5100,22 +5100,65 @@ fn secs(n: u64) -> Budget {
 }
 
 #[skuld::test]
-fn the_default_wait_of_stop_is_the_stop_timeout_plus_ten_seconds_and_restart_adds_ten_for_the_start() {
-    for (signal, timeout, stop, restart) in [
-        ("terminate", Some(30), secs(40), secs(50)),
-        ("terminate", Some(5), secs(15), secs(25)),
-        ("terminate", Some(86_400), secs(86_410), secs(86_420)),
-        ("interrupt", Some(120), secs(130), secs(140)),
+fn the_default_wait_of_stop_is_the_stop_timeout_plus_ten_seconds() {
+    for (signal, timeout, expected) in [
+        ("terminate", Some(30), secs(40)),
+        ("terminate", Some(5), secs(15)),
+        ("terminate", Some(86_400), secs(86_410)),
+        ("interrupt", Some(120), secs(130)),
         // No timeout waits as long as the platform does.
-        ("terminate", None, Budget::Unbounded, Budget::Unbounded),
+        ("terminate", None, Budget::Unbounded),
         // `kill` has nothing to wait for: the wait is what it was.
-        ("kill", None, Budget::DEFAULT, Budget::DEFAULT),
+        ("kill", None, Budget::DEFAULT),
     ] {
-        for (verb, expected) in [("stop", stop), ("restart", restart)] {
-            let fake = installed_with_stop_action(signal, timeout);
-            assert_eq!(budget_of(&fake, verb, &[]), expected, "{verb} {signal} {timeout:?}");
-        }
+        let fake = installed_with_stop_action(signal, timeout);
+        assert_eq!(budget_of(&fake, "stop", &[]), expected, "stop {signal} {timeout:?}");
     }
+}
+
+/// `restart` with no flag reserves for a wait and nothing more: each leg takes its own default as it is
+/// issued ([`the_stop_leg_of_a_restart_waits_the_stop_timeout_plus_ten_seconds`]), so the reservation is
+/// one that waits, whatever the daemon's stop action says.
+#[skuld::test]
+fn a_restart_with_no_flag_reserves_for_a_wait_whatever_the_stop_action_says() {
+    for (signal, timeout) in [("terminate", Some(30)), ("terminate", None), ("kill", None)] {
+        let fake = installed_with_stop_action(signal, timeout);
+        assert_eq!(
+            budget_of(&fake, "restart", &[]),
+            Budget::DEFAULT,
+            "restart {signal} {timeout:?}"
+        );
+    }
+}
+
+/// The stop leg waits the daemon's own stop timeout plus ten seconds, and the start leg its own ten: the
+/// budget each reports having waited is its own, not a total spread over both.
+#[skuld::test]
+fn the_stop_leg_of_a_restart_waits_the_stop_timeout_plus_ten_seconds() {
+    let fake = installed_with_stop_action("terminate", Some(30));
+    fake.seed_stop_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
+
+    assert_eq!(code, 4, "stdout:
+{out}
+stderr:
+{err}");
+    assert!(err.contains("did not report stopped within 40s:"), "{err}");
+}
+
+#[skuld::test]
+fn the_start_leg_of_a_restart_waits_ten_seconds_whatever_the_stop_action_gave_the_stop() {
+    let fake = installed_with_stop_action("terminate", Some(30));
+    fake.seed_start_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
+
+    assert_eq!(code, 4, "stdout:
+{out}
+stderr:
+{err}");
+    assert!(err.contains("did not report running within 10s:"), "{err}");
 }
 
 #[skuld::test]
