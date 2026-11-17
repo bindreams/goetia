@@ -11,7 +11,7 @@
 //! ends, and while it is held nothing can delete it, whoever tries. One left by a power cut is held by
 //! nothing, and the next write finds it by deleting it: a sharing violation says it is live
 //! ([`files::delete`] reads every failed delete, here and in the removal). What a
-//! pin's holder did not see yet is whatever [`Runs::appeared`] lists: the records written after the
+//! pin's holder did not see yet is whatever [`Pin::appeared`] lists: the records written after the
 //! pin's directory listing, which was taken after the pin. **No operation deletes a record while a pin
 //! is held:** a write prunes nothing, and [`Runs::remove_all`] waits for the pins first. A pin made
 //! after that wait began is refused, by the marker the removal places first ([`Runs::hold`]); so once
@@ -297,7 +297,7 @@ impl Runs {
     }
 
     /// Takes a pin, then lists the records there are. Do it before asking for the run whose record
-    /// is waited for: whatever [`Runs::appeared`] lists is then newer than the pin.
+    /// is waited for: whatever [`Pin::appeared`] lists is then newer than the pin.
     pub(crate) fn pin(&self) -> io::Result<Pin> {
         let mut pin = self.hold_in(Dir::open(&self.dir)?)?;
         let listing = entries(&pin.dir)?
@@ -312,7 +312,7 @@ impl Runs {
     }
 
     /// Takes a pin and lists nothing, for a holder that only keeps the records there are from being
-    /// pruned and reads them by name. [`Runs::appeared`] needs the listing [`Runs::pin`] takes.
+    /// pruned and reads them by name. [`Pin::appeared`] needs the listing [`Runs::pin`] takes.
     ///
     /// The pin is made first and the removal's marker looked for after, the opposite order of
     /// [`Runs::remove_all`]'s: so either the removal sees this pin and waits, or this finds the marker
