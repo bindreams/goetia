@@ -1491,14 +1491,14 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
     fake.finish();
 }
 
-/// A service changed into a task names the task's account alone in the default log. The service is refused
-/// while it runs and is gone before the task is registered, so no account but the task's needs the log, and
-/// nothing is looked up for the service's own; what the file held is not carried, whether the retirement
-/// lands or fails.
+/// A service changed into a task: the service is retired first, and only then is its log made for the task's
+/// account, alone. A retirement that fails leaves the log naming the service's own account, which still runs
+/// the service; nothing is looked up for it. What the log held is not carried.
 #[skuld::test]
-fn a_service_changed_into_a_task_names_the_tasks_account_alone_in_the_log() {
+fn a_service_changed_into_a_task_has_its_log_made_for_the_tasks_account_after_the_service_is_retired() {
     let spec = task_spec(Some("30 3 * * *"));
     let (dir, runs) = made_records();
+    // The service's account, the one nothing else names.
     log_with_an_entry_no_install_names(&dir);
     let fake = Fake::new();
 
@@ -1514,7 +1514,18 @@ fn a_service_changed_into_a_task_names_the_tasks_account_alone_in_the_log() {
         .unwrap_err();
 
     assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
-    assert_names_the_task_alone(&dir);
+    assert_eq!(
+        trustees_of(&default_log(&dir))
+            .iter()
+            .filter(|t| **t == process_user_sid())
+            .count(),
+        1,
+        "the service's log still names its own account"
+    );
+    assert!(
+        !trustees_of(&default_log(&dir)).contains(&users()),
+        "the task's account was named early"
+    );
 
     fake.on_register(Ok(Registration::Created));
     scm(&fake)
@@ -1524,7 +1535,13 @@ fn a_service_changed_into_a_task_names_the_tasks_account_alone_in_the_log() {
             &runs,
             prepared(users(), None),
             || Ok(()),
-            || Ok(()),
+            || {
+                assert!(
+                    !trustees_of(&default_log(&dir)).contains(&users()),
+                    "the log is made for the task after the service is gone"
+                );
+                Ok(())
+            },
         )
         .unwrap();
 

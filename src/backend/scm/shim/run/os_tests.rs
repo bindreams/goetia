@@ -420,6 +420,28 @@ fn a_held_default_log_is_appended_through_the_handle_that_was_held(#[fixture(tem
     assert!(!log.exists(), "the path was opened again");
 }
 
+/// The handle a shim holds is its default log's for the whole run: a use of another default path opens that
+/// path and does not give up the held one, so the shim's lines still go through it.
+#[skuld::test]
+fn using_another_default_path_keeps_the_log_that_was_held(#[fixture(temp_dir)] dir: &Path) {
+    let held = dir.join("held.log");
+    let other = dir.join("other.log");
+    let moved = dir.join("moved.log");
+    std::fs::write(&held, "").expect("the file an install made");
+    std::fs::write(&other, "").expect("another file an install made");
+    let real = Real::default();
+    real.hold_default(&held).expect("hold the default log");
+
+    real.append(&other, "elsewhere", LogKind::Default)
+        .expect("a line in the other log");
+    std::fs::rename(&held, &moved).expect("move the held file under the handle");
+    real.append(&held, "the line", LogKind::Default)
+        .expect("append through the handle that is still held");
+
+    assert_eq!(std::fs::read_to_string(&moved).expect("the held file"), "the line\n");
+    assert_eq!(std::fs::read_to_string(&other).expect("the other"), "elsewhere\n");
+}
+
 /// Holding makes nothing, as appending the default log does not: a log that is not there is
 /// [`NotFound`](io::ErrorKind::NotFound), and a line for it is then tried by its path.
 #[skuld::test]
@@ -483,12 +505,7 @@ fn the_daemons_output_goes_through_the_handle_the_log_held(#[fixture(temp_dir)] 
     let mut output = real
         .open_log(&log_file, LogKind::Default)
         .expect("the held handle, for the daemon");
-    output
-        .write_all(
-            b"output
-",
-        )
-        .expect("the daemon writes");
+    output.write_all(b"output\n").expect("the daemon writes");
     real.append(&log_file, "the line", LogKind::Default)
         .expect("a line through the same handle");
     let reopened = Real::default().open_log(&log_file, LogKind::Default);
@@ -499,9 +516,7 @@ fn the_daemons_output_goes_through_the_handle_the_log_held(#[fixture(temp_dir)] 
     permit_only(&log_file, &me);
     assert_eq!(
         std::fs::read_to_string(&log_file).expect("the log"),
-        "output
-the line
-"
+        "output\nthe line\n"
     );
 }
 
@@ -511,11 +526,7 @@ the line
 #[skuld::test]
 fn a_held_default_log_that_was_deleted_is_opened_again_for_the_next_line(#[fixture(temp_dir)] dir: &Path) {
     let log = dir.join("x.log");
-    std::fs::write(
-        &log, "old
-",
-    )
-    .expect("the file an install made");
+    std::fs::write(&log, "old\n").expect("the file an install made");
     let real = Real::default();
     real.hold_default(&log).expect("hold the default log");
     std::fs::remove_file(&log).expect("delete the log");
@@ -526,12 +537,7 @@ fn a_held_default_log_that_was_deleted_is_opened_again_for_the_next_line(#[fixtu
     real.append(&log, "second", LogKind::Default)
         .expect("another, through the handle it holds now");
 
-    assert_eq!(
-        std::fs::read_to_string(&log).expect("the new log"),
-        "first
-second
-"
-    );
+    assert_eq!(std::fs::read_to_string(&log).expect("the new log"), "first\nsecond\n");
 }
 
 /// The same for the daemon's output: a daemon started after the recovery writes the new file.
@@ -545,18 +551,9 @@ fn the_daemons_output_after_the_held_log_was_deleted_goes_to_the_new_file(#[fixt
     std::fs::write(&log, "").expect("the install makes it again");
 
     let mut output = real.open_log(&log, LogKind::Default).expect("the new file");
-    output
-        .write_all(
-            b"output
-",
-        )
-        .expect("the daemon writes");
+    output.write_all(b"output\n").expect("the daemon writes");
 
-    assert_eq!(
-        std::fs::read_to_string(&log).expect("the new log"),
-        "output
-"
-    );
+    assert_eq!(std::fs::read_to_string(&log).expect("the new log"), "output\n");
 }
 
 /// A deleted log that no install has made again is not written into the file that has no name, and makes
@@ -578,11 +575,7 @@ fn a_held_default_log_that_was_deleted_is_not_written_until_it_is_there_again(#[
     std::fs::write(&log, "").expect("the install makes it again");
     real.append(&log, "the line", LogKind::Default)
         .expect("the new file, once it is there");
-    assert_eq!(
-        std::fs::read_to_string(&log).expect("the new log"),
-        "the line
-"
-    );
+    assert_eq!(std::fs::read_to_string(&log).expect("the new log"), "the line\n");
 }
 
 #[skuld::test]

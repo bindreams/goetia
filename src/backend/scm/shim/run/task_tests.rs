@@ -20,7 +20,9 @@ use crate::backend::scm::manager::task::api::{Instance, Registered, TaskApi};
 use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::shim::run::os::LogKind;
-use crate::backend::scm::shim::run::os::fake::{FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd};
+use crate::backend::scm::shim::run::os::fake::{
+    FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
+};
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
@@ -561,6 +563,46 @@ fn without_logs_the_programs_output_goes_to_nul() {
     // task with no `logs` is discarded by design.
     assert_eq!(run.fake.calls(Op::OpenLog), 0);
     assert_eq!(run.finish(), Vec::<String>::new());
+}
+
+/// The marker goes where the program's output goes: a `logs:` equal to the task's default log as written is
+/// the default log, which the shim opens as an install made it (through the handle it holds), not as the user's
+/// own.
+#[skuld::test]
+fn the_marker_goes_to_the_default_log_when_logs_is_the_default_log() {
+    let default = format!(r"{FAKE_LOGS}\{ID}.log");
+    let run = Run::of(&spec_logging_to(Some(&default))).listed().program(exits(0));
+
+    assert_eq!(run.run(), 0);
+
+    assert_eq!(run.fake.calls(Op::OpenLog), 2);
+    for n in 0..2 {
+        assert_eq!(run.fake.opened_log_path(n), Path::new(&default), "open {n}");
+        assert_eq!(run.fake.opened_log_kind(n), LogKind::Default, "open {n}");
+    }
+    assert_eq!(
+        run.fake.opened_log_text(0),
+        "goetia-run 6f9619ff8b86d011b42d00c04fc964ff\n"
+    );
+    assert_eq!(run.finish(), Vec::<String>::new());
+}
+
+/// A marker whose log cannot be opened is said, so that a reader who cannot find the run's output in the log
+/// knows why, even when the program's own open then succeeds. The program's open of the same file is the same
+/// fault and says nothing more (`a_log_that_cannot_be_opened_is_reported_once`).
+#[skuld::test]
+fn a_marker_whose_log_cannot_be_opened_is_reported() {
+    let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(0));
+    run.fake.will_fail_open_log(Path::new(LOGS));
+
+    assert_eq!(run.run(), 0);
+
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!("goetia-shim[{ID}]: open log file {LOGS}: ")),
+        "{failures:?}"
+    );
 }
 
 /// With no instance there is no marker to write, since no run can be named, and the program still

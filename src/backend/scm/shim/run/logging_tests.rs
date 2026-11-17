@@ -192,6 +192,34 @@ fn a_default_log_that_cannot_be_held_is_reported_to_the_event_log_once_and_lines
     );
 }
 
+/// One fault is told once per start, whoever meets it: a file the shim could not hold, and then could not open
+/// for the daemon's output either, is one line; so is a file the marker and the output both fail to open. Another
+/// file's fault is another line.
+#[skuld::test]
+fn a_fault_in_one_file_is_told_once_whoever_meets_it() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    let other = Path::new("elsewhere").join("daemon.log");
+    let fault = std::io::Error::other("denied");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+    log.open_failed("svc", &default, &fault);
+    log.open_failed("svc", &other, &fault);
+    log.open_failed("svc", &other, &fault);
+
+    let told = fake.take_failures();
+    let [held, opened] = told.as_slice() else {
+        panic!("one line for each of the two files: {told:?}");
+    };
+    assert!(held.contains("hold the default log"), "{held}");
+    assert!(
+        opened.starts_with(&format!("goetia-shim[svc]: open log file {}: denied", other.display())),
+        "{opened}"
+    );
+}
+
 /// A machine with no `%ProgramData%` has no default log to hold.
 #[skuld::test]
 fn a_log_with_no_default_file_holds_nothing() {

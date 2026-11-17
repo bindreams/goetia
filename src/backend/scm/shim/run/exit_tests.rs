@@ -192,3 +192,15 @@ fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed
     let logged = std::fs::read_to_string(dir.path().join("frpc.log")).expect("the child's log");
     assert!(logged.contains("report SERVICE_STOPPED to SCM: refused"), "{logged}");
 }
+
+/// The failure an end that cannot terminate the process logs goes through the log the run kept, so through the
+/// handle the run holds on its default log, not through a fresh one that opens the path.
+#[skuld::test]
+fn the_end_logs_through_the_log_the_run_kept() {
+    let fake = FakeGuard::new();
+    let kept = fake.log();
+
+    keep_log(Arc::clone(&kept));
+
+    assert!(Arc::ptr_eq(&failure_log(), &kept));
+}

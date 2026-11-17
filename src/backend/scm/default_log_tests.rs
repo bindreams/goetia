@@ -356,6 +356,22 @@ fn a_logs_in_the_logs_folder_is_refused_whichever_file_it_names() {
     }
 }
 
+/// The refusal reads as one sentence, with single spaces.
+#[skuld::test]
+fn the_refusal_says_what_it_refuses_and_the_way_out() {
+    let (dir, log) = program_data_with_logs();
+    let folder = log.parent().unwrap().to_path_buf();
+
+    let said = refusal_of(&dir, &log).expect("refused");
+
+    let expected = format!(
+        "`logs: {}` is inside goetia's own log folder {}; remove `logs:` to use the default log, or name a file elsewhere",
+        log.display(),
+        folder.display()
+    );
+    assert!(said.contains(&expected), "{said}");
+}
+
 /// A first install has no `<id>.log` yet, and no other file or folder under the logs folder either: only the
 /// part of the path that exists is looked at.
 #[skuld::test]
@@ -418,6 +434,26 @@ fn a_logs_elsewhere_is_accepted() {
         assert_eq!(refusal_of(&dir, &elsewhere), None, "{}", elsewhere.display());
     }
     assert!(refuse_logs_in_folder(dir.path(), &id(), None).is_ok());
+}
+
+/// The check needs no more of a folder than `canonicalize` does, which opens it for no access at all: a folder
+/// the installer can pass through but may not read the permissions of (the owner's implicit right is withdrawn
+/// by an entry for `OWNER RIGHTS`) is not a failure of the install, and `logs:` in it is accepted. The entries
+/// grant what the temporary directory's removal needs. An elevated token holds `SeBackupPrivilege`, which opens
+/// any folder opened with backup semantics whatever its permissions, so the test can fail only for a
+/// non-elevated account (the unit suite on a developer's machine).
+#[skuld::test]
+fn a_logs_in_a_folder_whose_permissions_cannot_be_read_is_accepted() {
+    let (dir, _log) = program_data_with_logs();
+    let closed = dir.path().join("closed");
+    fs::create_dir(&closed).unwrap();
+    // List, traverse, delete, synchronize; and nothing else, not even the right to read the permissions.
+    let rights = "0x110021";
+    let me = sid_display(&process_user_sid());
+    let descriptor = Descriptor::from_sddl(&format!("D:P(A;;{rights};;;{me})(A;;;;;OW)")).unwrap();
+    set_dacl(&descriptor, &closed).unwrap();
+
+    assert_eq!(refusal_of(&dir, &closed.join("x.log")), None);
 }
 
 /// `path`, a path on a local drive, as `\\localhost\<drive>$\...`: the administrative share of the same

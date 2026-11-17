@@ -315,6 +315,30 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     assert!(daemon.dropped());
 }
 
+/// A default log that is not there is one fault: the shim's hold of it says so, and the daemon's output open
+/// that follows fails for the same reason and says nothing more.
+#[skuld::test]
+fn a_default_log_that_could_not_be_held_is_not_told_again_when_the_output_cannot_open_it() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new();
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+    let default = Path::new(FAKE_LOGS).join(format!("{ID}.log"));
+    fake.will_fail_hold(&default);
+    fake.will_fail_open_log(&default);
+    let supervisor = supervisor(&fake);
+
+    supervisor.log.hold_default(ID);
+    let launched = launch(&spec_logging_to(None), &supervisor, ID);
+
+    assert!(launched.is_ok(), "the daemon still runs");
+    let told = fake.take_failures();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].contains("hold the default log"), "{told:?}");
+    drop(launched);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
 #[skuld::test]
 fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs() {
     let fake = FakeGuard::new();
