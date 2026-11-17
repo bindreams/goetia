@@ -20,7 +20,7 @@ use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::{self, Right, Written};
 use crate::backend::scm::manager::{
-    Scm, ScmSnapshot, apply_gated, make_default_log, registered_account_sid, registry, service_gate, written_user,
+    Scm, ScmSnapshot, apply_gated, make_default_log, registry, service_gate, written_user,
 };
 use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
@@ -489,9 +489,7 @@ impl Scm {
                     old.id(),
                     DaemonKind::Service,
                     self.service_live_status(old)?.common().state,
-                )?;
-                // The account the service runs as until it is retired, which its log names beside the task's.
-                registered_account_sid(old.config()?)
+                )
             },
             || self.service_retire(old),
         )?;
@@ -500,9 +498,9 @@ impl Scm {
     }
 
     /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare`, `refuse` (the service runs:
-    /// [`Error::RetypeRunning`]; otherwise it says the account the service runs as, if any, which the default
-    /// log names beside the task's until the service is gone) and `retire` (the service is removed). The order
-    /// is the contract: `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
+    /// [`Error::RetypeRunning`]) and `retire` (the service is removed). The default log names the task's
+    /// account alone: the service is refused while it runs and gone before the task registers, so no account but
+    /// the task's runs against the log. The order is the contract: `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
     /// registration, then the default log for the task's account alone ([`landed`]); a refusal or a failed
     /// acquisition leaves the service untouched.
     pub(super) fn retype_to_task_with(
@@ -511,12 +509,12 @@ impl Scm {
         definition: &TaskXml,
         runs: &Runs,
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
-        refuse: impl FnOnce() -> Result<Option<Sid>>,
+        refuse: impl FnOnce() -> Result<()>,
         retire: impl FnOnce() -> Result<()>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        let registered = refuse()?;
-        let prepared = task_acquire(id, definition, runs, registered.as_slice(), prepare)?;
+        refuse()?;
+        let prepared = task_acquire(id, definition, runs, &[], prepare)?;
         retire()?;
         let wrote = self.task_register(id, definition, false, false, &prepared)?;
         landed(id, runs, &prepared, wrote)

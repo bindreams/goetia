@@ -14,9 +14,11 @@
 //! Where the file is not there, or is a link, or the account cannot append to it, the append fails and the
 //! Event Log still gets the line.
 //!
-//! **The shim compares no paths.** A daemon writes the default log exactly when its `logs:` is unset; an
-//! install refuses a `logs:` in the folder of the default logs ([`default_log::refuse_logs_in_folder`]), so
-//! a `logs:` that is set is never the default log.
+//! **The default log is told by its text.** A daemon writes the default log when its `logs:` is unset, or is
+//! the default path as written ([`Log::daemon_log`]): an install refuses a `logs:` in the folder of the
+//! default logs ([`default_log::refuse_logs_in_folder`]), but a service an earlier version installed may carry
+//! that one, and opened as the user's own it would be refused by the file's permissions. No other path is
+//! compared, and none is looked up.
 //!
 //! **Event Log.** Every failure also goes to the Windows Event Log, whose default ACL is far more
 //! permissive than a folder's, so it is the more likely of the two to still work exactly when the
@@ -29,7 +31,7 @@ use super::os::{Channels, LogKind, Real, Severity};
 use super::service::TABLE_NAME;
 use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{logs_folder, program_data};
-use crate::error::Result;
+use crate::error::{Chain, Result};
 
 /// The shim's failure log: composes the two channels for one service run. One shim serves one
 /// service, so one daemon log path.
@@ -50,10 +52,11 @@ impl Log {
         }
     }
 
-    /// The production log: the real channels, defaulting to `%ProgramData%\Goetia\logs\`
-    /// ([`program_data`]).
-    pub(crate) fn real() -> Log {
-        Log::from_program_data(Arc::new(Real::default()), program_data())
+    /// The production log over `real`, defaulting to `%ProgramData%\Goetia\logs\` ([`program_data`]). `real` is
+    /// the shim's one [`Real`], which is also its [`Os`](super::os::Os): the daemon's output and this log's lines
+    /// share the handle it holds on the default log.
+    pub(crate) fn real(real: Arc<Real>) -> Log {
+        Log::from_program_data(real, program_data())
     }
 
     /// A log over `channels` for the `%ProgramData%` that `found` says. When it was not found there
@@ -91,26 +94,39 @@ impl Log {
 
     /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
     /// ([`Channels::hold_default`]). Call it once, when the shim starts and
-    /// knows its `id`, before anything an install can change. A log that cannot be held is not said here: the
-    /// daemon's own open of the same file reports it, and each line that needs it fails again.
+    /// knows its `id`, before anything an install can change. A log that cannot be held is told to the Event
+    /// Log, once, with the error: the shim goes on, and each line opens the file by its path.
     pub(crate) fn hold_default(&self, id: &str) {
-        if let Some(path) = self.default_log_path(id) {
-            let _ = self.channels.hold_default(&path);
+        let Some(path) = self.default_log_path(id) else {
+            return;
+        };
+        if let Err(e) = self.channels.hold_default(&path) {
+            let line = failure_line(
+                id,
+                &format!(
+                    "hold the default log {}: {} (the shim's lines open it for each line instead)",
+                    path.display(),
+                    Chain(&e)
+                ),
+            );
+            eprintln!("{line}");
+            self.channels.event_log(Severity::Error, &line);
         }
     }
 
-    /// The daemon's log and its kind: `logs` from its spec, which is the user's own, or, when unset,
-    /// [`Log::default_log_path`], the default log. No path is compared (see the module).
+    /// The daemon's log and its kind: `logs` from its spec, which is the user's own, unless it is the default
+    /// log's path as written; and, when unset, [`Log::default_log_path`], the default log (see the module).
     pub(crate) fn daemon_log(&self, id: &str, logs: Option<&Path>) -> Option<(PathBuf, LogKind)> {
+        let default = self.default_log_path(id);
         match logs {
-            Some(path) => Some((path.to_path_buf(), LogKind::Own)),
-            None => self.default_log_path(id).map(|path| (path, LogKind::Default)),
+            Some(path) if default.as_deref() != Some(path) => Some((path.to_path_buf(), LogKind::Own)),
+            _ => default.map(|path| (path, LogKind::Default)),
         }
     }
 
-    /// From now on, failures go to `path`, the spec's `logs:`, before the default. Call right after the
-    /// spec decodes, and only for a spec that sets `logs:`: with none, the default log is the daemon's own
-    /// and is always tried. A second call must carry the same path; a different one is a caller bug,
+    /// From now on, failures go to `path`, the daemon's own log ([`Log::daemon_log`] says `Own`), before the
+    /// default. Call right after the spec decodes, and only for an own log: with none, the default log is the
+    /// daemon's and is always tried. A second call must carry the same path; a different one is a caller bug,
     /// debug-asserted.
     pub(crate) fn set_daemon_log(&self, path: PathBuf) {
         if let Err(second) = self.daemon_log.set(path) {

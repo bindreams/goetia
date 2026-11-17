@@ -57,10 +57,12 @@ pub(super) fn requested(args: &[OsString]) -> Option<&str> {
 
 /// Runs the task `id` and ends the process with the run's code. Never returns.
 pub(super) fn run(id: &str) -> ! {
-    let log = Arc::new(Log::real());
+    // One `Real` for the run, as a service's shim has (`service::service_main`).
+    let real = Arc::new(Real::default());
+    let log = Arc::new(Log::real(Arc::clone(&real)));
     // Held for the whole run, as a service's shim does (`service::run_service`).
     log.hold_default(id);
-    let supervisor = Supervisor::new(Arc::new(Real::default()), Arc::clone(&log));
+    let supervisor = Supervisor::new(real, Arc::clone(&log));
     // Before anything is read: from here on a stop is held by the bus until the run reaches it.
     if let Err(e) = register_close_handler(&supervisor.bus) {
         log.failure(id, &format!("register the console control handler: {}", Chain(&e)));

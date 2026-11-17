@@ -1084,7 +1084,7 @@ fn registered_account(cfg: &ServiceConfig) -> Option<String> {
 
 /// The SID of the account the service `cfg` describes is registered as. `None` when no account has that
 /// name (a deleted account): nothing runs as it, so there is no one to name. Any other failure is an error.
-pub(in crate::backend::scm) fn registered_account_sid(cfg: &ServiceConfig) -> Result<Option<Sid>> {
+fn registered_account_sid(cfg: &ServiceConfig) -> Result<Option<Sid>> {
     match identity::service_account_sid(registered_account(cfg).as_deref(), None) {
         Ok(sid) => Ok(Some(sid)),
         Err(Error::AccountLookup { .. }) => Ok(None),
@@ -1193,13 +1193,12 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// changes the account names the registered account and the new one before the configuration changes, and the
 /// new one alone once it has landed, so that a change that fails leaves the account the service still runs as
 /// its log, and the next install corrects what a failure left. The names come from what install knows (the
-/// snapshot's account, the new account), never from the file. A failure of the log after a create leaves the new service,
-/// and the next `install` finds it up to date and makes the log ([`Backend::ensure_beside`]). `Parameters` follows
-/// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
-/// the two writes after it leaves a registration the next `install` reads as
-/// hand-edited (`Conflict`, cleared by `--force`). An update restates the
-/// start type the service has, rather than resetting it; see `service_info`. `written` is what
-/// [`written_user`] says of the account's spec value.
+/// snapshot's account, the new account), never from the file. A failure of the log after a create leaves the
+/// new service, and the next `install` finds it up to date and makes the log ([`Backend::ensure_beside`]).
+/// `Parameters` follows create/update immediately, minimizing the window in which a crash leaves a service
+/// with no marker; a failure in the two writes after it leaves a registration the next `install` reads as
+/// hand-edited (`Conflict`, cleared by `--force`). An update restates the start type the service has, rather
+/// than resetting it; see `service_info`. `written` is what [`written_user`] says of the account's spec value.
 fn apply(
     spec: &DaemonSpec,
     reg: &ScmRegistration,
@@ -1209,15 +1208,33 @@ fn apply(
     let gated = service_gate(reg, written)?;
     if let Some(installed) = installed {
         let config = installed.config()?;
-        let before = if registered_account(config) == reg.account {
-            None
-        } else {
-            registered_account_sid(config)?
-        };
+        let before = accounts_kept_before_change(
+            generate::hosted(spec),
+            &registered_account(config),
+            &reg.account,
+            || registered_account_sid(config),
+        )?;
         make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice())?;
     }
     apply_gated(reg, gated.password, installed.is_none())?;
     make_default_log(spec, reg, gated.checked.as_ref(), &[])
+}
+
+/// The registered account of a service, which its default log names beside the new account until a change of
+/// account lands: `lookup` is asked for it only where a log names it, a hosted service (`hosted`) whose
+/// account `new` differs from the `registered` one. Any other install names the new account alone, and asks the
+/// system nothing of the old one.
+fn accounts_kept_before_change(
+    hosted: bool,
+    registered: &Option<String>,
+    new: &Option<String>,
+    lookup: impl FnOnce() -> Result<Option<Sid>>,
+) -> Result<Option<Sid>> {
+    if hosted && registered != new {
+        lookup()
+    } else {
+        Ok(None)
+    }
 }
 
 /// What [`service_gate`] settled for a service.
@@ -1282,8 +1299,8 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// The default log of the service `reg` registers, for the account it runs as, made or set to name it:
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
 /// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
-/// account up again), else the one the spec gave as a SID, else the registered name's. `kept` are the accounts it names beside it, those the service may still run as. Call it once the
-/// service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
+/// account up again), else the one the spec gave as a SID, else the registered name's. `kept` are the accounts
+/// it names beside it, those the service may still run as. Call it once the service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
 /// update is about to give a service that exists.
 fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&Sid>, kept: &[Sid]) -> Result<()> {
     if !generate::hosted(spec) {

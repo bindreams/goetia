@@ -36,7 +36,8 @@ pub(crate) use protected::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, missing
 pub use system::{Dacl, kernel_object_dacl};
 #[cfg(windows)]
 pub(crate) use system::{
-    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, read_path, require_acls_under,
+    ObjectId, display_path, index_at, is_unreadable, kernel_object_owner, normalise as lexical, read_object, read_path,
+    require_acls_under,
 };
 
 #[cfg(windows)]
@@ -363,7 +364,7 @@ mod system {
     /// the older file index where the volume has no file ID. The forms never compare equal, since a
     /// file index and a file ID can hold the same numbers and name two objects.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum ObjectId {
+    pub(crate) enum ObjectId {
         /// The volume's 64-bit serial number and the file's 128-bit ID.
         Id { volume: u64, id: [u8; 16] },
         /// The volume's 32-bit serial number and the file's 64-bit index.
@@ -449,6 +450,12 @@ mod system {
             volume: info.VolumeSerialNumber,
             id: info.FileId.Identifier,
         })
+    }
+
+    /// The object at `path` by the volume's serial number and the file's index, which no spelling of the path
+    /// changes (a share's, an 8.3 name's, a link's). A link is read as itself, not followed.
+    pub(crate) fn index_at(path: &Path) -> io::Result<ObjectId> {
+        file_index(&open(path)?)
     }
 
     fn file_index(file: &File) -> io::Result<ObjectId> {

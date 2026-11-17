@@ -470,10 +470,10 @@ fn a_logs_spelled_through_the_administrative_share_is_still_in_the_logs_folder(#
 
 // A deleted log -------------------------------------------------------------------------------------------------------
 
-/// A log that the README's recovery deleted is a file with no name: the handle the shim holds is on it still.
-/// One that was only moved, or that has another name left, is not deleted.
+/// A log that the README's recovery deleted has lost the name the shim's handle was opened by: the handle is on
+/// it still. One that was only moved has not.
 #[skuld::test]
-fn a_held_log_is_deleted_only_when_no_name_is_left() {
+fn a_held_log_is_deleted_when_its_name_is_deleted_and_not_when_it_is_moved() {
     let (_dir, log) = program_data_with_logs();
     fs::write(&log, "").unwrap();
     let held = open_for_append(&log).unwrap();
@@ -483,11 +483,6 @@ fn a_held_log_is_deleted_only_when_no_name_is_left() {
     fs::rename(&log, &moved).unwrap();
     assert!(!is_deleted(&held).unwrap(), "a moved file has a name");
 
-    let second = log.with_file_name("second.log");
-    fs::hard_link(&moved, &second).unwrap();
     fs::remove_file(&moved).unwrap();
-    assert!(!is_deleted(&held).unwrap(), "a name is left");
-
-    fs::remove_file(&second).unwrap();
-    assert!(is_deleted(&held).unwrap(), "no name is left");
+    assert!(is_deleted(&held).unwrap(), "its name was deleted");
 }

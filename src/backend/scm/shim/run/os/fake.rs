@@ -59,8 +59,9 @@ pub(crate) fn wait_failed_with_code(code: i32) -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::from_raw_os_error(code))
 }
 
-/// The default log directory of [`Fake::log`]. The `Fake` writes no file there.
-pub(crate) const FAKE_LOGS: &str = "fake-logs";
+/// The default log directory of [`Fake::log`], absolute as a spec's `logs:` must be. The `Fake` writes no
+/// file there.
+pub(crate) const FAKE_LOGS: &str = r"C:\goetia-shim-test\fake-logs";
 
 /// Poison is recovered from: a panicking thread must not make every later call on the `Fake` panic.
 /// Nothing here panics with a lock held.

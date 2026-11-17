@@ -29,7 +29,7 @@ use windows_sys::Win32::System::Services::{
 
 use super::exit;
 use super::logging::Log;
-use super::os::{Os, Real, Spawned, spawn_error_code};
+use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
@@ -45,7 +45,7 @@ pub(super) const TABLE_NAME: &str = "goetia-shim";
 /// (`super::run` did, to choose this mode): the service name comes from SCM.
 pub(crate) fn run() -> ! {
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
-        Log::real().failure(TABLE_NAME, &dispatcher_failure(e));
+        Log::real(Arc::default()).failure(TABLE_NAME, &dispatcher_failure(e));
         exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
     exit::end_when_dispatched()
@@ -55,9 +55,11 @@ define_windows_service!(ffi_service_main, service_main);
 
 /// SCM's arguments to `ServiceMain`: the first is the service's name.
 fn service_main(scm_args: Vec<OsString>) {
-    let log = Arc::new(Log::real());
+    // One `Real` for the run: the supervisor's `Os` and the log's channels share the handle held on the default log.
+    let real = Arc::new(Real::default());
+    let log = Arc::new(Log::real(Arc::clone(&real)));
     match service_name(&log, &scm_args) {
-        Ok(id) => run_service(id, log),
+        Ok(id) => run_service(id, log, real),
         Err(code) => exit::end_process(code),
     }
 }
@@ -76,11 +78,11 @@ fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32>
         })
 }
 
-fn run_service(id: &str, log: Arc<Log>) {
+fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
     // Before anything is read or registered: an install that changes the account can take it out of the log's
     // permissions from the moment it changes the service, and a handle opened now keeps working.
     log.hold_default(id);
-    let supervisor = Supervisor::new(Arc::new(Real::default()), Arc::clone(&log));
+    let supervisor = Supervisor::new(real, Arc::clone(&log));
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
@@ -110,16 +112,11 @@ fn run_service(id: &str, log: Arc<Log>) {
 }
 
 /// From now on the shim's failures go to the daemon's own log, interleaved with its output: the spec's
-/// `logs`, tried before the default; with none set, the default log is the daemon's own and is always tried.
-/// Call right after the spec decodes.
+/// `logs`, tried before the default; with none set, or one that is the default log, the default log is the
+/// daemon's own and is always tried. Call right after the spec decodes.
 pub(super) fn set_daemon_log(log: &Log, id: &str, spec: &DaemonSpec) {
-    if let Some(path) = spec.common().logs.as_deref() {
-        debug_assert_ne!(
-            log.default_log_path(id).as_deref(),
-            Some(path),
-            "an install refuses a `logs:` that is the default log"
-        );
-        log.set_daemon_log(path.to_path_buf());
+    if let Some((path, LogKind::Own)) = log.daemon_log(id, spec.common().logs.as_deref()) {
+        log.set_daemon_log(path);
     }
 }
 

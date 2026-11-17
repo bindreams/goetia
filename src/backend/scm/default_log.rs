@@ -11,13 +11,17 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt as _;
+use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+};
 
 use super::folder::logs_folder;
 use super::link::is_link;
-use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor};
+use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, ObjectId, index_at};
 use super::sid::Sid;
 use crate::error::{Error, Result};
 use crate::spec::Id;
@@ -63,22 +67,21 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, accounts: &[Sid]) -> Result<(
 
 /// Refuses a daemon's `logs:` that lies in goetia's logs folder under `program_data`, where the default logs
 /// are: the folder is protected, so no service account can make a file in it, and a SYSTEM service named
-/// there would append to another daemon's default log. The folder is the boundary, so no file-name rule of
-/// Windows (case, 8.3 names, trailing dots) is applied to the name itself: the part of the path that exists
-/// is resolved by the file system ([`resolved`]), which knows them. The folder is made before this is called.
+/// there would append to another daemon's default log. The folder is the boundary, and it is compared as the
+/// object it is ([`lies_in`]), not by its spelling: no file-name rule of Windows (case, 8.3 names, trailing
+/// dots, a share's name for the drive) is applied to the path. The folder is made before this is called.
 pub(crate) fn refuse_logs_in_folder(program_data: &Path, id: &Id, logs: Option<&Path>) -> Result<()> {
     let Some(logs) = logs else {
         return Ok(());
     };
     let folder = logs_folder(program_data);
-    let canonical = fs::canonicalize(&folder).map_err(|e| Error::os_at("read", &folder, e))?;
+    let identity = index_at(&folder).map_err(|e| Error::os_at("read", &folder, e))?;
     let absolute = std::path::absolute(logs).map_err(|e| Error::os_at("make absolute", logs, e))?;
-    if resolved(&absolute).starts_with(&canonical) {
+    if lies_in(&absolute, identity)? {
         return Err(Error::Invalid {
             daemon: id.to_string(),
             message: format!(
-                "`logs: {}` is inside goetia's own log folder {}; remove `logs:` to use the default log, or \
-                 name a file elsewhere",
+                "`logs: {}` is inside goetia's own log folder {}; remove `logs:` to use the default log, or                  name a file elsewhere",
                 logs.display(),
                 folder.display()
             ),
@@ -88,23 +91,43 @@ pub(crate) fn refuse_logs_in_folder(program_data: &Path, id: &Id, logs: Option<&
     Ok(())
 }
 
-/// `path` with its deepest part that exists made canonical (the stored case, long names, links followed) and
-/// the rest, which no file system can say anything of yet, kept as written.
-fn resolved(path: &Path) -> PathBuf {
-    let mut rest = Vec::new();
-    let mut head = path;
-    loop {
-        if let Ok(canonical) = fs::canonicalize(head) {
-            return rest.iter().rev().fold(canonical, |resolved, part| resolved.join(part));
-        }
-        match (head.parent(), head.file_name()) {
-            (Some(parent), Some(part)) => {
-                rest.push(part);
-                head = parent;
-            }
-            _ => return path.to_path_buf(),
+/// Whether the deepest part of `path` that exists, or a folder above it, is the folder `folder` identifies
+/// (the volume and file index of the logs folder). The rest of the path, which no file system can say anything
+/// of yet, is not looked at: whatever it names is made inside the part that exists. Each folder is read from
+/// the canonical form of that part (links followed), so a spelling that shares no text with the folder's is
+/// found by what it is.
+fn lies_in(path: &Path, folder: ObjectId) -> Result<bool> {
+    let Some(existing) = path.ancestors().find_map(|part| fs::canonicalize(part).ok()) else {
+        return Ok(false);
+    };
+    for part in existing.ancestors() {
+        if index_at(part).map_err(|e| Error::os_at("read", part, e))? == folder {
+            return Ok(true);
         }
     }
+    Ok(false)
+}
+
+/// Whether the name `file` was opened by has been deleted while the handle has been open, so the path no
+/// longer leads to this file and a line written through the handle is not in the file a reader of the path
+/// sees. The recovery in the README deletes the log and installs again while a shim may run, which makes a new
+/// file at the same path. A file that was only moved is not deleted: the handle follows it. `file` must have
+/// been opened for `FILE_READ_ATTRIBUTES`, as [`open_for_append`] does.
+pub(crate) fn is_deleted(file: &File) -> io::Result<bool> {
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: `info` is `size_of::<FILE_STANDARD_INFO>()` writable bytes; the handle is live.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.DeletePending || info.NumberOfLinks == 0)
 }
 
 /// Opens the default log at `path`, which an install made, for append and nothing else: the rights an

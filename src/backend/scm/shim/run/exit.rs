@@ -5,7 +5,7 @@
 //! ends the process with the record ([`end_when_dispatched`]). The service thread ends the process
 //! itself only where the dispatcher cannot be trusted to return.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 
@@ -33,7 +33,7 @@ pub(super) fn end_process(code: i32) -> ! {
     // SAFETY: the pseudo handle of the current process is always valid.
     if unsafe { TerminateProcess(GetCurrentProcess(), code as u32) } == 0 {
         let e = std::io::Error::last_os_error();
-        Log::real().failure(
+        Log::real(Arc::default()).failure(
             TABLE_NAME,
             &format!("end the shim's process with code {code}: {}", Chain(&e)),
         );

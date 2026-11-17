@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use cosca::Containment;
@@ -28,7 +28,8 @@ pub(crate) trait Os: Send + Sync {
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>;
 
     /// Open the file at `path` for appending, as `kind` says. It is the daemon's log: the daemon's output is
-    /// redirected into it.
+    /// redirected into it. The default log is the one [`Channels::hold_default`] holds, so the shim has one
+    /// handle on it for the daemon's output and for its own lines.
     fn open_log(&self, path: &Path, kind: LogKind) -> io::Result<File>;
 }
 
@@ -71,10 +72,13 @@ pub(crate) enum Severity {
 /// Where the shim's failure and warning lines go.
 pub(crate) trait Channels: Send + Sync {
     /// Open the default log at `path` for the rest of the shim's run, as [`LogKind::Default`] says, and hold it:
-    /// a later [`Channels::append`] of that path as the default log goes through this handle. A handle keeps
-    /// the rights it was opened with, so the shim's own lines are not cut off when an install that changes the
-    /// account takes the account out of the file's permissions while the shim still runs. Called once, at the
-    /// shim's start; where it fails (the log is not there) a line opens the path as it is, and fails likewise.
+    /// a later [`Channels::append`] or [`Os::open_log`] of that path as the default log goes through this
+    /// handle. A handle keeps the rights it was opened with, so the shim's lines and the daemon's output are not
+    /// cut off when an install that changes the account takes the account out of the file's permissions while
+    /// the shim still runs. Called once, at the shim's start. A held log whose file was deleted (the README's
+    /// recovery does, and installs again) is opened again by its path, and that file held, the next time the
+    /// log is used. Where the log cannot be opened (it is not there) nothing is held, and a use opens the path
+    /// as it is, and fails likewise.
     fn hold_default(&self, path: &Path) -> io::Result<()>;
 
     /// Append `line` and a newline to the file at `path`, opening it as `kind` says (the held default log is
@@ -87,11 +91,32 @@ pub(crate) trait Channels: Send + Sync {
     fn event_log(&self, severity: Severity, line: &str);
 }
 
-/// The production implementation of all three traits.
+/// The production implementation of all three traits. One `Real` serves one shim: the [`Os`] and the
+/// [`Channels`] of a run are the same value, so they share the one handle held on the default log.
 #[derive(Default)]
 pub(crate) struct Real {
     /// The default log [`Channels::hold_default`] opened, and its path.
-    held: OnceLock<(PathBuf, File)>,
+    held: Mutex<Option<(PathBuf, Arc<File>)>>,
+}
+
+impl Real {
+    /// The default log at `path` through the handle held on it: the one [`Channels::hold_default`] opened,
+    /// unless its file has been deleted, or none is held; then the path is opened ([`default_log::open_for_append`],
+    /// which makes nothing) and that handle is held. The new handle is held by the same call that made it, so
+    /// two uses at once cannot each open one.
+    fn default_log(&self, path: &Path) -> io::Result<Arc<File>> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((held_path, file)) = held.as_ref()
+            && held_path == path
+            && !default_log::is_deleted(file)?
+        {
+            return Ok(Arc::clone(file));
+        }
+        *held = None;
+        let file = Arc::new(default_log::open_for_append(path)?);
+        *held = Some((path.to_path_buf(), Arc::clone(&file)));
+        Ok(file)
+    }
 }
 
 impl Os for Real {
@@ -104,7 +129,10 @@ impl Os for Real {
     }
 
     fn open_log(&self, path: &Path, kind: LogKind) -> io::Result<File> {
-        open_append(path, kind)
+        match kind {
+            LogKind::Default => self.default_log(path)?.try_clone(),
+            LogKind::Own => open_own(path),
+        }
     }
 }
 
@@ -128,16 +156,13 @@ impl Spawned for cosca::Child {
 
 impl Channels for Real {
     fn hold_default(&self, path: &Path) -> io::Result<()> {
-        let file = default_log::open_for_append(path)?;
-        let first = self.held.set((path.to_path_buf(), file)).is_ok();
-        debug_assert!(first, "the default log is held once, at the shim's start");
-        Ok(())
+        self.default_log(path).map(drop)
     }
 
     fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
-        match self.held.get() {
-            Some((held, file)) if kind == LogKind::Default && held == path => append_line(&mut &*file, line),
-            Some(_) | None => append_line(&mut open_append(path, kind)?, line),
+        match kind {
+            LogKind::Default => append_line(&mut &*self.default_log(path)?, line),
+            LogKind::Own => append_line(&mut open_own(path)?, line),
         }
     }
 
@@ -159,18 +184,12 @@ pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
     })
 }
 
-/// Open `path` for append as `kind` says: an own log has its folders and the file made, the default log
-/// is opened as [`default_log::open_for_append`] does.
-fn open_append(path: &Path, kind: LogKind) -> io::Result<File> {
-    match kind {
-        LogKind::Default => default_log::open_for_append(path),
-        LogKind::Own => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            OpenOptions::new().create(true).append(true).open(path)
-        }
+/// Open the daemon's own log `path` for append, its folders and the file made.
+fn open_own(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// One `write` call, so another handle's appends cannot split the line.

@@ -1093,11 +1093,16 @@ makes it, so a file that is missing is a failed write, and the Event Log still
 has the line; `goetia daemon install` makes it again, even when the daemon is
 otherwise up to date. `goetia daemon uninstall` keeps the file.
 
+The shim opens `<id>.log` once, when it starts, and writes through that handle, so an install that
+changes the account (SCM does not restart the service) leaves the running shim its log. If you delete
+`<id>.log` and run `goetia daemon install` while the service runs, the shim's next line goes to the new
+file; the daemon's own output goes to the deleted file until the service restarts.
+
 A `logs:` that is inside `%ProgramData%\Goetia\logs` is refused at install, whichever file it
 names (the folder is the shim's default logs, which a daemon's own account cannot make a file in).
 Remove `logs:` to use the default log, or name a file elsewhere. A manifest that named
 `%ProgramData%\Goetia\logs\<id>.log` as its `logs:` must drop it; its output then goes to the same
-file.
+file. A service installed with that `logs:` by an earlier goetia keeps writing the default log.
 
 Goetia before this change left `%ProgramData%\Goetia\logs` readable by every
 user, and `goetia daemon install` refuses a folder it did not make this way. To
