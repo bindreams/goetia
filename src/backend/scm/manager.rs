@@ -1168,9 +1168,11 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// create or an update, as systemd and launchd do. The daemon's default log
 /// ([`make_default_log`]) is not a precondition: an update makes it for the new account before the
 /// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
-/// service exists, since a virtual account's SID resolves only then, before any start. A failure of that
-/// leaves the new service, and the next `install` finds it up to date and makes the log
-/// ([`Backend::ensure_beside`]). `Parameters` follows
+/// service exists, since a virtual account's SID resolves only then, before any start. An update that
+/// changes the account names the new one beside the old before the configuration changes, and alone once it
+/// has landed, so that a change that fails leaves the account the service still runs as its log, and the
+/// next install corrects what a failure left. A failure of the log after a create leaves the new service,
+/// and the next `install` finds it up to date and makes the log ([`Backend::ensure_beside`]). `Parameters` follows
 /// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
@@ -1179,13 +1181,10 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 fn apply(spec: &DaemonSpec, reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
     let gated = service_gate(reg, written)?;
     if !create {
-        make_default_log(spec, reg, gated.checked.as_ref())?;
+        with_default_log_account(spec, reg, gated.checked.as_ref(), default_log::admit)?;
     }
     apply_gated(reg, gated.password, create)?;
-    if create {
-        make_default_log(spec, reg, gated.checked.as_ref())?;
-    }
-    Ok(())
+    make_default_log(spec, reg, gated.checked.as_ref())
 }
 
 /// What [`service_gate`] settled for a service.
@@ -1253,14 +1252,26 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// up again. Call it once the service exists (a virtual account's SID resolves only then) and before it
 /// starts, or for the account an update is about to give a service that exists.
 fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&Sid>) -> Result<()> {
+    with_default_log_account(spec, reg, checked, default_log::ensure)
+}
+
+/// [`make_default_log`] with `set`, which sets the log's permissions for the account ([`default_log::ensure`],
+/// or [`default_log::admit`] before an account changes). The account is the gate's SID, else the one the spec
+/// gave as a SID, else the registered name's.
+fn with_default_log_account(
+    spec: &DaemonSpec,
+    reg: &ScmRegistration,
+    checked: Option<&Sid>,
+    set: fn(&Path, &Id, &Sid) -> Result<()>,
+) -> Result<()> {
     if !generate::hosted(spec) {
         return Ok(());
     }
     let account = match checked {
         Some(sid) => sid.clone(),
-        None => identity::service_account_sid(reg.account.as_deref())?,
+        None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
     };
-    default_log::ensure(&program_data()?, &spec.common().id, &account)
+    set(&program_data()?, &spec.common().id, &account)
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it

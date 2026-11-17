@@ -53,7 +53,7 @@ mod system {
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_ALWAYS, SYNCHRONIZE, WRITE_DAC,
+        OPEN_ALWAYS, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
     };
 
     use super::super::{ObjectSecurity, system::describe};
@@ -145,17 +145,20 @@ mod system {
         }
 
         /// The permissions of a daemon's default log file: Administrators own it; SYSTEM and Administrators
-        /// have full control; `account`, the account the daemon's shim runs as, may append to it
-        /// ([`DEFAULT_LOG_ACCESS`]) and do nothing else, so it cannot read, truncate, delete or re-permission
-        /// what it wrote. The DACL is protected. A SID that is not whole is an error.
-        pub(crate) fn for_default_log(account: &Sid) -> Result<Self> {
-            let account = sid_text(account, "a default log")?;
-            Self::from_sddl(&format!(
-                "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{DEFAULT_LOG_ACCESS:#x};;;{account})"
-            ))
+        /// have full control; each of `accounts`, the accounts the daemon's shim runs as (more than one only
+        /// while it changes from one to another), may append to it ([`DEFAULT_LOG_ACCESS`]) and do nothing
+        /// else, so it cannot read, truncate, delete or re-permission what it wrote. The DACL is protected.
+        /// A SID that is not whole is an error.
+        pub(crate) fn for_default_log(accounts: &[Sid]) -> Result<Self> {
+            let mut sddl = String::from("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            for account in accounts {
+                let account = sid_text(account, "a default log")?;
+                sddl.push_str(&format!("(A;;{DEFAULT_LOG_ACCESS:#x};;;{account})"));
+            }
+            Self::from_sddl(&sddl)
         }
 
-        /// Opens the file `path` for `WRITE_DAC` and attribute reads without following a link at it, making
+        /// Opens the file `path` for `READ_CONTROL`, `WRITE_DAC` and attribute reads without following a link at it, making
         /// it empty with this descriptor when it is not there (`OPEN_ALWAYS`); the flag says it was made,
         /// and so has the descriptor's permissions already. What is there is not changed:
         /// [`Descriptor::set_dacl_of`] on the handle sets its permissions. The file is shared for everything,
@@ -168,7 +171,7 @@ mod system {
             let handle = unsafe {
                 CreateFileW(
                     wide.as_ptr(),
-                    WRITE_DAC | FILE_READ_ATTRIBUTES,
+                    READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     &attributes,
                     OPEN_ALWAYS,

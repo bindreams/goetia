@@ -10,6 +10,8 @@
 //! edit survives them. Re-registering a task that logs on with a password takes the password (M3): `enable`
 //! and `disable` of a real user's task read `GOETIA_SERVICE_PASSWORD` as an install does.
 
+use std::path::Path;
+
 use super::api::{Registered, Registration};
 use super::live::Liveness;
 use super::verbs::{Processes, System, gone};
@@ -193,7 +195,7 @@ impl Scm {
         let changed = snapshot.filter(|old| stored_principal(old.registered()).as_ref() != Some(&prepared.principal));
         match changed {
             None => {
-                task_records(id, runs, &prepared)?;
+                task_records(id, runs, &prepared, default_log::ensure)?;
                 self.task_register(
                     id,
                     definition,
@@ -260,13 +262,14 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = old.id();
         self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
-        task_records(id, runs, prepared)?;
+        task_records(id, runs, prepared, default_log::admit)?;
         match self.tasks.delete(&TaskPath::of(id)) {
             // The task is gone; a folder that stays is still there for the create.
             Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
             Err(e) => return Err(e),
         }
-        self.task_register(id, definition, old.armed(), false, prepared)
+        let wrote = self.task_register(id, definition, old.armed(), false, prepared)?;
+        landed(id, runs, prepared, wrote)
     }
 
     /// Refuses installing `old`, a task, as another account while it runs:
@@ -323,7 +326,8 @@ fn principal_sid(registered: &Registered) -> Result<Sid> {
 
 /// Everything a registration of `definition` needs, before any request: what the machine holds for the
 /// account (`prepare`), and the record directory with permissions that name it. Every write makes it, so
-/// a reinstall as another user can still write its records.
+/// a reinstall as another user can still write its records. The default log names the account beside the
+/// one it names now, for a service that is yet to be retired ([`landed`]).
 fn task_acquire(
     id: &Id,
     definition: &TaskXml,
@@ -331,16 +335,29 @@ fn task_acquire(
     prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
 ) -> Result<Prepared> {
     let prepared = prepare(&definition.account())?;
-    task_records(id, runs, &prepared)?;
+    task_records(id, runs, &prepared, default_log::admit)?;
     Ok(prepared)
 }
 
 /// The record directory of `id` with permissions that name the account `prepared` holds, and its default
-/// log, which the account may append to (the shim opens it and never makes it).
-fn task_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
+/// log, which the account may append to (the shim opens it and never makes it). `log` is
+/// [`default_log::ensure`], which names the account alone, or [`default_log::admit`], which names it beside
+/// the account that has the log now, for a write that changes the account of a daemon that still runs as
+/// the old one until the write lands ([`landed`] follows it).
+fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, log: fn(&Path, &Id, &Sid) -> Result<()>) -> Result<()> {
     runs.ensure(&prepared.principal)
         .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
-    default_log::ensure(runs.program_data(), id, &prepared.principal)
+    log(runs.program_data(), id, &prepared.principal)
+}
+
+/// Once a registration that changed the account has landed (`wrote` is [`WriteOutcome::Done`]), the default
+/// log names the new account alone. Any other end leaves the log naming both, which the next install
+/// corrects: it is the one that finds the task as it is.
+fn landed(id: &Id, runs: &Runs, prepared: &Prepared, wrote: WriteOutcome) -> Result<WriteOutcome> {
+    if matches!(wrote, WriteOutcome::Done) {
+        default_log::ensure(runs.program_data(), id, &prepared.principal)?;
+    }
+    Ok(wrote)
 }
 
 /// The default log of the task `installed`, for the account it is registered as: what an install that finds
@@ -482,7 +499,7 @@ impl Scm {
     /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare`, `refuse` (the service
     /// runs: [`Error::RetypeRunning`]) and `retire` (the service is removed). The order is the contract:
     /// `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
-    /// registration; a refusal or a failed acquisition leaves the service untouched.
+    /// registration, then the default log for the task's account alone ([`landed`]); a refusal or a failed acquisition leaves the service untouched.
     pub(super) fn retype_to_task_with(
         &self,
         spec: &DaemonSpec,
@@ -496,7 +513,8 @@ impl Scm {
         refuse()?;
         let prepared = task_acquire(id, definition, runs, prepare)?;
         retire()?;
-        self.task_register(id, definition, false, false, &prepared)
+        let wrote = self.task_register(id, definition, false, false, &prepared)?;
+        landed(id, runs, &prepared, wrote)
     }
 
     /// The sweep of what the removal left: the file a removed service's or task's host named, which

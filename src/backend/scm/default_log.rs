@@ -17,7 +17,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
 use super::folder::logs_folder;
 use super::link::is_link;
-use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor};
+use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_trusted, read_object};
 use super::sid::Sid;
 use crate::error::{Error, Result};
 use crate::spec::Id;
@@ -28,16 +28,27 @@ pub(crate) fn path_in(logs: &Path, id: &str) -> PathBuf {
 }
 
 /// Makes the default log of `id` under `program_data` empty, or sets the permissions of the one there, to
-/// those of [`Descriptor::for_default_log`] for `account`, the account the daemon's shim runs as. The file
-/// is opened once, without following a link, and its permissions are set on that handle (a file this open
-/// made has them already); a link is refused and nothing is set on it. What is in the file is kept, so an
-/// install over a daemon that has logged, as another account too, leaves its log. The folder is
+/// those of [`Descriptor::for_default_log`] for `account`, the account the daemon's shim runs as, alone. The
+/// file is opened once, without following a link, and its permissions are set on that handle (a file this
+/// open made has them already); a link is refused and nothing is set on it. What is in the file is kept, so
+/// an install over a daemon that has logged, as another account too, leaves its log. The folder is
 /// [`make_goetia_folders`](super::folder::make_goetia_folders)'s, made before: where it is not there this
 /// is an error.
 pub(crate) fn ensure(program_data: &Path, id: &Id, account: &Sid) -> Result<()> {
+    set(program_data, id, account, false)
+}
+
+/// [`ensure`], keeping the accounts that have an entry on the file already and naming `account` beside
+/// them: what an install that changes the account does before the change, so that a change that fails
+/// leaves the account the daemon still runs as its log. [`ensure`] follows it once the change has landed.
+pub(crate) fn admit(program_data: &Path, id: &Id, account: &Sid) -> Result<()> {
+    set(program_data, id, account, true)
+}
+
+fn set(program_data: &Path, id: &Id, account: &Sid, beside: bool) -> Result<()> {
     let path = path_in(&logs_folder(program_data), id.as_str());
-    let permissions = Descriptor::for_default_log(account)?;
-    let (file, made) = permissions
+    let own = Descriptor::for_default_log(std::slice::from_ref(account))?;
+    let (file, made) = own
         .open_always_for_dacl(&path)
         .map_err(|e| Error::os_at("make", &path, e))?;
     if is_link(&file).map_err(|e| Error::os_at("read the type of", &path, e))? {
@@ -46,6 +57,21 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, account: &Sid) -> Result<()> 
     if made {
         return Ok(());
     }
+    let permissions = if beside {
+        let mut accounts: Vec<Sid> = read_object(&file, path.clone())?
+            .dacl
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|ace| ace.allow && !is_trusted(&ace.trustee) && ace.trustee != *account)
+            .map(|ace| ace.trustee)
+            .collect();
+        accounts.sort();
+        accounts.dedup();
+        accounts.push(account.clone());
+        Descriptor::for_default_log(&accounts)?
+    } else {
+        own
+    };
     permissions
         .set_dacl_of(&file)
         .map_err(|e| Error::os_at("set the permissions of", &path, e))

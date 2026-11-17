@@ -178,9 +178,13 @@ pub(in crate::backend::scm) fn sid_of_principal(principal: &str) -> Result<Sid> 
 /// The SID of the account a service registered as `account` ([`ScmRegistration::account`](crate::backend::scm::generate::ScmRegistration::account))
 /// runs as: `None` is LocalSystem and a recognised built-in is its well-known SID, neither of which
 /// `LookupAccountNameW` resolves by the spelling goetia registers; any other account is looked up. A
-/// virtual account (`NT SERVICE\<id>`) resolves only once the service exists, so call this after it is
-/// created. A real user's SID is the one [`require_user_account`] found, which the caller keeps.
-pub(in crate::backend::scm) fn service_account_sid(account: Option<&str>) -> Result<Sid> {
+/// `written` `user.id` is the SID the spec gave, which the logon gate used too: the name it registers is not
+/// looked up again. A virtual account (`NT SERVICE\<id>`) resolves only once the service exists, so call this
+/// after it is created. A real user's SID is the one [`require_user_account`] found, which the caller keeps.
+pub(in crate::backend::scm) fn service_account_sid(account: Option<&str>, written: Option<Written>) -> Result<Sid> {
+    if let Some(Written::Sid(sid)) = written {
+        return sid_from_string(sid, Some("user.id"));
+    }
     let account = account.unwrap_or_default();
     match windows_builtin(account) {
         Some(builtin) => sid_from_string(builtin_sid(builtin), None),
