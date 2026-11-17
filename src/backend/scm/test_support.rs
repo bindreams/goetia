@@ -134,3 +134,73 @@ pub(crate) fn delete_pending(path: &std::path::Path) -> std::fs::File {
     drop(holder);
     reader
 }
+
+/// Gives the existing empty directory `dir` the reparse tag `tag` with `payload`, as the account that may
+/// add files to it can (KB ddcbd14): it is the same directory, so a handle held on it before is on a
+/// reparse point now.
+#[cfg(windows)]
+pub(crate) fn set_reparse_point(dir: &std::path::Path, tag: u32, payload: &[u8]) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    // The tag, the length of the data, and a reserved field.
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(&tag.to_le_bytes());
+    buffer.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+    buffer.extend_from_slice(&0u16.to_le_bytes());
+    buffer.extend_from_slice(payload);
+    // `FILE_ADD_FILE`, which is what the account has on its directory, and `SYNCHRONIZE`.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x2 | 0x10_0000)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir)
+        .unwrap();
+    let mut returned = 0u32;
+    // SAFETY: `buffer` is readable for the length given; `file` is a live handle; no output is asked for.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr().cast(),
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0, "set the reparse point: {}", std::io::Error::last_os_error());
+}
+
+/// Makes the existing empty directory `dir` a mount point (a junction) to the existing `target`, in place:
+/// see [`set_reparse_point`]. `mklink /J` cannot, since it makes the directory.
+#[cfg(windows)]
+pub(crate) fn make_mount_point(dir: &std::path::Path, target: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    let target = target.canonicalize().unwrap();
+    // `canonicalize` gives `\?\C:\...`; the substitute name is `\??\C:\...` and the print name `C:\...`.
+    let print: Vec<u16> = target.as_os_str().encode_wide().skip(4).collect();
+    let substitute: Vec<u16> = r"\??\".encode_utf16().chain(print.iter().copied()).collect();
+    let bytes = |units: &[u16]| units.iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>();
+    let (substitute, print) = (bytes(&substitute), bytes(&print));
+    let mut payload = Vec::new();
+    // The offsets and lengths of the two names in the buffer that follows, each closed by a NUL unit.
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&u16::try_from(substitute.len()).unwrap().to_le_bytes());
+    payload.extend_from_slice(&u16::try_from(substitute.len() + 2).unwrap().to_le_bytes());
+    payload.extend_from_slice(&u16::try_from(print.len()).unwrap().to_le_bytes());
+    payload.extend_from_slice(&substitute);
+    payload.extend_from_slice(&[0, 0]);
+    payload.extend_from_slice(&print);
+    payload.extend_from_slice(&[0, 0]);
+    set_reparse_point(dir, IO_REPARSE_TAG_MOUNT_POINT, &payload);
+}

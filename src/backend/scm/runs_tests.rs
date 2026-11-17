@@ -17,7 +17,7 @@ use super::*;
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
 use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
-use crate::backend::scm::test_support::{delete_pending, directory_with_a_file};
+use crate::backend::scm::test_support::{delete_pending, directory_with_a_file, make_mount_point};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -473,7 +473,7 @@ fn appeared_lists_only_records_not_in_the_pins_listing_ascending() {
     runs.write(&record(3, 10)).unwrap();
     runs.write(&record(4, 20)).unwrap();
 
-    let appeared = runs.appeared(&pin).unwrap();
+    let appeared = pin.appeared().unwrap();
 
     assert_eq!(appeared, [record(3, 10), record(4, 20), record(2, 30)]);
 }
@@ -485,7 +485,7 @@ fn appeared_is_empty_when_nothing_was_written_after_the_pin() {
 
     let pin = runs.pin().unwrap();
 
-    assert_eq!(runs.appeared(&pin).unwrap(), []);
+    assert_eq!(pin.appeared().unwrap(), []);
 }
 
 // uninstall ===========================================================================================================
@@ -970,48 +970,42 @@ fn a_directory_that_is_not_empty_pauses_on_what_is_left_and_names_nothing_when_n
     assert!(matches!(pass_after_not_empty(dir, &[]), PassOutcome::Retry));
 }
 
-/// A directory that was not empty when its delete came and is by the time it is listed has nothing held
-/// to name. The removal says so once, naming the directory and claiming no holder, and goes on. What
-/// empties it here is a thread that makes and deletes a file until the note is made: the note, the real
-/// condition, stops it. A removal that finishes before the note (the file was never there when the delete
-/// came) is tried again on a new directory, until one is noted.
+/// What the removal says over the passes it makes ([`Said::note`]): a pause is noted when it is not what
+/// the last note said, so a hold that comes back after the directory emptied is a new thing to say, and so
+/// is a second phase of emptying. Driven on the sequence of passes, which a real removal makes only when
+/// a file goes between a delete and a listing.
 #[skuld::test]
-fn a_directory_that_empties_under_the_removal_is_noted_once_and_names_no_holder() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+fn a_pause_is_noted_when_it_differs_from_the_last_note_and_a_new_emptying_phase_is_noted_again() {
+    let dir = Path::new(r"C:\runs\frpc");
+    let (pin, record) = (dir.join("a.pin"), dir.join("b.json"));
+    let passes = [
+        PassOutcome::Waiting(pin.clone()),
+        PassOutcome::Waiting(pin.clone()),
+        PassOutcome::Retry,
+        PassOutcome::Retry,
+        PassOutcome::Waiting(pin.clone()),
+        PassOutcome::Retry,
+        PassOutcome::Waiting(record.clone()),
+        PassOutcome::Waiting(record.clone()),
+        PassOutcome::Done,
+    ];
+    let mut said = Said::Nothing;
+    let mut notes = Vec::new();
 
-    loop {
-        let (_dir, runs) = fixture();
-        let flicker = runs.dir.join("flicker");
-        let stop = AtomicBool::new(false);
-        let mut emptying = Vec::new();
-
-        thread::scope(|scope| {
-            scope.spawn(|| {
-                while !stop.load(Ordering::Acquire) {
-                    let _ = fs::write(&flicker, "");
-                    let _ = fs::remove_file(&flicker);
-                }
-            });
-            let removed = runs.remove_all(|path, kind| {
-                if kind == PauseKind::Emptying {
-                    emptying.push(path.to_path_buf());
-                    stop.store(true, Ordering::Release);
-                }
-            });
-            stop.store(true, Ordering::Release);
-            removed.unwrap();
-        });
-
-        if !emptying.is_empty() {
-            assert_eq!(
-                emptying,
-                std::slice::from_ref(&runs.dir),
-                "one note, naming the directory"
-            );
-            assert!(!runs.dir.exists());
-            return;
-        }
+    for pass in &passes {
+        said.note(dir, pass, &mut |path, kind| notes.push((path.to_path_buf(), kind)));
     }
+
+    assert_eq!(
+        notes,
+        [
+            (pin.clone(), PauseKind::Held),
+            (dir.to_path_buf(), PauseKind::Emptying),
+            (pin, PauseKind::Held),
+            (dir.to_path_buf(), PauseKind::Emptying),
+            (record, PauseKind::Held),
+        ]
+    );
 }
 
 /// A removal that fails leaves its marker, so that a `run` still backs off: its records are partly gone.
@@ -1070,7 +1064,7 @@ fn a_directory_with_a_held_pin_cannot_be_renamed_away() {
     let moved = fs::rename(&runs.dir, runs.dir.with_extension("moved"));
 
     assert!(moved.is_err());
-    assert_eq!(runs.appeared(&pin).unwrap(), []);
+    assert_eq!(pin.appeared().unwrap(), []);
 }
 
 // a link where the directory should be ================================================================================
@@ -1106,6 +1100,41 @@ fn remove_all_of_a_link_removes_the_link_and_leaves_what_it_points_to() {
     assert!(fs::symlink_metadata(&runs.dir).is_err(), "the link is gone");
     assert!(!runs.marker.exists());
     assert!(target_is_untouched(&target), "{:?}", names(&target));
+}
+
+/// The directory the removal holds becomes a mount point after the listing and before the deletes (its
+/// account does it to an empty directory), whatever the listing held, a pin first or a tree last. Every
+/// delete that says so ends the pass, with nothing held and nothing failed, and the directory's own delete
+/// that follows deletes the link; the target is as it was. Driven step by step, so no timing decides it.
+#[skuld::test]
+fn a_directory_that_becomes_a_link_after_the_listing_is_deleted_as_a_link() {
+    let listings = [
+        vec![Entry::Pin("pin-a.pin".into())],
+        vec![Entry::Record(instance(1), file_of(&instance(1)).into())],
+        vec![Entry::Temp(format!("{}.json.tmp", instance(2).hex()).into())],
+        vec![Entry::Other {
+            name: "foreign".into(),
+            dir: false,
+        }],
+        vec![Entry::Other {
+            name: "tree".into(),
+            dir: true,
+        }],
+    ];
+    for listed in listings {
+        let (_dir, runs) = fixture();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("victim.txt"), "keep").unwrap();
+        let held = Dir::open(&runs.dir).unwrap();
+        make_mount_point(&runs.dir, target.path());
+
+        let waiting = runs.delete_entries(&held, &listed).unwrap();
+        held.remove().unwrap();
+
+        assert_eq!(waiting, None);
+        assert!(fs::symlink_metadata(&runs.dir).is_err(), "the link is gone");
+        assert_eq!(fs::read(target.path().join("victim.txt")).unwrap(), b"keep");
+    }
 }
 
 #[skuld::test]
@@ -1144,25 +1173,22 @@ fn ensure_refuses_a_link_and_leaves_what_it_points_to_alone() {
 }
 
 /// Every other operation on the records refuses the link and touches nothing: a read does not follow it
-/// to a record, a pin or a write makes no file in its target, and a listing through it is refused.
+/// to a record, and a pin or a write makes no file in its target.
 #[skuld::test]
 fn nothing_reads_pins_or_writes_through_a_link() {
     let (_dir, runs) = fixture();
     let (_target_dir, target) = linked(&runs);
-    let their_pin = target.pin().unwrap();
     let before = names(&target);
 
     let read = runs.read(&instance(9)).unwrap_err();
     let pin = runs.pin().err().map(|e| e.kind());
     let hold = runs.hold().err().map(|e| e.kind());
     let write = runs.write(&record(1, 1)).unwrap_err();
-    let appeared = runs.appeared(&their_pin).unwrap_err();
 
     assert_eq!(read.kind(), io::ErrorKind::NotADirectory, "{read}");
     assert_eq!(pin, Some(io::ErrorKind::NotADirectory));
     assert_eq!(hold, Some(io::ErrorKind::NotADirectory));
     assert_eq!(write.kind(), io::ErrorKind::NotADirectory, "{write}");
-    assert_eq!(appeared.kind(), io::ErrorKind::NotADirectory, "{appeared}");
     assert_eq!(names(&target), before, "nothing was made or removed in the target");
 }
 

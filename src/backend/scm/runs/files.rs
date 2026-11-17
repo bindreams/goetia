@@ -14,15 +14,15 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{
     ERROR_SHARING_VIOLATION, HANDLE, STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    STATUS_SHARING_VIOLATION,
+    STATUS_REPARSE_POINT_NOT_RESOLVED, STATUS_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
-    FILE_TRAVERSE, SYNCHRONIZE,
+    DELETE, FILE_APPEND_DATA, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
+    FILE_TRAVERSE, FILE_WRITE_DATA, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::dir::{Dir, SHARE_ALL, SYNCHRONOUS_IO, delete_by_disposition, io_error};
+use super::dir::{Dir, Listed, SHARE_ALL, SYNCHRONOUS_IO, delete_by_disposition, io_error};
 
 /// Makes the temp file `name` for a record's bytes, which must not exist: one an interrupted write left
 /// is deleted first, and the file is made new, so that nothing of the old one (its attributes, say) is
@@ -30,14 +30,10 @@ use super::dir::{Dir, SHARE_ALL, SYNCHRONOUS_IO, delete_by_disposition, io_error
 /// while it is held, so a write in flight is not pruned from under it. A leftover that is held (a write
 /// in flight) is a sharing violation.
 pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
-    match delete(dir, name) {
-        DeleteOutcome::Deleted => {}
-        DeleteOutcome::Held => return Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION as i32)),
-        DeleteOutcome::Failed(e) => return Err(e),
-    }
+    delete(dir, name).into_result()?;
     dir.open_in(
         name,
-        FILE_GENERIC_WRITE | DELETE,
+        TEMP_ACCESS,
         FILE_SHARE_READ,
         FILE_CREATE,
         FILE_NON_DIRECTORY_FILE | SYNCHRONOUS_IO,
@@ -88,7 +84,7 @@ pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> 
 /// Creates the pin file `name` in `dir`, which must not exist. It is deleted when its last handle closes,
 /// whatever ends the holder. Nobody else can delete it while it is held: the holder shares no delete, so
 /// any delete of it, by any account the directory lets delete entries, is a sharing violation
-/// ([`is_held`]).
+/// ([`DeleteOutcome::Held`]).
 pub(super) fn create_pin(dir: &Dir, name: &OsStr) -> io::Result<File> {
     dir.open_in(
         name,
@@ -100,8 +96,15 @@ pub(super) fn create_pin(dir: &Dir, name: &OsStr) -> io::Result<File> {
     .map_err(io_error)
 }
 
-/// What a pin's holder has of it (`FILE_GENERIC_WRITE` includes `SYNCHRONIZE`).
-pub(super) const PIN_ACCESS: u32 = FILE_GENERIC_WRITE | DELETE;
+/// What the handle of a pin is made with. A creating open is granted all it asks for, whatever the
+/// directory's entry for the account says, so it asks for what is used and no more: `DELETE` is the
+/// delete-on-close, `SYNCHRONIZE` the synchronous handle. A pin is never written.
+pub(super) const PIN_ACCESS: u32 = DELETE | SYNCHRONIZE;
+
+/// What the handle of a temp file is made with, by the same rule: write and append are the record's bytes,
+/// `DELETE` the rename ([`rename_over`]), `SYNCHRONIZE` the synchronous handle. Not `FILE_GENERIC_WRITE`,
+/// which adds the right to set attributes and extended attributes.
+const TEMP_ACCESS: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | SYNCHRONIZE;
 
 /// The bytes of the file `name` in `dir`, or `None` if there is no such file. A link is opened, not
 /// followed, and has no bytes of its own to read.
@@ -131,6 +134,27 @@ pub(super) enum DeleteOutcome {
     Held,
     /// Windows refused the delete for a reason that is no handle: a permission, say.
     Failed(io::Error),
+    /// The directory `dir` is a link now, though it was not when it was opened: its account made it a mount
+    /// point while the handle was held. Every open relative to it fails with
+    /// `STATUS_REPARSE_POINT_NOT_RESOLVED` and reaches nothing of the target (KB 78c82b1); what is left
+    /// to do is to delete the link ([`Dir::remove`]), which no listing taken before it holds anything of.
+    Linked,
+}
+
+impl DeleteOutcome {
+    /// The outcome as a result, for a caller that needs the file gone and has nothing to wait for: held,
+    /// and a directory that became a link, are errors.
+    pub(super) fn into_result(self) -> io::Result<()> {
+        match self {
+            DeleteOutcome::Deleted => Ok(()),
+            DeleteOutcome::Held => Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION as i32)),
+            DeleteOutcome::Failed(e) => Err(e),
+            DeleteOutcome::Linked => Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "the directory became a link while goetia had it open",
+            )),
+        }
+    }
 }
 
 /// Deletes the file `name` of `dir` and says what became of it. This is the one place a failed delete is read
@@ -147,6 +171,8 @@ pub(super) enum DeleteOutcome {
 ///   answers access denied to a Win32 open and delete, as a permission that refuses it does (error 5 for
 ///   both); only the status under it, `STATUS_DELETE_PENDING` against `STATUS_ACCESS_DENIED`, tells them
 ///   apart, and the open reads it.
+/// - `STATUS_REPARSE_POINT_NOT_RESOLVED` says `dir` itself became a link: [`DeleteOutcome::Linked`], no
+///   failure.
 /// - Anything else, a directory by that name included, is a failure.
 ///
 /// Which account made the file is not read: a live pin of another account (after a change of account) is
@@ -158,23 +184,13 @@ pub(super) fn delete(dir: &Dir, name: &OsStr) -> DeleteOutcome {
             return DeleteOutcome::Deleted;
         }
         Err(STATUS_SHARING_VIOLATION) => return DeleteOutcome::Held,
+        Err(STATUS_REPARSE_POINT_NOT_RESOLVED) => return DeleteOutcome::Linked,
         Err(status) => return DeleteOutcome::Failed(io_error(status)),
     };
     match delete_by_disposition(&file) {
         Ok(()) => DeleteOutcome::Deleted,
         Err(e) if is_sharing_violation(&e) => DeleteOutcome::Held,
         Err(e) => DeleteOutcome::Failed(e),
-    }
-}
-
-/// Whether some handle holds the pin file `name`: [`delete`] says held. A pin nothing holds (one left by a
-/// power cut) is deleted by the asking and is not held. A delete that failed is returned: it says nothing
-/// about a handle.
-pub(super) fn is_held(dir: &Dir, name: &OsStr) -> io::Result<bool> {
-    match delete(dir, name) {
-        DeleteOutcome::Deleted => Ok(false),
-        DeleteOutcome::Held => Ok(true),
-        DeleteOutcome::Failed(e) => Err(e),
     }
 }
 
@@ -186,8 +202,10 @@ pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
 /// Removes the directory `name` of `dir` with everything in it, each entry through a handle opened relative
 /// to its parent: a link in the tree, a mount point or a symlink, is deleted and never followed. A handle
 /// anyone holds on something in the tree without sharing delete fails the removal, with the sharing
-/// violation. One that is not there is already removed.
-pub(super) fn remove_tree(dir: &Dir, name: &OsStr) -> io::Result<()> {
+/// violation. One that is not there is already removed. [`DeleteOutcome::Linked`] says `dir` is a link now;
+/// a directory in the tree that became one is deleted as a link. [`DeleteOutcome::Held`] is never the
+/// answer: what is held in the tree is a failure.
+pub(super) fn remove_tree(dir: &Dir, name: &OsStr) -> DeleteOutcome {
     let child = match dir.open_in(
         name,
         DELETE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -196,24 +214,45 @@ pub(super) fn remove_tree(dir: &Dir, name: &OsStr) -> io::Result<()> {
         SYNCHRONOUS_IO,
     ) {
         Ok(file) => file,
-        Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => return Ok(()),
-        Err(status) => return Err(io_error(status)),
+        Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => return DeleteOutcome::Deleted,
+        Err(STATUS_REPARSE_POINT_NOT_RESOLVED) => return DeleteOutcome::Linked,
+        Err(status) => return DeleteOutcome::Failed(io_error(status)),
     };
-    let child = Dir::from_open(child, dir.path().join(name))?;
+    let child = match Dir::from_open(child, dir.path().join(name)) {
+        Ok(child) => child,
+        Err(e) => return DeleteOutcome::Failed(e),
+    };
     if !child.is_link() {
-        for entry in child.list()? {
-            if entry.directory {
-                remove_tree(&child, &entry.name)?;
-            } else {
-                match delete(&child, &entry.name) {
-                    DeleteOutcome::Deleted => {}
-                    DeleteOutcome::Held => return Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION as i32)),
-                    DeleteOutcome::Failed(e) => return Err(e),
+        match child.list() {
+            Ok(entries) => {
+                if let Err(e) = remove_entries(&child, &entries) {
+                    return DeleteOutcome::Failed(e);
                 }
             }
+            Err(e) => return DeleteOutcome::Failed(e),
         }
     }
-    delete_by_disposition(child.file())
+    match delete_by_disposition(child.file()) {
+        Ok(()) => DeleteOutcome::Deleted,
+        Err(e) => DeleteOutcome::Failed(e),
+    }
+}
+
+/// Deletes the `entries` a listing of `dir` gave, each with its tree. `dir` that became a link since the
+/// listing has nothing of them to delete: the rest is skipped, and the caller deletes the link.
+fn remove_entries(dir: &Dir, entries: &[Listed]) -> io::Result<()> {
+    for entry in entries {
+        let outcome = if entry.directory {
+            remove_tree(dir, &entry.name)
+        } else {
+            delete(dir, &entry.name)
+        };
+        match outcome {
+            DeleteOutcome::Linked => break,
+            done => done.into_result()?,
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

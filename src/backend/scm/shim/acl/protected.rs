@@ -109,9 +109,12 @@ mod system {
         /// holds no entry on the files the other made (`0x1200eb`). Without the right to set attributes
         /// it cannot make the directory READONLY, which would keep an elevated removal from deleting it.
         /// Only SYSTEM and Administrators can delete, or delete-pend, the directory. It still has
-        /// `ADD_FILE`, which is all it takes to make the directory a mount point (KB 78c82b1): no mask
-        /// closes that, and the elevated side never follows one (`scm::runs`). A SID
-        /// that is not whole is an error.
+        /// `ADD_FILE`, which is all it takes to make the directory a mount point (KB ddcbd14): no mask
+        /// closes that, and the elevated side never follows one (`scm::runs`). **The masks cover the
+        /// directory and the files the account did not create.** A file the account creates is granted
+        /// what its creating open asks for, whatever the masks say (there is no entry to check yet), so
+        /// the handle of that open is as capable as the open asked it to be; goetia's own creating opens
+        /// ask for what they use. A SID that is not whole is an error.
         pub(crate) fn for_runs(principal: &Sid) -> Result<Self> {
             let principal = try_sid_display(principal).ok_or_else(|| {
                 Error::os(

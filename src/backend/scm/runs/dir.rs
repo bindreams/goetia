@@ -2,12 +2,12 @@
 //! it through that handle.
 //!
 //! The account a task runs as holds `ADD_FILE` on its own empty directory, which is all it takes to make it
-//! a mount point to any folder (KB 78c82b1, on windows-2022 and windows-2025); no permission closes that,
+//! a mount point to any folder (KB ddcbd14, on windows-2022 and windows-2025); no permission closes that,
 //! since an account that writes records needs the right. What the elevated side does to the directory is
 //! therefore done through one handle, opened without following a link and refused when it shows one
 //! ([`Dir::open`]); a removal alone takes a link and deletes it ([`Dir::open_even_if_link`]). The handle
 //! is measured to stay on the directory itself when the account makes it a mount point while the handle is
-//! held: its listing is empty and every open relative to it, a create too, fails with
+//! held (KB 78c82b1): its listing is empty and every open relative to it, a create too, fails with
 //! `STATUS_REPARSE_POINT_NOT_RESOLVED`, so nothing reaches the target. Every child is opened relative to
 //! the handle by its bare name ([`Dir::open_in`]), which does not follow a link either. There is no
 //! operation on a child by its path.
@@ -20,7 +20,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -34,14 +34,17 @@ use windows_sys::Win32::Foundation::{
     UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
-    FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfoEx,
+    DELETE, FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileAttributeTagInfo, FileDispositionInfoEx,
     FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdInfo, GetFileInformationByHandleEx, READ_CONTROL,
     SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+use crate::backend::scm::wide::wide_null;
 
 /// What every handle in a records directory shares: all of it. A holder that shared less would make
 /// another party's open, the account's or the removal's, a sharing violation of its own.
@@ -57,6 +60,12 @@ const ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_ADD_FILE | FILE_R
 /// `WriteFile`, which need it a synchronous handle; the access must then include `SYNCHRONIZE`. A handle
 /// for a delete, a rename or a query has neither: see [`Dir::open_in`].
 pub(super) const SYNCHRONOUS_IO: u32 = FILE_SYNCHRONOUS_IO_NONALERT;
+
+/// `IsReparseTagNameSurrogate`: whether a reparse `tag` says the file is another name for something else
+/// (a mount point, a symlink), which is bit 29. Any other tag is data on the file itself.
+pub(super) const fn is_name_surrogate(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
+}
 
 /// One entry of a directory's listing.
 pub(super) struct Listed {
@@ -101,9 +110,25 @@ impl Dir {
         Self::from_open(file, path.to_path_buf())
     }
 
-    /// `file`, which was opened without following a link, as the directory at `path`.
+    /// `file`, which was opened without following a link, as the directory at `path`. It is a link when it
+    /// has a reparse point whose tag is a name surrogate ([`is_name_surrogate`]); a directory with any
+    /// other tag is data goetia has no reason to refuse.
     pub(super) fn from_open(file: File, path: PathBuf) -> io::Result<Dir> {
-        let link = file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        // SAFETY: `info` is `size_of::<FILE_ATTRIBUTE_TAG_INFO>()` writable bytes; the handle is live.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as HANDLE,
+                FileAttributeTagInfo,
+                (&raw mut info).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The tag means something only where the attribute is set.
+        let link = info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && is_name_surrogate(info.ReparseTag);
         Ok(Dir { file, path, link })
     }
 
@@ -207,11 +232,11 @@ impl Dir {
             name.encode_wide().all(|unit| unit != u16::from(b'\\')),
             "a name, not a path"
         );
-        let mut units: Vec<u16> = name.encode_wide().collect();
+        // An interior NUL is refused as `wide_null` does everywhere goetia sends text; a counted string has
+        // no terminator to keep.
+        let mut units = wide_null(name).map_err(|_| STATUS_OBJECT_NAME_INVALID)?;
+        units.pop();
         let bytes = u16::try_from(units.len() * size_of::<u16>()).map_err(|_| STATUS_OBJECT_NAME_INVALID)?;
-        if units.contains(&0) {
-            return Err(STATUS_OBJECT_NAME_INVALID);
-        }
         let name = UNICODE_STRING {
             Length: bytes,
             MaximumLength: bytes,

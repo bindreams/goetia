@@ -5,10 +5,11 @@ use std::fs;
 use std::path::Path;
 
 use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
-use windows_sys::Win32::Foundation::STATUS_REPARSE_POINT_NOT_RESOLVED;
+use windows_sys::Win32::Foundation::{STATUS_OBJECT_NAME_INVALID, STATUS_REPARSE_POINT_NOT_RESOLVED};
 
 use super::*;
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
+use crate::backend::scm::test_support::{make_mount_point, set_reparse_point};
 
 /// A junction `link` in `dir`, to a folder holding the file `victim.txt`. Returns that folder, which
 /// is removed with the tempdir.
@@ -47,6 +48,85 @@ fn nothing_of_a_links_target_is_listed_or_opened_through_a_handle_on_the_link() 
 
     assert!(listed.is_empty(), "the target's files are not listed");
     assert_eq!(opened.err(), Some(STATUS_REPARSE_POINT_NOT_RESOLVED));
+}
+
+/// The directory the handle is held on becomes a mount point while it is held, as its account can make it:
+/// the handle is on the link, so a listing is empty and a relative open fails with the status that says so,
+/// which the removal reads (`STATUS_REPARSE_POINT_NOT_RESOLVED`).
+#[skuld::test]
+fn a_directory_that_becomes_a_mount_point_while_held_lists_nothing_and_opens_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = dir.path().join("held");
+    fs::create_dir(&held).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    fs::write(target.path().join("victim.txt"), "keep").unwrap();
+    let handle = Dir::open(&held).unwrap();
+
+    make_mount_point(&held, target.path());
+
+    assert!(handle.list().unwrap().is_empty());
+    assert_eq!(
+        handle
+            .open_in(OsStr::new("victim.txt"), FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, 0)
+            .err(),
+        Some(STATUS_REPARSE_POINT_NOT_RESOLVED)
+    );
+    assert!(Dir::open_even_if_link(&held).unwrap().is_link(), "a new open sees it");
+    handle.remove().unwrap();
+    assert!(!held.exists());
+    assert_eq!(fs::read(target.path().join("victim.txt")).unwrap(), b"keep");
+}
+
+/// Only a tag that names a surrogate of another name (a mount point, a symlink) is a link: a directory
+/// with any other tag is a directory of goetia's, listed and emptied through its handle. The tag values are
+/// Windows's (`ntifs.h`).
+#[skuld::test]
+fn only_a_name_surrogate_tag_is_a_link() {
+    for (tag, link) in [
+        (0xA000_0003u32, true), // IO_REPARSE_TAG_MOUNT_POINT
+        (0xA000_000C, true),    // IO_REPARSE_TAG_SYMLINK
+        (0x8000_0007, false),   // IO_REPARSE_TAG_HSM2
+        (0x9000_001A, false),   // IO_REPARSE_TAG_CLOUD_6
+        (0x8000_0023, false),   // IO_REPARSE_TAG_AF_UNIX
+        (0x0000_0000, false),
+    ] {
+        assert_eq!(is_name_surrogate(tag), link, "{tag:#x}");
+    }
+}
+
+/// The same on a real directory, where this host lets an unelevated account set a tag that is no
+/// surrogate: the handle does not call it a link.
+#[skuld::test]
+fn a_directory_with_a_tag_that_is_no_name_surrogate_is_listed_and_removed_like_any() {
+    let dir = tempfile::tempdir().unwrap();
+    let tagged = dir.path().join("tagged");
+    fs::create_dir(&tagged).unwrap();
+    let handle = Dir::open(&tagged).unwrap();
+    set_reparse_point(&tagged, 0x8000_0007, b"x");
+
+    let reopened = Dir::open(&tagged).expect("a directory with a tag that is no surrogate is not refused");
+    assert!(!reopened.is_link());
+    assert!(!Dir::open_even_if_link(&tagged).unwrap().is_link());
+    assert!(reopened.list().unwrap().is_empty());
+    drop(handle);
+    reopened.remove().unwrap();
+    assert!(!tagged.exists());
+}
+
+/// A name with a NUL in it is refused, not cut at it: the entry `a` would be opened for `a\0b`.
+#[skuld::test]
+fn a_name_with_a_nul_is_refused_and_not_cut() {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a"), "").unwrap();
+    let name = OsString::from_wide(&[u16::from(b'a'), 0, u16::from(b'b')]);
+
+    let opened = Dir::open(dir.path())
+        .unwrap()
+        .open_in(&name, FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, 0);
+
+    assert_eq!(opened.err(), Some(STATUS_OBJECT_NAME_INVALID));
 }
 
 /// A directory that is empty is deleted through the second handle; a link is deleted itself and what it
