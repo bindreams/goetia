@@ -17,8 +17,10 @@ use super::*;
 use crate::backend::Backend as _;
 use crate::backend::bounded::{self, Capture, Finished};
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
+use crate::backend::kill::Waited;
 use crate::backend::launchd::generate::timer_label;
 use crate::backend::standby;
+use crate::manager::Step;
 use crate::spec::{DaemonKind, DaemonSpec, StopAction, StopSignal, TaskFields, TaskSpec};
 use cosca::identity::Resolved;
 
@@ -787,35 +789,49 @@ fn a_process_launchd_no_longer_names_when_the_timeout_is_over_is_not_sent_sigkil
 }
 
 /// A deadline that is spent is the caller's timeout, whatever the pass would have done next: the stop reads
-/// nothing and sends nothing after it, and says what it had sent. Here the run was sent SIGTERM and its
-/// grace is over, which is when SIGKILL is due: it is not sent. The deadline is spent by construction
-/// (a bound of nothing), so no clock decides the outcome.
+/// nothing and sends nothing after it, and says what it had sent. A run sent SIGTERM whose grace is over is
+/// due SIGKILL, and it is not sent; one whose grace is not over has it still, and one that was sent SIGKILL
+/// has it said. The deadline is spent by construction (a bound of nothing), so no clock decides the outcome.
 #[skuld::test]
-fn a_stop_whose_deadline_is_spent_when_the_timeout_is_over_sends_no_sigkill() {
+fn a_stop_whose_deadline_is_spent_sends_nothing_and_says_what_it_sent() {
     let mut run = Held::ignoring_sigterm();
     let Resolved::Found(identity) = ProcessId::of(run.pid()) else {
         panic!("the child is running");
     };
-    let fake = Fake::new([]);
-    let mut course = Course::new(
-        Some(graced()),
-        Budget::Bounded(Duration::ZERO),
-        Watch::new().expect("a watch"),
-    );
-    course.termed = Some(Termed {
-        run: identity,
-        // Already over.
-        grace_end: Some(Budget::Immediate.start()),
-    });
+    let over = Budget::Immediate.start();
+    let not_over = Budget::Unbounded.start();
+    let cases = [
+        ("grace over", over, false, "before goetia sent SIGKILL"),
+        (
+            "grace pending",
+            not_over,
+            false,
+            "has the `stop-action` timeout to answer it",
+        ),
+        ("killed", over, true, "was sent SIGKILL"),
+    ];
+    for (what, grace_end, killed, says) in cases {
+        let fake = Fake::new([]);
+        let mut course = Course::new(
+            Some(graced()),
+            Budget::Bounded(Duration::ZERO),
+            Watch::new().expect("a watch"),
+        );
+        course.termed = Some(Termed {
+            run: identity,
+            grace_end: Some(grace_end),
+            killed,
+        });
 
-    let (result, sent) = stopping_course(&fake, course, Refusing::Nothing);
+        let (result, sent) = stopping_course(&fake, course, Refusing::Nothing);
 
-    let Err(Error::WaitTimeout { recovery, .. }) = &result else {
-        panic!("expected a wait timeout, got {result:?}");
-    };
-    assert!(recovery.contains("before goetia sent SIGKILL"), "{recovery}");
-    fake.assert_spent("nothing is read after the deadline");
-    assert_eq!(sent, [], "nothing is sent after the deadline");
+        let Err(Error::WaitTimeout { recovery, .. }) = &result else {
+            panic!("{what}: expected a wait timeout, got {result:?}");
+        };
+        assert!(recovery.contains(says), "{what}: {recovery}");
+        fake.assert_spent("nothing is read after the deadline");
+        assert_eq!(sent, [], "{what}: nothing is sent after the deadline");
+    }
     assert_eq!(run.finish(), Some(0), "the run was not signalled");
 }
 

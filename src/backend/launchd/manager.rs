@@ -1305,7 +1305,7 @@ const START_CALLS: usize = START_REQUESTS + 6 + 2;
 const SERVICE_STOP_CALLS: usize = SERVICE_STOP_REQUESTS + 1;
 /// One pass of a task's `stop`, the longest: the read of the job, and the confirmation of the process held
 /// (its `procinfo`, with the reads that go with it, one call's files). A pass that waits for a queued
-/// start's pid is shorter: the read, and the wait.
+/// start's pid is no longer: the read, and the wait.
 const TASK_STOP_CALLS: usize = 2;
 const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
 /// A task's `uninstall`: the two reads of which labels launchd holds, then both `bootout`s and their
@@ -1331,7 +1331,8 @@ const fn max(a: usize, b: usize) -> usize {
 }
 
 /// The most `step` draws, as `(requests, calls)`: for `install`, `uninstall`, `stop` and `kill`, the larger of a
-/// service's and a task's (a task's `stop` is counted per pass: a later pass reserves again). A draw
+/// service's and a task's (a task's `stop` is counted per pass: the first draws on this, and each later pass
+/// makes its own reservation of [`TASK_STOP_REQUESTS`] and [`TASK_STOP_CALLS`]). A draw
 /// past it is a miscount, caught by the assertion in [`Reservation`] in every test that runs the verb.
 ///
 /// `request_start_after_stop` is `start` under a budget that does not wait: it draws no more than

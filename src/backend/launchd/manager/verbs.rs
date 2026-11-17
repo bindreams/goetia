@@ -7,6 +7,7 @@
 //! SIGKILL once its `timeout` is over; SIGKILL at once for `kill`), each sent through a hold on the process
 //! and never by the label, and returns when launchd shows no process.
 
+use std::io;
 use std::time::{Duration, Instant};
 
 use cosca::Process;
@@ -15,13 +16,13 @@ use cosca::identity::ProcessId;
 use super::kill::JobKill;
 use super::task::TaskPrint;
 use super::watch::{Added, Watch};
-use super::{Launchd, Plist, UNLOAD_POLL, Until, never_expires};
+use super::{Launchd, Plist, TASK_STOP_CALLS, TASK_STOP_REQUESTS, UNLOAD_POLL, Until, never_expires, own_reservation};
 use crate::backend::bounded::{Reservation, Role};
-use crate::backend::kill::{Hold, KillOutcome, KillTarget, Signal, Waited, hold_pid, kill_failed, kill_service};
+use crate::backend::kill::{Hold, KillOutcome, KillTarget, Signal, failed_as, hold_pid, kill_failed, kill_service};
 use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, State, Step, flow};
+use crate::manager::{Budget, State};
 use crate::spec::{Id, StopAction, StopSignal};
 
 /// What one pass of `stop` left to do.
@@ -60,13 +61,15 @@ impl Ending {
     }
 }
 
-/// A run that was sent SIGTERM, and when its grace ends. The grace is the process's own, by identity: it
-/// began when that process was signalled.
+/// A run this stop has signalled, and when its grace ends. The grace is the process's own, by identity: it
+/// began when that process was sent SIGTERM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Termed {
     run: ProcessId,
-    /// `None` for a run with no grace: it is never sent SIGKILL.
+    /// `None` for a run with no grace: it is never sent SIGKILL after a SIGTERM.
     grace_end: Option<Deadline>,
+    /// SIGKILL has been sent to it, at once (`send-signal: kill`) or when its grace was over.
+    killed: bool,
 }
 
 /// What a `stop` carries from one pass to the next.
@@ -78,9 +81,9 @@ struct Course {
     /// no budget, so [`Self::extend`] moves the budget, and the deadline, which [`Self::deadline`] derives
     /// from it, with it. Unused under `Immediate`, which waits for no exit.
     counted: Budget,
-    /// The run last sent SIGTERM. A later pass can find the same run again (launchd's view lags, and a
-    /// confirmation can refuse): it is not sent a second one, and its grace is the one that began at the
-    /// first.
+    /// The run last signalled. A later pass can find the same run again (launchd's view lags, and a
+    /// confirmation can refuse): it is not sent a second SIGTERM, and its grace is the one that began at
+    /// the first.
     termed: Option<Termed>,
 }
 
@@ -103,10 +106,79 @@ impl Course {
         self.counted = self.counted.extended(by);
     }
 
-    /// `run`'s SIGTERM, if an earlier pass sent it. Another identity is another run, with a grace of its
+    /// The caller's timeout, if its deadline is spent: the one place a pass reads it, before it reads or
+    /// sends anything, and worded by what has been sent. `Immediate` waits for nothing, so it has no
+    /// deadline to spend.
+    fn timeout(&self, id: &str) -> Option<Error> {
+        if !matches!(self.counted, Budget::Bounded(_)) || !self.deadline().expired() {
+            return None;
+        }
+        let budget = self.counted;
+        Some(match self.termed {
+            Some(Termed { killed: true, .. }) => timed_out_stopping(id, budget, Escalation::Sent),
+            Some(Termed {
+                grace_end: Some(end), ..
+            }) => timed_out_stopping(
+                id,
+                budget,
+                if end.expired() {
+                    Escalation::Spent
+                } else {
+                    Escalation::Pending
+                },
+            ),
+            // Nothing was sent, or SIGTERM was and there is no grace to follow it.
+            Some(Termed { grace_end: None, .. }) | None => budget::timed_out(id, "stopped", budget),
+        })
+    }
+
+    /// `run`'s signals, if an earlier pass sent any. Another identity is another run, with a grace of its
     /// own, whatever pid it has.
     fn termed(&self, run: ProcessId) -> Option<Termed> {
         self.termed.filter(|termed| termed.run == run)
+    }
+
+    /// The signal due `run`, which a pass has held: its first, or SIGKILL once its grace is over. None for
+    /// a run that has been sent what it is due and whose grace is not over.
+    fn due(&self, run: ProcessId) -> Option<Signal> {
+        match self.termed(run) {
+            None if self.ending.kill => Some(Signal::Kill),
+            None => Some(Signal::Term),
+            Some(termed) if !termed.killed && termed.grace_end.is_some_and(|end| end.expired()) => Some(Signal::Kill),
+            Some(_) => None,
+        }
+    }
+
+    /// Records that `run` was sent `signal`. A run with a SIGTERM has its `timeout` to answer it, if the
+    /// caller waits that long.
+    fn sent(&mut self, run: ProcessId, signal: Signal) {
+        self.termed = Some(match (signal, self.termed(run)) {
+            (Signal::Term, _) => Termed {
+                run,
+                grace_end: self.ending.grace.map(|grace| Budget::Bounded(grace).start()),
+                killed: false,
+            },
+            (Signal::Kill, Some(termed)) => Termed { killed: true, ..termed },
+            (Signal::Kill, None) => Termed {
+                run,
+                grace_end: None,
+                killed: true,
+            },
+        });
+    }
+
+    /// When a pass stops waiting for `run`: at the end of its grace, if that comes before the deadline and
+    /// SIGKILL is still to be sent, else at the deadline.
+    fn wait_until(&self, run: ProcessId) -> Deadline {
+        let deadline = self.deadline();
+        match self.termed(run) {
+            Some(Termed {
+                grace_end: Some(end),
+                killed: false,
+                ..
+            }) if ends_before(end, deadline) => end,
+            _ => deadline,
+        }
     }
 }
 
@@ -203,7 +275,9 @@ impl Launchd {
         Ok(())
     }
 
-    /// Ends the run in flight, and returns once launchd shows no process. Each pass reads `print`:
+    /// Ends the run in flight, and returns once launchd shows no process. Every pass starts with the
+    /// deadline: a `Bounded` budget that is spent is the caller's timeout, worded by what has been sent, and
+    /// nothing is read or sent after it ([`Course::timeout`]). Then it reads `print`:
     ///
     /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
     ///   No process and any other state, or a `print` that failed or was not whole, is
@@ -215,18 +289,16 @@ impl Launchd {
     ///   it lasts as long as launchd's throttle, and `budget` is extended by exactly that wait: the
     ///   caller's bound is for the stop, not for launchd's throttle.
     /// - A pid: watches it, holds the process, confirms with launchd that it is the job's (as `kill`
-    ///   does: [`hold_pid`]), signals it through the hold, and waits for the exit under `budget`
-    ///   (`Immediate` does not wait). The signal is the `action`'s: SIGKILL for `send-signal: kill`, else
-    ///   SIGTERM. Neither goes by the label, which names whatever runs under it when the signal lands, so
-    ///   a process that is not the one held is never signalled, whatever pid launchd shows by then. A run
-    ///   that ignores SIGTERM for the action's `timeout`, which starts at its SIGTERM (if the budget lasts
-    ///   that long), is confirmed again and sent SIGKILL through the hold, unless the caller's deadline is
-    ///   spent by then: that is the timeout, with no SIGKILL sent. It is waited for under `budget` too: the
-    ///   `timeout` is the grace the user configured, as systemd's `TimeoutStopSec=` is. No `action`, or a
-    ///   `timeout` of `null`, never escalates. The SIGTERM and its grace belong to the process's
-    ///   identity, kept across passes: a pass that holds the same run again sends no second SIGTERM and
-    ///   does not restart the grace. A run that began meanwhile is a real run and is ended too, held and
-    ///   given a grace of its own, so the loop ends only when no process is left.
+    ///   does: [`hold_pid`]), sends it the signal it is due through the hold, and waits for the exit up to
+    ///   the deadline (`Immediate` does not wait). A run is due SIGKILL for `send-signal: kill`, else
+    ///   SIGTERM, and SIGKILL after that once the action's `timeout`, which starts at its SIGTERM, is
+    ///   over: the wait ends there if the deadline is later, and the next pass, which confirms the process
+    ///   again, sends it. Neither goes by the label, which names whatever runs under it when the signal
+    ///   lands, so a process that is not the one held is never signalled, whatever pid launchd shows by
+    ///   then. No `action`, or a `timeout` of `null`, never escalates. The signals sent and the grace
+    ///   belong to the process's identity, kept across passes: a pass that holds the same run again sends
+    ///   no second SIGTERM and does not restart the grace. A run that began meanwhile is a real run and is
+    ///   ended too, held and given a grace of its own, so the loop ends only when no process is left.
     ///
     /// A pid that exited before it was watched, or is not the job's any more, is the next pass, paced
     /// by [`UNLOAD_POLL`] while launchd's view catches up. The first pass draws on `reservation`, and each
@@ -248,6 +320,9 @@ impl Launchd {
 
     /// [`Self::stop_task`] over `course`, with the target of each pass made by `target`: the one place
     /// that decides what signals are sent, over whatever sends them.
+    ///
+    /// The deadline is read once for every pass, at its start, before anything is read or sent
+    /// ([`Course::timeout`]): a spent deadline is the caller's timeout, and nothing is sent after it.
     fn stop_course<T: KillTarget<Process = Process>>(
         &self,
         id: &Id,
@@ -255,9 +330,11 @@ impl Launchd {
         reservation: &mut Reservation,
         mut target: impl FnMut(&mut Reservation) -> Result<T>,
     ) -> Result<()> {
-        let budget = course.counted;
         let mut own: Option<Reservation> = None;
         loop {
+            if let Some(timeout) = course.timeout(id.as_str()) {
+                return Err(timeout);
+            }
             let pass = own.as_mut().unwrap_or(&mut *reservation);
             match self.stop_pass(id, &mut course, pass, &mut target)? {
                 Pass::Done => return Ok(()),
@@ -265,7 +342,7 @@ impl Launchd {
                 Pass::Queued(waited) => course.extend(waited),
                 Pass::Behind => std::thread::sleep(UNLOAD_POLL),
             }
-            own = Some(flow::reserved(self, id, &[Step::Stop], budget)?);
+            own = Some(own_reservation(id, TASK_STOP_REQUESTS, TASK_STOP_CALLS)?);
         }
     }
 
@@ -351,59 +428,28 @@ impl Launchd {
         let held = match hold_pid(&mut target, pid) {
             Ok(Hold::Held { process, .. }) => process,
             Ok(Hold::Ended { .. }) => return Ok(Pass::Behind),
-            Err(error) => return Err(kill_failed(name, error.into())),
+            Err(error) => return Err(stop_failed(name, "holding the process", error.into())),
         };
         let run = held.id();
-        let kills = course.ending.kill;
-        let grace_end = match course.termed(run) {
-            Some(termed) => termed.grace_end,
-            None if kills => {
-                target.signal(&held, Signal::Kill).map_err(|e| kill_failed(name, e))?;
-                None
-            }
-            None => {
-                target.signal(&held, Signal::Term).map_err(|e| kill_failed(name, e))?;
-                // A run sent SIGTERM has its `timeout` to answer, if the caller waits that long.
-                let grace_end = course.ending.grace.map(|grace| Budget::Bounded(grace).start());
-                course.termed = Some(Termed { run, grace_end });
-                grace_end
-            }
-        };
+        if let Some(signal) = course.due(run) {
+            target
+                .signal(&held, signal)
+                .map_err(|e| stop_failed(name, signal.sending(), e))?;
+            course.sent(run, signal);
+        }
         if course.counted == Budget::Immediate {
             return Ok(Pass::Done);
         }
-        let (budget, deadline) = (course.counted, course.deadline());
-        let (until, escalating) = match grace_end {
-            Some(end) if ends_before(end, deadline) => (end, true),
-            _ => (deadline, false),
-        };
-        if registered.wait(Some(until))?.is_some() {
-            return Ok(Pass::Again);
-        }
-        if !escalating {
-            return Err(match (kills, grace_end) {
-                (true, _) => timed_out_stopping(name, budget, Escalation::Sent),
-                (false, Some(_)) => timed_out_stopping(name, budget, Escalation::Pending),
-                (false, None) => budget::timed_out(name, "stopped", budget),
-            });
-        }
-        // The grace is over and the run is still there: launchd is asked again whether the process held is
-        // the job's, which it is not if the run has gone and the job has another, and then it is killed
-        // through the hold, never by its pid or by the label.
-        if !target.confirm(pid, &held).map_err(|e| kill_failed(name, e))? {
-            return Ok(Pass::Behind);
-        }
-        // A deadline that is spent is the caller's timeout, and nothing is sent after it.
-        if deadline.expired() {
-            return Err(timed_out_stopping(name, budget, Escalation::Spent));
-        }
-        target.signal(&held, Signal::Kill).map_err(|e| kill_failed(name, e))?;
-        // The wait for the exit is on the hold too: the watch is spent by the wait that ran out.
-        match target.await_exit(&held, deadline).map_err(|e| kill_failed(name, e))? {
-            Waited::Confirmed => Ok(Pass::Again),
-            Waited::Expired => Err(timed_out_stopping(name, budget, Escalation::Sent)),
-        }
+        // Whether the run exited or the wait ran out, the next pass decides: it reads the deadline first, and
+        // then launchd, and a run whose grace is over is sent SIGKILL by the pass that holds it.
+        registered.wait(Some(course.wait_until(run)))?;
+        Ok(Pass::Again)
     }
+}
+
+/// `e`, a failure of `doing` during a stop of `id`: the stop's own, in its words.
+fn stop_failed(id: &str, doing: &str, e: io::Error) -> Error {
+    failed_as(format!("stop `{id}`: {doing}"), e)
 }
 
 #[cfg(test)]

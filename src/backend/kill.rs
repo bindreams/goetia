@@ -50,6 +50,17 @@ pub enum Signal {
     Kill,
 }
 
+impl Signal {
+    /// What sending it is called in a failure: `sending SIGTERM`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn sending(self) -> &'static str {
+        match self {
+            Signal::Term => "sending SIGTERM",
+            Signal::Kill => "sending SIGKILL",
+        }
+    }
+}
+
 /// How a kill ended, when the manager could be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillOutcome {
@@ -66,7 +77,12 @@ pub enum KillOutcome {
 /// signal that was delivered ([`signalled_but`]) is the source of a step that says so. Any other error
 /// is an OS failure of the kill.
 pub(crate) fn kill_failed(id: &str, e: io::Error) -> Error {
-    carried(e).unwrap_or_else(|e| Error::os(format!("kill `{id}`"), e))
+    failed_as(format!("kill `{id}`"), e)
+}
+
+/// [`kill_failed`] for a verb other than `kill`: `what` is the verb's own action, as [`Error::Os`] has it.
+pub(crate) fn failed_as(what: impl Into<String>, e: io::Error) -> Error {
+    carried(e).unwrap_or_else(|e| Error::os(what, e))
 }
 
 /// What a [`KillTarget`] needs of the world, so the order of the steps is testable without one.

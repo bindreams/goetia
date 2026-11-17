@@ -29,9 +29,9 @@ impl Budget {
     /// bound behaves as `Immediate` everywhere a caller branches on this, and
     /// folding it in here spares every call site from doing so. The one
     /// exception is a launchd task's `stop`, which matches on the budget itself:
-    /// it waits for a queued start's pid under every budget, signals, and then
-    /// returns `Ok` under `Immediate` and [`Error::WaitTimeout`](crate::Error::WaitTimeout)
-    /// under a zero bound, which is a bound that has run out.
+    /// under `Immediate` it waits for a queued start's pid, signals and returns
+    /// `Ok`; a zero bound is a bound that has run out, so it reads nothing and
+    /// sends nothing and returns [`Error::WaitTimeout`](crate::Error::WaitTimeout).
     pub fn waits(self) -> bool {
         !matches!(self, Budget::Immediate | Budget::Bounded(Duration::ZERO))
     }
