@@ -111,7 +111,7 @@ pub(super) enum DeleteOutcome {
 /// - A file that is not there, or whose delete is pending, is deleted.
 /// - Anything else is a failure.
 ///
-/// A delete-pending file or directory answers access denied to an open and a delete, as a permission that
+/// A delete-pending file answers access denied to an open and a delete, as a permission that
 /// refuses the delete does: the Win32 error is 5 for both. Only the status under it differs, `STATUS_DELETE_PENDING`
 /// against `STATUS_ACCESS_DENIED`, and that is what [`delete_is_pending`] reads.
 ///
@@ -127,9 +127,9 @@ pub(super) fn delete(path: &Path) -> DeleteOutcome {
     }
 }
 
-/// Whether `error` is Win32's access denied, the answer to a file or directory that is delete-pending as
-/// much as to one a permission protects ([`delete_is_pending`] tells them apart).
-pub(super) fn is_access_denied(error: &io::Error) -> bool {
+/// Whether `error` is Win32's access denied, the answer to a file that is delete-pending as much as to
+/// one a permission protects ([`delete_is_pending`] tells them apart).
+fn is_access_denied(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
 }
 
@@ -149,10 +149,10 @@ pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
 }
 
-/// Whether the delete of `path` (a file or a directory) that failed with access denied found it with its
-/// delete pending, or found it gone since: the kernel's own answer to an open for `DELETE`. One the
+/// Whether the delete of the file `path` that failed with access denied found it with its delete
+/// pending, or found it gone since: the kernel's own answer to an open for `DELETE`. One the
 /// permissions refuse, or one that is there and opens, is not.
-pub(super) fn delete_is_pending(path: &Path) -> bool {
+fn delete_is_pending(path: &Path) -> bool {
     matches!(
         open_for_delete_status(path),
         Some(STATUS_DELETE_PENDING | STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND)
@@ -165,8 +165,13 @@ pub(super) fn delete_is_pending(path: &Path) -> bool {
 ///
 /// The open is made relative to a handle on the parent directory, by the bare file name, so no whole path
 /// is ever converted: a path past `MAX_PATH` (goetia has no long-path manifest) or in any prefix form is
-/// opened by `std` as it opens everything. A parent that is not there is a path that is gone. A name with
-/// a NUL in it is refused, not cut.
+/// opened by `std` as it opens everything.
+///
+/// The parent is the contract. A parent that is not there is a path that is gone
+/// (`STATUS_OBJECT_PATH_NOT_FOUND`). A parent that cannot be opened for any other reason (an account with
+/// the right to delete a child but not to open the directory, say) is `None`, which [`delete_is_pending`]
+/// reads as not pending: the delete is then a failure, never a delete taken as done. A name with a NUL in
+/// it is refused, not cut.
 fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
     let path = std::path::absolute(path).ok()?;
     let mut units = wide_null(path.file_name()?).ok()?;

@@ -540,7 +540,8 @@ fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_
         .unwrap_err();
 
     let text = failed.to_string();
-    assert!(text.contains("`nightly` is deleted"), "{text}");
+    assert!(text.contains("`nightly` is not installed"), "{text}");
+    assert!(!text.contains("is deleted"), "nothing was deleted: {text}");
     assert!(
         text.contains("Re-run `goetia daemon uninstall nightly` to remove them"),
         "{text}"

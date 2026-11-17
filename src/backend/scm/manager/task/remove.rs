@@ -30,6 +30,8 @@ enum Left {
     Disabled,
     /// The task is gone; its run records are not.
     Records,
+    /// There was no task, and nothing was deleted; records an earlier uninstall left are not removed.
+    LeftoverRecords,
 }
 
 /// An `uninstall` of `id` that failed with `cause`, led by what it left and the retry that finishes it.
@@ -46,6 +48,10 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
         Left::Records => format!(
             "`{id}` is deleted, but its run records could not be removed. Re-run `goetia daemon uninstall {id}` to \
              remove them"
+        ),
+        Left::LeftoverRecords => format!(
+            "`{id}` is not installed, and the run records an earlier uninstall left could not be removed. Re-run \
+             `goetia daemon uninstall {id}` to remove them"
         ),
     };
     Error::Step {
@@ -99,7 +105,8 @@ impl Scm {
     /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes
     /// the install lock. The records are removed under it: an install that has just made them holds it,
     /// and would lose them. With no records there is nothing to guard, and nothing is taken. A removal
-    /// that fails says what an `uninstall` that deleted the task and left its records says.
+    /// that fails says that the id is not installed and that its leftover records remain: nothing was
+    /// deleted.
     pub(super) fn uninstall_absent_with<L>(
         &self,
         id: &Id,
@@ -109,7 +116,7 @@ impl Scm {
         if runs.is_present() {
             let _lock = lock()?;
             runs.remove_all(waiting_for_records)
-                .map_err(|e| uninstall_failed(id, Left::Records, e))?;
+                .map_err(|e| uninstall_failed(id, Left::LeftoverRecords, e))?;
         }
         self.service_uninstall_absent()
     }
