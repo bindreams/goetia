@@ -74,6 +74,7 @@ pub(crate) fn open(pid: u32) -> io::Result<Option<Process>> {
 pub(crate) enum Signal {
     /// SIGTERM, the request to exit, which a process may answer or ignore. Not a [`KillTarget`] operation:
     /// only launchd's task stop sends it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Terminate,
     /// SIGKILL, the forced end that [`KillTarget::terminate`] is.
     Kill,
@@ -81,6 +82,7 @@ pub(crate) enum Signal {
 
 impl Signal {
     /// The signal's name, as a failure says it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Signal::Terminate => "SIGTERM",
