@@ -1010,7 +1010,7 @@ fn drawings() -> [Drawing; 5] {
             restart: Restart::Never,
             plist: marked_plist_restarting,
             calls: |_| fixed(&BOOTOUT),
-            drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
+            drew: (SERVICE_STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| Backend::stop(mgr, plist, Budget::DEFAULT, reservation),
         },
         // A task's longest `kill`: the first run finds no process, the read finds a start launchd has accepted
@@ -1043,7 +1043,7 @@ fn drawings() -> [Drawing; 5] {
             restart: Restart::Never,
             plist: marked_plist_restarting,
             calls: |_| fixed(&BOOTOUT),
-            drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
+            drew: (SERVICE_STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
                 Err(Error::Os { what, source, .. })
                     if what == "remove"
