@@ -902,7 +902,7 @@ fn remove_all_waits_for_a_handle_on_the_directory_that_shares_no_delete_and_name
     })
     .unwrap();
 
-    assert_eq!(noted, [runs.dir.clone()], "one pause, named once");
+    assert_eq!(noted, std::slice::from_ref(&runs.dir), "one pause, named once");
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
 }
