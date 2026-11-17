@@ -45,7 +45,7 @@ pub(super) fn local_to_system(local: &SYSTEMTIME) -> Option<SystemTime> {
     local_to_system_in(None, local)
 }
 
-/// [`local_to_system`] in `zone`, or in the machine's zone for `None`.
+/// The instant the civil time `local` is in `zone`, or in the machine's zone for `None`.
 pub(super) fn local_to_system_in(zone: Option<&TIME_ZONE_INFORMATION>, local: &SYSTEMTIME) -> Option<SystemTime> {
     let mut utc = SYSTEMTIME::default();
     let mut file_time = FILETIME::default();
