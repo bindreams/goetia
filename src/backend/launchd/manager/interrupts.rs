@@ -76,9 +76,6 @@ static WAKE: AtomicI32 = AtomicI32::new(-1);
 /// handler counts itself out before it claims its signal and raises it to the previous handler. So the
 /// close, which un-publishes the descriptor first, knows when none can write to it, and waits for no more
 /// than one `write` of each, never for the code of a previous handler, which may not return.
-///
-/// It is process-wide: a test that counts a handler in by hand, or looks at the wait it makes a close take,
-/// is reliable only while every test that opens a window takes `SERIAL`.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// The pipe a window's handler writes to and a wait reads, both ends non-blocking and close-on-exec.
@@ -310,6 +307,8 @@ fn shut(wake: Wake) -> u32 {
         test_hook::waited();
         std::thread::yield_now();
     }
+    #[cfg(test)]
+    test_hook::closing();
     drop(wake);
     OPEN.store(false, Ordering::SeqCst);
     claim(ALL)
@@ -416,7 +415,7 @@ fn restore(previous: &[libc::sigaction], taken: u32) {
 #[cfg(test)]
 mod test_hook {
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, PoisonError};
 
     use crate::backend::test_allowance::{Allowance, spend};
 
@@ -434,28 +433,45 @@ mod test_hook {
         spend(&STEPS, "no step of opening a window may be taken (test hook)")
     }
 
-    /// Whether a close has found a handler counted in and waited for it since [`forget_waits`]. It is
-    /// process-wide, so it is reliable only while every test that opens a window takes `SERIAL`.
-    static WAITED: AtomicBool = AtomicBool::new(false);
+    /// What a close did, in order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Event {
+        /// A pass of the wait for a handler that is counted in.
+        Waited,
+        /// About to close the pipe, the wait over.
+        Closing,
+    }
+
+    /// The events of closes since [`forget_events`], in order, a run of waits being one. It is process-wide,
+    /// so it is reliable only while every test that opens a window takes `SERIAL`.
+    static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+    fn record(event: Event) {
+        let mut events = EVENTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if event != Event::Waited || events.last() != Some(&Event::Waited) {
+            events.push(event);
+        }
+    }
 
     /// The close is waiting for a handler: called on each pass of its wait, so a close that does not wait
     /// never calls it.
     pub(super) fn waited() {
-        WAITED.store(true, Ordering::SeqCst);
+        record(Event::Waited);
     }
 
-    /// Whether [`waited`] was called since [`forget_waits`]; see [`WAITED`] for when this can be relied on.
-    pub(super) fn has_waited() -> bool {
-        WAITED.load(Ordering::SeqCst)
+    /// The close is about to close the pipe.
+    pub(super) fn closing() {
+        record(Event::Closing);
     }
 
-    /// Clears [`WAITED`]; see it for when that is reliable. The caller holds `SERIAL`.
-    pub(super) fn forget_waits() {
-        debug_assert!(
-            super::interrupts_tests::holds_serial(),
-            "the wait flag is process-wide: take SERIAL before clearing it"
-        );
-        WAITED.store(false, Ordering::SeqCst);
+    /// The events since [`forget_events`]; see [`EVENTS`] for when this can be relied on.
+    pub(super) fn events() -> Vec<Event> {
+        EVENTS.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Clears [`EVENTS`]; see it for when that is reliable. The caller holds `SERIAL`.
+    pub(super) fn forget_events() {
+        EVENTS.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
 }
 

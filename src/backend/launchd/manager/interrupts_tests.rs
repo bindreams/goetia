@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, MutexGuard};
@@ -28,11 +28,6 @@ thread_local! {
 
 /// The turn a test takes before it changes the process's signal dispositions.
 pub(in crate::backend::launchd::manager) struct Serial(Option<MutexGuard<'static, ()>>);
-
-/// Whether this thread has the turn.
-pub(super) fn holds_serial() -> bool {
-    HOLDS.get()
-}
 
 /// Waits for the turn, unless this thread has it.
 pub(in crate::backend::launchd::manager) fn serial() -> Serial {
@@ -204,34 +199,6 @@ fn readable(fd: RawFd) -> bool {
     let ready = unsafe { libc::poll(&mut asked, 1, 0) };
     assert!(ready >= 0, "poll {fd}: {}", io::Error::last_os_error());
     ready == 1 && asked.revents & libc::POLLIN != 0
-}
-
-/// A duplicate of the read end of a pipe, kept so that the pipe's write end can be told open or closed
-/// from outside it: the dup is a reader, so it sees a hang-up exactly when no write end is open.
-struct Reader(OwnedFd);
-
-impl Reader {
-    fn of(read: RawFd) -> Reader {
-        // SAFETY: `fcntl` with `F_DUPFD_CLOEXEC` only makes a new descriptor of an open one.
-        let dup = unsafe { libc::fcntl(read, libc::F_DUPFD_CLOEXEC, 0) };
-        assert!(dup >= 0, "duplicate {read}: {}", io::Error::last_os_error());
-        // SAFETY: `dup` is a descriptor that nothing else owns.
-        Reader(unsafe { OwnedFd::from_raw_fd(dup) })
-    }
-
-    /// Whether every write end of the pipe is closed: a `poll` that waits for nothing, at the state of the
-    /// pipe, which a reused descriptor number or inode cannot fake.
-    fn hung_up(&self) -> bool {
-        let mut asked = libc::pollfd {
-            fd: self.0.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `asked` is one valid `pollfd`, and a zero timeout does not block.
-        let ready = unsafe { libc::poll(&mut asked, 1, 0) };
-        assert!(ready >= 0, "poll the pipe: {}", io::Error::last_os_error());
-        asked.revents & libc::POLLHUP != 0
-    }
 }
 
 fn errno() -> i32 {
@@ -510,24 +477,25 @@ fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
 
 /// The last drop un-publishes the write end and then waits for a handler that is running before it closes
 /// the pipe, so a handler never writes to a closed descriptor. A running handler is stood in for by a count
-/// that the test holds. The test waits for the closing thread to say that it is waiting for that handler
-/// ([`test_hook::has_waited`]), or to end, which it must not do: a close that does not wait ends without
-/// setting the flag, and is told apart from one that waits whatever the schedule, as both waits are on a
-/// fact. Once it waits, the descriptor is un-published and the pipe's write end is open, told by a reader
-/// of the pipe that sees no hang-up; after the handler is out, the write end is closed.
+/// that the test holds, and the close reports its steps in order ([`test_hook::events`]). The test waits for
+/// the close to report a wait, or for the closing thread to end, which it must not do. Once it waits, the
+/// descriptor is un-published and the close has not reached the pipe; after the handler is out, it has,
+/// and only after the wait. A close that does not wait never reports one, and one that closes first reports
+/// that first, so each fails whatever the schedule.
 #[skuld::test]
 fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
+    use test_hook::Event::{Closing, Waited};
+
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
-    let reader = Reader::of(deferred.wake());
     let mut closing = Joined::default();
     let running = Running::enter();
-    test_hook::forget_waits();
+    test_hook::forget_events();
 
     closing.0 = Some(std::thread::spawn(move || drop(deferred)));
-    // The flag is set on a pass of the wait, which comes before the thread can end: a thread that has ended
-    // with the flag still clear never waited.
-    while !test_hook::has_waited() {
+    // The wait is reported on a pass of it, which comes before the thread can end: a thread that has ended
+    // with no wait reported never waited.
+    while !test_hook::events().contains(&Waited) {
         if closing.ended() {
             closing.fail("the closing thread ended while a handler was running");
         }
@@ -538,14 +506,19 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
         -1,
         "the write end is un-published before the wait"
     );
-    assert!(
-        !reader.hung_up(),
-        "a handler is running, so the write end is still open"
+    assert_eq!(
+        test_hook::events(),
+        [Waited],
+        "a handler is running, so the close has not reached the pipe"
     );
 
     drop(running);
     closing.finish();
-    assert!(reader.hung_up(), "the write end is closed once the handler is out");
+    assert_eq!(
+        test_hook::events(),
+        [Waited, Closing],
+        "the pipe is closed after the wait"
+    );
     before.assert_back();
 }
 
