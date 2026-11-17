@@ -422,7 +422,11 @@ fn remove_all_while_a_run_holds_a_pin_fails_saying_so_and_goes_through_when_it_r
     let text = error.to_string();
     assert!(text.contains("a run is waiting"), "{text}");
     assert!(text.contains(&runs.dir.display().to_string()), "{text}");
-    assert_eq!(runs.appeared(&pin).unwrap(), [], "the waiting run still reads its directory");
+    assert_eq!(
+        runs.appeared(&pin).unwrap(),
+        [],
+        "the waiting run still reads its directory"
+    );
     drop(pin);
     runs.remove_all().unwrap();
     assert!(!runs.dir.exists());

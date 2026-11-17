@@ -337,7 +337,9 @@ fn a_stop_that_cannot_take_the_pin_is_denied_by_name_and_sends_no_stop() {
     let (_dir, path, runs) = records();
     let _denied = Denied::new(&path);
     let fake = Fake::new();
-    fake.on_instances(one(4242)).on_instances(one(4242)).on_instances(one(4242));
+    fake.on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242));
     let mut machine = Machine::new(&fake, &[4242]);
 
     let failed = stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap_err();
