@@ -188,9 +188,9 @@ try {
     $null = Register-ProbeTask $folder 'marker' $mxml $P
     "marker due at civil $markerCiv (real $($u0.AddMinutes(130).ToString('HH:mm')) UTC)"
     "registered at $([DateTime]::UtcNow.ToString('o')) UTC"
+    foreach ($n in $names) { Info ($folder.GetTask($n)) $n }
     Section "GetRunTimes of the change day, as registered"
-    foreach ($n in 'rep-ign', 'lone-ign') { Listing $n $day $nextDay }
-    foreach ($n in $names) { Info (($folder.GetTask($n))) $n }
+    foreach ($n in 'lone-ign', 'rep-ign') { Listing $n $day $nextDay }
 
     # ---- Step 3: wait for the marker's line, the real condition; print the progress every five minutes.
     $lastP = [DateTime]::MinValue

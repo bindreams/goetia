@@ -27,6 +27,15 @@ fn plus_secs(s: &SYSTEMTIME, secs: u64) -> SYSTEMTIME {
     }
 }
 
+fn ft_of(s: &SYSTEMTIME) -> u64 {
+    // SAFETY: a plain conversion on a live struct.
+    unsafe {
+        let mut ft = FILETIME::default();
+        let _ = SystemTimeToFileTime(s, &mut ft);
+        ft_u64(ft)
+    }
+}
+
 fn dow(y: u16, m: u16, d: u16) -> u16 {
     let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let y = if m < 3 { y - 1 } else { y } as i32;
@@ -93,6 +102,7 @@ pub fn run(a: &[String]) -> i32 {
     let cap: u32 = a.get(3).and_then(|c| c.parse().ok()).unwrap_or(100_000);
     let mut all: Vec<SYSTEMTIME> = Vec::new();
     let mut cur = start;
+    let mut last_key = 0u64;
     loop {
         match call(&t, &cur, &end, cap) {
             Err(h) => {
@@ -103,6 +113,15 @@ pub fn run(a: &[String]) -> i32 {
                 if v.is_empty() {
                     break;
                 }
+                // A page that ends at or before the previous page's last time would make this loop forever (a time that
+                // DST moved back is listed at or before the window's start): say so and stop paging.
+                let key = ft_of(v.last().unwrap());
+                if key <= last_key {
+                    println!("paging stopped: a page from {} ended at {}, not after the previous page's last time ({} times in it)", fmt(&cur), fmt(v.last().unwrap()), v.len());
+                    all.extend(v);
+                    break;
+                }
+                last_key = key;
                 cur = plus_secs(v.last().unwrap(), 1);
                 all.extend(v);
             }
