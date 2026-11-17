@@ -7,7 +7,9 @@ use std::io;
 
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, shim_writes, snapshot_of};
+use super::super::support::{
+    Machine, PATH, id, instance, instance_id, linked_records, record, records, scm, shim_writes, snapshot_of,
+};
 use super::*;
 use crate::backend::ReadOutcome;
 use crate::backend::kill::Waited;
@@ -67,6 +69,34 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
         "its exit is waited for after the stop and before the delete"
     );
     assert!(!records_dir.exists(), "the records go with the task");
+    fake.finish();
+}
+
+/// The account can make the task's records directory a link. The uninstall goes on all the same: the run
+/// is stopped, and the link is deleted with what it points to left as it was.
+#[skuld::test]
+fn uninstall_of_a_task_whose_records_directory_is_a_link_stops_the_run_and_deletes_the_link() {
+    let (_dir, records_dir, runs, target) = linked_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_stop(Ok(()))
+        .on_delete(Ok(true));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .unwrap();
+
+    assert!(fake.calls().contains(&Call::Stop(PATH.to_owned(), instance_id(1))));
+    assert!(std::fs::symlink_metadata(&records_dir).is_err(), "the link is gone");
+    assert!(
+        target.path().join(format!("{}.json", instance_id(1).hex())).exists(),
+        "what it pointed to is as it was"
+    );
     fake.finish();
 }
 
