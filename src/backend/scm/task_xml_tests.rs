@@ -4,7 +4,7 @@ use super::*;
 use crate::backend::Identity;
 use crate::backend::scm::generate::{WindowsDefinition, registration};
 use crate::spec::test_support::{abs, program};
-use crate::spec::{AccountId, DaemonSpec, TaskSpec, User};
+use crate::spec::{AccountId, DaemonSpec, StopAction, StopSignal, TaskSpec, User};
 use crate::testing::task;
 use roxmltree::{Document, Node};
 
@@ -397,6 +397,43 @@ fn a_virtual_account_is_refused_naming_the_limit() {
                  account"
             )
         );
+    }
+}
+
+/// Task Scheduler decides how a task is stopped, so a `stop-action` written to the spec is a request Windows
+/// cannot honour: refused, naming the task and the limit, by the registration and by the install's alike (a
+/// spec from a blob never passed `resolve`).
+#[skuld::test]
+fn a_stop_action_for_a_task_is_refused_naming_the_task_and_the_limit() {
+    let DaemonSpec::Task(task) = spec() else {
+        unreachable!("a task spec")
+    };
+    let mut fields = task.into_fields();
+    fields.stop_action = StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    };
+    let spec = TaskSpec::new(fields).map(DaemonSpec::from).unwrap();
+    let host = || Ok(host());
+
+    for (what, error) in [
+        ("registration", registration(&spec, &identity(), &host).unwrap_err()),
+        (
+            "install_registration",
+            crate::backend::scm::generate::install_registration(&spec, &identity(), &host).unwrap_err(),
+        ),
+    ] {
+        match error {
+            Error::Invalid { daemon, message, .. } => {
+                assert_eq!(daemon.as_str(), ID, "{what}");
+                assert!(
+                    message.contains("`stop-action.send-signal`")
+                        && message.contains("a task on Windows is stopped by Task Scheduler"),
+                    "{what}: {message}"
+                );
+            }
+            other => panic!("{what}: expected Error::Invalid, got {other:?}"),
+        }
     }
 }
 
