@@ -10,7 +10,9 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Wdk::Foundation::{NtClose, OBJECT_ATTRIBUTES};
-use windows_sys::Wdk::Storage::FileSystem::{FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, NtOpenFile};
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, NtOpenFile, RtlDosPathNameToNtPathName_U_WithStatus,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE,
     STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
@@ -20,6 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::WindowsProgramming::RtlFreeUnicodeString;
 
 /// Creates `path`, or empties what an interrupted write left there, for a record's bytes. Others
 /// may read it but not delete it while it is held, so a write in flight is not pruned from under it.
@@ -116,13 +119,7 @@ pub(super) enum DeleteOutcome {
 /// Which account made the file is not read: a live pin of another account (after a change of account) is
 /// told from a stale one by the sharing and by nothing else.
 pub(super) fn delete(path: &Path) -> DeleteOutcome {
-    judged(std::fs::remove_file(path), path)
-}
-
-/// What `result`, of a delete of `path` (a file, or a directory or tree that is removed with it), means:
-/// see [`delete`].
-pub(super) fn judged(result: io::Result<()>, path: &Path) -> DeleteOutcome {
-    match result {
+    match std::fs::remove_file(path) {
         Ok(()) => DeleteOutcome::Deleted,
         Err(e) if e.kind() == io::ErrorKind::NotFound => DeleteOutcome::Deleted,
         Err(e) if is_sharing_violation(&e) => DeleteOutcome::Held,
@@ -144,8 +141,8 @@ pub(super) fn is_held(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Whether `error` says another handle has the file open without sharing what was asked.
-fn is_sharing_violation(error: &io::Error) -> bool {
+/// Whether `error` says another handle has the file or directory open without sharing what was asked.
+pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
 }
 
@@ -199,21 +196,30 @@ fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
     Some(status)
 }
 
-/// `path` as the name `ntdll` takes: absolute, under `\??\`, as UTF-16 with no terminator.
+/// `path` as the name `ntdll` takes (under `\??\`), as UTF-16 with no terminator: the OS's own conversion
+/// of a DOS path, which knows `\\?\`, `\\.\`, UNC and relative forms (measured: KB 2b01933).
 fn nt_path(path: &Path) -> io::Result<Vec<u16>> {
-    let absolute: Vec<u16> = std::path::absolute(path)?.as_os_str().encode_wide().collect();
-    let backslash = u16::from(b'\\');
-    let verbatim = [backslash, backslash, u16::from(b'?'), backslash];
-    let mut nt: Vec<u16> = r"\??\".encode_utf16().collect();
-    if let Some(rest) = absolute.strip_prefix(&verbatim[..]) {
-        nt.extend_from_slice(rest);
-    } else if let Some(rest) = absolute.strip_prefix(&[backslash, backslash][..]) {
-        nt.extend(r"UNC\".encode_utf16());
-        nt.extend_from_slice(rest);
-    } else {
-        nt.extend_from_slice(&absolute);
+    let dos: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut nt = UNICODE_STRING {
+        Length: 0,
+        MaximumLength: 0,
+        Buffer: null_mut(),
+    };
+    // SAFETY: `dos` is NUL-terminated and outlives the call; `nt` is a valid out-pointer, and the optional
+    // out-pointers are null.
+    let status = unsafe { RtlDosPathNameToNtPathName_U_WithStatus(dos.as_ptr(), &mut nt, null_mut(), null()) };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "the name {} has no NT form (status {:#010x})",
+            path.display(),
+            status as u32
+        )));
     }
-    Ok(nt)
+    // SAFETY: on success `Buffer` holds `Length` bytes, which are copied out before they are freed.
+    let units = unsafe { std::slice::from_raw_parts(nt.Buffer, usize::from(nt.Length) / size_of::<u16>()) }.to_vec();
+    // SAFETY: `nt` was filled in by the conversion, which allocated its buffer for the caller to free.
+    unsafe { RtlFreeUnicodeString(&mut nt) };
+    Ok(units)
 }
 
 #[cfg(test)]

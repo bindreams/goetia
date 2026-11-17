@@ -54,13 +54,14 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
     }
 }
 
-/// What an uninstall says on stderr, once, when its removal of the run records has to wait: the manager
-/// has no channel for a notice, so it is said as its warnings are. A `run` that still waits for a record
-/// holds the directory, and returns after the stop that came before.
-fn waiting_for_records(held: &Path) {
+/// What an uninstall says on stderr when its removal of the run records has to wait, each time the path it
+/// waits for changes: the manager has no channel for a notice, so it is said as its warnings are. A `run`
+/// that still waits for a record holds the directory, and returns after the stop that came before; a
+/// file whose delete is pending goes when the last handle on it closes.
+fn waiting_for_records(waits_for: &Path) {
     eprintln!(
-        "waiting for a `run` or another program that holds {} to let go",
-        held.display()
+        "waiting for {} to be released by a `run` or another program that has it open",
+        waits_for.display()
     );
 }
 
@@ -101,7 +102,10 @@ impl Scm {
     pub(super) fn uninstall_absent_with<L>(&self, runs: &Runs, lock: impl FnOnce() -> Result<L>) -> Result<()> {
         if runs.is_present() {
             let _lock = lock()?;
-            runs.remove_all(waiting_for_records)?;
+            runs.remove_all(waiting_for_records).map_err(|e| Error::Step {
+                what: "remove the run records of a task that is gone".to_owned(),
+                source: Box::new(e),
+            })?;
         }
         self.service_uninstall_absent()
     }

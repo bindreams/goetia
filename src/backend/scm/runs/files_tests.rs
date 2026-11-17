@@ -2,6 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt as _;
+use std::path::PathBuf;
 
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
 
@@ -77,6 +78,40 @@ fn a_file_whose_delete_is_pending_is_deleted_and_any_other_failure_is_a_failure(
         "a delete that fails for no handle and no pending delete is a failure"
     );
     assert!(is_held(&refused).is_err());
+}
+
+/// The name `ntdll` takes is the OS's own conversion of the DOS path. `\\.\C:\x` is the drive's path, not a
+/// UNC one: read as UNC it names no file, and a file the permissions refuse would be taken for one that is
+/// gone.
+#[skuld::test]
+fn nt_path_is_the_conversion_the_os_makes_and_a_device_path_is_not_unc() {
+    let nt = |dos: &str| String::from_utf16(&nt_path(Path::new(dos)).unwrap()).unwrap();
+
+    assert_eq!(nt(r"C:\a\.\b"), r"\??\C:\a\b");
+    assert_eq!(nt(r"\\?\C:\a\b"), r"\??\C:\a\b");
+    assert_eq!(nt(r"\\.\C:\a\b"), r"\??\C:\a\b");
+    assert_eq!(nt(r"\\server\share\x"), r"\??\UNC\server\share\x");
+    assert_eq!(nt(r"\\?\UNC\server\share\x"), r"\??\UNC\server\share\x");
+}
+
+/// A delete read through a device path (`%ProgramData%` given as `\\.\C:\...`) tells a pending delete from a
+/// refusal as it does through any path.
+#[skuld::test]
+fn a_device_path_gives_the_same_verdicts_as_a_drive_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = |path: &Path| PathBuf::from(format!(r"\\.\{}", path.display()));
+
+    let pending = dir.path().join("pin-a.pin");
+    let reader = delete_pending(&pending);
+    assert!(matches!(delete(&device(&pending)), DeleteOutcome::Deleted));
+    drop(reader);
+
+    let refused = dir.path().join("pin-b.pin");
+    directory_with_a_file(&refused);
+    assert!(
+        matches!(delete(&device(&refused)), DeleteOutcome::Failed(_)),
+        "a refusal is a failure, not a file that is gone"
+    );
 }
 
 #[skuld::test]

@@ -528,6 +528,30 @@ fn uninstall_of_an_id_with_no_records_takes_no_lock() {
         .unwrap();
 }
 
+/// A removal of the records of an id that is gone that fails says what it was removing, with the cause under
+/// it: the id is not installed, so the path alone would not say what the command was doing.
+#[skuld::test]
+fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_fails() {
+    let (_dir, records_dir, runs) = records();
+    crate::backend::scm::test_support::directory_with_a_file(&records_dir.join("pin-odd.pin"));
+
+    let failed = scm(&Fake::new())
+        .uninstall_absent_with(&runs, || -> Result<()> { Ok(()) })
+        .unwrap_err();
+
+    assert!(
+        failed
+            .to_string()
+            .contains("remove the run records of a task that is gone"),
+        "{failed}"
+    );
+    assert!(
+        failed.report().to_string().contains("pin-odd.pin"),
+        "{}",
+        failed.report()
+    );
+}
+
 // Retype ==============================================================================================================
 
 /// A crash between the removal and the creation leaves nothing at the id, which reads as absent, and

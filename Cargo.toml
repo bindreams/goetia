@@ -159,8 +159,8 @@ winreg = "0.56"
 # (`manager::registry`); the owner and DACL reads of the shim folder check (`scm::shim::acl`), the
 # protected DACL a shim file is created with, and `%ProgramFiles%` (`SHGetKnownFolderPath`, whose
 # string `CoTaskMemFree` releases: `Win32_System_Com`), and the `NtOpenFile` status that tells a file
-# whose delete is pending from one a permission protects (`Wdk_Storage_FileSystem`, `Win32_System_IO`;
-# `scm::runs::files`).
+# whose delete is pending from one a permission protects, with the path in the form `ntdll` takes
+# (`Wdk_Storage_FileSystem`, `Win32_System_IO`, `Win32_System_WindowsProgramming`; `scm::runs::files`).
 #
 # The shim (`src/backend/scm/shim/run/`) adds `Win32_System_EventLog`, the
 # version-skew/log-path-denied fallback channel — see
@@ -183,6 +183,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
     "Win32_UI_Shell",
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

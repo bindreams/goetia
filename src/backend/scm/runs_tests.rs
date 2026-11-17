@@ -8,7 +8,8 @@ use std::thread;
 
 use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, READ_CONTROL, WRITE_DAC,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    READ_CONTROL, WRITE_DAC,
 };
 
 use super::*;
@@ -552,8 +553,9 @@ fn remove_all_takes_a_file_whose_delete_is_pending_as_deleted() {
     let pending_record = delete_pending(&runs.dir.join(file_of(&instance(2))));
     let writing = files::create_temp(&runs.dir.join(format!("{}.json.tmp", instance(3).hex()))).unwrap();
 
-    runs.remove_all(|_| drop((pending_pin, pending_record, writing)))
-        .unwrap();
+    let mut handles = Some((pending_pin, pending_record, writing));
+
+    runs.remove_all(|_| drop(handles.take())).unwrap();
 
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
@@ -569,10 +571,11 @@ fn remove_all_waits_for_a_temp_file_the_shim_is_writing_and_names_it() {
     let temp = runs.dir.join(format!("{}.json.tmp", instance(2).hex()));
     let writing = files::create_temp(&temp).unwrap();
     let mut noted = None;
+    let mut writing = Some(writing);
 
     runs.remove_all(|held| {
         noted = Some(held.to_path_buf());
-        drop(writing);
+        drop(writing.take());
     })
     .unwrap();
 
@@ -744,10 +747,11 @@ fn remove_all_refuses_a_new_pin_while_it_waits_on_one() {
     runs.write(&record(1, 1)).unwrap();
     let pin = runs.pin().unwrap();
     let mut probe = None;
+    let mut pin = Some(pin);
 
     runs.remove_all(|_| {
         probe = Some((runs.marker.exists(), runs.hold().err().map(|e| e.kind())));
-        drop(pin);
+        drop(pin.take());
     })
     .unwrap();
 
@@ -798,16 +802,116 @@ fn remove_all_waits_for_a_file_another_program_holds_and_names_it() {
         .open(runs.dir.join(&held_name))
         .unwrap();
     let mut noted = None;
+    let mut held = Some(held);
 
     runs.remove_all(|path| {
         noted = Some(path.to_path_buf());
-        drop(held);
+        drop(held.take());
     })
     .unwrap();
 
     assert_eq!(noted, Some(runs.dir.join(&held_name)));
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
+}
+
+/// A file whose delete is pending keeps the directory from going, and a held temp file does too; the
+/// removal names each as the one it waits for, when that changes: the temp file first, then the record
+/// whose delete is pending, which goes when its handle does. A pause with nothing to say for it was silent.
+#[skuld::test]
+fn remove_all_names_each_thing_it_waits_for_as_it_changes() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let pending = runs.dir.join(file_of(&instance(2)));
+    let temp = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
+    let mut reader = Some(delete_pending(&pending));
+    let mut writing = Some(files::create_temp(&temp).unwrap());
+    let mut noted = Vec::new();
+
+    runs.remove_all(|path| {
+        noted.push(path.to_path_buf());
+        if path == temp {
+            drop(writing.take());
+        } else {
+            drop(reader.take());
+        }
+    })
+    .unwrap();
+
+    assert_eq!(noted, [temp, pending]);
+    assert!(!runs.dir.exists());
+}
+
+/// A directory of a name that is not goetia's is removed with its tree. One that cannot be (a handle on a
+/// file in it that shares no delete) ends the removal at once, naming the directory and not the file deep
+/// in it: it is no pause, since what is wrong is not goetia's to wait out. The marker stays; once the handle
+/// goes, the removal runs again and finishes.
+#[skuld::test]
+fn remove_all_fails_at_once_naming_a_directory_of_a_foreign_name_it_cannot_remove() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let sub = runs.dir.join("sub");
+    directory_with_a_file(&sub);
+    directory_with_a_file(&sub.join("inner"));
+    let holder = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(sub.join("inner").join("inside"))
+        .unwrap();
+
+    let failed = runs.remove_all(no_note).unwrap_err();
+
+    let text = failed.to_string();
+    assert!(text.contains(&sub.display().to_string()), "{text}");
+    assert!(!text.contains("inner"), "the top directory is named: {text}");
+    assert!(runs.marker.exists());
+    drop(holder);
+    runs.remove_all(no_note).unwrap();
+    assert!(!runs.dir.exists());
+}
+
+/// The directory itself held by a handle that shares no delete: a sharing violation, which is waited for
+/// and named as a file is. Measured on windows-2022 and windows-2025 (KB 2b01933).
+#[skuld::test]
+fn remove_all_waits_for_a_handle_on_the_directory_that_shares_no_delete_and_names_it() {
+    let (_dir, runs) = fixture();
+    let holder = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&runs.dir)
+        .unwrap();
+    let mut holder = Some(holder);
+    let mut noted = None;
+
+    runs.remove_all(|path| {
+        noted = Some(path.to_path_buf());
+        drop(holder.take());
+    })
+    .unwrap();
+
+    assert_eq!(noted, Some(runs.dir.clone()));
+    assert!(!runs.dir.exists());
+    assert!(!runs.marker.exists());
+}
+
+/// A handle that shares delete is no obstacle: the name goes at once, as for a file (KB 2b01933), so the
+/// removal pauses for nothing and has no delete-pending directory to tell.
+#[skuld::test]
+fn remove_all_removes_a_directory_at_once_while_a_handle_that_shares_delete_is_open() {
+    let (_dir, runs) = fixture();
+    let holder = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&runs.dir)
+        .unwrap();
+
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.dir.exists());
+    assert!(!runs.marker.exists());
+    drop(holder);
 }
 
 /// A removal that fails leaves its marker, so that a `run` still backs off: its records are partly gone.
@@ -824,10 +928,10 @@ fn a_failed_removal_leaves_its_marker_beside_the_directory() {
     assert_eq!(runs.hold().err().map(|e| e.kind()), Some(io::ErrorKind::ResourceBusy));
 }
 
-/// The note is for a held pin and for nothing else: records, a temp file, a stale pin and a marker a
-/// dead removal left are removed without it.
+/// The note is for a pause and for nothing else: records, a temp file, a stale pin and a marker a dead
+/// removal left are removed without one, as no handle holds any of them.
 #[skuld::test]
-fn remove_all_makes_no_note_for_anything_but_a_held_pin() {
+fn remove_all_makes_no_note_when_nothing_is_held_or_pending() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();

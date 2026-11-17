@@ -66,7 +66,7 @@ const REMOVING: &str = "~removing";
 /// The pace of [`Runs::remove_all`]'s passes while something is held or the directory is not yet
 /// empty. Each re-check decides; the pace only keeps the loop from spinning (the shim's re-reads of
 /// Task Scheduler's listing run at the same pace).
-const PIN_PACE: Duration = Duration::from_millis(100);
+const REMOVE_PACE: Duration = Duration::from_millis(100);
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,11 +118,21 @@ enum Entry {
     Record(InstanceId, PathBuf),
     Temp(PathBuf),
     Pin(PathBuf),
-    /// Anything else, a directory or a file of no name goetia gives: only a removal touches it.
+    /// Anything else, a directory or a file of no name goetia gives: only a removal touches it. Only
+    /// SYSTEM or an Administrator can put one there, and a removal takes it with its tree
+    /// ([`Runs::remove_all`]).
     Other {
         path: PathBuf,
         dir: bool,
     },
+}
+
+impl Entry {
+    fn path(&self) -> &Path {
+        match self {
+            Entry::Record(_, path) | Entry::Temp(path) | Entry::Pin(path) | Entry::Other { path, .. } => path,
+        }
+    }
 }
 
 impl Runs {
@@ -312,15 +322,23 @@ impl Runs {
     /// The pins come first. One that failed ends the removal, naming it, before anything else is
     /// deleted: it may be held, and no delete may run under a pin. One that is held pauses it. When no
     /// pin is held every other entry is deleted, and an entry that is held, a record or a temp file a
-    /// shim is writing, pauses it too. Last the directory: not yet empty (a pin being refused, a file
-    /// whose delete is pending, what a shim wrote since the listing) pauses it. A pause is [`PIN_PACE`],
-    /// then another pass, with no cap: whatever holds a file lets go in time, and the user can
-    /// interrupt the command. A failure ends the removal, naming the path and why. A marker left by a
-    /// removal that died is placed again; an install clears it ([`Runs::ensure`]).
+    /// shim is writing, pauses it too. A directory in it is removed with its tree, and anything that
+    /// stops that ends the removal, naming the directory: a handle in it is not waited for, since only
+    /// SYSTEM or an Administrator can have put one there. Last the directory itself, which a handle that
+    /// shares no delete holds (a pause) and which goes at once for any other: not yet empty (a pin being
+    /// refused, a file whose delete is pending, what a shim wrote since the listing) pauses it too,
+    /// naming one of the entries left. Every pause names a path. A pause is [`REMOVE_PACE`], then
+    /// another pass, with no cap: whatever holds a file lets go in time, and the user can interrupt the
+    /// command. A failure ends the removal, naming the path and why. A marker left by a removal that
+    /// died is placed again; an install clears it ([`Runs::ensure`]).
     ///
-    /// `waiting` is called once, with the path, before the first pause for what is held, so the caller
-    /// can say what is awaited.
-    pub(crate) fn remove_all(&self, waiting: impl FnOnce(&Path)) -> Result<()> {
+    /// **A limit, stated:** a directory someone placed in the task's directory that cannot be removed
+    /// (say, a program holds a file in it) fails the removal, which names it; remove it by hand and run
+    /// the removal again.
+    ///
+    /// `waiting` is called with the path being waited for, before the pause, and again each time that
+    /// path changes, so the caller can say what is awaited.
+    pub(crate) fn remove_all(&self, mut waiting: impl FnMut(&Path)) -> Result<()> {
         // The marker first, then the pins: see [`Runs::hold`].
         match fs::OpenOptions::new()
             .write(true)
@@ -333,15 +351,16 @@ impl Runs {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(Error::os_at("place the removal's marker", &self.marker, e)),
         }
-        let mut waiting = Some(waiting);
+        let mut announced: Option<PathBuf> = None;
         loop {
             match self.remove_pass()? {
                 PassOutcome::Done => return Ok(()),
-                PassOutcome::Waiting(held) => {
-                    if let (Some(held), Some(note)) = (held, waiting.take()) {
-                        note(&held);
+                PassOutcome::Waiting(path) => {
+                    if announced.as_ref() != Some(&path) {
+                        waiting(&path);
+                        announced = Some(path);
                     }
-                    thread::sleep(PIN_PACE);
+                    thread::sleep(REMOVE_PACE);
                 }
             }
         }
@@ -358,14 +377,34 @@ impl Runs {
             Err(e) => return Err(Error::os_at("list", &self.dir, e)),
         };
         if let Some(held) = self.delete_entries(&entries)? {
-            return Ok(PassOutcome::Waiting(Some(held)));
+            return Ok(PassOutcome::Waiting(held));
         }
-        match files::judged(fs::remove_dir(&self.dir), &self.dir) {
-            DeleteOutcome::Deleted => self.remove_marker(),
-            DeleteOutcome::Held => Ok(PassOutcome::Waiting(Some(self.dir.clone()))),
+        match fs::remove_dir(&self.dir) {
+            Ok(()) => self.remove_marker(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.remove_marker(),
+            // A handle that shares no delete holds the directory. One that shares it does not: the name
+            // goes at once (KB 2b01933).
+            Err(e) if files::is_sharing_violation(&e) => Ok(PassOutcome::Waiting(self.dir.clone())),
             // Something is in it still: see `Runs::remove_all`.
-            DeleteOutcome::Failed(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(PassOutcome::Waiting(None)),
-            DeleteOutcome::Failed(e) => Err(Error::os_at("remove", &self.dir, e)),
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => self.wait_for_what_is_left(),
+            Err(e) => Err(Error::os_at("remove", &self.dir, e)),
+        }
+    }
+
+    /// The pause of a directory that is not empty: it names the first of what is left, by name, so that
+    /// a pause on the same thing is told once. What is left can be gone by now, and the directory too;
+    /// the directory is then what is waited for, and the next pass finds it done.
+    fn wait_for_what_is_left(&self) -> Result<PassOutcome> {
+        match self.entries() {
+            Ok(entries) => Ok(PassOutcome::Waiting(
+                entries
+                    .iter()
+                    .map(Entry::path)
+                    .min()
+                    .map_or_else(|| self.dir.clone(), Path::to_path_buf),
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.remove_marker(),
+            Err(e) => Err(Error::os_at("list", &self.dir, e)),
         }
     }
 
@@ -373,7 +412,7 @@ impl Runs {
     fn remove_marker(&self) -> Result<PassOutcome> {
         match files::delete(&self.marker) {
             DeleteOutcome::Deleted => Ok(PassOutcome::Done),
-            DeleteOutcome::Held => Ok(PassOutcome::Waiting(Some(self.marker.clone()))),
+            DeleteOutcome::Held => Ok(PassOutcome::Waiting(self.marker.clone())),
             DeleteOutcome::Failed(e) => Err(Error::os_at("remove", &self.marker, e)),
         }
     }
@@ -392,14 +431,21 @@ impl Runs {
         for entry in entries {
             let (path, outcome) = match entry {
                 Entry::Pin(_) => continue,
-                Entry::Other { path, dir: true } => (path, files::judged(fs::remove_dir_all(path), path)),
+                // A tree is no file: whatever stops its removal is a failure naming the top directory.
+                Entry::Other { path, dir: true } => match fs::remove_dir_all(path) {
+                    Ok(()) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(Error::os_at("remove", path, e)),
+                },
                 Entry::Record(_, path) | Entry::Temp(path) | Entry::Other { path, dir: false } => {
                     (path, files::delete(path))
                 }
             };
             match outcome {
                 DeleteOutcome::Deleted => {}
-                DeleteOutcome::Held => held = held.or_else(|| Some(path.clone())),
+                DeleteOutcome::Held => {
+                    held.get_or_insert_with(|| path.clone());
+                }
                 DeleteOutcome::Failed(e) => return Err(Error::os_at("remove", path, e)),
             }
         }
@@ -496,8 +542,8 @@ impl Runs {
 enum PassOutcome {
     /// The directory and the marker are gone.
     Done,
-    /// Something is left: the path of what a handle holds, if that is why.
-    Waiting(Option<PathBuf>),
+    /// Something is left, and this is the path of what is waited for.
+    Waiting(PathBuf),
 }
 
 /// Deletes the file `path` ([`files::delete`]); one that is not there is already deleted. A file that
@@ -533,7 +579,9 @@ fn scan_pins(entries: &[Entry]) -> PinScan {
     for entry in entries {
         if let Entry::Pin(path) = entry {
             match files::is_held(path) {
-                Ok(true) => scan.held = scan.held.take().or_else(|| Some(path.clone())),
+                Ok(true) => {
+                    scan.held.get_or_insert_with(|| path.clone());
+                }
                 Ok(false) => {}
                 Err(e) => scan.unclassified.push((path.clone(), e)),
             }

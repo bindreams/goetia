@@ -364,12 +364,12 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
         .on_instances(one(4242));
     let mut machine = Machine::new(&fake, &[4242]);
     // The removal is under way while a `run` holds a pin, which is what it waits for.
-    let held = runs.pin().unwrap();
+    let mut held = Some(runs.pin().unwrap());
     let mut during = None;
 
     runs.remove_all(|_| {
         during = Some(stopped(&fake, &mut machine, &runs, Budget::Unbounded));
-        drop(held);
+        drop(held.take());
     })
     .unwrap();
 
