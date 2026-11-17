@@ -82,6 +82,25 @@ pub(crate) fn status_once_ended(mgr: &Scm, id: &Id) -> TaskStatus {
     found.expect("a status was read")
 }
 
+/// An install that finds a task up to date still sees that its default log is there: see
+/// `managed::an_up_to_date_install_makes_a_deleted_default_log_again`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_of_a_task_makes_a_deleted_default_log_again(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let spec = task_as(id, User::Root, Some(SCHEDULE));
+    let log = support::shim_default_log(&support::program_data(), id.as_str());
+    mgr.install(&spec, false).expect("install");
+    assert!(log.is_file(), "the install made {}", log.display());
+    std::fs::remove_file(&log).unwrap_or_else(|e| panic!("delete {}: {e}", log.display()));
+
+    let again = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(log.is_file(), "the install made {} again", log.display());
+}
+
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_task_installs_and_uninstalls(#[fixture(scm_group)] _group: &Group) {
     let guard = TaskGuard::new();

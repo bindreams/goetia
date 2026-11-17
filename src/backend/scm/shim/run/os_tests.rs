@@ -375,17 +375,17 @@ fn append_makes_nothing_of_the_default_log_and_fails_when_it_is_missing(#[fixtur
     );
 }
 
-/// A default log that is a reparse point is not what the install made: the line is not written, and the
-/// error names the file.
+/// A default log that is another name for a file (a bit-29 tag) is not what the install made: the line is
+/// not written, and the error names the file.
 #[skuld::test]
-fn append_refuses_a_default_log_that_is_a_reparse_point(#[fixture(temp_dir)] dir: &Path) {
+fn append_refuses_a_default_log_that_is_a_link(#[fixture(temp_dir)] dir: &Path) {
     let log = dir.join("x.log");
     std::fs::write(&log, "").expect("the file an install made");
-    crate::backend::scm::test_support::set_reparse_point(&log, 0x8000_0007, b"x");
+    crate::backend::scm::test_support::set_reparse_point(&log, 0xA000_0001, b"x");
 
     let refused = Real
         .append(&log, "the line", LogKind::Default)
-        .expect_err("a reparse point");
+        .expect_err("a link");
 
     assert!(refused.to_string().contains(&log.display().to_string()), "{refused}");
 }

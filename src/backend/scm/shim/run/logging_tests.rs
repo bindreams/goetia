@@ -139,6 +139,44 @@ fn parents_are_made_for_every_path_but_the_default() {
     );
 }
 
+/// Windows reads a path without regard to case, and `.`, `..` and `/` mean what they mean in any spelling of
+/// it: a `logs:` that names the default log so is the default log, which the shim may only open for append.
+#[skuld::test]
+fn a_path_that_names_the_default_log_in_other_case_or_spelling_is_the_default() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+
+    for spelled in [r"LOGS\SVC.LOG", "logs/svc.log", r"logs\.\svc.log", r"logs\other\..\Svc.Log"] {
+        assert_eq!(log.kind_of("svc", Path::new(spelled)), LogKind::Default, "{spelled}");
+    }
+    assert_eq!(log.kind_of("svc", Path::new(r"logs\svc.log.txt")), LogKind::Own);
+}
+
+#[skuld::test]
+fn a_failure_goes_to_the_default_once_when_the_daemon_log_names_it_in_other_case() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    log.set_daemon_log(PathBuf::from(r"LOGS\SVC.LOG"));
+
+    log.failure("svc", "the line");
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![appended_default(&default, true), reported()]
+    );
+}
+
+#[skuld::test]
+fn log_destinations_do_not_retry_the_default_when_the_daemon_log_names_it_in_other_case() {
+    let default = PathBuf::from(r"C:\ProgramData\Goetia\logs\svc.log");
+
+    assert_eq!(
+        log_destinations(Some(Path::new(r"c:\programdata\goetia\logs\SVC.LOG")), default.clone()),
+        vec![(default, LogKind::Default)]
+    );
+}
+
 #[skuld::test]
 fn daemon_log_path_is_the_spec_s_logs_or_the_default() {
     let fake = FakeGuard::new();

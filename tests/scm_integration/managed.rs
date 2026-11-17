@@ -814,6 +814,31 @@ fn install_twice_is_up_to_date_for_both_kinds(#[fixture(scm_group)] _group: &Gro
     }
 }
 
+/// An install that finds a service up to date still sees that its default log is there: the shim makes no
+/// log, and the message it gives for one that is gone says to install again, so that install makes it.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_makes_a_deleted_default_log_again(#[fixture(scm_group)] _group: &Group) {
+    let mgr = support::stock_shim_manager();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = ServiceSpec::new(ServiceFields {
+        protocol: Protocol::Plain,
+        ..support::base_fields(&id, fixture_command(&id, 1, 1, "plain"))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let log = support::shim_default_log(&support::program_data(), &id);
+    let first = mgr.install(&spec, false).expect("install");
+    assert!(matches!(first, Outcome::Create), "{first:?}");
+    assert!(log.is_file(), "the install made {}", log.display());
+    std::fs::remove_file(&log).unwrap_or_else(|e| panic!("delete {}: {e}", log.display()));
+
+    let again = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(log.is_file(), "the install made {} again", log.display());
+}
+
 /// goetia owns `Parameters` whole: `install --force` removes a stray value and a subkey, and a
 /// marker stored in another case is still ours, so the service reads as unchanged afterwards.
 #[skuld::test]

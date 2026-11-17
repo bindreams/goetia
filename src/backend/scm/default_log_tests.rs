@@ -18,8 +18,12 @@ use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
 /// `IO_REPARSE_TAG_HSM2`: a tag that names no other file, which an unelevated account can set on its own
-/// file. A log with any tag is not one goetia made.
+/// file. It is data on the file, not a way to another one.
 const A_TAG: u32 = 0x8000_0007;
+
+/// A tag whose bit 29 is set, which says the file is another name for something else, as a symlink or a mount
+/// point does.
+const A_LINK_TAG: u32 = 0xA000_0001;
 
 fn id() -> Id {
     Id::try_from("nightly").unwrap()
@@ -87,12 +91,12 @@ fn an_account_change_rewrites_the_entry_and_keeps_what_is_in_the_log() {
     assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what the account wrote is kept");
 }
 
-/// A log that is a reparse point is not goetia's: nothing is set on it, and it is refused naming it.
+/// A log that is another name for a file is not goetia's: nothing is set on it, and it is refused naming it.
 #[skuld::test]
-fn a_log_that_is_a_reparse_point_is_refused_and_its_permissions_are_left_alone() {
+fn a_log_that_is_a_link_is_refused_and_its_permissions_are_left_alone() {
     let (dir, log) = program_data_with_logs();
     fs::write(&log, "").unwrap();
-    set_reparse_point(&log, A_TAG, b"x");
+    set_reparse_point(&log, A_LINK_TAG, b"x");
 
     let refused = ensure(dir.path(), &id(), &process_user_sid()).unwrap_err();
 
@@ -102,6 +106,19 @@ fn a_log_that_is_a_reparse_point_is_refused_and_its_permissions_are_left_alone()
         refused.report()
     );
     assert!(!read_path(&log).unwrap().protected, "its permissions are as they were");
+}
+
+/// A tag that names no other file is data on this one, which the install sets the permissions of like any.
+#[skuld::test]
+fn a_log_with_a_tag_that_is_no_link_has_its_permissions_set() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    set_reparse_point(&log, A_TAG, b"x");
+    let me = process_user_sid();
+
+    ensure(dir.path(), &id(), &me).unwrap();
+
+    assert_eq!(entries_of(&log), entries_wanted_for(&me));
 }
 
 /// The folder is an install's, made before the file: where it is not there nothing is made.
@@ -144,6 +161,24 @@ fn the_shim_does_not_make_a_missing_log() {
     assert!(!log.exists());
 }
 
+/// What an account may do to its log is append, read the attributes and wait on the handle, and nothing
+/// that changes what is in it, who may reach it or who owns it.
+#[skuld::test]
+fn the_access_granted_on_a_default_log_is_append_and_nothing_that_rewrites_it() {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_APPEND_DATA, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    };
+
+    assert_eq!(
+        DEFAULT_LOG_ACCESS,
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    );
+    for denied in [FILE_READ_DATA, FILE_WRITE_DATA, FILE_WRITE_ATTRIBUTES, DELETE, WRITE_DAC, WRITE_OWNER] {
+        assert_eq!(DEFAULT_LOG_ACCESS & denied, 0, "{denied:#x}");
+    }
+}
+
 /// The open is for exactly what the account is granted: it appends, after what is there, and the handle
 /// can do nothing else.
 #[skuld::test]
@@ -158,18 +193,41 @@ fn the_shim_appends_to_a_log_through_a_handle_that_can_do_nothing_else() {
     let mut read = [0u8; 1];
     let denied = file.read(&mut read).unwrap_err();
     assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied, "the handle cannot read");
-    assert_eq!(DEFAULT_LOG_ACCESS, 0x10_0084);
 }
 
-/// A log that is a reparse point is refused on the shim's own handle, which a link set after the install
-/// checked it would otherwise lead to anywhere.
+/// A log that is another name for a file is refused on the shim's own handle, which a link set after the
+/// install checked it would otherwise lead to anywhere.
 #[skuld::test]
-fn the_shim_refuses_a_log_that_is_a_reparse_point() {
+fn the_shim_refuses_a_log_that_is_a_link() {
     let (_dir, log) = program_data_with_logs();
     fs::write(&log, "").unwrap();
-    set_reparse_point(&log, A_TAG, b"x");
+    set_reparse_point(&log, A_LINK_TAG, b"x");
 
     let refused = open_for_append(&log).unwrap_err();
 
     assert!(refused.to_string().contains(&log.display().to_string()), "{refused}");
+}
+
+/// The refusal is the install's and the shim's alike: one message, naming the file and the way out.
+#[skuld::test]
+fn the_install_and_the_shim_refuse_a_link_in_the_same_words() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    set_reparse_point(&log, A_LINK_TAG, b"x");
+
+    let install = ensure(dir.path(), &id(), &process_user_sid()).unwrap_err().report().to_string();
+    let shim = open_for_append(&log).unwrap_err().to_string();
+
+    assert!(install.contains(&shim), "{install} / {shim}");
+}
+
+/// A tag that names no other file is data on the file: the shim appends through it.
+#[skuld::test]
+fn the_shim_appends_to_a_log_with_a_tag_that_is_no_link() {
+    let (_dir, log) = program_data_with_logs();
+    fs::write(&log, "first
+").unwrap();
+    set_reparse_point(&log, A_TAG, b"x");
+
+    open_for_append(&log).expect("a tag that is no link is not refused");
 }
