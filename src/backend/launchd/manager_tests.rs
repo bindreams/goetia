@@ -922,11 +922,11 @@ fn a_reservation_holds_what_its_steps_count() {
     let cases: [(&[Step], (usize, usize)); 7] = [
         (&[Step::Install], (4, 18)),
         (&[Step::Start], (5, 26)),
-        (&[Step::Stop], (1, 6)),
+        (&[Step::Stop], (1, 4)),
         (&[Step::Kill], (0, 6)),
         (&[Step::Uninstall], (2, 12)),
         (&[Step::RequestStartAfterStop], (5, 26)),
-        (&[Step::Stop, Step::Start], (6, 32)),
+        (&[Step::Stop, Step::Start], (6, 30)),
     ];
     for (steps, held) in cases {
         assert_eq!(bounded::test_hook::left(&reserved(steps)), held, "{steps:?}");

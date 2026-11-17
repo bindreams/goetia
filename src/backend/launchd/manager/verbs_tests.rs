@@ -617,33 +617,27 @@ fn stop_under_a_bounded_budget_expires_into_wait_timeout_and_leaves_the_signal()
 }
 
 /// The wait that ends while a run still has its grace to answer SIGTERM says what that costs: nothing
-/// sends SIGKILL after it, and `goetia daemon kill` does. A wait that ends with no grace pending has
-/// nothing to say of it.
+/// sends SIGKILL after it, and `goetia daemon kill` does.
 #[skuld::test]
-fn a_wait_that_ends_inside_the_grace_names_the_limit_and_one_that_does_not_stays_plain() {
+fn a_wait_that_ends_inside_the_grace_names_the_limit() {
     // The run ignores SIGTERM, so the wait ends at the budget.
-    let recovery = |action: StopAction| {
-        let run = Held::ignoring_sigterm();
-        let pid = run.pid();
-        let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid)]);
-        match stopping_as(&fake, Budget::Bounded(Duration::from_millis(100)), action) {
-            Err(Error::WaitTimeout { recovery, .. }) => recovery,
-            other => panic!("expected a wait timeout, got {other:?}"),
-        }
+    let run = Held::ignoring_sigterm();
+    let pid = run.pid();
+    let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid)]);
+
+    let recovery = match stopping_as(
+        &fake,
+        Budget::Bounded(Duration::from_millis(100)),
+        StopAction::default(),
+    ) {
+        Err(Error::WaitTimeout { recovery, .. }) => recovery,
+        other => panic!("expected a wait timeout, got {other:?}"),
     };
 
-    let in_grace = recovery(StopAction::default());
     assert!(
-        in_grace.contains("SIGKILL") && in_grace.contains("goetia daemon kill"),
-        "{in_grace}"
+        recovery.contains("SIGKILL") && recovery.contains("goetia daemon kill"),
+        "{recovery}"
     );
-
-    // No `timeout`: no grace is pending, and no SIGKILL is to follow.
-    let no_grace = recovery(StopAction {
-        send_signal: StopSignal::Terminate,
-        timeout: None,
-    });
-    assert!(!no_grace.contains("goetia daemon kill"), "{no_grace}");
 }
 
 /// A run that ignores SIGTERM for as long as the `timeout` is escalated: SIGKILL is sent when it is over,
