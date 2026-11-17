@@ -17,7 +17,7 @@ use super::*;
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
 use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
-use crate::backend::scm::test_support::{delete_pending, directory_with_a_file, make_mount_point};
+use crate::backend::scm::test_support::{delete_pending, directory_held_open, directory_with_a_file, make_mount_point};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -31,9 +31,8 @@ const WRITE_EA: u32 = 0x10;
 const DELETE_CHILD: u32 = 0x40;
 const WRITE_ATTRIBUTES: u32 = 0x100;
 const DELETE: u32 = 0x1_0000;
-/// What the account has on the files it makes: [`MODIFY`] without the two rights that let it set a file's
-/// attributes (READONLY, say) or its extended attributes, which an overwrite of a leftover needed and
-/// the shim's delete-then-create does not (KB ddcbd14).
+/// What the account has on the files it makes (`Descriptor::for_runs`): [`MODIFY`] without the rights to
+/// set attributes or extended attributes.
 const FILES: u32 = MODIFY & !WRITE_ATTRIBUTES & !WRITE_EA;
 
 fn id() -> Id {
@@ -321,8 +320,8 @@ fn a_stale_pin_the_writing_account_has_no_entry_on_is_deleted_and_does_not_stop_
     runs.write(&record(1, 1)).unwrap();
     let stale = runs.dir.join("pin-old.pin");
     fs::write(&stale, "").unwrap();
-    let administrators_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
-    crate::backend::scm::test_support::set_dacl(&administrators_only, &stale).unwrap();
+    let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
+    crate::backend::scm::test_support::set_dacl(&system_only, &stale).unwrap();
 
     let problems = runs.write(&record(2, 2)).unwrap();
 
@@ -355,9 +354,8 @@ fn a_live_pin_the_writing_account_has_no_entry_on_is_kept_and_stops_pruning() {
     assert!(!live.exists(), "the pin goes when its holder does");
 }
 
-/// A pin that cannot be deleted for another reason than a sharing violation (here its delete is pending:
-/// Windows reports that as access denied) is told, and is not taken as held: reading it as held would
-/// stop every later prune.
+/// A pin that cannot be deleted for another reason than a sharing violation (here it is a directory that is
+/// not empty) is told, and is not taken as held: reading it as held would stop every later prune.
 #[skuld::test]
 fn a_pin_that_cannot_be_deleted_is_a_problem_and_is_taken_as_not_held() {
     let (_dir, runs) = fixture();
@@ -539,51 +537,91 @@ fn remove_all_does_not_wait_for_a_stale_pin_it_has_no_entry_on() {
     runs.write(&record(1, 1)).unwrap();
     let stale = runs.dir.join("pin-old.pin");
     fs::write(&stale, "").unwrap();
-    let administrators_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
-    crate::backend::scm::test_support::set_dacl(&administrators_only, &stale).unwrap();
+    let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
+    crate::backend::scm::test_support::set_dacl(&system_only, &stale).unwrap();
 
     runs.remove_all(no_note).unwrap();
 
     assert!(!runs.dir.exists());
 }
 
-/// A pin whose state cannot be told (its delete fails, and not for a handle) may be held, and none can be
-/// taken now: the removal returns the failure, naming the pin, before it deletes anything, and does not
-/// wait for a handle that may never go. Once the pin can be told about, the same call finishes.
+/// The files `names` of `runs`' directory, whose delete is refused for no handle and no pending delete, to
+/// every account and an elevated token too: they carry SYSTEM's entry alone, and the directory grants no
+/// right to delete entries. Dropping restores the directory, so that the test's own can be removed.
+struct Undeletable<'a>(&'a Path);
+
+impl<'a> Undeletable<'a> {
+    fn new(runs: &'a Runs, names: &[&str]) -> Self {
+        let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
+        for name in names {
+            crate::backend::scm::test_support::set_dacl(&system_only, &runs.dir.join(name)).unwrap();
+        }
+        // Read, list and add a file, which `Dir::open` asks for; not `DELETE_CHILD`.
+        let listable = Descriptor::from_sddl("D:P(A;;0x1200a3;;;WD)").unwrap();
+        crate::backend::scm::test_support::set_dacl(&listable, &runs.dir).unwrap();
+        Undeletable(&runs.dir)
+    }
+}
+
+impl Drop for Undeletable<'_> {
+    fn drop(&mut self) {
+        let restored = Descriptor::for_runs(&process_user_sid())
+            .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
+        if !matches!(restored, Ok(Ok(()))) {
+            eprintln!(
+                "warning: could not restore the permissions of {}: {restored:?}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+/// Pins whose state cannot be told (their delete fails, and not for a handle) may be held, and none can be
+/// taken now: the removal returns the failure, naming every one of them, before it deletes anything, and
+/// does not wait for a handle that may never go. Once they can be told about, the same call finishes.
 #[skuld::test]
-fn remove_all_with_a_pin_it_cannot_tell_about_deletes_nothing_and_names_it() {
+fn remove_all_with_pins_it_cannot_tell_about_deletes_nothing_and_names_each() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     fs::write(runs.dir.join("other.txt"), "").unwrap();
-    let odd = runs.dir.join("pin-odd.pin");
-    directory_with_a_file(&odd);
+    fs::write(runs.dir.join("pin-odd.pin"), "").unwrap();
+    fs::write(runs.dir.join("pin-odd2.pin"), "").unwrap();
     let before = names(&runs);
+    let refused = Undeletable::new(&runs, &["pin-odd.pin", "pin-odd2.pin"]);
 
     let failed = runs.remove_all(no_note).unwrap_err();
 
-    assert!(failed.to_string().contains("pin-odd.pin"), "{failed}");
+    let said = failed.report().to_string();
+    assert!(said.contains("pin-odd.pin"), "{said}");
+    assert!(said.contains("pin-odd2.pin"), "{said}");
     assert_eq!(names(&runs), before, "nothing was deleted");
-    fs::remove_dir_all(&odd).unwrap();
+    drop(refused);
     runs.remove_all(no_note).unwrap();
     assert!(!runs.dir.exists());
 }
 
 /// A file whose delete is pending is deleted as far as anything can do it: it goes when the handle open
 /// on it closes. Its delete was no failure, so it is no reason to refuse the removal, whether it is a pin
-/// or a record; the directory is not empty until it goes, and the removal looks again. The note is for
-/// what is held, here a temp file the shim is writing, and the three handles are dropped when it is made.
+/// or a record; the directory is not empty until it goes, and the removal looks again. The only note is
+/// for what is held, here a temp file the shim is writing, and the three handles are dropped when it is made.
 #[skuld::test]
 fn remove_all_takes_a_file_whose_delete_is_pending_as_deleted() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let pending_pin = delete_pending(&runs.dir.join("pin-odd.pin"));
     let pending_record = delete_pending(&runs.dir.join(file_of(&instance(2))));
-    let writing = temp_held(&runs, &runs.dir.join(format!("{}.json.tmp", instance(3).hex())));
-
+    let temp = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
+    let writing = temp_held(&runs, &temp);
     let mut handles = Some((pending_pin, pending_record, writing));
+    let mut noted = Vec::new();
 
-    runs.remove_all(|_, _| drop(handles.take())).unwrap();
+    runs.remove_all(|path, _| {
+        noted.push(path.to_path_buf());
+        drop(handles.take());
+    })
+    .unwrap();
 
+    assert_eq!(noted, [temp], "a pending delete is no pause");
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
 }
@@ -815,6 +853,39 @@ fn remove_all_removes_files_and_directories_of_names_that_are_not_goetias() {
     assert!(!runs.dir.exists());
 }
 
+/// What a name says is a file: a directory or a directory link of that name is removed with its tree all the
+/// same, and never followed. Each once failed every pass.
+#[skuld::test]
+fn remove_all_removes_a_directory_or_a_link_whose_name_is_a_pins_a_records_or_a_temps() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    fs::write(target.path().join("victim.txt"), "keep").unwrap();
+    let temp = format!("{}.json.tmp", instance(2).hex());
+    for name in ["a.pin", temp.as_str(), &file_of(&instance(3))] {
+        directory_with_a_file(&runs.dir.join(name));
+    }
+    junction(&runs.dir.join("b.pin"), target.path());
+    junction(&runs.dir.join(file_of(&instance(4))), target.path());
+
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.dir.exists());
+    assert!(!runs.marker.exists());
+    assert_eq!(fs::read(target.path().join("victim.txt")).unwrap(), b"keep");
+}
+
+/// A directory named as a record is no record: a pin's listing and what appeared since do not read it.
+#[skuld::test]
+fn a_directory_named_as_a_record_is_not_a_record_to_a_pin() {
+    let (_dir, runs) = fixture();
+    let pin = runs.pin().unwrap();
+    directory_with_a_file(&runs.dir.join(file_of(&instance(1))));
+    runs.write(&record(2, 2)).unwrap();
+
+    assert_eq!(pin.appeared().unwrap(), [record(2, 2)]);
+}
+
 /// A file another program holds is waited for, as a pin is, whoever the holder is: the removal says what
 /// it waits for, naming the file, and finishes when the handle goes.
 #[skuld::test]
@@ -884,12 +955,7 @@ fn remove_all_fails_at_once_naming_a_directory_of_a_foreign_name_it_cannot_remov
     runs.write(&record(1, 1)).unwrap();
     let sub = runs.dir.join("sub");
     directory_with_a_file(&sub);
-    directory_with_a_file(&sub.join("inner"));
-    let holder = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .open(sub.join("inner").join("inside"))
-        .unwrap();
+    let holder = directory_held_open(&sub.join("inner"));
 
     let failed = runs.remove_all(no_note).unwrap_err();
 
@@ -903,7 +969,7 @@ fn remove_all_fails_at_once_naming_a_directory_of_a_foreign_name_it_cannot_remov
 }
 
 /// The directory itself held by a handle that shares no delete: a sharing violation, which is waited for
-/// and named as a file is. Measured on windows-2022 and windows-2025 (KB 2b01933).
+/// and named as a file is. Measured on windows-2022 and windows-2025.
 #[skuld::test]
 fn remove_all_waits_for_a_handle_on_the_directory_that_shares_no_delete_and_names_it() {
     let (_dir, runs) = fixture();
@@ -929,8 +995,8 @@ fn remove_all_waits_for_a_handle_on_the_directory_that_shares_no_delete_and_name
     assert!(!runs.marker.exists());
 }
 
-/// A handle that shares delete is no obstacle: the name goes at once, as for a file (KB 2b01933), so the
-/// removal pauses for nothing and has no delete-pending directory to tell.
+/// A handle that shares delete is no obstacle: the name goes at once, as for a file, so the removal pauses
+/// for nothing and has no delete-pending directory to tell.
 #[skuld::test]
 fn remove_all_removes_a_directory_at_once_while_a_handle_that_shares_delete_is_open() {
     let (_dir, runs) = fixture();
@@ -955,11 +1021,17 @@ fn remove_all_removes_a_directory_at_once_while_a_handle_that_shares_delete_is_o
 fn a_directory_that_is_not_empty_pauses_on_what_is_left_and_names_nothing_when_nothing_is() {
     let dir = Path::new(r"C:\runs\frpc");
     let left = [
-        Entry::Temp("b.json.tmp".into()),
-        Entry::Pin("a.pin".into()),
+        Entry::Temp {
+            name: "b.json.tmp".into(),
+            directory: false,
+        },
+        Entry::Pin {
+            name: "a.pin".into(),
+            directory: false,
+        },
         Entry::Other {
             name: "c".into(),
-            dir: true,
+            directory: true,
         },
     ];
 
@@ -1013,7 +1085,7 @@ fn a_pause_is_noted_when_it_differs_from_the_last_note_and_a_new_emptying_phase_
 #[skuld::test]
 fn a_failed_removal_leaves_its_marker_beside_the_directory() {
     let (_dir, runs) = fixture();
-    directory_with_a_file(&runs.dir.join(file_of(&instance(1))));
+    let _held = directory_held_open(&runs.dir.join(file_of(&instance(1))));
 
     let failed = runs.remove_all(no_note).unwrap_err();
 
@@ -1069,8 +1141,8 @@ fn a_directory_with_a_held_pin_cannot_be_renamed_away() {
 
 // a link where the directory should be ================================================================================
 
-/// What the task's account can make of its empty directory (it holds `ADD_FILE` on it, which is all a
-/// mount point takes: KB ddcbd14): a junction to a folder it cannot reach. The target is another task's
+/// What the task's account can make of its empty directory (see the note of `runs::dir`): a junction to a
+/// folder it cannot reach. The target is another task's
 /// records directory, with a record in it and a file that is no record. The task's own empty directory is
 /// replaced by the junction, as the account does it. Returns the target's `Runs`, and its temporary
 /// directory, which outlasts the junction.
@@ -1089,7 +1161,7 @@ fn target_is_untouched(target: &Runs) -> bool {
 }
 
 /// Measured: an elevated listing and delete through the mount point deleted a file in a folder only
-/// Administrators can write (KB ddcbd14). The removal deletes the link and reads nothing through it.
+/// Administrators can write. The removal deletes the link and reads nothing through it.
 #[skuld::test]
 fn remove_all_of_a_link_removes_the_link_and_leaves_what_it_points_to() {
     let (_dir, runs) = fixture();
@@ -1109,16 +1181,30 @@ fn remove_all_of_a_link_removes_the_link_and_leaves_what_it_points_to() {
 #[skuld::test]
 fn a_directory_that_becomes_a_link_after_the_listing_is_deleted_as_a_link() {
     let listings = [
-        vec![Entry::Pin("pin-a.pin".into())],
-        vec![Entry::Record(instance(1), file_of(&instance(1)).into())],
-        vec![Entry::Temp(format!("{}.json.tmp", instance(2).hex()).into())],
+        vec![Entry::Pin {
+            name: "pin-a.pin".into(),
+            directory: false,
+        }],
+        vec![Entry::Record {
+            instance: instance(1),
+            name: file_of(&instance(1)).into(),
+            directory: false,
+        }],
+        vec![Entry::Temp {
+            name: format!("{}.json.tmp", instance(2).hex()).into(),
+            directory: false,
+        }],
         vec![Entry::Other {
             name: "foreign".into(),
-            dir: false,
+            directory: false,
         }],
         vec![Entry::Other {
             name: "tree".into(),
-            dir: true,
+            directory: true,
+        }],
+        vec![Entry::Pin {
+            name: "pin-b.pin".into(),
+            directory: true,
         }],
     ];
     for listed in listings {
@@ -1180,16 +1266,77 @@ fn nothing_reads_pins_or_writes_through_a_link() {
     let (_target_dir, target) = linked(&runs);
     let before = names(&target);
 
-    let read = runs.read(&instance(9)).unwrap_err();
+    let read = runs.read(&instance(9)).unwrap();
     let pin = runs.pin().err().map(|e| e.kind());
     let hold = runs.hold().err().map(|e| e.kind());
     let write = runs.write(&record(1, 1)).unwrap_err();
 
-    assert_eq!(read.kind(), io::ErrorKind::NotADirectory, "{read}");
+    assert_eq!(read, None, "a link holds no records");
     assert_eq!(pin, Some(io::ErrorKind::NotADirectory));
     assert_eq!(hold, Some(io::ErrorKind::NotADirectory));
     assert_eq!(write.kind(), io::ErrorKind::NotADirectory, "{write}");
     assert_eq!(names(&target), before, "nothing was made or removed in the target");
+}
+
+/// The task's directory, held open, which its account then makes a mount point to a folder with `victim.txt`
+/// in it, as it can while nothing is in it. Returns the handle and the target.
+fn held_and_then_linked(runs: &Runs) -> (Dir, TempDir) {
+    let held = Dir::open(&runs.dir).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    fs::write(target.path().join("victim.txt"), "keep").unwrap();
+    make_mount_point(&runs.dir, target.path());
+    (held, target)
+}
+
+/// The account makes the directory a link after the handle opened it and before the pin is created or a
+/// record is read: both answer as a link does, which a stop takes as no records, and nothing is made in the
+/// target.
+#[skuld::test]
+fn a_directory_that_becomes_a_link_after_it_was_opened_is_a_link_to_a_pin_and_a_read() {
+    let (_dir, runs) = fixture();
+    let (held, target) = held_and_then_linked(&runs);
+
+    let read = read_in(&held, &instance(9)).unwrap_err();
+    let pin = runs.hold_in(held).err().expect("a pin is refused");
+
+    assert_eq!(read.kind(), io::ErrorKind::NotADirectory, "{read}");
+    assert_eq!(pin.kind(), io::ErrorKind::NotADirectory, "{pin}");
+    assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1, "only victim.txt");
+}
+
+/// The same while the removal's marker is there: the pin is refused as one taken during the removal, which
+/// a stop does not take as no records.
+#[skuld::test]
+fn a_pin_that_cannot_be_made_while_the_records_are_being_removed_says_so() {
+    let (_dir, runs) = fixture();
+    let (held, _target) = held_and_then_linked(&runs);
+    leave_marker(&runs);
+
+    let refused = runs.hold_in(held).err().expect("a pin is refused");
+
+    assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy, "{refused}");
+    assert!(refused.to_string().contains("being removed"), "{refused}");
+}
+
+/// The directory becomes a mount point during the removal, as its account can make it of an empty one: here
+/// when the pin that held the pass up is released. The next pass finds the link and deletes it, and the target
+/// is as it was.
+#[skuld::test]
+fn a_directory_that_becomes_a_link_between_two_passes_is_deleted_as_one() {
+    let (_dir, runs) = fixture();
+    let pin = runs.pin().unwrap();
+    leave_marker(&runs);
+    assert!(matches!(runs.remove_pass().unwrap(), PassOutcome::Waiting(_)));
+    drop(pin);
+    let target = tempfile::tempdir().unwrap();
+    fs::write(target.path().join("victim.txt"), "keep").unwrap();
+    make_mount_point(&runs.dir, target.path());
+
+    assert!(matches!(runs.remove_pass().unwrap(), PassOutcome::Done));
+
+    assert!(fs::symlink_metadata(&runs.dir).is_err(), "the link is gone");
+    assert!(!runs.marker.exists());
+    assert_eq!(fs::read(target.path().join("victim.txt")).unwrap(), b"keep");
 }
 
 // the directory's permissions =========================================================================================
@@ -1278,7 +1425,7 @@ fn a_directory_that_is_there_gets_a_protected_dacl_naming_the_principal() {
         0,
         "the account may not set READONLY on its directory, which would keep the removal from deleting it"
     );
-    assert_eq!(own.mask, 0x1200eb, "the directory's mask, as measured (KB ddcbd14)");
+    assert_eq!(own.mask, 0x1200eb, "the directory's mask, as measured");
     assert_eq!(
         own.mask & DELETE,
         0,

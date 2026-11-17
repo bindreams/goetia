@@ -607,7 +607,7 @@ fn uninstall_of_an_id_with_no_records_takes_no_lock() {
 #[skuld::test]
 fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_fails() {
     let (_dir, records_dir, runs) = records();
-    crate::backend::scm::test_support::directory_with_a_file(&records_dir.join("pin-odd.pin"));
+    let _held = crate::backend::scm::test_support::directory_held_open(&records_dir.join("stuck"));
 
     let failed = scm(&Fake::new())
         .uninstall_absent_with(&id(), &runs, || -> Result<()> { Ok(()) }, || Ok(()))
@@ -627,11 +627,7 @@ fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_
         text.contains("Re-run `goetia daemon uninstall nightly` to remove them"),
         "{text}"
     );
-    assert!(
-        failed.report().to_string().contains("pin-odd.pin"),
-        "{}",
-        failed.report()
-    );
+    assert!(failed.report().to_string().contains("stuck"), "{}", failed.report());
 }
 
 /// The shim sweep does not depend on the records: a removal that fails does not skip it, and a sweep that
@@ -639,7 +635,7 @@ fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_
 #[skuld::test]
 fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_removed() {
     let (_dir, records_dir, runs) = records();
-    crate::backend::scm::test_support::directory_with_a_file(&records_dir.join("pin-odd.pin"));
+    let _held = crate::backend::scm::test_support::directory_held_open(&records_dir.join("stuck"));
     let swept = Cell::new(false);
 
     let failed = scm(&Fake::new())
@@ -677,7 +673,7 @@ fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_remo
 
     assert!(swept.get());
     let said = both.report().to_string();
-    assert!(said.contains("pin-odd.pin"), "the records' failure is kept: {said}");
+    assert!(said.contains("stuck"), "the records' failure is kept: {said}");
     assert!(
         said.contains("sweep the shim files"),
         "the sweep's failure is kept: {said}"

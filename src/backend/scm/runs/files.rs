@@ -22,15 +22,17 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::dir::{Dir, Listed, SHARE_ALL, SYNCHRONOUS_IO, delete_by_disposition, io_error};
+use super::dir::{Dir, Listed, SHARE_ALL, SYNCHRONOUS_IO, delete_by_disposition, io_error, is_bare};
 
-/// Makes the temp file `name` for a record's bytes, which must not exist: one an interrupted write left
-/// is deleted first, and the file is made new, so that nothing of the old one (its attributes, say) is
-/// kept and the account needs no right to overwrite it (KB ddcbd14). Others may read it but not delete it
-/// while it is held, so a write in flight is not pruned from under it. A leftover that is held (a write
-/// in flight) is a sharing violation.
+/// Makes the temp file `name` for a record's bytes. A leftover of an interrupted write is deleted first,
+/// so the file is new and the account needs no right to overwrite one; a leftover that is held (a write in
+/// flight) is a sharing violation. Others may read the file but not delete it while it is held, so a prune
+/// cannot take it from under the write.
 pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
-    delete(dir, name).into_result()?;
+    match delete(dir, name) {
+        DeleteOutcome::Linked => return Err(dir.link_error()),
+        left => left.into_result()?,
+    }
     dir.open_in(
         name,
         TEMP_ACCESS,
@@ -38,7 +40,7 @@ pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
         FILE_CREATE,
         FILE_NON_DIRECTORY_FILE | SYNCHRONOUS_IO,
     )
-    .map_err(io_error)
+    .map_err(|status| dir.open_error(status))
 }
 
 /// Renames the file `file` holds to the name `to` in `dir`, replacing what is there. It is renamed through
@@ -46,13 +48,13 @@ pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
 /// old name: nothing can delete it between its last write and the rename. `file` must have been opened
 /// with `DELETE`, and be in `dir`.
 pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> {
+    debug_assert!(is_bare(to), "a name, not a path");
     let name: Vec<u16> = to.encode_wide().collect();
     let name_bytes = name.len() * size_of::<u16>();
     let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
-    // The whole struct and then the name, not only up to the name's end: a buffer cut at the end of the
-    // name came out with garbage after the new name, or was refused, for one length of path in eight.
+    // The whole struct and then the name: a buffer cut at the name's end is refused or garbled for some
+    // name lengths.
     let total = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
-    // 8-byte alignment for `FILE_RENAME_INFORMATION`, whose name runs on past its declared end.
     let mut buffer = vec![0u64; total.div_ceil(size_of::<u64>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFORMATION`: room for
@@ -93,17 +95,16 @@ pub(super) fn create_pin(dir: &Dir, name: &OsStr) -> io::Result<File> {
         FILE_CREATE,
         FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | SYNCHRONOUS_IO,
     )
-    .map_err(io_error)
+    .map_err(|status| dir.open_error(status))
 }
 
-/// What the handle of a pin is made with. A creating open is granted all it asks for, whatever the
-/// directory's entry for the account says, so it asks for what is used and no more: `DELETE` is the
-/// delete-on-close, `SYNCHRONIZE` the synchronous handle. A pin is never written.
+/// What the handle of a pin is made with: what a creating open asks for is what it is granted
+/// (`Descriptor::for_runs`), so it asks for what is used. `DELETE` is the delete-on-close, `SYNCHRONIZE` the
+/// synchronous handle; a pin is never written.
 pub(super) const PIN_ACCESS: u32 = DELETE | SYNCHRONIZE;
 
 /// What the handle of a temp file is made with, by the same rule: write and append are the record's bytes,
-/// `DELETE` the rename ([`rename_over`]), `SYNCHRONIZE` the synchronous handle. Not `FILE_GENERIC_WRITE`,
-/// which adds the right to set attributes and extended attributes.
+/// `DELETE` the rename ([`rename_over`]), `SYNCHRONIZE` the synchronous handle. Not `FILE_GENERIC_WRITE`.
 const TEMP_ACCESS: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | SYNCHRONIZE;
 
 /// The bytes of the file `name` in `dir`, or `None` if there is no such file. A link is opened, not
@@ -118,7 +119,7 @@ pub(super) fn read(dir: &Dir, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
     ) {
         Ok(file) => file,
         Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Ok(None),
-        Err(status) => return Err(io_error(status)),
+        Err(status) => return Err(dir.open_error(status)),
     };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -134,10 +135,9 @@ pub(super) enum DeleteOutcome {
     Held,
     /// Windows refused the delete for a reason that is no handle: a permission, say.
     Failed(io::Error),
-    /// The directory `dir` is a link now, though it was not when it was opened: its account made it a mount
-    /// point while the handle was held. Every open relative to it fails with
-    /// `STATUS_REPARSE_POINT_NOT_RESOLVED` and reaches nothing of the target (KB 78c82b1); what is left
-    /// to do is to delete the link ([`Dir::remove`]), which no listing taken before it holds anything of.
+    /// The directory is a link now: its account made it a mount point after it was opened (see the
+    /// [module's note](super::dir)). What is left to do is to delete the link ([`Dir::remove`]); no listing
+    /// taken before holds anything of it.
     Linked,
 }
 
@@ -159,11 +159,10 @@ impl DeleteOutcome {
 
 /// Deletes the file `name` of `dir` and says what became of it. This is the one place a failed delete is read
 /// ([`Runs::remove_all`](super::Runs::remove_all), a prune and a pin's liveness all go through it). The file
-/// is opened for `DELETE` relative to `dir`, without following a link. It asks for `DELETE` and nothing
-/// else, not even `SYNCHRONIZE`: the directory's `FILE_DELETE_CHILD` lets an account delete an entry whose
-/// own permissions it has no entry on (a file of the account the task had before), but covers no other
-/// right, and an open for `DELETE | SYNCHRONIZE` was refused as access denied, a live pin of another
-/// account included (KB 44fca8b). The status of the open says:
+/// is opened relative to `dir` for `DELETE` and nothing else, not even `SYNCHRONIZE`: the directory's
+/// `FILE_DELETE_CHILD` lets an account delete an entry whose own permissions it has no entry on (a file of
+/// the account the task had before), but covers no other right, and an open for `DELETE | SYNCHRONIZE` was
+/// refused as access denied, a live pin of another account included (measured). The status of the open says:
 ///
 /// - A sharing violation says a handle holds the file without sharing delete, whoever it is: a pin's
 ///   holder shares none, nor does a shim writing its temp file. Held.
@@ -199,14 +198,20 @@ pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
 }
 
-/// Removes the directory `name` of `dir` with everything in it, each entry through a handle opened relative
-/// to its parent: a link in the tree, a mount point or a symlink, is deleted and never followed. A handle
-/// anyone holds on something in the tree without sharing delete fails the removal, with the sharing
-/// violation. One that is not there is already removed. [`DeleteOutcome::Linked`] says `dir` is a link now;
-/// a directory in the tree that became one is deleted as a link. [`DeleteOutcome::Held`] is never the
-/// answer: what is held in the tree is a failure.
+/// Removes the directory `name` of `dir` with its tree, whatever `name` is. A link in the tree, or one that
+/// a directory becomes meanwhile, is deleted and never followed. What is held in the tree without sharing
+/// delete fails the removal with the sharing violation ([`DeleteOutcome::Held`] is never the answer), and
+/// one that is not there is removed already. [`DeleteOutcome::Linked`] says `dir` is a link now.
 pub(super) fn remove_tree(dir: &Dir, name: &OsStr) -> DeleteOutcome {
-    let child = match dir.open_in(
+    match open_child(dir, name) {
+        Ok(child) => remove_opened(&child),
+        Err(outcome) => outcome,
+    }
+}
+
+/// Opens the directory `name` of `dir` to list it and delete it, or says what became of it instead.
+fn open_child(dir: &Dir, name: &OsStr) -> Result<Dir, DeleteOutcome> {
+    let file = match dir.open_in(
         name,
         DELETE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         SHARE_ALL,
@@ -214,25 +219,22 @@ pub(super) fn remove_tree(dir: &Dir, name: &OsStr) -> DeleteOutcome {
         SYNCHRONOUS_IO,
     ) {
         Ok(file) => file,
-        Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => return DeleteOutcome::Deleted,
-        Err(STATUS_REPARSE_POINT_NOT_RESOLVED) => return DeleteOutcome::Linked,
-        Err(status) => return DeleteOutcome::Failed(io_error(status)),
+        Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => return Err(DeleteOutcome::Deleted),
+        Err(STATUS_REPARSE_POINT_NOT_RESOLVED) => return Err(DeleteOutcome::Linked),
+        Err(status) => return Err(DeleteOutcome::Failed(io_error(status))),
     };
-    let child = match Dir::from_open(child, dir.path().join(name)) {
-        Ok(child) => child,
-        Err(e) => return DeleteOutcome::Failed(e),
+    Dir::from_open(file, dir.path().join(name)).map_err(DeleteOutcome::Failed)
+}
+
+/// Deletes the tree of `child`, an open directory, or `child` alone if it is a link. One that became a link
+/// since it was opened has an empty listing, and its handle is on the link: the link is deleted.
+fn remove_opened(child: &Dir) -> DeleteOutcome {
+    let emptied = if child.is_link() {
+        Ok(())
+    } else {
+        child.list().and_then(|entries| remove_entries(child, &entries))
     };
-    if !child.is_link() {
-        match child.list() {
-            Ok(entries) => {
-                if let Err(e) = remove_entries(&child, &entries) {
-                    return DeleteOutcome::Failed(e);
-                }
-            }
-            Err(e) => return DeleteOutcome::Failed(e),
-        }
-    }
-    match delete_by_disposition(child.file()) {
+    match emptied.and_then(|()| delete_by_disposition(child.file())) {
         Ok(()) => DeleteOutcome::Deleted,
         Err(e) => DeleteOutcome::Failed(e),
     }

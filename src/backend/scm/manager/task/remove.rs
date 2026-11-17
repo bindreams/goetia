@@ -62,10 +62,9 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
 }
 
 /// What an uninstall says on stderr when its removal of the run records has to wait, each time the path it
-/// waits for changes: the manager has no channel for a notice, so it is said as its warnings are. A `run`
-/// that still waits for a record holds the directory, and returns after the stop that came before; a
-/// file whose delete is pending goes when the last handle on it closes. A directory that is not empty
-/// with nothing known to hold what is in it is said as that, and claims no holder.
+/// waits for changes: the manager has no channel for a notice, so it is said as its warnings are. A
+/// directory that is not empty with nothing known to hold what is in it is said as that, and claims no
+/// holder.
 fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
     match kind {
         PauseKind::Held => eprintln!(
@@ -151,10 +150,8 @@ impl Scm {
     /// 2. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
     ///    event. A run whose shim recorded an incomplete stop, or whose record cannot be read, keeps the
     ///    task, disabled.
-    /// 3. The task is deleted, then its run records. A `run` that still waits for a record holds a pin
-    ///    and the records are not deleted under it; a file another program holds cannot be deleted
-    ///    either. The removal waits for any holder, with no bound, and says on stderr what it waits for,
-    ///    each time that changes ([`Runs::remove_all`]). The install lock is held throughout.
+    /// 3. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder,
+    ///    with no bound, and says on stderr what it waits for. The install lock is held throughout.
     ///
     /// A task that is gone has nothing to disable or stop; the rest finds nothing.
     pub(super) fn task_remove_with<P: Processes>(

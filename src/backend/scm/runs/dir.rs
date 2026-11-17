@@ -1,20 +1,22 @@
 //! A task's records directory as one handle that never follows a link, and everything done to what is in
 //! it through that handle.
 //!
-//! The account a task runs as holds `ADD_FILE` on its own empty directory, which is all it takes to make it
-//! a mount point to any folder (KB ddcbd14, on windows-2022 and windows-2025); no permission closes that,
-//! since an account that writes records needs the right. What the elevated side does to the directory is
-//! therefore done through one handle, opened without following a link and refused when it shows one
-//! ([`Dir::open`]); a removal alone takes a link and deletes it ([`Dir::open_even_if_link`]). The handle
-//! is measured to stay on the directory itself when the account makes it a mount point while the handle is
-//! held (KB 78c82b1): its listing is empty and every open relative to it, a create too, fails with
-//! `STATUS_REPARSE_POINT_NOT_RESOLVED`, so nothing reaches the target. Every child is opened relative to
-//! the handle by its bare name ([`Dir::open_in`]), which does not follow a link either. There is no
-//! operation on a child by its path.
+//! **The threat.** The account a task runs as holds `ADD_FILE` on its own empty directory, which is all it
+//! takes to make it a mount point to any folder (measured on windows-2022 and windows-2025); no permission
+//! closes that, since an account that writes records needs the right (`Descriptor::for_runs`). What the
+//! elevated side does to the directory is therefore done through one handle, opened without following a
+//! link and refused when it shows one ([`Dir::open`]); a removal alone takes a link and deletes it
+//! ([`Dir::open_even_if_link`]).
+//!
+//! Measured: a handle held while the account makes the directory a mount point stays on the directory
+//! itself. Its listing is empty and every open relative to it, a create too, fails with
+//! `STATUS_REPARSE_POINT_NOT_RESOLVED`, so nothing reaches the target; [`Dir::open_error`] reads that status
+//! as a link. Every child is opened relative to the handle by its bare name ([`Dir::open_in`]), which does
+//! not follow a link either. There is no operation on a child by its path.
 //!
 //! The handle is opened without `DELETE`: one with it stopped the account's rename of a record on
-//! windows-2022 (KB 78c82b1). The directory is deleted through a second handle opened relative to its
-//! parent ([`Dir::remove`]).
+//! windows-2022. The directory is deleted through a second handle opened relative to its parent
+//! ([`Dir::remove`]).
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -31,7 +33,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{
     ERROR_NO_MORE_FILES, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_INVALID,
-    UNICODE_STRING,
+    STATUS_REPARSE_POINT_NOT_RESOLVED, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
@@ -51,15 +53,19 @@ use crate::backend::scm::wide::wide_null;
 pub(super) const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
 /// What the handle on the directory is opened for: to list it, to make files in it and to open its
-/// entries. Deleting an entry another account made needs no more of the handle: the open of the entry for
-/// `DELETE` is judged against the directory's own permissions (`FILE_DELETE_CHILD`), not the handle's
-/// access (KB 44fca8b). No `DELETE` on the directory itself: see the module's note.
+/// entries. Deleting an entry needs no more of it ([`files::delete`](super::files::delete)), and the
+/// directory itself is deleted through another handle (see the module's note).
 const ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_ADD_FILE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
 /// The option of an [`open_in`](Dir::open_in) whose handle is read or written with `ReadFile` or
 /// `WriteFile`, which need it a synchronous handle; the access must then include `SYNCHRONIZE`. A handle
 /// for a delete, a rename or a query has neither: see [`Dir::open_in`].
 pub(super) const SYNCHRONOUS_IO: u32 = FILE_SYNCHRONOUS_IO_NONALERT;
+
+/// Whether `name` is a bare name and no path, which is all a handle on a directory opens or renames to.
+pub(super) fn is_bare(name: &OsStr) -> bool {
+    name.encode_wide().all(|unit| unit != u16::from(b'\\'))
+}
 
 /// `IsReparseTagNameSurrogate`: whether a reparse `tag` says the file is another name for something else
 /// (a mount point, a symlink), which is bit 29. Any other tag is data on the file itself.
@@ -127,22 +133,36 @@ impl Dir {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        // The tag means something only where the attribute is set.
         let link = info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && is_name_surrogate(info.ReparseTag);
         Ok(Dir { file, path, link })
     }
 
     fn not_a_link(self) -> io::Result<Dir> {
         if self.link {
-            return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                format!(
-                    "{} is a link, which goetia did not make; uninstalling the task removes it",
-                    self.path.display()
-                ),
-            ));
+            return Err(self.link_error());
         }
         Ok(self)
+    }
+
+    /// What goetia says of a directory that is a link where it made a directory.
+    pub(super) fn link_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!(
+                "{} is a link, which goetia did not make; uninstalling the task removes it",
+                self.path.display()
+            ),
+        )
+    }
+
+    /// The error of an [`open_in`](Dir::open_in) that failed with `status`: a directory that became a link
+    /// since it was opened is a link ([`Dir::open`]), and anything else is what Windows calls it.
+    pub(super) fn open_error(&self, status: NTSTATUS) -> io::Error {
+        if status == STATUS_REPARSE_POINT_NOT_RESOLVED {
+            self.link_error()
+        } else {
+            io_error(status)
+        }
     }
 
     /// Whether the directory is a link (a mount point or a symlink) and not a directory of its own.
@@ -164,7 +184,6 @@ impl Dir {
     /// UTF-16 and not necessarily Unicode.
     pub(super) fn list(&self) -> io::Result<Vec<Listed>> {
         let mut listed = Vec::new();
-        // 8-byte aligned, as `FILE_ID_BOTH_DIR_INFO` is.
         let mut buffer = vec![0u64; 8192];
         let mut class = FileIdBothDirectoryRestartInfo;
         loop {
@@ -215,11 +234,10 @@ impl Dir {
     /// do, `disposition` is one of `FILE_OPEN`, `FILE_CREATE` and `FILE_OPEN_IF`, and `options` is more
     /// `NtCreateFile` options (`FILE_NON_DIRECTORY_FILE`, say).
     ///
-    /// Nothing is added to `access`: `SYNCHRONIZE` is a right the entry's own permissions must give, and
-    /// those of an entry another account made do not, so an open that asked for it was refused where one
-    /// for `DELETE` alone is allowed by the directory's `FILE_DELETE_CHILD` (KB 44fca8b). A handle that is
-    /// read or written asks for `SYNCHRONIZE` and passes [`SYNCHRONOUS_IO`].
-    /// The error is the `NTSTATUS`, which tells a pending delete from a refusal where the Win32 code does not.
+    /// Nothing is added to `access`: a handle that is read or written asks for `SYNCHRONIZE` and passes
+    /// [`SYNCHRONOUS_IO`]; one for a delete, a rename or a query has neither
+    /// ([`files::delete`](super::files::delete)). The error is the `NTSTATUS`, which tells a pending delete
+    /// from a refusal where the Win32 code does not; [`Dir::open_error`] words it.
     pub(super) fn open_in(
         &self,
         name: &OsStr,
@@ -228,10 +246,7 @@ impl Dir {
         disposition: u32,
         options: u32,
     ) -> Result<File, NTSTATUS> {
-        debug_assert!(
-            name.encode_wide().all(|unit| unit != u16::from(b'\\')),
-            "a name, not a path"
-        );
+        debug_assert!(is_bare(name), "a name, not a path");
         // An interior NUL is refused as `wide_null` does everywhere goetia sends text; a counted string has
         // no terminator to keep.
         let mut units = wide_null(name).map_err(|_| STATUS_OBJECT_NAME_INVALID)?;
@@ -290,7 +305,7 @@ impl Dir {
         let parent = Dir::open(parent)?;
         let second = parent
             .open_in(name, DELETE | FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, 0)
-            .map_err(io_error)?;
+            .map_err(|status| parent.open_error(status))?;
         if file_id(&second)? != file_id(&self.file)? {
             return Err(io::Error::other(format!(
                 "{} was replaced while goetia had it open",
@@ -309,8 +324,8 @@ pub(super) fn io_error(status: NTSTATUS) -> io::Error {
 }
 
 /// Deletes the file or directory `file` is open on, with POSIX semantics: its name goes at once, whoever
-/// else has it open and shares delete (KB 1315c05, 2b01933), and a READONLY file goes too. `file` must have
-/// been opened with `DELETE`.
+/// else has it open and shares delete (measured), and a READONLY file goes too. `file` must have been opened
+/// with `DELETE`.
 pub(super) fn delete_by_disposition(file: &File) -> io::Result<()> {
     let info = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE

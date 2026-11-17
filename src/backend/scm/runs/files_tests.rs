@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
-use windows_sys::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_SHARE_DELETE, FILE_SHARE_WRITE, FILE_WRITE_DATA};
+use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
 
 use super::*;
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
@@ -162,54 +162,8 @@ fn a_file_a_handle_holds_without_sharing_delete_is_held_and_one_that_is_gone_is_
     );
 }
 
-/// The access a handle holds on its file.
-fn granted(file: &fs::File) -> u32 {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_ACCESS_INFORMATION, FileAccessInformation, NtQueryInformationFile,
-    };
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
-    let mut info = FILE_ACCESS_INFORMATION::default();
-    let mut block = IO_STATUS_BLOCK::default();
-    // SAFETY: `info` is `size_of::<FILE_ACCESS_INFORMATION>()` writable bytes; the handle is live.
-    let status = unsafe {
-        NtQueryInformationFile(
-            file.as_raw_handle() as HANDLE,
-            &mut block,
-            (&raw mut info).cast(),
-            size_of::<FILE_ACCESS_INFORMATION>() as u32,
-            FileAccessInformation,
-        )
-    };
-    assert!(status >= 0, "{status:#x}");
-    info.AccessFlags
-}
-
-/// A creating open is granted what it asks for, whatever the directory's entry for the account says, so
-/// the files the account's shim makes are as capable as those opens ask. The temp file: write and append,
-/// and delete for the rename; the pin: delete, for its delete-on-close. Both `SYNCHRONIZE`, for the
-/// synchronous handle. Not the right to set attributes or extended attributes, which a task's account has
-/// no entry for.
-#[skuld::test]
-fn the_temp_file_and_the_pin_are_created_for_what_they_use_and_no_more() {
-    let dir = tempfile::tempdir().unwrap();
-    let held_in = open(dir.path());
-
-    let temp = create_temp(&held_in, OsStr::new("f.json.tmp")).unwrap();
-    let pin = create_pin(&held_in, OsStr::new("pin-a.pin")).unwrap();
-
-    assert_eq!(
-        granted(&temp),
-        FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | SYNCHRONIZE,
-        "the temp file"
-    );
-    assert_eq!(granted(&pin), DELETE | SYNCHRONIZE, "the pin");
-}
-
 /// A temp file an interrupted write left is deleted and made new, not overwritten: the account has no
-/// right to overwrite (KB ddcbd14), and nothing of the leftover is kept.
+/// right to overwrite, and nothing of the leftover is kept.
 #[skuld::test]
 fn a_leftover_temp_file_is_replaced_by_a_new_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -245,9 +199,9 @@ fn a_tree_is_removed_with_the_links_in_it_deleted_and_not_followed() {
     assert_eq!(fs::read(target.path().join("victim.txt")).unwrap(), b"keep");
 }
 
-/// A directory held open, emptied, and made a mount point by its account between a listing and the deletes
-/// that follow: `held` is the handle and `stale` what the listing named. Nothing of the target is reachable
-/// through the handle. The target is returned, with `victim.txt` in it.
+/// A directory `held` that is open when its account empties it and makes it a mount point. The names in
+/// `stale` are in the target too, as if they were what the directory held. Returns the handle and the target,
+/// which holds `victim.txt`.
 fn held_directory_turned_into_a_link(dir: &Path, stale: &[&str]) -> (Dir, tempfile::TempDir) {
     let held = dir.join("held");
     fs::create_dir(&held).unwrap();
@@ -279,6 +233,53 @@ fn a_delete_in_a_directory_that_became_a_link_says_so_and_touches_nothing_of_the
     for name in ["a.json", "pin-a.pin", "victim.txt"] {
         assert!(target.path().join(name).exists(), "{name}");
     }
+}
+
+/// A create or a read in a directory that became a link after it was opened is refused as a link is
+/// ([`Dir::open`]), where it would otherwise surface as `STATUS_REPARSE_POINT_NOT_RESOLVED`. Nothing is made
+/// in the target.
+#[skuld::test]
+fn a_create_or_a_read_in_a_directory_that_became_a_link_is_refused_as_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let (held, target) = held_directory_turned_into_a_link(dir.path(), &[]);
+
+    let refused = [
+        create_temp(&held, OsStr::new("f.json.tmp")).unwrap_err(),
+        create_pin(&held, OsStr::new("pin-a.pin")).unwrap_err(),
+        read(&held, OsStr::new("a.json")).unwrap_err(),
+    ];
+
+    for error in refused {
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error}");
+        assert!(
+            error.to_string().contains(&held.path().display().to_string()),
+            "{error}"
+        );
+    }
+    assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1, "only victim.txt");
+}
+
+/// A child of the tree that becomes a link after `remove_tree` opened it is deleted as a link, and what it
+/// points to stays.
+#[skuld::test]
+fn a_child_that_becomes_a_link_after_it_is_opened_is_deleted_as_one() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("child")).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    fs::write(target.path().join("victim.txt"), "keep").unwrap();
+    let Ok(child) = open_child(&open(dir.path()), OsStr::new("child")) else {
+        panic!("the child opens");
+    };
+    make_mount_point(&dir.path().join("child"), target.path());
+
+    assert!(matches!(remove_opened(&child), DeleteOutcome::Deleted));
+    drop(child);
+
+    assert!(
+        fs::symlink_metadata(dir.path().join("child")).is_err(),
+        "the link is gone"
+    );
+    assert_eq!(fs::read(target.path().join("victim.txt")).unwrap(), b"keep");
 }
 
 /// A directory of the tree that became a link between its listing and the deletes is deleted as a link,

@@ -35,7 +35,7 @@ fn a_link_is_refused_by_open_and_opened_itself_by_open_even_if_link() {
     assert!(!Dir::open(dir.path()).unwrap().is_link());
 }
 
-/// What the whole design stands on (measured, KB 78c82b1): a handle on a mount point is on the link itself,
+/// What the whole design stands on (measured): a handle on a mount point is on the link itself,
 /// so a listing through it is empty and an open relative to it reaches nothing of the target.
 #[skuld::test]
 fn nothing_of_a_links_target_is_listed_or_opened_through_a_handle_on_the_link() {
@@ -146,6 +146,27 @@ fn remove_deletes_the_directory_or_the_link_and_not_what_a_link_points_to() {
     assert!(fs::symlink_metadata(dir.path().join("link")).is_err());
     assert!(!dir.path().join("plain").exists());
     assert_eq!(fs::read(target.path().join("victim.txt")).unwrap(), b"keep");
+}
+
+/// The name the handle was opened by is now another directory: the delete is refused, and the replacement
+/// is not touched.
+#[skuld::test]
+fn remove_refuses_a_directory_whose_name_was_replaced_while_it_was_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = dir.path().join("held");
+    fs::create_dir(&held).unwrap();
+    let handle = Dir::open(&held).unwrap();
+    fs::rename(&held, dir.path().join("moved")).unwrap();
+    fs::create_dir(&held).unwrap();
+
+    let refused = handle.remove().unwrap_err();
+
+    assert!(refused.to_string().contains("was replaced"), "{refused}");
+    assert!(
+        held.is_dir(),
+        "the replacement, which is empty and would have gone, is there"
+    );
+    assert!(dir.path().join("moved").is_dir());
 }
 
 #[skuld::test]

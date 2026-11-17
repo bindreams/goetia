@@ -116,6 +116,21 @@ pub(crate) fn directory_with_a_file(path: &std::path::Path) {
     std::fs::write(path.join("inside"), "").unwrap();
 }
 
+/// A directory at `path` that cannot be removed while the returned handle is open: a file in it is held
+/// without sharing delete, so removing its tree is a sharing violation.
+#[cfg(windows)]
+pub(crate) fn directory_held_open(path: &std::path::Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    directory_with_a_file(path);
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path.join("inside"))
+        .unwrap()
+}
+
 /// A file at `path` whose delete is pending: its holder closed it while the returned handle was open on
 /// it, so it is deleted when that handle is dropped. Windows answers an open or a delete of it with
 /// access denied.
@@ -136,7 +151,7 @@ pub(crate) fn delete_pending(path: &std::path::Path) -> std::fs::File {
 }
 
 /// Gives the existing empty directory `dir` the reparse tag `tag` with `payload`, as the account that may
-/// add files to it can (KB ddcbd14): it is the same directory, so a handle held on it before is on a
+/// add files to it can: it is the same directory, so a handle held on it before is on a
 /// reparse point now.
 #[cfg(windows)]
 pub(crate) fn set_reparse_point(dir: &std::path::Path, tag: u32, payload: &[u8]) {
