@@ -788,8 +788,8 @@ fn a_process_launchd_no_longer_names_when_the_timeout_is_over_is_not_sent_sigkil
     assert_eq!(run.finish(), Some(0), "the process was not killed");
 }
 
-/// A deadline that is spent is the caller's timeout, whatever the pass would have done next: the stop reads
-/// nothing and sends nothing after it, and says what it had sent. A run sent SIGTERM whose grace is over is
+/// A deadline that is spent is the caller's timeout, whatever the pass would have done next: the stop sends
+/// nothing after it, reads `print` once to see whether the job is done, and says what it had sent. A run sent SIGTERM whose grace is over is
 /// due SIGKILL, and it is not sent; one whose grace is not over has it still, and one that was sent SIGKILL
 /// has it said. The deadline is spent by construction (a bound of nothing), so no clock decides the outcome.
 #[skuld::test]
@@ -800,6 +800,7 @@ fn a_stop_whose_deadline_is_spent_sends_nothing_and_says_what_it_sent() {
     };
     let over = Budget::Immediate.start();
     let not_over = Budget::Unbounded.start();
+    let shown = running(run.pid());
     let cases = [
         ("grace over", over, false, "before goetia sent SIGKILL"),
         (
@@ -811,7 +812,7 @@ fn a_stop_whose_deadline_is_spent_sends_nothing_and_says_what_it_sent() {
         ("killed", over, true, "was sent SIGKILL"),
     ];
     for (what, grace_end, killed, says) in cases {
-        let fake = Fake::new([]);
+        let fake = Fake::new([print(&shown)]);
         let mut course = Course::new(
             Some(graced()),
             Budget::Bounded(Duration::ZERO),
@@ -829,24 +830,70 @@ fn a_stop_whose_deadline_is_spent_sends_nothing_and_says_what_it_sent() {
             panic!("{what}: expected a wait timeout, got {result:?}");
         };
         assert!(recovery.contains(says), "{what}: {recovery}");
-        fake.assert_spent("nothing is read after the deadline");
+        fake.assert_spent("the one read after the deadline, which shows the run still there");
         assert_eq!(sent, [], "{what}: nothing is sent after the deadline");
     }
     assert_eq!(run.finish(), Some(0), "the run was not signalled");
 }
 
-/// A stop with no time reads nothing, waits for no queued start, and sends no SIGTERM to a run it has not
-/// signalled yet: the deadline is checked before anything is read or sent. (A zero bound is spent from the
-/// start, so no clock decides the outcome.)
+/// A stop with no time sends no SIGTERM to a run it has not signalled yet, and waits for no queued start: the
+/// deadline is checked before anything is sent. It reads `print` once, and whatever shows a job that is not done
+/// (a process, a start launchd accepted, a state that says nothing, a read that failed) is the timeout.
+/// (A zero bound is spent from the start, so no clock decides the outcome.)
 #[skuld::test]
-fn a_stop_with_no_time_reads_nothing_and_sends_nothing() {
-    let fake = Fake::new([]);
+fn a_stop_with_no_time_reads_once_and_sends_nothing() {
+    let failed = reply(
+        &["print", &target()],
+        exited(5, "", "Could not print: 5: Input/output error\n"),
+    );
+    let reads = [
+        ("a process", print(&running(4242))),
+        ("a queued start", print(QUEUED)),
+        (
+            "a state that says nothing",
+            print("\tstate = someday-new-apple-state\n"),
+        ),
+        ("a read that failed", failed),
+    ];
+    for (what, read) in reads {
+        let fake = Fake::new([read]);
 
-    let (result, sent) = stopping_signals(&fake, Budget::Bounded(Duration::ZERO), StopAction::default());
+        let (result, sent) = stopping_signals(&fake, Budget::Bounded(Duration::ZERO), StopAction::default());
 
-    assert_wait_timeout(&result.expect_err("a bound that has run out"));
-    fake.assert_spent("no read");
-    assert_eq!(sent, []);
+        assert_wait_timeout(&result.expect_err(what));
+        fake.assert_spent("the one read");
+        assert_eq!(sent, [], "{what}");
+    }
+}
+
+/// A run that ended inside the budget is not a timeout, whenever the next pass starts: the watch fired before
+/// the deadline, the next pass begins after it (here the deadline is spent by construction, and the run has
+/// been sent SIGTERM), and its one read shows the job idle. Nothing is sent, and nothing is read twice.
+#[skuld::test]
+fn a_run_that_ended_inside_the_budget_is_not_a_timeout_though_the_next_pass_starts_after_it() {
+    let run = Held::new(0);
+    let Resolved::Found(identity) = ProcessId::of(run.pid()) else {
+        panic!("the child is running");
+    };
+    for read in [print(IDLE), print("\tstate = exited\n"), not_loaded()] {
+        let fake = Fake::new([read]);
+        let mut course = Course::new(
+            Some(graced()),
+            Budget::Bounded(Duration::ZERO),
+            Watch::new().expect("a watch"),
+        );
+        course.termed = Some(Termed {
+            run: identity,
+            grace_end: Some(Budget::Unbounded.start()),
+            killed: false,
+        });
+
+        let (result, sent) = stopping_course(&fake, course, Refusing::Nothing);
+
+        result.expect("the job is done");
+        fake.assert_spent("the one read, which shows no process");
+        assert_eq!(sent, [], "nothing is sent after the deadline");
+    }
 }
 
 /// A later pass can find the run that was sent SIGTERM again: here launchd's lookup did not name the process
