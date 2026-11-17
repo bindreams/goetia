@@ -112,8 +112,33 @@ pub(crate) const A_STRANGER: &str = "S-1-5-21-1-2-3-1000";
 /// text), and nothing else, administrators included. The file's owner may still change them.
 #[cfg(windows)]
 pub(crate) fn permit_only(path: &std::path::Path, sid: &str) {
-    let only = crate::backend::scm::shim::acl::Descriptor::from_sddl(&format!("D:P(A;;FA;;;{sid})")).unwrap();
-    set_dacl(&only, path).unwrap();
+    set_entries(path, &[("FA", sid)]);
+}
+
+/// [`permit_only`] for an account no test runs as, with the account `sid` left only the rights to read the
+/// attributes and the permissions and to change them: it may not append, which is what a log's account loses
+/// when an install takes its entry out, and a test may still put the permissions back.
+#[cfg(windows)]
+pub(crate) fn withdraw_append(path: &std::path::Path, sid: &str) {
+    // Read the attributes and the permissions, change the permissions, and wait on the handle (every open asks
+    // for the last).
+    set_entries(path, &[("FA", A_STRANGER), ("0x160080", sid)]);
+}
+
+/// Makes the permissions of the existing file `path` `entries`, each rights in SDDL and the account's SID,
+/// set on a handle opened as an install opens a log to set them.
+#[cfg(windows)]
+fn set_entries(path: &std::path::Path, entries: &[(&str, &str)]) {
+    let sddl: String = entries
+        .iter()
+        .map(|(rights, sid)| format!("(A;;{rights};;;{sid})"))
+        .collect();
+    let descriptor = crate::backend::scm::shim::acl::Descriptor::from_sddl(&format!("D:P{sddl}")).unwrap();
+    let (file, made) = descriptor
+        .open_always_for_dacl(path)
+        .unwrap_or_else(|e| panic!("open {} to set {sddl}: {e}", path.display()));
+    assert!(!made, "{} was not there", path.display());
+    descriptor.set_dacl_of(&file).unwrap();
 }
 
 /// Makes a directory with a file in it at `path`. Where a file is expected, deleting it as a file fails

@@ -378,7 +378,9 @@ fn a_stored_principal_that_cannot_be_read_is_an_account_change() {
             Some(&TaskSnapshot::new(id(), Ok(blob(&new)), no_principal)),
             &runs,
             &mut Running(vec![]),
-            prepared(network_service(), None),
+            // An account the test is in: the default log is set twice, and the second open needs to read the
+            // attributes the first set left only to the accounts it names.
+            prepared(users(), None),
         )
         .unwrap();
 
@@ -806,7 +808,8 @@ fn a_change_of_account_that_lands_leaves_the_new_account_alone_in_the_log() {
 fn an_unchanged_install_names_the_account_alone_in_the_log() {
     let (dir, runs) = made_records();
     log_with_an_entry_no_install_names(&dir);
-    let spec = as_service("LocalService");
+    // An account the test is in, so that it may read what the install sets.
+    let spec = task_spec_as(User::Id(AccountId::Sid("S-1-5-32-545".to_owned())), Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
 
@@ -817,12 +820,12 @@ fn an_unchanged_install_names_the_account_alone_in_the_log() {
             Some(&snapshot_of(&spec, false)),
             &runs,
             &mut Running(vec![]),
-            prepared(local_service(), None),
+            prepared(users(), None),
         )
         .unwrap();
 
     let trustees = trustees_of(&default_log(&dir));
-    assert!(trustees.contains(&local_service()));
+    assert!(trustees.contains(&users()));
     assert!(!trustees.contains(&process_user_sid()));
 }
 
@@ -1385,9 +1388,8 @@ fn a_service_that_runs_is_not_changed_into_a_task() {
             &spec,
             &definition(&spec),
             &runs,
-            None,
             |_| panic!("nothing is acquired for a retype that is refused"),
-            || refuse_running(&id(), DaemonKind::Service, State::Running),
+            || refuse_running(&id(), DaemonKind::Service, State::Running).map(|()| None),
             || panic!("the service is not removed"),
         )
         .unwrap_err();
@@ -1419,14 +1421,13 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
             &spec,
             &definition(&spec),
             &runs,
-            None,
             |account| {
                 password_of(account, || Ok(None)).map(|password| Prepared {
                     principal: system(),
                     password,
                 })
             },
-            || Ok(()),
+            || Ok(None),
             || panic!("the service is not removed when what the task needs is missing"),
         )
         .unwrap_err();
@@ -1442,9 +1443,8 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
         &spec,
         &definition(&spec),
         &blocked,
-        None,
         prepared_alice(),
-        || Ok(()),
+        || Ok(None),
         || panic!("the service is not removed when its record directory cannot be made"),
     );
     assert!(refused.is_err());
@@ -1467,9 +1467,8 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
             &spec,
             &definition(&spec),
             &runs,
-            None,
             prepared(process_user_sid(), None),
-            || Ok(()),
+            || Ok(None),
             || {
                 assert_eq!(
                     fake.calls(),
@@ -1507,9 +1506,8 @@ fn a_service_changed_into_a_task_keeps_its_old_account_in_the_log_until_the_task
             &spec,
             &definition(&spec),
             &runs,
-            Some(local_service()),
             prepared(users(), None),
-            || Ok(()),
+            || Ok(Some(local_service())),
             || Err(Error::os("retire", std::io::Error::other("denied"))),
         )
         .unwrap_err();
@@ -1529,9 +1527,8 @@ fn a_service_changed_into_a_task_keeps_its_old_account_in_the_log_until_the_task
             &spec,
             &definition(&spec),
             &runs,
-            Some(local_service()),
             prepared(users(), None),
-            || Ok(()),
+            || Ok(Some(local_service())),
             || Ok(()),
         )
         .unwrap();

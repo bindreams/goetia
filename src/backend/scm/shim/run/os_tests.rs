@@ -25,7 +25,7 @@ use crate::backend::scm::shim::run::os::fake::FakeGuard;
 use crate::backend::scm::shim::run::service::build_command;
 use crate::backend::scm::shim::run::test_support::not_found;
 use crate::backend::scm::sid::sid_display;
-use crate::backend::scm::test_support::{A_STRANGER, permit_only};
+use crate::backend::scm::test_support::{permit_only, withdraw_append};
 use crate::elevation::test_support::process_user_sid;
 
 /// Holds a real daemon and ends it when dropped, so a failing test leaves no sleeper behind. Made
@@ -451,7 +451,7 @@ fn the_shims_own_lines_after_its_account_was_taken_out_land_in_the_held_log(#[fi
     let real = Real::default();
     real.hold_default(&log).expect("hold the default log");
 
-    permit_only(&log, A_STRANGER);
+    withdraw_append(&log, &me);
 
     real.append(&log, "the line", LogKind::Default)
         .expect("a line through the held handle");

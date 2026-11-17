@@ -10,8 +10,6 @@
 //! edit survives them. Re-registering a task that logs on with a password takes the password (M3): `enable`
 //! and `disable` of a real user's task read `GOETIA_SERVICE_PASSWORD` as an install does.
 
-use std::path::Path;
-
 use super::api::{Registered, Registration};
 use super::live::Liveness;
 use super::verbs::{Processes, System, gone};
@@ -22,7 +20,7 @@ use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::{self, Right, Written};
 use crate::backend::scm::manager::{
-    Scm, ScmSnapshot, apply_gated, make_default_log, registry, service_gate, written_user,
+    Scm, ScmSnapshot, apply_gated, make_default_log, registered_account_sid, registry, service_gate, written_user,
 };
 use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
@@ -195,7 +193,7 @@ impl Scm {
         let changed = snapshot.filter(|old| stored_principal(old.registered()).as_ref() != Some(&prepared.principal));
         match changed {
             None => {
-                task_records(id, runs, &prepared, default_log::ensure)?;
+                task_records(id, runs, &prepared, &[])?;
                 self.task_register(
                     id,
                     definition,
@@ -262,7 +260,9 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = old.id();
         self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
-        task_records(id, runs, prepared, default_log::admit)?;
+        // The task is registered as the old account until the create lands, so its log names it too.
+        let registered = stored_principal(old.registered());
+        task_records(id, runs, prepared, registered.as_slice())?;
         match self.tasks.delete(&TaskPath::of(id)) {
             // The task is gone; a folder that stays is still there for the create.
             Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
@@ -326,28 +326,29 @@ fn principal_sid(registered: &Registered) -> Result<Sid> {
 
 /// Everything a registration of `definition` needs, before any request: what the machine holds for the
 /// account (`prepare`), and the record directory with permissions that name it. Every write makes it, so
-/// a reinstall as another user can still write its records. The default log names the account beside the
-/// one it names now, for a service that is yet to be retired ([`landed`]).
+/// a reinstall as another user can still write its records. The default log names `kept` beside the account:
+/// the account a service that is yet to be retired runs as ([`landed`] follows).
 fn task_acquire(
     id: &Id,
     definition: &TaskXml,
     runs: &Runs,
+    kept: &[Sid],
     prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
 ) -> Result<Prepared> {
     let prepared = prepare(&definition.account())?;
-    task_records(id, runs, &prepared, default_log::admit)?;
+    task_records(id, runs, &prepared, kept)?;
     Ok(prepared)
 }
 
 /// The record directory of `id` with permissions that name the account `prepared` holds, and its default
-/// log, which the account may append to (the shim opens it and never makes it). `log` is
-/// [`default_log::ensure`], which names the account alone, or [`default_log::admit`], which names it beside
-/// the account that has the log now, for a write that changes the account of a daemon that still runs as
-/// the old one until the write lands ([`landed`] follows it).
-fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, log: fn(&Path, &Id, &Sid) -> Result<()>) -> Result<()> {
+/// log, which the account may append to (the shim opens it and never makes it) and so may `kept`: the
+/// accounts a write that changes the account leaves the daemon running as until it lands ([`landed`] follows
+/// it). Nothing is read back from either.
+fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, kept: &[Sid]) -> Result<()> {
     runs.ensure(&prepared.principal)
         .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
-    log(runs.program_data(), id, &prepared.principal)
+    let accounts = [kept, std::slice::from_ref(&prepared.principal)].concat();
+    default_log::ensure(runs.program_data(), id, &accounts)
 }
 
 /// Once a registration that changed the account has landed (`wrote` is [`WriteOutcome::Done`]), the default
@@ -355,7 +356,7 @@ fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, log: fn(&Path, &Id, &
 /// corrects: it is the one that finds the task as it is.
 fn landed(id: &Id, runs: &Runs, prepared: &Prepared, wrote: WriteOutcome) -> Result<WriteOutcome> {
     if matches!(wrote, WriteOutcome::Done) {
-        default_log::ensure(runs.program_data(), id, &prepared.principal)?;
+        default_log::ensure(runs.program_data(), id, std::slice::from_ref(&prepared.principal))?;
     }
     Ok(wrote)
 }
@@ -364,7 +365,7 @@ fn landed(id: &Id, runs: &Runs, prepared: &Prepared, wrote: WriteOutcome) -> Res
 /// the task up to date makes again if it is gone, since the shim makes none.
 pub(in crate::backend::scm) fn task_default_log(installed: &TaskSnapshot) -> Result<()> {
     let principal = principal_sid(installed.registered())?;
-    default_log::ensure(&program_data()?, installed.id(), &principal)
+    default_log::ensure(&program_data()?, installed.id(), &[principal])
 }
 
 // Enable and disable ==================================================================================================
@@ -429,7 +430,7 @@ impl Scm {
             || service_gate(definition, written),
             |gated| {
                 apply_gated(definition, gated.password, true)?;
-                make_default_log(spec, definition, gated.checked.as_ref())?;
+                make_default_log(spec, definition, gated.checked.as_ref(), &[])?;
                 Ok(WriteOutcome::Done)
             },
         )?;
@@ -488,7 +489,9 @@ impl Scm {
                     old.id(),
                     DaemonKind::Service,
                     self.service_live_status(old)?.common().state,
-                )
+                )?;
+                // The account the service runs as until it is retired, which its log names beside the task's.
+                registered_account_sid(old.config()?)
             },
             || self.service_retire(old),
         )?;
@@ -496,22 +499,24 @@ impl Scm {
         Ok(wrote)
     }
 
-    /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare`, `refuse` (the service
-    /// runs: [`Error::RetypeRunning`]) and `retire` (the service is removed). The order is the contract:
-    /// `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
-    /// registration, then the default log for the task's account alone ([`landed`]); a refusal or a failed acquisition leaves the service untouched.
+    /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare`, `refuse` (the service runs:
+    /// [`Error::RetypeRunning`]; otherwise it says the account the service runs as, if any, which the default
+    /// log names beside the task's until the service is gone) and `retire` (the service is removed). The order
+    /// is the contract: `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
+    /// registration, then the default log for the task's account alone ([`landed`]); a refusal or a failed
+    /// acquisition leaves the service untouched.
     pub(super) fn retype_to_task_with(
         &self,
         spec: &DaemonSpec,
         definition: &TaskXml,
         runs: &Runs,
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
-        refuse: impl FnOnce() -> Result<()>,
+        refuse: impl FnOnce() -> Result<Option<Sid>>,
         retire: impl FnOnce() -> Result<()>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        refuse()?;
-        let prepared = task_acquire(id, definition, runs, prepare)?;
+        let registered = refuse()?;
+        let prepared = task_acquire(id, definition, runs, registered.as_slice(), prepare)?;
         retire()?;
         let wrote = self.task_register(id, definition, false, false, &prepared)?;
         landed(id, runs, &prepared, wrote)

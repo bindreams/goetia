@@ -26,8 +26,8 @@ pub(super) fn stopping(reported: Reported) {
 
 /// End the process with exactly `code`, from any thread. `TerminateProcess` runs no DLL detach and no
 /// thread-local destructor, unlike `ExitProcess`, which cuts other threads off first: one cut off
-/// inside the allocator can hang the exit. The log opens and closes its file per line, so only a
-/// write in flight on a thread nobody joined (the `DaemonMayRun` waiter) can be cut. If it fails, it is
+/// inside the allocator can hang the exit. The log buffers nothing (each line is one write to a file handle),
+/// so only a write in flight on a thread nobody joined (the `DaemonMayRun` waiter) can be cut. If it fails, it is
 /// logged and `process::exit` is all that is left.
 pub(super) fn end_process(code: i32) -> ! {
     // SAFETY: the pseudo handle of the current process is always valid.

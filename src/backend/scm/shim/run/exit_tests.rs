@@ -70,6 +70,10 @@ impl<'a> Children<'a> {
 struct FileChannels;
 
 impl Channels for FileChannels {
+    fn hold_default(&self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
         Real::default().append(path, line, kind)
     }

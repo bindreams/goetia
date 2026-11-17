@@ -369,7 +369,11 @@ fn the_default_log_of_a_service_names_the_registered_account_alone(#[fixture(scm
 
     mgr.install(&service_as(id, &host, "LocalService"), false)
         .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
-    assert_eq!(accounts_of_default_log(id), [local_service.clone()], "a new service");
+    assert_eq!(
+        accounts_of_default_log(id),
+        vec![local_service.clone()],
+        "a new service"
+    );
 
     // An entry an administrator added, which an install that finds nothing to change still sets the log
     // without.

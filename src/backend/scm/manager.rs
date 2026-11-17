@@ -343,22 +343,29 @@ impl Scm {
         if !generate::hosted(spec) {
             return Ok(None);
         }
-        self.begin_hosted_install(HostCommand {
-            exe: desired.executable.clone(),
-            args: desired.arguments.clone(),
-        })
+        self.begin_hosted_install(
+            HostCommand {
+                exe: desired.executable.clone(),
+                args: desired.arguments.clone(),
+            },
+            spec,
+        )
         .map(Some)
     }
 
     /// What an install of a daemon that runs under the shim host does first, for a service and a task
-    /// alike: see [`Self::service_begin_install`]. `rendered` is the host the definition names.
-    fn begin_hosted_install(&self, rendered: HostCommand) -> Result<InstallLock> {
+    /// alike: see [`Self::service_begin_install`]. `rendered` is the host the definition names. A `logs:` of
+    /// `spec` in goetia's logs folder is refused here, for every install, up to date or not: see
+    /// [`default_log::refuse_logs_in_folder`].
+    fn begin_hosted_install(&self, rendered: HostCommand, spec: &DaemonSpec) -> Result<InstallLock> {
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
         // Made here, by an elevated process, for the shim to write in: it runs as the daemon's account
         // and makes no folder. Always judged, whatever `folders` is: no caller guarantees them.
         let judge = FolderCheck::new(CheckPermissions::Enable);
-        make_goetia_folders(&program_data()?, |path| judge.check(path))?;
+        let program_data = program_data()?;
+        make_goetia_folders(&program_data, |path| judge.check(path))?;
+        default_log::refuse_logs_in_folder(&program_data, &spec.common().id, spec.common().logs.as_deref())?;
         self.sweep_before_install(shim);
         let provided = shim.provide(&self.folders)?;
         let provided = confirm_provided(rendered, provided)?;
@@ -431,7 +438,7 @@ impl Scm {
         definition: &ScmRegistration,
         snapshot: Option<&ScmSnapshot>,
     ) -> Result<WriteOutcome> {
-        apply(spec, definition, written_user(&spec.common().user), snapshot.is_none())?;
+        apply(spec, definition, written_user(&spec.common().user), snapshot)?;
         Ok(WriteOutcome::Done)
     }
 
@@ -647,7 +654,7 @@ impl Backend for Scm {
     ) -> Result<Option<InstallLock>> {
         match desired {
             WindowsDefinition::Service(desired) => self.service_begin_install(spec, desired),
-            WindowsDefinition::Task(desired) => self.begin_hosted_install(desired.host()).map(Some),
+            WindowsDefinition::Task(desired) => self.begin_hosted_install(desired.host(), spec).map(Some),
         }
     }
 
@@ -741,7 +748,7 @@ impl Backend for Scm {
     ) -> Result<()> {
         match (definition, snapshot) {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
-                make_default_log(spec, definition, None)
+                make_default_log(spec, definition, None, &[])
             }
             (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_default_log(installed),
             // An install that changes a daemon's kind writes, and is not up to date.
@@ -1042,19 +1049,7 @@ fn read_live_registration(
 ) -> Result<ScmRegistration> {
     let cmdline = cfg.executable_path.to_string_lossy().into_owned();
     let (executable, arguments) = split_command_line(&cmdline);
-    let account = cfg
-        .account_name
-        .as_ref()
-        .map(|a| a.to_string_lossy().into_owned())
-        // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
-        // doc comment) forces a live `LocalSystem` account to be written back
-        // as some spelling of it, not `None` — canonicalise it through the
-        // same table `generate::registration` uses so a `LocalSystem`
-        // service (whatever spelling SCM's own readback happens to use)
-        // reads as up-to-date rather than a permanent phantom diff. This is
-        // the `LocalSystem` row of that same table, folded in rather than a
-        // one-off `LocalSystem`-only filter.
-        .and_then(|a| generate::canonical_account(&a));
+    let account = registered_account(cfg);
     let failure_actions = read_failure_actions(service, name)?;
     let environment = held_service(name, registry::read_environment(name)?)?;
 
@@ -1069,6 +1064,32 @@ fn read_live_registration(
         parameters: live_params.fields.clone(),
         stray_parameters: live_params.strays.clone(),
     })
+}
+
+/// The account `cfg` says a service runs as, as the registration spells it: `None` is LocalSystem.
+fn registered_account(cfg: &ServiceConfig) -> Option<String> {
+    cfg.account_name
+        .as_ref()
+        .map(|a| a.to_string_lossy().into_owned())
+        // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
+        // doc comment) forces a live `LocalSystem` account to be written back
+        // as some spelling of it, not `None` — canonicalise it through the
+        // same table `generate::registration` uses so a `LocalSystem`
+        // service (whatever spelling SCM's own readback happens to use)
+        // reads as up-to-date rather than a permanent phantom diff. This is
+        // the `LocalSystem` row of that same table, folded in rather than a
+        // one-off `LocalSystem`-only filter.
+        .and_then(|a| generate::canonical_account(&a))
+}
+
+/// The SID of the account the service `cfg` describes is registered as. `None` when no account has that
+/// name (a deleted account): nothing runs as it, so there is no one to name. Any other failure is an error.
+pub(in crate::backend::scm) fn registered_account_sid(cfg: &ServiceConfig) -> Result<Option<Sid>> {
+    match identity::service_account_sid(registered_account(cfg).as_deref(), None) {
+        Ok(sid) => Ok(Some(sid)),
+        Err(Error::AccountLookup { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailureActions>> {
@@ -1169,22 +1190,34 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// ([`make_default_log`]) is not a precondition: an update makes it for the new account before the
 /// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
 /// service exists, since a virtual account's SID resolves only then, before any start. An update that
-/// changes the account names the new one beside the old before the configuration changes, and alone once it
-/// has landed, so that a change that fails leaves the account the service still runs as its log, and the
-/// next install corrects what a failure left. A failure of the log after a create leaves the new service,
+/// changes the account names the registered account and the new one before the configuration changes, and the
+/// new one alone once it has landed, so that a change that fails leaves the account the service still runs as
+/// its log, and the next install corrects what a failure left. The names come from what install knows (the
+/// snapshot's account, the new account), never from the file. A failure of the log after a create leaves the new service,
 /// and the next `install` finds it up to date and makes the log ([`Backend::ensure_beside`]). `Parameters` follows
 /// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
 /// start type the service has, rather than resetting it; see `service_info`. `written` is what
 /// [`written_user`] says of the account's spec value.
-fn apply(spec: &DaemonSpec, reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
+fn apply(
+    spec: &DaemonSpec,
+    reg: &ScmRegistration,
+    written: Option<identity::Written>,
+    installed: Option<&ScmSnapshot>,
+) -> Result<()> {
     let gated = service_gate(reg, written)?;
-    if !create {
-        with_default_log_account(spec, reg, gated.checked.as_ref(), default_log::admit)?;
+    if let Some(installed) = installed {
+        let config = installed.config()?;
+        let before = if registered_account(config) == reg.account {
+            None
+        } else {
+            registered_account_sid(config)?
+        };
+        make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice())?;
     }
-    apply_gated(reg, gated.password, create)?;
-    make_default_log(spec, reg, gated.checked.as_ref())
+    apply_gated(reg, gated.password, installed.is_none())?;
+    make_default_log(spec, reg, gated.checked.as_ref(), &[])
 }
 
 /// What [`service_gate`] settled for a service.
@@ -1248,22 +1281,11 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 
 /// The default log of the service `reg` registers, for the account it runs as, made or set to name it:
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
-/// `checked` is the SID the gate found for a real user, which the log names rather than looking the account
-/// up again. Call it once the service exists (a virtual account's SID resolves only then) and before it
-/// starts, or for the account an update is about to give a service that exists.
-fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&Sid>) -> Result<()> {
-    with_default_log_account(spec, reg, checked, default_log::ensure)
-}
-
-/// [`make_default_log`] with `set`, which sets the log's permissions for the account ([`default_log::ensure`],
-/// or [`default_log::admit`] before an account changes). The account is the gate's SID, else the one the spec
-/// gave as a SID, else the registered name's.
-fn with_default_log_account(
-    spec: &DaemonSpec,
-    reg: &ScmRegistration,
-    checked: Option<&Sid>,
-    set: fn(&Path, &Id, &Sid) -> Result<()>,
-) -> Result<()> {
+/// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
+/// account up again), else the one the spec gave as a SID, else the registered name's. `kept` are the accounts it names beside it, those the service may still run as. Call it once the
+/// service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
+/// update is about to give a service that exists.
+fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&Sid>, kept: &[Sid]) -> Result<()> {
     if !generate::hosted(spec) {
         return Ok(());
     }
@@ -1271,7 +1293,8 @@ fn with_default_log_account(
         Some(sid) => sid.clone(),
         None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
     };
-    set(&program_data()?, &spec.common().id, &account)
+    let accounts = [kept, &[account]].concat();
+    default_log::ensure(&program_data()?, &spec.common().id, &accounts)
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it

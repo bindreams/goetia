@@ -24,7 +24,7 @@ use windows_sys::core::BOOL;
 
 use super::exit;
 use super::logging::Log;
-use super::os::Real;
+use super::os::{LogKind, Real};
 use super::service::{PassOutcome, SpecStop, run_pass, set_daemon_log};
 use super::stop_bus::{StopBus, Supervisor};
 use crate::backend::scm::exit_status::Reported;
@@ -58,7 +58,9 @@ pub(super) fn requested(args: &[OsString]) -> Option<&str> {
 /// Runs the task `id` and ends the process with the run's code. Never returns.
 pub(super) fn run(id: &str) -> ! {
     let log = Arc::new(Log::real());
-    let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
+    // Held for the whole run, as a service's shim does (`service::run_service`).
+    log.hold_default(id);
+    let supervisor = Supervisor::new(Arc::new(Real::default()), Arc::clone(&log));
     // Before anything is read: from here on a stop is held by the bus until the run reaches it.
     if let Err(e) = register_close_handler(&supervisor.bus) {
         log.failure(id, &format!("register the console control handler: {}", Chain(&e)));
@@ -264,7 +266,7 @@ fn own_instance(
 /// it, so one fault is one line.
 fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &InstanceId) {
     let line = format!("{}\n", instance.marker());
-    let Ok(mut file) = supervisor.os.open_log(logs, supervisor.log.kind_of(id, logs)) else {
+    let Ok(mut file) = supervisor.os.open_log(logs, LogKind::Own) else {
         return;
     };
     if let Err(e) = file.write_all(line.as_bytes()) {

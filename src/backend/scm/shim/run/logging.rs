@@ -8,9 +8,15 @@
 //!
 //! **The default file is an install's.** `%ProgramData%\Goetia\logs` and `<id>.log` in it are made, and
 //! judged, by the elevated install that registers the shim ([`default_log::ensure`]); the shim, which runs
-//! as the daemon's account, makes neither and opens the file for appending alone ([`LogKind::Default`]).
+//! as the daemon's account, makes neither and opens the file for appending alone ([`LogKind::Default`]), once,
+//! when it starts ([`Log::hold_default`]): an install may take the account out of the file's permissions (an
+//! account change, which SCM does not apply to a running service), and a handle keeps what it was opened with.
 //! Where the file is not there, or is a link, or the account cannot append to it, the append fails and the
 //! Event Log still gets the line.
+//!
+//! **The shim compares no paths.** A daemon writes the default log exactly when its `logs:` is unset; an
+//! install refuses a `logs:` in the folder of the default logs ([`default_log::refuse_logs_in_folder`]), so
+//! a `logs:` that is set is never the default log.
 //!
 //! **Event Log.** Every failure also goes to the Windows Event Log, whose default ACL is far more
 //! permissive than a folder's, so it is the more likely of the two to still work exactly when the
@@ -23,7 +29,6 @@ use super::os::{Channels, LogKind, Real, Severity};
 use super::service::TABLE_NAME;
 use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{logs_folder, program_data};
-use crate::backend::scm::shim::sweep::{normalise, same_path};
 use crate::error::Result;
 
 /// The shim's failure log: composes the two channels for one service run. One shim serves one
@@ -48,7 +53,7 @@ impl Log {
     /// The production log: the real channels, defaulting to `%ProgramData%\Goetia\logs\`
     /// ([`program_data`]).
     pub(crate) fn real() -> Log {
-        Log::from_program_data(Arc::new(Real), program_data())
+        Log::from_program_data(Arc::new(Real::default()), program_data())
     }
 
     /// A log over `channels` for the `%ProgramData%` that `found` says. When it was not found there
@@ -78,31 +83,35 @@ impl Log {
 
     /// `<default dir>\<id>.log` — derivable from `id` alone. This is where a failure goes before
     /// the spec is decoded or when the daemon's log cannot be opened, and the daemon's own log when
-    /// `goetia.yaml` sets no `logs:` ([`Log::daemon_log_path`]). `None` when the machine's
+    /// `goetia.yaml` sets no `logs:` ([`Log::daemon_log`]). `None` when the machine's
     /// `%ProgramData%` could not be located.
     pub(crate) fn default_log_path(&self, id: &str) -> Option<PathBuf> {
         self.default_dir.as_ref().map(|dir| default_log::path_in(dir, id))
     }
 
-    /// The daemon's log: `logs` from its spec, or [`Log::default_log_path`] when unset.
-    pub(crate) fn daemon_log_path(&self, id: &str, logs: Option<&Path>) -> Option<PathBuf> {
-        logs.map(Path::to_path_buf).or_else(|| self.default_log_path(id))
-    }
-
-    /// Which kind of log `path`, the log of daemon `id`, is: the default log, which an install made, or the
-    /// user's own. A `path` that names the default log is the default log, as `sweep::normalise` reads a path: the
-    /// default log is there by the time the shim runs (an install made it), so its stored case, its long name for an
-    /// 8.3 alias and Win32's trailing dots and spaces are what it is.
-    pub(crate) fn kind_of(&self, id: &str, path: &Path) -> LogKind {
-        match self.default_log_path(id) {
-            Some(default) if same_path(&normalise(&default), &normalise(path)) => LogKind::Default,
-            Some(_) | None => LogKind::Own,
+    /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
+    /// ([`Channels::hold_default`](super::os::Channels::hold_default)). Call it once, when the shim starts and
+    /// knows its `id`, before anything an install can change. A log that cannot be held is not said here: the
+    /// daemon's own open of the same file reports it, and each line that needs it fails again.
+    pub(crate) fn hold_default(&self, id: &str) {
+        if let Some(path) = self.default_log_path(id) {
+            let _ = self.channels.hold_default(&path);
         }
     }
 
-    /// From now on, failures go to `path` (see [`Log::daemon_log_path`]) instead of the default.
-    /// Call right after the spec decodes. A second call must carry the same path; a different one
-    /// is a caller bug, debug-asserted.
+    /// The daemon's log and its kind: `logs` from its spec, which is the user's own, or, when unset,
+    /// [`Log::default_log_path`], the default log. No path is compared (see the module).
+    pub(crate) fn daemon_log(&self, id: &str, logs: Option<&Path>) -> Option<(PathBuf, LogKind)> {
+        match logs {
+            Some(path) => Some((path.to_path_buf(), LogKind::Own)),
+            None => self.default_log_path(id).map(|path| (path, LogKind::Default)),
+        }
+    }
+
+    /// From now on, failures go to `path`, the spec's `logs:`, before the default. Call right after the
+    /// spec decodes, and only for a spec that sets `logs:`: with none, the default log is the daemon's own
+    /// and is always tried. A second call must carry the same path; a different one is a caller bug,
+    /// debug-asserted.
     pub(crate) fn set_daemon_log(&self, path: PathBuf) {
         if let Err(second) = self.daemon_log.set(path) {
             debug_assert_eq!(
@@ -148,14 +157,12 @@ fn failure_line(id: &str, message: &str) -> String {
     format!("goetia-shim[{id}]: {message}")
 }
 
-/// The files to try for a line, in order, with the kind of each: the daemon's log, then the default. When
-/// they are the same file ([`Log::kind_of`]), it is tried once, as the default.
+/// The files to try for a line, in order, with the kind of each: the daemon's own log when its spec sets
+/// `logs:`, then the default.
 fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<(PathBuf, LogKind)> {
     match daemon_log {
-        Some(path) if !same_path(&normalise(path), &normalise(&default)) => {
-            vec![(path.to_path_buf(), LogKind::Own), (default, LogKind::Default)]
-        }
-        Some(_) | None => vec![(default, LogKind::Default)],
+        Some(path) => vec![(path.to_path_buf(), LogKind::Own), (default, LogKind::Default)],
+        None => vec![(default, LogKind::Default)],
     }
 }
 

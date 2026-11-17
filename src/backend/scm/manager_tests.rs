@@ -1585,7 +1585,7 @@ fn apply_refuses_an_account_that_is_no_user_before_the_password(#[fixture(env)] 
             &simple_daemon(),
             &dummy_reg(Some(name)),
             Some(identity::Written::Name(name)),
-            true,
+            None,
         )
         .expect_err(name);
         assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");

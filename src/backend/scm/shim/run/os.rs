@@ -4,8 +4,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 
 use cosca::Containment;
@@ -69,7 +70,15 @@ pub(crate) enum Severity {
 
 /// Where the shim's failure and warning lines go.
 pub(crate) trait Channels: Send + Sync {
-    /// Append `line` and a newline to the file at `path`, opening it as `kind` says. The line is written in one `write`, so output another handle appends to the same
+    /// Open the default log at `path` for the rest of the shim's run, as [`LogKind::Default`] says, and hold it:
+    /// a later [`Channels::append`] of that path as the default log goes through this handle. A handle keeps
+    /// the rights it was opened with, so the shim's own lines are not cut off when an install that changes the
+    /// account takes the account out of the file's permissions while the shim still runs. Called once, at the
+    /// shim's start; where it fails (the log is not there) a line opens the path as it is, and fails likewise.
+    fn hold_default(&self, path: &Path) -> io::Result<()>;
+
+    /// Append `line` and a newline to the file at `path`, opening it as `kind` says (the held default log is
+    /// not opened again). The line is written in one `write`, so output another handle appends to the same
     /// file cannot split it.
     fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()>;
 
@@ -79,7 +88,11 @@ pub(crate) trait Channels: Send + Sync {
 }
 
 /// The production implementation of all three traits.
-pub(crate) struct Real;
+#[derive(Default)]
+pub(crate) struct Real {
+    /// The default log [`Channels::hold_default`] opened, and its path.
+    held: OnceLock<(PathBuf, File)>,
+}
 
 impl Os for Real {
     fn spawn(&self, mut cmd: cosca::Command) -> Result<Box<dyn Spawned>, cosca::error::Error> {
@@ -114,8 +127,18 @@ impl Spawned for cosca::Child {
 }
 
 impl Channels for Real {
+    fn hold_default(&self, path: &Path) -> io::Result<()> {
+        let file = default_log::open_for_append(path)?;
+        let first = self.held.set((path.to_path_buf(), file)).is_ok();
+        debug_assert!(first, "the default log is held once, at the shim's start");
+        Ok(())
+    }
+
     fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
-        append_line(&mut open_append(path, kind)?, line)
+        match self.held.get() {
+            Some((held, file)) if kind == LogKind::Default && held == path => append_line(&mut &*file, line),
+            Some(_) | None => append_line(&mut open_append(path, kind)?, line),
+        }
     }
 
     fn event_log(&self, severity: Severity, line: &str) {

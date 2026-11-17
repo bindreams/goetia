@@ -13,7 +13,7 @@ use super::*;
 use crate::backend::scm::folder::logs_folder;
 use crate::backend::scm::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, read_path};
 use crate::backend::scm::sid::{sid_display, sid_from_parts};
-use crate::backend::scm::test_support::{A_STRANGER, permit_only, set_dacl, set_reparse_point, short};
+use crate::backend::scm::test_support::{permit_only, set_dacl, set_reparse_point, short, withdraw_append};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -70,7 +70,7 @@ fn a_log_that_is_there_has_its_permissions_set_to_the_account_s_append_and_nothi
     fs::write(&log, "kept\n").unwrap();
     let me = process_user_sid();
 
-    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&me)).unwrap();
 
     let security = read_path(&log).unwrap();
     assert!(security.protected);
@@ -83,9 +83,9 @@ fn an_account_change_rewrites_the_entry_and_keeps_what_is_in_the_log() {
     let (dir, log) = program_data_with_logs();
     fs::write(&log, "kept\n").unwrap();
     let (first, second) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
-    ensure(dir.path(), &id(), &[first.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&first)).unwrap();
 
-    ensure(dir.path(), &id(), &[second.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&second)).unwrap();
 
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&second)));
     assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what the account wrote is kept");
@@ -99,14 +99,14 @@ fn an_account_change_names_both_accounts_and_then_the_new_one_alone() {
     let (dir, log) = program_data_with_logs();
     fs::write(&log, "kept\n").unwrap();
     let (first, second) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
-    ensure(dir.path(), &id(), &[first.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&first)).unwrap();
 
     ensure(dir.path(), &id(), &[first.clone(), second.clone()]).unwrap();
 
     assert!(read_path(&log).unwrap().protected);
     assert_eq!(entries_of(&log), entries_wanted_for(&[first, second.clone()]));
 
-    ensure(dir.path(), &id(), &[second.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&second)).unwrap();
 
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&second)));
     assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what is in the log is kept");
@@ -127,7 +127,7 @@ fn an_entry_an_administrator_added_is_not_carried_over() {
     set_dacl(&added, &log).unwrap();
     assert!(entries_of(&log).len() > entries_wanted_for(std::slice::from_ref(&me)).len());
 
-    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&me)).unwrap();
 
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
 }
@@ -138,13 +138,13 @@ fn an_entry_an_administrator_added_is_not_carried_over() {
 /// without waiting for the running shim to stop.
 #[skuld::test]
 fn a_handle_opened_while_the_account_had_its_entry_keeps_appending_when_the_entry_is_taken_away() {
-    let (dir, log) = program_data_with_logs();
+    let (_dir, log) = program_data_with_logs();
     fs::write(&log, "first\n").unwrap();
     let me = process_user_sid();
-    ensure(dir.path(), &id(), std::slice::from_ref(&me)).unwrap();
+    permit_only(&log, &sid_display(&me));
     let mut held = open_for_append(&log).unwrap();
 
-    permit_only(&log, A_STRANGER);
+    withdraw_append(&log, &sid_display(&me));
 
     let refused = open_for_append(&log).expect_err("the entry is gone, so a new open is refused");
     assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
@@ -180,7 +180,7 @@ fn a_log_with_a_tag_that_is_no_link_has_its_permissions_set() {
     set_reparse_point(&log, A_TAG, b"x");
     let me = process_user_sid();
 
-    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&me)).unwrap();
 
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
 }
@@ -206,7 +206,7 @@ fn a_log_that_is_missing_is_made_empty_with_the_whole_descriptor(#[fixture(scm_g
     let (dir, log) = program_data_with_logs();
     let me = process_user_sid();
 
-    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&me)).unwrap();
 
     assert_eq!(fs::metadata(&log).unwrap().len(), 0);
     let wanted = Descriptor::for_default_log(std::slice::from_ref(&me))
@@ -214,7 +214,7 @@ fn a_log_that_is_missing_is_made_empty_with_the_whole_descriptor(#[fixture(scm_g
         .wanted()
         .unwrap();
     assert!(is_as_wanted(&read_path(&log).unwrap(), &wanted));
-    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
+    ensure(dir.path(), &id(), std::slice::from_ref(&me)).unwrap();
 }
 
 /// The shim never makes the file: one that is missing is an open that fails, and nothing is made.
@@ -379,14 +379,16 @@ fn a_logs_spelled_another_way_is_still_in_the_logs_folder() {
         if exists {
             fs::write(&log, "").unwrap();
         }
-        let spelled = [
+        let mut spelled = vec![
             upper(&log),
             short(&folder).join("nightly.log"),
-            short(&log),
             folder.join("sub").join("..").join("nightly.log"),
             folder.join("nightly.log."),
             folder.join("nightly.log "),
         ];
+        if exists {
+            spelled.push(short(&log));
+        }
         for spelled in spelled {
             assert!(
                 refusal_of(&dir, &spelled).is_some(),

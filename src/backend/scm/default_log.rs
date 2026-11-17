@@ -8,7 +8,7 @@
 //! one after the install checked. Only a link is refused ([`is_link`]): a file with any other reparse tag is
 //! data, as for the run records.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
 use super::folder::logs_folder;
 use super::link::is_link;
-use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_trusted, read_object};
+use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor};
 use super::sid::Sid;
 use crate::error::{Error, Result};
 use crate::spec::Id;
@@ -28,27 +28,26 @@ pub(crate) fn path_in(logs: &Path, id: &str) -> PathBuf {
 }
 
 /// Makes the default log of `id` under `program_data` empty, or sets the permissions of the one there, to
-/// those of [`Descriptor::for_default_log`] for `account`, the account the daemon's shim runs as, alone. The
-/// file is opened once, without following a link, and its permissions are set on that handle (a file this
-/// open made has them already); a link is refused and nothing is set on it. What is in the file is kept, so
-/// an install over a daemon that has logged, as another account too, leaves its log. The folder is
+/// those of [`Descriptor::for_default_log`] for `accounts`: the accounts the daemon's shim runs as, or may
+/// run as until a change lands. The permissions are computed from `accounts` and never read back from the
+/// file. The file is opened once, without following a link, and its permissions are set on that handle (a
+/// file this open made has them already); a link is refused and nothing is set on it. What is in the file is
+/// kept, so an install over a daemon that has logged, as another account too, leaves its log. The folder is
 /// [`make_goetia_folders`](super::folder::make_goetia_folders)'s, made before: where it is not there this
 /// is an error.
-pub(crate) fn ensure(program_data: &Path, id: &Id, account: &Sid) -> Result<()> {
-    set(program_data, id, account, false)
-}
-
-/// [`ensure`], keeping the accounts that have an entry on the file already and naming `account` beside
-/// them: what an install that changes the account does before the change, so that a change that fails
-/// leaves the account the daemon still runs as its log. [`ensure`] follows it once the change has landed.
-pub(crate) fn admit(program_data: &Path, id: &Id, account: &Sid) -> Result<()> {
-    set(program_data, id, account, true)
-}
-
-fn set(program_data: &Path, id: &Id, account: &Sid, beside: bool) -> Result<()> {
+///
+/// A shim that is running holds its log open ([`open_for_append`] at its start), and a handle keeps the
+/// rights it was opened with, so taking its account out of the permissions does not stop its lines.
+pub(crate) fn ensure(program_data: &Path, id: &Id, accounts: &[Sid]) -> Result<()> {
     let path = path_in(&logs_folder(program_data), id.as_str());
-    let own = Descriptor::for_default_log(std::slice::from_ref(account))?;
-    let (file, made) = own
+    let mut named: Vec<Sid> = Vec::new();
+    for account in accounts {
+        if !named.contains(account) {
+            named.push(account.clone());
+        }
+    }
+    let permissions = Descriptor::for_default_log(&named)?;
+    let (file, made) = permissions
         .open_always_for_dacl(&path)
         .map_err(|e| Error::os_at("make", &path, e))?;
     if is_link(&file).map_err(|e| Error::os_at("read the type of", &path, e))? {
@@ -57,24 +56,55 @@ fn set(program_data: &Path, id: &Id, account: &Sid, beside: bool) -> Result<()> 
     if made {
         return Ok(());
     }
-    let permissions = if beside {
-        let mut accounts: Vec<Sid> = read_object(&file, path.clone())?
-            .dacl
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|ace| ace.allow && !is_trusted(&ace.trustee) && ace.trustee != *account)
-            .map(|ace| ace.trustee)
-            .collect();
-        accounts.sort();
-        accounts.dedup();
-        accounts.push(account.clone());
-        Descriptor::for_default_log(&accounts)?
-    } else {
-        own
-    };
     permissions
         .set_dacl_of(&file)
         .map_err(|e| Error::os_at("set the permissions of", &path, e))
+}
+
+/// Refuses a daemon's `logs:` that lies in goetia's logs folder under `program_data`, where the default logs
+/// are: the folder is protected, so no service account can make a file in it, and a SYSTEM service named
+/// there would append to another daemon's default log. The folder is the boundary, so no file-name rule of
+/// Windows (case, 8.3 names, trailing dots) is applied to the name itself: the part of the path that exists
+/// is resolved by the file system ([`resolved`]), which knows them. The folder is made before this is called.
+pub(crate) fn refuse_logs_in_folder(program_data: &Path, id: &Id, logs: Option<&Path>) -> Result<()> {
+    let Some(logs) = logs else {
+        return Ok(());
+    };
+    let folder = logs_folder(program_data);
+    let canonical = fs::canonicalize(&folder).map_err(|e| Error::os_at("read", &folder, e))?;
+    let absolute = std::path::absolute(logs).map_err(|e| Error::os_at("make absolute", logs, e))?;
+    if resolved(&absolute).starts_with(&canonical) {
+        return Err(Error::Invalid {
+            daemon: id.to_string(),
+            message: format!(
+                "`logs: {}` is inside goetia's own log folder {}; remove `logs:` to use the default log, or \
+                 name a file elsewhere",
+                logs.display(),
+                folder.display()
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+/// `path` with its deepest part that exists made canonical (the stored case, long names, links followed) and
+/// the rest, which no file system can say anything of yet, kept as written.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut head = path;
+    loop {
+        if let Ok(canonical) = fs::canonicalize(head) {
+            return rest.iter().rev().fold(canonical, |resolved, part| resolved.join(part));
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(parent), Some(part)) => {
+                rest.push(part);
+                head = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// Opens the default log at `path`, which an install made, for append and nothing else: the rights an

@@ -77,7 +77,10 @@ fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32>
 }
 
 fn run_service(id: &str, log: Arc<Log>) {
-    let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
+    // Before anything is read or registered: an install that changes the account can take it out of the log's
+    // permissions from the moment it changes the service, and a handle opened now keeps working.
+    log.hold_default(id);
+    let supervisor = Supervisor::new(Arc::new(Real::default()), Arc::clone(&log));
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
@@ -106,11 +109,17 @@ fn run_service(id: &str, log: Arc<Log>) {
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
 
-/// From now on the shim's failures go to the daemon's own log (the default one when `spec` sets no
-/// `logs`), interleaved with its output. Call right after the spec decodes.
+/// From now on the shim's failures go to the daemon's own log, interleaved with its output: the spec's
+/// `logs`, tried before the default; with none set, the default log is the daemon's own and is always tried.
+/// Call right after the spec decodes.
 pub(super) fn set_daemon_log(log: &Log, id: &str, spec: &DaemonSpec) {
-    if let Some(path) = log.daemon_log_path(id, spec.common().logs.as_deref()) {
-        log.set_daemon_log(path);
+    if let Some(path) = spec.common().logs.as_deref() {
+        debug_assert_ne!(
+            log.default_log_path(id).as_deref(),
+            Some(path),
+            "an install refuses a `logs:` that is the default log"
+        );
+        log.set_daemon_log(path.to_path_buf());
     }
 }
 
@@ -621,10 +630,8 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
     // `Err(None)`: no file, by design.
     let opened = match (spec, logs) {
         (DaemonSpec::Task(_), None) => Err(None),
-        (_, logs) => match log.daemon_log_path(id, logs) {
-            Some(path) => os
-                .open_log(&path, log.kind_of(id, &path))
-                .map_err(|e| Some(log_open_failed(&path, &e))),
+        (_, logs) => match log.daemon_log(id, logs) {
+            Some((path, kind)) => os.open_log(&path, kind).map_err(|e| Some(log_open_failed(&path, &e))),
             None => Err(Some(NO_LOG_FILE.to_string())),
         },
     };
