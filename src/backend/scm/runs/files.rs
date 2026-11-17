@@ -10,8 +10,7 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_RENAME_INFO, FILE_SHARE_READ, FileRenameInfo, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_RENAME_INFO, FILE_SHARE_READ, FileRenameInfo, SetFileInformationByHandle,
 };
 
 /// Creates `path`, or empties what an interrupted write left there, for a record's bytes. Others
@@ -62,34 +61,38 @@ pub(super) fn rename_over(file: &File, to: &Path) -> io::Result<()> {
 }
 
 /// Creates the pin file `path`, which must not exist. It is deleted when its last handle closes,
-/// whatever ends the holder, and others may delete it, which [`Runs::remove_all`](super::Runs::remove_all) does.
+/// whatever ends the holder. Nobody else can delete it while it is held: the holder shares no delete, so
+/// any delete of it, by any account the directory lets delete entries, is a sharing violation
+/// ([`is_held`]).
 pub(super) fn create_pin(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .access_mode(GENERIC_WRITE | DELETE)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-        .open(path)
+    pin_options().create_new(true).open(path)
 }
 
-/// Whether some handle holds the pin file `path`, and the pin is live. An exclusive open succeeds
-/// only on a file that nothing holds (a pin left by a power cut), and that file goes with the handle
-/// it was opened with. A sharing violation says a handle holds it; a file that is gone is not held.
-/// Any other failure is returned: it says nothing about a handle. Access denied is the one to expect: a
-/// pin a previous principal left has no entry for this one, and a file whose delete is pending
-/// (another handle is open on it, its holder closed it) fails an open with access denied too, so the
-/// two cannot be told apart by the open.
-///
-/// It asks for no more than the delete needs (`DELETE` and `SYNCHRONIZE`, which `CreateFile` always
-/// adds), no read.
-pub(super) fn is_held(path: &Path) -> io::Result<bool> {
-    match OpenOptions::new()
-        .access_mode(DELETE | SYNCHRONIZE)
+/// How a pin is opened: no sharing at all, and deleted on close.
+pub(super) fn pin_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .access_mode(PIN_ACCESS)
         .share_mode(0)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-        .open(path)
-    {
-        Ok(_stale) => Ok(false),
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    options
+}
+
+/// What a pin's holder has of it.
+pub(super) const PIN_ACCESS: u32 = GENERIC_WRITE | DELETE;
+
+/// Whether some handle holds the pin file `path`, and the pin is live: it tries to delete it. A pin's
+/// holder shares no delete, so a sharing violation says a handle holds it; a delete that succeeds found
+/// a pin nothing held (one left by a power cut), which is now gone; a file that is gone is not held.
+/// Any other failure is returned: it says nothing about a handle.
+///
+/// This works for every account the directory lets delete entries, which is what a delete needs: the
+/// pin's own permissions, which name the account that made it, are not read, so a live pin of another
+/// account (after a change of account) is told from a stale one by the sharing and by nothing else.
+pub(super) fn is_held(path: &Path) -> io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(false),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) if is_sharing_violation(&e) => Ok(true),
         Err(e) => Err(e),

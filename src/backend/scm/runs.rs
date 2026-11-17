@@ -7,10 +7,11 @@
 //! **No clock decides anything.** A record is pruned when a later run writes, and only when nobody
 //! waits for what it holds: a waiting `run` takes a [`Pin`] before it asks Task Scheduler to start the
 //! task, and while any pin is live a write prunes nothing. With none, a write removes every record
-//! but its own. A pin is a file held open: it goes when its holder does, however it ends; one left
-//! by a power cut is held by nothing, and the next write finds it by an exclusive open and deletes
-//! it. What a pin's holder did not see yet is whatever [`Runs::appeared`] lists: the records written
-//! after the pin's directory listing, which was taken after the pin.
+//! but its own. A pin is a file held open with no sharing: it goes when its holder does, however it
+//! ends, and while it is held nothing can delete it, whoever tries. One left by a power cut is held by
+//! nothing, and the next write finds it by deleting it: a sharing violation says it is live. What a
+//! pin's holder did not see yet is whatever [`Runs::appeared`] lists: the records written after the
+//! pin's directory listing, which was taken after the pin.
 //!
 //! **`started` only orders** the records of runs that overlap: no decision compares it to the time.
 //!
@@ -206,22 +207,10 @@ impl Runs {
     }
 
     /// The records that are not in `pin`'s listing, the earliest `started` first (ties by instance).
-    ///
-    /// A directory that is gone is a task uninstalled while its `run` waited ([`Runs::remove_all`]):
-    /// an error of kind `NotFound` that says so.
+    /// The directory is there: `pin` is a file in it that nothing can delete while it is held.
     pub(crate) fn appeared(&self, pin: &Pin) -> io::Result<Vec<RunRecord>> {
-        let entries = self.entries().map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "the run records in {} are gone: the task was uninstalled while a run waited for it",
-                    self.dir.display()
-                ),
-            ),
-            _ => e,
-        })?;
         let mut appeared = Vec::new();
-        for entry in entries {
+        for entry in self.entries()? {
             let Entry::Record(instance) = entry else { continue };
             if pin.listing.contains(&instance) {
                 continue;
@@ -243,12 +232,18 @@ impl Runs {
 
     /// Removes the directory and everything in it, pins too: the task is uninstalled. A directory
     /// that is not there is already removed. Uninstalling stops the task first; a `run` that still
-    /// waits then is the user's own concurrent action, and does not hold the removal up: the
-    /// directory goes at once (a pin's holder keeps its open handle, which no longer names a file),
-    /// and that `run`'s next [`Runs::appeared`] fails saying so.
+    /// waits then is the user's own concurrent action, and its live pin cannot be deleted: the removal
+    /// fails, saying so, and goes through when that `run` has returned.
     pub(crate) fn remove_all(&self) -> io::Result<()> {
         match fs::remove_dir_all(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) if files::is_sharing_violation(&e) => Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "a run is waiting for the records in {}: it holds a file there ({e}); remove them when it returns",
+                    self.dir.display()
+                ),
+            )),
             result => result,
         }
     }
@@ -268,10 +263,8 @@ impl Runs {
     /// which is not promised; pins read first would miss a pin taken between the two.
     ///
     /// Returns what went wrong, one line each, besides a file that is gone or held. A pin that cannot be
-    /// opened says nothing about a handle: it is taken as not held, since reading it as held would stop
-    /// every later prune for good. Access denied is a pin a previous principal left (no entry for this
-    /// one) or a pin whose delete is pending, which Windows reports alike; the directory lets this
-    /// principal delete entries, so the pin is deleted, which a pending one refuses (told).
+    /// deleted for another reason than a sharing violation says nothing about a handle: it is taken as
+    /// not held, since reading it as held would stop every later prune for good.
     fn prune_listing(&self, own: &InstanceId, list: impl Fn() -> io::Result<Vec<Entry>>) -> Vec<String> {
         let listing = |e: io::Error| {
             vec![format!(
@@ -293,17 +286,11 @@ impl Runs {
             if let Entry::Pin(path) = entry {
                 match files::is_held(path) {
                     Ok(pinned) => held |= pinned,
-                    Err(e) => {
-                        let said = format!("open the pin {} to tell whether a run holds it: {e}", path.display());
-                        // Taken as not held, whatever the failure was.
-                        if e.kind() != io::ErrorKind::PermissionDenied {
-                            problems.push(said);
-                        } else if let Err(removed) = fs::remove_file(path)
-                            && removed.kind() != io::ErrorKind::NotFound
-                        {
-                            problems.push(format!("{said}; and remove it: {removed}"));
-                        }
-                    }
+                    // Taken as not held, whatever the failure was.
+                    Err(e) => problems.push(format!(
+                        "delete the pin {} to tell whether a run holds it: {e}",
+                        path.display()
+                    )),
                 }
             }
         }

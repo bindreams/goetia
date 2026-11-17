@@ -219,10 +219,16 @@ mod system {
                 .access_mode(WRITE_DAC | READ_CONTROL)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(path)?;
-            // SAFETY: `folder` is open with `WRITE_DAC`, and `self.raw` is a live descriptor.
+            self.set_dacl_of(&folder)
+        }
+
+        /// [`Descriptor::set_dacl`] on an object already open, `file`, which must have been opened with
+        /// `WRITE_DAC`.
+        pub(crate) fn set_dacl_of(&self, file: &File) -> io::Result<()> {
+            // SAFETY: `file` is open with `WRITE_DAC`, and `self.raw` is a live descriptor.
             let set = unsafe {
                 SetKernelObjectSecurity(
-                    folder.as_raw_handle() as HANDLE,
+                    file.as_raw_handle() as HANDLE,
                     DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                     self.raw,
                 )

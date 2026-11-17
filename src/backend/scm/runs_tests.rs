@@ -5,11 +5,14 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use tempfile::TempDir;
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+};
 
 use super::*;
 use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
+use crate::backend::scm::test_support::delete_pending;
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -218,9 +221,7 @@ fn a_removal_that_fails_is_a_problem_and_the_rest_are_removed() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let stuck = runs.dir.join(file_of(&instance(2)));
-    let holder = files::create_pin(&stuck).unwrap();
-    let reader = OpenOptions::new().read(true).open(&stuck).unwrap();
-    drop(holder);
+    let reader = delete_pending(&stuck);
     let doomed = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
     fs::write(&doomed, "").unwrap();
 
@@ -300,17 +301,43 @@ fn a_stale_pin_the_writing_account_has_no_entry_on_is_deleted_and_does_not_stop_
     assert_eq!(problems, Vec::<String>::new());
 }
 
-/// A pin that cannot be opened or deleted for any reason (here its delete is pending: Windows reports
-/// that as access denied too) is told, and is not taken as held: no run waits on a pin whose holder has
-/// closed it, and reading it as held would stop every later prune.
+/// A pin a `run` of another account holds, live, with no entry for this account: after a change of
+/// account the new account's shim writes while that `run` waits. The write must not delete the live pin,
+/// which the directory's right to delete entries would let it, and must keep the record the `run` waits
+/// for.
 #[skuld::test]
-fn a_pin_that_can_be_neither_opened_nor_deleted_is_a_problem_and_is_taken_as_not_held() {
+fn a_live_pin_the_writing_account_has_no_entry_on_is_kept_and_stops_pruning() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let live = runs.dir.join("pin-other.pin");
+    let holder = files::pin_options()
+        .access_mode(files::PIN_ACCESS | WRITE_DAC)
+        .create_new(true)
+        .open(&live)
+        .unwrap();
+    Descriptor::from_sddl("D:P(A;;FA;;;SY)")
+        .unwrap()
+        .set_dacl_of(&holder)
+        .unwrap();
+
+    let problems = runs.write(&record(2, 2)).unwrap();
+
+    assert!(live.exists(), "a live pin is not deleted");
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [true, true]);
+    assert_eq!(problems, Vec::<String>::new());
+    drop(holder);
+    assert!(!live.exists(), "the pin goes when its holder does");
+}
+
+/// A pin that cannot be deleted for another reason than a sharing violation (here its delete is pending:
+/// Windows reports that as access denied) is told, and is not taken as held: reading it as held would
+/// stop every later prune.
+#[skuld::test]
+fn a_pin_that_cannot_be_deleted_is_a_problem_and_is_taken_as_not_held() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let pending = runs.dir.join("pin-odd.pin");
-    let holder = files::create_pin(&pending).unwrap();
-    let reader = OpenOptions::new().read(true).open(&pending).unwrap();
-    drop(holder);
+    let reader = delete_pending(&pending);
 
     let problems = runs.write(&record(2, 2)).unwrap();
 
@@ -382,20 +409,35 @@ fn remove_all_clears_the_directory_and_its_pins() {
     runs.remove_all().unwrap();
 }
 
+/// A live pin cannot be deleted by anyone, so the removal while a `run` waits fails and says why; the
+/// `run` is undisturbed, and the removal goes through once it returns.
 #[skuld::test]
-fn remove_all_while_a_run_holds_a_pin_removes_the_directory_and_the_pins_reader_is_told_why() {
+fn remove_all_while_a_run_holds_a_pin_fails_saying_so_and_goes_through_when_it_returns() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let pin = runs.pin().unwrap();
 
-    runs.remove_all().unwrap();
+    let error = runs.remove_all().unwrap_err();
 
-    assert!(!runs.dir.exists());
-    let error = runs.appeared(&pin).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::NotFound);
     let text = error.to_string();
-    assert!(text.contains("uninstalled"), "{text}");
+    assert!(text.contains("a run is waiting"), "{text}");
     assert!(text.contains(&runs.dir.display().to_string()), "{text}");
+    assert_eq!(runs.appeared(&pin).unwrap(), [], "the waiting run still reads its directory");
+    drop(pin);
+    runs.remove_all().unwrap();
+    assert!(!runs.dir.exists());
+}
+
+/// What makes the directory's removal impossible while a pin is held: not even a rename moves it.
+#[skuld::test]
+fn a_directory_with_a_held_pin_cannot_be_renamed_away() {
+    let (_dir, runs) = fixture();
+    let pin = runs.pin().unwrap();
+
+    let moved = fs::rename(&runs.dir, runs.dir.with_extension("moved"));
+
+    assert!(moved.is_err());
+    assert_eq!(runs.appeared(&pin).unwrap(), []);
 }
 
 // the directory's permissions =========================================================================================

@@ -83,3 +83,22 @@ pub(crate) fn registered_task(
         data: crate::blob::metadata_text(spec),
     }
 }
+
+/// A file at `path` whose delete is pending: its holder closed it while the returned handle was open on
+/// it, so it is deleted when that handle is dropped. Windows answers an open or a delete of it with
+/// access denied.
+#[cfg(windows)]
+pub(crate) fn delete_pending(path: &std::path::Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
+
+    let holder = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path)
+        .unwrap();
+    let reader = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+    drop(holder);
+    reader
+}
