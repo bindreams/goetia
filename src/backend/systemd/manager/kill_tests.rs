@@ -37,7 +37,7 @@ fn unreaped() -> (Sleeper, Process) {
     let held = process::open(run.pid())
         .expect("open the child")
         .expect("it is running");
-    process::terminate(&held).expect("signal the child");
+    process::send_signal(&held, process::Signal::Kill).expect("signal the child");
     let waited = process::await_exit(&held, Bound::Unbounded.start()).expect("wait for it to exit");
     assert_eq!(waited, Waited::Confirmed);
     (run, held)

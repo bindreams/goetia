@@ -878,17 +878,14 @@ fn a_send_after_the_first_is_refused_once_the_deadline_is_spent() {
         _ => panic!("the child is running"),
     };
     let signalled = identity(&first);
-    let mgr = launchd_over(Fake::new([]));
-    let mut reservation = reserved(&mgr, Step::Stop);
-    let mut target = JobKill::new(&mgr.launchctl, ID, &mut reservation).expect("a target");
     let held = crate::backend::kill::process::open(second.pid())
         .expect("open the child")
         .expect("the child is running");
     let mut course = Course::new(None, Budget::Bounded(Duration::ZERO), Watch::new().expect("a watch"));
-    course.sent(signalled, Signal::Term);
+    course.sent(signalled, Signal::Terminate);
     assert!(course.spent(), "a zero bound is spent once something was sent");
 
-    let sent = send(&mut target, &held, &mut course, ID, Signal::Term).expect("a refusal is not a failure");
+    let sent = send(&held, &mut course, ID, Signal::Terminate).expect("a refusal is not a failure");
 
     assert!(!sent, "a spent deadline sends nothing");
     assert_eq!(
@@ -1022,7 +1019,7 @@ fn the_timeout_of_a_run_that_was_not_signalled_says_so_in_one_sentence_and_names
     assert_eq!(
         recovery,
         format!(
-            "{plain} The run was not signalled before the deadline; nothing will signal it:              `goetia daemon kill {ID}` ends it."
+            "{plain} The run was not signalled before the deadline; nothing will signal it: `goetia daemon kill {ID}` ends it."
         )
     );
 }
@@ -1054,7 +1051,7 @@ fn a_run_is_due_sigkill_once_its_grace_is_over_and_not_before() {
         course
     };
 
-    assert_eq!(course(graced()).due(mine), Some(Signal::Term), "its first");
+    assert_eq!(course(graced()).due(mine), Some(Signal::Terminate), "its first");
     assert_eq!(course(kill).due(mine), Some(Signal::Kill), "its first, for `kill`");
     assert_eq!(termed(pending, false).due(mine), None, "a grace that is not over");
     assert_eq!(
@@ -1065,7 +1062,7 @@ fn a_run_is_due_sigkill_once_its_grace_is_over_and_not_before() {
     assert_eq!(termed(over, true).due(mine), None, "killed once");
     assert_eq!(
         termed(over, false).due(other),
-        Some(Signal::Term),
+        Some(Signal::Terminate),
         "another run has a grace of its own"
     );
 }
@@ -1398,11 +1395,11 @@ fn a_pass_of_a_tasks_stop_spends_what_a_pass_reserves() {
 #[skuld::test]
 fn a_failed_send_or_hold_is_the_stops_failure() {
     for (doing, said) in [
-        (Signal::Term.sending(), "sending SIGTERM"),
-        (Signal::Kill.sending(), "sending SIGKILL"),
-        ("holding the process", "holding the process"),
+        (format!("sending {}", Signal::Terminate.name()), "sending SIGTERM"),
+        (format!("sending {}", Signal::Kill.name()), "sending SIGKILL"),
+        ("holding the process".to_string(), "holding the process"),
     ] {
-        let e = stop_failed(ID, doing, io::Error::other("refused"));
+        let e = stop_failed(ID, &doing, io::Error::other("refused"));
 
         assert!(
             matches!(&e, Error::Os { what, .. } if *what == format!("stop `{ID}`: {said}")),

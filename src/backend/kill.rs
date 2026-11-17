@@ -75,8 +75,9 @@ pub trait KillTarget {
     /// Open the process holding `pid`; `None` if there is none.
     fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>>;
 
-    /// Signal `process`, through the hold and never by pid, and do not wait for it. A process that
-    /// has exited or is exiting is success: [`Self::await_exit`] is the wait.
+    /// End `process` by force (SIGKILL, `TerminateProcess`), through the hold and never by pid, and do not
+    /// wait for it. A process that has exited or is exiting is success: [`Self::await_exit`] is the wait.
+    /// A SIGTERM, which launchd's task stop sends, is outside the trait.
     fn terminate(&mut self, process: &Self::Process) -> io::Result<()>;
 
     /// Whether the manager still vouches for `pid` as the service's process, read after `pid` was

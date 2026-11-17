@@ -1055,7 +1055,7 @@ fn a_refused_simple_install_never_reaches_the_provider() {
 /// access would fail or find no such service, so a test that gets an answer shows there was none.
 fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
     let blob = Blob {
-        schema: 1,
+        schema: crate::blob::SCHEMA,
         version: crate::version().to_string(),
         spec: spec.clone(),
     };

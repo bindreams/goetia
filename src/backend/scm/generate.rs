@@ -173,8 +173,9 @@ impl fmt::Display for WindowsDefinition {
 /// - a `protocol: native` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics;
-/// - a `stop-action` Windows cannot honour: a signal it has no equivalent of, or a signal for a
-///   `protocol: native` service, which handles SCM's own stop itself;
+/// - a `stop-action` Windows cannot honour: a signal it has no equivalent of, a signal for a
+///   `protocol: native` service, which handles SCM's own stop itself, or, for a task, a leaf that differs from the default
+///   (Task Scheduler decides how a task is stopped);
 /// - for a task, a virtual service account, a `%` in the host's path or arguments (Task Scheduler
 ///   expands it), a schedule whose day-of-month and day-of-week fields are both restricted (an AND, or
 ///   an either-or whose two triggers would coincide: see `triggers::compile`), and a schedule that
@@ -204,7 +205,8 @@ fn definition(
             build(spec, service, id, host.as_ref()).map(WindowsDefinition::Service)
         }
         DaemonSpec::Task(task) => {
-            // As for a service, a spec from a blob arrives here: Windows cannot do what Task Scheduler decides.
+            // Task Scheduler decides how a task is stopped, so a `stop-action` is a request Windows cannot
+            // honour. `resolve` refuses it in a manifest; a spec from a blob never passed `resolve`.
             task.stop_action
                 .refuse(BackendKind::Scm, DaemonKind::Task, Protocol::Plain)
                 .into_result(&task.common.id)?;

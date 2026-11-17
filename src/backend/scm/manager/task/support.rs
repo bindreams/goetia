@@ -56,7 +56,7 @@ pub(super) fn scm(fake: &Fake) -> Scm {
 
 pub(super) fn snapshot_of(spec: &DaemonSpec, armed: bool) -> TaskSnapshot {
     let blob = Blob {
-        schema: 1,
+        schema: crate::blob::SCHEMA,
         version: crate::version().to_string(),
         spec: spec.clone(),
     };
