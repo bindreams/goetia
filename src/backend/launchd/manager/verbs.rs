@@ -11,14 +11,14 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use cosca::Process;
-use cosca::identity::{ProcessId, Resolved};
+use cosca::identity::ProcessId;
 
 use super::kill::JobKill;
 use super::task::TaskPrint;
-use super::watch::{Added, Watch};
+use super::watch::{Added, Registered, Watch};
 use super::{Launchd, Plist, TASK_STOP_CALLS, TASK_STOP_REQUESTS, UNLOAD_POLL, Until, never_expires, own_reservation};
 use crate::backend::bounded::{Reservation, Role};
-use crate::backend::kill::process::{Signal, send_signal};
+use crate::backend::kill::process::{Signal, Signalling, send_signal};
 use crate::backend::kill::{Hold, KillOutcome, KillTarget as _, failed_as, hold_pid, kill_failed, kill_service};
 use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
@@ -38,7 +38,7 @@ enum Pass {
     Queued(Duration),
     /// Read again, paced: launchd still shows what has ended (a pid that exited) or a job other than the
     /// one watched, and its view has to catch up. The pause is [`UNLOAD_POLL`], as for a wait on `print`: it
-    /// spaces the reads and decides nothing.
+    /// spaces the reads and decides nothing. Under `Immediate`, which waits for nothing, it ends the stop.
     Behind,
 }
 
@@ -213,6 +213,9 @@ enum Escalation {
     Spent,
     /// SIGKILL, and the run is still there.
     Sent,
+    /// Nothing, because there was nothing to signal: the run has ended, and launchd still showed it (or a
+    /// process that is not the job's) when the wait ran out.
+    Uncleared,
 }
 
 /// [`budget::timed_out`] for a `stop` of a launchd task, which says what it had sent the run: goetia sends SIGKILL
@@ -241,6 +244,10 @@ fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> Error {
                      this wait ended before goetia sent SIGKILL, and nothing will: `goetia daemon kill {id}` ends it."
                 ),
                 Escalation::Sent => format!("{recovery} The run was sent SIGKILL and has not exited yet."),
+                Escalation::Uncleared => format!(
+                    "{recovery} The run has ended, and launchd had not cleared it by the deadline: \
+                     `goetia daemon stop {id}` returns once it has."
+                ),
             },
             id,
             awaited,
@@ -274,6 +281,24 @@ pub(super) fn quiet(id: &Id, print: &TaskPrint) -> Result<Quiet> {
     }
 }
 
+/// What `print` and the process it shows say is up for a stop: [`Launchd::read_up`].
+enum Up<'a> {
+    /// No process, and launchd holds no start: [`Quiet::Idle`].
+    Idle,
+    /// A start launchd has accepted and not yet forked: [`Quiet::Queued`].
+    Queued,
+    /// Launchd still shows what has ended: a pid whose process is gone, or is held and that launchd does not
+    /// name (a stranger's, or the job's next run before it is cleared). Nothing is signalled.
+    Behind,
+    /// A process held and confirmed by launchd as the job's, with its exit registered.
+    Run {
+        pid: u32,
+        registered: Registered,
+        target: Signalling<JobKill<'a>>,
+        held: Process,
+    },
+}
+
 impl Launchd {
     /// Loads the job from where its plist is, waiting out one that is being torn down, then a plain
     /// `launchctl kickstart system/<id>`: no `-p`, so the pid is not waited for, and no state read
@@ -296,9 +321,11 @@ impl Launchd {
     /// backend's is, whatever the budget: the first pass always runs, and the wait for a queued start and the
     /// signal to the run found after it are part of it. From the second pass on every pass starts with the
     /// deadline, whether anything was sent or not: a `Bounded` budget that is spent is the caller's timeout,
-    /// and nothing more is sent ([`Course::spent`]); the one read the pass makes then is to see whether the
-    /// job is done ([`Self::done_or`]). So a stop that keeps finding a pid launchd has not cleared ends at its
-    /// deadline. Otherwise it reads `print`:
+    /// and nothing more is sent ([`Course::spent`]); the one reading the pass makes then, the one every pass
+    /// makes ([`Self::read_up`]), is to see whether the job is done ([`Self::done_or`]). So a stop that keeps
+    /// finding a pid launchd has not cleared ends at its deadline. `Immediate` waits for nothing, launchd's
+    /// view included: its stop is the one pass, after a queued start's wait, and a pass that finds launchd
+    /// still showing what has ended ends it. Otherwise the pass reads `print`:
     ///
     /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
     ///   No process and any other state, or a `print` that failed or was not whole, is
@@ -343,6 +370,7 @@ impl Launchd {
             }
             match self.stop_pass(id, &mut course, pass)? {
                 Pass::Done => return Ok(()),
+                Pass::Again | Pass::Behind if course.counted == Budget::Immediate => return Ok(()),
                 Pass::Again => course.first_pass_over(),
                 Pass::Queued(waited) => course.extend(waited),
                 Pass::Behind => {
@@ -354,32 +382,63 @@ impl Launchd {
         }
     }
 
-    /// What a stop whose deadline is spent ends with, after one read of `print` on `reservation` and no loop:
-    /// the overrun is that one read, and nothing is sent. A job with no process and idle is `Ok`, and so is one
-    /// whose pid the OS reports gone: a run that ended inside the budget is not a timeout because the pass that
-    /// noticed came after the deadline. A process, or a start launchd has accepted, is the timeout, worded by
-    /// what the stop did to the run that is up ([`Course::escalation`]). Any other read is the contract's error: no process and a state that is
-    /// not idle is [`Error::StopUnconfirmed`] ([`quiet`]), and a read that failed returns its error.
+    /// What a stop whose deadline is spent ends with, after one reading ([`Self::read_up`]) on `reservation`
+    /// and no loop: the overrun is that one reading, and nothing is sent. A job with no process and idle is
+    /// `Ok`: a run that ended inside the budget is not a timeout because the pass that noticed came after the
+    /// deadline. A run held and confirmed as the job's, and a start launchd has accepted, are the timeout,
+    /// worded by what the stop did to the run that is up ([`Course::escalation`]). So is launchd still
+    /// showing a run that has ended (a pid that is gone, or that it does not name), with its own wording: not
+    /// `Ok`, since a `start` made now starts nothing while launchd shows a pid. Any other reading is the
+    /// contract's error: no process and a state that is not idle is [`Error::StopUnconfirmed`] ([`quiet`]),
+    /// and a read that failed returns its error.
     fn done_or(&self, id: &Id, course: &Course, reservation: &mut Reservation) -> Result<()> {
-        let issuing = Budget::Unbounded.start();
-        let print = self
-            .launchctl
-            .read_task_print(id.as_str(), issuing, Role::Query, reservation)?;
-        let said = match print.pid {
-            Some(pid) => match ProcessId::of(pid) {
-                Resolved::Found(run) => course.escalation(run),
-                // Launchd shows a pid it has not yet cleared: the run it was has ended.
-                Resolved::Gone => return Ok(()),
-                Resolved::Unknown => None,
-            },
-            None => match quiet(id, &print)? {
-                Quiet::Idle => return Ok(()),
-                Quiet::Queued => Some(Escalation::Unsent),
-            },
+        let said = match self.read_up(id, &course.watch, reservation)? {
+            Up::Idle => return Ok(()),
+            Up::Queued => Some(Escalation::Unsent),
+            Up::Behind => Some(Escalation::Uncleared),
+            Up::Run { held, .. } => course.escalation(held.id()),
         };
         Err(match said {
             Some(sent) => timed_out_stopping(id.as_str(), course.counted, sent),
             None => budget::timed_out(id.as_str(), "stopped", course.counted),
+        })
+    }
+
+    /// What is up for the job, read the one way for the pass that acts on it ([`Self::stop_pass`]) and the one
+    /// that only reports it ([`Self::done_or`]): `print`; for a pid, its exit registered with `watch`, the
+    /// process held, and launchd asked whether it is the job's ([`hold_pid`], as `kill` does). The
+    /// registration is dropped on any way out of the caller, which deletes it and drains the queue: a pid that
+    /// is reused later cannot be handed this process's exit. Launchd's record of a run that has gone is not
+    /// waited for here: [`Up::Behind`], and the caller reads again, paced, or ends.
+    fn read_up<'a>(&'a self, id: &'a Id, watch: &Watch, reservation: &mut Reservation) -> Result<Up<'a>> {
+        let name = id.as_str();
+        // Unbounded: `print` answers at once, and its body is whole.
+        let issuing = Budget::Unbounded.start();
+        let print = self
+            .launchctl
+            .read_task_print(name, issuing, Role::Query, reservation)?;
+        let Some(pid) = print.pid else {
+            return Ok(match quiet(id, &print)? {
+                Quiet::Queued => Up::Queued,
+                Quiet::Idle => Up::Idle,
+            });
+        };
+        let Added::Watching(registered) = watch.add(pid)? else {
+            return Ok(Up::Behind);
+        };
+        // The process is held, and only then does launchd confirm that it is the job's: a pid that was
+        // read and then reused is a process launchd does not name, and is left alone.
+        let mut target = JobKill::new(&self.launchctl, name, reservation)?;
+        let held = match hold_pid(&mut target, pid) {
+            Ok(Hold::Held { process, .. }) => process,
+            Ok(Hold::Ended { .. }) => return Ok(Up::Behind),
+            Err(error) => return Err(stop_failed(name, "holding the process", error.into())),
+        };
+        Ok(Up::Run {
+            pid,
+            registered,
+            target,
+            held,
         })
     }
 
@@ -428,38 +487,24 @@ impl Launchd {
         Ok(())
     }
 
-    /// One pass of [`Self::stop_task`] over the run `print` shows. `course` is what the stop is held to and
-    /// reports having waited, and what it has sent: the waits for queued starts are in its budget.
+    /// One pass of [`Self::stop_task`] over what [`Self::read_up`] finds. `course` is what the stop is held to
+    /// and reports having waited, and what it has sent: the waits for queued starts are in its budget.
     fn stop_pass(&self, id: &Id, course: &mut Course, reservation: &mut Reservation) -> Result<Pass> {
         let name = id.as_str();
-        // Unbounded: `print` answers at once, and its body is whole.
-        let issuing = Budget::Unbounded.start();
-        let print = self
-            .launchctl
-            .read_task_print(name, issuing, Role::Query, reservation)?;
-        let Some(pid) = print.pid else {
-            return match quiet(id, &print)? {
-                Quiet::Queued => {
-                    let began = Instant::now();
-                    self.await_queued_start(name, reservation)?;
-                    Ok(Pass::Queued(began.elapsed()))
-                }
-                Quiet::Idle => Ok(Pass::Done),
-            };
-        };
-        // Dropped on any way out of this pass, which deletes the registration and drains the queue: a
-        // pid that is reused later cannot be handed this process's exit.
-        let Added::Watching(registered) = course.watch.add(pid)? else {
-            return Ok(Pass::Behind);
-        };
-        // The process is held, and only then does launchd confirm that it is the job's: a pid that was
-        // read and then reused is a process launchd does not name, and is left alone. Launchd's record of
-        // a run that has gone is not waited for here: the next pass reads it, paced.
-        let mut target = JobKill::new(&self.launchctl, name, reservation)?;
-        let held = match hold_pid(&mut target, pid) {
-            Ok(Hold::Held { process, .. }) => process,
-            Ok(Hold::Ended { .. }) => return Ok(Pass::Behind),
-            Err(error) => return Err(stop_failed(name, "holding the process", error.into())),
+        let (pid, registered, mut target, held) = match self.read_up(id, &course.watch, reservation)? {
+            Up::Idle => return Ok(Pass::Done),
+            Up::Queued => {
+                let began = Instant::now();
+                self.await_queued_start(name, reservation)?;
+                return Ok(Pass::Queued(began.elapsed()));
+            }
+            Up::Behind => return Ok(Pass::Behind),
+            Up::Run {
+                pid,
+                registered,
+                target,
+                held,
+            } => (pid, registered, target, held),
         };
         let run = held.id();
         if let Some(signal) = course.due(run)
