@@ -387,3 +387,18 @@ fn a_zero_bound_extended_by_a_wait_has_run_out_when_the_wait_ends() {
 
     assert_eq!(deadline.remaining_at(ends), Some(Duration::ZERO));
 }
+
+#[skuld::test]
+fn a_deadline_ends_before_a_later_one_and_before_an_unbounded_one_and_never_the_other_way() {
+    let now = Instant::now();
+    let soon = Budget::Bounded(Duration::from_secs(1)).start_at(now);
+    let later = Budget::Bounded(Duration::from_secs(2)).start_at(now);
+    let never = Budget::Unbounded.start_at(now);
+
+    assert!(soon.ends_before(later));
+    assert!(!later.ends_before(soon));
+    assert!(!soon.ends_before(soon));
+    assert!(soon.ends_before(never));
+    assert!(!never.ends_before(soon));
+    assert!(!never.ends_before(never));
+}

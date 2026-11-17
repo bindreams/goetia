@@ -101,6 +101,7 @@ mod interrupts;
 mod kill;
 mod proc;
 mod run;
+mod stop;
 mod task;
 mod verbs;
 mod watch;

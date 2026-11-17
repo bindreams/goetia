@@ -200,6 +200,16 @@ impl Deadline {
         self.remaining() == Some(Duration::ZERO)
     }
 
+    /// Whether this deadline comes before `other`; an unbounded one never does, and any bounded one comes
+    /// before an unbounded one.
+    pub fn ends_before(&self, other: Deadline) -> bool {
+        match (self.0, other.0) {
+            (Some(a), Some(b)) => a < b,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
     /// [`Self::remaining`] in whole milliseconds, rounded up, capped below
     /// `u32::MAX` (which means `INFINITE` to `SleepEx`). `None` = unbounded
     /// — pass `INFINITE` deliberately.
