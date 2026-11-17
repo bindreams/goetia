@@ -57,7 +57,10 @@ fn remove_deletes_the_directory_or_the_link_and_not_what_a_link_points_to() {
     let target = linked(dir.path());
     fs::create_dir(dir.path().join("plain")).unwrap();
 
-    Dir::open_even_if_link(&dir.path().join("link")).unwrap().remove().unwrap();
+    Dir::open_even_if_link(&dir.path().join("link"))
+        .unwrap()
+        .remove()
+        .unwrap();
     Dir::open(&dir.path().join("plain")).unwrap().remove().unwrap();
 
     assert!(fs::symlink_metadata(dir.path().join("link")).is_err());

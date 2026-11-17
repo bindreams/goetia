@@ -134,7 +134,10 @@ enum Entry {
     /// Anything else, a directory or a file of no name goetia gives: only a removal touches it, and
     /// takes it with its tree ([`Runs::remove_all`]). Only SYSTEM or an Administrator can put a directory
     /// there; the task's account can make a file of any name.
-    Other { name: OsString, dir: bool },
+    Other {
+        name: OsString,
+        dir: bool,
+    },
 }
 
 impl Entry {

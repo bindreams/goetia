@@ -124,7 +124,10 @@ fn a_device_path_gives_the_same_verdicts_as_a_drive_path() {
 
     let pending = dir.path().join("pin-a.pin");
     let reader = delete_pending(&pending);
-    assert!(matches!(delete(&held_in, OsStr::new("pin-a.pin")), DeleteOutcome::Deleted));
+    assert!(matches!(
+        delete(&held_in, OsStr::new("pin-a.pin")),
+        DeleteOutcome::Deleted
+    ));
     drop(reader);
 
     let refused = dir.path().join("pin-b.pin");
@@ -159,7 +162,11 @@ fn a_leftover_temp_file_is_replaced_by_a_new_one() {
 
     let _file = create_temp(&open(dir.path()), OsStr::new("f.tmp")).unwrap();
 
-    assert_eq!(fs::metadata(dir.path().join("f.tmp")).unwrap().len(), 0, "the file is new");
+    assert_eq!(
+        fs::metadata(dir.path().join("f.tmp")).unwrap().len(),
+        0,
+        "the file is new"
+    );
 }
 
 /// A tree is removed through handles opened relative to each directory, and a link in it is deleted and

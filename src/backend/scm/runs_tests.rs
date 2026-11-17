@@ -1003,7 +1003,11 @@ fn a_directory_that_empties_under_the_removal_is_noted_once_and_names_no_holder(
         });
 
         if !emptying.is_empty() {
-            assert_eq!(emptying, std::slice::from_ref(&runs.dir), "one note, naming the directory");
+            assert_eq!(
+                emptying,
+                std::slice::from_ref(&runs.dir),
+                "one note, naming the directory"
+            );
             assert!(!runs.dir.exists());
             return;
         }
@@ -1127,8 +1131,15 @@ fn ensure_refuses_a_link_and_leaves_what_it_points_to_alone() {
     let refused = runs.ensure(&process_user_sid()).unwrap_err();
 
     assert_eq!(refused.kind(), io::ErrorKind::NotADirectory);
-    assert!(refused.to_string().contains(&runs.dir.display().to_string()), "{refused}");
-    assert_eq!(entries_of(&target.dir), before, "the target's permissions are not rewritten");
+    assert!(
+        refused.to_string().contains(&runs.dir.display().to_string()),
+        "{refused}"
+    );
+    assert_eq!(
+        entries_of(&target.dir),
+        before,
+        "the target's permissions are not rewritten"
+    );
     assert!(target_is_untouched(&target));
 }
 

@@ -169,9 +169,10 @@ mod windows {
             allow(system(), FULL, inherit),
             allow(administrators(), FULL, inherit),
             // The files made in it, and the directory itself without a subdirectory, with delete-child
-            // and without `DELETE` (0x1_0000) on itself.
-            allow(me.clone(), 0x13_01BF, OBJECT_INHERIT | INHERIT_ONLY),
-            allow(me, 0x12_01FB, 0),
+            // and without `DELETE` (0x1_0000) on itself; neither can set attributes or extended
+            // attributes (0x110).
+            allow(me.clone(), 0x13_00AF, OBJECT_INHERIT | INHERIT_ONLY),
+            allow(me, 0x12_00EB, 0),
         ];
 
         assert_eq!(wanted.owner, administrators());

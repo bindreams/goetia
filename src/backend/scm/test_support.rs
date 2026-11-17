@@ -88,7 +88,10 @@ pub(crate) fn registered_task(
 /// Makes `descriptor`'s DACL, protected, the DACL of the existing file or folder `path`, not following a
 /// link at it: a fixture's permissions.
 #[cfg(windows)]
-pub(crate) fn set_dacl(descriptor: &crate::backend::scm::shim::acl::Descriptor, path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn set_dacl(
+    descriptor: &crate::backend::scm::shim::acl::Descriptor,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
