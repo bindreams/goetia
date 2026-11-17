@@ -303,6 +303,7 @@ impl Runs {
             match fs::OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(self.dir.join(REMOVING))
             {
                 Ok(_) => {}
