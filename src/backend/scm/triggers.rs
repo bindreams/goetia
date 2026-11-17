@@ -4,8 +4,10 @@
 //! a time that does not exist. A repetition's ticks are civil too: across a change of clocks
 //! `GetRunTimes` lists the same grid each day, listing an hour that repeats once and the ticks of an hour
 //! a change skips an hour earlier, so those minutes are listed twice (the knowledge base's "GetRunTimes
-//! lists a repetition across a DST change in local civil time ..."). What Task Scheduler fires at those
-//! minutes is not measured.
+//! lists a repetition across a DST change in local civil time ..."). What fires is measured too: a
+//! repetition runs on both the civil grid and elapsed time, so some minutes run twice; a lone daily
+//! trigger in a skipped hour does not run that day, and one in a repeated hour runs at both passes (the
+//! knowledge base's "A repetition across a DST change runs twice a minute for part of its span ...").
 //!
 //! A trigger names days (every day, weekdays, days of the month, in some months or all), a start time
 //! and optionally a repetition that restarts at its start each day. What the shapes rest on was
