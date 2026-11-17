@@ -5,7 +5,7 @@
 use std::io;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::manager_tests::{launchd_over, procinfo_not_naming};
@@ -17,7 +17,6 @@ use super::*;
 use crate::backend::Backend as _;
 use crate::backend::bounded::{self, Capture, Finished};
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
-use crate::backend::kill::Waited;
 use crate::backend::launchd::generate::timer_label;
 use crate::backend::standby;
 use crate::manager::Step;
@@ -120,85 +119,6 @@ fn stopping_as(fake: &Fake, budget: Budget, action: StopAction) -> Result<()> {
         budget,
         &mut held,
     )
-}
-
-/// Every signal a stop sent, in order.
-type Sent = Arc<Mutex<Vec<Signal>>>;
-
-/// What a [`Recording`] target refuses.
-#[derive(Clone, Copy)]
-enum Refusing {
-    Nothing,
-    /// The open of the process, so the hold fails.
-    Open,
-    /// The send of this signal.
-    Signal(Signal),
-}
-
-/// A target that records each signal sent through it, over the real one, which sends it to the run held.
-struct Recording<T> {
-    target: T,
-    sent: Sent,
-    refusing: Refusing,
-}
-
-impl<T: KillTarget> KillTarget for Recording<T> {
-    type Process = T::Process;
-
-    fn service_pid(&mut self) -> io::Result<Option<u32>> {
-        self.target.service_pid()
-    }
-
-    fn open(&mut self, pid: u32) -> io::Result<Option<T::Process>> {
-        if matches!(self.refusing, Refusing::Open) {
-            return Err(io::Error::other("the open was refused"));
-        }
-        self.target.open(pid)
-    }
-
-    fn signal(&mut self, process: &T::Process, signal: Signal) -> io::Result<()> {
-        if matches!(self.refusing, Refusing::Signal(refused) if refused == signal) {
-            return Err(io::Error::other("the send was refused"));
-        }
-        self.sent.lock().unwrap().push(signal);
-        self.target.signal(process, signal)
-    }
-
-    fn confirm(&mut self, pid: u32, process: &T::Process) -> io::Result<bool> {
-        self.target.confirm(pid, process)
-    }
-
-    fn await_exit(&mut self, process: &T::Process, deadline: Deadline) -> io::Result<Waited> {
-        self.target.await_exit(process, deadline)
-    }
-
-    fn await_recorded(&mut self, pid: u32, held: Option<&T::Process>, deadline: Deadline) -> io::Result<Waited> {
-        self.target.await_recorded(pid, held, deadline)
-    }
-}
-
-/// `course` over `fake`, drawing on a reservation made for [`Step::Stop`], and the signals it sent.
-fn stopping_course(fake: &Fake, course: Course, refusing: Refusing) -> (Result<()>, Vec<Signal>) {
-    let tree = Tree::new();
-    let mgr = launchd_over(fake.clone());
-    let mut held = reserved(&mgr, Step::Stop);
-    let id = task_snapshot(&tree, false).id.clone();
-    let sent = Sent::default();
-    let result = mgr.stop_course(&id, course, &mut held, |reservation| {
-        Ok(Recording {
-            target: JobKill::new(&mgr.launchctl, id.as_str(), reservation)?,
-            sent: sent.clone(),
-            refusing,
-        })
-    });
-    let sent = sent.lock().unwrap().clone();
-    (result, sent)
-}
-
-/// [`stopping_as`], and the signals it sent.
-fn stopping_signals(fake: &Fake, budget: Budget, action: StopAction) -> (Result<()>, Vec<Signal>) {
-    let course = Course::new(Some(action), budget, Watch::new().expect("a watch"));
-    stopping_course(fake, course, Refusing::Nothing)
 }
 
 /// A stop action that sends SIGTERM and gives a run [`StopAction::MIN_TIMEOUT`] to answer it.
@@ -747,7 +667,7 @@ fn a_wait_that_ends_inside_the_grace_names_the_limit() {
 /// A run that ignores SIGTERM for as long as the `timeout` is escalated: SIGKILL is sent when it is over,
 /// and the stop returns once the run is gone. The `timeout` is the grace the user configured, as it is
 /// for systemd's `TimeoutStopSec=`. Both signals go to the process held, the SIGKILL by the pass that
-/// finds the grace over, once launchd has confirmed the process again, and neither to the label.
+/// holds the run when the grace ends, once launchd has confirmed the process again, and neither to the label.
 #[skuld::test]
 fn stop_sends_sigkill_to_a_run_that_ignores_sigterm_for_the_timeout() {
     let mut run = Held::ignoring_sigterm();
@@ -756,18 +676,15 @@ fn stop_sends_sigkill_to_a_run_that_ignores_sigterm_for_the_timeout() {
         print(&running(pid)),
         print(&running(pid)),
         procinfo(pid),
-        // The timeout is over: the next pass reads, holds and confirms the process again, and kills it.
-        print(&running(pid)),
+        // The timeout is over: the pass confirms the process again, and kills it. No read of its own.
         print(&running(pid)),
         procinfo(pid),
         print(IDLE),
     ]);
 
-    let (result, sent) = stopping_signals(&fake, Budget::Unbounded, graced());
+    stopping_as(&fake, Budget::Unbounded, graced()).expect("a stop that ends the run");
 
-    result.expect("a stop that ends the run");
-    fake.assert_spent("SIGTERM, the timeout, then the read, the confirmation and the kill of the process held");
-    assert_eq!(sent, [Signal::Term, Signal::Kill]);
+    fake.assert_spent("SIGTERM, the timeout, then the confirmation and the kill of the process held");
     assert_no_label_signal(&fake);
     assert_eq!(ended_by(&mut run), Some(libc::SIGKILL), "the run was ended by SIGKILL");
 }
@@ -783,83 +700,76 @@ fn a_process_launchd_no_longer_names_when_the_timeout_is_over_is_not_sent_sigkil
         print(&running(pid)),
         procinfo(pid),
         print(&running(pid)),
-        print(&running(pid)),
         procinfo_not_naming(pid),
         print(IDLE),
     ]);
 
-    let (result, sent) = stopping_signals(&fake, Budget::Unbounded, graced());
+    stopping_as(&fake, Budget::Unbounded, graced()).expect("a stop that finds no run to end");
 
-    result.expect("a stop that finds no run to end");
     fake.assert_spent("SIGTERM, the timeout, the confirmation that refused, and the read that found none");
     assert_eq!(
-        sent,
-        [Signal::Term],
-        "nothing is sent to a process launchd does not name"
+        run.finish(),
+        Some(0),
+        "SIGTERM was ignored, and nothing is sent to a process launchd does not name"
     );
-    assert_eq!(run.finish(), Some(0), "the process was not killed");
 }
 
-/// A deadline that is spent is the caller's timeout, whatever the pass would have done next: the stop sends
-/// nothing after it, reads `print` once to see whether the job is done, and says what it had sent. A run sent SIGTERM whose grace is over is
-/// due SIGKILL, and it is not sent; one whose grace is not over has it still, and one that was sent SIGKILL
-/// has it said. The deadline is spent by construction (a bound of nothing), so no clock decides the outcome.
+/// The stop is always issued, whatever the budget: the first pass sends the run it finds its first signal,
+/// and a bound that is spent (a zero bound, or the least bound a `restart` hands its stop leg once its budget
+/// ran out) then ends the stop at its next pass, which reads once and finds the run still there.
 #[skuld::test]
-fn a_stop_whose_deadline_is_spent_sends_nothing_and_says_what_it_sent() {
-    let mut run = Held::ignoring_sigterm();
-    let Resolved::Found(identity) = ProcessId::of(run.pid()) else {
-        panic!("the child is running");
-    };
-    let over = Budget::Immediate.start();
-    let not_over = Budget::Unbounded.start();
-    let shown = running(run.pid());
-    let cases = [
-        ("grace over", over, false, "before goetia sent SIGKILL"),
-        (
-            "grace pending",
-            not_over,
-            false,
-            "has the `stop-action` timeout to answer it",
-        ),
-        ("killed", over, true, "was sent SIGKILL"),
-    ];
-    for (what, grace_end, killed, says) in cases {
-        let fake = Fake::new([print(&shown)]);
-        let mut course = Course::new(
-            Some(graced()),
-            Budget::Bounded(Duration::ZERO),
-            Watch::new().expect("a watch"),
-        );
-        course.termed = Some(Termed {
-            run: identity,
-            grace_end: Some(grace_end),
-            killed,
-        });
+fn a_stop_with_a_spent_budget_sends_its_first_signal_and_then_reports_the_timeout() {
+    for budget in [Duration::ZERO, Duration::from_nanos(1)] {
+        let mut run = Held::new(0);
+        let pid = run.pid();
+        let fake = Fake::new([
+            print(&running(pid)),
+            print(&running(pid)),
+            procinfo(pid),
+            // The read the next pass makes once, with its deadline spent.
+            print(&running(pid)),
+        ]);
 
-        let (result, sent) = stopping_course(&fake, course, Refusing::Nothing);
+        let e = stopping(&fake, Budget::Bounded(budget)).expect_err("a deadline that is spent");
 
-        let Err(Error::WaitTimeout { recovery, .. }) = &result else {
-            panic!("{what}: expected a wait timeout, got {result:?}");
-        };
-        assert!(recovery.contains(says), "{what}: {recovery}");
-        fake.assert_spent("the one read after the deadline, which shows the run still there");
-        assert_eq!(sent, [], "{what}: nothing is sent after the deadline");
+        assert_wait_timeout(&e);
+        fake.assert_spent("the first signal, and the one read after it");
+        assert_eq!(ended_by(&mut run), Some(libc::SIGTERM), "{budget:?}: SIGTERM went out");
     }
-    assert_eq!(run.finish(), Some(0), "the run was not signalled");
 }
 
-/// A stop with no time sends no SIGTERM to a run it has not signalled yet, and waits for no queued start: the
-/// deadline is checked before anything is sent. It reads `print` once, and whatever shows a job that is not done
-/// (a process, a start launchd accepted, a state that says nothing, a read that failed) is the timeout.
-/// (A zero bound is spent from the start, so no clock decides the outcome.)
+/// A zero bound still waits for a queued start's pid, as every budget does, and signals the run it begins.
 #[skuld::test]
-fn a_stop_with_no_time_reads_once_and_sends_nothing() {
+fn a_stop_with_no_time_waits_for_a_queued_start_signals_it_and_reports_the_timeout() {
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(QUEUED),
+        print(QUEUED),
+        print(&running(pid)),
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        print(&running(pid)),
+    ]);
+
+    let e = stopping(&fake, Budget::Bounded(Duration::ZERO)).expect_err("a deadline that is spent");
+
+    assert_wait_timeout(&e);
+    fake.assert_spent("the queued start, the signal, and the one read after it");
+    assert_eq!(ended_by(&mut run), Some(libc::SIGTERM), "SIGTERM went out");
+}
+
+/// Once the first signal is sent, a spent deadline sends nothing more, and the pass that finds it spent reads
+/// `print` once: whatever shows a job that is not done (a start launchd accepted, a state that says nothing,
+/// a read that failed) is the timeout.
+#[skuld::test]
+fn a_stop_whose_deadline_is_spent_after_its_first_signal_reads_once_and_times_out() {
     let failed = reply(
         &["print", &target()],
         exited(5, "", "Could not print: 5: Input/output error\n"),
     );
     let reads = [
-        ("a process", print(&running(4242))),
         ("a queued start", print(QUEUED)),
         (
             "a state that says nothing",
@@ -868,44 +778,114 @@ fn a_stop_with_no_time_reads_once_and_sends_nothing() {
         ("a read that failed", failed),
     ];
     for (what, read) in reads {
-        let fake = Fake::new([read]);
+        let mut run = Held::ignoring_sigterm();
+        let pid = run.pid();
+        let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid), read]);
 
-        let (result, sent) = stopping_signals(&fake, Budget::Bounded(Duration::ZERO), StopAction::default());
+        let e = stopping_as(&fake, Budget::Bounded(Duration::ZERO), graced()).expect_err(what);
 
-        assert_wait_timeout(&result.expect_err(what));
-        fake.assert_spent("the one read");
-        assert_eq!(sent, [], "{what}");
+        assert_wait_timeout(&e);
+        fake.assert_spent(what);
+        assert_eq!(run.finish(), Some(0), "{what}: SIGTERM, ignored, and nothing more");
     }
 }
 
-/// A run that ended inside the budget is not a timeout, whenever the next pass starts: the watch fired before
-/// the deadline, the next pass begins after it (here the deadline is spent by construction, and the run has
-/// been sent SIGTERM), and its one read shows the job idle. Nothing is sent, and nothing is read twice.
+/// A run that ended inside the budget is not a timeout, whenever the next pass starts: the next pass is after
+/// the deadline, and its one read shows the job idle. Nothing is sent, and nothing is read twice.
 #[skuld::test]
 fn a_run_that_ended_inside_the_budget_is_not_a_timeout_though_the_next_pass_starts_after_it() {
-    let run = Held::new(0);
-    let Resolved::Found(identity) = ProcessId::of(run.pid()) else {
-        panic!("the child is running");
-    };
     for read in [print(IDLE), print("\tstate = exited\n"), not_loaded()] {
-        let fake = Fake::new([read]);
-        let mut course = Course::new(
-            Some(graced()),
-            Budget::Bounded(Duration::ZERO),
-            Watch::new().expect("a watch"),
-        );
-        course.termed = Some(Termed {
-            run: identity,
-            grace_end: Some(Budget::Unbounded.start()),
-            killed: false,
-        });
+        let mut run = Held::new(0);
+        let pid = run.pid();
+        let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid), read]);
 
-        let (result, sent) = stopping_course(&fake, course, Refusing::Nothing);
+        stopping(&fake, Budget::Bounded(Duration::ZERO)).expect("the job is done");
 
-        result.expect("the job is done");
-        fake.assert_spent("the one read, which shows no process");
-        assert_eq!(sent, [], "nothing is sent after the deadline");
+        fake.assert_spent("the signal, and the one read, which shows no process");
+        assert_eq!(ended_by(&mut run), Some(libc::SIGTERM), "SIGTERM went out");
     }
+}
+
+/// What the timeout says is what this stop did to the run that is up: SIGTERM for the run it sent SIGTERM;
+/// for a run it never signalled, that it was not signalled, whatever it sent the run before (SIGKILL
+/// included) and whether the run is shown or a start is queued.
+#[skuld::test]
+fn a_timeout_says_what_the_stop_did_to_the_run_that_is_up() {
+    let kill = StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    };
+    let spent = Budget::Bounded(Duration::ZERO);
+    let timeout_of = |fake: &Fake, action| match stopping_as(fake, spent, action) {
+        Err(Error::WaitTimeout { recovery, .. }) => recovery,
+        other => panic!("expected a wait timeout, got {other:?}"),
+    };
+
+    // A run sent SIGTERM, and still there.
+    let mut run = Held::ignoring_sigterm();
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        print(&running(pid)),
+    ]);
+    let recovery = timeout_of(&fake, graced());
+    assert!(recovery.contains("was sent SIGTERM"), "{recovery}");
+    run.finish();
+
+    // A run sent SIGKILL, gone; another run is up.
+    let (mut killed, mut next) = (Held::ignoring_sigterm(), Held::ignoring_sigterm());
+    let (a, b) = (killed.pid(), next.pid());
+    let fake = Fake::new([print(&running(a)), print(&running(a)), procinfo(a), print(&running(b))]);
+    let recovery = timeout_of(&fake, kill);
+    assert!(recovery.contains("was not signalled"), "{recovery}");
+    assert!(!recovery.contains("was sent SIGKILL"), "{recovery}");
+    assert_eq!(ended_by(&mut killed), Some(libc::SIGKILL));
+    assert_eq!(next.finish(), Some(0), "the run that was up was sent nothing");
+
+    // A run sent SIGTERM, gone; a start is queued.
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        print(QUEUED),
+    ]);
+    let recovery = timeout_of(&fake, graced());
+    assert!(recovery.contains("was not signalled"), "{recovery}");
+    assert_eq!(ended_by(&mut run), Some(libc::SIGTERM));
+}
+
+/// The deadline is decided once more right before every send after the first. Here it passes during the read
+/// that shows the next run, after the pass began with time left: that run is not sent its first signal, and
+/// the stop reports the timeout. (The read is slow by the fake's own sleep; the deadline is far enough that
+/// only that sleep spends it.)
+#[skuld::test]
+fn a_deadline_that_passes_before_a_later_runs_first_signal_sends_nothing_to_it() {
+    let mut first = Held::new(0);
+    let mut second = Held::ignoring_sigterm();
+    let (a, b) = (first.pid(), second.pid());
+    let slow = Duration::from_millis(1500);
+    let fake = Fake::new([
+        print(&running(a)),
+        print(&running(a)),
+        procinfo(a),
+        // The next pass begins with time left; this read, which shows the next run, spends it.
+        print(&running(b)).then(move || std::thread::sleep(slow)),
+        print(&running(b)),
+        procinfo(b),
+        // The pass after it finds the deadline spent, and reads once.
+        print(&running(b)),
+    ]);
+
+    let e = stopping(&fake, Budget::Bounded(Duration::from_millis(1000))).expect_err("a deadline that passed");
+
+    assert_wait_timeout(&e);
+    fake.assert_spent("the first run's signal, the next run held and not signalled, and the one read");
+    assert_eq!(ended_by(&mut first), Some(libc::SIGTERM));
+    assert_eq!(second.finish(), Some(0), "the next run was sent nothing");
 }
 
 /// A later pass can find the run that was sent SIGTERM again: here launchd's lookup did not name the process
@@ -922,7 +902,6 @@ fn a_run_found_again_keeps_the_grace_that_began_at_its_sigterm() {
         procinfo(pid),
         // The grace is over, and launchd does not name the process held.
         print(&running(pid)),
-        print(&running(pid)),
         procinfo_not_naming(pid),
         // The next pass holds the same process: the grace is over, so it is killed through the hold.
         print(&running(pid)),
@@ -931,11 +910,9 @@ fn a_run_found_again_keeps_the_grace_that_began_at_its_sigterm() {
         print(IDLE),
     ]);
 
-    let (result, sent) = stopping_signals(&fake, Budget::Unbounded, graced());
+    stopping_as(&fake, Budget::Unbounded, graced()).expect("a stop that ends the run");
 
-    result.expect("a stop that ends the run");
     fake.assert_spent("SIGTERM once, the refused confirmation, then the kill of the same run");
-    assert_eq!(sent, [Signal::Term, Signal::Kill], "one SIGTERM, and then the kill");
     assert_eq!(ended_by(&mut run), Some(libc::SIGKILL), "the run was ended by SIGKILL");
 }
 
@@ -1021,7 +998,6 @@ fn a_queued_starts_wait_does_not_spend_the_grace_of_the_run_that_follows() {
         print(&running(pid)),
         print(&running(pid)),
         procinfo(pid),
-        print(&running(pid)),
         print(&running(pid)),
         procinfo(pid),
         print(IDLE),
@@ -1127,12 +1103,13 @@ fn the_sigkill_is_for_the_run_whose_timeout_ran_out_and_not_for_the_next() {
         print(&running(a)),
         procinfo(a),
         // `print` shows another run by the time the timeout is over: the first is not the job's any more,
-        // and the process held is left alone. The second is told to stop, and ignores it.
+        // and the process held is left alone.
+        print(&running(b)),
+        // The second is told to stop, and ignores it.
         print(&running(b)),
         print(&running(b)),
         procinfo(b),
         // Its own timeout is over: it is killed.
-        print(&running(b)),
         print(&running(b)),
         procinfo(b),
         print(IDLE),
@@ -1142,11 +1119,9 @@ fn the_sigkill_is_for_the_run_whose_timeout_ran_out_and_not_for_the_next() {
         timeout: Some(StopAction::MIN_TIMEOUT),
     };
 
-    let (result, sent) = stopping_signals(&fake, Budget::Unbounded, action);
+    stopping_as(&fake, Budget::Unbounded, action).expect("a stop that ends the second run");
 
-    result.expect("a stop that ends the second run");
     fake.assert_spent("each run was told to stop once, and the second killed");
-    assert_eq!(sent, [Signal::Term, Signal::Term, Signal::Kill]);
     assert_no_label_signal(&fake);
     assert_eq!(
         first.finish(),
@@ -1311,58 +1286,22 @@ fn a_pass_of_a_tasks_stop_spends_what_a_pass_reserves() {
     }
 }
 
-/// A SIGTERM that could not be sent is the stop's failure, in its words, and the run is not waited for.
+/// A signal or a hold that failed is the stop's failure, in the stop's words and not `kill`'s.
 #[skuld::test]
-fn a_sigterm_that_could_not_be_sent_is_the_stops_failure() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid)]);
-    let course = Course::new(Some(graced()), Budget::Unbounded, Watch::new().expect("a watch"));
+fn a_failed_send_or_hold_is_the_stops_failure() {
+    use crate::backend::kill::Signal;
+    for (doing, said) in [
+        (Signal::Term.sending(), "sending SIGTERM"),
+        (Signal::Kill.sending(), "sending SIGKILL"),
+        ("holding the process", "holding the process"),
+    ] {
+        let e = stop_failed(ID, doing, io::Error::other("refused"));
 
-    let (result, sent) = stopping_course(&fake, course, Refusing::Signal(Signal::Term));
-
-    assert!(
-        matches!(&result, Err(Error::Os { what, .. }) if *what == format!("stop `{ID}`: sending SIGTERM")),
-        "{result:?}"
-    );
-    assert_eq!(sent, [], "the refused send is not a sent one");
-}
-
-/// A SIGKILL that could not be sent names the SIGKILL, for `send-signal: kill` and for the escalation alike.
-#[skuld::test]
-fn a_sigkill_that_could_not_be_sent_names_the_sigkill() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid)]);
-    let action = StopAction {
-        send_signal: StopSignal::Kill,
-        timeout: None,
-    };
-    let course = Course::new(Some(action), Budget::Unbounded, Watch::new().expect("a watch"));
-
-    let (result, _) = stopping_course(&fake, course, Refusing::Signal(Signal::Kill));
-
-    assert!(
-        matches!(&result, Err(Error::Os { what, .. }) if *what == format!("stop `{ID}`: sending SIGKILL")),
-        "{result:?}"
-    );
-}
-
-/// A process that cannot be held is the stop's failure too: not a `kill`, which `goetia daemon kill` is.
-#[skuld::test]
-fn a_process_that_cannot_be_held_is_the_stops_failure() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid))]);
-    let course = Course::new(Some(graced()), Budget::Unbounded, Watch::new().expect("a watch"));
-
-    let (result, sent) = stopping_course(&fake, course, Refusing::Open);
-
-    assert!(
-        matches!(&result, Err(Error::Os { what, .. }) if *what == format!("stop `{ID}`: holding the process")),
-        "{result:?}"
-    );
-    assert_eq!(sent, []);
+        assert!(
+            matches!(&e, Error::Os { what, .. } if *what == format!("stop `{ID}`: {said}")),
+            "{e:?}"
+        );
+    }
 }
 
 /// A task is never booted out by `stop`, in any path: the label stays loaded, and a start loads nothing.
