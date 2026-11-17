@@ -174,8 +174,8 @@ impl fmt::Display for WindowsDefinition {
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics;
 /// - a `stop-action` Windows cannot honour: a signal it has no equivalent of, a signal for a
-///   `protocol: native` service, which handles SCM's own stop itself, or, for a task, a leaf that differs from the default
-///   (Task Scheduler decides how a task is stopped);
+///   `protocol: native` service, which handles SCM's own stop itself, or, for a task, a leaf that differs from
+///   the default (Task Scheduler decides how a task is stopped);
 /// - for a task, a virtual service account, a `%` in the host's path or arguments (Task Scheduler
 ///   expands it), a schedule whose day-of-month and day-of-week fields are both restricted (an AND, or
 ///   an either-or whose two triggers would coincide: see `triggers::compile`), and a schedule that
