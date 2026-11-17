@@ -87,14 +87,14 @@ impl Drop for Marked {
 }
 
 extern "C" fn stand_in(signal: libc::c_int) {
-    // Before the count, so that a test that waits for the count finds this set. `pthread_self` is
-    // async-signal-safe.
+    // The count is the last write: a test that waits on another thread for the count to leave zero then
+    // finds every other fact of this run set. `pthread_self` is async-signal-safe.
     // SAFETY: `pthread_self` has no preconditions.
     if MARKED_THREAD.load(Ordering::SeqCst) == unsafe { libc::pthread_self() } {
         SEEN_ON_MARKED.store(true, Ordering::SeqCst);
     }
-    SEEN.fetch_add(1, Ordering::SeqCst);
     SEEN_BITS.fetch_or(1 << signal, Ordering::SeqCst);
+    SEEN.fetch_add(1, Ordering::SeqCst);
 }
 
 fn stand_in_address() -> libc::sighandler_t {
@@ -483,8 +483,9 @@ fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
 
 /// The last drop un-publishes the write end and then waits for a handler that is running before it closes
 /// the pipe, so a handler never writes to a closed descriptor. A running handler is stood in for by a count
-/// that the test holds; the drop is observed at its un-publishing, which is a fact of the state and not a
-/// wait of a chosen length.
+/// that the test holds. The test waits for the closing thread to say that it is waiting for that handler
+/// ([`test_hook::has_waited`]), or to end, which it must not do: a close that does not wait ends without
+/// saying so, and is told apart from one that waits whatever the schedule, as both waits are on a fact.
 #[skuld::test]
 fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     let before = StandIn::install();
@@ -492,19 +493,18 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     let wake = deferred.wake();
     let mut closing = Joined::default();
     let running = Running::enter();
+    test_hook::forget_waits();
 
     closing.0 = Some(std::thread::spawn(move || drop(deferred)));
-    // The closing thread must block while the handler runs: it ending at all, with or without a panic, is
-    // the failure, and ends the wait rather than hanging it.
-    while WAKE.load(Ordering::SeqCst) != -1 {
+    // The flag is read before `ended`: a close that waits says so before it can end, so a thread that has
+    // ended with the flag still clear never waited.
+    while !test_hook::has_waited() {
         if closing.ended() {
             closing.fail("the closing thread ended while a handler was running");
         }
         std::thread::yield_now();
     }
-    if closing.ended() {
-        closing.fail("the closing thread ended while a handler was running");
-    }
+    assert!(!closing.ended(), "the closing thread is waiting, not done");
     assert!(is_open(wake), "a handler is running, so the pipe is still open");
 
     drop(running);

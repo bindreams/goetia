@@ -302,9 +302,8 @@ impl Drop for Deferred {
 /// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
     WAKE.store(-1, Ordering::SeqCst);
-    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
-        std::thread::yield_now();
-    }
+    // MUTANT: no wait for the handlers in flight
+
     drop(wake);
     OPEN.store(false, Ordering::SeqCst);
     claim(ALL)
@@ -411,6 +410,7 @@ fn restore(previous: &[libc::sigaction], taken: u32) {
 #[cfg(test)]
 mod test_hook {
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::backend::test_allowance::{Allowance, spend};
 
@@ -426,6 +426,22 @@ mod test_hook {
 
     pub(super) fn step() -> std::io::Result<()> {
         spend(&STEPS, "no step of opening a window may be taken (test hook)")
+    }
+
+    /// Whether a close has found a handler counted in and waited for it since [`forget_waits`].
+    static WAITED: AtomicBool = AtomicBool::new(false);
+
+    /// The close is waiting for a handler: called on each pass of its wait.
+    pub(super) fn waited() {
+        WAITED.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn has_waited() -> bool {
+        WAITED.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn forget_waits() {
+        WAITED.store(false, Ordering::SeqCst);
     }
 }
 
