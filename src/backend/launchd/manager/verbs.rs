@@ -38,8 +38,8 @@ enum Pass {
     Queued(Duration),
     /// Read again, paced: launchd shows this pid, which is no run of the job's that the stop can reach: the
     /// run ended and launchd has not cleared it, or launchd has moved on to another run. The pause is
-    /// [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing. Under `Immediate`,
-    /// which waits for nothing, the next reading is at once, and one that shows the same pid ends the stop.
+    /// [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing, and never runs past
+    /// the deadline. Under `Immediate` a reading that shows the same pid as the last such pass ends the stop.
     Behind(u32),
 }
 
@@ -246,9 +246,9 @@ fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> Error {
                 ),
                 Escalation::Sent => format!("{recovery} The run was sent SIGKILL and has not exited yet."),
                 Escalation::Uncleared => format!(
-                    "{recovery} Launchd showed a pid that is no run of the job's that this stop can reach: the run ended \
-                     and launchd had not cleared it, or launchd had moved on to another run. `goetia daemon stop {id}` \
-                     again returns once launchd shows no process."
+                    "{recovery} Launchd still showed a process ID for the job when the deadline passed, but that \
+                     process had already ended or belonged to a run that replaced it; run `goetia daemon stop {id}` \
+                     again."
                 ),
             },
             id,
@@ -326,11 +326,12 @@ impl Launchd {
     /// deadline, whether anything was sent or not: a `Bounded` budget that is spent is the caller's timeout,
     /// and nothing more is sent ([`Course::spent`]); the one reading the pass makes then, the one every pass
     /// makes ([`Self::read_up`]), is to see whether the job is done ([`Self::done_or`]). So a stop that keeps
-    /// finding a pid launchd has not cleared ends at its deadline. `Immediate` waits for nothing, launchd's
-    /// view included: a pass that finds launchd showing a pid it cannot reach is followed by another at once,
-    /// with no pause, and ends the stop with `Ok` when it shows the same pid (launchd is lagging) or no
-    /// process; a run it shows is signalled as in any pass, and another pid, or a queued start, goes on the same
-    /// way, so the loop runs only while what `print` shows changes. Otherwise the pass reads `print`:
+    /// finding a pid launchd has not cleared ends at its deadline. `Immediate` waits for no exit: it signals the
+    /// run it finds and returns. While launchd shows a pid the stop cannot reach it reads again, paced by
+    /// [`UNLOAD_POLL`], and returns `Ok` with nothing sent when two readings in a row show the same pid
+    /// (launchd is lagging) or when one shows no process; a run it shows is signalled as in any pass, and another
+    /// pid, or a queued start, goes on the same way, so the loop runs only while what `print` shows changes.
+    /// Otherwise the pass reads `print`:
     ///
     /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
     ///   No process and any other state, or a `print` that failed or was not whole, is
@@ -355,8 +356,9 @@ impl Launchd {
     ///
     /// The deadline is decided before a send, not atomically with it: one that passes between the check and
     /// the send does not stop that send. A pid that exited before it was watched, or is not the job's any
-    /// more, is the next pass, paced by [`UNLOAD_POLL`] while launchd's view catches up; a pass after which
-    /// the deadline is spent is not paced, and is the reading that ends the stop ([`Self::done_or`]). The first pass draws
+    /// more, is the next pass, paced by [`UNLOAD_POLL`] while launchd's view catches up, or by what is left of
+    /// the deadline when that is less; a pass after which the deadline is spent is the reading that ends the
+    /// stop ([`Self::done_or`]). The first pass draws
     /// on `reservation`, and each later one on one of its own: an uncapped loop would draw what was never
     /// reserved. A pass that cannot reserve returns that error, the SIGTERM standing. The one [`Watch`] is
     /// made first, so that failing to make it sends nothing.
@@ -381,18 +383,22 @@ impl Launchd {
                 Pass::Again => course.first_pass_over(),
                 Pass::Queued(waited) => {
                     course.extend(waited);
+                    lagging = None;
                 }
-                Pass::Behind(shown) if course.counted == Budget::Immediate => {
-                    if lagging == Some(shown) {
-                        return Ok(());
+                Pass::Behind(shown) => {
+                    if course.counted == Budget::Immediate {
+                        if lagging == Some(shown) {
+                            return Ok(());
+                        }
+                        lagging = Some(shown);
                     }
-                    lagging = Some(shown);
-                }
-                Pass::Behind(_) => {
                     course.first_pass_over();
-                    if !course.spent() {
-                        std::thread::sleep(UNLOAD_POLL);
-                    }
+                    // The pause never crosses the deadline; `Immediate` has none, and paces by `UNLOAD_POLL`.
+                    let pause = match (course.counted, course.deadline().remaining()) {
+                        (Budget::Bounded(_), Some(left)) => left.min(UNLOAD_POLL),
+                        _ => UNLOAD_POLL,
+                    };
+                    std::thread::sleep(pause);
                 }
             }
             own = Some(own_reservation(id, TASK_STOP_REQUESTS, TASK_STOP_CALLS)?);

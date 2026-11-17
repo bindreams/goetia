@@ -31,7 +31,9 @@ impl Budget {
     /// exception is a launchd task's `stop`, which matches on the budget itself:
     /// under every budget it waits for a queued start's pid and sends the run its
     /// first signal, as every backend's stop is issued. Under `Immediate` it
-    /// then returns `Ok`; a zero bound is a bound that has run out, so after
+    /// then returns `Ok`, but may read launchd again, paced, while launchd shows a
+    /// pid it cannot hold, and returns `Ok` with nothing sent when two readings
+    /// show the same such pid; a zero bound is a bound that has run out, so after
     /// that signal it sends nothing more, does one reading (`read_up`), and
     /// returns `Ok` if the job is idle, else
     /// [`Error::WaitTimeout`](crate::Error::WaitTimeout), a pid launchd has
