@@ -15,7 +15,7 @@ use crate::backend::InstalledService;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::kill::HoldOutcome;
 use crate::backend::scm::manager::{Scm, Uninstalled, shim_exe};
-use crate::backend::scm::runs::Runs;
+use crate::backend::scm::runs::{PauseKind, Runs};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
 use crate::error::{Error, Result};
@@ -64,12 +64,16 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
 /// What an uninstall says on stderr when its removal of the run records has to wait, each time the path it
 /// waits for changes: the manager has no channel for a notice, so it is said as its warnings are. A `run`
 /// that still waits for a record holds the directory, and returns after the stop that came before; a
-/// file whose delete is pending goes when the last handle on it closes.
-fn waiting_for_records(waits_for: &Path) {
-    eprintln!(
-        "waiting for {} to be released by a `run` or another program that has it open",
-        waits_for.display()
-    );
+/// file whose delete is pending goes when the last handle on it closes. A directory that is not empty
+/// with nothing known to hold what is in it is said as that, and claims no holder.
+fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
+    match kind {
+        PauseKind::Held => eprintln!(
+            "waiting for {} to be released by a `run` or another program that has it open",
+            waits_for.display()
+        ),
+        PauseKind::Emptying => eprintln!("waiting for {} to empty", waits_for.display()),
+    }
 }
 
 /// The shim file the stored task runs, when its file name is that of one a provider placed (the one
@@ -128,14 +132,8 @@ impl Scm {
         } else {
             Ok(())
         };
-        match (removed, sweep()) {
-            (Ok(()), swept) => swept,
-            (Err(removal), Ok(())) => Err(removal),
-            (Err(first), Err(then)) => Err(Error::Both {
-                first: Box::new(first),
-                then: Box::new(then),
-            }),
-        }
+        let swept = sweep();
+        Error::both_all(removed.err().into_iter().chain(swept.err())).map_or(Ok(()), Err)
     }
 
     /// The task and its records removed, with nothing swept: the caller holds the install lock. See

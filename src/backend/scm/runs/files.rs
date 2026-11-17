@@ -1,96 +1,126 @@
-//! The file operations under [`Runs`](super::Runs) that `std::fs` does not offer: a file that is
-//! renamed while it is held, the pin's open modes, and what a failed delete means ([`delete`]).
+//! The file operations under [`Runs`](super::Runs), each on an entry of a [`Dir`] by its bare name and
+//! through the directory's handle: a record's temp file and its rename, the pin's open modes, a read, and
+//! what a failed delete means ([`delete`]).
 
-use std::fs::{File, OpenOptions};
-use std::io;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{self, Read as _};
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
-use std::path::Path;
-use std::ptr::{null, null_mut};
 
-use windows_sys::Wdk::Foundation::{NtClose, OBJECT_ATTRIBUTES};
-use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN_REPARSE_POINT, NtOpenFile};
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FileRenameInformation,
+    FILE_RENAME_INFORMATION, NtSetInformationFile,
+};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE,
-    STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+    ERROR_SHARING_VIOLATION, HANDLE, STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
+    DELETE, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
+    FILE_TRAVERSE, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use crate::backend::scm::wide::wide_null;
+use super::dir::{Dir, SHARE_ALL, SYNCHRONOUS_IO, delete_by_disposition, io_error};
 
-/// Creates `path`, or empties what an interrupted write left there, for a record's bytes. Others
-/// may read it but not delete it while it is held, so a write in flight is not pruned from under it.
-pub(super) fn create_temp(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .access_mode(GENERIC_WRITE | DELETE)
-        .share_mode(FILE_SHARE_READ)
-        .open(path)
+/// Makes the temp file `name` for a record's bytes, which must not exist: one an interrupted write left
+/// is deleted first, and the file is made new, so that nothing of the old one (its attributes, say) is
+/// kept and the account needs no right to overwrite it (KB ddcbd14). Others may read it but not delete it
+/// while it is held, so a write in flight is not pruned from under it. A leftover that is held (a write
+/// in flight) is a sharing violation.
+pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
+    match delete(dir, name) {
+        DeleteOutcome::Deleted => {}
+        DeleteOutcome::Held => return Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION as i32)),
+        DeleteOutcome::Failed(e) => return Err(e),
+    }
+    dir.open_in(
+        name,
+        FILE_GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | SYNCHRONOUS_IO,
+    )
+    .map_err(io_error)
 }
 
-/// Renames the file `file` holds to `to`, replacing what is there. It is renamed through the handle,
-/// so there is no moment at which it is closed and under its old name: nothing can delete it between
-/// its last write and the rename. `file` must have been opened with `DELETE`.
-pub(super) fn rename_over(file: &File, to: &Path) -> io::Result<()> {
-    let name: Vec<u16> = std::path::absolute(to)?.as_os_str().encode_wide().collect();
+/// Renames the file `file` holds to the name `to` in `dir`, replacing what is there. It is renamed through
+/// the handle, relative to the directory's, so there is no moment at which it is closed and under its
+/// old name: nothing can delete it between its last write and the rename. `file` must have been opened
+/// with `DELETE`, and be in `dir`.
+pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> {
+    let name: Vec<u16> = to.encode_wide().collect();
     let name_bytes = name.len() * size_of::<u16>();
-    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
     // The whole struct and then the name, not only up to the name's end: a buffer cut at the end of the
     // name came out with garbage after the new name, or was refused, for one length of path in eight.
-    let total = size_of::<FILE_RENAME_INFO>() + name_bytes;
-    // 8-byte alignment for `FILE_RENAME_INFO`, whose name runs on past its declared end.
+    let total = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
+    // 8-byte alignment for `FILE_RENAME_INFORMATION`, whose name runs on past its declared end.
     let mut buffer = vec![0u64; total.div_ceil(size_of::<u64>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFO`: room for the
-    // struct and for the name, which is copied in at the name's own offset.
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFORMATION`: room for
+    // the struct and for the name, which is copied in at the name's own offset.
     unsafe {
         (*info).Anonymous.ReplaceIfExists = true;
+        (*info).RootDirectory = dir.file().as_raw_handle() as HANDLE;
         (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), info.cast::<u8>().add(header).cast::<u16>(), name.len());
     }
-    // SAFETY: `file` is a live handle opened with `DELETE`; `info` is `total` readable bytes.
-    let ok = unsafe {
-        SetFileInformationByHandle(
+    let mut block = IO_STATUS_BLOCK::default();
+    // SAFETY: `file` is a live handle opened with `DELETE`, `dir`'s handle is live; `info` is `total`
+    // readable bytes.
+    let status = unsafe {
+        NtSetInformationFile(
             file.as_raw_handle() as HANDLE,
-            FileRenameInfo,
+            &mut block,
             info.cast(),
             total as u32,
+            FileRenameInformation,
         )
     };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
+    if status < 0 {
+        return Err(io_error(status));
     }
     Ok(())
 }
 
-/// Creates the pin file `path`, which must not exist. It is deleted when its last handle closes,
+/// Creates the pin file `name` in `dir`, which must not exist. It is deleted when its last handle closes,
 /// whatever ends the holder. Nobody else can delete it while it is held: the holder shares no delete, so
 /// any delete of it, by any account the directory lets delete entries, is a sharing violation
 /// ([`is_held`]).
-pub(super) fn create_pin(path: &Path) -> io::Result<File> {
-    pin_options().create_new(true).open(path)
+pub(super) fn create_pin(dir: &Dir, name: &OsStr) -> io::Result<File> {
+    dir.open_in(
+        name,
+        PIN_ACCESS,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | SYNCHRONOUS_IO,
+    )
+    .map_err(io_error)
 }
 
-/// How a pin is opened: no sharing at all, and deleted on close.
-pub(super) fn pin_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .access_mode(PIN_ACCESS)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
-    options
-}
+/// What a pin's holder has of it (`FILE_GENERIC_WRITE` includes `SYNCHRONIZE`).
+pub(super) const PIN_ACCESS: u32 = FILE_GENERIC_WRITE | DELETE;
 
-/// What a pin's holder has of it.
-pub(super) const PIN_ACCESS: u32 = GENERIC_WRITE | DELETE;
+/// The bytes of the file `name` in `dir`, or `None` if there is no such file. A link is opened, not
+/// followed, and has no bytes of its own to read.
+pub(super) fn read(dir: &Dir, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
+    let mut file = match dir.open_in(
+        name,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | SYNCHRONOUS_IO,
+    ) {
+        Ok(file) => file,
+        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Ok(None),
+        Err(status) => return Err(io_error(status)),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
 
 /// How [`delete`] of one file went.
 pub(super) enum DeleteOutcome {
@@ -103,41 +133,45 @@ pub(super) enum DeleteOutcome {
     Failed(io::Error),
 }
 
-/// Deletes the file `path` and says what became of it. This is the one place a failed delete is read
-/// ([`Runs::remove_all`](super::Runs::remove_all), a prune and a pin's liveness all go through it):
+/// Deletes the file `name` of `dir` and says what became of it. This is the one place a failed delete is read
+/// ([`Runs::remove_all`](super::Runs::remove_all), a prune and a pin's liveness all go through it). The file
+/// is opened for `DELETE` relative to `dir`, without following a link. It asks for `DELETE` and nothing
+/// else, not even `SYNCHRONIZE`: the directory's `FILE_DELETE_CHILD` lets an account delete an entry whose
+/// own permissions it has no entry on (a file of the account the task had before), but covers no other
+/// right, and an open for `DELETE | SYNCHRONIZE` was refused as access denied, a live pin of another
+/// account included (KB 44fca8b). The status of the open says:
 ///
 /// - A sharing violation says a handle holds the file without sharing delete, whoever it is: a pin's
 ///   holder shares none, nor does a shim writing its temp file. Held.
-/// - A file that is not there, or whose delete is pending, is deleted.
-/// - Anything else is a failure.
-///
-/// A delete-pending file answers access denied to an open and a delete, as a permission that
-/// refuses the delete does: the Win32 error is 5 for both. Only the status under it differs, `STATUS_DELETE_PENDING`
-/// against `STATUS_ACCESS_DENIED`, and that is what [`delete_is_pending`] reads.
+/// - A file that is not there, or whose delete is pending, is deleted. A file whose delete is pending
+///   answers access denied to a Win32 open and delete, as a permission that refuses it does (error 5 for
+///   both); only the status under it, `STATUS_DELETE_PENDING` against `STATUS_ACCESS_DENIED`, tells them
+///   apart, and the open reads it.
+/// - Anything else, a directory by that name included, is a failure.
 ///
 /// Which account made the file is not read: a live pin of another account (after a change of account) is
 /// told from a stale one by the sharing and by nothing else.
-pub(super) fn delete(path: &Path) -> DeleteOutcome {
-    match std::fs::remove_file(path) {
+pub(super) fn delete(dir: &Dir, name: &OsStr) -> DeleteOutcome {
+    let file = match dir.open_in(name, DELETE, SHARE_ALL, FILE_OPEN, FILE_NON_DIRECTORY_FILE) {
+        Ok(file) => file,
+        Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND | STATUS_DELETE_PENDING) => {
+            return DeleteOutcome::Deleted;
+        }
+        Err(STATUS_SHARING_VIOLATION) => return DeleteOutcome::Held,
+        Err(status) => return DeleteOutcome::Failed(io_error(status)),
+    };
+    match delete_by_disposition(&file) {
         Ok(()) => DeleteOutcome::Deleted,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => DeleteOutcome::Deleted,
         Err(e) if is_sharing_violation(&e) => DeleteOutcome::Held,
-        Err(e) if is_access_denied(&e) && delete_is_pending(path) => DeleteOutcome::Deleted,
         Err(e) => DeleteOutcome::Failed(e),
     }
 }
 
-/// Whether `error` is Win32's access denied, the answer to a file that is delete-pending as much as to
-/// one a permission protects ([`delete_is_pending`] tells them apart).
-fn is_access_denied(error: &io::Error) -> bool {
-    error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
-}
-
-/// Whether some handle holds the pin file `path`: [`delete`] says held. A pin nothing holds (one left by a
+/// Whether some handle holds the pin file `name`: [`delete`] says held. A pin nothing holds (one left by a
 /// power cut) is deleted by the asking and is not held. A delete that failed is returned: it says nothing
 /// about a handle.
-pub(super) fn is_held(path: &Path) -> io::Result<bool> {
-    match delete(path) {
+pub(super) fn is_held(dir: &Dir, name: &OsStr) -> io::Result<bool> {
+    match delete(dir, name) {
         DeleteOutcome::Deleted => Ok(false),
         DeleteOutcome::Held => Ok(true),
         DeleteOutcome::Failed(e) => Err(e),
@@ -149,76 +183,37 @@ pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
 }
 
-/// Whether the delete of the file `path` that failed with access denied found it with its delete
-/// pending, or found it gone since: the kernel's own answer to an open for `DELETE`. One the
-/// permissions refuse, or one that is there and opens, is not.
-fn delete_is_pending(path: &Path) -> bool {
-    matches!(
-        open_for_delete_status(path),
-        Some(STATUS_DELETE_PENDING | STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND)
-    )
-}
-
-/// The `NTSTATUS` of opening `path` for `DELETE` without following a link, or `None` if that cannot be
-/// asked. The Win32 call that `std` makes folds the status into an error code, which is what [`delete`]
-/// cannot read the cause from.
-///
-/// The open is made relative to a handle on the parent directory, by the bare file name, so no whole path
-/// is ever converted: a path past `MAX_PATH` (goetia has no long-path manifest) or in any prefix form is
-/// opened by `std` as it opens everything.
-///
-/// The parent is the contract. A parent that is not there is a path that is gone
-/// (`STATUS_OBJECT_PATH_NOT_FOUND`). A parent that cannot be opened for any other reason (an account with
-/// the right to delete a child but not to open the directory, say) is `None`, which [`delete_is_pending`]
-/// reads as not pending: the delete is then a failure, never a delete taken as done. A name with a NUL in
-/// it is refused, not cut.
-fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
-    let path = std::path::absolute(path).ok()?;
-    let mut units = wide_null(path.file_name()?).ok()?;
-    units.pop();
-    let bytes = u16::try_from(units.len() * size_of::<u16>()).ok()?;
-    let parent = match OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path.parent()?)
-    {
-        Ok(parent) => parent,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(STATUS_OBJECT_PATH_NOT_FOUND),
-        Err(_) => return None,
+/// Removes the directory `name` of `dir` with everything in it, each entry through a handle opened relative
+/// to its parent: a link in the tree, a mount point or a symlink, is deleted and never followed. A handle
+/// anyone holds on something in the tree without sharing delete fails the removal, with the sharing
+/// violation. One that is not there is already removed.
+pub(super) fn remove_tree(dir: &Dir, name: &OsStr) -> io::Result<()> {
+    let child = match dir.open_in(
+        name,
+        DELETE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        SHARE_ALL,
+        FILE_OPEN,
+        SYNCHRONOUS_IO,
+    ) {
+        Ok(file) => file,
+        Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => return Ok(()),
+        Err(status) => return Err(io_error(status)),
     };
-    let name = UNICODE_STRING {
-        Length: bytes,
-        MaximumLength: bytes,
-        Buffer: units.as_mut_ptr(),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.as_raw_handle() as HANDLE,
-        ObjectName: &name,
-        Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: null(),
-        SecurityQualityOfService: null(),
-    };
-    let mut handle: HANDLE = null_mut();
-    let mut status_block = IO_STATUS_BLOCK::default();
-    // SAFETY: `attributes`, the name it points at and `parent`, the handle it is relative to, outlive the
-    // call; `handle` and `status_block` are valid out-pointers. A handle that is returned is closed below.
-    let status = unsafe {
-        NtOpenFile(
-            &mut handle,
-            DELETE | SYNCHRONIZE,
-            &attributes,
-            &mut status_block,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN_REPARSE_POINT,
-        )
-    };
-    if status >= 0 {
-        // SAFETY: `handle` was just opened and is not used again.
-        unsafe { NtClose(handle) };
+    let child = Dir::from_open(child, dir.path().join(name))?;
+    if !child.is_link() {
+        for entry in child.list()? {
+            if entry.directory {
+                remove_tree(&child, &entry.name)?;
+            } else {
+                match delete(&child, &entry.name) {
+                    DeleteOutcome::Deleted => {}
+                    DeleteOutcome::Held => return Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION as i32)),
+                    DeleteOutcome::Failed(e) => return Err(e),
+                }
+            }
+        }
     }
-    Some(status)
+    delete_by_disposition(child.file())
 }
 
 #[cfg(test)]

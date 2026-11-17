@@ -857,4 +857,4 @@ mod system {
 
 #[cfg(test)]
 #[path = "acl_tests.rs"]
-pub(in crate::backend::scm::shim) mod acl_tests;
+pub(in crate::backend::scm) mod acl_tests;

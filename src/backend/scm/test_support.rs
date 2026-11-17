@@ -85,16 +85,30 @@ pub(crate) fn registered_task(
     }
 }
 
+/// Makes `descriptor`'s DACL, protected, the DACL of the existing file or folder `path`, not following a
+/// link at it: a fixture's permissions.
+#[cfg(windows)]
+pub(crate) fn set_dacl(descriptor: &crate::backend::scm::shim::acl::Descriptor, path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+    };
+
+    let object = std::fs::OpenOptions::new()
+        .access_mode(WRITE_DAC | READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    descriptor.set_dacl_of(&object)
+}
+
 /// Makes a directory with a file in it at `path`. Where a file is expected, deleting it as a file fails
 /// for a reason that is no handle and no pending delete, whoever runs it. The tempdir the tests make it
 /// in removes it. A task's records directory names its account without the right to add a subdirectory,
 /// so the directory `path` is in is opened to everyone first.
 #[cfg(windows)]
 pub(crate) fn directory_with_a_file(path: &std::path::Path) {
-    crate::backend::scm::shim::acl::Descriptor::from_sddl("D:P(A;;FA;;;WD)")
-        .unwrap()
-        .set_dacl(path.parent().expect("a path in a directory"))
-        .unwrap();
+    let everyone = crate::backend::scm::shim::acl::Descriptor::from_sddl("D:P(A;;FA;;;WD)").unwrap();
+    set_dacl(&everyone, path.parent().expect("a path in a directory")).unwrap();
     std::fs::create_dir(path).unwrap();
     std::fs::write(path.join("inside"), "").unwrap();
 }

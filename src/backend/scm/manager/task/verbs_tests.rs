@@ -294,17 +294,16 @@ impl<'a> Denied<'a> {
     fn new(path: &'a std::path::Path) -> Self {
         let me = try_sid_display(&process_user_sid()).unwrap();
         // READ_CONTROL, WRITE_DAC and SYNCHRONIZE (which `CreateFile` adds to every open).
-        Descriptor::from_sddl(&format!("D:P(A;;FA;;;SY)(A;;0x160000;;;{me})"))
-            .unwrap()
-            .set_dacl(path)
-            .unwrap();
+        let denied = Descriptor::from_sddl(&format!("D:P(A;;FA;;;SY)(A;;0x160000;;;{me})")).unwrap();
+        crate::backend::scm::test_support::set_dacl(&denied, path).unwrap();
         Denied(path)
     }
 }
 
 impl Drop for Denied<'_> {
     fn drop(&mut self) {
-        let restored = Descriptor::for_runs(&process_user_sid()).map(|wanted| wanted.set_dacl(self.0));
+        let restored = Descriptor::for_runs(&process_user_sid())
+            .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
         if !matches!(restored, Ok(Ok(()))) {
             eprintln!(
                 "warning: could not restore the permissions of {}: {restored:?}",
@@ -367,7 +366,7 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
     let mut held = Some(runs.pin().unwrap());
     let mut during = None;
 
-    runs.remove_all(|_| {
+    runs.remove_all(|_, _| {
         during.get_or_insert_with(|| stopped(&fake, &mut machine, &runs, Budget::Unbounded));
         drop(held.take());
     })

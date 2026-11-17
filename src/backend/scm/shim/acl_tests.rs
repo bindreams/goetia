@@ -464,7 +464,7 @@ fn the_nearest_object_to_the_target_is_reported_first() {
 }
 
 #[cfg(windows)]
-pub(in crate::backend::scm::shim) mod windows {
+pub(in crate::backend::scm) mod windows {
     use super::system::{
         ObjectId, copy_sid, display_path, identity_of, is_unreadable, kernel_object_dacl, kernel_object_owner, parse,
         read_chain, resolve_target,
@@ -598,7 +598,7 @@ pub(in crate::backend::scm::shim) mod windows {
     }
 
     /// A junction (no privilege needed, unlike a symlink) at `link` to the existing `target`.
-    pub(in crate::backend::scm::shim) fn junction(link: &Path, target: &Path) {
+    pub(in crate::backend::scm) fn junction(link: &Path, target: &Path) {
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(link)
