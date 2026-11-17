@@ -239,7 +239,7 @@ fn a_fifth_weekday_matches_the_schedulers_run_times(#[fixture(scm_group)] _group
 fn a_refused_schedule_writes_nothing(#[fixture(scm_group)] _group: &Group) {
     let mgr = support::stock_shim_manager();
     for text in [
-        "0-29,31-35,37,40 0,1,3,7,9,10 * * *",
+        "1,2,4,8,16 * * * *",
         "0 0 */2 * 1",
         "0 0 1 * 1",
         "30 3 1,15 * 1-5",
