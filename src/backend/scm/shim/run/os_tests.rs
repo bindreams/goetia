@@ -383,9 +383,7 @@ fn append_refuses_a_default_log_that_is_a_link(#[fixture(temp_dir)] dir: &Path) 
     std::fs::write(&log, "").expect("the file an install made");
     crate::backend::scm::test_support::set_reparse_point(&log, 0xA000_0001, b"x");
 
-    let refused = Real
-        .append(&log, "the line", LogKind::Default)
-        .expect_err("a link");
+    let refused = Real.append(&log, "the line", LogKind::Default).expect_err("a link");
 
     assert!(refused.to_string().contains(&log.display().to_string()), "{refused}");
 }

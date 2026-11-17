@@ -1090,7 +1090,8 @@ Log.
 reading `<id>.log` needs an elevated shell. `goetia daemon install` makes the
 file, and the account the daemon runs as may only append to it; the shim never
 makes it, so a file that is missing is a failed write, and the Event Log still
-has the line. `goetia daemon uninstall` keeps the file.
+has the line; `goetia daemon install` makes it again, even when the daemon is
+otherwise up to date. `goetia daemon uninstall` keeps the file.
 
 Goetia before this change left `%ProgramData%\Goetia\logs` readable by every
 user, and `goetia daemon install` refuses a folder it did not make this way. To

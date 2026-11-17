@@ -114,7 +114,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, which};
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_default_log, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
@@ -135,6 +135,7 @@ use crate::backend::scm::shim::provider::{ShimProvider, require_absolute};
 use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
+use crate::backend::scm::sid::Sid;
 use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
 use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
@@ -430,8 +431,7 @@ impl Scm {
         definition: &ScmRegistration,
         snapshot: Option<&ScmSnapshot>,
     ) -> Result<WriteOutcome> {
-        apply(definition, written_user(&spec.common().user), snapshot.is_none())?;
-        make_default_log(spec, definition)?;
+        apply(spec, definition, written_user(&spec.common().user), snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
@@ -726,6 +726,27 @@ impl Backend for Scm {
             (WindowsDefinition::Task(definition), Some(WindowsSnapshot::Service(old))) => {
                 self.retype_to_task(spec, definition, old, scope)
             }
+        }
+    }
+
+    /// The default log of a daemon that runs the shim host, which the shim only opens: where an install
+    /// finds the daemon up to date and its log gone (deleted, or its folder was), this makes it again,
+    /// which is what the shim's own message for a link or a missing log says to do. The account is the
+    /// one the definition registers, which is the one installed.
+    fn ensure_beside(
+        &self,
+        spec: &DaemonSpec,
+        definition: &WindowsDefinition,
+        snapshot: &WindowsSnapshot,
+    ) -> Result<()> {
+        match (definition, snapshot) {
+            (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
+                make_default_log(spec, definition, None)
+            }
+            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_default_log(installed),
+            // An install that changes a daemon's kind writes, and is not up to date.
+            (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
+            | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
         }
     }
 
@@ -1144,21 +1165,42 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// then `Parameters`, `Environment` and the failure actions. A precondition
 /// that fails fails the install before any service write, leaving no new
 /// service and an existing one unchanged, so the next `install` retries as a
-/// create or an update, as systemd and launchd do. `Parameters` follows
+/// create or an update, as systemd and launchd do. The daemon's default log
+/// ([`make_default_log`]) is not a precondition: an update makes it for the new account before the
+/// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
+/// service exists, since a virtual account's SID resolves only then, before any start. A failure of that
+/// leaves the new service, and the next `install` finds it up to date and makes the log
+/// ([`Backend::ensure_beside`]). `Parameters` follows
 /// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
 /// start type the service has, rather than resetting it; see `service_info`. `written` is what
 /// [`written_user`] says of the account's spec value.
-fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
-    let password = service_gate(reg, written)?;
-    apply_gated(reg, password, create)
+fn apply(spec: &DaemonSpec, reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
+    let gated = service_gate(reg, written)?;
+    if !create {
+        make_default_log(spec, reg, gated.checked.as_ref())?;
+    }
+    apply_gated(reg, gated.password, create)?;
+    if create {
+        make_default_log(spec, reg, gated.checked.as_ref())?;
+    }
+    Ok(())
+}
+
+/// What [`service_gate`] settled for a service.
+struct Gated {
+    /// What `CreateServiceW` and `ChangeServiceConfigW` log on with: a real user's password.
+    password: Option<String>,
+    /// The SID of the real user the gate checked and granted the logon right to, which the daemon's
+    /// default log names too. `None` for the accounts that need no check.
+    checked: Option<Sid>,
 }
 
 /// What a service of `reg` needs before it is written, which a change of a task into a service sees to
 /// before it removes the task: the account is a user and its right is granted, the password is read,
-/// and the event source is registered. Returns the password to register with. See [`apply`].
-fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Result<Option<String>> {
+/// and the event source is registered. See [`apply`].
+fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Result<Gated> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -1180,7 +1222,7 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
     // Win32 failure being the only way it would ever surface. "Needs no
     // password" must mean "is never given one", not merely "is not
     // required to have one".
-    let password = if generate::account_needs_password(reg.account.as_deref()) {
+    let (password, checked) = if generate::account_needs_password(reg.account.as_deref()) {
         let account = reg.account.as_deref().expect(
             "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
         );
@@ -1194,25 +1236,30 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
             kind: DaemonKind::Service,
         })?;
         identity::grant_logon_right(&user, identity::Right::Service)?;
-        Some(pw)
+        (Some(pw), Some(user.sid().clone()))
     } else {
-        None
+        (None, None)
     };
 
     // Here rather than in the shim: it writes under HKLM, and the shim may run as an unprivileged
     // account.
     registry::register_event_source()?;
-    Ok(password)
+    Ok(Gated { password, checked })
 }
 
 /// The default log of the service `reg` registers, for the account it runs as, made or set to name it:
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
-/// Call it once the service exists (a virtual account's SID resolves only then) and before it starts.
-fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration) -> Result<()> {
+/// `checked` is the SID the gate found for a real user, which the log names rather than looking the account
+/// up again. Call it once the service exists (a virtual account's SID resolves only then) and before it
+/// starts, or for the account an update is about to give a service that exists.
+fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&Sid>) -> Result<()> {
     if !generate::hosted(spec) {
         return Ok(());
     }
-    let account = identity::service_account_sid(reg.account.as_deref())?;
+    let account = match checked {
+        Some(sid) => sid.clone(),
+        None => identity::service_account_sid(reg.account.as_deref())?,
+    };
     default_log::ensure(&program_data()?, &spec.common().id, &account)
 }
 

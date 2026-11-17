@@ -23,6 +23,8 @@ use super::os::{Channels, LogKind, Real, Severity};
 use super::service::TABLE_NAME;
 use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{logs_folder, program_data};
+use crate::backend::scm::shim::acl::{display_path, lexical};
+use crate::backend::scm::shim::sweep::same_path;
 use crate::error::Result;
 
 /// The shim's failure log: composes the two channels for one service run. One shim serves one
@@ -89,10 +91,10 @@ impl Log {
     }
 
     /// Which kind of log `path`, the log of daemon `id`, is: the default log, which an install made, or the
-    /// user's own.
+    /// user's own. A `path` that names the default log by Windows's rules is the default log ([`names_same_file`]).
     pub(crate) fn kind_of(&self, id: &str, path: &Path) -> LogKind {
         match self.default_log_path(id) {
-            Some(default) if default == path => LogKind::Default,
+            Some(default) if names_same_file(&default, path) => LogKind::Default,
             Some(_) | None => LogKind::Own,
         }
     }
@@ -145,11 +147,21 @@ fn failure_line(id: &str, message: &str) -> String {
     format!("goetia-shim[{id}]: {message}")
 }
 
+/// Whether `a` and `b` name one file as Windows reads a path, without opening either: without regard to
+/// case, with `/` for `\`, `.` and `..` applied, and a `\?\` prefix dropped. Two names for one file by a link
+/// or an 8.3 name are not found so.
+fn names_same_file(a: &Path, b: &Path) -> bool {
+    let spelled = |path: &Path| lexical(&display_path(path));
+    same_path(&spelled(a), &spelled(b))
+}
+
 /// The files to try for a line, in order, with the kind of each: the daemon's log, then the default. When
-/// they are the same path, it is tried once, as the default.
+/// they are the same file ([`names_same_file`]), it is tried once, as the default.
 fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<(PathBuf, LogKind)> {
     match daemon_log {
-        Some(path) if path != default => vec![(path.to_path_buf(), LogKind::Own), (default, LogKind::Default)],
+        Some(path) if !names_same_file(path, &default) => {
+            vec![(path.to_path_buf(), LogKind::Own), (default, LogKind::Default)]
+        }
         Some(_) | None => vec![(default, LogKind::Default)],
     }
 }

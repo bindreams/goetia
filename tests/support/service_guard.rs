@@ -97,17 +97,18 @@ fn cleanup(id: &str) -> Vec<String> {
         problems.extend(remove_path_retrying(&super::task_records(id), true));
     }
 
-    // The default log an install made for the daemon, which an uninstall keeps.
-    problems.extend(remove_path_retrying(
-        &super::shim_default_log(&super::program_data(), id),
-        false,
-    ));
-
     // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST,
     // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE.
     problems.extend(cmd::run_cleanup("sc.exe", &[&["stop", id]], &[1060, 1062, 1072]));
     // 1072: `uninstall` may return while the record is only marked for deletion;
     // SCM drops it once its last handle closes. Nothing is left to delete.
     problems.extend(cmd::run_cleanup("sc.exe", &[&["delete", id]], &[1060, 1072]));
+
+    // The default log an install made for the daemon, which an uninstall keeps. Last: the service is
+    // stopped and deleted, so nothing holds it open or writes to it.
+    problems.extend(remove_path_retrying(
+        &super::shim_default_log(&super::program_data(), id),
+        false,
+    ));
     problems
 }

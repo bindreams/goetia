@@ -174,7 +174,14 @@ fn the_access_granted_on_a_default_log_is_append_and_nothing_that_rewrites_it() 
         DEFAULT_LOG_ACCESS,
         FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     );
-    for denied in [FILE_READ_DATA, FILE_WRITE_DATA, FILE_WRITE_ATTRIBUTES, DELETE, WRITE_DAC, WRITE_OWNER] {
+    for denied in [
+        FILE_READ_DATA,
+        FILE_WRITE_DATA,
+        FILE_WRITE_ATTRIBUTES,
+        DELETE,
+        WRITE_DAC,
+        WRITE_OWNER,
+    ] {
         assert_eq!(DEFAULT_LOG_ACCESS & denied, 0, "{denied:#x}");
     }
 }
@@ -215,7 +222,10 @@ fn the_install_and_the_shim_refuse_a_link_in_the_same_words() {
     fs::write(&log, "").unwrap();
     set_reparse_point(&log, A_LINK_TAG, b"x");
 
-    let install = ensure(dir.path(), &id(), &process_user_sid()).unwrap_err().report().to_string();
+    let install = ensure(dir.path(), &id(), &process_user_sid())
+        .unwrap_err()
+        .report()
+        .to_string();
     let shim = open_for_append(&log).unwrap_err().to_string();
 
     assert!(install.contains(&shim), "{install} / {shim}");
@@ -225,8 +235,11 @@ fn the_install_and_the_shim_refuse_a_link_in_the_same_words() {
 #[skuld::test]
 fn the_shim_appends_to_a_log_with_a_tag_that_is_no_link() {
     let (_dir, log) = program_data_with_logs();
-    fs::write(&log, "first
-").unwrap();
+    fs::write(
+        &log, "first
+",
+    )
+    .unwrap();
     set_reparse_point(&log, A_TAG, b"x");
 
     open_for_append(&log).expect("a tag that is no link is not refused");

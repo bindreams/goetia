@@ -312,8 +312,13 @@ impl Scm {
 /// when it cannot be told (no principal, or a name that names no account), which is not known to be
 /// the account being installed.
 fn stored_principal(registered: &Registered) -> Option<Sid> {
-    let (TaskAccount::Service(text) | TaskAccount::User(text)) = TaskXml::principal(&registered.xml).ok()?;
-    identity::sid_of_principal(&text).ok()
+    principal_sid(registered).ok()
+}
+
+/// [`stored_principal`], with the reason it cannot be told.
+fn principal_sid(registered: &Registered) -> Result<Sid> {
+    let (TaskAccount::Service(text) | TaskAccount::User(text)) = TaskXml::principal(&registered.xml)?;
+    identity::sid_of_principal(&text)
 }
 
 /// Everything a registration of `definition` needs, before any request: what the machine holds for the
@@ -336,6 +341,13 @@ fn task_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
     runs.ensure(&prepared.principal)
         .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
     default_log::ensure(runs.program_data(), id, &prepared.principal)
+}
+
+/// The default log of the task `installed`, for the account it is registered as: what an install that finds
+/// the task up to date makes again if it is gone, since the shim makes none.
+pub(in crate::backend::scm) fn task_default_log(installed: &TaskSnapshot) -> Result<()> {
+    let principal = principal_sid(installed.registered())?;
+    default_log::ensure(&program_data()?, installed.id(), &principal)
 }
 
 // Enable and disable ==================================================================================================
@@ -398,9 +410,9 @@ impl Scm {
             &runs,
             &mut System,
             || service_gate(definition, written),
-            |password| {
-                apply_gated(definition, password, true)?;
-                make_default_log(spec, definition)?;
+            |gated| {
+                apply_gated(definition, gated.password, true)?;
+                make_default_log(spec, definition, gated.checked.as_ref())?;
                 Ok(WriteOutcome::Done)
             },
         )?;

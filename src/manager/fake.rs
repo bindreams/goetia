@@ -189,6 +189,8 @@ struct Store {
     settles: usize,
     /// Times an install asked for the definition's standing.
     standings: usize,
+    /// Times an install that found the definition up to date saw to what stands beside it.
+    ensures: usize,
     calls: Vec<(&'static str, String)>,
     /// The id of every `read_for_install`, kept apart from `calls`: a read is no request to the manager.
     install_reads: Vec<String>,
@@ -671,6 +673,12 @@ impl Fake {
         state.settles
     }
 
+    /// How many times an install that found the definition up to date saw to what stands beside it.
+    pub fn ensures(&self) -> usize {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.ensures
+    }
+
     /// How many times an install asked whether the definition it wrote stands: a read-back a write
     /// that is known to have landed does not need.
     pub fn standings(&self) -> usize {
@@ -1014,6 +1022,11 @@ impl crate::backend::Backend for Fake {
             },
         );
         Ok(WriteOutcome::Done)
+    }
+
+    fn ensure_beside(&self, _spec: &DaemonSpec, _definition: &String, _snapshot: &Artifact) -> Result<()> {
+        self.state.lock().expect("Fake mutex poisoned").ensures += 1;
+        Ok(())
     }
 
     /// Counts the asks: the scope asks only after a write that made something.

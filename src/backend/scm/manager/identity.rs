@@ -29,10 +29,11 @@ use windows_sys::Win32::Security::{
 };
 
 use crate::backend::Identity;
-use crate::backend::scm::sid::{Sid, copy_sid, is_whole_sid, sid_display, sid_from_parts, system};
+use crate::backend::scm::sid::{Sid, copy_sid, is_whole_sid, sid_display};
+use crate::backend::scm::task_xml::builtin_sid;
 use crate::backend::scm::wide::wide_null;
 use crate::error::{BoxError, Error, Result};
-use crate::spec::{AccountId, Builtin, User, windows_builtin};
+use crate::spec::{AccountId, User, windows_builtin};
 
 // resolve =============================================================================================================
 
@@ -178,15 +179,11 @@ pub(in crate::backend::scm) fn sid_of_principal(principal: &str) -> Result<Sid> 
 /// runs as: `None` is LocalSystem and a recognised built-in is its well-known SID, neither of which
 /// `LookupAccountNameW` resolves by the spelling goetia registers; any other account is looked up. A
 /// virtual account (`NT SERVICE\<id>`) resolves only once the service exists, so call this after it is
-/// created.
+/// created. A real user's SID is the one [`require_user_account`] found, which the caller keeps.
 pub(in crate::backend::scm) fn service_account_sid(account: Option<&str>) -> Result<Sid> {
-    let Some(account) = account else {
-        return Ok(system());
-    };
+    let account = account.unwrap_or_default();
     match windows_builtin(account) {
-        Some(Builtin::LocalSystem) => Ok(system()),
-        Some(Builtin::LocalService) => Ok(sid_from_parts(5, &[19])),
-        Some(Builtin::NetworkService) => Ok(sid_from_parts(5, &[20])),
+        Some(builtin) => sid_from_string(builtin_sid(builtin), None),
         None => sid_for_account_name(account, None).map(|(sid, _kind)| sid),
     }
 }

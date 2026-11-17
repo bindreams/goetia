@@ -40,7 +40,9 @@ mod system {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::path::{Path, PathBuf};
 
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
@@ -49,8 +51,9 @@ mod system {
         PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, WRITE_DAC,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_ALWAYS, SYNCHRONIZE, WRITE_DAC,
     };
 
     use super::super::{ObjectSecurity, system::describe};
@@ -80,10 +83,10 @@ mod system {
     /// needs it enabled in the creator's token, like [`LOCK`].
     const LOGS: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
-    /// What the shim's default log is opened for, and all an account is granted on it: append data
-    /// (`0x4`), read attributes (`0x80`) and synchronize (`0x100000`). `std`'s own append open asks
-    /// for write attributes as well, which this denies.
-    pub(crate) const DEFAULT_LOG_ACCESS: u32 = 0x10_0084;
+    /// What the shim's default log is opened for, and all an account is granted on it: append data, read
+    /// attributes and synchronize. `std`'s own append open asks for write attributes as well, which this
+    /// denies.
+    pub(crate) const DEFAULT_LOG_ACCESS: u32 = FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
     /// A security descriptor that a file or folder is created with.
     pub(crate) struct Descriptor {
@@ -153,10 +156,11 @@ mod system {
         }
 
         /// Opens the file `path` for `WRITE_DAC` and attribute reads without following a link at it, making
-        /// it empty with this descriptor when it is not there (`OPEN_ALWAYS`). What is there is not changed;
+        /// it empty with this descriptor when it is not there (`OPEN_ALWAYS`); the flag says it was made,
+        /// and so has the descriptor's permissions already. What is there is not changed:
         /// [`Descriptor::set_dacl_of`] on the handle sets its permissions. The file is shared for everything,
         /// so a shim that holds it open does not stop this.
-        pub(crate) fn open_always_for_dacl(&self, path: &Path) -> io::Result<File> {
+        pub(crate) fn open_always_for_dacl(&self, path: &Path) -> io::Result<(File, bool)> {
             let wide = wide_null(path)?;
             let attributes = self.attributes();
             // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live for the
@@ -175,8 +179,10 @@ mod system {
             if handle == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
+            // `OPEN_ALWAYS` succeeds with `ERROR_ALREADY_EXISTS` as the last error when the file was there.
+            let made = io::Error::last_os_error().raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32);
             // SAFETY: `handle` is a valid file handle that nothing else owns.
-            Ok(unsafe { File::from_raw_handle(handle) })
+            Ok((unsafe { File::from_raw_handle(handle) }, made))
         }
 
         /// A descriptor written as SDDL.

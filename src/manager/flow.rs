@@ -219,6 +219,9 @@ pub(crate) fn install<B: Backend>(
             // The desired definition stands here, so what an earlier write made for it is kept.
             Outcome::UpToDate => {
                 scope.settle(|| Standing::Yes);
+                if let Some(snapshot) = found.snapshot.as_ref() {
+                    b.ensure_beside(spec, &desired, snapshot)?;
+                }
                 return Ok(outcome);
             }
             Outcome::Conflict { .. }

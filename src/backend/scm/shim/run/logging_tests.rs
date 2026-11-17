@@ -146,7 +146,12 @@ fn a_path_that_names_the_default_log_in_other_case_or_spelling_is_the_default() 
     let fake = FakeGuard::new();
     let log = log_over(&fake);
 
-    for spelled in [r"LOGS\SVC.LOG", "logs/svc.log", r"logs\.\svc.log", r"logs\other\..\Svc.Log"] {
+    for spelled in [
+        r"LOGS\SVC.LOG",
+        "logs/svc.log",
+        r"logs\.\svc.log",
+        r"logs\other\..\Svc.Log",
+    ] {
         assert_eq!(log.kind_of("svc", Path::new(spelled)), LogKind::Default, "{spelled}");
     }
     assert_eq!(log.kind_of("svc", Path::new(r"logs\svc.log.txt")), LogKind::Own);

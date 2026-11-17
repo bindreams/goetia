@@ -45,7 +45,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use crate::backend::scm::link::reparse_tag;
+use crate::backend::scm::link::is_link;
 use crate::backend::scm::wide::wide_null;
 
 /// What every handle in a records directory shares: all of it. A holder that shared less would make
@@ -65,12 +65,6 @@ pub(super) const SYNCHRONOUS_IO: u32 = FILE_SYNCHRONOUS_IO_NONALERT;
 /// Whether `name` is a bare name and no path, which is all a handle on a directory opens or renames to.
 pub(super) fn is_bare(name: &OsStr) -> bool {
     name.encode_wide().all(|unit| unit != u16::from(b'\\'))
-}
-
-/// `IsReparseTagNameSurrogate`: whether a reparse `tag` says the file is another name for something else
-/// (a mount point, a symlink), which is bit 29. Any other tag is data on the file itself.
-pub(super) const fn is_name_surrogate(tag: u32) -> bool {
-    tag & 0x2000_0000 != 0
 }
 
 /// One entry of a directory's listing.
@@ -117,10 +111,10 @@ impl Dir {
     }
 
     /// `file`, which was opened without following a link, as the directory at `path`. It is a link when it
-    /// has a reparse point whose tag is a name surrogate ([`is_name_surrogate`]); a directory with any
-    /// other tag is data goetia has no reason to refuse.
+    /// has a reparse point whose tag is a name surrogate ([`is_link`]); a directory with any other tag is
+    /// data goetia has no reason to refuse.
     pub(super) fn from_open(file: File, path: PathBuf) -> io::Result<Dir> {
-        let link = reparse_tag(&file)?.is_some_and(is_name_surrogate);
+        let link = is_link(&file)?;
         Ok(Dir { file, path, link })
     }
 
