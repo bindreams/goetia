@@ -1,13 +1,23 @@
 //! Compiles a cron schedule into Task Scheduler triggers, or refuses it.
 //!
-//! The triggers fire at the minutes the schedule names, in local civil time, by Task Scheduler's rule for
-//! a time that does not exist. A repetition's ticks are civil too: across a change of clocks
-//! `GetRunTimes` lists the same grid each day, listing an hour that repeats once and the ticks of an hour
-//! a change skips an hour earlier, so those minutes are listed twice (the knowledge base's "GetRunTimes
-//! lists a repetition across a DST change in local civil time ..."). What fires is measured too: a
-//! repetition runs on both the civil grid and elapsed time, so some minutes run twice; a lone daily
-//! trigger in a skipped hour does not run that day, and one in a repeated hour runs at both passes (the
-//! knowledge base's "A repetition across a DST change runs twice a minute for part of its span ...").
+//! The triggers fire at the minutes the schedule names, in local civil time, by Task Scheduler's rule
+//! for a time that does not exist. No repetition crosses a local hour boundary (see "The time of day").
+//!
+//! # Clock changes
+//!
+//! Measured on Windows Server 2025 with the change on an hour boundary (the knowledge base's
+//! "A repetition across a DST change runs twice a minute for part of its span ..." and "Task Scheduler
+//! runs a repetition that stays inside one hour across a DST change ..."):
+//!
+//! - A repetition that spans the change runs on both the civil grid and elapsed time, so some minutes
+//!   run twice, and under `IgnoreNew` a doubled run is dropped only while the first is still going.
+//!   That is why none spans an hour boundary, where a change is; a change off the hour was not measured.
+//! - A repetition inside one hour, or a lone trigger, has `IgnoreNew` run exactly what `Parallel` runs.
+//!   An hour a change skips runs nothing that day. An hour it repeats runs in both passes.
+//! - Except a trigger due at the instant of the change: a repetition starting on the hour that ends
+//!   the skipped hour, or the second pass of a repeated hour, does not run at all (every tick) in that
+//!   pass. A repetition at `:05` or a lone trigger at `:30` of the same hours ran. A lone trigger at
+//!   `:00` was not measured.
 //!
 //! A trigger names days (every day, weekdays, days of the month, in some months or all), a start time
 //! and optionally a repetition that restarts at its start each day. What the shapes rest on was
@@ -29,20 +39,18 @@
 //!
 //! # The time of day
 //!
-//! Cron's minute grid restarts each hour and Task Scheduler's each day, so minutes are one
-//! repetition across hours only when they are a whole residue class of 60 (`*/15`, `0,30`, `*`).
-//! The minutes are split into such classes, then (greedily, longest first) into other
-//! progressions, then single minutes. The hours of each group are covered by the fewest triggers
-//! (found exactly), each one of:
+//! The minutes are split into progressions, longest first (a class like `*/15` is one), then single
+//! minutes. Each group costs one trigger per hour the schedule names, none of which crosses an hour
+//! boundary:
 //!
-//! - a class over a run of consecutive hours, repeating through them;
-//! - another progression within one hour, repeating through it;
-//! - one minute of the group over evenly spaced hours, repeating through them.
+//! - a progression is one repetition from its first minute to its last, inside the hour;
+//! - a lone minute is one trigger without a repetition.
 //!
-//! A repetition ends inside its day, so it never runs into a day the trigger does not name.
-//! `*/7 * * * *` is not one repetition: it costs a trigger per minute it names.
+//! So `*/15 * * * *` is 24 triggers, `5,10 * * * *` and `5,10,15 * * * *` too, and `0 9-17 * * *` is
+//! nine lone triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused. A repetition ends
+//! inside its day, so it never runs into a day the trigger does not name.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::backend::refuse_day_fields_and;
@@ -268,71 +276,33 @@ enum Shape {
     Single,
     /// The minutes have this step.
     Progression(u8),
-    /// Every minute of the hour with this step (a divisor of 60 below 60): the grid carries on
-    /// across hours.
-    Class(u8),
 }
 
-/// The steps of a minute class, the divisors of 60 below 60, smallest (largest class) first.
-const CLASS_STEPS: [u8; 11] = [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30];
-
+/// A trigger per hour of `hours` for each group: a repetition inside the hour for a progression, a lone
+/// trigger for a minute.
 fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     let mut times = Vec::new();
     for group in groups(minutes) {
         let (first, last) = (group.minutes[0], group.minutes[group.minutes.len() - 1]);
-        for span in spans(hours, &group) {
-            match span {
-                Span::Run { first: from, last: to } => {
-                    let (Shape::Progression(step) | Shape::Class(step)) = group.shape else {
-                        unreachable!("a lone minute is never covered by a run of hours");
-                    };
-                    times.push(Time {
-                        at: (from, first),
-                        repeat: Some(Repeat {
-                            every_minutes: u32::from(step),
-                            for_minutes: u32::from(to - from) * 60 + u32::from(last - first),
-                        }),
-                    });
-                }
-                Span::Hours {
-                    first: from,
-                    step,
-                    last: to,
-                } => {
-                    for &minute in &group.minutes {
-                        times.push(Time {
-                            at: (from, minute),
-                            repeat: (to > from).then(|| Repeat {
-                                every_minutes: u32::from(step) * 60,
-                                for_minutes: u32::from(to - from) * 60,
-                            }),
-                        });
-                    }
-                }
-            }
-        }
+        let repeat = match group.shape {
+            Shape::Single => None,
+            Shape::Progression(step) => Some(Repeat {
+                every_minutes: u32::from(step),
+                for_minutes: u32::from(last - first),
+            }),
+        };
+        times.extend(hours.iter().map(|&hour| Time {
+            at: (hour, first),
+            repeat,
+        }));
     }
     times
 }
 
-/// `minutes` split into classes, then progressions, then single minutes.
+/// `minutes` split into progressions, longest first, then single minutes.
 fn groups(minutes: &BTreeSet<u8>) -> Vec<Group> {
     let mut left = minutes.clone();
     let mut groups = Vec::new();
-    for step in CLASS_STEPS {
-        for first in 0..step {
-            let class: Vec<u8> = (first..60).step_by(usize::from(step)).collect();
-            if class.iter().all(|minute| left.contains(minute)) {
-                for minute in &class {
-                    left.remove(minute);
-                }
-                groups.push(Group {
-                    minutes: class,
-                    shape: Shape::Class(step),
-                });
-            }
-        }
-    }
     while let Some(&first) = left.first() {
         let mut longest = vec![first];
         for step in 1..=59 - first {
@@ -361,96 +331,6 @@ fn groups(minutes: &BTreeSet<u8>) -> Vec<Group> {
         });
     }
     groups
-}
-
-/// How one group's hours are covered.
-#[derive(Debug, Clone, Copy)]
-enum Span {
-    /// Hours `first` to `last` in a row, all the group's minutes in one trigger.
-    Run { first: u8, last: u8 },
-    /// Every `step` hours from `first` to `last`, a trigger for each minute of the group.
-    Hours { first: u8, step: u8, last: u8 },
-}
-
-/// The spans that cover `hours` for `group` with the fewest triggers.
-fn spans(hours: &BTreeSet<u8>, group: &Group) -> Vec<Span> {
-    let all = hours.iter().fold(0u32, |mask, &hour| mask | 1 << hour);
-    let mut memo = HashMap::new();
-    cheapest(all, group, &mut memo);
-    let mut spans = Vec::new();
-    let mut rest = all;
-    while rest != 0 {
-        let (_, span, taken) = memo[&rest];
-        spans.push(span);
-        rest &= !taken;
-    }
-    spans
-}
-
-/// The fewest triggers that cover the hours of `mask`, the best first span of each remaining set
-/// kept in `memo` (the cost, the span, the hours it takes).
-fn cheapest(mask: u32, group: &Group, memo: &mut HashMap<u32, (usize, Span, u32)>) -> usize {
-    if mask == 0 {
-        return 0;
-    }
-    if let Some(&(cost, ..)) = memo.get(&mask) {
-        return cost;
-    }
-    let mut best: Option<(usize, Span, u32)> = None;
-    for (span, taken, cost) in options(mask, group) {
-        let total = cost + cheapest(mask & !taken, group, memo);
-        if best.is_none_or(|(least, ..)| total < least) {
-            best = Some((total, span, taken));
-        }
-    }
-    let best = best.expect("an hour is always a span of its own");
-    memo.insert(mask, best);
-    best.0
-}
-
-/// The spans that start at the first hour of `mask`: each with the hours it takes and its triggers.
-fn options(mask: u32, group: &Group) -> Vec<(Span, u32, usize)> {
-    let first = u8::try_from(mask.trailing_zeros()).expect("an hour mask has 24 bits");
-    let has = |hour: u8| hour < 24 && mask & 1 << hour != 0;
-    let minutes = group.minutes.len();
-    let mut options = Vec::new();
-    match group.shape {
-        Shape::Single => options.push((
-            Span::Hours {
-                first,
-                step: 1,
-                last: first,
-            },
-            1 << first,
-            1,
-        )),
-        Shape::Progression(_) => options.push((Span::Run { first, last: first }, 1 << first, 1)),
-        Shape::Class(_) => {
-            let mut taken = 0;
-            for last in first..24 {
-                if !has(last) {
-                    break;
-                }
-                taken |= 1 << last;
-                options.push((Span::Run { first, last }, taken, 1));
-            }
-        }
-    }
-    for step in 1..24 {
-        let mut taken = 1 << first;
-        let mut last = first;
-        let mut hours = 1;
-        while has(last + step) {
-            last += step;
-            hours += 1;
-            taken |= 1 << last;
-            // A trigger per minute for fewer hours than minutes is never fewer than a trigger per hour.
-            if minutes == 1 || hours > minutes {
-                options.push((Span::Hours { first, step, last }, taken, minutes));
-            }
-        }
-    }
-    options
 }
 
 #[cfg(test)]
