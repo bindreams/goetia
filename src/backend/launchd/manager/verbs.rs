@@ -17,9 +17,7 @@ use super::task::TaskPrint;
 use super::watch::{Added, Watch};
 use super::{Launchd, Plist, UNLOAD_POLL, Until, never_expires};
 use crate::backend::bounded::{Reservation, Role};
-use crate::backend::kill::{
-    Hold, KillOutcome, KillTarget, Signal, Waited, hold_pid, kill_failed, kill_service,
-};
+use crate::backend::kill::{Hold, KillOutcome, KillTarget, Signal, Waited, hold_pid, kill_failed, kill_service};
 use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
