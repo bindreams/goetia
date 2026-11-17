@@ -465,16 +465,14 @@ impl Runs {
     /// What the directory holds, in no order. One listing, over the names as the file system gives them:
     /// a name that is not Unicode is classified by its ending all the same (the replacement character
     /// that stands for what is not Unicode is no part of `.pin` or `.json.tmp`), so a pin the task's
-    /// account made with such a name is a pin.
+    /// account made with such a name is a pin. A name decides, a directory with a goetia name too: its
+    /// delete fails and is told, where a skipped one would be kept for ever.
     fn entries(&self) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                entries.push(Entry::Other { path, dir: true });
-                continue;
-            }
+            let dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
             let name = entry.file_name().to_string_lossy().into_owned();
             entries.push(if name.ends_with(TEMP) {
                 Entry::Temp(path)
@@ -487,7 +485,7 @@ impl Runs {
             {
                 Entry::Record(instance, path)
             } else {
-                Entry::Other { path, dir: false }
+                Entry::Other { path, dir }
             });
         }
         Ok(entries)

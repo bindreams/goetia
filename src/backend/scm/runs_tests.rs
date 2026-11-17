@@ -14,7 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::*;
 use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
-use crate::backend::scm::test_support::{delete_denied, delete_pending};
+use crate::backend::scm::test_support::{delete_pending, directory_with_a_file};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -216,14 +216,13 @@ fn a_listing_that_fails_is_a_problem_of_the_prune() {
     assert!(problems[0].contains("listing denied"), "{problems:?}");
 }
 
-/// A removal that fails (a permission, not a handle) is told, and the prune goes on to the rest.
+/// A removal that fails (not a handle, not a pending delete) is told, and the prune goes on to the rest.
 #[skuld::test]
 fn a_removal_that_fails_is_a_problem_and_the_rest_are_removed() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let stuck = runs.dir.join(file_of(&instance(2)));
-    fs::write(&stuck, "").unwrap();
-    let _denied = delete_denied(&stuck);
+    directory_with_a_file(&stuck);
     let doomed = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
     fs::write(&doomed, "").unwrap();
 
@@ -338,8 +337,7 @@ fn a_pin_that_cannot_be_deleted_is_a_problem_and_is_taken_as_not_held() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let odd = runs.dir.join("pin-odd.pin");
-    fs::write(&odd, "").unwrap();
-    let _denied = delete_denied(&odd);
+    directory_with_a_file(&odd);
 
     let problems = runs.write(&record(2, 2)).unwrap();
 
@@ -521,24 +519,23 @@ fn remove_all_does_not_wait_for_a_stale_pin_it_has_no_entry_on() {
     assert!(!runs.dir.exists());
 }
 
-/// A pin whose state cannot be told (its permissions refuse the delete) may be held, and none can be taken
-/// now: the removal returns the failure, naming the pin, before it deletes anything, and does not wait
-/// for a handle that may never go. Once the pin can be told about, the same call finishes.
+/// A pin whose state cannot be told (its delete fails, and not for a handle) may be held, and none can be
+/// taken now: the removal returns the failure, naming the pin, before it deletes anything, and does not
+/// wait for a handle that may never go. Once the pin can be told about, the same call finishes.
 #[skuld::test]
 fn remove_all_with_a_pin_it_cannot_tell_about_deletes_nothing_and_names_it() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     fs::write(runs.dir.join("other.txt"), "").unwrap();
     let odd = runs.dir.join("pin-odd.pin");
-    fs::write(&odd, "").unwrap();
-    let denied = delete_denied(&odd);
+    directory_with_a_file(&odd);
     let before = names(&runs);
 
     let failed = runs.remove_all(no_note).unwrap_err();
 
     assert!(failed.to_string().contains("pin-odd.pin"), "{failed}");
     assert_eq!(names(&runs), before, "nothing was deleted");
-    drop(denied);
+    fs::remove_dir_all(&odd).unwrap();
     runs.remove_all(no_note).unwrap();
     assert!(!runs.dir.exists());
 }
@@ -773,6 +770,20 @@ fn remove_all_is_not_blocked_by_a_marker_a_cut_short_removal_left() {
     assert!(!runs.dir.exists());
 }
 
+/// What is not goetia's is removed too: a file of another name, and a directory with files in it.
+#[skuld::test]
+fn remove_all_removes_files_and_directories_of_names_that_are_not_goetias() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    fs::write(runs.dir.join("notes.txt"), "").unwrap();
+    // A directory in it: made as an account that may add one.
+    crate::backend::scm::test_support::directory_with_a_file(&runs.dir.join("sub"));
+
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.dir.exists());
+}
+
 /// A file another program holds is waited for, as a pin is, whoever the holder is: the removal says what
 /// it waits for, naming the file, and finishes when the handle goes.
 #[skuld::test]
@@ -804,8 +815,7 @@ fn remove_all_waits_for_a_file_another_program_holds_and_names_it() {
 #[skuld::test]
 fn a_failed_removal_leaves_its_marker_beside_the_directory() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
-    let _denied = delete_denied(&runs.dir.join(file_of(&instance(1))));
+    directory_with_a_file(&runs.dir.join(file_of(&instance(1))));
 
     let failed = runs.remove_all(no_note).unwrap_err();
 

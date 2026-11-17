@@ -1,13 +1,12 @@
 //! The pin's open modes, over files in a temporary directory.
 
 use std::fs::{self, OpenOptions};
-use std::io;
 use std::os::windows::fs::OpenOptionsExt as _;
 
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
 
 use super::*;
-use crate::backend::scm::test_support::{delete_denied, delete_pending};
+use crate::backend::scm::test_support::{delete_pending, directory_with_a_file};
 
 #[skuld::test]
 fn a_pin_with_a_handle_open_is_held() {
@@ -56,8 +55,9 @@ fn a_pin_nothing_holds_is_stale_and_goes_and_one_that_is_gone_is_not_held() {
 /// Measured: a file whose delete is pending answers a delete with access denied, as a permission that
 /// refuses it does (the Win32 error is 5 for both); only the status under it, `STATUS_DELETE_PENDING`,
 /// tells them apart. It is deleted as far as anything can do it: it goes when the last handle closes.
+/// A delete that fails for any other reason is a failure.
 #[skuld::test]
-fn a_file_whose_delete_is_pending_is_deleted_and_a_permission_that_refuses_is_a_failure() {
+fn a_file_whose_delete_is_pending_is_deleted_and_any_other_failure_is_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pin-a.pin");
     let reader = delete_pending(&path);
@@ -71,13 +71,12 @@ fn a_file_whose_delete_is_pending_is_deleted_and_a_permission_that_refuses_is_a_
     assert!(!path.exists());
 
     let refused = dir.path().join("pin-b.pin");
-    fs::write(&refused, "").unwrap();
-    let _denied = delete_denied(&refused);
-    let DeleteOutcome::Failed(failed) = delete(&refused) else {
-        panic!("a delete a permission refuses is a failure");
-    };
-    assert_eq!(failed.kind(), io::ErrorKind::PermissionDenied, "{failed:?}");
-    assert_eq!(is_held(&refused).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    directory_with_a_file(&refused);
+    assert!(
+        matches!(delete(&refused), DeleteOutcome::Failed(_)),
+        "a delete that fails for no handle and no pending delete is a failure"
+    );
+    assert!(is_held(&refused).is_err());
 }
 
 #[skuld::test]

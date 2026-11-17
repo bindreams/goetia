@@ -85,42 +85,18 @@ pub(crate) fn registered_task(
     }
 }
 
-/// Keeps the file `path` from being deleted by anyone, by permissions, until it is dropped (which gives
-/// the file and its directory open permissions back, so that they can be removed). The file refuses the
-/// delete right and its directory the right to delete a child, since either one allows a delete. A
-/// delete of it fails with access denied, as a pending delete does, but for a reason that is not one.
+/// Makes a directory with a file in it at `path`. Where a file is expected, deleting it as a file fails
+/// for a reason that is no handle and no pending delete, whoever runs it. The tempdir the tests make it
+/// in removes it. A task's records directory names its account without the right to add a subdirectory,
+/// so the directory `path` is in is opened to everyone first.
 #[cfg(windows)]
-#[must_use]
-pub(crate) struct DeleteDenied(std::path::PathBuf);
-
-#[cfg(windows)]
-pub(crate) fn delete_denied(path: &std::path::Path) -> DeleteDenied {
-    use crate::backend::scm::shim::acl::Descriptor;
-
-    let directory = path.parent().expect("a file is in a directory");
-    Descriptor::from_sddl("D:P(D;;SD;;;WD)(A;;FA;;;WD)")
+pub(crate) fn directory_with_a_file(path: &std::path::Path) {
+    crate::backend::scm::shim::acl::Descriptor::from_sddl("D:P(A;;FA;;;WD)")
         .unwrap()
-        .set_dacl(path)
+        .set_dacl(path.parent().expect("a path in a directory"))
         .unwrap();
-    Descriptor::from_sddl("D:P(D;;0x40;;;WD)(A;;FA;;;WD)")
-        .unwrap()
-        .set_dacl(directory)
-        .unwrap();
-    DeleteDenied(path.to_path_buf())
-}
-
-#[cfg(windows)]
-impl Drop for DeleteDenied {
-    fn drop(&mut self) {
-        use crate::backend::scm::shim::acl::Descriptor;
-
-        if let Ok(open) = Descriptor::from_sddl("D:P(A;;FA;;;WD)") {
-            let _ = open.set_dacl(&self.0);
-            if let Some(directory) = self.0.parent() {
-                let _ = open.set_dacl(directory);
-            }
-        }
-    }
+    std::fs::create_dir(path).unwrap();
+    std::fs::write(path.join("inside"), "").unwrap();
 }
 
 /// A file at `path` whose delete is pending: its holder closed it while the returned handle was open on
