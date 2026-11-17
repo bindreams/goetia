@@ -8,7 +8,7 @@ use super::ExitCode;
 use super::support::{WordedVerbCall, run_worded_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::Result;
-use crate::manager::ServiceManager;
+use crate::manager::{Budget, ServiceManager};
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -32,11 +32,15 @@ pub fn run(
             ids: &args.ids,
             get_manager,
             is_elevated,
-            // The wait is each daemon's own, so the word follows it.
+            // With no flag the wait is each daemon's own, which always waits, so the word follows the flag.
             verb: &|mgr, id| {
-                let budget = args.wait.stop_budget(|| mgr.stop_action(id));
-                mgr.stop(id, budget)?;
-                Ok(wait::reported(budget, "stopped", "stop requested"))
+                let given = args.wait.given();
+                mgr.stop(id, given)?;
+                Ok(wait::reported(
+                    given.unwrap_or(Budget::DEFAULT),
+                    "stopped",
+                    "stop requested",
+                ))
             },
             absent_is_success: false,
         },

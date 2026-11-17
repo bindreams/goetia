@@ -287,7 +287,7 @@ fn stop_ends_a_run_and_run_reports_the_stopped_code(#[fixture(scm_group)] _group
         let ends_the_run = EndsTheRunOnPanic::new(id);
         listener.accept("the task's program to start");
 
-        mgr.stop(id, Budget::DEFAULT).expect("stop");
+        mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
         ends_the_run.defuse();
 
         let exit = run.join().expect("the run thread").expect("run");
@@ -340,7 +340,7 @@ fn run_refuses_a_run_in_flight(#[fixture(scm_group)] _group: &Group) {
     assert!(matches!(refused, Error::AlreadyRunning { .. }), "{refused:?}");
     assert_eq!(task_status(&mgr, id).common.state, State::Running);
 
-    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
     assert_eq!(task_status(&mgr, id).common.state, State::Idle);
     mgr.uninstall(id).expect("uninstall");
 }
@@ -362,7 +362,7 @@ fn start_returns_before_the_run_ends(#[fixture(scm_group)] _group: &Group) {
     let status = task_status(&mgr, id);
     assert_eq!(status.common.state, State::Running);
     assert_eq!(status.last_result, None, "no run has ended");
-    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
     mgr.uninstall(id).expect("uninstall");
 }
 
@@ -389,7 +389,7 @@ fn a_start_after_an_unwaited_stop_is_refused_while_the_run_is_alive(#[fixture(sc
     let status = task_status(&mgr, id);
     assert_eq!(status.common.state, State::Running);
     assert_eq!(status.common.pid, Some(pid), "the run it refused to start over");
-    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
     mgr.uninstall(id).expect("uninstall");
 }
 

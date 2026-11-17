@@ -188,7 +188,7 @@ fn a_service_of_a_standard_account_leaves_no_folder_that_refuses_a_task_install(
         started.accept("the program of a service run by a standard account");
         let log = support::shim_default_log(&support::program_data(), service.as_str());
         assert!(log.is_file(), "the shim of {account} opened {}", log.display());
-        mgr.stop(&service, Budget::DEFAULT)
+        mgr.stop(&service, Some(Budget::DEFAULT))
             .unwrap_or_else(|e| panic!("stop the service as {account}: {}", e.report()));
 
         let task = TaskGuard::new();

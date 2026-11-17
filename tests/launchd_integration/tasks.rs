@@ -70,7 +70,7 @@ struct StopOnDrop(Id);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        drop(Launchd::new().stop(&self.0, Budget::Unbounded));
+        drop(Launchd::new().stop(&self.0, Some(Budget::Unbounded)));
     }
 }
 
@@ -412,7 +412,7 @@ fn the_timer_fire_after_a_stop_starts_a_fresh_run(#[fixture(launchd_group)] _gro
     mgr.enable(&task_id).expect("enable");
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
     held.wait_started();
-    mgr.stop(&task_id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&task_id, Some(Budget::DEFAULT)).expect("stop");
 
     // The stop's outcome is the run's result, not the task's state: a fire may start a run the moment
     // after `stop` returns. `stop` returned with no run left, so every run numbered up to now is dead
@@ -520,7 +520,7 @@ fn stop_straight_after_start_ends_the_run(#[fixture(launchd_group)] _group: &Gro
     let _guard = Guard::install(&mgr, &task(&id, held.command.clone(), None));
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
 
-    mgr.stop(&task_id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&task_id, Some(Budget::DEFAULT)).expect("stop");
 
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.common.state, State::Idle, "{status:?}");
@@ -542,7 +542,7 @@ fn stop_with_no_budget_straight_after_start_ends_the_run(#[fixture(launchd_group
     let _guard = Guard::install(&mgr, &task(&id, held.command.clone(), None));
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
 
-    mgr.stop(&task_id, Budget::Immediate).expect("stop");
+    mgr.stop(&task_id, Some(Budget::Immediate)).expect("stop");
 
     kill::until(|| task_status(&mgr, &task_id).common.state == State::Idle);
     let status = task_status(&mgr, &task_id);
@@ -560,14 +560,15 @@ fn stop_ends_the_run_and_reports_sigterm_in_last_result(#[fixture(launchd_group)
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
     held.wait_started();
 
-    mgr.stop(&task_id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&task_id, Some(Budget::DEFAULT)).expect("stop");
 
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.common.state, State::Idle, "{status:?}");
     assert_eq!(status.last_result, Some(Exit::Signal(15)), "{status:?}");
     assert!(status.common.enabled, "stop leaves the schedule armed: {status:?}");
     assert!(is_loaded(&id), "a task is never booted out by stop");
-    mgr.stop(&task_id, Budget::DEFAULT).expect("stop of an idle task is Ok");
+    mgr.stop(&task_id, Some(Budget::DEFAULT))
+        .expect("stop of an idle task is Ok");
 }
 
 /// A run that ignores SIGTERM outlives a bounded `stop`, which says so; `kill` ends it.
@@ -582,7 +583,7 @@ fn stop_of_a_task_that_ignores_sigterm_times_out_and_kill_ends_it(#[fixture(laun
     held.wait_started();
 
     let e = mgr
-        .stop(&task_id, Budget::Bounded(Duration::from_millis(500)))
+        .stop(&task_id, Some(Budget::Bounded(Duration::from_millis(500))))
         .expect_err("a run that ignores SIGTERM outlives the budget");
 
     assert!(
@@ -628,7 +629,8 @@ fn stop_of_a_task_that_ignores_sigterm_ends_it_after_its_timeout(#[fixture(launc
     held.wait_started();
 
     let stopping = Instant::now();
-    mgr.stop(&task_id, Budget::Unbounded).expect("a stop that ends the run");
+    mgr.stop(&task_id, Some(Budget::Unbounded))
+        .expect("a stop that ends the run");
 
     assert!(
         stopping.elapsed() >= StopAction::MIN_TIMEOUT,
@@ -651,7 +653,8 @@ fn stop_of_a_task_with_send_signal_kill_ends_a_run_that_ignores_sigterm(#[fixtur
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
     held.wait_started();
 
-    mgr.stop(&task_id, Budget::Unbounded).expect("a stop that ends the run");
+    mgr.stop(&task_id, Some(Budget::Unbounded))
+        .expect("a stop that ends the run");
 
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.common.state, State::Idle, "{status:?}");
@@ -831,7 +834,7 @@ fn run_of_a_signalled_task_returns_signal_15(#[fixture(launchd_group)] _group: &
         while !seen.windows(6).any(|window| window == b"ready\n") {
             seen.extend(shown.recv().expect("the run ended before the task said ready"));
         }
-        mgr.stop(task_id, Budget::DEFAULT).expect("stop");
+        mgr.stop(task_id, Some(Budget::DEFAULT)).expect("stop");
         run.join().expect("the run's thread")
     });
 

@@ -15,7 +15,7 @@ use crate::backend::{
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Exit, Installed, State, Status, Step, output};
-use crate::spec::{DaemonKind, DaemonSpec, Id, StopAction};
+use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 // Ownership ===========================================================================================================
 
@@ -367,21 +367,19 @@ pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exi
     }
 }
 
-/// The spec of the marked service `snapshot`, from its blob. A blob that will not decode is its error:
-/// what is read of the spec is not guessed.
-fn installed_spec_of<S: InstalledService>(snapshot: &S) -> Result<&DaemonSpec> {
-    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
-    Ok(&blob.spec)
-}
-
-/// Whether the marked service `snapshot` is a service or a task, from its blob.
+/// Whether the marked service `snapshot` is a service or a task, from its blob. A blob that will not decode is
+/// its error: what is read of the spec is not guessed.
 pub(crate) fn kind_of<S: InstalledService>(snapshot: &S) -> Result<DaemonKind> {
-    Ok(installed_spec_of(snapshot)?.kind())
+    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+    Ok(blob.spec.kind())
 }
 
-/// What a stop of the marked service `snapshot` asks of it, from its blob.
-pub(crate) fn stop_action_of<S: InstalledService>(snapshot: &S) -> Result<StopAction> {
-    Ok(*installed_spec_of(snapshot)?.stop_action())
+/// The wait of a `stop` of the marked service `snapshot`: `given`, or, where the caller named none,
+/// [`Budget::for_stop`] of the stop action in the blob this `snapshot` holds, the one the stop then acts on.
+/// A blob that will not decode has no stop action to read, which `stop` does not need (the marker alone is
+/// proof of ownership): the wait is then [`Budget::DEFAULT`], what it was before stop actions.
+pub(crate) fn stop_budget<S: InstalledService>(snapshot: &S, given: Option<Budget>) -> Budget {
+    given.unwrap_or_else(|| Budget::for_stop(snapshot.blob().ok().map(|blob| blob.spec.stop_action())))
 }
 
 /// The thread that waits for a run, made before the run is requested.

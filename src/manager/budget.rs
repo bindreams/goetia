@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::spec::{StopAction, StopSignal};
+
 // Budget ==============================================================================================================
 
 /// How long a caller is willing to wait for a service manager to report a
@@ -24,6 +26,20 @@ impl Budget {
     pub const DEFAULT_WAIT: Duration = Duration::from_secs(10);
     pub const DEFAULT: Budget = Budget::Bounded(Self::DEFAULT_WAIT);
 
+    /// The wait of a `stop` that names none: the daemon's own stop action, with
+    /// [`StopAction::TEARDOWN_MARGIN`] to be torn down and recorded ([`StopAction::longest_stop`]); no bound
+    /// for a stop action with no `timeout`; and [`Self::DEFAULT`], what it always was, for `kill`, which
+    /// sends nothing to answer, and for a daemon with no stop action to read (`None`: its definition does
+    /// not decode).
+    pub fn for_stop(action: Option<&StopAction>) -> Budget {
+        match action {
+            Some(action) if action.send_signal != StopSignal::Kill => {
+                action.longest_stop().map_or(Budget::Unbounded, Budget::Bounded)
+            }
+            _ => Budget::DEFAULT,
+        }
+    }
+
     /// Whether this budget permits any waiting at all. `false` for
     /// `Immediate` and for `Bounded(Duration::ZERO)` alike: a zero-length
     /// bound behaves as `Immediate` everywhere a caller branches on this, and
@@ -31,9 +47,9 @@ impl Budget {
     /// exception is a launchd task's `stop`, which matches on the budget itself:
     /// under every budget it waits for a queued start's pid and sends the run its
     /// first signal, as every backend's stop is issued. Under `Immediate` it
-    /// then returns `Ok`, but may read launchd again, paced, while launchd shows a
-    /// pid it cannot hold, and returns `Ok` with nothing sent when two readings
-    /// show the same such pid; a zero bound is a bound that has run out, so after
+    /// then returns `Ok`, but waits for no exit: it reads launchd again, paced,
+    /// for as long as launchd shows a pid it cannot hold, and returns `Ok` when a
+    /// reading shows no process; a zero bound is a bound that has run out, so after
     /// that signal it sends nothing more, does one reading (`read_up`), and
     /// returns `Ok` if the job is idle, else
     /// [`Error::WaitTimeout`](crate::Error::WaitTimeout), a pid launchd has

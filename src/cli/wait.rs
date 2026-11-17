@@ -8,9 +8,8 @@ use std::time::Duration;
 
 use clap::Args as ClapArgs;
 
-use crate::error::{Chain, Result};
+use crate::error::Chain;
 use crate::manager::Budget;
-use crate::spec::{StopAction, StopSignal};
 
 /// The flag pair every waiting verb flattens in.
 ///
@@ -19,7 +18,7 @@ use crate::spec::{StopAction, StopSignal};
 /// from its absence, and [`dispatch`](super::dispatch)'s `install` refusal
 /// needs that distinction (see [`Self::was_given`]). Clap therefore cannot
 /// render `[default: 10s]`, so the help text states the default in words, and `stop` and
-/// `restart` take theirs from the daemon ([`Self::stop_budget`]).
+/// `restart` take theirs from the daemon ([`Self::given`] is `None`).
 #[derive(ClapArgs, Debug, Default)]
 pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
@@ -53,48 +52,17 @@ impl WaitArgs {
         }
     }
 
-    /// [`Self::budget`] for `stop`, whose default wait is the daemon's own: its stop timeout plus the
-    /// teardown margin, unbounded for no timeout, and what it always was ([`Budget::DEFAULT`]) for `kill`,
-    /// which sends nothing to answer. `stop_action` reads it, and is not asked when a flag was given. A
-    /// daemon whose stop action cannot be read (not installed, not goetia's, a definition that will not
-    /// decode) has none to wait for, and the previous default stands: the verb meets the same gate itself
-    /// and reports it, as it always did, and the order in which it does is unchanged.
-    pub fn stop_budget(&self, stop_action: impl FnOnce() -> Result<StopAction>) -> Budget {
-        self.default_after(stop_action, Duration::ZERO)
-    }
-
-    /// [`Self::stop_budget`] for `restart`, whose one budget covers both legs: the stop's, and the
-    /// previous default again for the start. `kill` keeps the previous default for the whole restart.
-    pub fn restart_budget(&self, stop_action: impl FnOnce() -> Result<StopAction>) -> Budget {
-        self.default_after(stop_action, Budget::DEFAULT_WAIT)
-    }
-
-    /// The flags' budget, or the daemon's default stop budget with `start_leg` added to it.
-    fn default_after(&self, stop_action: impl FnOnce() -> Result<StopAction>, start_leg: Duration) -> Budget {
-        if self.was_given() {
-            return self.budget();
-        }
-        stop_action().map_or(Budget::DEFAULT, |stop_action| {
-            default_stop_budget(&stop_action, start_leg)
-        })
+    /// The [`Budget`] the flags name, or `None` when neither was given: a verb that stops a daemon then leaves
+    /// the wait to the manager, which resolves it from the definition it stops
+    /// ([`ServiceManager::stop`](crate::manager::ServiceManager::stop)).
+    pub fn given(&self) -> Option<Budget> {
+        self.was_given().then(|| self.budget())
     }
 
     /// Whether either flag was actually given, which [`Self::budget`] cannot
     /// say: the default budget is what *no* flag means.
     pub fn was_given(&self) -> bool {
         self.no_timeout || self.timeout.is_some()
-    }
-}
-
-/// The default wait of a verb that stops a daemon with `stop_action`, and then spends `start_leg` more:
-/// see [`WaitArgs::stop_budget`].
-fn default_stop_budget(stop_action: &StopAction, start_leg: Duration) -> Budget {
-    if stop_action.send_signal == StopSignal::Kill {
-        return Budget::DEFAULT;
-    }
-    match stop_action.longest_stop() {
-        Some(longest) => Budget::Bounded(longest + start_leg),
-        None => Budget::Unbounded,
     }
 }
 

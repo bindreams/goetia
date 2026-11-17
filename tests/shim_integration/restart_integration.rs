@@ -175,7 +175,7 @@ fn on_failure_restarts_are_paced_new_shims(#[fixture(scm_group)] _group: &Group)
         }
     }
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     drop(running);
 }
 
@@ -395,7 +395,7 @@ fn a_commanded_stop_reports_win32_zero(#[fixture(scm_group)] _group: &Group) {
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon to report in");
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     let stopped = scm_status(&id);
     assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
@@ -469,7 +469,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version(#[fixture(scm_grou
         "the shim did not log the version-skew notice into the daemon's log:\n{logged}"
     );
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 }
 
 /// A service whose blob says `restart: always` must stay operable, because the verbs that act on a
@@ -525,14 +525,14 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
         .prepare(&[Step::Stop, Step::Start], Budget::DEFAULT)
         .expect("prepare a restart");
     sequence
-        .stop(&spec.common().id, Budget::DEFAULT)
+        .stop(&spec.common().id, Some(Budget::DEFAULT))
         .expect("stop for the restart");
     sequence
         .start(&spec.common().id, Budget::DEFAULT)
         .expect("start for the restart");
     reported.accept("the daemon of the restarted service to report in");
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     mgr.uninstall(&spec.common().id).expect("uninstall");
 
     let query = support::cmd::run("sc.exe", &["query", &id]);

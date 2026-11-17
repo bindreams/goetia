@@ -19,7 +19,7 @@ use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
 use crate::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step, flow};
-use crate::spec::{DaemonKind, DaemonSpec, Id, StopAction};
+use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 /// A marked artifact's metadata as `read` decoded it, or the failure kept in its place. Shared, so
 /// every verb that reports the failure hands out the one error.
@@ -468,8 +468,9 @@ impl<B: Backend> ServiceManager for B {
         Backend::request_start_after_stop(self, snapshot, &mut reservation)
     }
 
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> Result<()> {
         let snapshot = flow::owned(self, id)?;
+        let budget = flow::stop_budget(&snapshot, budget);
         let mut reservation = flow::reserved(self, id, &[Step::Stop], budget)?;
         Backend::stop(self, snapshot, budget, &mut reservation)
     }
@@ -490,10 +491,6 @@ impl<B: Backend> ServiceManager for B {
 
     fn kind(&self, id: &Id) -> Result<DaemonKind> {
         flow::kind_of(&flow::owned(self, id)?)
-    }
-
-    fn stop_action(&self, id: &Id) -> Result<StopAction> {
-        flow::stop_action_of(&flow::owned(self, id)?)
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
@@ -540,8 +537,9 @@ impl<B: Backend> Sequence for Reserved<'_, B> {
         Backend::enable(self.backend, snapshot, &mut self.reservation)
     }
 
-    fn stop(&mut self, id: &Id, budget: Budget) -> Result<()> {
+    fn stop(&mut self, id: &Id, budget: Option<Budget>) -> Result<()> {
         let snapshot = flow::owned(self.backend, id)?;
+        let budget = flow::stop_budget(&snapshot, budget);
         self.spend(&[Step::Stop]);
         Backend::stop(self.backend, snapshot, budget, &mut self.reservation)
     }

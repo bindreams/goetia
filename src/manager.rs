@@ -22,7 +22,7 @@ use std::io::Write;
 use std::time::SystemTime;
 
 use crate::error::{Error, Reason, Result};
-use crate::spec::{DaemonKind, DaemonSpec, Id, StopAction};
+use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
 
@@ -189,7 +189,11 @@ pub trait ServiceManager {
     /// waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;
 
-    /// Stop the service now, waiting up to `budget` for it. Does not change
+    /// Stop the service now, waiting up to `budget` for it, or, with `None`, for as long as the daemon's
+    /// own stop takes ([`Budget::for_stop`]): its `stop-action` `timeout` plus
+    /// [`StopAction::TEARDOWN_MARGIN`](crate::spec::StopAction::TEARDOWN_MARGIN), without bound where it has no `timeout`, and [`Budget::DEFAULT`] for
+    /// `send-signal: kill` and for a daemon whose definition does not decode. `None` is read from the
+    /// definition this call reads and acts on, so the wait and the stop cannot disagree. Does not change
     /// its boot-enablement.
     ///
     /// `Ok(())` means the service manager reports the service as stopped, on
@@ -228,7 +232,7 @@ pub trait ServiceManager {
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::ProcessWaitTimeout`]: crate::Error::ProcessWaitTimeout
     /// [`Error::StopUnconfirmed`]: crate::Error::StopUnconfirmed
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> Result<()>;
 
     /// End the process the manager reports as the service's, as a failure, and return once it has
     /// exited and the manager no longer reports it: on every backend, the next `status` does not show
@@ -287,11 +291,6 @@ pub trait ServiceManager {
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     /// [`Error::Kept`]: crate::Error::Kept
     fn kind(&self, id: &Id) -> Result<DaemonKind>;
-
-    /// What a stop of `id` asks of it, read from the definition goetia installed it with, and nothing
-    /// else of its status: the CLI's default wait for `stop` and `restart` is built on it. The gate and
-    /// the errors are [`Self::kind`]'s.
-    fn stop_action(&self, id: &Id) -> Result<StopAction>;
 
     /// Every id this backend could account for. A foreign (unmarked)
     /// service at some id is never included; see [`Installed`] for what
@@ -354,7 +353,7 @@ pub trait Sequence {
     fn enable(&mut self, id: &Id) -> Result<()>;
 
     /// See [`ServiceManager::stop`].
-    fn stop(&mut self, id: &Id, budget: Budget) -> Result<()>;
+    fn stop(&mut self, id: &Id, budget: Option<Budget>) -> Result<()>;
 
     /// See [`ServiceManager::start`].
     fn start(&mut self, id: &Id, budget: Budget) -> Result<()>;

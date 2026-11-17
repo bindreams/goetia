@@ -464,7 +464,7 @@ fn start_stop_status_reflect_reality(#[fixture(systemd_group)] _group: &Group) {
     assert_eq!(status.common().state, State::Running, "{status:?}");
     assert!(status.common().pid.is_some(), "{status:?}");
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     let status = mgr.status(&spec.common().id).expect("status after stop");
     assert_ne!(status.common().state, State::Running, "{status:?}");
     assert!(status.common().pid.is_none(), "{status:?}");
@@ -621,7 +621,7 @@ fn killing_a_stopped_unit_is_not_running(#[fixture(systemd_group)] _group: &Grou
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 }
 
@@ -677,7 +677,7 @@ fn a_stop_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Grou
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
-    mgr.stop(&spec.common().id, Budget::Immediate)
+    mgr.stop(&spec.common().id, Some(Budget::Immediate))
         .expect("a stop with no budget issues the request and returns");
 
     let (state, job) = active_state_and_job(guard.id());
@@ -744,7 +744,7 @@ fn a_stop_that_can_never_complete_times_out_with_the_job_standing(#[fixture(syst
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let err = mgr
-        .stop(&spec.common().id, Budget::Bounded(Duration::from_secs(1)))
+        .stop(&spec.common().id, Some(Budget::Bounded(Duration::from_secs(1))))
         .expect_err("a stop that can never complete must not report stopped");
 
     assert!(
@@ -768,7 +768,7 @@ fn a_stop_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gro
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let err = mgr
-        .stop(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)))
+        .stop(&spec.common().id, Some(Budget::Bounded(Duration::from_nanos(1))))
         .expect_err("a stop that can never complete must not report stopped");
 
     assert!(
@@ -983,7 +983,7 @@ fn a_stop_of_a_unit_systemd_cannot_load_has_nothing_to_stop(#[fixture(systemd_gr
     assert_eq!(load_state.stdout.trim(), "bad-setting");
 
     for budget in [Budget::DEFAULT, Budget::Unbounded, Budget::Immediate] {
-        mgr.stop(&Id::try_from(guard.id()).unwrap(), budget)
+        mgr.stop(&Id::try_from(guard.id()).unwrap(), Some(budget))
             .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
         assert_eq!(
             active_state_and_job(guard.id()),
@@ -3008,7 +3008,7 @@ fn a_daemon_that_answers_the_stop_signal_ends_cleanly(#[fixture(systemd_group)] 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to have installed its trap");
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     assert_eq!(show_property(guard.id(), "Result"), "success");
     assert_eq!(show_property(guard.id(), "ExecMainStatus"), "0");
@@ -3034,7 +3034,7 @@ fn a_daemon_that_ignores_the_stop_signal_is_killed_after_the_timeout(#[fixture(s
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to be ignoring SIGTERM");
 
-    mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(60)))
+    mgr.stop(&spec.common().id, Some(Budget::Bounded(Duration::from_secs(60))))
         .expect("stop");
 
     let status = mgr.status(&spec.common().id).expect("status");
@@ -3069,7 +3069,7 @@ fn kill_ends_a_daemon_that_ignores_everything_at_once(#[fixture(systemd_group)] 
 
     // `Budget::DEFAULT` is shorter than systemd's default stop timeout: a stop that had to wait that out
     // would not return `Ok`.
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     let status = mgr.status(&spec.common().id).expect("status");
     assert_ne!(status.common().state, State::Running, "{status:?}");

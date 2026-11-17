@@ -1474,7 +1474,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     script.assert_driven("request_start_after_stop, longest path");
 
     let (mgr, script) = over_sh(&BOOTOUT);
-    mgr.stop(&id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
     script.assert_driven("stop");
 
     let mut fields = service_fields(spec);

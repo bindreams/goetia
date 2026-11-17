@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use super::{WaitArgs, parse_timeout};
-use crate::error::Error;
 use crate::manager::Budget;
-use crate::spec::{StopAction, StopSignal};
 
 fn args(timeout: Option<Duration>, no_timeout: bool) -> WaitArgs {
     WaitArgs { timeout, no_timeout }
@@ -63,102 +61,13 @@ fn was_given_is_false_only_when_neither_flag_appears() {
     assert!(args(None, true).was_given());
 }
 
-// The default wait of a stop ==========================================================================================
-
-fn after(signal: StopSignal, timeout: Option<u64>) -> Budget {
-    args(None, false).stop_budget(|| {
-        Ok(StopAction {
-            send_signal: signal,
-            timeout: timeout.map(Duration::from_secs),
-        })
-    })
-}
-
 #[skuld::test]
-fn a_stop_waits_for_its_timeout_and_the_teardown_margin() {
+fn given_is_the_budget_a_flag_names_and_none_when_no_flag_was_given() {
+    assert_eq!(args(None, false).given(), None);
     assert_eq!(
-        after(StopSignal::Terminate, Some(30)),
-        Budget::Bounded(Duration::from_secs(40))
+        args(Some(Duration::from_secs(3)), false).given(),
+        Some(Budget::Bounded(Duration::from_secs(3)))
     );
-    assert_eq!(
-        after(StopSignal::Interrupt, Some(1)),
-        Budget::Bounded(Duration::from_secs(11))
-    );
-    assert_eq!(
-        after(StopSignal::Quit, Some(86_400)),
-        Budget::Bounded(Duration::from_secs(86_410))
-    );
-    assert_eq!(StopAction::TEARDOWN_MARGIN, Duration::from_secs(10));
-}
-
-#[skuld::test]
-fn no_timeout_is_an_unbounded_wait_and_kill_keeps_the_previous_default() {
-    assert_eq!(after(StopSignal::Terminate, None), Budget::Unbounded);
-    assert_eq!(after(StopSignal::Kill, None), Budget::DEFAULT);
-}
-
-fn restart_after(signal: StopSignal, timeout: Option<u64>) -> Budget {
-    args(None, false).restart_budget(|| {
-        Ok(StopAction {
-            send_signal: signal,
-            timeout: timeout.map(Duration::from_secs),
-        })
-    })
-}
-
-#[skuld::test]
-fn a_restart_waits_for_the_stop_and_then_for_the_start() {
-    // The stop's timeout and teardown margin, and the start leg's previous default.
-    assert_eq!(
-        restart_after(StopSignal::Terminate, Some(30)),
-        Budget::Bounded(Duration::from_secs(50))
-    );
-    assert_eq!(
-        restart_after(StopSignal::Quit, Some(1)),
-        Budget::Bounded(Duration::from_secs(21))
-    );
-    assert_eq!(restart_after(StopSignal::Terminate, None), Budget::Unbounded);
-    assert_eq!(restart_after(StopSignal::Kill, None), Budget::DEFAULT);
-}
-
-#[skuld::test]
-fn a_restart_follows_the_flags_and_the_unreadable_default_as_a_stop_does() {
-    for (given, expected) in [
-        (
-            args(Some(Duration::from_secs(3)), false),
-            Budget::Bounded(Duration::from_secs(3)),
-        ),
-        (args(Some(Duration::ZERO), false), Budget::Immediate),
-        (args(None, true), Budget::Unbounded),
-    ] {
-        let budget = given.restart_budget(|| panic!("a flag was given: the daemon's stop action is not read"));
-        assert_eq!(budget, expected);
-    }
-    let absent = Error::NotInstalled { id: "frpc".to_string() };
-    assert_eq!(args(None, false).restart_budget(|| Err(absent)), Budget::DEFAULT);
-}
-
-#[skuld::test]
-fn a_flag_decides_without_reading_the_stop_action() {
-    for (given, expected) in [
-        (
-            args(Some(Duration::from_secs(3)), false),
-            Budget::Bounded(Duration::from_secs(3)),
-        ),
-        (args(Some(Duration::ZERO), false), Budget::Immediate),
-        (args(None, true), Budget::Unbounded),
-    ] {
-        let budget = given.stop_budget(|| panic!("a flag was given: the daemon's stop action is not read"));
-        assert_eq!(budget, expected);
-    }
-}
-
-#[skuld::test]
-fn a_stop_action_that_cannot_be_read_gets_the_previous_default_whatever_the_reason() {
-    // The verb meets the same gate itself, and says why.
-    let kept = Error::Kept(std::sync::Arc::new(Error::blob("unreadable".to_string())));
-    let absent = Error::NotInstalled { id: "frpc".to_string() };
-    for error in [kept, absent] {
-        assert_eq!(args(None, false).stop_budget(|| Err(error)), Budget::DEFAULT);
-    }
+    assert_eq!(args(Some(Duration::ZERO), false).given(), Some(Budget::Immediate));
+    assert_eq!(args(None, true).given(), Some(Budget::Unbounded));
 }

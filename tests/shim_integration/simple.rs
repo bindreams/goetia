@@ -143,7 +143,7 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
         "pid {pid} reported by status() is not goetia-shim.exe:\n{tasklist}"
     );
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     let status = mgr.status(&spec.common().id).expect("status after stop");
     assert_eq!(status.common().state, State::Stopped);
 }

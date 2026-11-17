@@ -85,7 +85,7 @@ fn list_reports_the_same_pid_as_status() {
         "list's pid must agree with status's pid while running"
     );
 
-    fake.stop(&spec.common().id, Budget::DEFAULT).unwrap();
+    fake.stop(&spec.common().id, Some(Budget::DEFAULT)).unwrap();
     let status = fake.status(&spec.common().id).unwrap();
     let listed = fake.list().unwrap();
     let entry = listed
@@ -151,7 +151,7 @@ fn operations_on_an_unknown_id_error() {
     assert!(fake.enable(&id).is_err());
     assert!(fake.disable(&id).is_err());
     assert!(fake.start(&id, Budget::DEFAULT).is_err());
-    assert!(fake.stop(&id, Budget::DEFAULT).is_err());
+    assert!(fake.stop(&id, Some(Budget::DEFAULT)).is_err());
     assert!(fake.status(&id).is_err());
 }
 
@@ -210,7 +210,7 @@ fn mutating_verbs_refuse_a_foreign_id() {
         "start must refuse a foreign id"
     );
     assert!(
-        fake.stop(&id, Budget::DEFAULT).is_err(),
+        fake.stop(&id, Some(Budget::DEFAULT)).is_err(),
         "stop must refuse a foreign id"
     );
     assert!(fake.status(&id).is_err(), "status must refuse a foreign id");
@@ -252,7 +252,7 @@ fn absence_over_a_residual_artifact_is_not_not_installed() {
         ("enable", fake.enable(&id)),
         ("disable", fake.disable(&id)),
         ("start", fake.start(&id, Budget::DEFAULT).map(drop)),
-        ("stop", fake.stop(&id, Budget::DEFAULT)),
+        ("stop", fake.stop(&id, Some(Budget::DEFAULT))),
         ("status", fake.status(&id).map(drop)),
     ] {
         match result {
@@ -309,7 +309,7 @@ fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)>
         ("enable", fake.enable(&spec.common().id)),
         ("disable", fake.disable(&spec.common().id)),
         ("start", fake.start(&spec.common().id, Budget::DEFAULT).map(drop)),
-        ("stop", fake.stop(&spec.common().id, Budget::DEFAULT)),
+        ("stop", fake.stop(&spec.common().id, Some(Budget::DEFAULT))),
         ("install", fake.install(spec, false).map(drop)),
         ("preview_install", fake.preview_install(spec).map(drop)),
     ]
@@ -461,7 +461,7 @@ fn the_fake_records_the_calls_it_was_asked_to_make() {
     fake.start(&first.common().id, Budget::DEFAULT).unwrap();
     // Already running: idempotent, changes nothing, and is still recorded.
     fake.start(&first.common().id, Budget::DEFAULT).unwrap();
-    fake.stop(&first.common().id, Budget::DEFAULT).unwrap();
+    fake.stop(&first.common().id, Some(Budget::DEFAULT)).unwrap();
     fake.start(&second.common().id, Budget::DEFAULT).unwrap();
 
     assert_eq!(
@@ -511,7 +511,7 @@ fn a_stalled_stop_times_out_under_a_bounded_budget() {
     fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
     fake.seed_stop_stalls(spec.common().id.as_str());
 
-    match fake.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(10))) {
+    match fake.stop(&spec.common().id, Some(Budget::Bounded(Duration::from_secs(10)))) {
         Err(Error::WaitTimeout { id, awaited, .. }) => {
             assert_eq!(id, "stalls");
             assert_eq!(awaited, "stopped");
@@ -554,7 +554,7 @@ fn a_stalled_stop_is_ok_under_no_budget_and_leaves_the_state_alone() {
     fake.seed_stop_stalls(spec.common().id.as_str());
 
     for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
-        fake.stop(&spec.common().id, budget)
+        fake.stop(&spec.common().id, Some(budget))
             .unwrap_or_else(|e| panic!("{budget:?} establishes nothing, so it cannot fail: {e}"));
         assert_eq!(
             fake.status(&spec.common().id).unwrap().common().state,
@@ -619,7 +619,7 @@ fn a_stalled_stop_under_an_unbounded_budget_refuses_rather_than_pretending() {
     fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
     fake.seed_stop_stalls(spec.common().id.as_str());
 
-    let _ = fake.stop(&spec.common().id, Budget::Unbounded);
+    let _ = fake.stop(&spec.common().id, Some(Budget::Unbounded));
 }
 
 /// An un-stalled entry reaches `Running` under every budget that waits,
@@ -681,7 +681,7 @@ fn a_running_entry_is_left_alone_by_a_stop_under_a_budget_that_does_not_wait() {
         fake.install(&spec, false).unwrap();
         fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
-        fake.stop(&spec.common().id, budget)
+        fake.stop(&spec.common().id, Some(budget))
             .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
 
         assert_eq!(
@@ -703,7 +703,7 @@ fn a_start_request_after_an_unconfirmed_stop_is_refused_while_still_running() {
     let spec = mk("healthy");
     fake.install(&spec, false).unwrap();
     fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
-    fake.stop(&spec.common().id, Budget::Immediate).unwrap();
+    fake.stop(&spec.common().id, Some(Budget::Immediate)).unwrap();
 
     assert!(fake.request_start_after_stop(&spec.common().id).is_err());
     assert_eq!(
@@ -941,7 +941,7 @@ fn a_task_start_then_stop_goes_running_then_idle() {
     assert_eq!(running.common.state, State::Running);
     assert!(running.common.pid.is_some(), "a running task has a pid");
 
-    fake.stop(&id, Budget::DEFAULT).unwrap();
+    fake.stop(&id, Some(Budget::DEFAULT)).unwrap();
     let idle = task_status(&fake, "nightly");
     assert_eq!(
         idle.common.state,

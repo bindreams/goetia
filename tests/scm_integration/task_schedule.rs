@@ -87,7 +87,7 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(after.common.state, State::Running);
     assert_eq!(after.common.pid, pid, "the run that was there");
     assert!(!listener.connected_yet(), "no second program was started");
-    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
     mgr.uninstall(id).expect("uninstall");
 }
 

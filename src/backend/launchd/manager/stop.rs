@@ -28,11 +28,11 @@ enum Pass {
     /// Read again: a start launchd had accepted has forked, after a wait of this long under no budget.
     /// That wait is not the caller's to spend, so the caller's budget is extended by it.
     Queued(Duration),
-    /// Read again, paced: launchd shows this pid, which is no run of the job's that the stop can reach: the
-    /// run ended and launchd has not cleared it, or launchd has moved on to another run. The pause is
+    /// Read again, paced: launchd shows a pid that is no run of the job's that the stop can reach: the run
+    /// ended and launchd has not cleared it, or launchd has moved on to another run. The pause is
     /// [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing, and never runs past
-    /// the deadline. Under `Immediate` a reading that shows the same pid as the last such pass ends the stop.
-    Behind(u32),
+    /// the deadline.
+    Behind,
 }
 
 /// A run this stop has signalled, and when its grace ends. The grace is the process's own, by identity: it
@@ -87,10 +87,12 @@ impl Course {
         self.counted = self.counted.extended(by);
     }
 
-    /// Whether the caller's deadline is spent. The first pass always runs, whatever the budget, as every
-    /// backend's stop is issued: until it is over, or something has been sent, the deadline is not read. After
-    /// that every pass reads it first, whether anything was sent or not. `Immediate` waits for nothing, so
-    /// it has no deadline to spend.
+    /// Whether the caller's deadline is spent: the stop's one rule for it. The first pass always runs, whatever
+    /// the budget, as every backend's stop is issued: until it is over, or something has been sent, the
+    /// deadline is not read. After that every pass reads it first, whether anything was sent or not, and a spent
+    /// `Bounded` one is the caller's timeout: nothing more is sent, and the pass makes one reading, which ends the
+    /// stop ([`Launchd::done_or`]). So a stop that keeps finding a pid launchd has not cleared ends at its
+    /// deadline. `Immediate` waits for no exit, so it has no deadline to spend.
     fn spent(&self) -> bool {
         (self.first_over || self.termed.is_some())
             && matches!(self.counted, Budget::Bounded(_))
@@ -239,10 +241,10 @@ enum Up<'a> {
     Idle,
     /// A start launchd has accepted and not yet forked: [`Quiet::Queued`].
     Queued,
-    /// Launchd shows this pid, and it is no run of the job's that the stop can reach: the process is gone, or
+    /// Launchd shows a pid, and it is no run of the job's that the stop can reach: the process is gone, or
     /// is held and launchd does not name it (the run ended and is not cleared, or launchd has moved on to
     /// another run, which this reading did not hold). Nothing is signalled.
-    Behind { shown: u32 },
+    Behind,
     /// A process held and confirmed by launchd as the job's, with its exit registered.
     Run {
         pid: u32,
@@ -255,16 +257,11 @@ enum Up<'a> {
 impl Launchd {
     /// Ends the run in flight, and returns once launchd shows no process. The stop is always issued, as every
     /// backend's is, whatever the budget: the first pass always runs, and the wait for a queued start and the
-    /// signal to the run found after it are part of it. From the second pass on every pass starts with the
-    /// deadline, whether anything was sent or not: a `Bounded` budget that is spent is the caller's timeout,
-    /// and nothing more is sent ([`Course::spent`]); the one reading the pass makes then, the one every pass
-    /// makes ([`Self::read_up`]), is to see whether the job is done ([`Self::done_or`]). So a stop that keeps
-    /// finding a pid launchd has not cleared ends at its deadline. `Immediate` waits for no exit: it signals the
-    /// run it finds and returns. While launchd shows a pid the stop cannot reach it reads again, paced by
-    /// [`UNLOAD_POLL`], and returns `Ok` with nothing sent when two readings in a row show the same pid
-    /// (launchd is lagging) or when one shows no process; a run it shows is signalled as in any pass, and another
-    /// pid, or a queued start, goes on the same way, so the loop runs only while what `print` shows changes.
-    /// Otherwise the pass reads `print`:
+    /// signal to the run found after it are part of it. A spent deadline ends it ([`Course::spent`]).
+    /// `Immediate` waits for no exit: it signals the run it finds and returns. While launchd shows a pid the stop cannot reach it reads again, paced by
+    /// [`UNLOAD_POLL`], until a reading shows no process (`Ok`) or a run it can hold (signalled as in any pass,
+    /// then `Ok`); it has no other end, so it lasts as long as launchd shows that pid. Otherwise the pass reads
+    /// `print`:
     ///
     /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
     ///   No process and any other state, or a `print` that failed or was not whole, is
@@ -290,8 +287,7 @@ impl Launchd {
     /// The deadline is decided before a send, not atomically with it: one that passes between the check and
     /// the send does not stop that send. A pid that exited before it was watched, or is not the job's any
     /// more, is the next pass, paced by [`UNLOAD_POLL`] while launchd's view catches up, or by what is left of
-    /// the deadline when that is less; a pass after which the deadline is spent is the reading that ends the
-    /// stop ([`Self::done_or`]). The first pass draws
+    /// the deadline when that is less. The first pass draws
     /// on `reservation`, and each later one on one of its own: an uncapped loop would draw what was never
     /// reserved. A pass that cannot reserve returns that error, the SIGTERM standing. The one [`Watch`] is
     /// made first, so that failing to make it sends nothing.
@@ -304,8 +300,6 @@ impl Launchd {
     ) -> Result<()> {
         let mut course = Course::new(action, budget, Watch::new()?);
         let mut own: Option<Reservation> = None;
-        // The pid the last pass found launchd showing without a run to signal, while only such passes have come.
-        let mut lagging: Option<u32> = None;
         loop {
             let pass = own.as_mut().unwrap_or(&mut *reservation);
             if course.spent() {
@@ -314,17 +308,8 @@ impl Launchd {
             match self.stop_pass(id, &mut course, pass)? {
                 Pass::Done => return Ok(()),
                 Pass::Again => course.first_pass_over(),
-                Pass::Queued(waited) => {
-                    course.extend(waited);
-                    lagging = None;
-                }
-                Pass::Behind(shown) => {
-                    if course.counted == Budget::Immediate {
-                        if lagging == Some(shown) {
-                            return Ok(());
-                        }
-                        lagging = Some(shown);
-                    }
+                Pass::Queued(waited) => course.extend(waited),
+                Pass::Behind => {
                     course.first_pass_over();
                     // The pause never crosses the deadline; `Immediate` has none, and paces by `UNLOAD_POLL`.
                     let pause = match (course.counted, course.deadline().remaining()) {
@@ -352,7 +337,7 @@ impl Launchd {
         let said = match self.read_up(id, &course.watch, reservation)? {
             Up::Idle => return Ok(()),
             Up::Queued => Some(Escalation::Unsent),
-            Up::Behind { .. } => Some(Escalation::Uncleared),
+            Up::Behind => Some(Escalation::Uncleared),
             Up::Run { held, .. } => course.escalation(held.id()),
         };
         Err(match said {
@@ -381,14 +366,14 @@ impl Launchd {
             });
         };
         let Added::Watching(registered) = watch.add(pid)? else {
-            return Ok(Up::Behind { shown: pid });
+            return Ok(Up::Behind);
         };
         // The process is held, and only then does launchd confirm that it is the job's: a pid that was
         // read and then reused is a process launchd does not name, and is left alone.
         let mut target = JobKill::new(&self.launchctl, name, reservation)?;
         let held = match hold_pid(&mut target, pid) {
             Ok(Hold::Held { process, .. }) => process,
-            Ok(Hold::Ended { .. }) => return Ok(Up::Behind { shown: pid }),
+            Ok(Hold::Ended { .. }) => return Ok(Up::Behind),
             Err(error) => return Err(stop_failed(name, "holding the process", error.into())),
         };
         Ok(Up::Run {
@@ -410,7 +395,7 @@ impl Launchd {
                 self.await_queued_start(name, reservation)?;
                 return Ok(Pass::Queued(began.elapsed()));
             }
-            Up::Behind { shown } => return Ok(Pass::Behind(shown)),
+            Up::Behind => return Ok(Pass::Behind),
             Up::Run {
                 pid,
                 registered,
@@ -441,7 +426,7 @@ impl Launchd {
             .confirm(pid, &held)
             .map_err(|e| stop_failed(name, "confirming the process", e))?
         {
-            return Ok(Pass::Behind(pid));
+            return Ok(Pass::Behind);
         }
         if send(&held, course, name, Signal::Kill)? {
             // The wait for the exit is on the hold too: the watch is spent by the wait that ran out. Whether it

@@ -90,7 +90,7 @@ fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_
         let child = child_reported.accept_line("the direct child to start and report its pid");
         let grandchild = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
-        mgr.stop(&id, Budget::DEFAULT).expect("stop");
+        mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
         ends_the_run.defuse();
 
         let exit = run.join().expect("the run thread").expect("run");
@@ -152,7 +152,7 @@ fn a_spec_without_cwd_runs_in_system32(#[fixture(scm_group)] _group: &Group) {
         cwd.eq_ignore_ascii_case(&system32),
         "a spec with no `cwd` runs where Task Scheduler starts the shim: {cwd} (want {system32})"
     );
-    mgr.stop(&id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
     mgr.uninstall(&id).expect("uninstall");
 }
 

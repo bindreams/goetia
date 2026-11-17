@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 use crate::decide::{self, ExternalConfig, Outcome};
 use crate::error::Error;
@@ -701,7 +703,7 @@ fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
         ("enable", &|id| mgr.enable(id)),
         ("disable", &|id| mgr.disable(id)),
         ("start", &|id| mgr.start(id, budget).map(drop)),
-        ("stop", &|id| mgr.stop(id, budget)),
+        ("stop", &|id| mgr.stop(id, Some(budget))),
         ("kill", &|id| mgr.kill(id)),
         ("request_restart", &|id| {
             mgr.request_restart(id).expect("this fake restarts natively")
@@ -880,7 +882,7 @@ fn single_verbs<'a>(
             budget,
             Box::new(move || mgr.start(id, budget).map(drop)),
         ),
-        ("stop", Step::Stop, budget, Box::new(move || mgr.stop(id, budget))),
+        ("stop", Step::Stop, budget, Box::new(move || mgr.stop(id, Some(budget)))),
         ("kill", Step::Kill, Budget::Unbounded, Box::new(|| mgr.kill(id))),
         (
             "uninstall",
@@ -972,8 +974,8 @@ fn a_sequence_refuses_a_step_run_twice() {
     let id = Id::try_from("frpc").unwrap();
     let mut sequence = fake.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
 
-    sequence.stop(&id, Budget::DEFAULT).unwrap();
-    drop(sequence.stop(&id, Budget::DEFAULT));
+    sequence.stop(&id, Some(Budget::DEFAULT)).unwrap();
+    drop(sequence.stop(&id, Some(Budget::DEFAULT)));
 }
 
 /// `restart --timeout 0` prepares `Start` and runs `request_start_after_stop`: a request for a start
@@ -986,7 +988,7 @@ fn a_prepared_start_covers_a_start_requested_after_a_stop() {
     let id = Id::try_from("frpc").unwrap();
     let mut sequence = fake.prepare(&[Step::Stop, Step::Start], Budget::Immediate).unwrap();
 
-    sequence.stop(&id, Budget::Immediate).unwrap();
+    sequence.stop(&id, Some(Budget::Immediate)).unwrap();
     let requested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drop(sequence.request_start_after_stop(&id));
     }));
@@ -1038,11 +1040,11 @@ fn a_verb_the_gate_refuses_spends_no_step() {
     let id = Id::try_from("frpc").unwrap();
     let mut sequence = fake.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).unwrap();
 
-    let refused = sequence.stop(&id, Budget::DEFAULT);
+    let refused = sequence.stop(&id, Some(Budget::DEFAULT));
 
     assert!(matches!(refused, Err(Error::NotInstalled { .. })), "{refused:?}");
     fake.install(&mk("frpc"), false).unwrap();
-    sequence.stop(&id, Budget::DEFAULT).unwrap();
+    sequence.stop(&id, Some(Budget::DEFAULT)).unwrap();
     sequence.start(&id, Budget::DEFAULT).unwrap();
 }
 
@@ -1502,4 +1504,62 @@ fn enable_of_a_service_and_of_an_unusable_blob_is_not_judged_by_a_schedule() {
 
     assert!(fake.is_enabled("frpc"), "the service is enabled");
     assert!(fake.is_enabled("odd"), "the unusable blob is enabled");
+}
+
+// The wait of a stop that names none =================================================================================
+
+/// The budget the one reservation of the last verb was made under.
+fn reserved_under(fake: &Fake) -> Budget {
+    fake.prepared().last().expect("a reservation").1
+}
+
+#[skuld::test]
+fn a_stop_that_names_no_budget_reserves_and_waits_for_the_daemons_own_stop() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+
+    ServiceManager::stop(&fake, &id, None).unwrap();
+
+    // The default `stop-action`: SIGTERM, 30s to answer it, and the teardown margin.
+    assert_eq!(reserved_under(&fake), Budget::Bounded(Duration::from_secs(40)));
+}
+
+#[skuld::test]
+fn a_stop_that_names_a_budget_keeps_it_whatever_the_daemons_stop_action_says() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+
+    ServiceManager::stop(&fake, &id, Some(Budget::Immediate)).unwrap();
+
+    assert_eq!(reserved_under(&fake), Budget::Immediate);
+}
+
+#[skuld::test]
+fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_and_waits_as_it_always_did() {
+    let fake = Fake::new();
+    fake.seed_unusable("odd");
+
+    ServiceManager::stop(&fake, &Id::try_from("odd").unwrap(), None).unwrap();
+
+    assert_eq!(reserved_under(&fake), Budget::DEFAULT);
+}
+
+/// A sequence's stop resolves its wait from the snapshot it reads: the fake's stalled stop reports the budget
+/// it was given as the time it waited.
+#[skuld::test]
+fn a_sequences_stop_that_names_no_budget_waits_for_the_daemons_own_stop() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_stop_stalls("frpc");
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+
+    let e = sequence.stop(&id, None).expect_err("a stalled stop");
+
+    assert!(
+        matches!(e, Error::WaitTimeout { waited, .. } if waited == Duration::from_secs(40)),
+        "{e:?}"
+    );
 }

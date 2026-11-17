@@ -402,3 +402,27 @@ fn a_deadline_ends_before_a_later_one_and_before_an_unbounded_one_and_never_the_
     assert!(!never.ends_before(soon));
     assert!(!never.ends_before(never));
 }
+
+#[skuld::test]
+fn a_stop_with_no_budget_waits_the_stop_actions_timeout_plus_the_teardown_margin() {
+    let secs = |n| Budget::Bounded(Duration::from_secs(n));
+    let action = |send_signal, timeout: Option<u64>| StopAction {
+        send_signal,
+        timeout: timeout.map(Duration::from_secs),
+    };
+
+    assert_eq!(
+        Budget::for_stop(Some(&action(StopSignal::Terminate, Some(30)))),
+        secs(40)
+    );
+    assert_eq!(
+        Budget::for_stop(Some(&action(StopSignal::Interrupt, Some(5)))),
+        secs(15)
+    );
+    assert_eq!(
+        Budget::for_stop(Some(&action(StopSignal::Terminate, None))),
+        Budget::Unbounded
+    );
+    assert_eq!(Budget::for_stop(Some(&action(StopSignal::Kill, None))), Budget::DEFAULT);
+    assert_eq!(Budget::for_stop(None), Budget::DEFAULT);
+}

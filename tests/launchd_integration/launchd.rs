@@ -634,7 +634,7 @@ fn disable_returns_the_plist_to_staging(#[fixture(launchd_group)] _group: &Group
         State::Running,
         "disable must not stop a job that was loaded"
     );
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 }
 
 // Runtime behavior ====================================================================================================
@@ -667,7 +667,7 @@ fn start_stop_status_reflect_reality(#[fixture(launchd_group)] _group: &Group) {
     assert_eq!(running.common().state, State::Running);
     assert!(running.common().pid.is_some(), "a running job should report a pid");
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 
@@ -697,7 +697,7 @@ fn a_daemon_that_ignores_the_stop_signal_is_ended_after_the_timeout(#[fixture(la
     listener.accept("the daemon to be ignoring SIGTERM");
 
     let stopping = std::time::Instant::now();
-    mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(90)))
+    mgr.stop(&spec.common().id, Some(Budget::Bounded(Duration::from_secs(90))))
         .expect("stop");
 
     assert!(stopping.elapsed() >= timeout, "the run was ended before its timeout");
@@ -725,7 +725,7 @@ fn a_kill_stop_ends_a_daemon_that_ignores_sigterm(#[fixture(launchd_group)] _gro
     listener.accept("the daemon to be ignoring SIGTERM");
 
     let stopping = std::time::Instant::now();
-    mgr.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(4)))
+    mgr.stop(&spec.common().id, Some(Budget::Bounded(Duration::from_secs(4))))
         .expect("stop");
 
     assert!(
@@ -831,7 +831,7 @@ fn killing_a_job_with_no_process_is_not_running(#[fixture(launchd_group)] _group
     );
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 }
 
@@ -879,7 +879,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded(#[fixture(launchd_grou
         "a refused install must not stop the daemon"
     );
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     assert!(
         matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })),
         "the same install must go through once the job is not loaded"
@@ -888,7 +888,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded(#[fixture(launchd_grou
     mgr.start(&spec.common().id, Budget::DEFAULT)
         .expect("start the updated daemon");
     listener.accept("the updated daemon to report in");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 }
 
 #[skuld::test]
@@ -1294,7 +1294,7 @@ fn a_stop_with_no_budget_waits_for_the_job_to_be_gone(#[fixture(launchd_group)] 
     let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
-    mgr.stop(&spec.common().id, Budget::Immediate)
+    mgr.stop(&spec.common().id, Some(Budget::Immediate))
         .expect("a stop with no budget still waits for the job to be gone, and completes");
 
     assert_eq!(
@@ -1330,7 +1330,7 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixtur
     listener.accept("the job to be up with SIGTERM ignored");
 
     let first = mgr
-        .stop(&spec.common().id, Budget::Bounded(Duration::from_millis(500)))
+        .stop(&spec.common().id, Some(Budget::Bounded(Duration::from_millis(500))))
         .expect_err("a job that ignores SIGTERM outlives the budget");
     assert!(
         matches!(first, goetia::Error::WaitTimeout { awaited: "stopped", .. }),
@@ -1345,7 +1345,7 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixtur
         print_field(&before.stdout, "pid = ")
     );
 
-    mgr.stop(&spec.common().id, Budget::Unbounded)
+    mgr.stop(&spec.common().id, Some(Budget::Unbounded))
         .expect("the second stop returns Ok once the job is gone");
     assert!(!is_loaded(&id), "the job is still loaded after the second stop");
 }
@@ -1462,7 +1462,7 @@ fn a_start_with_no_budget_is_ok_for_a_restart_always_job(#[fixture(launchd_group
     let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let _guard = Guard::install(&mgr, &spec);
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     mgr.start(&spec.common().id, Budget::Immediate)
         .expect("a start with no budget issues the request and returns Ok");

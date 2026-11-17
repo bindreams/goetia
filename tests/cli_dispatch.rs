@@ -353,7 +353,7 @@ impl Sequence for Direct<'_> {
     fn enable(&mut self, id: &Id) -> goetia::Result<()> {
         self.0.enable(id)
     }
-    fn stop(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&mut self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
     fn start(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
@@ -426,7 +426,7 @@ impl ServiceManager for FlakyManager {
         self.injected_start(id)?;
         self.inner.request_start_after_stop(id)
     }
-    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.inner.stop(id, budget)
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
@@ -434,9 +434,6 @@ impl ServiceManager for FlakyManager {
     }
     fn kind(&self, id: &Id) -> goetia::Result<goetia::spec::DaemonKind> {
         self.inner.kind(id)
-    }
-    fn stop_action(&self, id: &Id) -> goetia::Result<StopAction> {
-        self.inner.stop_action(id)
     }
     fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
         self.inner.run(id, out)
@@ -1217,7 +1214,7 @@ impl ServiceManager for PanicsOnStart {
     fn request_start_after_stop(&self, _id: &Id) -> goetia::Result<()> {
         panic!("restart on an absent id must never reach start")
     }
-    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
@@ -1225,9 +1222,6 @@ impl ServiceManager for PanicsOnStart {
     }
     fn kind(&self, id: &Id) -> goetia::Result<goetia::spec::DaemonKind> {
         self.0.kind(id)
-    }
-    fn stop_action(&self, id: &Id) -> goetia::Result<StopAction> {
-        self.0.stop_action(id)
     }
     fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
         self.0.run(id, out)
@@ -3473,7 +3467,7 @@ impl ServiceManager for PanicsOnStatus {
     fn request_start_after_stop(&self, id: &Id) -> goetia::Result<()> {
         self.0.request_start_after_stop(id)
     }
-    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
@@ -3481,9 +3475,6 @@ impl ServiceManager for PanicsOnStatus {
     }
     fn kind(&self, id: &Id) -> goetia::Result<goetia::spec::DaemonKind> {
         self.0.kind(id)
-    }
-    fn stop_action(&self, id: &Id) -> goetia::Result<StopAction> {
-        self.0.stop_action(id)
     }
     fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
         self.0.run(id, out)
@@ -4005,9 +3996,8 @@ fn restart_prepares_both_legs_under_its_budget() {
     let two_legs: &[(&str, &str)] = &[("stop", "frpc"), ("start", "frpc"), ("stop", "web"), ("start", "web")];
     let native: &[(&str, &str)] = &[("restart", "frpc"), ("restart", "web")];
     for (budget, given, one_request, sent) in [
-        // No flag: each daemon's own stop timeout (30s by default), the teardown margin and the start's
-        // usual wait.
-        (&[][..], Budget::Bounded(Duration::from_secs(50)), false, two_legs),
+        // No flag: a wait; each leg takes its own default as it is issued.
+        (&[][..], Budget::DEFAULT, false, two_legs),
         (&["--no-timeout"][..], Budget::Unbounded, false, two_legs),
         (
             &["--timeout", "5s"][..],

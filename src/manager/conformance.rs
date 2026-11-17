@@ -277,14 +277,14 @@ fn a_task_start_returns_and_stop_leaves_it_idle(
     mgr.install(&spec, false).expect("install");
 
     mgr.start(id, Budget::DEFAULT).expect("a task's start is a request");
-    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
 
     assert_eq!(
         task_status(mgr, id, "after stop").common.state,
         State::Idle,
         "a stopped task is idle, never stopped (id {id})"
     );
-    mgr.stop(id, Budget::DEFAULT)
+    mgr.stop(id, Some(Budget::DEFAULT))
         .expect("stop of an idle task must be Ok, not an error");
 }
 
@@ -434,7 +434,7 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
         "start must refuse a foreign id"
     );
     assert!(
-        mgr.stop(&spec.common().id, Budget::DEFAULT).is_err(),
+        mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).is_err(),
         "stop must refuse a foreign id"
     );
     assert!(
@@ -495,7 +495,7 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
     let spec = fresh_spec(mk, "idempotent-start-stop", cleanup);
     mgr.install(&spec, false).expect("install");
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT)
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT))
         .expect("stop on a never-started service must be Ok, not an error");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     assert_eq!(
@@ -512,7 +512,7 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
 
     mgr.start(&spec.common().id, Budget::DEFAULT)
         .expect("start on an already-running service must be Ok, not an error");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     assert_ne!(
         mgr.status(&spec.common().id).expect("status after stop").common().state,
         State::Running,
@@ -520,7 +520,7 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
         spec.common().id
     );
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT)
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT))
         .expect("stop on an already-stopped service must be Ok, not an error");
 }
 
@@ -541,7 +541,7 @@ fn kill_of_a_service_that_is_not_running_says_so(
     );
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     let stopped = mgr.kill(&spec.common().id);
     assert!(
         matches!(stopped.as_ref().err().map(Error::cause), Some(Error::NotRunning { id }) if id == spec.common().id.as_str()),
@@ -611,7 +611,7 @@ fn a_start_request_after_a_confirmed_stop_is_accepted(
     let spec = fresh_spec(mk, "start-after-stop", cleanup);
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     mgr.request_start_after_stop(&spec.common().id)
         .expect("a start request over a confirmed stop must be accepted");
@@ -651,7 +651,7 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
     );
     assert_list_is_complete_and_pid_agrees(mgr, &spec.common().id, cleanup);
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     assert_list_is_complete_and_pid_agrees(mgr, &spec.common().id, cleanup);
 }
 
@@ -731,7 +731,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
         ("enable", mgr.enable(id)),
         ("disable", mgr.disable(id)),
         ("start", mgr.start(id, Budget::DEFAULT).map(drop)),
-        ("stop", mgr.stop(id, Budget::DEFAULT)),
+        ("stop", mgr.stop(id, Some(Budget::DEFAULT))),
         ("kill", mgr.kill(id)),
     ]
     .into_iter()

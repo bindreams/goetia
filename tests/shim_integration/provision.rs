@@ -428,7 +428,7 @@ fn install_provisions_under_program_files(#[fixture(scm_group)] _group: &Group) 
         mgr.status(&spec.common().id).expect("status").common().state,
         State::Running
     );
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -598,7 +598,7 @@ fn runs_as(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16)) {
         State::Running,
         "{label}"
     );
-    mgr.stop(&id, Budget::DEFAULT)
+    mgr.stop(&id, Some(Budget::DEFAULT))
         .unwrap_or_else(|e| panic!("{label}: stop: {}", e.report()));
 }
 
@@ -1155,7 +1155,7 @@ fn stop_returns_after_the_services_process_has_exited(#[fixture(scm_group)] _gro
     started.accept("the service to report in");
     let running = ShimProcess::attach(&id);
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     assert!(
         running.has_exited(),
@@ -1178,7 +1178,7 @@ fn uninstall_right_after_stop_leaves_no_file(#[fixture(scm_group)] _group: &Grou
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the service to report in");
     let file = shim_in(&folder);
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     mgr.uninstall(&spec.common().id).expect("uninstall");
 
@@ -1208,7 +1208,7 @@ fn uninstall_right_after_an_unwaited_stop_succeeds_and_the_next_sweep_takes_the_
     started.accept("the service to report in");
     let running = ShimProcess::attach(&id);
     let file = shim_in(&folder);
-    mgr.stop(&spec.common().id, Budget::Immediate)
+    mgr.stop(&spec.common().id, Some(Budget::Immediate))
         .expect("request the stop");
 
     mgr.uninstall(&spec.common().id).expect("uninstall");
