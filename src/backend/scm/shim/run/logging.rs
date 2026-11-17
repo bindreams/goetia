@@ -8,7 +8,7 @@
 //!
 //! **The default file's folder is an install's.** `%ProgramData%\Goetia\logs` is made, and judged, by
 //! the elevated install that registers the shim ([`make_goetia_folders`](crate::backend::scm::folder::make_goetia_folders)); the shim, which runs as the
-//! daemon's account, makes no folder for its default log ([`Parents::Never`]). Where the folder is not
+//! daemon's account, makes no folder for its default log ([`LogKind::Default`]). Where the folder is not
 //! there, or the account cannot write in it, the append fails and the Event Log still gets the line.
 //!
 //! **Event Log.** Every failure also goes to the Windows Event Log, whose default ACL is far more
@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use super::os::{Channels, Parents, Real, Severity};
+use super::os::{Channels, LogKind, Real, Severity};
 use super::service::TABLE_NAME;
 use crate::backend::scm::folder::{logs_folder, program_data};
 use crate::error::Result;
@@ -88,10 +88,10 @@ impl Log {
 
     /// Whether the folders above the log `path` of daemon `id` are made when it is opened: not for the
     /// default log, whose folder an install made, and yes for any other, which is the user's own.
-    pub(crate) fn parents_of(&self, id: &str, path: &Path) -> Parents {
+    pub(crate) fn kind_of(&self, id: &str, path: &Path) -> LogKind {
         match self.default_log_path(id) {
-            Some(default) if default == path => Parents::Never,
-            Some(_) | None => Parents::Create,
+            Some(default) if default == path => LogKind::Default,
+            Some(_) | None => LogKind::Own,
         }
     }
 
@@ -128,13 +128,13 @@ impl Log {
         let files = match self.default_log_path(id) {
             Some(default) => log_destinations(daemon_log, default),
             None => daemon_log
-                .map(|path| (path.to_path_buf(), Parents::Create))
+                .map(|path| (path.to_path_buf(), LogKind::Own))
                 .into_iter()
                 .collect(),
         };
         let _ = files
             .iter()
-            .any(|(path, parents)| self.channels.append(path, &line, *parents).is_ok());
+            .any(|(path, kind)| self.channels.append(path, &line, *kind).is_ok());
         self.channels.event_log(severity, &line);
     }
 }
@@ -146,10 +146,10 @@ fn failure_line(id: &str, message: &str) -> String {
 /// The files to try for a line, in order, with whether each one's folders are made: the daemon's log,
 /// then the default, which has none made for it. When they are the same path, it is tried once, as the
 /// default.
-fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<(PathBuf, Parents)> {
+fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<(PathBuf, LogKind)> {
     match daemon_log {
-        Some(path) if path != default => vec![(path.to_path_buf(), Parents::Create), (default, Parents::Never)],
-        Some(_) | None => vec![(default, Parents::Never)],
+        Some(path) if path != default => vec![(path.to_path_buf(), LogKind::Own), (default, LogKind::Default)],
+        Some(_) | None => vec![(default, LogKind::Default)],
     }
 }
 

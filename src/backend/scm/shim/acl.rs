@@ -30,7 +30,7 @@ use crate::backend::scm::sid::sid_display;
 use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_installer};
 
 #[cfg(windows)]
-pub(crate) use protected::{Descriptor, is_as_wanted, missing_components};
+pub(crate) use protected::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, missing_components};
 #[cfg(all(windows, any(test, feature = "testing")))]
 #[doc(hidden)]
 pub use system::{Dacl, kernel_object_dacl};

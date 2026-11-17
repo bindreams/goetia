@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::*;
-use crate::backend::scm::shim::run::os::Parents;
+use crate::backend::scm::shim::run::os::LogKind;
 use crate::backend::scm::shim::run::os::fake::{
     FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, tree_kill_refused,
     wait_failed, wait_failed_with_code,
@@ -347,9 +347,9 @@ fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs()
 /// runs as the service's account, makes no folder for.
 #[skuld::test]
 fn the_daemons_log_has_its_folders_made_only_when_it_is_the_users_own() {
-    for (logs, parents) in [
-        (Some(PathBuf::from(DAEMON_LOG)), Parents::Create),
-        (None, Parents::Never),
+    for (logs, kind) in [
+        (Some(PathBuf::from(DAEMON_LOG)), LogKind::Own),
+        (None, LogKind::Default),
     ] {
         let fake = FakeGuard::new();
         let daemon = FakeProcess::new();
@@ -359,7 +359,7 @@ fn the_daemons_log_has_its_folders_made_only_when_it_is_the_users_own() {
         let launched = launch(&spec_logging_to(logs.clone()), &supervisor(&fake), ID);
 
         assert!(launched.is_ok(), "{logs:?}");
-        assert_eq!(fake.opened_log_parents(0), parents, "{logs:?}");
+        assert_eq!(fake.opened_log_kind(0), kind, "{logs:?}");
         drop(launched);
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     }

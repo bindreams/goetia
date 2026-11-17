@@ -264,7 +264,7 @@ fn own_instance(
 /// it, so one fault is one line.
 fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &InstanceId) {
     let line = format!("{}\n", instance.marker());
-    let Ok(mut file) = supervisor.os.open_log(logs, supervisor.log.parents_of(id, logs)) else {
+    let Ok(mut file) = supervisor.os.open_log(logs, supervisor.log.kind_of(id, logs)) else {
         return;
     };
     if let Err(e) = file.write_all(line.as_bytes()) {

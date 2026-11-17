@@ -8,23 +8,23 @@ use crate::error::Error;
 
 const LINE: &str = "goetia-shim[svc]: the line";
 
-fn appended(path: &Path, parents: Parents, ok: bool) -> ChannelCall {
+fn appended(path: &Path, kind: LogKind, ok: bool) -> ChannelCall {
     ChannelCall::Append {
         path: path.to_path_buf(),
         line: LINE.to_string(),
-        parents,
+        kind,
         ok,
     }
 }
 
 /// The default log: the shim makes no folder for it.
 fn appended_default(path: &Path, ok: bool) -> ChannelCall {
-    appended(path, Parents::Never, ok)
+    appended(path, LogKind::Default, ok)
 }
 
 /// The daemon's own `logs` path, whose folders are the user's to name and so are made.
 fn appended_own(path: &Path, ok: bool) -> ChannelCall {
-    appended(path, Parents::Create, ok)
+    appended(path, LogKind::Own, ok)
 }
 
 fn reported() -> ChannelCall {
@@ -131,11 +131,11 @@ fn parents_are_made_for_every_path_but_the_default() {
 
     assert_eq!(
         (
-            log.parents_of("svc", &Path::new("logs").join("svc.log")),
-            log.parents_of("svc", Path::new(r"D:\logs\mine.log")),
-            log.parents_of("other", &Path::new("logs").join("svc.log")),
+            log.kind_of("svc", &Path::new("logs").join("svc.log")),
+            log.kind_of("svc", Path::new(r"D:\logs\mine.log")),
+            log.kind_of("other", &Path::new("logs").join("svc.log")),
         ),
-        (Parents::Never, Parents::Create, Parents::Create)
+        (LogKind::Default, LogKind::Own, LogKind::Own)
     );
 }
 
@@ -206,7 +206,7 @@ fn log_destinations_try_the_daemon_log_then_the_default() {
 
     assert_eq!(
         log_destinations(Some(&daemon), default.clone()),
-        vec![(daemon, Parents::Create), (default, Parents::Never)]
+        vec![(daemon, LogKind::Own), (default, LogKind::Default)]
     );
 }
 
@@ -214,7 +214,7 @@ fn log_destinations_try_the_daemon_log_then_the_default() {
 fn log_destinations_try_the_default_once_when_there_is_no_daemon_log() {
     let default = PathBuf::from("default.log");
 
-    assert_eq!(log_destinations(None, default.clone()), vec![(default, Parents::Never)]);
+    assert_eq!(log_destinations(None, default.clone()), vec![(default, LogKind::Default)]);
 }
 
 #[skuld::test]
@@ -223,7 +223,7 @@ fn log_destinations_do_not_retry_the_default_when_it_is_the_daemon_log() {
 
     assert_eq!(
         log_destinations(Some(&default), default.clone()),
-        vec![(default, Parents::Never)]
+        vec![(default, LogKind::Default)]
     );
 }
 

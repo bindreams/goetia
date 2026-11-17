@@ -56,13 +56,21 @@ fn records() -> (TempDir, Runs) {
     (dir, runs)
 }
 
-/// [`records`] with the task's directory made plainly, for a write that gets as far as making it. Making
-/// it as an install does names Administrators as its owner, which needs an elevated token (a test of the
-/// `scm` group makes it); a directory that is there has only its permissions set.
+/// [`records`] with the task's directory and its default log made plainly, for a write that gets as far as
+/// making them. Making them as an install does names Administrators as their owner, which needs an
+/// elevated token (a test of the `scm` group makes them); ones that are there have only their permissions
+/// set.
 fn made_records() -> (TempDir, Runs) {
     let (dir, runs) = records();
     std::fs::create_dir_all(records_dir(&dir)).unwrap();
+    let logs = crate::backend::scm::folder::logs_folder(dir.path());
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(default_log(&dir), "").unwrap();
     (dir, runs)
+}
+
+fn default_log(dir: &TempDir) -> PathBuf {
+    crate::backend::scm::default_log::path_in(&crate::backend::scm::folder::logs_folder(dir.path()), "nightly")
 }
 
 fn records_dir(dir: &TempDir) -> PathBuf {
@@ -656,7 +664,8 @@ fn trustees_of(dir: &std::path::Path) -> Vec<Sid> {
 }
 
 /// A reinstall as another user must leave the shim, which runs as that user, able to write its
-/// records: the directory's permissions are rewritten by every write, an update included.
+/// records and append to its default log: the permissions of the directory and of the log are rewritten by
+/// every write, an update included.
 #[skuld::test]
 fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
     let (dir, runs) = made_records();
@@ -681,6 +690,7 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
     )
     .unwrap();
     assert!(trustees_of(&records_dir(&dir)).contains(&me));
+    assert!(trustees_of(&default_log(&dir)).contains(&me));
 
     scm.task_write_with(
         &spec,
@@ -695,6 +705,9 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
     let trustees = trustees_of(&records_dir(&dir));
     assert!(trustees.contains(&users), "the new account is named");
     assert!(!trustees.contains(&me), "the old account is not");
+    let trustees = trustees_of(&default_log(&dir));
+    assert!(trustees.contains(&users), "the new account may append to the default log");
+    assert!(!trustees.contains(&me), "the old account may not");
 }
 
 // Before any write ====================================================================================================

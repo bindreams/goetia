@@ -183,13 +183,21 @@ fn a_service_of_a_standard_account_leaves_no_folder_that_refuses_a_task_install(
         .expect("a valid service");
         mgr.install(&spec, false)
             .unwrap_or_else(|e| panic!("install the service as {account}: {}", e.report()));
+        let log = support::shim_default_log(&support::program_data(), service.as_str());
+        assert!(
+            log.is_file(),
+            "the install made {} for the account to append to; the shim makes none",
+            log.display()
+        );
         mgr.start(&service, Budget::Unbounded)
             .unwrap_or_else(|e| panic!("start the service as {account}: {}", e.report()));
         started.accept("the program of a service run by a standard account");
-        let log = support::shim_default_log(&support::program_data(), service.as_str());
         assert!(log.is_file(), "the shim of {account} opened {}", log.display());
         mgr.stop(&service, Budget::DEFAULT)
             .unwrap_or_else(|e| panic!("stop the service as {account}: {}", e.report()));
+        mgr.uninstall(&service)
+            .unwrap_or_else(|e| panic!("uninstall the service as {account}: {}", e.report()));
+        assert!(log.is_file(), "an uninstall keeps {}", log.display());
 
         let task = TaskGuard::new();
         mgr.install(&task_as(&task.id, User::Root, None), false)
@@ -277,6 +285,8 @@ fn the_shim_of_a_standard_accounts_task_writes_its_failure_to_the_default_log(#[
         let spec = task_spec(id, missing_program(&host), None, User::Name(account.to_owned()), None);
         mgr.install(&spec, false)
             .unwrap_or_else(|e| panic!("install as {account}: {}", e.report()));
+        let log = support::shim_default_log(&support::program_data(), id.as_str());
+        assert!(log.is_file(), "{account}: the install made {}", log.display());
 
         let refused = mgr.run(id, &mut Vec::new()).expect_err("a program that is not there");
 

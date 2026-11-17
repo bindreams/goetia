@@ -623,7 +623,7 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
         (DaemonSpec::Task(_), None) => Err(None),
         (_, logs) => match log.daemon_log_path(id, logs) {
             Some(path) => os
-                .open_log(&path, log.parents_of(id, &path))
+                .open_log(&path, log.kind_of(id, &path))
                 .map_err(|e| Some(log_open_failed(&path, &e))),
             None => Err(Some(NO_LOG_FILE.to_string())),
         },

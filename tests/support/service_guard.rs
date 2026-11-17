@@ -4,7 +4,8 @@
 //! removes is created, in creation order: locals drop in reverse, so a thing is removed only
 //! after everything that uses it.
 //!
-//! On Windows it also removes a task of the same id and its run records (`testing::remove_task`).
+//! On Windows it also removes a task of the same id and its run records (`testing::remove_task`), and
+//! the default log an install makes for the daemon.
 //!
 //! On macOS it boots the job and a task's timer (`<id>@timer`) out and removes only
 //! `/Library/LaunchDaemons/<id>.plist` and `<id>@timer.plist`, not goetia's staging directory. A
@@ -95,6 +96,12 @@ fn cleanup(id: &str) -> Vec<String> {
         goetia::testing::remove_task(&task);
         problems.extend(remove_path_retrying(&super::task_records(id), true));
     }
+
+    // The default log an install made for the daemon, which an uninstall keeps.
+    problems.extend(remove_path_retrying(
+        &super::shim_default_log(&super::program_data(), id),
+        false,
+    ));
 
     // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST,
     // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE.

@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 
 use cosca::Containment;
 
-use super::{Channels, Os, Parents, Severity, Spawned};
+use super::{Channels, Os, LogKind, Severity, Spawned};
 use crate::backend::scm::shim::run::logging::Log;
 
 /// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
@@ -109,7 +109,7 @@ pub(crate) enum ChannelCall {
     Append {
         path: PathBuf,
         line: String,
-        parents: Parents,
+        kind: LogKind,
         ok: bool,
     },
     EventLog {
@@ -328,9 +328,9 @@ struct State {
     spawns: VecDeque<SpawnReply>,
     threads: VecDeque<ThreadReply>,
     open_log_failures: Vec<PathBuf>,
-    /// Every log opened, in order: the path asked for, whether its parents were to be made, and a
+    /// Every log opened, in order: the path asked for, which kind of log it was, and a
     /// handle to what was opened, which is what the code under test writes into.
-    opened_logs: Vec<(PathBuf, Parents, File)>,
+    opened_logs: Vec<(PathBuf, LogKind, File)>,
     append_failures: Vec<PathBuf>,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
@@ -460,8 +460,8 @@ impl Fake {
         lock(&self.shared.state).opened_logs[n].0.clone()
     }
 
-    /// Whether the parents of the `n`th log opened were to be made.
-    pub(crate) fn opened_log_parents(&self, n: usize) -> Parents {
+    /// Which kind of log the `n`th log opened was asked for.
+    pub(crate) fn opened_log_kind(&self, n: usize) -> LogKind {
         lock(&self.shared.state).opened_logs[n].1
     }
 
@@ -656,7 +656,7 @@ impl Os for Fake {
         spawned
     }
 
-    fn open_log(&self, path: &Path, parents: Parents) -> io::Result<File> {
+    fn open_log(&self, path: &Path, kind: LogKind) -> io::Result<File> {
         let mut state = lock(&self.shared.state);
         *state.calls.entry(Op::OpenLog).or_default() += 1;
         match state.open_log_failures.iter().position(|failing| failing == path) {
@@ -669,7 +669,7 @@ impl Os for Fake {
                 let file = tempfile::tempfile()?;
                 lock(&self.shared.state)
                     .opened_logs
-                    .push((path.to_path_buf(), parents, file.try_clone()?));
+                    .push((path.to_path_buf(), kind, file.try_clone()?));
                 Ok(file)
             }
         }
@@ -696,7 +696,7 @@ impl Drop for ThreadExit {
 }
 
 impl Channels for Fake {
-    fn append(&self, path: &Path, line: &str, parents: Parents) -> io::Result<()> {
+    fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
         let mut state = lock(&self.shared.state);
         let failing = match state.append_failures.iter().position(|failing| failing == path) {
             Some(i) => {
@@ -708,7 +708,7 @@ impl Channels for Fake {
         state.channel_calls.push(ChannelCall::Append {
             path: path.to_path_buf(),
             line: line.to_string(),
-            parents,
+            kind,
             ok: !failing,
         });
         if failing {

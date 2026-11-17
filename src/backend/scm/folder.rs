@@ -52,6 +52,14 @@ pub(crate) fn make_goetia_folders(program_data: &Path, judge: impl Fn(&Path) -> 
     Ok(())
 }
 
+/// Makes `folder`, whose parent exists, with `wanted` when it is missing; one that is there must be as
+/// `wanted` makes it (owner, protection and entries) or it is refused ([`Error::FolderNotAsMade`]). A folder
+/// is never repaired or adopted, and one that appears after it was found missing is refused.
+pub(crate) fn ensure_as_made(folder: &Path, wanted: &Descriptor) -> Result<()> {
+    let _ = (folder, wanted);
+    todo!()
+}
+
 /// The folder `id` names, for the machine. `name` stands for it in an error.
 pub(crate) fn known_folder(id: &GUID, name: &str) -> Result<PathBuf> {
     let mut path: *mut u16 = std::ptr::null_mut();

@@ -28,7 +28,7 @@ fn sorted(aces: &[Ace]) -> Vec<&Ace> {
 }
 
 #[cfg(windows)]
-pub(crate) use system::{Descriptor, missing_components};
+pub(crate) use system::{DEFAULT_LOG_ACCESS, Descriptor, missing_components};
 
 #[cfg(windows)]
 mod system {
@@ -70,6 +70,17 @@ mod system {
     /// What names only the owner: Administrators own it, and the DACL is left for what it is made in to
     /// inherit. Naming `BA` needs it enabled in the creator's token, like [`LOCK`].
     const INHERITING: &str = "O:BA";
+
+    /// The folder of the shims' default logs: Administrators own it; SYSTEM and Administrators have full
+    /// control of it and of what is made in it, and nobody else any right, so nobody else can list it,
+    /// make a file in it or plant a link in it. Nothing is inherited from `%ProgramData%`. Naming `BA`
+    /// needs it enabled in the creator's token, like [`LOCK`].
+    const LOGS: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    /// What the shim's default log is opened for, and all an account is granted on it: append data
+    /// (`0x4`), read attributes (`0x80`) and synchronize (`0x100000`). `std`'s own append open asks
+    /// for write attributes as well, which this denies.
+    pub(crate) const DEFAULT_LOG_ACCESS: u32 = 0x10_0084;
 
     /// A security descriptor that a file or folder is created with.
     pub(crate) struct Descriptor {
@@ -125,6 +136,29 @@ mod system {
             Self::from_sddl(&format!(
                 "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OIIO;0x1300af;;;{principal})(A;;0x1200eb;;;{principal})"
             ))
+        }
+
+        /// The permissions of `Goetia\logs`: see [`LOGS`].
+        pub(crate) fn for_logs() -> Result<Self> {
+            todo!()
+        }
+
+        /// The permissions of a daemon's default log file: Administrators own it; SYSTEM and Administrators
+        /// have full control; `account`, the account the daemon's shim runs as, may append to it
+        /// ([`DEFAULT_LOG_ACCESS`]) and do nothing else, so it cannot read, truncate, delete or re-permission
+        /// what it wrote. The DACL is protected. A SID that is not whole is an error.
+        pub(crate) fn for_default_log(account: &Sid) -> Result<Self> {
+            let _ = account;
+            todo!()
+        }
+
+        /// Opens the file `path` for `WRITE_DAC` and attribute reads without following a link at it, making
+        /// it empty with this descriptor when it is not there (`OPEN_ALWAYS`). What is there is not changed;
+        /// [`Descriptor::set_dacl_of`] on the handle sets its permissions. The file is shared for everything,
+        /// so a shim that holds it open does not stop this.
+        pub(crate) fn open_always_for_dacl(&self, path: &Path) -> io::Result<File> {
+            let _ = path;
+            todo!()
         }
 
         /// A descriptor written as SDDL.

@@ -8,7 +8,7 @@ use skuld::TempDir;
 use super::*;
 use crate::backend::scm::shim::run::logging::Log;
 use crate::backend::scm::shim::run::os::fake::FakeGuard;
-use crate::backend::scm::shim::run::os::{Channels, Parents, Real, Severity};
+use crate::backend::scm::shim::run::os::{Channels, LogKind, Real, Severity};
 use crate::backend::scm::shim::run::service::finish;
 
 /// Names what a child of this test binary does: a code to end itself with, or an index into [`reports`].
@@ -70,8 +70,8 @@ impl<'a> Children<'a> {
 struct FileChannels;
 
 impl Channels for FileChannels {
-    fn append(&self, path: &Path, line: &str, parents: Parents) -> io::Result<()> {
-        Real.append(path, line, parents)
+    fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
+        Real.append(path, line, kind)
     }
 
     fn event_log(&self, _severity: Severity, _line: &str) {}
