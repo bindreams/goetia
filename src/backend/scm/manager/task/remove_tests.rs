@@ -499,6 +499,35 @@ fn uninstall_of_an_id_that_is_absent_removes_the_records_under_the_install_lock(
     );
 }
 
+/// The sweep takes the install lock itself, so it runs after the records' removal has let the lock go.
+#[skuld::test]
+fn the_sweep_of_an_absent_id_runs_after_the_install_lock_is_released() {
+    struct Lock<'a>(&'a Cell<bool>);
+    impl Drop for Lock<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let (_dir, _records_dir, runs) = records();
+    let released = Cell::new(false);
+    let swept = Cell::new(false);
+
+    scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            || Ok(Lock(&released)),
+            || {
+                assert!(released.get(), "the lock was still held when the sweep began");
+                swept.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert!(swept.get());
+}
+
 /// An uninstall that died after its records' directory went, and before it removed its marker, leaves the
 /// marker, which makes the id's `run` back off for good. The next uninstall of the id, which is absent,
 /// takes it away, under the lock.
