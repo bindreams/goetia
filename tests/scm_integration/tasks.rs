@@ -101,6 +101,35 @@ fn an_up_to_date_install_of_a_task_makes_a_deleted_default_log_again(#[fixture(s
     assert!(log.is_file(), "the install made {} again", log.display());
 }
 
+/// A `logs:` in goetia's log folder is refused at a task's install, as at a service's
+/// (`managed::a_logs_in_goetias_log_folder_is_refused_at_install`). Nothing is installed.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_logs_in_goetias_log_folder_is_refused_at_a_tasks_install(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    for named in [id.as_str(), "another-daemon"] {
+        let logs = support::shim_default_log(&support::program_data(), named);
+        let spec = task_spec(
+            id,
+            vec![support::current_exe_str()],
+            Some(SCHEDULE),
+            User::Root,
+            Some(&logs),
+        );
+
+        let refused = mgr.install(&spec, false).expect_err("a `logs:` in the logs folder");
+
+        let said = refused.report().to_string();
+        assert!(said.contains("is inside goetia's own log folder"), "{named}: {said}");
+        let absent = mgr.status(id).expect_err("nothing was installed");
+        assert!(
+            matches!(absent.cause(), Error::NotInstalled { .. }),
+            "{named}: {absent:?}"
+        );
+    }
+}
+
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_task_installs_and_uninstalls(#[fixture(scm_group)] _group: &Group) {
     let guard = TaskGuard::new();

@@ -116,6 +116,9 @@ pub(crate) enum ChannelCall {
         severity: Severity,
         line: String,
     },
+    HoldDefault {
+        path: PathBuf,
+    },
 }
 
 // Process -------------------------------------------------------------------------------------------------------------
@@ -716,6 +719,13 @@ impl Channels for Fake {
         } else {
             Ok(())
         }
+    }
+
+    fn hold_default(&self, path: &Path) -> io::Result<()> {
+        lock(&self.shared.state).channel_calls.push(ChannelCall::HoldDefault {
+            path: path.to_path_buf(),
+        });
+        Ok(())
     }
 
     fn event_log(&self, severity: Severity, line: &str) {

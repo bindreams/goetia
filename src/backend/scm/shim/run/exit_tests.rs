@@ -71,7 +71,7 @@ struct FileChannels;
 
 impl Channels for FileChannels {
     fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
-        Real.append(path, line, kind)
+        Real::default().append(path, line, kind)
     }
 
     fn event_log(&self, _severity: Severity, _line: &str) {}

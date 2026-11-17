@@ -24,6 +24,9 @@ use crate::backend::scm::shim::run::logging::Log;
 use crate::backend::scm::shim::run::os::fake::FakeGuard;
 use crate::backend::scm::shim::run::service::build_command;
 use crate::backend::scm::shim::run::test_support::not_found;
+use crate::backend::scm::sid::sid_display;
+use crate::backend::scm::test_support::{A_STRANGER, permit_only};
+use crate::elevation::test_support::process_user_sid;
 
 /// Holds a real daemon and ends it when dropped, so a failing test leaves no sleeper behind. Made
 /// before the spawn it will hold.
@@ -63,7 +66,7 @@ fn send_kill_tree_ends_a_job_contained_daemon_and_its_grandchild() {
     cmd.stdout(Stdio::from_file(File::from(OwnedHandle::from(writer))))
         .expect("redirect the daemon's stdout to the pipe");
     let mut reap = Reap::default();
-    let daemon = reap.hold(Real.spawn(cmd).expect("spawn the daemon"));
+    let daemon = reap.hold(Real::default().spawn(cmd).expect("spawn the daemon"));
     let mut line = String::new();
     BufReader::new(reader)
         .read_line(&mut line)
@@ -85,7 +88,8 @@ fn send_kill_tree_ends_a_job_contained_daemon_and_its_grandchild() {
 fn kill_ends_a_real_daemon() {
     let mut reap = Reap::default();
     let daemon = reap.hold(
-        Real.spawn(powershell("Start-Sleep -Seconds 300"))
+        Real::default()
+            .spawn(powershell("Start-Sleep -Seconds 300"))
             .expect("spawn the daemon"),
     );
 
@@ -99,7 +103,7 @@ fn kill_ends_a_real_daemon() {
 #[skuld::test]
 fn wait_gives_the_same_exit_code_every_time() {
     let mut reap = Reap::default();
-    let daemon = reap.hold(Real.spawn(powershell("exit 3")).expect("spawn the daemon"));
+    let daemon = reap.hold(Real::default().spawn(powershell("exit 3")).expect("spawn the daemon"));
 
     let first = daemon.wait().expect("the first wait");
     let second = daemon.wait().expect("the second wait");
@@ -119,7 +123,7 @@ fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir:
         (absolute.as_path(), Some(ERROR_FILE_NOT_FOUND as i32)),
     ];
     for (missing, raw) in os_code {
-        let refused = Real
+        let refused = Real::default()
             .spawn(cosca::run([missing]))
             .err()
             .expect("the binary does not exist");
@@ -223,7 +227,8 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     let mut reap = Reap::default();
 
     let daemon = reap.hold(
-        Real.spawn(build_command(&spec, &Real, &fake.log(), ID))
+        Real::default()
+            .spawn(build_command(&spec, &Real::default(), &fake.log(), ID))
             .expect("spawn the daemon"),
     );
     let contained = daemon.containment();
@@ -296,7 +301,8 @@ fn a_task_programs_env_and_cwd_are_the_specs_over_the_inherited_ones(#[fixture(t
     let mut reap = Reap::default();
 
     let program = reap.hold(
-        Real.spawn(build_command(&spec, &Real, &fake.log(), ID))
+        Real::default()
+            .spawn(build_command(&spec, &Real::default(), &fake.log(), ID))
             .expect("spawn the program"),
     );
     program.wait().expect("the program exits");
@@ -322,7 +328,8 @@ fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] di
     let mut reap = Reap::default();
 
     let program = reap.hold(
-        Real.spawn(build_command(&spec, &Real, &log, ID))
+        Real::default()
+            .spawn(build_command(&spec, &Real::default(), &log, ID))
             .expect("spawn the program"),
     );
     program.wait().expect("the program exits");
@@ -341,7 +348,7 @@ fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] di
 fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("Goetia").join("logs").join("x.log");
 
-    Real.append(&path, "the line", LogKind::Own).expect("append");
+    Real::default().append(&path, "the line", LogKind::Own).expect("append");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("the file was written"),
@@ -356,18 +363,19 @@ fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] d
 fn append_makes_nothing_of_the_default_log_and_fails_when_it_is_missing(#[fixture(temp_dir)] dir: &Path) {
     let missing = dir.join("Goetia").join("logs");
 
-    let result = Real.append(&missing.join("x.log"), "the line", LogKind::Default);
+    let result = Real::default().append(&missing.join("x.log"), "the line", LogKind::Default);
 
     assert_eq!(result.expect_err("no folder").kind(), io::ErrorKind::NotFound);
     assert!(!dir.join("Goetia").exists(), "a folder was made");
 
     std::fs::create_dir_all(&missing).expect("the folder an install made");
-    let result = Real.append(&missing.join("x.log"), "the line", LogKind::Default);
+    let result = Real::default().append(&missing.join("x.log"), "the line", LogKind::Default);
     assert_eq!(result.expect_err("no file").kind(), io::ErrorKind::NotFound);
     assert!(!missing.join("x.log").exists(), "the file was made");
 
     std::fs::write(missing.join("x.log"), "").expect("the file an install made");
-    Real.append(&missing.join("x.log"), "the line", LogKind::Default)
+    Real::default()
+        .append(&missing.join("x.log"), "the line", LogKind::Default)
         .expect("append where the file is");
     assert_eq!(
         std::fs::read_to_string(missing.join("x.log")).expect("the file was written"),
@@ -383,17 +391,85 @@ fn append_refuses_a_default_log_that_is_a_link(#[fixture(temp_dir)] dir: &Path) 
     std::fs::write(&log, "").expect("the file an install made");
     crate::backend::scm::test_support::set_reparse_point(&log, 0xA000_0001, b"x");
 
-    let refused = Real.append(&log, "the line", LogKind::Default).expect_err("a link");
+    let refused = Real::default()
+        .append(&log, "the line", LogKind::Default)
+        .expect_err("a link");
 
     assert!(refused.to_string().contains(&log.display().to_string()), "{refused}");
+}
+
+/// The shim holds its default log from its start: a line is written through that handle, whatever has
+/// happened to the path since (here, the file is moved; a line written by opening the path again would be
+/// lost or would make a new file).
+#[skuld::test]
+fn a_held_default_log_is_appended_through_the_handle_that_was_held(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("x.log");
+    let moved = dir.join("moved.log");
+    std::fs::write(&log, "first\n").expect("the file an install made");
+    let real = Real::default();
+    real.hold_default(&log).expect("hold the default log");
+    std::fs::rename(&log, &moved).expect("move the file under the handle");
+
+    real.append(&log, "the line", LogKind::Default)
+        .expect("append through the held handle");
+
+    assert_eq!(
+        std::fs::read_to_string(&moved).expect("the held file"),
+        "first\nthe line\n"
+    );
+    assert!(!log.exists(), "the path was opened again");
+}
+
+/// Holding makes nothing, as appending the default log does not: a log that is not there is
+/// [`NotFound`](io::ErrorKind::NotFound), and a line for it is then tried by its path.
+#[skuld::test]
+fn holding_the_default_log_makes_nothing_and_fails_when_it_is_missing(#[fixture(temp_dir)] dir: &Path) {
+    let missing = dir.join("Goetia").join("logs").join("x.log");
+    let real = Real::default();
+
+    let refused = real.hold_default(&missing).expect_err("no folder, no file");
+
+    assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+    assert!(!dir.join("Goetia").exists(), "a folder was made");
+    assert_eq!(
+        real.append(&missing, "the line", LogKind::Default)
+            .expect_err("nothing held, nothing there")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+/// An account change takes the shim's account out of the log's permissions while the old shim still runs
+/// (SCM does not restart a service it updates). Its own lines still reach the log, through the handle it
+/// opened at its start; a shim that opened the path for each line would lose them.
+#[skuld::test]
+fn the_shims_own_lines_after_its_account_was_taken_out_land_in_the_held_log(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("x.log");
+    let me = sid_display(&process_user_sid());
+    std::fs::write(&log, "").expect("the file an install made");
+    permit_only(&log, &me);
+    let real = Real::default();
+    real.hold_default(&log).expect("hold the default log");
+
+    permit_only(&log, A_STRANGER);
+
+    real.append(&log, "the line", LogKind::Default)
+        .expect("a line through the held handle");
+    let reopened = Real::default().append(&log, "lost", LogKind::Default);
+    assert_eq!(
+        reopened.expect_err("a shim that opens it for each line").kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    permit_only(&log, &me);
+    assert_eq!(std::fs::read_to_string(&log).expect("the log"), "the line\n");
 }
 
 #[skuld::test]
 fn append_appends_rather_than_truncates(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("x.log");
 
-    Real.append(&path, "first", LogKind::Own).expect("append");
-    Real.append(&path, "second", LogKind::Own).expect("append");
+    Real::default().append(&path, "first", LogKind::Own).expect("append");
+    Real::default().append(&path, "second", LogKind::Own).expect("append");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("the file was written"),
@@ -407,7 +483,7 @@ fn append_fails_and_writes_nothing_when_the_path_cannot_be_opened(#[fixture(temp
     std::fs::write(&file, "x").expect("a regular file to use as a parent");
 
     // A directory cannot be created under a regular file.
-    let result = Real.append(&file.join("x.log"), "lost", LogKind::Own);
+    let result = Real::default().append(&file.join("x.log"), "lost", LogKind::Own);
 
     assert!(result.is_err());
     assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
@@ -421,7 +497,7 @@ fn open_log_fails_with_the_os_reason_when_the_path_cannot_be_opened(#[fixture(te
     std::fs::write(&file, "x").expect("a regular file to use as a parent");
 
     // A directory cannot be created under a regular file.
-    let refused = Real
+    let refused = Real::default()
         .open_log(&file.join("daemon.log"), LogKind::Own)
         .expect_err("a log under a regular file");
 
@@ -435,11 +511,12 @@ fn open_log_fails_with_the_os_reason_when_the_path_cannot_be_opened(#[fixture(te
 fn open_log_makes_nothing_of_the_default_log(#[fixture(temp_dir)] dir: &Path) {
     let log = dir.join("Goetia").join("logs").join("daemon.log");
 
-    let refused = Real.open_log(&log, LogKind::Default).expect_err("no folder");
+    let refused = Real::default().open_log(&log, LogKind::Default).expect_err("no folder");
 
     assert_eq!(refused.kind(), io::ErrorKind::NotFound);
     assert!(!dir.join("Goetia").exists(), "a folder was made");
-    Real.open_log(&log, LogKind::Own)
+    Real::default()
+        .open_log(&log, LogKind::Own)
         .expect("a user's own `logs` parents are made");
     assert!(log.is_file());
 }

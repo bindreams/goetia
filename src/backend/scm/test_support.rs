@@ -104,6 +104,18 @@ pub(crate) fn set_dacl(
     descriptor.set_dacl_of(&object)
 }
 
+/// An account no test runs as.
+#[cfg(windows)]
+pub(crate) const A_STRANGER: &str = "S-1-5-21-1-2-3-1000";
+
+/// Makes the permissions of the existing file `path` one entry, full access for the account `sid` (SDDL
+/// text), and nothing else, administrators included. The file's owner may still change them.
+#[cfg(windows)]
+pub(crate) fn permit_only(path: &std::path::Path, sid: &str) {
+    let only = crate::backend::scm::shim::acl::Descriptor::from_sddl(&format!("D:P(A;;FA;;;{sid})")).unwrap();
+    set_dacl(&only, path).unwrap();
+}
+
 /// Makes a directory with a file in it at `path`. Where a file is expected, deleting it as a file fails
 /// for a reason that is no handle and no pending delete, whoever runs it. The tempdir the tests make it
 /// in removes it. A task's records directory names its account without the right to add a subdirectory,

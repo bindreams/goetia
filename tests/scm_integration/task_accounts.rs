@@ -3,9 +3,11 @@
 
 use std::process::{Command, Output};
 
+use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
+use goetia::testing::sid_of;
 
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
@@ -230,6 +232,11 @@ fn a_task_installed_as_another_account_over_the_first_ones_records_still_records
 
     mgr.install(&as_account("LocalService"), false)
         .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
+    assert_eq!(
+        accounts_of_default_log(id),
+        [sid_of(5, &LOCAL_SERVICE)],
+        "a new task names its account alone"
+    );
     let exit = mgr
         .run(id, &mut Vec::new())
         .unwrap_or_else(|e| panic!("run as LocalService: {}", e.report()));
@@ -242,6 +249,11 @@ fn a_task_installed_as_another_account_over_the_first_ones_records_still_records
     // unrecorded here, as an error, and not as a wait that has no end.
     mgr.install(&as_account("NetworkService"), false)
         .unwrap_or_else(|e| panic!("install over it as NetworkService: {}", e.report()));
+    assert_eq!(
+        accounts_of_default_log(id),
+        [sid_of(5, &NETWORK_SERVICE)],
+        "a change of account that landed names the new account alone"
+    );
     let exit = mgr
         .run(id, &mut Vec::new())
         .unwrap_or_else(|e| panic!("run as NetworkService: {}", e.report()));
@@ -299,4 +311,82 @@ fn the_shim_of_a_standard_accounts_task_writes_its_failure_to_the_default_log(#[
             "{account}: the shim wrote its failure to the default log"
         );
     }
+}
+
+// The accounts a default log names ------------------------------------------------------------------------------------
+
+const LOCAL_SERVICE: [u32; 1] = [19];
+const NETWORK_SERVICE: [u32; 1] = [20];
+
+/// The accounts the default log of `id` lets append, apart from SYSTEM and Administrators, which it always
+/// names: each trustee of an allow entry, sorted.
+fn accounts_of_default_log(id: &Id) -> Vec<Vec<u8>> {
+    let log = support::shim_default_log(&support::program_data(), id.as_str());
+    let dacl =
+        goetia::testing::file_dacl(&log).unwrap_or_else(|e| panic!("read the permissions of the log: {}", e.report()));
+    assert!(dacl.protected, "{} inherits permissions", log.display());
+    let mut accounts: Vec<Vec<u8>> = dacl
+        .aces
+        .expect("a DACL")
+        .into_iter()
+        .filter(|ace| ace.allow)
+        .map(|ace| ace.trustee)
+        .filter(|sid| *sid != sid_of(5, &[18]) && *sid != sid_of(5, &[32, 544]))
+        .collect();
+    accounts.sort();
+    accounts
+}
+
+fn service_as(id: &Id, host: &ServiceAccountHost, account: &str) -> DaemonSpec {
+    let base = support::base_fields(
+        id.as_str(),
+        vec![host.exe.path_str(), RUN_UNTIL_KILLED.to_owned(), "0".to_owned()],
+    );
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            user: User::Name(account.to_owned()),
+            ..base.common
+        },
+        protocol: Protocol::Plain,
+        ..base
+    })
+    .map(DaemonSpec::from)
+    .expect("a valid service")
+}
+
+/// What an install names in the default log is computed from the accounts it knows, never read back from the
+/// file: the registered account alone for a new service and for one installed again as it is (an entry an
+/// administrator added is gone), and for one whose account changes, the new account alone once it has.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn the_default_log_of_a_service_names_the_registered_account_alone(#[fixture(scm_group)] _group: &Group) {
+    let id = &test_id();
+    let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = host.manager();
+    let log = support::shim_default_log(&support::program_data(), id.as_str());
+    let local_service = sid_of(5, &LOCAL_SERVICE);
+    let network_service = sid_of(5, &NETWORK_SERVICE);
+
+    mgr.install(&service_as(id, &host, "LocalService"), false)
+        .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
+    assert_eq!(accounts_of_default_log(id), [local_service.clone()], "a new service");
+
+    // An entry an administrator added, which an install that finds nothing to change still sets the log
+    // without.
+    let granted = support::cmd::run("icacls.exe", &[&log.to_string_lossy(), "/grant", "*S-1-5-32-545:(R)"]);
+    granted.expect_ok();
+    assert_eq!(accounts_of_default_log(id).len(), 2, "the entry was added");
+    let again = mgr
+        .install(&service_as(id, &host, "LocalService"), false)
+        .unwrap_or_else(|e| panic!("install again: {}", e.report()));
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert_eq!(accounts_of_default_log(id), [local_service], "an install as it is");
+
+    mgr.install(&service_as(id, &host, "NetworkService"), false)
+        .unwrap_or_else(|e| panic!("install as NetworkService: {}", e.report()));
+    assert_eq!(
+        accounts_of_default_log(id),
+        [network_service],
+        "an account change that landed"
+    );
 }

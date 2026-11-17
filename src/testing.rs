@@ -90,6 +90,23 @@ pub fn remove_task(id: &Id) {
 
 #[cfg(windows)]
 pub use crate::backend::scm::shim::acl::{Ace, Dacl, kernel_object_dacl};
+
+/// The DACL of the file or folder `path`, as an install reads one, not following a link at it.
+#[cfg(windows)]
+pub fn file_dacl(path: &std::path::Path) -> Result<Dacl> {
+    let security = crate::backend::scm::shim::acl::read_path(path)?;
+    Ok(Dacl {
+        protected: security.protected,
+        aces: security.dacl,
+    })
+}
+
+/// The binary SID with `authority` as its identifier authority and `subauthorities` after it, as an
+/// [`Ace`] names its trustee.
+#[cfg(windows)]
+pub fn sid_of(authority: u8, subauthorities: &[u32]) -> Vec<u8> {
+    crate::backend::scm::sid::sid_from_parts(authority, subauthorities)
+}
 #[cfg(windows)]
 pub use crate::backend::scm::wide::{units_until_nul, wide_null};
 

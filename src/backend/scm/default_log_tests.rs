@@ -12,8 +12,8 @@ use tempfile::TempDir;
 use super::*;
 use crate::backend::scm::folder::logs_folder;
 use crate::backend::scm::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, read_path};
-use crate::backend::scm::sid::sid_from_parts;
-use crate::backend::scm::test_support::set_reparse_point;
+use crate::backend::scm::sid::{sid_display, sid_from_parts};
+use crate::backend::scm::test_support::{A_STRANGER, permit_only, set_dacl, set_reparse_point, short};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -70,7 +70,7 @@ fn a_log_that_is_there_has_its_permissions_set_to_the_account_s_append_and_nothi
     fs::write(&log, "kept\n").unwrap();
     let me = process_user_sid();
 
-    ensure(dir.path(), &id(), &me).unwrap();
+    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
 
     let security = read_path(&log).unwrap();
     assert!(security.protected);
@@ -83,51 +83,76 @@ fn an_account_change_rewrites_the_entry_and_keeps_what_is_in_the_log() {
     let (dir, log) = program_data_with_logs();
     fs::write(&log, "kept\n").unwrap();
     let (first, second) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
-    ensure(dir.path(), &id(), &first).unwrap();
+    ensure(dir.path(), &id(), &[first.clone()]).unwrap();
 
-    ensure(dir.path(), &id(), &second).unwrap();
+    ensure(dir.path(), &id(), &[second.clone()]).unwrap();
 
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&second)));
     assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what the account wrote is kept");
 }
 
-/// An update that changes the account names the new one before the service changes and the new one alone after
-/// it: in between, the account the service still runs as keeps its entry, and what is in the log is kept.
+/// An account change names the registered account and the new one before the service changes, and the new
+/// one alone once it has: what is on the file is computed from the accounts install knows, so it is the same
+/// whatever the file held, and what is in the log is kept.
 #[skuld::test]
-fn an_account_is_admitted_beside_the_old_one_and_then_set_alone() {
+fn an_account_change_names_both_accounts_and_then_the_new_one_alone() {
     let (dir, log) = program_data_with_logs();
     fs::write(&log, "kept\n").unwrap();
     let (first, second) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
-    ensure(dir.path(), &id(), &first).unwrap();
+    ensure(dir.path(), &id(), &[first.clone()]).unwrap();
 
-    admit(dir.path(), &id(), &second).unwrap();
+    ensure(dir.path(), &id(), &[first.clone(), second.clone()]).unwrap();
 
     assert!(read_path(&log).unwrap().protected);
-    assert_eq!(entries_of(&log), entries_wanted_for(&[first.clone(), second.clone()]));
-    admit(dir.path(), &id(), &second).unwrap();
-    assert_eq!(
-        entries_of(&log),
-        entries_wanted_for(&[first, second.clone()]),
-        "admitting again changes nothing"
-    );
+    assert_eq!(entries_of(&log), entries_wanted_for(&[first, second.clone()]));
 
-    ensure(dir.path(), &id(), &second).unwrap();
+    ensure(dir.path(), &id(), &[second.clone()]).unwrap();
 
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&second)));
     assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what is in the log is kept");
 }
 
-/// A link is refused by an admission as by an install, and nothing is set on it.
+/// An entry an administrator added is not carried over: install sets the permissions it computes and does
+/// not read the file's back, so a read-only entry for another account is gone after any install.
 #[skuld::test]
-fn a_log_that_is_a_link_is_not_admitted_to() {
+fn an_entry_an_administrator_added_is_not_carried_over() {
     let (dir, log) = program_data_with_logs();
     fs::write(&log, "").unwrap();
-    set_reparse_point(&log, A_LINK_TAG, b"x");
+    let me = process_user_sid();
+    let added = Descriptor::from_sddl(&format!(
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)(A;;FA;;;{})",
+        sid_display(&me)
+    ))
+    .unwrap();
+    set_dacl(&added, &log).unwrap();
+    assert!(entries_of(&log).len() > entries_wanted_for(std::slice::from_ref(&me)).len());
 
-    let refused = admit(dir.path(), &id(), &process_user_sid()).unwrap_err();
+    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
 
-    assert!(refused.report().to_string().contains(&log.display().to_string()));
-    assert!(!read_path(&log).unwrap().protected, "its permissions are as they were");
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
+}
+
+/// A handle's rights are fixed when it is opened: a shim that opened its log while its account had an entry
+/// keeps appending after an install takes the entry away (an account change, which SCM does not apply to a
+/// running service), though a new open is refused. This is what lets install set the permissions it computes
+/// without waiting for the running shim to stop.
+#[skuld::test]
+fn a_handle_opened_while_the_account_had_its_entry_keeps_appending_when_the_entry_is_taken_away() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "first\n").unwrap();
+    let me = process_user_sid();
+    ensure(dir.path(), &id(), std::slice::from_ref(&me)).unwrap();
+    let mut held = open_for_append(&log).unwrap();
+
+    permit_only(&log, A_STRANGER);
+
+    let refused = open_for_append(&log).expect_err("the entry is gone, so a new open is refused");
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    held.write_all(b"second\n")
+        .expect("the handle was opened with the right, which the permissions no longer name");
+    drop(held);
+    permit_only(&log, &sid_display(&me));
+    assert_eq!(fs::read_to_string(&log).unwrap(), "first\nsecond\n");
 }
 
 /// A log that is another name for a file is not goetia's: nothing is set on it, and it is refused naming it.
@@ -137,7 +162,7 @@ fn a_log_that_is_a_link_is_refused_and_its_permissions_are_left_alone() {
     fs::write(&log, "").unwrap();
     set_reparse_point(&log, A_LINK_TAG, b"x");
 
-    let refused = ensure(dir.path(), &id(), &process_user_sid()).unwrap_err();
+    let refused = ensure(dir.path(), &id(), &[process_user_sid()]).unwrap_err();
 
     assert!(
         refused.report().to_string().contains(&log.display().to_string()),
@@ -155,7 +180,7 @@ fn a_log_with_a_tag_that_is_no_link_has_its_permissions_set() {
     set_reparse_point(&log, A_TAG, b"x");
     let me = process_user_sid();
 
-    ensure(dir.path(), &id(), &me).unwrap();
+    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
 
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
 }
@@ -165,7 +190,7 @@ fn a_log_with_a_tag_that_is_no_link_has_its_permissions_set() {
 fn a_missing_logs_folder_is_an_error_and_nothing_is_made() {
     let dir = tempfile::tempdir().unwrap();
 
-    let refused = ensure(dir.path(), &id(), &process_user_sid()).unwrap_err();
+    let refused = ensure(dir.path(), &id(), &[process_user_sid()]).unwrap_err();
 
     assert!(
         refused.report().to_string().contains("nightly.log"),
@@ -181,7 +206,7 @@ fn a_log_that_is_missing_is_made_empty_with_the_whole_descriptor(#[fixture(scm_g
     let (dir, log) = program_data_with_logs();
     let me = process_user_sid();
 
-    ensure(dir.path(), &id(), &me).unwrap();
+    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
 
     assert_eq!(fs::metadata(&log).unwrap().len(), 0);
     let wanted = Descriptor::for_default_log(std::slice::from_ref(&me))
@@ -189,7 +214,7 @@ fn a_log_that_is_missing_is_made_empty_with_the_whole_descriptor(#[fixture(scm_g
         .wanted()
         .unwrap();
     assert!(is_as_wanted(&read_path(&log).unwrap(), &wanted));
-    ensure(dir.path(), &id(), &me).unwrap();
+    ensure(dir.path(), &id(), &[me.clone()]).unwrap();
 }
 
 /// The shim never makes the file: one that is missing is an open that fails, and nothing is made.
@@ -264,7 +289,7 @@ fn the_install_and_the_shim_refuse_a_link_in_the_same_words() {
     fs::write(&log, "").unwrap();
     set_reparse_point(&log, A_LINK_TAG, b"x");
 
-    let install = ensure(dir.path(), &id(), &process_user_sid())
+    let install = ensure(dir.path(), &id(), &[process_user_sid()])
         .unwrap_err()
         .report()
         .to_string();
@@ -294,4 +319,101 @@ fn the_shim_appends_to_a_log_with_a_tag_that_is_no_link() {
         .read_to_string(&mut written)
         .unwrap();
     assert_eq!(written, "first\nsecond\n");
+}
+
+// A `logs:` in the folder of the default logs ------------------------------------------------------------------------
+
+/// What the install says of `logs`, for the daemon `nightly` under the `%ProgramData%` of `dir`.
+fn refusal_of(dir: &TempDir, logs: &Path) -> Option<String> {
+    refuse_logs_in_folder(dir.path(), &id(), Some(logs))
+        .err()
+        .map(|e| e.report().to_string())
+}
+
+/// A `logs:` anywhere in the logs folder is refused, in words that name the folder and the way out: a service
+/// account cannot make a file there, and one that runs as SYSTEM would append to another daemon's default
+/// log. Which file in the folder it names does not matter.
+#[skuld::test]
+fn a_logs_in_the_logs_folder_is_refused_whichever_file_it_names() {
+    let (dir, log) = program_data_with_logs();
+    let folder = log.parent().unwrap().to_path_buf();
+    fs::write(&log, "").unwrap();
+    let other = path_in(&folder, "another-daemon");
+    fs::write(&other, "").unwrap();
+
+    for named in [
+        log.clone(),
+        other,
+        folder.join("not-a-log.txt"),
+        folder.join("sub").join("x.log"),
+    ] {
+        let said = refusal_of(&dir, &named).unwrap_or_else(|| panic!("{} was accepted", named.display()));
+
+        assert!(said.contains("is inside goetia's own log folder"), "{said}");
+        assert!(said.contains(&named.display().to_string()), "{said}");
+        assert!(said.contains(&folder.display().to_string()), "{said}");
+        assert!(said.contains("remove `logs:` to use the default log"), "{said}");
+    }
+}
+
+/// A first install has no `<id>.log` yet, and no other file or folder under the logs folder either: only the
+/// part of the path that exists is looked at.
+#[skuld::test]
+fn a_logs_naming_the_default_log_of_a_first_install_is_refused() {
+    let (dir, log) = program_data_with_logs();
+    assert!(!log.exists());
+
+    assert!(refusal_of(&dir, &log).is_some());
+}
+
+/// Windows reads a path by its own rules, which the check follows by asking the file system for the folder:
+/// a spelling in another case, as an 8.3 alias, with `..` or with a trailing dot is in the folder too, whether
+/// or not the file is there.
+#[skuld::test]
+fn a_logs_spelled_another_way_is_still_in_the_logs_folder() {
+    let (dir, log) = program_data_with_logs();
+    let folder = log.parent().unwrap().to_path_buf();
+    let upper = |path: &Path| PathBuf::from(path.to_string_lossy().to_uppercase());
+
+    for exists in [false, true] {
+        if exists {
+            fs::write(&log, "").unwrap();
+        }
+        let spelled = [
+            upper(&log),
+            short(&folder).join("nightly.log"),
+            short(&log),
+            folder.join("sub").join("..").join("nightly.log"),
+            folder.join("nightly.log."),
+            folder.join("nightly.log "),
+        ];
+        for spelled in spelled {
+            assert!(
+                refusal_of(&dir, &spelled).is_some(),
+                "exists={exists}: {} was accepted",
+                spelled.display()
+            );
+        }
+    }
+}
+
+/// Elsewhere is accepted: a file next to the logs folder, a folder whose name starts with its name, a folder
+/// that is not there at all, and no `logs:`.
+#[skuld::test]
+fn a_logs_elsewhere_is_accepted() {
+    let (dir, log) = program_data_with_logs();
+    let folder = log.parent().unwrap().to_path_buf();
+    let goetia = folder.parent().unwrap().to_path_buf();
+    fs::create_dir(goetia.join("logs-old")).unwrap();
+
+    for elsewhere in [
+        goetia.join("mine.log"),
+        goetia.join("logs-old").join("x.log"),
+        goetia.join("logs.log"),
+        dir.path().join("somewhere").join("not").join("made").join("x.log"),
+        goetia.join("runs").join("..").join("mine.log"),
+    ] {
+        assert_eq!(refusal_of(&dir, &elsewhere), None, "{}", elsewhere.display());
+    }
+    assert!(refuse_logs_in_folder(dir.path(), &id(), None).is_ok());
 }

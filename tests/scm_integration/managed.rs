@@ -839,6 +839,41 @@ fn an_up_to_date_install_makes_a_deleted_default_log_again(#[fixture(scm_group)]
     assert!(log.is_file(), "the install made {} again", log.display());
 }
 
+/// A `logs:` in goetia's log folder is refused at install, whether it names this daemon's default log, which
+/// is not there yet on a first install, or another daemon's: a service account cannot make a file in the
+/// folder, and a SYSTEM service would append to another daemon's log. Nothing is installed.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_logs_in_goetias_log_folder_is_refused_at_install(#[fixture(scm_group)] _group: &Group) {
+    let mgr = support::stock_shim_manager();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    for named in [id.as_str(), "another-daemon"] {
+        let logs = support::shim_default_log(&support::program_data(), named);
+        let base = support::base_fields(&id, fixture_command(&id, 1, 1, "plain"));
+        let spec = ServiceSpec::new(ServiceFields {
+            common: DaemonFields {
+                logs: Some(logs),
+                ..base.common
+            },
+            protocol: Protocol::Plain,
+            ..base
+        })
+        .map(DaemonSpec::from)
+        .unwrap();
+
+        let refused = mgr.install(&spec, false).expect_err("a `logs:` in the logs folder");
+
+        let said = refused.report().to_string();
+        assert!(said.contains("is inside goetia's own log folder"), "{named}: {said}");
+        assert!(said.contains("remove `logs:`"), "{named}: {said}");
+        let absent = mgr.status(&id_of(&id)).expect_err("nothing was installed");
+        assert!(
+            matches!(absent.cause(), goetia::Error::NotInstalled { .. }),
+            "{named}: {absent:?}"
+        );
+    }
+}
+
 /// goetia owns `Parameters` whole: `install --force` removes a stray value and a subkey, and a
 /// marker stored in another case is still ours, so the service reads as unchanged afterwards.
 #[skuld::test]
