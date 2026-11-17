@@ -767,15 +767,21 @@ fn a_stop_with_no_time_waits_for_a_queued_start_signals_it_and_reports_the_timeo
 fn a_stop_whose_deadline_is_spent_after_its_first_signal_reads_once_and_ends_as_the_read_says() {
     let failed = reply(
         &["print", &target()],
-        exited(5, "", "Could not print: 5: Input/output error
-"),
+        exited(
+            5,
+            "",
+            "Could not print: 5: Input/output error
+",
+        ),
     );
     let reads = [
         ("a queued start", print(QUEUED), true),
         (
             "a state that says nothing",
-            print("	state = someday-new-apple-state
-"),
+            print(
+                "	state = someday-new-apple-state
+",
+            ),
             false,
         ),
         ("a read that failed", failed, false),
@@ -842,7 +848,7 @@ fn a_timeout_says_what_the_stop_did_to_the_run_that_is_up() {
     run.finish();
 
     // A run sent SIGKILL, gone; another run is up.
-    let (mut killed, mut next) = (Held::ignoring_sigterm(), Held::ignoring_sigterm());
+    let (mut killed, mut next) = (Held::ignoring_sigterm(), Held::new(0));
     let (a, b) = (killed.pid(), next.pid());
     let fake = Fake::new([print(&running(a)), print(&running(a)), procinfo(a), print(&running(b))]);
     let recovery = timeout_of(&fake, kill);
@@ -854,12 +860,7 @@ fn a_timeout_says_what_the_stop_did_to_the_run_that_is_up() {
     // A run sent SIGTERM, gone; a start is queued.
     let mut run = Held::new(0);
     let pid = run.pid();
-    let fake = Fake::new([
-        print(&running(pid)),
-        print(&running(pid)),
-        procinfo(pid),
-        print(QUEUED),
-    ]);
+    let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid), print(QUEUED)]);
     let recovery = timeout_of(&fake, graced());
     assert!(recovery.contains("was not signalled"), "{recovery}");
     assert_eq!(ended_by(&mut run), Some(libc::SIGTERM));
@@ -872,7 +873,7 @@ fn a_timeout_says_what_the_stop_did_to_the_run_that_is_up() {
 #[skuld::test]
 fn a_deadline_that_passes_before_a_later_runs_first_signal_sends_nothing_to_it() {
     let mut first = Held::new(0);
-    let mut second = Held::ignoring_sigterm();
+    let mut second = Held::new(0);
     let (a, b) = (first.pid(), second.pid());
     let slow = Duration::from_millis(1500);
     let fake = Fake::new([
@@ -947,7 +948,11 @@ fn a_run_is_said_to_have_been_sent_what_this_stop_sent_it() {
     assert_eq!(course(Some(pending), false).escalation(mine), Some(Escalation::Pending));
     assert_eq!(course(Some(over), false).escalation(mine), Some(Escalation::Spent));
     assert_eq!(course(Some(over), true).escalation(mine), Some(Escalation::Sent));
-    assert_eq!(course(None, false).escalation(mine), None, "SIGTERM and no grace to follow it");
+    assert_eq!(
+        course(None, false).escalation(mine),
+        None,
+        "SIGTERM and no grace to follow it"
+    );
     for killed in [false, true] {
         assert_eq!(
             course(Some(over), killed).escalation(other),

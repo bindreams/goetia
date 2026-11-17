@@ -206,14 +206,18 @@ pub trait ServiceManager {
     /// README's "Waiting for a start or stop".
     ///
     /// **A task's stop ends the run in flight and leaves its schedule armed;** the task is then
-    /// [`State::Idle`]. On macOS, a task's `stop` sends SIGTERM only and waits until the run ends
-    /// (bounded by `budget`); a task that ignores SIGTERM keeps running, and `kill` ends it. `stop` also
-    /// ends a run that begins while it is stopping. On macOS, a task's `stop` under `Immediate` also waits
-    /// for a start launchd has accepted to begin, so it can end it; then it signals and returns `Ok`. A zero
-    /// `Bounded` bound is a deadline that is spent: it sends nothing and reads once, and returns `Ok` if the
-    /// job is idle, else [`Error::WaitTimeout`], as any `Bounded` stop does once its deadline is spent, after
-    /// what it sent, which stands. If launchd shows the job with no process in a state that does
-    /// not say it is idle, or the read fails, the result is [`Error::StopUnconfirmed`].
+    /// [`State::Idle`]. On macOS, a task's `stop` is always issued, as on the other backends, whatever the
+    /// budget (`Immediate` and a zero bound included): the run in flight is sent its `stop-action`'s signal
+    /// (SIGTERM, or SIGKILL for `send-signal: kill`), after a wait for a start launchd has accepted to begin,
+    /// so it can end it. It then waits until the run ends (bounded by `budget`; `Immediate` does not wait). A
+    /// run that has not answered SIGTERM when the action's `timeout` is over is sent SIGKILL, if the budget
+    /// lasts that long. Once the first signal is sent, a `Bounded` deadline that is spent sends nothing more:
+    /// no SIGKILL, and no first signal to a run that began later. The stop then reads once, and returns `Ok`
+    /// if the job is idle, else [`Error::WaitTimeout`], what it sent standing; a task that ignores SIGTERM past
+    /// the budget keeps running, and `kill` ends it. The deadline is decided right before each send, not
+    /// atomically with it. `stop` also ends a run that begins while it is stopping. If launchd shows the job
+    /// with no process in a state that does not say it is idle, or the read fails, the result is
+    /// [`Error::StopUnconfirmed`].
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

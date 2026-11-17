@@ -24,7 +24,7 @@ use super::live::{Liveness, probe};
 use super::read::live_runs;
 use super::{TaskApi, TaskPath};
 use crate::backend::kill::{
-    Hold, HoldError, KillTarget, Signal, Waited, hold_once, kill_failed, kill_service, wait_saying, waiting_notice,
+    Hold, HoldError, KillTarget, Waited, hold_once, kill_failed, kill_service, wait_saying, waiting_notice,
 };
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::InstanceId;
@@ -127,14 +127,8 @@ impl<P: Processes> KillTarget for RunTarget<'_, P> {
         }
     }
 
-    fn signal(&mut self, process: &P::Held, signal: Signal) -> io::Result<()> {
-        match signal {
-            Signal::Kill => self.processes.terminate(process),
-            Signal::Term => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "a run's process cannot be sent a request to exit, only terminated",
-            )),
-        }
+    fn terminate(&mut self, process: &P::Held) -> io::Result<()> {
+        self.processes.terminate(process)
     }
 
     fn await_exit(&mut self, process: &P::Held, deadline: Deadline) -> io::Result<Waited> {
