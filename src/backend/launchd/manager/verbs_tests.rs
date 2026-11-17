@@ -953,7 +953,9 @@ fn the_timeout_of_a_pid_launchd_shows_and_the_stop_cannot_reach_is_true_of_both_
     assert_eq!(
         recovery,
         format!(
-            "{plain} Launchd showed a pid that is no run of the job's that this stop can reach: the run ended              and launchd had not cleared it, or launchd had moved on to another run. `goetia daemon stop {ID}`              again returns once launchd shows no process."
+            "{plain} Launchd showed a pid that is no run of the job's that this stop can reach: the run ended \
+             and launchd had not cleared it, or launchd had moved on to another run. `goetia daemon stop {ID}` \
+             again returns once launchd shows no process."
         )
     );
 }
