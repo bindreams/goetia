@@ -106,8 +106,8 @@ impl Course {
         self.counted = self.counted.extended(by);
     }
 
-    /// The caller's timeout, if its deadline is spent: the one place a pass reads it, before it reads or
-    /// sends anything, and worded by what has been sent. `Immediate` waits for nothing, so it has no
+    /// The caller's timeout, if its deadline is spent: the one place a pass reads it, before it sends
+    /// anything, and worded by what has been sent. `Immediate` waits for nothing, so it has no
     /// deadline to spend.
     fn timeout(&self, id: &str) -> Option<Error> {
         if !matches!(self.counted, Budget::Bounded(_)) || !self.deadline().expired() {
@@ -277,7 +277,8 @@ impl Launchd {
 
     /// Ends the run in flight, and returns once launchd shows no process. Every pass starts with the
     /// deadline: a `Bounded` budget that is spent is the caller's timeout, worded by what has been sent, and
-    /// nothing is read or sent after it ([`Course::timeout`]). Then it reads `print`:
+    /// nothing is sent after it ([`Course::timeout`]); the one read it makes then is to see whether the job
+    /// is done, which is `Ok` ([`Self::done_or`]). Otherwise it reads `print`:
     ///
     /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
     ///   No process and any other state, or a `print` that failed or was not whole, is
@@ -321,8 +322,10 @@ impl Launchd {
     /// [`Self::stop_task`] over `course`, with the target of each pass made by `target`: the one place
     /// that decides what signals are sent, over whatever sends them.
     ///
-    /// The deadline is read once for every pass, at its start, before anything is read or sent
-    /// ([`Course::timeout`]): a spent deadline is the caller's timeout, and nothing is sent after it.
+    /// The deadline is read once for every pass, at its start, before anything is sent ([`Course::timeout`]):
+    /// a spent deadline is the caller's timeout, and nothing is sent after it. The pass that finds it spent
+    /// makes one read, to learn whether the job is done ([`Self::done_or`]): a run that ended inside the
+    /// budget is not a timeout because the pass that noticed came after the deadline.
     fn stop_course<T: KillTarget<Process = Process>>(
         &self,
         id: &Id,
@@ -332,10 +335,10 @@ impl Launchd {
     ) -> Result<()> {
         let mut own: Option<Reservation> = None;
         loop {
-            if let Some(timeout) = course.timeout(id.as_str()) {
-                return Err(timeout);
-            }
             let pass = own.as_mut().unwrap_or(&mut *reservation);
+            if let Some(timeout) = course.timeout(id.as_str()) {
+                return self.done_or(id, timeout, pass);
+            }
             match self.stop_pass(id, &mut course, pass, &mut target)? {
                 Pass::Done => return Ok(()),
                 Pass::Again => {}
@@ -343,6 +346,21 @@ impl Launchd {
                 Pass::Behind => std::thread::sleep(UNLOAD_POLL),
             }
             own = Some(own_reservation(id, TASK_STOP_REQUESTS, TASK_STOP_CALLS)?);
+        }
+    }
+
+    /// What a stop whose deadline is spent ends with: `Ok` if one read of `print` shows the job done (no
+    /// process, and idle), else `timeout`, which is also what a read that failed, a start launchd has
+    /// accepted and a state that says nothing are. One read, on `reservation`, and no loop: the overrun is
+    /// that one read, and nothing is sent.
+    fn done_or(&self, id: &Id, timeout: Error, reservation: &mut Reservation) -> Result<()> {
+        let issuing = Budget::Unbounded.start();
+        match self
+            .launchctl
+            .read_task_print(id.as_str(), issuing, Role::Query, reservation)
+        {
+            Ok(print) if print.pid.is_none() && matches!(quiet(id, &print), Ok(Quiet::Idle)) => Ok(()),
+            _ => Err(timeout),
         }
     }
 

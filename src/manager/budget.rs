@@ -30,8 +30,9 @@ impl Budget {
     /// folding it in here spares every call site from doing so. The one
     /// exception is a launchd task's `stop`, which matches on the budget itself:
     /// under `Immediate` it waits for a queued start's pid, signals and returns
-    /// `Ok`; a zero bound is a bound that has run out, so it reads nothing and
-    /// sends nothing and returns [`Error::WaitTimeout`](crate::Error::WaitTimeout).
+    /// `Ok`; a zero bound is a bound that has run out, so it sends nothing, reads
+    /// `print` once, and returns `Ok` if the job is idle, else
+    /// [`Error::WaitTimeout`](crate::Error::WaitTimeout).
     pub fn waits(self) -> bool {
         !matches!(self, Budget::Immediate | Budget::Bounded(Duration::ZERO))
     }

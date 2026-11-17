@@ -209,9 +209,9 @@ pub trait ServiceManager {
     /// (bounded by `budget`); a task that ignores SIGTERM keeps running, and `kill` ends it. `stop` also
     /// ends a run that begins while it is stopping. On macOS, a task's `stop` under `Immediate` also waits
     /// for a start launchd has accepted to begin, so it can end it; then it signals and returns `Ok`. A zero
-    /// `Bounded` bound is a deadline that is spent: it reads nothing, sends nothing and returns
-    /// [`Error::WaitTimeout`], as any `Bounded` stop does once its deadline is spent, after what it
-    /// sent, which stands. If launchd shows the job with no process in a state that does
+    /// `Bounded` bound is a deadline that is spent: it sends nothing and reads once, and returns `Ok` if the
+    /// job is idle, else [`Error::WaitTimeout`], as any `Bounded` stop does once its deadline is spent, after
+    /// what it sent, which stands. If launchd shows the job with no process in a state that does
     /// not say it is idle, or the read fails, the result is [`Error::StopUnconfirmed`].
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
