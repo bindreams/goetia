@@ -1,11 +1,13 @@
 //! Compiles a cron schedule into Task Scheduler triggers, or refuses it.
 //!
-//! The triggers fire at the minutes the schedule names and no others, in local civil time. A
-//! repetition's ticks are civil too: across a change of clocks `GetRunTimes` lists the same grid
-//! each day, an hour that repeats counts once, and the ticks in an hour a change skips are listed
-//! an hour earlier, so those minutes come twice (the knowledge base's "GetRunTimes lists a
-//! repetition across a DST change in local civil time ..."; whether Task Scheduler then fires
-//! twice is not measured). A trigger names days (every day, weekdays, days of the month, in some months or all), a start time
+//! The triggers fire at the minutes the schedule names, in local civil time, by Task Scheduler's rule for
+//! a time that does not exist. A repetition's ticks are civil too: across a change of clocks
+//! `GetRunTimes` lists the same grid each day, listing an hour that repeats once and the ticks of an hour
+//! a change skips an hour earlier, so those minutes are listed twice (the knowledge base's "GetRunTimes
+//! lists a repetition across a DST change in local civil time ..."). What Task Scheduler fires at those
+//! minutes is not measured.
+//!
+//! A trigger names days (every day, weekdays, days of the month, in some months or all), a start time
 //! and optionally a repetition that restarts at its start each day. What the shapes rest on was
 //! measured: a day a month lacks is skipped, never moved, but Task Scheduler refuses a trigger
 //! whose days no month in its month set has (that schedule is [`Trigger::Never`]); a repetition is

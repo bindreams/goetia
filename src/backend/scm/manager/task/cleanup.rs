@@ -32,7 +32,9 @@ fn remove_task_with<P: Processes, L>(
     let path = TaskPath::of(id);
     // So that a scheduled fire starts no run the delete would leave behind. Best effort, as an uninstall's
     // first step is not: a task that cannot be disabled (or is not there) is deleted all the same.
-    warn_left_behind(disable_problem(&path, tasks.set_enabled(&path, false)));
+    if let Some(warning) = disable_warning(&path, tasks.set_enabled(&path, false)) {
+        eprintln!("{warning}");
+    }
     // A shim that outlives its task has nothing to stop it. A run that cannot be ended, or that does not
     // end in time, is warned of, and the task is deleted all the same.
     if let Err(e) = stop_runs(tasks, "cleanup", id, Budget::Bounded(CLEANUP_BOUND), processes, || Ok(())) {
@@ -61,12 +63,12 @@ fn remove_task_with<P: Processes, L>(
     }));
 }
 
-/// What a failed disable of the task at `path` says, or `None` for one that went through or found no
-/// task.
-fn disable_problem(path: &TaskPath, disabled: Result<()>) -> Option<String> {
+/// The warning a failed disable of the task at `path` is, or `None` for one that went through or found no
+/// task. Not a "left behind" warning: the guard goes on to delete the task.
+fn disable_warning(path: &TaskPath, disabled: Result<()>) -> Option<String> {
     disabled.err().filter(|e| !gone(e)).map(|e| {
         format!(
-            "disable the task `{}` (a scheduled fire can still start a run): {}",
+            "warning: disable the task `{}` (a scheduled fire can still start a run): {}",
             path.as_str(),
             e.report()
         )
