@@ -76,6 +76,9 @@ static WAKE: AtomicI32 = AtomicI32::new(-1);
 /// handler counts itself out before it claims its signal and raises it to the previous handler. So the
 /// close, which un-publishes the descriptor first, knows when none can write to it, and waits for no more
 /// than one `write` of each, never for the code of a previous handler, which may not return.
+///
+/// It is process-wide: a test that counts a handler in by hand, or looks at the wait it makes a close take,
+/// is reliable only while every test that opens a window takes `SERIAL`.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// The pipe a window's handler writes to and a wait reads, both ends non-blocking and close-on-exec.
@@ -302,11 +305,9 @@ impl Drop for Deferred {
 /// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
     WAKE.store(-1, Ordering::SeqCst);
-    #[cfg(test)]
-    if IN_FLIGHT.load(Ordering::SeqCst) != 0 {
-        test_hook::waited();
-    }
     while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        #[cfg(test)]
+        test_hook::waited();
         std::thread::yield_now();
     }
     drop(wake);
@@ -437,7 +438,8 @@ mod test_hook {
     /// process-wide, so it is reliable only while every test that opens a window takes `SERIAL`.
     static WAITED: AtomicBool = AtomicBool::new(false);
 
-    /// The close found a handler counted in and is about to wait for it.
+    /// The close is waiting for a handler: called on each pass of its wait, so a close that does not wait
+    /// never calls it.
     pub(super) fn waited() {
         WAITED.store(true, Ordering::SeqCst);
     }
@@ -447,8 +449,12 @@ mod test_hook {
         WAITED.load(Ordering::SeqCst)
     }
 
-    /// Clears [`WAITED`]; see it for when that is reliable.
+    /// Clears [`WAITED`]; see it for when that is reliable. The caller holds `SERIAL`.
     pub(super) fn forget_waits() {
+        debug_assert!(
+            super::interrupts_tests::holds_serial(),
+            "the wait flag is process-wide: take SERIAL before clearing it"
+        );
         WAITED.store(false, Ordering::SeqCst);
     }
 }
