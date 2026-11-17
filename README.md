@@ -1086,6 +1086,18 @@ that, or if the daemon's log cannot be opened, it writes to
 `%ProgramData%\Goetia\logs\<id>.log`. It also writes each to the Windows Event
 Log.
 
+`%ProgramData%\Goetia\logs` is readable by SYSTEM and Administrators only, so
+reading `<id>.log` needs an elevated shell. `goetia daemon install` makes the
+file, and the account the daemon runs as may only append to it; the shim never
+makes it, so a file that is missing is a failed write, and the Event Log still
+has the line. `goetia daemon uninstall` keeps the file.
+
+Goetia before this change left `%ProgramData%\Goetia\logs` readable by every
+user, and `goetia daemon install` refuses a folder it did not make this way. To
+upgrade, stop the services an earlier goetia installed, delete
+`%ProgramData%\Goetia\logs` (keep any log you want first), and run
+`goetia daemon install` for each daemon again.
+
 `sc query` shows the difference between your command failing and the shim
 failing:
 

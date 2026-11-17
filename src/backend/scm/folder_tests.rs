@@ -155,7 +155,10 @@ fn the_folders_are_made_owned_by_administrators_goetia_inheriting_and_logs_prote
             folder.display()
         );
     }
-    assert!(!owner_and_protection_of(&goetia).1, "it inherits what %ProgramData% gives");
+    assert!(
+        !owner_and_protection_of(&goetia).1,
+        "it inherits what %ProgramData% gives"
+    );
     let wanted = Descriptor::for_logs().unwrap().wanted().unwrap();
     assert!(
         is_as_wanted(&read_path(&logs).unwrap(), &wanted),

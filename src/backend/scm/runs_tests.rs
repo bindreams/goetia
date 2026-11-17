@@ -15,7 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::*;
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
-use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
+use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, is_as_wanted, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
 use crate::backend::scm::test_support::{delete_pending, directory_held_open, directory_with_a_file, make_mount_point};
 use crate::elevation::test_support::process_user_sid;

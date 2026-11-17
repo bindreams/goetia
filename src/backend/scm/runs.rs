@@ -50,8 +50,8 @@ use tempfile::Builder;
 
 use self::dir::Dir;
 use self::files::DeleteOutcome;
-use super::folder::{goetia_folder, make_goetia_folders};
-use super::shim::acl::{Descriptor, FolderCheck, is_as_wanted, missing_components, read_path};
+use super::folder::{ensure_as_made, goetia_folder, make_goetia_folders};
+use super::shim::acl::{Descriptor, FolderCheck};
 use super::sid::Sid;
 use crate::error::{Error, Result};
 use crate::spec::Id;
@@ -232,25 +232,19 @@ impl Runs {
     ///   missing is made, one that is there must pass over its whole chain or it is refused
     ///   ([`Error::FolderUnsafe`]), and one that appears after it was found missing is refused too.
     /// - `runs` that is missing is made with [`Descriptor::for_folder`]. One that is there must be as
-    ///   that is (owner, protection and entries), or it is refused ([`Error::FolderNotAsMade`]).
+    ///   that is (owner, protection and entries), or it is refused ([`Error::FolderNotAsMade`]); so is
+    ///   `logs`, which [`make_goetia_folders`] makes protected.
     ///
     /// Call it before [`Runs::ensure`] on every write of a task, since a reinstall may find them gone.
     pub(crate) fn ensure_roots(&self, folders: &FolderCheck) -> Result<()> {
+        make_goetia_folders(self.program_data(), |path| folders.check(path))?;
+        ensure_as_made(&self.root, &Descriptor::for_folder()?)
+    }
+
+    /// The `%ProgramData%` the records are under.
+    pub(crate) fn program_data(&self) -> &Path {
         let goetia = self.root.parent().expect("`runs` is in `Goetia`");
-        let program_data = goetia.parent().expect("`Goetia` is in `%ProgramData%`");
-        make_goetia_folders(program_data, |path| folders.check(path))?;
-        let wanted = Descriptor::for_folder()?;
-        let missing = missing_components(&self.root)?;
-        if !missing.is_empty() {
-            return wanted.create_each(&missing);
-        }
-        if is_as_wanted(&read_path(&self.root)?, &wanted.wanted()?) {
-            Ok(())
-        } else {
-            Err(Error::FolderNotAsMade {
-                path: self.root.clone(),
-            })
-        }
+        goetia.parent().expect("`Goetia` is in `%ProgramData%`")
     }
 
     /// Makes the directory, in `runs`, which [`Runs::ensure_roots`] saw to, with permissions that name

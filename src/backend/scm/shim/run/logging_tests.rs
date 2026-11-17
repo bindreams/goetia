@@ -214,7 +214,10 @@ fn log_destinations_try_the_daemon_log_then_the_default() {
 fn log_destinations_try_the_default_once_when_there_is_no_daemon_log() {
     let default = PathBuf::from("default.log");
 
-    assert_eq!(log_destinations(None, default.clone()), vec![(default, LogKind::Default)]);
+    assert_eq!(
+        log_destinations(None, default.clone()),
+        vec![(default, LogKind::Default)]
+    );
 }
 
 #[skuld::test]

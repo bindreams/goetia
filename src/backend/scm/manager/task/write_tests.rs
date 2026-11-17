@@ -706,7 +706,10 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
     assert!(trustees.contains(&users), "the new account is named");
     assert!(!trustees.contains(&me), "the old account is not");
     let trustees = trustees_of(&default_log(&dir));
-    assert!(trustees.contains(&users), "the new account may append to the default log");
+    assert!(
+        trustees.contains(&users),
+        "the new account may append to the default log"
+    );
     assert!(!trustees.contains(&me), "the old account may not");
 }
 

@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use cosca::Containment;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
+use crate::backend::scm::default_log;
 use crate::backend::unreaped::release_unreaped;
 use crate::error::os_error_in;
 
@@ -135,12 +136,18 @@ pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
     })
 }
 
-/// Open `path` for append as `kind` says.
+/// Open `path` for append as `kind` says: an own log has its folders and the file made, the default log
+/// is opened as [`default_log::open_for_append`] does.
 fn open_append(path: &Path, kind: LogKind) -> io::Result<File> {
-    if let (LogKind::Own, Some(parent)) = (kind, path.parent()) {
-        fs::create_dir_all(parent)?;
+    match kind {
+        LogKind::Default => default_log::open_for_append(path),
+        LogKind::Own => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            OpenOptions::new().create(true).append(true).open(path)
+        }
     }
-    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// One `write` call, so another handle's appends cannot split the line.

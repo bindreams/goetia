@@ -1,8 +1,8 @@
 //! The scm backend.
 
-pub mod exit_status;
 #[cfg(windows)]
 pub(crate) mod default_log;
+pub mod exit_status;
 #[cfg(windows)]
 pub(crate) mod folder;
 pub mod generate;

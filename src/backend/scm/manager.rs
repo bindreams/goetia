@@ -121,6 +121,7 @@ use super::wait::{
     carried, end_on_incomplete_stop, end_process,
 };
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
+use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{make_goetia_folders, program_data};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::kill::system::Held;
@@ -430,6 +431,7 @@ impl Scm {
         snapshot: Option<&ScmSnapshot>,
     ) -> Result<WriteOutcome> {
         apply(definition, written_user(&spec.common().user), snapshot.is_none())?;
+        make_default_log(spec, definition)?;
         Ok(WriteOutcome::Done)
     }
 
@@ -1201,6 +1203,17 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
     // account.
     registry::register_event_source()?;
     Ok(password)
+}
+
+/// The default log of the service `reg` registers, for the account it runs as, made or set to name it:
+/// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
+/// Call it once the service exists (a virtual account's SID resolves only then) and before it starts.
+fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration) -> Result<()> {
+    if !generate::hosted(spec) {
+        return Ok(());
+    }
+    let account = identity::service_account_sid(reg.account.as_deref())?;
+    default_log::ensure(&program_data()?, &spec.common().id, &account)
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it

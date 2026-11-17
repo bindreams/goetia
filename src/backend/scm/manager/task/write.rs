@@ -14,11 +14,14 @@ use super::api::{Registered, Registration};
 use super::live::Liveness;
 use super::verbs::{Processes, System, gone};
 use super::{TaskApi, TaskPath, TaskSnapshot};
+use crate::backend::scm::default_log;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::{self, Right, Written};
-use crate::backend::scm::manager::{Scm, ScmSnapshot, apply_gated, registry, service_gate, written_user};
+use crate::backend::scm::manager::{
+    Scm, ScmSnapshot, apply_gated, make_default_log, registry, service_gate, written_user,
+};
 use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::lock::InstallLock;
@@ -327,10 +330,12 @@ fn task_acquire(
     Ok(prepared)
 }
 
-/// The record directory of `id` with permissions that name the account `prepared` holds.
+/// The record directory of `id` with permissions that name the account `prepared` holds, and its default
+/// log, which the account may append to (the shim opens it and never makes it).
 fn task_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
     runs.ensure(&prepared.principal)
-        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))
+        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))?;
+    default_log::ensure(runs.program_data(), id, &prepared.principal)
 }
 
 // Enable and disable ==================================================================================================
@@ -395,6 +400,7 @@ impl Scm {
             || service_gate(definition, written),
             |password| {
                 apply_gated(definition, password, true)?;
+                make_default_log(spec, definition)?;
                 Ok(WriteOutcome::Done)
             },
         )?;

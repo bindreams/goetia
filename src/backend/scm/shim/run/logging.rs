@@ -6,10 +6,11 @@
 //! fails to decode `Spec` before it learns the daemon's `logs:` path, so the path derivable from
 //! the service id alone is the only file destination a decode failure can target.
 //!
-//! **The default file's folder is an install's.** `%ProgramData%\Goetia\logs` is made, and judged, by
-//! the elevated install that registers the shim ([`make_goetia_folders`](crate::backend::scm::folder::make_goetia_folders)); the shim, which runs as the
-//! daemon's account, makes no folder for its default log ([`LogKind::Default`]). Where the folder is not
-//! there, or the account cannot write in it, the append fails and the Event Log still gets the line.
+//! **The default file is an install's.** `%ProgramData%\Goetia\logs` and `<id>.log` in it are made, and
+//! judged, by the elevated install that registers the shim ([`default_log::ensure`]); the shim, which runs
+//! as the daemon's account, makes neither and opens the file for appending alone ([`LogKind::Default`]).
+//! Where the file is not there, or is a link, or the account cannot append to it, the append fails and the
+//! Event Log still gets the line.
 //!
 //! **Event Log.** Every failure also goes to the Windows Event Log, whose default ACL is far more
 //! permissive than a folder's, so it is the more likely of the two to still work exactly when the
@@ -20,6 +21,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::os::{Channels, LogKind, Real, Severity};
 use super::service::TABLE_NAME;
+use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{logs_folder, program_data};
 use crate::error::Result;
 
@@ -78,7 +80,7 @@ impl Log {
     /// `goetia.yaml` sets no `logs:` ([`Log::daemon_log_path`]). `None` when the machine's
     /// `%ProgramData%` could not be located.
     pub(crate) fn default_log_path(&self, id: &str) -> Option<PathBuf> {
-        self.default_dir.as_ref().map(|dir| dir.join(format!("{id}.log")))
+        self.default_dir.as_ref().map(|dir| default_log::path_in(dir, id))
     }
 
     /// The daemon's log: `logs` from its spec, or [`Log::default_log_path`] when unset.
@@ -86,8 +88,8 @@ impl Log {
         logs.map(Path::to_path_buf).or_else(|| self.default_log_path(id))
     }
 
-    /// Whether the folders above the log `path` of daemon `id` are made when it is opened: not for the
-    /// default log, whose folder an install made, and yes for any other, which is the user's own.
+    /// Which kind of log `path`, the log of daemon `id`, is: the default log, which an install made, or the
+    /// user's own.
     pub(crate) fn kind_of(&self, id: &str, path: &Path) -> LogKind {
         match self.default_log_path(id) {
             Some(default) if default == path => LogKind::Default,
@@ -143,9 +145,8 @@ fn failure_line(id: &str, message: &str) -> String {
     format!("goetia-shim[{id}]: {message}")
 }
 
-/// The files to try for a line, in order, with whether each one's folders are made: the daemon's log,
-/// then the default, which has none made for it. When they are the same path, it is tried once, as the
-/// default.
+/// The files to try for a line, in order, with the kind of each: the daemon's log, then the default. When
+/// they are the same path, it is tried once, as the default.
 fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<(PathBuf, LogKind)> {
     match daemon_log {
         Some(path) if path != default => vec![(path.to_path_buf(), LogKind::Own), (default, LogKind::Default)],

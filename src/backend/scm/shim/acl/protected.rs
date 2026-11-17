@@ -6,6 +6,8 @@
 //! inherited by what is made in it. `Descriptor` holds them as SDDL, the one place the spec's
 //! permissions are written down, and [`is_as_wanted`] compares what a file has with them.
 //! `Descriptor` also makes the folders, never adopting one that exists (`Descriptor::create_each`).
+//! The folder of the default logs and the logs in it are protected too: SYSTEM and Administrators alone,
+//! and on a log an entry for the account the shim runs as that lets it append and nothing else.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use super::{Ace, ObjectSecurity};
@@ -47,7 +49,8 @@ mod system {
         PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, WRITE_DAC,
     };
 
     use super::super::{ObjectSecurity, system::describe};
@@ -127,12 +130,7 @@ mod system {
         /// the handle of that open is as capable as the open asked it to be; goetia's own creating opens
         /// ask for what they use. A SID that is not whole is an error.
         pub(crate) fn for_runs(principal: &Sid) -> Result<Self> {
-            let principal = try_sid_display(principal).ok_or_else(|| {
-                Error::os(
-                    "build the permissions of a run-record directory",
-                    io::Error::other("the account is not a whole SID"),
-                )
-            })?;
+            let principal = sid_text(principal, "a run-record directory")?;
             Self::from_sddl(&format!(
                 "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OIIO;0x1300af;;;{principal})(A;;0x1200eb;;;{principal})"
             ))
@@ -140,7 +138,7 @@ mod system {
 
         /// The permissions of `Goetia\logs`: see [`LOGS`].
         pub(crate) fn for_logs() -> Result<Self> {
-            todo!()
+            Self::from_sddl(LOGS)
         }
 
         /// The permissions of a daemon's default log file: Administrators own it; SYSTEM and Administrators
@@ -148,8 +146,10 @@ mod system {
         /// ([`DEFAULT_LOG_ACCESS`]) and do nothing else, so it cannot read, truncate, delete or re-permission
         /// what it wrote. The DACL is protected. A SID that is not whole is an error.
         pub(crate) fn for_default_log(account: &Sid) -> Result<Self> {
-            let _ = account;
-            todo!()
+            let account = sid_text(account, "a default log")?;
+            Self::from_sddl(&format!(
+                "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{DEFAULT_LOG_ACCESS:#x};;;{account})"
+            ))
         }
 
         /// Opens the file `path` for `WRITE_DAC` and attribute reads without following a link at it, making
@@ -157,8 +157,26 @@ mod system {
         /// [`Descriptor::set_dacl_of`] on the handle sets its permissions. The file is shared for everything,
         /// so a shim that holds it open does not stop this.
         pub(crate) fn open_always_for_dacl(&self, path: &Path) -> io::Result<File> {
-            let _ = path;
-            todo!()
+            let wide = wide_null(path)?;
+            let attributes = self.attributes();
+            // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live for the
+            // call; no template file.
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    WRITE_DAC | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    &attributes,
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `handle` is a valid file handle that nothing else owns.
+            Ok(unsafe { File::from_raw_handle(handle) })
         }
 
         /// A descriptor written as SDDL.
@@ -279,6 +297,16 @@ mod system {
                 bInheritHandle: 0,
             }
         }
+    }
+
+    /// `sid` as SDDL spells it, or an error naming what the permissions were being built for.
+    fn sid_text(sid: &Sid, what: &str) -> Result<String> {
+        try_sid_display(sid).ok_or_else(|| {
+            Error::os(
+                format!("build the permissions of {what}"),
+                io::Error::other("the account is not a whole SID"),
+            )
+        })
     }
 
     /// The folders of `dir` that do not exist, outermost first: those below its first existing

@@ -41,7 +41,12 @@ fn entries_of(path: &Path) -> Vec<crate::backend::scm::shim::acl::Ace> {
 }
 
 fn entries_wanted_for(account: &Sid) -> Vec<crate::backend::scm::shim::acl::Ace> {
-    let mut entries = Descriptor::for_default_log(account).unwrap().wanted().unwrap().dacl.unwrap();
+    let mut entries = Descriptor::for_default_log(account)
+        .unwrap()
+        .wanted()
+        .unwrap()
+        .dacl
+        .unwrap();
     entries.sort();
     entries
 }
@@ -91,7 +96,11 @@ fn a_log_that_is_a_reparse_point_is_refused_and_its_permissions_are_left_alone()
 
     let refused = ensure(dir.path(), &id(), &process_user_sid()).unwrap_err();
 
-    assert!(refused.report().to_string().contains(&log.display().to_string()), "{}", refused.report());
+    assert!(
+        refused.report().to_string().contains(&log.display().to_string()),
+        "{}",
+        refused.report()
+    );
     assert!(!read_path(&log).unwrap().protected, "its permissions are as they were");
 }
 
@@ -102,7 +111,11 @@ fn a_missing_logs_folder_is_an_error_and_nothing_is_made() {
 
     let refused = ensure(dir.path(), &id(), &process_user_sid()).unwrap_err();
 
-    assert!(refused.report().to_string().contains("nightly.log"), "{}", refused.report());
+    assert!(
+        refused.report().to_string().contains("nightly.log"),
+        "{}",
+        refused.report()
+    );
     assert!(!dir.path().join("Goetia").exists());
 }
 

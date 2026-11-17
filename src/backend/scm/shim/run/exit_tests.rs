@@ -168,7 +168,8 @@ fn finish_returns_when_the_stopped_report_succeeded() {
 /// process itself, with the code it was to report, after it logged why.
 ///
 /// The directory is the parent's, made after the child's branch: a child ends itself without
-/// dropping anything, so it creates nothing.
+/// dropping anything, so it creates nothing. The default log is the parent's too, as an install makes
+/// it: the shim only opens it.
 #[skuld::test]
 fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed() {
     if child_mode().is_some() {
@@ -179,6 +180,7 @@ fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed
     }
 
     let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(dir.path().join("frpc.log"), "").expect("the log an install made");
     let code = Children::of("finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed")
         .exit_logging(0, dir.path());
 

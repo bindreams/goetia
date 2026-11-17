@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 
 use cosca::Containment;
 
-use super::{Channels, Os, LogKind, Severity, Spawned};
+use super::{Channels, LogKind, Os, Severity, Spawned};
 use crate::backend::scm::shim::run::logging::Log;
 
 /// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
