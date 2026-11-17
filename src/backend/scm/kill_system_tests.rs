@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 
 use windows_sys::Win32::System::Threading::{PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
 
-use super::system::{open_process_with, request_termination, wait_exit};
+use super::system::{is_running, open_process_with, request_termination, wait_exit};
 use crate::backend::scm::wait::Waited;
 use crate::manager::budget::Budget;
 
@@ -135,6 +135,33 @@ fn waiting_for_an_exited_process_confirms_whatever_the_deadline() {
     });
 
     assert_eq!(waited.unwrap(), Waited::Confirmed);
+}
+
+// Whether a pid is a running process ----------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_child_that_runs_is_running() {
+    let child = spawn_long_running();
+
+    assert!(is_running(child.0.id()).unwrap());
+}
+
+/// The child keeps its own handle, so the pid still opens and the object is signalled.
+#[skuld::test]
+fn a_child_that_exited_is_not_running_while_its_object_is_held() {
+    let mut child = spawn_exiting_with(0);
+    child.0.wait().unwrap();
+
+    assert!(!is_running(child.0.id()).unwrap());
+}
+
+/// 259 is `STILL_ACTIVE`: the answer is the object's signal, never the exit code.
+#[skuld::test]
+fn a_child_that_exited_with_259_is_not_running() {
+    let mut child = spawn_exiting_with(259);
+    child.0.wait().unwrap();
+
+    assert!(!is_running(child.0.id()).unwrap());
 }
 
 #[skuld::test]

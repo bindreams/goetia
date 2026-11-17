@@ -1712,7 +1712,13 @@ Per platform:
   rule above exists at all. For exactly one it **names that service**, and
   its `reason` is about that service rather than about the host, so a
   `name == null` assertion written from the aggregate case is wrong on a
-  host where exactly one read was denied.
+  host where exactly one read was denied. A task is not a service, and its
+  running is read from its process: an unelevated `status` or `list` of a task
+  that runs as another account (SYSTEM, LocalService, or an administrator's own
+  elevated task) cannot open that process, so it cannot tell running from
+  idle. It reports the id as `unusable`, naming the denial, exit `4`, and
+  `run` of it refuses with the same denial. Re-running as Administrator
+  clears it.
 
 **Whether a `reason` also carries a remedy is platform-specific.** On systemd
 and launchd it is facts only, and any remedy belongs to the per-id

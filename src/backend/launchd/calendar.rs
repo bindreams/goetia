@@ -11,8 +11,9 @@
 //! some months lack is therefore written with a month that has it, a weekday under a restricted
 //! month is refused, and so is a schedule that has to name 29 February.
 
+use crate::backend::refuse_day_fields_and;
 use crate::error::Error;
-use crate::spec::{CronField, DayRule, Id, Schedule, invalid};
+use crate::spec::{CronField, DaySelection, Id, Schedule, invalid};
 
 /// One `StartCalendarInterval` dict; a `None` field is a key the dict omits. The fields are in the
 /// order the dict renders its keys.
@@ -47,18 +48,12 @@ pub(crate) fn entries(schedule: &Schedule, id: &Id) -> Result<Vec<Entry>, Error>
     let months_full = months.values.len() == 12;
     let refuse = |message: String| invalid(id, &message);
 
-    let (use_days, use_weekdays, every_day) = match (schedule.day_rule(), is_full(days, 31), is_full(weekdays, 7)) {
-        (_, true, true) | (DayRule::Or, true, false) | (DayRule::Or, false, true) => (false, false, true),
-        (DayRule::And, true, false) => (false, true, false),
-        (DayRule::And, false, true) => (true, false, false),
-        (DayRule::Or, false, false) => (true, true, false),
-        (DayRule::And, false, false) => {
-            return Err(refuse(format!(
-                "launchd matches a day of the month and a day of the week as either-or, so it cannot hold `{text}`: \
-                 one of its day fields starts with `*` (both must match) while both day fields are restricted; use \
-                 `*` for one of the two"
-            )));
-        }
+    let (use_days, use_weekdays, every_day) = match schedule.days() {
+        DaySelection::Every => (false, false, true),
+        DaySelection::OfWeek => (false, true, false),
+        DaySelection::OfMonth => (true, false, false),
+        DaySelection::Either => (true, true, false),
+        DaySelection::Both => return Err(refuse_day_fields_and(id, "launchd", text)),
     };
 
     if use_weekdays && !months_full {

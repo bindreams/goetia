@@ -231,6 +231,12 @@ pub(in crate::backend::scm) mod system {
     }
 
     impl Held {
+        /// Opens the process `pid` with the rights a kill and a wait need, or `None` if no process has
+        /// that pid. The hold of every target of the state machine, a task's included.
+        pub(in crate::backend::scm) fn open(pid: u32) -> io::Result<Option<Held>> {
+            Ok(open_process_with(pid, PROCESS_ACCESS)?.map(|handle| Held { handle, pid }))
+        }
+
         /// Says on stderr why nothing returns while `id`'s process runs, and why it is still
         /// running if ending it failed.
         pub(in crate::backend::scm) fn notice(&self, id: &str, terminate_failed: Option<&io::Error>) {
@@ -295,7 +301,7 @@ pub(in crate::backend::scm) mod system {
         }
 
         fn open(&mut self, pid: u32) -> io::Result<Option<Held>> {
-            Ok(open_process_with(pid, PROCESS_ACCESS)?.map(|handle| Held { handle, pid }))
+            Held::open(pid)
         }
 
         /// A process is ended with `TerminateProcess`: there is no request to exit to send first.
@@ -383,6 +389,17 @@ pub(in crate::backend::scm) mod system {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Whether the process with `pid` is running: `false` for one that does not exist or whose
+    /// object is signalled, `true` for one that opens and is not. Any other failure to open it is
+    /// the error, never "running". For a pid a manager's own handle keeps from being reused (a task's
+    /// instance, held by Task Scheduler while it lists it), so the answer is about that process.
+    pub(in crate::backend::scm) fn is_running(pid: u32) -> io::Result<bool> {
+        match open_process_with(pid, PROCESS_SYNCHRONIZE)? {
+            None => Ok(false),
+            Some(process) => has_exited(&process).map(|exited| !exited),
+        }
     }
 
     /// Whether the process behind `process`, held with `SYNCHRONIZE`, has exited.

@@ -122,6 +122,52 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
     })
 }
 
+// Metadata text =======================================================================================================
+
+/// The blob as the text a launchd plist comment and a Task Scheduler task's `Data` carry: `Marker`,
+/// `Schema`, `Version` and `Spec`, one `Name: value` line each in that order, with no outer
+/// whitespace and LF line ends (Task Scheduler drops a CR and outer whitespace from `Data`).
+pub(crate) fn metadata_text(spec: &DaemonSpec) -> String {
+    format!(
+        "Marker: {MARKER}\nSchema: {SCHEMA}\nVersion: {version}\nSpec: {encoded}",
+        version = crate::version(),
+        encoded = encode(spec),
+    )
+}
+
+/// Parse [`metadata_text`]'s text, with LF or CRLF line ends, and decode the embedded blob. `Schema`
+/// and `Version` are discarded: [`decode`] re-derives both from `Spec`, and the plain-text copies are
+/// for a human reading the artifact.
+pub(crate) fn parse_metadata_text(content: &str) -> Result<Blob, Error> {
+    let mut lines = content.lines();
+
+    let marker = read_field(&mut lines, "Marker")?;
+    let _schema = read_field(&mut lines, "Schema")?;
+    let _version = read_field(&mut lines, "Version")?;
+    let spec = read_field(&mut lines, "Spec")?;
+
+    if lines.next().is_some() {
+        // Our `Spec` never contains whitespace, so a further line is a hand-edit or bit-rot. Reject
+        // it rather than decode a truncated prefix.
+        return Err(Error::blob("goetia metadata has content after `Spec`"));
+    }
+    if marker != MARKER {
+        return Err(Error::blob(format!(
+            "goetia metadata names marker `{marker}`, expected `{MARKER}`"
+        )));
+    }
+    decode(spec)
+}
+
+fn read_field<'a>(lines: &mut std::str::Lines<'a>, name: &str) -> Result<&'a str, Error> {
+    let line = lines
+        .next()
+        .ok_or_else(|| Error::blob(format!("goetia metadata is missing `{name}`")))?;
+    let prefix = format!("{name}: ");
+    line.strip_prefix(prefix.as_str())
+        .ok_or_else(|| Error::blob(format!("goetia metadata: expected `{name}: ...`, got `{line}`")))
+}
+
 // Canonical JSON ======================================================================================================
 
 /// Build the envelope and render it as compact, key-sorted-at-every-level

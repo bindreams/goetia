@@ -180,9 +180,10 @@ pub trait ServiceManager {
     /// down (a Windows `protocol: plain` service reads `RUNNING` until its shim
     /// has taken the stop), and reading that answer as a start would report a
     /// restart that leaves the daemon down. launchd answers a `kickstart` of
-    /// a task that still has its run as it answers a start, so there a task's
-    /// start reads the job first and is refused with [`Error::StillRunning`],
-    /// sending nothing, and one whose read fails is [`Error::StopUnconfirmed`], also sending nothing.
+    /// a task that still has its run as it answers a start, and Task Scheduler
+    /// accepts a `Run` over a live run and begins nothing, so there a task's
+    /// start reads the run first and is refused with [`Error::StillRunning`],
+    /// sending nothing, and one whose read fails is [`Error::StopUnconfirmed`] (launchd), also sending nothing.
     /// `Ok(())` means the manager
     /// accepted a start request and nothing more. Takes no budget: it never
     /// waits.

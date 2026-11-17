@@ -48,7 +48,7 @@ const SCM_DENIAL: skuld::Label;
 /// which the lock tests in `src/backend/scm/shim/lock_tests.rs` and `tests/shim_integration` poll
 /// for who holds it. Shared with both by label *name*.
 #[skuld::label]
-const UNIT_DIR_EXCLUSIVE: skuld::Label;
+pub(crate) const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")
@@ -1713,9 +1713,7 @@ fn list_reads_a_service_whose_own_key_denies_the_reader_as_standing(#[fixture(sc
 
 /// The same boundary on the `list` side, and what the entry standing for it is allowed to say. One
 /// denied `Parameters` read is one entry that names its service — and carries the *rendered cause*
-/// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
-/// match `Err(_)` and hand the entry a static sentence instead, which says nothing of a real Win32
-/// failure.
+/// `registry::read_parameters` built: the key, the operation and the Win32 message.
 #[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
 fn list_reports_a_denied_parameters_read_with_the_cause_it_established(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();

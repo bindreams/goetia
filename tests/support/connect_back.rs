@@ -71,6 +71,14 @@ impl ConnectBack {
         self.accept_value(what);
     }
 
+    /// Blocks until the daemon reports in, with no bound of its own: for an event the service manager
+    /// causes at a time it chooses (a schedule's next minute, a first logon that builds a profile), where
+    /// any number picked here would be a guess. A daemon that never connects is the CI watchdog's to
+    /// report.
+    pub fn accept_unbounded(&self) {
+        self.listener.accept().expect("accept a daemon's report");
+    }
+
     /// Like [`Self::accept`], but hands back the connection itself, unread.
     ///
     /// The daemon may be waiting on its end of the stream (it reads until the

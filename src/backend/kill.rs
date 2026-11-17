@@ -152,7 +152,7 @@ fn recording_notice(id: &str, pid: u32) -> String {
 /// `wait` under [`NOTICE_AFTER`], and once it has lasted that long `line` said and `wait` again with no
 /// bound: a wait that blocks would otherwise leave the verb looking stuck. The exit and the record are
 /// the events, so the second wait ends on them.
-fn wait_saying<T: KillTarget>(
+pub(crate) fn wait_saying<T: KillTarget>(
     target: &mut T,
     line: &str,
     mut wait: impl FnMut(&mut T, Deadline) -> io::Result<Waited>,

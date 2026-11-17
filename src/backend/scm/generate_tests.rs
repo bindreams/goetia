@@ -73,6 +73,31 @@ fn build(spec: &DaemonSpec) -> ScmRegistration {
     registration(spec, &identity(), &|| Ok(host())).unwrap()
 }
 
+/// The service registration of `spec`: the generators return either kind, and every spec built in
+/// this file is a service (tasks are tested in `task_xml_tests.rs`). These shadow theirs.
+fn registration(
+    spec: &DaemonSpec,
+    id: &Identity,
+    host: &dyn Fn() -> Result<HostCommand, Error>,
+) -> Result<ScmRegistration, Error> {
+    service(super::registration(spec, id, host)?)
+}
+
+fn install_registration(
+    spec: &DaemonSpec,
+    id: &Identity,
+    host: &dyn Fn() -> Result<HostCommand, Error>,
+) -> Result<ScmRegistration, Error> {
+    service(super::install_registration(spec, id, host)?)
+}
+
+fn service(definition: WindowsDefinition) -> Result<ScmRegistration, Error> {
+    match definition {
+        WindowsDefinition::Service(registration) => Ok(registration),
+        WindowsDefinition::Task(_) => panic!("a service spec registers as a service"),
+    }
+}
+
 /// The `host` argument of a service that has no host: asking for one is a failure.
 fn no_host() -> Result<HostCommand, Error> {
     panic!("a managed service never asks for a host")
@@ -95,6 +120,34 @@ fn simple_kind_executable_is_shim() {
         !reg.arguments.contains(&spec.common().command[0]),
         "the spec's own command must not appear in arguments: {:?}",
         reg.arguments
+    );
+}
+
+#[skuld::test]
+fn registration_of_a_service_is_unchanged() {
+    let spec = simple_spec();
+    let expected = format!(
+        "Name: frpc\n\
+         DisplayName: \"FRP tunnel client\"\n\
+         Account: \"LocalSystem\"\n\
+         Executable: {exe:?}\n\
+         Arguments:\n  - \"--service-host\"\n\
+         FailureActions:\n  Delay: 1s\n  ResetPeriod: 1day\n  OnNonCrashFailures: true\n\
+         Environment:\n\
+         Parameters:\n  Marker: \"goetia\"\n  Schema: \"1\"\n  Spec: {spec_text:?}\n  Version: {version:?}\n",
+        exe = shim_path(),
+        spec_text = blob::encode(&spec),
+        version = crate::version(),
+    );
+    assert_eq!(
+        registration(&spec, &identity(), &|| Ok(host())).unwrap().to_string(),
+        expected
+    );
+    assert_eq!(
+        install_registration(&spec, &identity(), &|| Ok(host()))
+            .unwrap()
+            .to_string(),
+        expected
     );
 }
 

@@ -28,6 +28,7 @@ pub(crate) mod test_support;
 pub use backend::BackendKind;
 pub(crate) use resolve::invalid;
 pub use resolve::load;
+pub(crate) use schedule::DaySelection;
 pub use schedule::{CronField, DayRule, HashSeed, Schedule};
 pub use stop_action::{NativeSignal, StopAction, StopSignal};
 pub use user::{AccountId, User};
