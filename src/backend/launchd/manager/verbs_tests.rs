@@ -695,12 +695,18 @@ fn stop_with_a_pid_that_has_exited_reads_again() {
 fn stop_under_a_bounded_budget_expires_into_wait_timeout_and_leaves_the_signal() {
     let mut run = Held::ignoring_sigterm();
     let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid)]);
+    // The last read is the one a stop makes once its deadline is spent: the run is still there.
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        print(&running(pid)),
+    ]);
 
     let e = stopping(&fake, Budget::Bounded(Duration::from_millis(100))).expect_err("a run that ignores SIGTERM");
 
     assert_wait_timeout(&e);
-    fake.assert_spent("the signal was sent, and nothing after it");
+    fake.assert_spent("the signal was sent, and nothing after it but the read at the deadline");
     assert_eq!(
         run.finish(),
         Some(0),
@@ -715,7 +721,13 @@ fn a_wait_that_ends_inside_the_grace_names_the_limit() {
     // The run ignores SIGTERM, so the wait ends at the budget.
     let run = Held::ignoring_sigterm();
     let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), procinfo(pid)]);
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        // The read once the deadline is spent.
+        print(&running(pid)),
+    ]);
 
     let recovery = match stopping_as(
         &fake,
@@ -1044,6 +1056,8 @@ fn a_stop_held_to_a_budget_ends_after_a_queued_start_and_reports_the_whole_wait(
         print(&running(pid)),
         print(&running(pid)),
         procinfo(pid),
+        // The read once the deadline is spent.
+        print(&running(pid)),
     ]);
 
     let e = stopping(&fake, Budget::Bounded(budget)).expect_err("a run that ignores SIGTERM");
