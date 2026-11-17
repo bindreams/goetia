@@ -138,31 +138,66 @@ fn a_date_no_month_has_is_installed_armed_and_never_fires(#[fixture(scm_group)] 
 
 // The run times =======================================================================================================
 
-/// The end of 2028, a leap year: most shapes are checked over 2027 and 2028.
+/// The end of 2028, a leap year: the range is 2027 and 2028.
 fn end_of_two_years() -> DateTime {
     civil::date(2028, 12, 31).at(23, 59, 0, 0)
 }
 
-/// The schedules that name a run time every few minutes. A task of the 24 triggers they compile to made
-/// `GetRunTimes` take over 300 s for the two years, so they are checked over January 2027.
-const EVERY_FEW_MINUTES: [&str; 2] = ["* * * * *", "*/7 * * * *"];
+/// The end of January 2027, the range of a schedule with more than [`MANY_RUN_TIMES`] run times in two
+/// years: `GetRunTimes` of the many triggers of such a task took over 300 s for the two years.
+fn end_of_january() -> DateTime {
+    civil::date(2027, 1, 31).at(23, 59, 0, 0)
+}
 
-/// The civil minutes, in the machine's zone, that Task Scheduler runs the task `text` at from the start of
-/// 2027 to `last`, compared with every minute of them against the cron's own reading of it, in both
-/// directions: a run time the cron does not name and a minute it names that has none. The range is fixed
-/// and not derived from today's date; the zone is the machine's, and the comparison assumes it has no
-/// daylight-saving change in those years (CI's is UTC).
-fn assert_runs_as_cron_says(texts: &[&str], last: DateTime) {
+/// More run times in the two years than this, and a schedule is checked over January 2027 only.
+const MANY_RUN_TIMES: usize = 10_000;
+
+/// Whether the cron names `minute`.
+fn cron_names(schedule: &Schedule, minute: DateTime) -> bool {
+    cron_matches(
+        schedule,
+        u8::try_from(minute.minute()).expect("a minute"),
+        u8::try_from(minute.hour()).expect("an hour"),
+        u8::try_from(minute.day()).expect("a day"),
+        u8::try_from(minute.month()).expect("a month"),
+        u8::try_from(minute.weekday().to_sunday_zero_offset()).expect("a weekday"),
+    )
+}
+
+/// The civil minutes, in the machine's zone, that Task Scheduler runs the task `text` at in the two years
+/// 2027 and 2028 (January 2027 for a schedule of more than [`MANY_RUN_TIMES`] run times in them),
+/// compared with every minute of them against the cron's own reading of it, in both directions: a run
+/// time the cron does not name and a minute it names that has none. The range is fixed and not derived
+/// from today's date; the zone is the machine's, and the comparison assumes it has no daylight-saving
+/// change in those years (CI's is UTC).
+fn assert_runs_as_cron_says(texts: &[&str]) {
     let mgr = support::stock_shim_manager();
     let zone = TimeZone::system();
     let first = civil::date(2027, 1, 1).at(0, 0, 0, 0);
     // The window is `(from, to]`.
     let instant = |at: DateTime| SystemTime::from(at.to_zoned(zone.clone()).expect("a time in the zone").timestamp());
-    let (from, to) = (instant(first - 1.minute()), instant(last));
 
     for text in texts {
         let guard = TaskGuard::new();
         let id = &guard.id;
+        let seed = HashSeed {
+            hostname: "testing",
+            id,
+        };
+        let schedule = Schedule::parse(text, &seed).unwrap_or_else(|e| panic!("`{text}`: {e}"));
+        let mut run_times = 0;
+        let mut minute = first;
+        while minute <= end_of_two_years() {
+            run_times += usize::from(cron_names(&schedule, minute));
+            minute += 1.minute();
+        }
+        let last = if run_times > MANY_RUN_TIMES {
+            end_of_january()
+        } else {
+            end_of_two_years()
+        };
+        let (from, to) = (instant(first - 1.minute()), instant(last));
+
         mgr.install(&task_as(id, User::Root, Some(text)), false)
             .unwrap_or_else(|e| panic!("`{text}` is refused: {}", e.report()));
         let times =
@@ -176,23 +211,11 @@ fn assert_runs_as_cron_says(texts: &[&str], last: DateTime) {
                     .datetime()
             })
             .collect();
-        let seed = HashSeed {
-            hostname: "testing",
-            id,
-        };
-        let schedule = Schedule::parse(text, &seed).unwrap_or_else(|e| panic!("`{text}`: {e}"));
 
         let mut wrong = Vec::new();
         let mut minute = first;
         while minute <= last {
-            let named = cron_matches(
-                &schedule,
-                u8::try_from(minute.minute()).expect("a minute"),
-                u8::try_from(minute.hour()).expect("an hour"),
-                u8::try_from(minute.day()).expect("a day"),
-                u8::try_from(minute.month()).expect("a month"),
-                u8::try_from(minute.weekday().to_sunday_zero_offset()).expect("a weekday"),
-            );
+            let named = cron_names(&schedule, minute);
             if named != fired.contains(&minute) {
                 let (cron, scheduler) = if named {
                     ("names it", "has no run")
@@ -225,22 +248,17 @@ fn assert_runs_as_cron_says(texts: &[&str], last: DateTime) {
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn every_cron_shape_matches_the_schedulers_run_times(#[fixture(scm_group)] _group: &Group) {
-    let (every_few_minutes, others): (Vec<&str>, Vec<&str>) = FIRING_SCHEDULES[0]
-        .iter()
-        .copied()
-        .partition(|text| EVERY_FEW_MINUTES.contains(text));
-    assert_runs_as_cron_says(&others, end_of_two_years());
-    assert_runs_as_cron_says(&every_few_minutes, civil::date(2027, 1, 31).at(23, 59, 0, 0));
+    assert_runs_as_cron_says(FIRING_SCHEDULES[0]);
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_time_with_no_single_progression_matches_the_schedulers_run_times(#[fixture(scm_group)] _group: &Group) {
-    assert_runs_as_cron_says(FIRING_SCHEDULES[1], end_of_two_years());
+    assert_runs_as_cron_says(FIRING_SCHEDULES[1]);
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_fifth_weekday_matches_the_schedulers_run_times(#[fixture(scm_group)] _group: &Group) {
-    assert_runs_as_cron_says(FIRING_SCHEDULES[2], end_of_two_years());
+    assert_runs_as_cron_says(FIRING_SCHEDULES[2]);
 }
 
 // Refusals ============================================================================================================

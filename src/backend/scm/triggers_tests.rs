@@ -202,7 +202,7 @@ fn a_fifth_occurrence_of_a_weekday_runs_through_the_last_week() {
 
 // Shapes ==============================================================================================================
 
-/// A daily trigger at `hour`:`minute`, repeating every `every` minutes for `for_minutes` after it.
+/// A daily trigger at `hour`:`minute` with the repetition `repeat`, if any.
 fn daily(hour: u8, minute: u8, repeat: Option<Repeat>) -> Trigger {
     Trigger::Daily {
         every_days: 1,

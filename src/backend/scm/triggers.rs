@@ -146,8 +146,8 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The triggers that fire exactly when `schedule` does, with the fewest this compilation finds. A
-/// schedule that never fires (no month of its month set has any of its days) is `[Trigger::Never]`:
+/// The triggers that fire exactly when `schedule` does, one per hour for each group of minutes (see "The
+/// time of day" in the module doc). A schedule that never fires (no month of its month set has any of its days) is `[Trigger::Never]`:
 /// the result is never empty.
 ///
 /// Refused with [`Error::Invalid`] for `id`: a day of the month and a day of the week that must both
@@ -264,33 +264,16 @@ struct Time {
     repeat: Option<Repeat>,
 }
 
-/// The minutes of one trigger's start and repetition, covered together.
-struct Group {
-    /// Ascending.
-    minutes: Vec<u8>,
-    shape: Shape,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Shape {
-    Single,
-    /// The minutes have this step.
-    Progression(u8),
-}
-
-/// A trigger per hour of `hours` for each group: a repetition inside the hour for a progression, a lone
-/// trigger for a minute.
+/// A trigger per hour of `hours` for each group of `minutes`: a repetition inside the hour for a
+/// progression, a lone trigger for a minute.
 fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     let mut times = Vec::new();
     for group in groups(minutes) {
-        let (first, last) = (group.minutes[0], group.minutes[group.minutes.len() - 1]);
-        let repeat = match group.shape {
-            Shape::Single => None,
-            Shape::Progression(step) => Some(Repeat {
-                every_minutes: u32::from(step),
-                for_minutes: u32::from(last - first),
-            }),
-        };
+        let (first, last) = (group[0], group[group.len() - 1]);
+        let repeat = group.get(1).map(|second| Repeat {
+            every_minutes: u32::from(second - first),
+            for_minutes: u32::from(last - first),
+        });
         times.extend(hours.iter().map(|&hour| Time {
             at: (hour, first),
             repeat,
@@ -299,8 +282,10 @@ fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     times
 }
 
-/// `minutes` split into progressions, longest first, then single minutes.
-fn groups(minutes: &BTreeSet<u8>) -> Vec<Group> {
+/// `minutes` split into groups, each an ascending progression (one minute is a progression): the
+/// longest progression that starts at the smallest minute left, until none is left. Greedy, so not always
+/// the fewest groups.
+fn groups(minutes: &BTreeSet<u8>) -> Vec<Vec<u8>> {
     let mut left = minutes.clone();
     let mut groups = Vec::new();
     while let Some(&first) = left.first() {
@@ -317,18 +302,7 @@ fn groups(minutes: &BTreeSet<u8>) -> Vec<Group> {
         for minute in &longest {
             left.remove(minute);
         }
-        let shape = match longest.as_slice() {
-            [only] => {
-                debug_assert_eq!(*only, first);
-                Shape::Single
-            }
-            [a, b, ..] => Shape::Progression(b - a),
-            [] => unreachable!("a progression starts at its first minute"),
-        };
-        groups.push(Group {
-            minutes: longest,
-            shape,
-        });
+        groups.push(longest);
     }
     groups
 }
