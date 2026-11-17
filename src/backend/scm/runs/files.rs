@@ -10,19 +10,18 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Wdk::Foundation::{NtClose, OBJECT_ATTRIBUTES};
-use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, NtOpenFile, RtlDosPathNameToNtPathName_U_WithStatus,
-};
+use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN_REPARSE_POINT, NtOpenFile};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE,
     STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
+    DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-use windows_sys::Win32::System::WindowsProgramming::RtlFreeUnicodeString;
+
+use crate::backend::scm::wide::wide_null;
 
 /// Creates `path`, or empties what an interrupted write left there, for a record's bytes. Others
 /// may read it but not delete it while it is held, so a write in flight is not pruned from under it.
@@ -112,8 +111,8 @@ pub(super) enum DeleteOutcome {
 /// - A file that is not there, or whose delete is pending, is deleted.
 /// - Anything else is a failure.
 ///
-/// A delete-pending file answers access denied to an open and a delete, as a permission that refuses the
-/// delete does: the Win32 error is 5 for both. Only the status under it differs, `STATUS_DELETE_PENDING`
+/// A delete-pending file or directory answers access denied to an open and a delete, as a permission that
+/// refuses the delete does: the Win32 error is 5 for both. Only the status under it differs, `STATUS_DELETE_PENDING`
 /// against `STATUS_ACCESS_DENIED`, and that is what [`delete_is_pending`] reads.
 ///
 /// Which account made the file is not read: a live pin of another account (after a change of account) is
@@ -123,11 +122,15 @@ pub(super) fn delete(path: &Path) -> DeleteOutcome {
         Ok(()) => DeleteOutcome::Deleted,
         Err(e) if e.kind() == io::ErrorKind::NotFound => DeleteOutcome::Deleted,
         Err(e) if is_sharing_violation(&e) => DeleteOutcome::Held,
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) && delete_is_pending(path) => {
-            DeleteOutcome::Deleted
-        }
+        Err(e) if is_access_denied(&e) && delete_is_pending(path) => DeleteOutcome::Deleted,
         Err(e) => DeleteOutcome::Failed(e),
     }
+}
+
+/// Whether `error` is Win32's access denied, the answer to a file or directory that is delete-pending as
+/// much as to one a permission protects ([`delete_is_pending`] tells them apart).
+pub(super) fn is_access_denied(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
 }
 
 /// Whether some handle holds the pin file `path`: [`delete`] says held. A pin nothing holds (one left by a
@@ -146,22 +149,39 @@ pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
 }
 
-/// Whether the delete of `path` that failed with access denied found the file with its delete pending,
-/// or found it gone since: the kernel's own answer to an open for `DELETE`. A file the permissions
-/// refuse, or one that is there and opens, is not.
-fn delete_is_pending(path: &Path) -> bool {
+/// Whether the delete of `path` (a file or a directory) that failed with access denied found it with its
+/// delete pending, or found it gone since: the kernel's own answer to an open for `DELETE`. One the
+/// permissions refuse, or one that is there and opens, is not.
+pub(super) fn delete_is_pending(path: &Path) -> bool {
     matches!(
         open_for_delete_status(path),
         Some(STATUS_DELETE_PENDING | STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND)
     )
 }
 
-/// The `NTSTATUS` of opening `path` for `DELETE` without following a link, or `None` if the name cannot
-/// be put to `ntdll`. The Win32 call that `std` makes folds the status into an error code, which is
-/// what [`delete`] cannot read the cause from.
+/// The `NTSTATUS` of opening `path` for `DELETE` without following a link, or `None` if that cannot be
+/// asked. The Win32 call that `std` makes folds the status into an error code, which is what [`delete`]
+/// cannot read the cause from.
+///
+/// The open is made relative to a handle on the parent directory, by the bare file name, so no whole path
+/// is ever converted: a path past `MAX_PATH` (goetia has no long-path manifest) or in any prefix form is
+/// opened by `std` as it opens everything. A parent that is not there is a path that is gone. A name with
+/// a NUL in it is refused, not cut.
 fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
-    let mut units = nt_path(path).ok()?;
-    let bytes = u16::try_from(units.len() * 2).ok()?;
+    let path = std::path::absolute(path).ok()?;
+    let mut units = wide_null(path.file_name()?).ok()?;
+    units.pop();
+    let bytes = u16::try_from(units.len() * size_of::<u16>()).ok()?;
+    let parent = match OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path.parent()?)
+    {
+        Ok(parent) => parent,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(STATUS_OBJECT_PATH_NOT_FOUND),
+        Err(_) => return None,
+    };
     let name = UNICODE_STRING {
         Length: bytes,
         MaximumLength: bytes,
@@ -169,7 +189,7 @@ fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
     };
     let attributes = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: null_mut(),
+        RootDirectory: parent.as_raw_handle() as HANDLE,
         ObjectName: &name,
         Attributes: OBJ_CASE_INSENSITIVE,
         SecurityDescriptor: null(),
@@ -177,8 +197,8 @@ fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
     };
     let mut handle: HANDLE = null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
-    // SAFETY: `attributes` and the name it points at outlive the call; `handle` and `status_block` are valid
-    // out-pointers. A handle that is returned is closed below.
+    // SAFETY: `attributes`, the name it points at and `parent`, the handle it is relative to, outlive the
+    // call; `handle` and `status_block` are valid out-pointers. A handle that is returned is closed below.
     let status = unsafe {
         NtOpenFile(
             &mut handle,
@@ -186,7 +206,7 @@ fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
             &attributes,
             &mut status_block,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            FILE_OPEN_REPARSE_POINT,
         )
     };
     if status >= 0 {
@@ -194,32 +214,6 @@ fn open_for_delete_status(path: &Path) -> Option<NTSTATUS> {
         unsafe { NtClose(handle) };
     }
     Some(status)
-}
-
-/// `path` as the name `ntdll` takes (under `\??\`), as UTF-16 with no terminator: the OS's own conversion
-/// of a DOS path, which knows `\\?\`, `\\.\`, UNC and relative forms (measured: KB 2b01933).
-fn nt_path(path: &Path) -> io::Result<Vec<u16>> {
-    let dos: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut nt = UNICODE_STRING {
-        Length: 0,
-        MaximumLength: 0,
-        Buffer: null_mut(),
-    };
-    // SAFETY: `dos` is NUL-terminated and outlives the call; `nt` is a valid out-pointer, and the optional
-    // out-pointers are null.
-    let status = unsafe { RtlDosPathNameToNtPathName_U_WithStatus(dos.as_ptr(), &mut nt, null_mut(), null()) };
-    if status < 0 {
-        return Err(io::Error::other(format!(
-            "the name {} has no NT form (status {:#010x})",
-            path.display(),
-            status as u32
-        )));
-    }
-    // SAFETY: on success `Buffer` holds `Length` bytes, which are copied out before they are freed.
-    let units = unsafe { std::slice::from_raw_parts(nt.Buffer, usize::from(nt.Length) / size_of::<u16>()) }.to_vec();
-    // SAFETY: `nt` was filled in by the conversion, which allocated its buffer for the caller to free.
-    unsafe { RtlFreeUnicodeString(&mut nt) };
-    Ok(units)
 }
 
 #[cfg(test)]

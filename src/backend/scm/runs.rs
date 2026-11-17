@@ -118,9 +118,9 @@ enum Entry {
     Record(InstanceId, PathBuf),
     Temp(PathBuf),
     Pin(PathBuf),
-    /// Anything else, a directory or a file of no name goetia gives: only a removal touches it. Only
-    /// SYSTEM or an Administrator can put one there, and a removal takes it with its tree
-    /// ([`Runs::remove_all`]).
+    /// Anything else, a directory or a file of no name goetia gives: only a removal touches it, and
+    /// takes it with its tree ([`Runs::remove_all`]). Only SYSTEM or an Administrator can put a directory
+    /// there; the task's account can make a file of any name.
     Other {
         path: PathBuf,
         dir: bool,
@@ -327,14 +327,17 @@ impl Runs {
     /// SYSTEM or an Administrator can have put one there. Last the directory itself, which a handle that
     /// shares no delete holds (a pause) and which goes at once for any other: not yet empty (a pin being
     /// refused, a file whose delete is pending, what a shim wrote since the listing) pauses it too,
-    /// naming one of the entries left. Every pause names a path. A pause is [`REMOVE_PACE`], then
-    /// another pass, with no cap: whatever holds a file lets go in time, and the user can interrupt the
-    /// command. A failure ends the removal, naming the path and why. A marker left by a removal that
-    /// died is placed again; an install clears it ([`Runs::ensure`]).
+    /// naming the smallest of the entries left; if none is left by then, the next pass follows at once,
+    /// with no pause. A directory that another program deleted while it held it (its delete is pending,
+    /// and it can no longer be listed) is as good as removed, and the removal goes on to its marker.
+    /// Every pause names a path. A pause is [`REMOVE_PACE`], then another pass, with no cap: whatever
+    /// holds a file lets go in time, and the user can interrupt the command. A failure ends the removal,
+    /// naming the path and why. A marker left by a removal that died is placed again; an install clears
+    /// it ([`Runs::ensure`]).
     ///
-    /// **A limit, stated:** a directory someone placed in the task's directory that cannot be removed
-    /// (say, a program holds a file in it) fails the removal, which names it; remove it by hand and run
-    /// the removal again.
+    /// **A limit, stated:** a directory someone placed in the task's directory that a program holds
+    /// open (a handle on a file in it, say) fails the removal, which names that directory; once the
+    /// program lets go, or the directory is removed by hand, run the removal again.
     ///
     /// `waiting` is called with the path being waited for, before the pause, and again each time that
     /// path changes, so the caller can say what is awaited.
@@ -362,6 +365,7 @@ impl Runs {
                     }
                     thread::sleep(REMOVE_PACE);
                 }
+                PassOutcome::Again => {}
             }
         }
     }
@@ -374,6 +378,11 @@ impl Runs {
             Ok(entries) => entries,
             // Already removed.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return self.remove_marker(),
+            // Deleted by another program while it held the directory: the name goes when that handle
+            // does, and nothing in it can be listed or deleted any more.
+            Err(e) if files::is_access_denied(&e) && files::delete_is_pending(&self.dir) => {
+                return self.remove_marker();
+            }
             Err(e) => return Err(Error::os_at("list", &self.dir, e)),
         };
         if let Some(held) = self.delete_entries(&entries)? {
@@ -391,18 +400,11 @@ impl Runs {
         }
     }
 
-    /// The pause of a directory that is not empty: it names the first of what is left, by name, so that
-    /// a pause on the same thing is told once. What is left can be gone by now, and the directory too;
-    /// the directory is then what is waited for, and the next pass finds it done.
+    /// What follows a directory that was not empty: a second listing says what is left
+    /// ([`pass_after_not_empty`]). The directory can be gone by now, and is then done.
     fn wait_for_what_is_left(&self) -> Result<PassOutcome> {
         match self.entries() {
-            Ok(entries) => Ok(PassOutcome::Waiting(
-                entries
-                    .iter()
-                    .map(Entry::path)
-                    .min()
-                    .map_or_else(|| self.dir.clone(), Path::to_path_buf),
-            )),
+            Ok(entries) => Ok(pass_after_not_empty(&entries)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => self.remove_marker(),
             Err(e) => Err(Error::os_at("list", &self.dir, e)),
         }
@@ -544,6 +546,19 @@ enum PassOutcome {
     Done,
     /// Something is left, and this is the path of what is waited for.
     Waiting(PathBuf),
+    /// What was left is gone: there is nothing to wait for, and the next pass decides.
+    Again,
+}
+
+/// The outcome of a pass whose `remove_dir` found the directory not empty, given a listing taken after:
+/// a pause naming the smallest path left, by name, so that a pause on the same thing is told once; or, if
+/// the listing is empty, no pause at all, since what was left went in between and there is no path that
+/// is held.
+fn pass_after_not_empty(left: &[Entry]) -> PassOutcome {
+    left.iter()
+        .map(Entry::path)
+        .min()
+        .map_or(PassOutcome::Again, |path| PassOutcome::Waiting(path.to_path_buf()))
 }
 
 /// Deletes the file `path` ([`files::delete`]); one that is not there is already deleted. A file that

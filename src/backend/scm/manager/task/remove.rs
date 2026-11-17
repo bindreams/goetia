@@ -93,19 +93,23 @@ impl Scm {
     /// What `uninstall` of an id that is absent does for a task: the run records an `uninstall` that
     /// deleted the task could not remove, and the sweep a service's does.
     pub(in crate::backend::scm) fn task_uninstall_absent(&self, id: &Id) -> Result<()> {
-        self.uninstall_absent_with(&Runs::of(&program_data()?, id), InstallLock::acquire)
+        self.uninstall_absent_with(id, &Runs::of(&program_data()?, id), InstallLock::acquire)
     }
 
-    /// [`Self::task_uninstall_absent`] over the record directory `runs`, and `lock`, which takes the
-    /// install lock. The records are removed under it: an install that has just made them holds it, and
-    /// would lose them. With no records there is nothing to guard, and nothing is taken.
-    pub(super) fn uninstall_absent_with<L>(&self, runs: &Runs, lock: impl FnOnce() -> Result<L>) -> Result<()> {
+    /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes
+    /// the install lock. The records are removed under it: an install that has just made them holds it,
+    /// and would lose them. With no records there is nothing to guard, and nothing is taken. A removal
+    /// that fails says what an `uninstall` that deleted the task and left its records says.
+    pub(super) fn uninstall_absent_with<L>(
+        &self,
+        id: &Id,
+        runs: &Runs,
+        lock: impl FnOnce() -> Result<L>,
+    ) -> Result<()> {
         if runs.is_present() {
             let _lock = lock()?;
-            runs.remove_all(waiting_for_records).map_err(|e| Error::Step {
-                what: "remove the run records of a task that is gone".to_owned(),
-                source: Box::new(e),
-            })?;
+            runs.remove_all(waiting_for_records)
+                .map_err(|e| uninstall_failed(id, Left::Records, e))?;
         }
         self.service_uninstall_absent()
     }
@@ -127,8 +131,8 @@ impl Scm {
     ///    task, disabled.
     /// 3. The task is deleted, then its run records. A `run` that still waits for a record holds a pin
     ///    and the records are not deleted under it; a file another program holds cannot be deleted
-    ///    either. The removal waits for any holder, with no bound, and says once on stderr what it waits
-    ///    for ([`Runs::remove_all`]). The install lock is held throughout.
+    ///    either. The removal waits for any holder, with no bound, and says on stderr what it waits for,
+    ///    each time that changes ([`Runs::remove_all`]). The install lock is held throughout.
     ///
     /// A task that is gone has nothing to disable or stop; the rest finds nothing.
     pub(super) fn task_remove_with<P: Processes>(

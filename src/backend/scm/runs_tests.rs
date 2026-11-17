@@ -15,7 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::*;
 use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
-use crate::backend::scm::test_support::{delete_pending, directory_with_a_file};
+use crate::backend::scm::test_support::{delete_pending, delete_pending_directory, directory_with_a_file};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -472,7 +472,8 @@ fn no_note(_: &Path) {
 
 /// `remove_all` while `holder` (what a `run` or a stop holds) is alive. A thread drops `holder` when the
 /// note is made, so the wait ends on the real condition and nothing is slept for. Returns the result and,
-/// when a note was made, what the directory held at that moment.
+/// when a note was made, what the directory held at the first one: a pin that closes can bring a second
+/// note, by which time the holder is gone.
 fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (Result<()>, Option<Vec<String>>) {
     let (release, released) = mpsc::channel::<()>();
     let mut seen = None;
@@ -482,7 +483,7 @@ fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (Result<()>, Option<
             drop(holder);
         });
         runs.remove_all(|_| {
-            seen = Some(names(runs));
+            seen.get_or_insert_with(|| names(runs));
             let _ = release.send(());
         })
     });
@@ -570,16 +571,18 @@ fn remove_all_waits_for_a_temp_file_the_shim_is_writing_and_names_it() {
     runs.write(&record(1, 1)).unwrap();
     let temp = runs.dir.join(format!("{}.json.tmp", instance(2).hex()));
     let writing = files::create_temp(&temp).unwrap();
-    let mut noted = None;
+    let mut noted = Vec::new();
     let mut writing = Some(writing);
 
     runs.remove_all(|held| {
-        noted = Some(held.to_path_buf());
-        drop(writing.take());
+        noted.push(held.to_path_buf());
+        if held == temp {
+            drop(writing.take());
+        }
     })
     .unwrap();
 
-    assert_eq!(noted, Some(temp));
+    assert!(noted.contains(&temp), "{noted:?}");
     assert!(!runs.dir.exists());
 }
 
@@ -746,18 +749,20 @@ fn remove_all_refuses_a_new_pin_while_it_waits_on_one() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let pin = runs.pin().unwrap();
-    let mut probe = None;
+    let mut probes = Vec::new();
     let mut pin = Some(pin);
 
     runs.remove_all(|_| {
-        probe = Some((runs.marker.exists(), runs.hold().err().map(|e| e.kind())));
+        probes.push((runs.marker.exists(), runs.hold().err().map(|e| e.kind())));
         drop(pin.take());
     })
     .unwrap();
 
-    let (seen, refused) = probe.expect("the removal waited");
-    assert!(seen, "the marker was there while the removal waited");
-    assert_eq!(refused, Some(io::ErrorKind::ResourceBusy));
+    assert!(!probes.is_empty(), "the removal waited");
+    for (seen, refused) in probes {
+        assert!(seen, "the marker was there while the removal waited");
+        assert_eq!(refused, Some(io::ErrorKind::ResourceBusy));
+    }
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists(), "the marker goes after the directory");
 }
@@ -801,16 +806,19 @@ fn remove_all_waits_for_a_file_another_program_holds_and_names_it() {
         .share_mode(FILE_SHARE_READ)
         .open(runs.dir.join(&held_name))
         .unwrap();
-    let mut noted = None;
+    let held_path = runs.dir.join(&held_name);
+    let mut noted = Vec::new();
     let mut held = Some(held);
 
     runs.remove_all(|path| {
-        noted = Some(path.to_path_buf());
-        drop(held.take());
+        noted.push(path.to_path_buf());
+        if path == held_path {
+            drop(held.take());
+        }
     })
     .unwrap();
 
-    assert_eq!(noted, Some(runs.dir.join(&held_name)));
+    assert!(noted.contains(&held_path), "{noted:?}");
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
 }
@@ -828,17 +836,24 @@ fn remove_all_names_each_thing_it_waits_for_as_it_changes() {
     let mut writing = Some(files::create_temp(&temp).unwrap());
     let mut noted = Vec::new();
 
+    // Each handle goes when the path it holds is named: a note for anything else (another program's
+    // hold on a file of ours) lets neither go early.
     runs.remove_all(|path| {
         noted.push(path.to_path_buf());
         if path == temp {
             drop(writing.take());
-        } else {
+        } else if path == pending {
             drop(reader.take());
         }
     })
     .unwrap();
 
-    assert_eq!(noted, [temp, pending]);
+    assert!(noted.contains(&temp), "{noted:?}");
+    assert!(noted.contains(&pending), "{noted:?}");
+    assert!(
+        noted.windows(2).all(|pair| pair[0] != pair[1]),
+        "a path is named when it changes, not again: {noted:?}"
+    );
     assert!(!runs.dir.exists());
 }
 
@@ -882,15 +897,17 @@ fn remove_all_waits_for_a_handle_on_the_directory_that_shares_no_delete_and_name
         .open(&runs.dir)
         .unwrap();
     let mut holder = Some(holder);
-    let mut noted = None;
+    let mut noted = Vec::new();
 
     runs.remove_all(|path| {
-        noted = Some(path.to_path_buf());
-        drop(holder.take());
+        noted.push(path.to_path_buf());
+        if path == runs.dir {
+            drop(holder.take());
+        }
     })
     .unwrap();
 
-    assert_eq!(noted, Some(runs.dir.clone()));
+    assert!(noted.contains(&runs.dir), "{noted:?}");
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
 }
@@ -912,6 +929,43 @@ fn remove_all_removes_a_directory_at_once_while_a_handle_that_shares_delete_is_o
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
     drop(holder);
+}
+
+/// A records directory another program deleted while it held it is delete-pending: Windows answers its
+/// listing with access denied, and its name goes when the holder's handle does. Goetia's own removal never
+/// leaves that state (KB D1), so it is the other program's delete the removal finds. The delete is as good
+/// as done: the removal does not fail, nor pause, and takes its marker away.
+#[skuld::test]
+fn remove_all_takes_a_records_directory_whose_delete_is_pending_as_removed() {
+    let (_dir, runs) = fixture();
+    let holder = delete_pending_directory(&runs.dir);
+
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.marker.exists());
+    drop(holder);
+    assert!(!runs.dir.exists());
+}
+
+/// The pause of a directory that is not empty names the smallest path left. A listing that comes back
+/// empty (what was left went in between) is no pause and has no path to name: the pass is made again.
+#[skuld::test]
+fn a_directory_that_is_not_empty_pauses_on_what_is_left_and_is_passed_again_when_nothing_is() {
+    let dir = Path::new(r"C:\runs\frpc");
+    let left = [
+        Entry::Temp(dir.join("b.json.tmp")),
+        Entry::Pin(dir.join("a.pin")),
+        Entry::Other {
+            path: dir.join("c"),
+            dir: true,
+        },
+    ];
+
+    assert!(matches!(
+        pass_after_not_empty(&left),
+        PassOutcome::Waiting(path) if path == dir.join("a.pin")
+    ));
+    assert!(matches!(pass_after_not_empty(&[]), PassOutcome::Again));
 }
 
 /// A removal that fails leaves its marker, so that a `run` still backs off: its records are partly gone.

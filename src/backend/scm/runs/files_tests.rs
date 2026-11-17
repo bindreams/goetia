@@ -80,18 +80,26 @@ fn a_file_whose_delete_is_pending_is_deleted_and_any_other_failure_is_a_failure(
     assert!(is_held(&refused).is_err());
 }
 
-/// The name `ntdll` takes is the OS's own conversion of the DOS path. `\\.\C:\x` is the drive's path, not a
-/// UNC one: read as UNC it names no file, and a file the permissions refuse would be taken for one that is
-/// gone.
+/// The path's length is no part of the verdict: a records directory under a relocated `%ProgramData%`, or
+/// of a long id, can pass `MAX_PATH`, and goetia has no long-path manifest.
 #[skuld::test]
-fn nt_path_is_the_conversion_the_os_makes_and_a_device_path_is_not_unc() {
-    let nt = |dos: &str| String::from_utf16(&nt_path(Path::new(dos)).unwrap()).unwrap();
+fn a_file_whose_delete_is_pending_is_deleted_at_any_path_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir
+        .path()
+        .join("a".repeat(100))
+        .join("b".repeat(100))
+        .join("c".repeat(100));
+    fs::create_dir_all(&deep).unwrap();
+    let path = deep.join("pin-a.pin");
+    assert!(path.as_os_str().len() > 300, "the path is past MAX_PATH");
+    let reader = delete_pending(&path);
 
-    assert_eq!(nt(r"C:\a\.\b"), r"\??\C:\a\b");
-    assert_eq!(nt(r"\\?\C:\a\b"), r"\??\C:\a\b");
-    assert_eq!(nt(r"\\.\C:\a\b"), r"\??\C:\a\b");
-    assert_eq!(nt(r"\\server\share\x"), r"\??\UNC\server\share\x");
-    assert_eq!(nt(r"\\?\UNC\server\share\x"), r"\??\UNC\server\share\x");
+    let outcome = delete(&path);
+
+    assert!(matches!(outcome, DeleteOutcome::Deleted));
+    drop(reader);
+    assert!(!path.exists());
 }
 
 /// A delete read through a device path (`%ProgramData%` given as `\\.\C:\...`) tells a pending delete from a
