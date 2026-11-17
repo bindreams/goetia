@@ -11,7 +11,8 @@
 //! ends, and while it is held nothing can delete it, whoever tries. One left by a power cut is held by
 //! nothing, and the next write finds it by deleting it: a sharing violation says it is live. What a
 //! pin's holder did not see yet is whatever [`Runs::appeared`] lists: the records written after the
-//! pin's directory listing, which was taken after the pin.
+//! pin's directory listing, which was taken after the pin. **No operation deletes a record while a pin
+//! is held:** a write prunes nothing, and [`Runs::remove_all`] waits for the pins first.
 //!
 //! **`started` only orders** the records of runs that overlap: no decision compares it to the time.
 //!
@@ -35,6 +36,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
@@ -53,6 +56,9 @@ const RECORD: &str = ".json";
 const TEMP: &str = ".json.tmp";
 /// The end of a pin's file name.
 const PIN: &str = ".pin";
+/// The pace of [`Runs::remove_all`]'s re-checks while a pin is held. Each re-check decides; the pace only
+/// keeps the loop from spinning (the shim's re-reads of Task Scheduler's listing run at the same pace).
+const PIN_PACE: Duration = Duration::from_millis(100);
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,21 +256,44 @@ impl Runs {
     }
 
     /// Removes the directory and everything in it, pins too: the task is uninstalled. A directory
-    /// that is not there is already removed. Uninstalling stops the task first; a `run` that still
-    /// waits then is the user's own concurrent action, and its live pin cannot be deleted: the removal
-    /// fails, saying so, and goes through when that `run` has returned.
-    pub(crate) fn remove_all(&self) -> io::Result<()> {
-        match fs::remove_dir_all(&self.dir) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) if files::is_sharing_violation(&e) => Err(io::Error::new(
-                e.kind(),
-                format!(
-                    "a run is waiting for the records in {}: it holds a file there ({e}); remove them when it returns",
-                    self.dir.display()
-                ),
-            )),
-            result => result,
+    /// that is not there is already removed.
+    ///
+    /// **Nothing is deleted while a pin is held.** A `run` that waits for a record holds one, and
+    /// uninstalling stops the task first, so that `run` returns soon after; the removal waits for it,
+    /// re-checking the pins every [`PIN_PACE`] with no cap, and only then deletes. A delete that meets
+    /// a sharing violation (a pin taken since, or a file another program holds open) goes back to the
+    /// wait. `waiting` is called once, before the first pause, so the caller can say what is awaited.
+    /// A pin whose state cannot be told is not waited for: the delete reports its own failure.
+    pub(crate) fn remove_all(&self, waiting: impl FnOnce()) -> io::Result<()> {
+        let mut waiting = Some(waiting);
+        loop {
+            let held = match self.pin_held() {
+                Ok(held) => held,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            };
+            if !held {
+                match fs::remove_dir_all(&self.dir) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) if !files::is_sharing_violation(&e) => return Err(e),
+                    Err(_) => {}
+                    Ok(()) => return Ok(()),
+                }
+            }
+            if let Some(note) = waiting.take() {
+                note();
+            }
+            thread::sleep(PIN_PACE);
         }
+    }
+
+    /// Whether some pin in the directory is held. A pin that nothing holds is deleted by the asking
+    /// ([`files::is_held`]); one that cannot be told about is not held.
+    fn pin_held(&self) -> io::Result<bool> {
+        Ok(self
+            .entries()?
+            .iter()
+            .any(|entry| matches!(entry, Entry::Pin(path) if matches!(files::is_held(path), Ok(true)))))
     }
 
     /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record

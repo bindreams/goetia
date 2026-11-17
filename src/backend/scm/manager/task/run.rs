@@ -110,7 +110,8 @@ pub(crate) struct TaskRun<P: Processes = System> {
     runs: Runs,
     processes: P,
     following: Following<P::Held>,
-    /// Held until the run has been read: no write prunes the record it waits for.
+    /// Held until the run has been read: no write prunes the record it waits for, and an uninstall
+    /// waits for it ([`Runs::remove_all`]) before it removes the records.
     pin: Pin,
     /// The task's `logs` file and its length before the run was requested, where it has one.
     logs: Option<(PathBuf, u64)>,

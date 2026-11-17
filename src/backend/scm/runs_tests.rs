@@ -3,6 +3,8 @@
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
 
 use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -347,6 +349,60 @@ fn a_pin_that_cannot_be_deleted_is_a_problem_and_is_taken_as_not_held() {
     drop(reader);
 }
 
+/// A stop's hold ([`Runs::hold`], no listing) keeps the records it will read as a `run`'s pin does.
+#[skuld::test]
+fn a_hold_keeps_the_records_from_every_write_as_a_pin_does() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let hold = runs.hold().unwrap();
+
+    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(3, 3)).unwrap();
+
+    assert_eq!(
+        instances_kept(&runs, &[instance(1), instance(2), instance(3)]),
+        [true, true, true]
+    );
+    drop(hold);
+}
+
+/// A stale pin beside a live one is told from it by its own sharing: the stale one is deleted, the
+/// live one and every record stay.
+#[skuld::test]
+fn a_stale_pin_beside_a_live_one_is_deleted_and_the_live_one_still_keeps_every_record() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let pin = runs.pin().unwrap();
+    let stale = runs.dir.join("pin-stale.pin");
+    fs::write(&stale, "").unwrap();
+
+    let problems = runs.write(&record(2, 2)).unwrap();
+
+    assert!(!stale.exists());
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [true, true]);
+    assert_eq!(problems, Vec::<String>::new());
+    drop(pin);
+}
+
+#[skuld::test]
+fn the_records_are_kept_until_the_last_of_two_pins_is_dropped() {
+    let (_dir, runs) = fixture();
+    let first = runs.pin().unwrap();
+    let second = runs.hold().unwrap();
+    runs.write(&record(1, 1)).unwrap();
+
+    drop(first);
+    runs.write(&record(2, 2)).unwrap();
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [true, true]);
+
+    drop(second);
+    runs.write(&record(3, 3)).unwrap();
+    assert_eq!(
+        instances_kept(&runs, &[instance(1), instance(2), instance(3)]),
+        [false, false, true]
+    );
+}
+
 #[skuld::test]
 fn dropping_a_pin_releases_its_records_to_the_next_write() {
     let (_dir, runs) = fixture();
@@ -396,39 +452,158 @@ fn appeared_is_empty_when_nothing_was_written_after_the_pin() {
 
 // uninstall ===========================================================================================================
 
+/// The note of a `remove_all` that has nothing to wait for: it is never made.
+fn no_note() {
+    panic!("nothing holds the directory, so there is nothing to wait for");
+}
+
+/// `remove_all` while `holder` (what a `run` or a stop holds) is alive. A thread drops `holder` when the
+/// note is made, so the wait ends on the real condition and nothing is slept for. Returns the result and,
+/// when a note was made, what the directory held at that moment.
+fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (io::Result<()>, Option<Vec<String>>) {
+    let (release, released) = mpsc::channel::<()>();
+    let mut seen = None;
+    let result = thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = released.recv();
+            drop(holder);
+        });
+        runs.remove_all(|| {
+            seen = Some(names(runs));
+            let _ = release.send(());
+        })
+    });
+    (result, seen)
+}
+
 #[skuld::test]
-fn remove_all_clears_the_directory_and_its_pins() {
+fn remove_all_clears_the_directory_and_its_pins_that_nothing_holds() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
     fs::write(runs.dir.join(format!("{}.json.tmp", instance(2).hex())), "").unwrap();
 
-    runs.remove_all().unwrap();
+    runs.remove_all(no_note).unwrap();
 
     assert!(!runs.dir.exists());
-    runs.remove_all().unwrap();
+    runs.remove_all(no_note).unwrap();
 }
 
-/// A live pin cannot be deleted by anyone, so the removal while a `run` waits fails and says why; the
-/// `run` is undisturbed, and the removal goes through once it returns.
+/// A pin left by a power cut, of an account the writer has no entry for, is told from a live one by its
+/// sharing alone: it is deleted with the directory and is not waited for.
 #[skuld::test]
-fn remove_all_while_a_run_holds_a_pin_fails_saying_so_and_goes_through_when_it_returns() {
+fn remove_all_does_not_wait_for_a_stale_pin_it_has_no_entry_on() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let stale = runs.dir.join("pin-old.pin");
+    fs::write(&stale, "").unwrap();
+    Descriptor::from_sddl("D:P(A;;FA;;;SY)(A;;FA;;;BA)")
+        .unwrap()
+        .set_dacl(&stale)
+        .unwrap();
+
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.dir.exists());
+}
+
+/// A pin whose state cannot be told (its delete is pending, which Windows answers with access denied) is
+/// not a held one: the wait is for a handle that holds, and none is known to. The removal then returns
+/// its own failure instead of waiting for one that may never come.
+#[skuld::test]
+fn remove_all_does_not_wait_for_a_pin_it_cannot_tell_about() {
+    let (_dir, runs) = fixture();
+    let pending = runs.dir.join("pin-odd.pin");
+    let reader = delete_pending(&pending);
+
+    let result = runs.remove_all(no_note);
+
+    assert!(result.is_err(), "the directory cannot be removed around it");
+    drop(reader);
+    runs.remove_all(no_note).unwrap();
+}
+
+#[skuld::test]
+fn remove_all_of_a_directory_that_is_gone_is_done_without_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+
+    runs.remove_all(no_note).unwrap();
+}
+
+/// While a `run` waits, its pin is held and nothing in the directory is deleted: the removal says it
+/// waits, then removes everything when the `run` returns.
+#[skuld::test]
+fn remove_all_deletes_nothing_while_a_run_holds_a_pin_and_removes_everything_when_it_returns() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let pin = runs.pin().unwrap();
+    runs.write(&record(2, 2)).unwrap();
+    let before = names(&runs);
 
-    let error = runs.remove_all().unwrap_err();
+    let (result, seen) = remove_all_while_held(&runs, pin);
 
-    let text = error.to_string();
-    assert!(text.contains("a run is waiting"), "{text}");
-    assert!(text.contains(&runs.dir.display().to_string()), "{text}");
+    result.unwrap();
     assert_eq!(
-        runs.appeared(&pin).unwrap(),
-        [],
-        "the waiting run still reads its directory"
+        seen,
+        Some(before),
+        "a pin was held at the note, and every file was still there"
     );
-    drop(pin);
-    runs.remove_all().unwrap();
+    assert!(!runs.dir.exists());
+}
+
+/// A stop holds a pin too ([`Runs::hold`]), which keeps the records it reads as much as a `run`'s does.
+#[skuld::test]
+fn remove_all_waits_for_a_stops_hold_as_for_a_runs_pin() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let hold = runs.hold().unwrap();
+    let before = names(&runs);
+
+    let (result, seen) = remove_all_while_held(&runs, hold);
+
+    result.unwrap();
+    assert_eq!(seen, Some(before));
+    assert!(!runs.dir.exists());
+}
+
+/// A pin held by a `run` of another account, which this account has no entry on, is waited for as any
+/// is: the directory's right to delete entries does not let a removal take it.
+#[skuld::test]
+fn remove_all_waits_for_a_live_pin_the_removing_account_has_no_entry_on() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let live = runs.dir.join("pin-other.pin");
+    let holder = files::pin_options()
+        .access_mode(files::PIN_ACCESS | WRITE_DAC)
+        .create_new(true)
+        .open(&live)
+        .unwrap();
+    Descriptor::from_sddl("D:P(A;;FA;;;SY)")
+        .unwrap()
+        .set_dacl_of(&holder)
+        .unwrap();
+    let before = names(&runs);
+
+    let (result, seen) = remove_all_while_held(&runs, holder);
+
+    result.unwrap();
+    assert_eq!(seen, Some(before), "the live pin and the record were there at the note");
+    assert!(!runs.dir.exists());
+}
+
+#[skuld::test]
+fn remove_all_waits_for_two_held_pins_and_is_not_confused_by_a_stale_one_beside_them() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let first = runs.pin().unwrap();
+    let second = runs.hold().unwrap();
+    fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
+
+    let (result, seen) = remove_all_while_held(&runs, (first, second));
+
+    result.unwrap();
+    assert!(seen.is_some(), "two pins were held at the note");
     assert!(!runs.dir.exists());
 }
 
@@ -580,7 +755,7 @@ fn a_task_has_records_to_remove_while_its_directory_is_there() {
     made_for(&runs, &process_user_sid());
     assert!(runs.is_present());
 
-    runs.remove_all().unwrap();
+    runs.remove_all(no_note).unwrap();
     assert!(!runs.is_present());
 }
 

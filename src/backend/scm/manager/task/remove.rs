@@ -54,6 +54,13 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
     }
 }
 
+/// What an uninstall says on stderr, once, when its removal of the run records has to wait: the manager
+/// has no channel for a notice, so it is said as its warnings are. A `run` that still waits for a record
+/// holds the directory, and returns after the stop that came before.
+fn waiting_for_records() {
+    eprintln!("waiting for a `run` or another program that holds the task's run records to let go");
+}
+
 /// The shim file the stored task runs, when its file name is that of one a provider placed (the one
 /// file an uninstall may sweep). `None` for any other host.
 fn task_shim_host(registered: &Registered) -> Result<Option<PathBuf>> {
@@ -91,7 +98,7 @@ impl Scm {
     pub(super) fn uninstall_absent_with<L>(&self, runs: &Runs, lock: impl FnOnce() -> Result<L>) -> Result<()> {
         if runs.is_present() {
             let _lock = lock()?;
-            runs.remove_all()
+            runs.remove_all(waiting_for_records)
                 .map_err(|e| Error::os("remove the run records of a task that is gone", e))?;
         }
         self.service_uninstall_absent()
@@ -112,7 +119,9 @@ impl Scm {
     /// 2. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
     ///    event. A run whose shim recorded an incomplete stop, or whose record cannot be read, keeps the
     ///    task, disabled.
-    /// 3. The task is deleted, then its run records.
+    /// 3. The task is deleted, then its run records. A `run` that still waits for a record holds a pin
+    ///    and the records are not deleted under it: the removal waits for it, with no bound, and says so
+    ///    once on stderr ([`Runs::remove_all`]). The install lock is held throughout.
     ///
     /// A task that is gone has nothing to disable or stop; the rest finds nothing.
     pub(super) fn task_remove_with<P: Processes>(
@@ -140,7 +149,7 @@ impl Scm {
             Err(e @ Error::TaskFolderKept { .. }) => eprintln!("warning: {}", e.report()),
             Err(e) => return Err(uninstall_failed(id, Left::Disabled, e)),
         }
-        runs.remove_all().map_err(|e| {
+        runs.remove_all(waiting_for_records).map_err(|e| {
             uninstall_failed(
                 id,
                 Left::Records,
