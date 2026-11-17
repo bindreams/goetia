@@ -420,13 +420,13 @@ fn a_logs_elsewhere_is_accepted() {
     assert!(refuse_logs_in_folder(dir.path(), &id(), None).is_ok());
 }
 
-/// `path`, a path on a local drive, as `\localhost\<drive>$\...`: the administrative share of the same
+/// `path`, a path on a local drive, as `\\localhost\<drive>$\...`: the administrative share of the same
 /// folder, which the system lets an elevated account open. Its canonical form is a UNC path, which has no
 /// text in common with the local one.
 fn through_the_admin_share(path: &Path) -> PathBuf {
     let text = path.to_str().expect("a UTF-8 path");
     let (drive, rest) = text.split_once(r":\").expect("a path on a local drive");
-    PathBuf::from(format!(r"\localhost\{drive}$\{rest}"))
+    PathBuf::from(format!(r"\\localhost\{drive}$\{rest}"))
 }
 
 /// A folder is the same folder however it is reached. The administrative share of the drive spells the logs
