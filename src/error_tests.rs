@@ -98,6 +98,11 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::NotATask { id: id() },
         Error::AlreadyRunning { id: id() },
         Error::StillRunning { id: id(), pid: 1 },
+        Error::RetypeRunning {
+            id: id(),
+            old: crate::spec::DaemonKind::Task,
+        },
+        Error::AccountChangeRunning { id: id() },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -145,7 +150,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             kind: DaemonKind::Service,
         },
-        Error::PasswordRequired { account: id() },
+        Error::PasswordRequired {
+            account: id(),
+            kind: DaemonKind::Service,
+        },
         Error::UnsupportedManager {
             client: VersionReading::Major(241),
             manager: VersionReading::Unreadable(String::new()),
@@ -172,10 +180,16 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             source: Box::new(not_installed()),
         },
-        Error::ShimFolderUnsafe {
+        Error::FolderUnsafe {
             path: PathBuf::new(),
             account: String::new(),
             right: OWN,
+        },
+        Error::FolderNotAsMade { path: PathBuf::new() },
+        Error::TaskFolderKept {
+            task: String::new(),
+            folder: String::new(),
+            source: Box::new(std::io::Error::other("x")),
         },
         Error::ShimMarkerMissing { path: PathBuf::new() },
         Error::ShimNotEmbedded,
@@ -705,15 +719,20 @@ fn loaded_job_words_the_task_case() {
 
 #[skuld::test]
 fn report_of_a_missing_password() {
-    assert_eq!(
-        Error::PasswordRequired {
-            account: "DOM\\bob".to_string()
-        }
-        .report()
-        .to_string(),
-        "service account `DOM\\bob` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
-         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD before installing"
-    );
+    for (kind, noun) in [(DaemonKind::Service, "service"), (DaemonKind::Task, "task")] {
+        assert_eq!(
+            Error::PasswordRequired {
+                account: "DOM\\bob".to_string(),
+                kind,
+            }
+            .report()
+            .to_string(),
+            format!(
+                "{noun} account `DOM\\bob` needs a password (it is not LocalSystem/LocalService/NetworkService, nor \
+                 an `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again"
+            )
+        );
+    }
 }
 
 #[skuld::test]
@@ -800,17 +819,43 @@ fn report_of_a_refused_directory_names_the_path_and_why() {
 }
 
 #[skuld::test]
-fn report_of_an_unsafe_shim_folder_names_the_path_the_account_and_the_right() {
-    let e = Error::ShimFolderUnsafe {
+fn report_of_an_unsafe_folder_names_the_path_the_account_and_the_right() {
+    let e = Error::FolderUnsafe {
         path: PathBuf::from("/p"),
         account: "Users".to_string(),
         right: CHANGE_PERMISSIONS_OF,
     };
     assert_eq!(
         e.report().to_string(),
-        "refusing to use /p for the shim: Users can change permissions of it, so it could replace the shim; fix its permissions"
+        "refusing to use /p: Users can change permissions of it, so it could replace what goetia keeps in it; fix its permissions"
     );
     assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_folder_that_is_not_as_made_names_the_path_and_the_way_out() {
+    let e = Error::FolderNotAsMade {
+        path: PathBuf::from("/p"),
+    };
+    let text = e.report().to_string();
+    assert!(
+        text.starts_with("refusing /p: its owner or permissions are not those goetia gives the folder"),
+        "{text}"
+    );
+    assert!(text.ends_with("run the command again"), "{text}");
+}
+
+#[skuld::test]
+fn report_of_a_folder_kept_after_a_delete_names_the_task_the_folder_and_the_cause() {
+    let e = Error::TaskFolderKept {
+        task: r"\Goetia\x".to_string(),
+        folder: r"\Goetia".to_string(),
+        source: Box::new(std::io::Error::other("refused")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        r"the task `\Goetia\x` is deleted, but its empty folder `\Goetia` could not be removed: refused"
+    );
 }
 
 #[skuld::test]
@@ -1238,9 +1283,33 @@ fn error_messages_and_exit_class() {
         ),
         (
             Error::StillRunning { id: id(), pid: 4242 },
-            "`nightly` still has the run that was sent SIGTERM (pid 4242), and launchd starts no new run of a task \
-             while one is in flight, so no start was issued; `goetia daemon start nightly` starts one once it has \
-             exited, and `goetia daemon restart nightly` without `--timeout 0` waits for the exit",
+            "`nightly` still has the run that was asked to stop (pid 4242), and the service manager starts no new \
+             run of a task while one is in flight, so no start was issued; `goetia daemon start nightly` starts \
+             one once it has exited, and `goetia daemon restart nightly` without `--timeout 0` waits for the exit",
+            false,
+        ),
+        (
+            Error::RetypeRunning {
+                id: id(),
+                old: crate::spec::DaemonKind::Service,
+            },
+            "`nightly` is running as a service, and changing it to a task removes it first: run `goetia daemon stop \
+             nightly`, then re-run install",
+            false,
+        ),
+        (
+            Error::RetypeRunning {
+                id: id(),
+                old: crate::spec::DaemonKind::Task,
+            },
+            "`nightly` is running as a task, and changing it to a service removes it first: run `goetia daemon stop \
+             nightly`, then re-run install",
+            false,
+        ),
+        (
+            Error::AccountChangeRunning { id: id() },
+            "`nightly` is running, and installing it as another account registers it again, which removes the \
+             running task first: run `goetia daemon stop nightly`, then re-run install",
             false,
         ),
         (

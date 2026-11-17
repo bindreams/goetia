@@ -123,6 +123,38 @@ fn encode_decode_round_trips() {
     }
 }
 
+// Metadata text =======================================================================================================
+
+#[skuld::test]
+fn metadata_text_is_four_lines_and_parses_back() {
+    for spec in [full_spec(), minimal_spec()] {
+        let text = metadata_text(&spec);
+        assert_eq!(text.lines().count(), 4, "{text:?}");
+        assert!(text.starts_with("Marker: goetia\nSchema: 1\nVersion: "), "{text:?}");
+        assert!(!text.ends_with('\n'), "no trailing line break: {text:?}");
+        assert_eq!(parse_metadata_text(&text).unwrap().spec, spec);
+    }
+}
+
+#[skuld::test]
+fn metadata_text_parses_with_crlf_line_ends() {
+    let spec = full_spec();
+    let text = metadata_text(&spec).replace('\n', "\r\n");
+    assert_eq!(parse_metadata_text(&text).unwrap().spec, spec);
+}
+
+#[skuld::test]
+fn metadata_text_with_a_wrong_marker_or_a_missing_or_extra_line_is_refused() {
+    let text = metadata_text(&minimal_spec());
+    let wrong_marker = text.replacen("Marker: goetia", "Marker: other", 1);
+    let missing = text.lines().take(3).collect::<Vec<_>>().join("\n");
+    let extra = format!("{text}\nSpec: again");
+    for bad in [wrong_marker, missing, extra] {
+        let err = parse_metadata_text(&bad).expect_err(&bad);
+        assert!(matches!(err, Error::Blob { .. }), "{err:?}");
+    }
+}
+
 // Tasks ===============================================================================================================
 
 const GOLDEN_HOST: &str = "build-host";

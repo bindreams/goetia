@@ -4,6 +4,8 @@
 //! removes is created, in creation order: locals drop in reverse, so a thing is removed only
 //! after everything that uses it.
 //!
+//! On Windows it also removes a task of the same id and its run records (`testing::remove_task`).
+//!
 //! On macOS it boots the job and a task's timer (`<id>@timer`) out and removes only
 //! `/Library/LaunchDaemons/<id>.plist` and `<id>@timer.plist`, not goetia's staging directory. A
 //! goetia-installed launchd id is guarded with the launchd suite's `Guard`.
@@ -81,9 +83,18 @@ fn cleanup(id: &str) -> Vec<String> {
     problems
 }
 
+/// A service of `id`, and a task of the same id with the run records it made: the id is one namespace
+/// across the SCM and Task Scheduler, so a guard of either removes both. The task goes first, so that
+/// nothing starts it again, and its runs are over before its records are removed.
 #[cfg(windows)]
 fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
+
+    // An id that is no `Id` names no task. `remove_task` never panics and reports its own failures.
+    if let Ok(task) = goetia::spec::Id::try_from(id) {
+        goetia::testing::remove_task(&task);
+        problems.extend(remove_path_retrying(&super::task_records(id), true));
+    }
 
     // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST,
     // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE.

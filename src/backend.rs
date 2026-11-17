@@ -71,7 +71,41 @@ pub(crate) fn refuse_env_sh_resets(
     }
 }
 
-/// What a generator answers for a task until its backend's task support lands.
-pub(crate) fn cannot_run_tasks(backend: &str, id: &crate::spec::Id) -> crate::error::Error {
-    crate::spec::invalid(id, &format!("{backend} cannot run tasks yet"))
+/// Escape the three characters XML element content cannot contain unescaped. Applied to every
+/// emitted value (argv, paths, environment keys and values, the account name), since
+/// `ServiceSpec::new` does not reject `&`/`<`/`>`. Shared by the XML generators (launchd's plist, Task
+/// Scheduler's task).
+///
+/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them. `ServiceSpec::new`
+/// rejects them (and the other Unicode noncharacters); this panics on them as a backstop rather
+/// than emit XML no parser can load.
+pub(crate) fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        assert!(
+            !matches!(c, '\u{FFFE}' | '\u{FFFF}'),
+            "value contains {c:?} (U+FFFE/U+FFFF), which XML 1.0 cannot represent at all; \
+             ServiceSpec::new must reject this upstream, before it ever reaches a generator"
+        );
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The refusal of a schedule whose day-of-month and day-of-week fields must both match
+/// ([`crate::spec::DaySelection::Both`]) by a `manager` that matches the two as either-or.
+pub(crate) fn refuse_day_fields_and(id: &crate::spec::Id, manager: &str, text: &str) -> crate::error::Error {
+    crate::spec::invalid(
+        id,
+        &format!(
+            "{manager} matches a day of the month and a day of the week as either-or, so it cannot hold `{text}`: \
+             one of its day fields starts with `*` (both must match) while both day fields are restricted; use \
+             `*` for one of the two"
+        ),
+    )
 }
