@@ -302,8 +302,11 @@ impl Drop for Deferred {
 /// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
     WAKE.store(-1, Ordering::SeqCst);
-    // MUTANT: no wait for the handlers in flight
-
+    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        #[cfg(test)]
+        test_hook::waited();
+        std::thread::yield_now();
+    }
     drop(wake);
     OPEN.store(false, Ordering::SeqCst);
     claim(ALL)
