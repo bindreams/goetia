@@ -74,9 +74,62 @@ fn the_portable_signals_by_their_native_names_are_the_portable_values() {
     }
 }
 
+/// The names of the 31 standard Linux signals as systemd's `signal_to_string` has them, written out here and
+/// not read from [`NATIVE_SIGNALS`], which they are compared with.
+const SYSTEMD_SIGNALS: [&str; 31] = [
+    "SIGHUP",
+    "SIGINT",
+    "SIGQUIT",
+    "SIGILL",
+    "SIGTRAP",
+    "SIGABRT",
+    "SIGBUS",
+    "SIGFPE",
+    "SIGKILL",
+    "SIGUSR1",
+    "SIGSEGV",
+    "SIGUSR2",
+    "SIGPIPE",
+    "SIGALRM",
+    "SIGTERM",
+    "SIGSTKFLT",
+    "SIGCHLD",
+    "SIGCONT",
+    "SIGSTOP",
+    "SIGTSTP",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGURG",
+    "SIGXCPU",
+    "SIGXFSZ",
+    "SIGVTALRM",
+    "SIGPROF",
+    "SIGWINCH",
+    "SIGIO",
+    "SIGPWR",
+    "SIGSYS",
+];
+
+/// Every signal systemd names parses, and is native exactly when it is not one of the four portable ones;
+/// and the table of native names holds no name systemd does not have.
 #[skuld::test]
-fn every_native_name_systemd_has_parses() {
+fn every_native_name_systemd_has_parses_and_the_table_has_no_other() {
+    let portable = ["SIGTERM", "SIGINT", "SIGQUIT", "SIGKILL"];
+    for name in SYSTEMD_SIGNALS {
+        let signal = name.parse::<StopSignal>().unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            matches!(signal, StopSignal::Native(_)),
+            !portable.contains(&name),
+            "{name}"
+        );
+        assert_eq!(
+            NATIVE_SIGNALS.contains(&name),
+            !portable.contains(&name),
+            "{name} in the table of native names"
+        );
+    }
     for name in NATIVE_SIGNALS {
+        assert!(SYSTEMD_SIGNALS.contains(&name), "{name} is not a name systemd has");
         assert_eq!(name.parse::<StopSignal>().unwrap().to_string(), name);
     }
 }

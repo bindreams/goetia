@@ -5140,10 +5140,13 @@ fn the_stop_leg_of_a_restart_waits_the_stop_timeout_plus_ten_seconds() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
 
-    assert_eq!(code, 4, "stdout:
+    assert_eq!(
+        code, 4,
+        "stdout:
 {out}
 stderr:
-{err}");
+{err}"
+    );
     assert!(err.contains("did not report stopped within 40s:"), "{err}");
 }
 
@@ -5154,10 +5157,13 @@ fn the_start_leg_of_a_restart_waits_ten_seconds_whatever_the_stop_action_gave_th
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
 
-    assert_eq!(code, 4, "stdout:
+    assert_eq!(
+        code, 4,
+        "stdout:
 {out}
 stderr:
-{err}");
+{err}"
+    );
     assert!(err.contains("did not report running within 10s:"), "{err}");
 }
 

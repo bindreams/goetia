@@ -4,7 +4,7 @@
 
 use std::io;
 use std::os::unix::process::ExitStatusExt as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::manager_tests::{launchd_over, procinfo_not_naming};
 use super::super::task::task_tests::{ID, Tree, task_spec};
@@ -75,6 +75,15 @@ fn graced() -> StopAction {
         send_signal: StopSignal::Terminate,
         timeout: Some(StopAction::MIN_TIMEOUT),
     }
+}
+
+/// SIGKILL goes out only once the `timeout` that began at SIGTERM is over, so a stop that ended a run that
+/// ignores SIGTERM by SIGKILL took at least [`StopAction::MIN_TIMEOUT`], the `timeout` these tests give.
+fn assert_grace_passed(stop_took: Duration) {
+    assert!(
+        stop_took >= StopAction::MIN_TIMEOUT,
+        "SIGKILL was sent {stop_took:?} after the stop began, before the timeout was over"
+    );
 }
 
 fn assert_wait_timeout(e: &Error) {
@@ -325,8 +334,14 @@ fn a_wait_that_ends_inside_the_grace_names_the_limit() {
     };
 
     assert!(
-        recovery.contains("SIGKILL") && recovery.contains("goetia daemon kill"),
+        recovery.contains("was sent SIGTERM and has the `stop-action` timeout to answer it")
+            && recovery.contains("sends SIGKILL after that only while it waits")
+            && recovery.contains(&format!("`goetia daemon kill {ID}` ends it")),
         "{recovery}"
+    );
+    assert!(
+        !recovery.contains("did not answer it within") && !recovery.contains("was sent SIGKILL"),
+        "the text of the other cases: {recovery}"
     );
 }
 
@@ -348,8 +363,10 @@ fn stop_sends_sigkill_to_a_run_that_ignores_sigterm_for_the_timeout() {
         print(IDLE),
     ]);
 
+    let began = Instant::now();
     stopping_as(&fake, Budget::Unbounded, graced()).expect("a stop that ends the run");
 
+    assert_grace_passed(began.elapsed());
     fake.assert_spent("SIGTERM, the timeout, then the confirmation and the kill of the process held");
     assert_no_label_signal(&fake);
     assert_eq!(ended_by(&mut run), Some(libc::SIGKILL), "the run was ended by SIGKILL");
@@ -444,21 +461,13 @@ fn a_stop_with_no_time_waits_for_a_queued_start_signals_it_and_reports_the_timeo
 fn a_stop_whose_deadline_is_spent_after_its_first_signal_reads_once_and_ends_as_the_read_says() {
     let failed = reply(
         &["print", &target()],
-        exited(
-            5,
-            "",
-            "Could not print: 5: Input/output error
-",
-        ),
+        exited(5, "", "Could not print: 5: Input/output error\n"),
     );
     let reads = [
         ("a queued start", print(QUEUED), true),
         (
             "a state that says nothing",
-            print(
-                "	state = someday-new-apple-state
-",
-            ),
+            print("\tstate = someday-new-apple-state\n"),
             false,
         ),
         ("a read that failed", failed, false),
@@ -666,11 +675,11 @@ fn a_pid_shown_at_the_deadline_that_has_exited_is_a_run_that_ended_and_is_not_cl
     fake.assert_spent("the first pass, which could not watch the pid, and the one reading at the deadline");
 }
 
-/// `Immediate` waits for nothing, launchd's view included: a pass that finds launchd showing what has ended (a
-/// pid gone, or one it does not name) is read once more at once, and a second reading that shows the same pid
-/// is the end of the stop: launchd is lagging, and `Immediate` does not wait for it.
+/// `Immediate` waits for no exit, but not past what launchd shows: a pass that finds launchd showing a pid that
+/// has ended (gone, or one it does not name) is followed by another reading, however many readings show it, and
+/// the stop returns when one shows no process.
 #[skuld::test]
-fn stop_under_immediate_with_launchd_lagging_on_one_pid_returns_after_two_readings() {
+fn stop_under_immediate_reads_on_while_launchd_shows_a_pid_it_cannot_reach_and_returns_when_it_shows_none() {
     let mut zombie = Held::new(0);
     let gone = zombie.pid();
     zombie.exit_unreaped();
@@ -679,7 +688,12 @@ fn stop_under_immediate_with_launchd_lagging_on_one_pid_returns_after_two_readin
     for (what, fake) in [
         (
             "a pid that is gone",
-            Fake::new([print(&running(gone)), print(&running(gone))]),
+            Fake::new([
+                print(&running(gone)),
+                print(&running(gone)),
+                print(&running(gone)),
+                print(IDLE),
+            ]),
         ),
         (
             "a pid launchd does not name",
@@ -690,10 +704,14 @@ fn stop_under_immediate_with_launchd_lagging_on_one_pid_returns_after_two_readin
                 print(&running(other)),
                 print(&running(other)),
                 procinfo_not_naming(other),
+                print(&running(other)),
+                print(&running(other)),
+                procinfo_not_naming(other),
+                print(IDLE),
             ]),
         ),
     ] {
-        stopping(&fake, Budget::Immediate).expect("a stop that waits for nothing");
+        stopping(&fake, Budget::Immediate).expect("a stop that waits for no exit");
 
         fake.assert_spent(what);
         assert_no_label_signal(&fake);
@@ -728,8 +746,8 @@ fn stop_under_immediate_whose_second_reading_shows_a_new_run_sends_it_sigterm() 
     assert_eq!(ended_by(&mut next), Some(libc::SIGTERM), "the new run was sent SIGTERM");
 }
 
-/// What `print` shows changing is what keeps the loop going: another pid launchd shows and does not
-/// reach is read again, an idle job ends it, and the same pid twice in a row ends it.
+/// What `print` shows is what keeps the loop going, whether it changes or not: another pid launchd shows and
+/// does not reach is read again, as is the same pid, and only an idle job ends it.
 #[skuld::test]
 fn stop_under_immediate_reads_again_while_the_pid_launchd_shows_changes() {
     let (mut first, mut second) = (Held::new(0), Held::new(0));
@@ -738,8 +756,8 @@ fn stop_under_immediate_reads_again_while_the_pid_launchd_shows_changes() {
     second.exit_unreaped();
     for (what, fake) in [
         (
-            "another pid, then the same",
-            Fake::new([print(&running(a)), print(&running(b)), print(&running(b))]),
+            "another pid, then the same, then no process",
+            Fake::new([print(&running(a)), print(&running(b)), print(&running(b)), print(IDLE)]),
         ),
         (
             "another pid, then no process",
@@ -752,8 +770,8 @@ fn stop_under_immediate_reads_again_while_the_pid_launchd_shows_changes() {
     }
 }
 
-/// A start that forks between two readings of the same pid is a new beginning: the pid shown before it says
-/// nothing of the pid shown after, so the second reading of `a` is read once more, not taken as launchd lagging.
+/// A start that forks between two readings of the same pid is waited for under `Immediate` too, and the pid
+/// shown after it is read like any other.
 #[skuld::test]
 fn stop_under_immediate_reads_a_pid_again_after_a_queued_start_forked_between_the_readings() {
     let mut zombie = Held::new(0);
@@ -795,8 +813,10 @@ fn a_run_found_again_keeps_the_grace_that_began_at_its_sigterm() {
         print(IDLE),
     ]);
 
+    let began = Instant::now();
     stopping_as(&fake, Budget::Unbounded, graced()).expect("a stop that ends the run");
 
+    assert_grace_passed(began.elapsed());
     fake.assert_spent("SIGTERM once, the refused confirmation, then the kill of the same run");
     assert_eq!(ended_by(&mut run), Some(libc::SIGKILL), "the run was ended by SIGKILL");
 }
@@ -1032,8 +1052,10 @@ fn the_sigkill_is_for_the_run_whose_timeout_ran_out_and_not_for_the_next() {
         timeout: Some(StopAction::MIN_TIMEOUT),
     };
 
+    let began = Instant::now();
     stopping_as(&fake, Budget::Unbounded, action).expect("a stop that ends the second run");
 
+    assert_grace_passed(began.elapsed());
     fake.assert_spent("each run was told to stop once, and the second killed");
     assert_no_label_signal(&fake);
     assert_eq!(

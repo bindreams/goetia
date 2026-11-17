@@ -1317,18 +1317,15 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixtur
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
     // `trap '' TERM` first, then the report: once the listener has accepted, SIGTERM is ignored.
-    let spec = base_spec(&id, listener.sh_after("trap '' TERM", "while :; do /bin/sleep 1; done"));
-    let _guard = Guard::install(&mgr, &spec);
-    // The generator writes no `ExitTimeOut`, so the staged plist gets one before the job is loaded.
-    let staged = staging_path(&id);
-    let plist = std::fs::read_to_string(&staged).expect("read the staged plist");
-    let end = plist.rfind("</dict>").expect("the plist's top-level dict");
-    let plist = format!(
-        "{}\t<key>ExitTimeOut</key>\n\t<integer>5</integer>\n{}",
-        &plist[..end],
-        &plist[end..]
+    let spec = support::stopping_by(
+        sleepy(&id),
+        listener.sh_after("trap '' TERM", "while :; do /bin/sleep 1; done"),
+        StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: Some(Duration::from_secs(5)),
+        },
     );
-    write_plist(&staged, &plist);
+    let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the job to be up with SIGTERM ignored");
 

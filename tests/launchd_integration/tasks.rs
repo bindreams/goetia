@@ -13,7 +13,7 @@ use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use goetia::Error;
 use goetia::backend::launchd::manager::Launchd;
@@ -627,8 +627,13 @@ fn stop_of_a_task_that_ignores_sigterm_ends_it_after_its_timeout(#[fixture(launc
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
     held.wait_started();
 
+    let stopping = Instant::now();
     mgr.stop(&task_id, Budget::Unbounded).expect("a stop that ends the run");
 
+    assert!(
+        stopping.elapsed() >= StopAction::MIN_TIMEOUT,
+        "the run was ended before its timeout"
+    );
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.common.state, State::Idle, "{status:?}");
     assert_eq!(status.last_result, Some(Exit::Signal(9)), "{status:?}");
