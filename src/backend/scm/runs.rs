@@ -12,7 +12,8 @@
 //! nothing, and the next write finds it by deleting it: a sharing violation says it is live. What a
 //! pin's holder did not see yet is whatever [`Runs::appeared`] lists: the records written after the
 //! pin's directory listing, which was taken after the pin. **No operation deletes a record while a pin
-//! is held:** a write prunes nothing, and [`Runs::remove_all`] waits for the pins first.
+//! is held:** a write prunes nothing, and [`Runs::remove_all`] waits for the pins first. A pin made
+//! after that wait began is refused, by the marker the removal places first ([`Runs::hold`]).
 //!
 //! **`started` only orders** the records of runs that overlap: no decision compares it to the time.
 //!
@@ -56,6 +57,8 @@ const RECORD: &str = ".json";
 const TEMP: &str = ".json.tmp";
 /// The end of a pin's file name.
 const PIN: &str = ".pin";
+/// The marker file of a removal under way, which a new pin looks for ([`Runs::remove_all`]).
+const REMOVING: &str = ".removing";
 /// The pace of [`Runs::remove_all`]'s re-checks while a pin is held. Each re-check decides; the pace only
 /// keeps the loop from spinning (the shim's re-reads of Task Scheduler's listing run at the same pace).
 const PIN_PACE: Duration = Duration::from_millis(100);
@@ -151,11 +154,18 @@ impl Runs {
     /// `principal`, the account the task runs as; or, when it is there, sets its permissions to name it
     /// ([`Descriptor::set_dacl`]: the directory alone, never what is in it). Call it on every write of
     /// the task, so that a reinstall that changes the account can still write.
+    ///
+    /// It also takes away a removal's marker that an uninstall left when it died ([`Runs::remove_all`]):
+    /// the task is installed again, and its `run` must not back off.
     pub(crate) fn ensure(&self, principal: &Sid) -> io::Result<()> {
         let permissions = Descriptor::for_runs(principal).map_err(io::Error::other)?;
         match permissions.create_dir(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => permissions.set_dacl(&self.dir),
             made => made,
+        }?;
+        match fs::remove_file(self.dir.join(REMOVING)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            Err(_) | Ok(()) => Ok(()),
         }
     }
 
@@ -213,14 +223,26 @@ impl Runs {
 
     /// Takes a pin and lists nothing, for a holder that only keeps the records there are from being
     /// pruned and reads them by name. [`Runs::appeared`] needs the listing [`Runs::pin`] takes.
+    ///
+    /// The pin is made first and the removal's marker looked for after, the opposite order of
+    /// [`Runs::remove_all`]'s: so either the removal sees this pin and waits, or this finds the marker
+    /// and drops the pin. A pin that finds the marker is refused with an [`io::ErrorKind::NotFound`]
+    /// error, as one in a directory already removed is.
     pub(crate) fn hold(&self) -> io::Result<Pin> {
         let mut names = Builder::new();
         names.prefix("pin-").suffix(PIN).disable_cleanup(true);
         let (file, _path) = names.make_in(&self.dir, files::create_pin)?.into_parts();
-        Ok(Pin {
+        let pin = Pin {
             _file: file,
             listing: None,
-        })
+        };
+        if self.dir.join(REMOVING).try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "its run records are being removed: the task is being uninstalled",
+            ));
+        }
+        Ok(pin)
     }
 
     /// The records that are not in `pin`'s listing, the earliest `started` first (ties by instance).
@@ -260,30 +282,96 @@ impl Runs {
     ///
     /// **Nothing is deleted while a pin is held.** A `run` that waits for a record holds one, and
     /// uninstalling stops the task first, so that `run` returns soon after; the removal waits for it,
-    /// re-checking the pins every [`PIN_PACE`] with no cap, and only then deletes. A delete that meets
-    /// a sharing violation (a pin taken since, or a file another program holds open) goes back to the
-    /// wait. `waiting` is called once, before the first pause, so the caller can say what is awaited.
-    /// A pin whose state cannot be told is not waited for: the delete reports its own failure.
+    /// re-checking the pins every [`PIN_PACE`] with no cap, and only then deletes.
+    ///
+    /// **A pin cannot be taken in the moment between the check and the delete.** The removal places
+    /// a marker file (`.removing`) before it looks at the pins; a pin is made before it looks for the
+    /// marker ([`Runs::hold`]). Either the pin is there when the removal looks, or the marker is there
+    /// when the pin looks and the pin is dropped. The marker is deleted last, after every other file,
+    /// so that a pin taken during the delete finds it. A file another program holds open (a sharing
+    /// violation) is left, the rest deleted, and the removal goes back to the wait. A marker left by a
+    /// removal that died is placed again and deleted with the directory; an install clears it
+    /// ([`Runs::ensure`]).
+    ///
+    /// `waiting` is called once, before the first pause, so the caller can say what is awaited. A pin
+    /// whose state cannot be told is not waited for: the delete reports its own failure.
     pub(crate) fn remove_all(&self, waiting: impl FnOnce()) -> io::Result<()> {
+        let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
         let mut waiting = Some(waiting);
         loop {
+            // The marker first, then the pins: see [`Runs::hold`].
+            match fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(self.dir.join(REMOVING))
+            {
+                Ok(_) => {}
+                Err(e) if gone(&e) => return Ok(()),
+                Err(e) => return Err(e),
+            }
             let held = match self.pin_held() {
                 Ok(held) => held,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) if gone(&e) => return Ok(()),
                 Err(e) => return Err(e),
             };
             if !held {
-                match fs::remove_dir_all(&self.dir) {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-                    Err(e) if !files::is_sharing_violation(&e) => return Err(e),
-                    Err(_) => {}
-                    Ok(()) => return Ok(()),
+                match self.delete_all_but_marker() {
+                    Ok(false) => match self.remove_marker_and_dir() {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {}
+                        Err(e) if gone(&e) => return Ok(()),
+                        Err(e) => return Err(e),
+                    },
+                    Ok(true) => {}
+                    Err(e) if gone(&e) => return Ok(()),
+                    Err(e) => return Err(e),
                 }
             }
             if let Some(note) = waiting.take() {
                 note();
             }
             thread::sleep(PIN_PACE);
+        }
+    }
+
+    /// Deletes every entry of the directory but the marker, and returns whether one is left because a
+    /// handle holds it (a sharing violation). The marker stays until the rest is gone, so that no pin
+    /// is taken while the records are being deleted ([`Runs::hold`]).
+    fn delete_all_but_marker(&self) -> io::Result<bool> {
+        let mut left = false;
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.file_name() == REMOVING {
+                continue;
+            }
+            let path = entry.path();
+            let deleted = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match deleted {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if files::is_sharing_violation(&e) => left = true,
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
+        }
+        Ok(left)
+    }
+
+    /// Removes the marker and then the directory, which holds nothing else. Returns `false` when
+    /// something was put in it since (a pin taken in the moment after the marker went), for the removal
+    /// to go back to its wait.
+    fn remove_marker_and_dir(&self) -> io::Result<bool> {
+        match fs::remove_file(self.dir.join(REMOVING)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            Err(_) | Ok(()) => {}
+        }
+        match fs::remove_dir(&self.dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty || files::is_sharing_violation(&e) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 

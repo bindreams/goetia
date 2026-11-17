@@ -8,7 +8,7 @@ use std::thread;
 
 use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, READ_CONTROL, WRITE_DAC,
 };
 
 use super::*;
@@ -457,6 +457,13 @@ fn no_note() {
     panic!("nothing holds the directory, so there is nothing to wait for");
 }
 
+/// `names` with the removal's marker, which `remove_all` has placed by the time it makes its note.
+fn marked(mut names: Vec<String>) -> Vec<String> {
+    names.push(REMOVING.to_string());
+    names.sort();
+    names
+}
+
 /// `remove_all` while `holder` (what a `run` or a stop holds) is alive. A thread drops `holder` when the
 /// note is made, so the wait ends on the real condition and nothing is slept for. Returns the result and,
 /// when a note was made, what the directory held at that moment.
@@ -539,7 +546,7 @@ fn remove_all_deletes_nothing_while_a_run_holds_a_pin_and_removes_everything_whe
     runs.write(&record(1, 1)).unwrap();
     let pin = runs.pin().unwrap();
     runs.write(&record(2, 2)).unwrap();
-    let before = names(&runs);
+    let before = marked(names(&runs));
 
     let (result, seen) = remove_all_while_held(&runs, pin);
 
@@ -558,7 +565,7 @@ fn remove_all_waits_for_a_stops_hold_as_for_a_runs_pin() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let hold = runs.hold().unwrap();
-    let before = names(&runs);
+    let before = marked(names(&runs));
 
     let (result, seen) = remove_all_while_held(&runs, hold);
 
@@ -583,7 +590,7 @@ fn remove_all_waits_for_a_live_pin_the_removing_account_has_no_entry_on() {
         .unwrap()
         .set_dacl_of(&holder)
         .unwrap();
-    let before = names(&runs);
+    let before = marked(names(&runs));
 
     let (result, seen) = remove_all_while_held(&runs, holder);
 
@@ -604,6 +611,102 @@ fn remove_all_waits_for_two_held_pins_and_is_not_confused_by_a_stale_one_beside_
 
     result.unwrap();
     assert!(seen.is_some(), "two pins were held at the note");
+    assert!(!runs.dir.exists());
+}
+
+/// The removal's marker, placed as an uninstall that began and was cut short leaves it.
+fn leave_marker(runs: &Runs) {
+    fs::write(runs.dir.join(REMOVING), "").unwrap();
+}
+
+/// A pin taken after the removal began finds its marker, is dropped, and is refused as a directory
+/// that is gone is: the records it would have kept are being deleted, and no pin file is left to
+/// hold the removal up.
+#[skuld::test]
+fn a_pin_or_hold_taken_after_the_removal_began_backs_off_and_leaves_no_file() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    leave_marker(&runs);
+
+    let pin = runs.pin().err().expect("a pin is refused");
+    let hold = runs.hold().err().expect("a hold is refused");
+
+    assert_eq!(pin.kind(), io::ErrorKind::NotFound);
+    assert_eq!(hold.kind(), io::ErrorKind::NotFound);
+    assert_eq!(names(&runs), [REMOVING.to_string(), file_of(&instance(1))]);
+}
+
+/// The other order: a pin taken before the marker is waited for by a removal that finds the marker
+/// already there, and nothing is deleted while it is held.
+#[skuld::test]
+fn a_pin_taken_before_the_marker_is_waited_for_and_nothing_is_deleted_under_it() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let pin = runs.pin().unwrap();
+    leave_marker(&runs);
+    let before = names(&runs);
+
+    let (result, seen) = remove_all_while_held(&runs, pin);
+
+    result.unwrap();
+    assert_eq!(seen, Some(before));
+    assert!(!runs.dir.exists());
+}
+
+/// The removal places its marker before it looks at the pins, so that a pin taken while it waits
+/// backs off instead of keeping records the removal is about to delete.
+#[skuld::test]
+fn remove_all_refuses_a_new_pin_while_it_waits_on_one() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let pin = runs.pin().unwrap();
+    let mut probe = None;
+
+    runs.remove_all(|| {
+        probe = Some((names(&runs), runs.hold().err().map(|e| e.kind())));
+        drop(pin);
+    })
+    .unwrap();
+
+    let (seen, refused) = probe.expect("the removal waited");
+    assert!(seen.contains(&REMOVING.to_string()), "{seen:?}");
+    assert_eq!(refused, Some(io::ErrorKind::NotFound));
+    assert!(!runs.dir.exists());
+}
+
+/// A marker an uninstall that died left does not block the removal that finishes it.
+#[skuld::test]
+fn remove_all_is_not_blocked_by_a_marker_a_cut_short_removal_left() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    leave_marker(&runs);
+
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.dir.exists());
+}
+
+/// A file a handle holds does not keep the rest: everything else is deleted, the removal waits, and
+/// when the handle goes the marker and the directory go too.
+#[skuld::test]
+fn remove_all_waits_for_a_file_another_program_holds_and_deletes_the_rest() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(2, 2)).unwrap();
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(runs.dir.join(file_of(&instance(2))))
+        .unwrap();
+    let mut left = None;
+
+    runs.remove_all(|| {
+        left = Some(names(&runs));
+        drop(held);
+    })
+    .unwrap();
+
+    assert_eq!(left, Some(vec![REMOVING.to_string(), file_of(&instance(2))]));
     assert!(!runs.dir.exists());
 }
 
@@ -757,6 +860,20 @@ fn a_task_has_records_to_remove_while_its_directory_is_there() {
 
     runs.remove_all(no_note).unwrap();
     assert!(!runs.is_present());
+}
+
+/// An install makes the directory again, and with it a task that may run: a marker a removal left
+/// must not make its `run` back off.
+#[skuld::test]
+fn ensure_clears_a_marker_a_cut_short_removal_left() {
+    let (_dir, runs) = fixture();
+    leave_marker(&runs);
+    assert!(runs.pin().is_err());
+
+    runs.ensure(&process_user_sid()).unwrap();
+
+    assert!(runs.pin().is_ok());
+    assert!(!names(&runs).contains(&REMOVING.to_string()));
 }
 
 #[skuld::test]
