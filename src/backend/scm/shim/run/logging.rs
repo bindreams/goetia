@@ -90,7 +90,7 @@ impl Log {
     }
 
     /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
-    /// ([`Channels::hold_default`](super::os::Channels::hold_default)). Call it once, when the shim starts and
+    /// ([`Channels::hold_default`]). Call it once, when the shim starts and
     /// knows its `id`, before anything an install can change. A log that cannot be held is not said here: the
     /// daemon's own open of the same file reports it, and each line that needs it fails again.
     pub(crate) fn hold_default(&self, id: &str) {

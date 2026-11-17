@@ -321,7 +321,7 @@ fn the_shim_appends_to_a_log_with_a_tag_that_is_no_link() {
     assert_eq!(written, "first\nsecond\n");
 }
 
-// A `logs:` in the folder of the default logs ------------------------------------------------------------------------
+// A `logs:` in the folder of the default logs -------------------------------------------------------------------------
 
 /// What the install says of `logs`, for the daemon `nightly` under the `%ProgramData%` of `dir`.
 fn refusal_of(dir: &TempDir, logs: &Path) -> Option<String> {
