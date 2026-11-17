@@ -214,8 +214,8 @@ enum Escalation {
     Spent,
     /// SIGKILL, and the run is still there.
     Sent,
-    /// Nothing, because there was nothing to signal: the run has ended, and launchd still showed it (or a
-    /// process that is not the job's) when the wait ran out.
+    /// Nothing, because there was nothing to signal: launchd showed a pid that is no run of the job's the stop
+    /// can reach (the run ended and was not cleared, or launchd had moved on to another run) when the wait ran out.
     Uncleared,
 }
 
@@ -246,8 +246,9 @@ fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> Error {
                 ),
                 Escalation::Sent => format!("{recovery} The run was sent SIGKILL and has not exited yet."),
                 Escalation::Uncleared => format!(
-                    "{recovery} The run has ended, and launchd had not cleared it by the deadline: \
-                     `goetia daemon stop {id}` returns once it has."
+                    "{recovery} Launchd showed a pid that is no run of the job's that this stop can reach: the run ended \
+                     and launchd had not cleared it, or launchd had moved on to another run. `goetia daemon stop {id}` \
+                     again returns once launchd shows no process."
                 ),
             },
             id,
@@ -403,9 +404,10 @@ impl Launchd {
     /// and no loop: the overrun is that one reading, and nothing is sent. A job with no process and idle is
     /// `Ok`: a run that ended inside the budget is not a timeout because the pass that noticed came after the
     /// deadline. A run held and confirmed as the job's, and a start launchd has accepted, are the timeout,
-    /// worded by what the stop did to the run that is up ([`Course::escalation`]). So is launchd still
-    /// showing a run that has ended (a pid that is gone, or that it does not name), with its own wording: not
-    /// `Ok`, since a `start` made now starts nothing while launchd shows a pid. Any other reading is the
+    /// worded by what the stop did to the run that is up ([`Course::escalation`]). So is launchd showing a pid
+    /// that is no run of the job's the stop can reach (gone, or one it does not name: the run ended and is not
+    /// cleared, or launchd has moved on to another run), with its own wording: not `Ok`, since a `start` made
+    /// now starts nothing while launchd shows a pid. Any other reading is the
     /// contract's error: no process and a state that is not idle is [`Error::StopUnconfirmed`] ([`quiet`]),
     /// and a read that failed returns its error.
     fn done_or(&self, id: &Id, course: &Course, reservation: &mut Reservation) -> Result<()> {
