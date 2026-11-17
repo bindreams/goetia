@@ -7,7 +7,7 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
 
 use super::*;
-use crate::backend::scm::test_support::delete_pending;
+use crate::backend::scm::test_support::{delete_denied, delete_pending};
 
 #[skuld::test]
 fn a_pin_with_a_handle_open_is_held() {
@@ -53,16 +53,44 @@ fn a_pin_nothing_holds_is_stale_and_goes_and_one_that_is_gone_is_not_held() {
     assert!(!is_held(&path).unwrap(), "a pin that is gone is not held");
 }
 
-/// Measured: a file whose delete is pending fails a delete with access denied, not with its own error, so
-/// it says nothing about a handle: any failure but a sharing violation is the caller's to judge.
+/// Measured: a file whose delete is pending answers a delete with access denied, as a permission that
+/// refuses it does (the Win32 error is 5 for both); only the status under it, `STATUS_DELETE_PENDING`,
+/// tells them apart. It is deleted as far as anything can do it: it goes when the last handle closes.
 #[skuld::test]
-fn a_file_whose_delete_is_pending_fails_with_access_denied() {
+fn a_file_whose_delete_is_pending_is_deleted_and_a_permission_that_refuses_is_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pin-a.pin");
     let reader = delete_pending(&path);
 
-    let failed = is_held(&path).unwrap_err();
+    let pending = delete(&path);
+    let pin = is_held(&path);
 
-    assert_eq!(failed.kind(), io::ErrorKind::PermissionDenied, "{failed:?}");
+    assert!(matches!(pending, DeleteOutcome::Deleted));
+    assert!(!pin.unwrap(), "a pin whose delete is pending is not held");
     drop(reader);
+    assert!(!path.exists());
+
+    let refused = dir.path().join("pin-b.pin");
+    fs::write(&refused, "").unwrap();
+    let _denied = delete_denied(&refused);
+    let DeleteOutcome::Failed(failed) = delete(&refused) else {
+        panic!("a delete a permission refuses is a failure");
+    };
+    assert_eq!(failed.kind(), io::ErrorKind::PermissionDenied, "{failed:?}");
+    assert_eq!(is_held(&refused).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[skuld::test]
+fn a_file_a_handle_holds_without_sharing_delete_is_held_and_one_that_is_gone_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.tmp");
+    let holder = create_temp(&path).unwrap();
+
+    assert!(matches!(delete(&path), DeleteOutcome::Held));
+    drop(holder);
+    assert!(matches!(delete(&path), DeleteOutcome::Deleted));
+    assert!(
+        matches!(delete(&path), DeleteOutcome::Deleted),
+        "a file that is not there"
+    );
 }

@@ -14,7 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::*;
 use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
-use crate::backend::scm::test_support::delete_pending;
+use crate::backend::scm::test_support::{delete_denied, delete_pending};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -216,14 +216,14 @@ fn a_listing_that_fails_is_a_problem_of_the_prune() {
     assert!(problems[0].contains("listing denied"), "{problems:?}");
 }
 
-/// A file whose delete is pending (another handle has it open) cannot be opened, deleted or listed as
-/// anything but denied: a removal that fails so is told, and the prune goes on to the rest.
+/// A removal that fails (a permission, not a handle) is told, and the prune goes on to the rest.
 #[skuld::test]
 fn a_removal_that_fails_is_a_problem_and_the_rest_are_removed() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     let stuck = runs.dir.join(file_of(&instance(2)));
-    let reader = delete_pending(&stuck);
+    fs::write(&stuck, "").unwrap();
+    let _denied = delete_denied(&stuck);
     let doomed = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
     fs::write(&doomed, "").unwrap();
 
@@ -232,7 +232,6 @@ fn a_removal_that_fails_is_a_problem_and_the_rest_are_removed() {
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains(&file_of(&instance(2))), "{problems:?}");
     assert!(!doomed.exists() && runs.read(&instance(1)).unwrap().is_none());
-    drop(reader);
 }
 
 #[skuld::test]
@@ -338,13 +337,28 @@ fn a_live_pin_the_writing_account_has_no_entry_on_is_kept_and_stops_pruning() {
 fn a_pin_that_cannot_be_deleted_is_a_problem_and_is_taken_as_not_held() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
-    let pending = runs.dir.join("pin-odd.pin");
-    let reader = delete_pending(&pending);
+    let odd = runs.dir.join("pin-odd.pin");
+    fs::write(&odd, "").unwrap();
+    let _denied = delete_denied(&odd);
 
     let problems = runs.write(&record(2, 2)).unwrap();
 
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("pin-odd.pin"), "{problems:?}");
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
+}
+
+/// A pin whose delete is pending is going away by itself: a prune takes it as deleted, tells nothing of
+/// it, and goes on.
+#[skuld::test]
+fn a_pin_whose_delete_is_pending_is_no_problem_and_no_hold_to_a_prune() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let reader = delete_pending(&runs.dir.join("pin-odd.pin"));
+
+    let problems = runs.write(&record(2, 2)).unwrap();
+
+    assert_eq!(problems, Vec::<String>::new());
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
     drop(reader);
 }
@@ -453,14 +467,14 @@ fn appeared_is_empty_when_nothing_was_written_after_the_pin() {
 // uninstall ===========================================================================================================
 
 /// The note of a `remove_all` that has nothing to wait for: it is never made.
-fn no_note() {
+fn no_note(_: &Path) {
     panic!("nothing holds the directory, so there is nothing to wait for");
 }
 
 /// `remove_all` while `holder` (what a `run` or a stop holds) is alive. A thread drops `holder` when the
 /// note is made, so the wait ends on the real condition and nothing is slept for. Returns the result and,
 /// when a note was made, what the directory held at that moment.
-fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (io::Result<()>, Option<Vec<String>>) {
+fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (Result<()>, Option<Vec<String>>) {
     let (release, released) = mpsc::channel::<()>();
     let mut seen = None;
     let result = thread::scope(|scope| {
@@ -468,7 +482,7 @@ fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (io::Result<()>, Opt
             let _ = released.recv();
             drop(holder);
         });
-        runs.remove_all(|| {
+        runs.remove_all(|_| {
             seen = Some(names(runs));
             let _ = release.send(());
         })
@@ -507,25 +521,85 @@ fn remove_all_does_not_wait_for_a_stale_pin_it_has_no_entry_on() {
     assert!(!runs.dir.exists());
 }
 
-/// A pin whose state cannot be told (its delete is pending, which Windows answers with access denied)
-/// may be held, and none can be taken now: the removal returns the failure, naming the pin, before it
-/// deletes anything, and does not wait for a handle that may never go. Once the pin can be told about,
-/// the same call finishes.
+/// A pin whose state cannot be told (its permissions refuse the delete) may be held, and none can be taken
+/// now: the removal returns the failure, naming the pin, before it deletes anything, and does not wait
+/// for a handle that may never go. Once the pin can be told about, the same call finishes.
 #[skuld::test]
 fn remove_all_with_a_pin_it_cannot_tell_about_deletes_nothing_and_names_it() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     fs::write(runs.dir.join("other.txt"), "").unwrap();
-    let pending = runs.dir.join("pin-odd.pin");
-    let reader = delete_pending(&pending);
+    let odd = runs.dir.join("pin-odd.pin");
+    fs::write(&odd, "").unwrap();
+    let denied = delete_denied(&odd);
     let before = names(&runs);
 
     let failed = runs.remove_all(no_note).unwrap_err();
 
     assert!(failed.to_string().contains("pin-odd.pin"), "{failed}");
     assert_eq!(names(&runs), before, "nothing was deleted");
-    drop(reader);
+    drop(denied);
     runs.remove_all(no_note).unwrap();
+    assert!(!runs.dir.exists());
+}
+
+/// A file whose delete is pending is deleted as far as anything can do it: it goes when the handle open
+/// on it closes. Its delete was no failure, so it is no reason to refuse the removal, whether it is a pin
+/// or a record; the directory is not empty until it goes, and the removal looks again. The note is for
+/// what is held, here a temp file the shim is writing, and the three handles are dropped when it is made.
+#[skuld::test]
+fn remove_all_takes_a_file_whose_delete_is_pending_as_deleted() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let pending_pin = delete_pending(&runs.dir.join("pin-odd.pin"));
+    let pending_record = delete_pending(&runs.dir.join(file_of(&instance(2))));
+    let writing = files::create_temp(&runs.dir.join(format!("{}.json.tmp", instance(3).hex()))).unwrap();
+
+    runs.remove_all(|_| drop((pending_pin, pending_record, writing)))
+        .unwrap();
+
+    assert!(!runs.dir.exists());
+    assert!(!runs.marker.exists());
+}
+
+/// The shim's write is under way when the task is uninstalled by another route (its task deleted from
+/// outside): its temp file is open without sharing delete, for as long as the write lasts. The removal
+/// waits for it, naming the file, as it waits for a pin, and then removes everything.
+#[skuld::test]
+fn remove_all_waits_for_a_temp_file_the_shim_is_writing_and_names_it() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let temp = runs.dir.join(format!("{}.json.tmp", instance(2).hex()));
+    let writing = files::create_temp(&temp).unwrap();
+    let mut noted = None;
+
+    runs.remove_all(|held| {
+        noted = Some(held.to_path_buf());
+        drop(writing);
+    })
+    .unwrap();
+
+    assert_eq!(noted, Some(temp));
+    assert!(!runs.dir.exists());
+}
+
+/// A pin whose name is not Unicode (the task's account can make one) is a pin all the same: a stale one
+/// is deleted with the rest, and the removal finishes. It once was skipped by the listing and kept by the
+/// delete, so the removal never ended.
+#[skuld::test]
+fn remove_all_deletes_a_pin_whose_name_is_not_unicode() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let mut units: Vec<u16> = "pin-".encode_utf16().collect();
+    units.push(0xD800);
+    units.extend(".pin".encode_utf16());
+    fs::write(runs.dir.join(OsString::from_wide(&units)), "").unwrap();
+
+    runs.remove_all(no_note).unwrap();
+
     assert!(!runs.dir.exists());
 }
 
@@ -674,7 +748,7 @@ fn remove_all_refuses_a_new_pin_while_it_waits_on_one() {
     let pin = runs.pin().unwrap();
     let mut probe = None;
 
-    runs.remove_all(|| {
+    runs.remove_all(|_| {
         probe = Some((runs.marker.exists(), runs.hold().err().map(|e| e.kind())));
         drop(pin);
     })
@@ -699,11 +773,10 @@ fn remove_all_is_not_blocked_by_a_marker_a_cut_short_removal_left() {
     assert!(!runs.dir.exists());
 }
 
-/// A file another program holds is no pin: the removal does not wait for it. It fails at once, naming
-/// the file, so the user can close what holds it and uninstall again; what else it could delete is
-/// deleted. The same call finishes once the handle is gone.
+/// A file another program holds is waited for, as a pin is, whoever the holder is: the removal says what
+/// it waits for, naming the file, and finishes when the handle goes.
 #[skuld::test]
-fn remove_all_with_a_file_another_program_holds_fails_naming_it_and_does_not_wait() {
+fn remove_all_waits_for_a_file_another_program_holds_and_names_it() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
     runs.write(&record(2, 2)).unwrap();
@@ -713,34 +786,32 @@ fn remove_all_with_a_file_another_program_holds_fails_naming_it_and_does_not_wai
         .share_mode(FILE_SHARE_READ)
         .open(runs.dir.join(&held_name))
         .unwrap();
+    let mut noted = None;
 
-    let failed = runs.remove_all(no_note).unwrap_err();
+    runs.remove_all(|path| {
+        noted = Some(path.to_path_buf());
+        drop(held);
+    })
+    .unwrap();
 
-    assert!(failed.to_string().contains(&held_name), "{failed}");
-    assert!(runs.dir.exists());
-    drop(held);
-    runs.remove_all(no_note).unwrap();
+    assert_eq!(noted, Some(runs.dir.join(&held_name)));
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
 }
 
-/// A failed removal leaves its marker, so that a `run` still backs off: its records are partly gone.
+/// A removal that fails leaves its marker, so that a `run` still backs off: its records are partly gone.
 /// An install, which makes them again, takes it away ([`Runs::ensure`]).
 #[skuld::test]
 fn a_failed_removal_leaves_its_marker_beside_the_directory() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
-    let held = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .open(runs.dir.join(file_of(&instance(1))))
-        .unwrap();
+    let _denied = delete_denied(&runs.dir.join(file_of(&instance(1))));
 
-    runs.remove_all(no_note).unwrap_err();
+    let failed = runs.remove_all(no_note).unwrap_err();
 
+    assert!(failed.to_string().contains(&file_of(&instance(1))), "{failed}");
     assert!(runs.marker.exists());
     assert_eq!(runs.hold().err().map(|e| e.kind()), Some(io::ErrorKind::ResourceBusy));
-    drop(held);
 }
 
 /// The note is for a held pin and for nothing else: records, a temp file, a stale pin and a marker a
@@ -926,6 +997,21 @@ fn a_task_has_records_to_remove_while_its_directory_is_there() {
 
     runs.remove_all(no_note).unwrap();
     assert!(!runs.is_present());
+}
+
+/// A marker a removal left, after its directory went, is something to remove: the marker would make a
+/// `run` of the id back off for good.
+#[skuld::test]
+fn a_marker_with_no_directory_is_something_to_remove() {
+    let (_dir, runs) = fixture();
+    leave_marker(&runs);
+    fs::remove_dir(&runs.dir).unwrap();
+
+    assert!(runs.is_present());
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.is_present());
+    assert!(!runs.marker.exists());
 }
 
 /// An install makes the directory again, and with it a task that may run: a marker a removal left

@@ -367,7 +367,7 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
     let held = runs.pin().unwrap();
     let mut during = None;
 
-    runs.remove_all(|| {
+    runs.remove_all(|_| {
         during = Some(stopped(&fake, &mut machine, &runs, Budget::Unbounded));
         drop(held);
     })

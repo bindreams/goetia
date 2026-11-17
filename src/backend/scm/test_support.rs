@@ -85,6 +85,44 @@ pub(crate) fn registered_task(
     }
 }
 
+/// Keeps the file `path` from being deleted by anyone, by permissions, until it is dropped (which gives
+/// the file and its directory open permissions back, so that they can be removed). The file refuses the
+/// delete right and its directory the right to delete a child, since either one allows a delete. A
+/// delete of it fails with access denied, as a pending delete does, but for a reason that is not one.
+#[cfg(windows)]
+#[must_use]
+pub(crate) struct DeleteDenied(std::path::PathBuf);
+
+#[cfg(windows)]
+pub(crate) fn delete_denied(path: &std::path::Path) -> DeleteDenied {
+    use crate::backend::scm::shim::acl::Descriptor;
+
+    let directory = path.parent().expect("a file is in a directory");
+    Descriptor::from_sddl("D:P(D;;SD;;;WD)(A;;FA;;;WD)")
+        .unwrap()
+        .set_dacl(path)
+        .unwrap();
+    Descriptor::from_sddl("D:P(D;;0x40;;;WD)(A;;FA;;;WD)")
+        .unwrap()
+        .set_dacl(directory)
+        .unwrap();
+    DeleteDenied(path.to_path_buf())
+}
+
+#[cfg(windows)]
+impl Drop for DeleteDenied {
+    fn drop(&mut self) {
+        use crate::backend::scm::shim::acl::Descriptor;
+
+        if let Ok(open) = Descriptor::from_sddl("D:P(A;;FA;;;WD)") {
+            let _ = open.set_dacl(&self.0);
+            if let Some(directory) = self.0.parent() {
+                let _ = open.set_dacl(directory);
+            }
+        }
+    }
+}
+
 /// A file at `path` whose delete is pending: its holder closed it while the returned handle was open on
 /// it, so it is deleted when that handle is dropped. Windows answers an open or a delete of it with
 /// access denied.

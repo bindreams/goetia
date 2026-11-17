@@ -763,24 +763,15 @@ fn a_failed_record_write_still_returns_the_programs_code() {
     run.api.finish();
 }
 
-/// A prune that cannot remove a record (here a file whose delete is pending, which Windows answers with
-/// access denied) is a warning in the log, and the run still ends with the program's code and its own record.
+/// A prune that cannot remove a record (here a file whose permissions refuse the delete) is a warning in
+/// the log, and the run still ends with the program's code and its own record.
 #[skuld::test]
 fn a_prune_problem_is_logged_and_does_not_change_the_runs_end() {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
-
     let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(5));
     let stuck = format!("{:032x}.json", 9);
     let stuck_path = run._dir.path().join("Goetia").join("runs").join(ID).join(&stuck);
-    let holder = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-        .open(&stuck_path)
-        .unwrap();
-    let reader = std::fs::OpenOptions::new().read(true).open(&stuck_path).unwrap();
-    drop(holder);
+    std::fs::write(&stuck_path, "").unwrap();
+    let denied = crate::backend::scm::test_support::delete_denied(&stuck_path);
 
     let code = run.run();
 
@@ -802,7 +793,7 @@ fn a_prune_problem_is_logged_and_does_not_change_the_runs_end() {
         said[0].contains("prune the run records") && said[0].contains(&stuck),
         "{said:?}"
     );
-    drop(reader);
+    drop(denied);
 }
 
 /// A run with no `%ProgramData%` to keep records in is run, and not recorded.

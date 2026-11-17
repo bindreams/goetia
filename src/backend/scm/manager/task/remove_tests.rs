@@ -494,6 +494,28 @@ fn uninstall_of_an_id_that_is_absent_removes_the_records_under_the_install_lock(
     );
 }
 
+/// An uninstall that died after its records' directory went, and before it removed its marker, leaves the
+/// marker, which makes the id's `run` back off for good. The next uninstall of the id, which is absent,
+/// takes it away, under the lock.
+#[skuld::test]
+fn uninstall_of_an_id_that_is_absent_clears_a_marker_left_beside_no_records() {
+    let (_dir, records_dir, runs) = records();
+    let marker = records_dir.with_file_name(format!("{}~removing", id()));
+    std::fs::write(&marker, "").unwrap();
+    std::fs::remove_dir(&records_dir).unwrap();
+    let locked = Cell::new(false);
+
+    scm(&Fake::new())
+        .uninstall_absent_with(&runs, || {
+            locked.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(locked.get());
+    assert!(!marker.exists());
+}
+
 /// With no records there is nothing to remove, and so no lock to take: a library caller that is not
 /// elevated keeps getting `NotInstalled` for an id that never was.
 #[skuld::test]
