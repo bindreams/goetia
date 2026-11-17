@@ -318,7 +318,7 @@ const TIMER_SUFFIX: &str = "@timer";
 
 /// The `ExitTimeOut` of `kill`: launchd sends SIGTERM, and SIGKILL one second later. Not `0`, which
 /// `launchd.plist(5)` documents as no limit: it ends the job at once on macOS 15 and 26 (measured),
-/// but macOS 14 cannot be measured (GitHub no longer has a runner for it), and a `kill` that never
+/// but macOS 14 cannot be measured, and a `kill` that never
 /// kills is worse than one that waits a second.
 const KILL_EXIT_TIMEOUT: u64 = 1;
 

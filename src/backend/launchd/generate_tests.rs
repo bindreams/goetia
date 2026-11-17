@@ -1263,8 +1263,7 @@ fn the_default_is_thirty_seconds_not_launchds_five() {
     assert_eq!(exit_time_out(&minimal_spec()), 30);
 }
 
-/// `ExitTimeOut` 0 is documented as no limit, and measured as SIGKILL at once on macOS 15 and 26, but
-/// macOS 14 cannot be measured: 1 is SIGKILL after a second on every release.
+/// `kill` is an `ExitTimeOut` of one second (see `KILL_EXIT_TIMEOUT`).
 #[skuld::test]
 fn kill_is_an_exit_time_out_of_one_second() {
     let spec = with_stop_action(StopAction {

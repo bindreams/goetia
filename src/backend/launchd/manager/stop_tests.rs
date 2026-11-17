@@ -397,10 +397,7 @@ fn a_process_launchd_no_longer_names_when_the_timeout_is_over_is_not_sent_sigkil
     );
 }
 
-/// The stop is always issued, whatever the budget: the first pass sends the run it finds its first signal,
-/// and a bound that is spent (a zero bound, or the least bound a `restart` hands its stop leg once its budget
-/// ran out) then ends the stop at its next pass, which reads once (`print`, and the confirmation of the pid it
-/// shows) and finds the run still there. The run ignores SIGTERM, so it is there to be found, whatever the clock.
+/// A spent budget still sends the first signal, then reports the timeout.
 #[skuld::test]
 fn a_stop_with_a_spent_budget_sends_its_first_signal_and_then_reports_the_timeout() {
     for budget in [Duration::ZERO, Duration::from_nanos(1)] {

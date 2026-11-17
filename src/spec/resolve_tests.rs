@@ -3835,7 +3835,7 @@ fn an_override_that_sends_kill_does_not_inherit_the_bases_timeout() {
             panic!("{backend}: {err}");
         }
     }
-    // The review's case: the native backend's override replaces a base `quit, 90s` with `kill`.
+    // The native backend's override replaces a base `quit, 90s` with `kill`.
     let native = BackendKind::native().expect("the tests run where there is a service manager");
     let base = format!("{SERVICE}stop-action: {{send-signal: quit, timeout: 90s}}\n");
     let yaml = format!("{base}backend-specific:\n  {native}:\n    stop-action: kill\n");

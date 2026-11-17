@@ -1503,7 +1503,7 @@ fn written(signal: &str, timeout: Option<u64>) -> StopAction {
     }
 }
 
-/// Until the shim asks (unit 3), the registration is what it was: the stop action is carried in the
+/// Until the shim asks, the registration is what it was: the stop action is carried in the
 /// blob, and nothing of it reaches SCM.
 #[skuld::test]
 fn a_stop_action_is_carried_in_the_blob_and_changes_nothing_else() {
