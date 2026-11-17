@@ -15,7 +15,7 @@ use crate::backend::InstalledService;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::kill::HoldOutcome;
 use crate::backend::scm::manager::{Scm, Uninstalled, shim_exe};
-use crate::backend::scm::runs::Runs;
+use crate::backend::scm::runs::{PauseKind, Runs};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
 use crate::error::{Error, Result};
@@ -30,6 +30,9 @@ enum Left {
     Disabled,
     /// The task is gone; its run records are not.
     Records,
+    /// There was no task; run records left for it (by a failed install, an uninstall, or a task deleted
+    /// outside goetia) are not all removed: some may be gone.
+    LeftoverRecords,
 }
 
 /// An `uninstall` of `id` that failed with `cause`, led by what it left and the retry that finishes it.
@@ -47,6 +50,10 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
             "`{id}` is deleted, but its run records could not be removed. Re-run `goetia daemon uninstall {id}` to \
              remove them"
         ),
+        Left::LeftoverRecords => format!(
+            "`{id}` is not installed, and run records left for it could not be removed. Re-run `goetia daemon \
+             uninstall {id}` to remove them"
+        ),
     };
     Error::Step {
         what,
@@ -55,14 +62,17 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
 }
 
 /// What an uninstall says on stderr when its removal of the run records has to wait, each time the path it
-/// waits for changes: the manager has no channel for a notice, so it is said as its warnings are. A `run`
-/// that still waits for a record holds the directory, and returns after the stop that came before; a
-/// file whose delete is pending goes when the last handle on it closes.
-fn waiting_for_records(waits_for: &Path) {
-    eprintln!(
-        "waiting for {} to be released by a `run` or another program that has it open",
-        waits_for.display()
-    );
+/// waits for changes: the manager has no channel for a notice, so it is said as its warnings are. A
+/// directory that is not empty with nothing known to hold what is in it is said as that, and claims no
+/// holder.
+fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
+    match kind {
+        PauseKind::Held => eprintln!(
+            "waiting for {} to be released by a `run` or another program that has it open",
+            waits_for.display()
+        ),
+        PauseKind::Emptying => eprintln!("waiting for {} to empty", waits_for.display()),
+    }
 }
 
 /// The shim file the stored task runs, when its file name is that of one a provider placed (the one
@@ -93,25 +103,36 @@ impl Scm {
     /// What `uninstall` of an id that is absent does for a task: the run records an `uninstall` that
     /// deleted the task could not remove, and the sweep a service's does.
     pub(in crate::backend::scm) fn task_uninstall_absent(&self, id: &Id) -> Result<()> {
-        self.uninstall_absent_with(id, &Runs::of(&program_data()?, id), InstallLock::acquire)
+        self.uninstall_absent_with(id, &Runs::of(&program_data()?, id), InstallLock::acquire, || {
+            self.service_uninstall_absent()
+        })
     }
 
     /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes
     /// the install lock. The records are removed under it: an install that has just made them holds it,
     /// and would lose them. With no records there is nothing to guard, and nothing is taken. A removal
-    /// that fails says what an `uninstall` that deleted the task and left its records says.
+    /// that fails says that the id is not installed and that records left for it could not be removed;
+    /// some may be gone by then.
+    ///
+    /// `sweep` runs whether or not the records were removed, after the lock is released. If both fail,
+    /// both errors are kept, the records' first. A `lock` that fails ends the call: the sweep takes the
+    /// same lock.
     pub(super) fn uninstall_absent_with<L>(
         &self,
         id: &Id,
         runs: &Runs,
         lock: impl FnOnce() -> Result<L>,
+        sweep: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        if runs.is_present() {
+        let removed = if runs.is_present() {
             let _lock = lock()?;
             runs.remove_all(waiting_for_records)
-                .map_err(|e| uninstall_failed(id, Left::Records, e))?;
-        }
-        self.service_uninstall_absent()
+                .map_err(|e| uninstall_failed(id, Left::LeftoverRecords, e))
+        } else {
+            Ok(())
+        };
+        let swept = sweep();
+        Error::both_all(removed.err().into_iter().chain(swept.err())).map_or(Ok(()), Err)
     }
 
     /// The task and its records removed, with nothing swept: the caller holds the install lock. See
@@ -129,10 +150,8 @@ impl Scm {
     /// 2. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
     ///    event. A run whose shim recorded an incomplete stop, or whose record cannot be read, keeps the
     ///    task, disabled.
-    /// 3. The task is deleted, then its run records. A `run` that still waits for a record holds a pin
-    ///    and the records are not deleted under it; a file another program holds cannot be deleted
-    ///    either. The removal waits for any holder, with no bound, and says on stderr what it waits for,
-    ///    each time that changes ([`Runs::remove_all`]). The install lock is held throughout.
+    /// 3. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder,
+    ///    with no bound, and says on stderr what it waits for. The install lock is held throughout.
     ///
     /// A task that is gone has nothing to disable or stop; the rest finds nothing.
     pub(super) fn task_remove_with<P: Processes>(
