@@ -920,25 +920,47 @@ fn a_send_after_the_first_is_refused_once_the_deadline_is_spent() {
     assert_eq!(second.finish(), Some(0), "the run was sent nothing");
 }
 
-/// What the timeout says of a run that has ended and that launchd still shows at the deadline: that the run has
-/// ended and launchd has not cleared it, and no word of a signal or of `goetia daemon kill`, which would refuse.
+/// What the timeout says of a pid launchd shows that is no run of the job's this stop can reach: that it is not
+/// one, and why (the run ended and launchd had not cleared it, or launchd had moved on to another run), and no
+/// word of a signal or of `goetia daemon kill`, which would not help.
 fn assert_uncleared(e: &Error) {
     let Error::WaitTimeout { recovery, .. } = e else {
         panic!("expected a wait timeout, got {e:?}")
     };
     assert!(
-        recovery.contains("has ended") && recovery.contains("not cleared"),
+        recovery.contains("not cleared") && recovery.contains("another run") && recovery.contains("daemon stop"),
         "{recovery}"
     );
     assert!(
         !recovery.contains("not signalled") && !recovery.contains("daemon kill"),
-        "nothing was left to signal, and `kill` refuses: {recovery}"
+        "nothing was left to signal, and `kill` does not help: {recovery}"
+    );
+}
+
+/// The wording for a pid launchd shows and this stop cannot reach, which is true for both ways there is one: the
+/// run ended and is not cleared, or launchd has another run.
+#[skuld::test]
+fn the_timeout_of_a_pid_launchd_shows_and_the_stop_cannot_reach_is_true_of_both_ways_it_comes() {
+    let budget = Budget::Bounded(Duration::from_secs(3));
+    let Error::WaitTimeout { recovery: plain, .. } = budget::timed_out(ID, "stopped", budget) else {
+        panic!("a wait timeout")
+    };
+
+    let Error::WaitTimeout { recovery, .. } = timed_out_stopping(ID, budget, Escalation::Uncleared) else {
+        panic!("a wait timeout")
+    };
+
+    assert_eq!(
+        recovery,
+        format!(
+            "{plain} Launchd showed a pid that is no run of the job's that this stop can reach: the run ended              and launchd had not cleared it, or launchd had moved on to another run. `goetia daemon stop {ID}`              again returns once launchd shows no process."
+        )
     );
 }
 
 /// The first pass always runs, and from the second on every pass reads the deadline first, whether anything was
 /// sent or not: a stop that keeps finding a pid launchd shows and does not name (a stranger given the run's
-/// number) ends at its deadline, with the timeout of a run that has ended and is not cleared. It is not read
+/// number) ends at its deadline, with the timeout of a pid it cannot reach. It is not read
 /// again and again for ever.
 #[skuld::test]
 fn a_stop_that_keeps_finding_a_pid_launchd_does_not_name_ends_at_its_deadline() {
@@ -967,8 +989,8 @@ fn a_stop_that_keeps_finding_a_pid_launchd_does_not_name_ends_at_its_deadline() 
 }
 
 /// The same outcome for a pid the OS reports gone: a zombie, which cannot be watched and whose number cannot be
-/// reused while it is unreaped, so no other process can take its place in the script. The run has ended, and
-/// launchd has not cleared it by the deadline: not `Ok`, since a start made now starts nothing.
+/// reused while it is unreaped, so no other process can take its place in the script. Launchd has not cleared
+/// it by the deadline: not `Ok`, since a start made now starts nothing.
 #[skuld::test]
 fn a_pid_shown_at_the_deadline_that_has_exited_is_a_run_that_ended_and_is_not_cleared() {
     let mut ended = Held::new(0);
@@ -982,20 +1004,27 @@ fn a_pid_shown_at_the_deadline_that_has_exited_is_a_run_that_ended_and_is_not_cl
     fake.assert_spent("the first pass, which could not watch the pid, and the one reading at the deadline");
 }
 
-/// `Immediate` waits for nothing, launchd's view included: a first pass that finds launchd still showing what
-/// has ended (a pid gone, or one it does not name) is the end of the stop, and is read once.
+/// `Immediate` waits for nothing, launchd's view included: a pass that finds launchd showing what has ended (a
+/// pid gone, or one it does not name) is read once more at once, and a second reading that shows the same pid
+/// is the end of the stop: launchd is lagging, and `Immediate` does not wait for it.
 #[skuld::test]
-fn stop_under_immediate_that_finds_launchd_still_showing_a_run_that_ended_returns_after_one_pass() {
+fn stop_under_immediate_with_launchd_lagging_on_one_pid_returns_after_two_readings() {
     let mut zombie = Held::new(0);
     let gone = zombie.pid();
     zombie.exit_unreaped();
     let mut stranger = Held::new(0);
     let other = stranger.pid();
     for (what, fake) in [
-        ("a pid that is gone", Fake::new([print(&running(gone))])),
+        (
+            "a pid that is gone",
+            Fake::new([print(&running(gone)), print(&running(gone))]),
+        ),
         (
             "a pid launchd does not name",
             Fake::new([
+                print(&running(other)),
+                print(&running(other)),
+                procinfo_not_naming(other),
                 print(&running(other)),
                 print(&running(other)),
                 procinfo_not_naming(other),
@@ -1012,6 +1041,53 @@ fn stop_under_immediate_that_finds_launchd_still_showing_a_run_that_ended_return
         Some(0),
         "a process that is not the job's is sent nothing"
     );
+}
+
+/// The second reading is a pass like any other: a new live run of the job is held, and sent SIGTERM; the stop
+/// returns, as it does for a run it finds first.
+#[skuld::test]
+fn stop_under_immediate_whose_second_reading_shows_a_new_run_sends_it_sigterm() {
+    let mut zombie = Held::new(0);
+    let gone = zombie.pid();
+    zombie.exit_unreaped();
+    let mut next = Held::new(0);
+    let pid = next.pid();
+    let fake = Fake::new([
+        print(&running(gone)),
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+    ]);
+
+    stopping(&fake, Budget::Immediate).expect("a stop that waits for nothing after the signal");
+
+    fake.assert_spent("the pid that is gone, then the new run, and the signal to it");
+    assert_no_label_signal(&fake);
+    assert_eq!(ended_by(&mut next), Some(libc::SIGTERM), "the new run was sent SIGTERM");
+}
+
+/// What `print` shows changing is what keeps the loop going: another pid launchd shows and does not
+/// reach is read again, an idle job ends it, and the same pid twice in a row ends it.
+#[skuld::test]
+fn stop_under_immediate_reads_again_while_the_pid_launchd_shows_changes() {
+    let (mut first, mut second) = (Held::new(0), Held::new(0));
+    let (a, b) = (first.pid(), second.pid());
+    first.exit_unreaped();
+    second.exit_unreaped();
+    for (what, fake) in [
+        (
+            "another pid, then the same",
+            Fake::new([print(&running(a)), print(&running(b)), print(&running(b))]),
+        ),
+        (
+            "another pid, then no process",
+            Fake::new([print(&running(a)), print(&running(b)), print(IDLE)]),
+        ),
+    ] {
+        stopping(&fake, Budget::Immediate).expect(what);
+
+        fake.assert_spent(what);
+    }
 }
 
 /// A later pass can find the run that was sent SIGTERM again: here launchd's lookup did not name the process
