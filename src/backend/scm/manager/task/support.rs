@@ -76,6 +76,22 @@ pub(super) fn records() -> (TempDir, PathBuf, Runs) {
     (dir, path, runs)
 }
 
+/// [`records`] where the task's directory is a junction, as its account can make it (adding a file is all
+/// that takes). The target holds an incomplete stop of the run `1`, which a read through the link would
+/// find: nothing may. The last is the target, which outlasts the link.
+pub(super) fn linked_records() -> (TempDir, PathBuf, Runs, TempDir) {
+    let (dir, path, runs) = records();
+    let target = tempfile::tempdir().unwrap();
+    std::fs::write(
+        target.path().join(format!("{}.json", instance_id(1).hex())),
+        br#"{"started":1,"outcome":"incomplete_stop"}"#,
+    )
+    .unwrap();
+    std::fs::remove_dir(&path).unwrap();
+    crate::backend::scm::shim::acl::acl_tests::windows::junction(&path, target.path());
+    (dir, path, runs, target)
+}
+
 /// What a shim does as its run ends: it writes the run's record, and its prune has nothing to say.
 pub(super) fn shim_writes(shim: &Runs, record: &RunRecord) {
     assert_eq!(shim.write(record).unwrap(), Vec::<String>::new());

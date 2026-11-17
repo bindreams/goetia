@@ -303,8 +303,15 @@ pub(super) fn stop_runs<P: Processes>(
     Ok(held.into_iter().map(|(instance, _)| instance.id).collect())
 }
 
+/// Whether `error` from [`Runs::hold`] says the records' directory holds no records: it is not there, or it is
+/// a link, which the task's account can make of it and which goetia reads nothing through.
+fn no_records(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+}
+
 /// The runs `stopped` ended, as their shims recorded them: one that could not end the program's process
-/// tree is a failed stop, and a record that cannot be read does not say the stop was complete.
+/// tree is a failed stop, and a record that cannot be read does not say the stop was complete. A task
+/// with no records, or whose directory is a link, has no stop to read ([`Runs::read`]).
 fn check_stopped(id: &Id, runs: &Runs, stopped: &[InstanceId]) -> Result<()> {
     for instance in stopped {
         match runs.read(instance) {
@@ -366,7 +373,8 @@ impl Scm {
     /// held from before the first `Stop` is sent until every record is read: the shims write as their
     /// runs end, and without it the write of a later run prunes the record of an earlier one before it
     /// is read. A task with no run to stop has no records to keep, so it takes none (a caller who is not
-    /// an Administrator cannot); one whose record directory is gone has none either (`NotFound`). Any
+    /// an Administrator cannot); one whose record directory is gone has none either (`NotFound`), nor has
+    /// one where the directory is a link ([`no_records`]), and the stop goes on. Any
     /// other refusal is an error, worded as any verb's refusal is (a denial for access denied): that
     /// includes the pin refused because the records are being removed, which is not "no records".
     pub(super) fn task_stop_with<P: Processes>(
@@ -381,7 +389,7 @@ impl Scm {
         let stopped = stop_runs(&*self.tasks, operation, id, budget, processes, || {
             match runs.hold() {
                 Ok(held) => pin = Some(held),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if no_records(&e) => {}
                 Err(e) => {
                     return Err(open_refused(
                         operation,
