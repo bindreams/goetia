@@ -1536,14 +1536,41 @@ fn a_stop_that_names_a_budget_keeps_it_whatever_the_daemons_stop_action_says() {
     assert_eq!(reserved_under(&fake), Budget::Immediate);
 }
 
+/// A definition that will not decode has no stop action to take the daemon's own wait from: the stop is the
+/// decode failure, as the other verbs that read the definition are, and reserves and sends nothing. A caller
+/// that names the wait does not need the definition, and the stop still works.
 #[skuld::test]
-fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_and_waits_as_it_always_did() {
+fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_is_the_decode_failure() {
     let fake = Fake::new();
     fake.seed_unusable("odd");
+    let id = Id::try_from("odd").unwrap();
 
-    ServiceManager::stop(&fake, &Id::try_from("odd").unwrap(), None).unwrap();
+    let e = ServiceManager::stop(&fake, &id, None).expect_err("no stop action to wait by");
 
-    assert_eq!(reserved_under(&fake), Budget::DEFAULT);
+    assert!(matches!(e, Error::Kept(_)), "the decode failure itself: {e:?}");
+    assert_eq!(
+        e.to_string(),
+        ServiceManager::kind(&fake, &id).expect_err("the same blob").to_string()
+    );
+    assert!(fake.prepared().is_empty(), "nothing was reserved");
+
+    ServiceManager::stop(&fake, &id, Some(Budget::DEFAULT)).expect("a stop that names its wait");
+}
+
+/// The same through a sequence, which has spent no step when the stop cannot resolve its wait.
+#[skuld::test]
+fn a_sequences_stop_of_a_definition_that_will_not_decode_names_no_budget_is_the_decode_failure() {
+    let fake = Fake::new();
+    fake.seed_unusable("odd");
+    let id = Id::try_from("odd").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+
+    let e = sequence.stop(&id, None).expect_err("no stop action to wait by");
+
+    assert!(matches!(e, Error::Kept(_)), "{e:?}");
+    sequence
+        .stop(&id, Some(Budget::DEFAULT))
+        .expect("the step is still unspent");
 }
 
 /// A sequence's stop resolves its wait from the snapshot it reads: the fake's stalled stop reports the budget

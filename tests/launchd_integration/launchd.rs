@@ -1288,19 +1288,49 @@ fn root_user_runs_as_uid_zero(#[fixture(launchd_group)] _group: &Group) {
 /// — `bootout` is SIGKILLed the instant it is spawned, so this returns a `WaitTimeout` instead of
 /// stopping anything, or trips `budget::timed_out`'s `debug_assert!` outright in a debug build.
 #[skuld::test]
-fn a_stop_with_no_budget_waits_for_the_job_to_be_gone(#[fixture(launchd_group)] _group: &Group) {
+fn a_stop_under_immediate_waits_for_the_job_to_be_gone(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     mgr.stop(&spec.common().id, Some(Budget::Immediate))
-        .expect("a stop with no budget still waits for the job to be gone, and completes");
+        .expect("a stop under `Immediate` still waits for the job to be gone, and completes");
 
     assert_eq!(
         mgr.status(&spec.common().id).expect("status after stop").common().state,
         State::Stopped,
         "launchd no longer has the job, so it reads as stopped"
+    );
+}
+
+/// `stop(id, None)` waits for the daemon's own stop: its `timeout` plus the teardown margin, here 12 s of
+/// grace for a job that ignores SIGTERM and so 22 s, where [`Budget::DEFAULT`] would give up at 10 s with the
+/// job still there.
+#[skuld::test]
+fn a_stop_that_names_no_budget_waits_for_the_daemons_own_stop(#[fixture(launchd_group)] _group: &Group) {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let listener = ConnectBack::listen();
+    let spec = support::stopping_by(
+        sleepy(&id),
+        listener.sh_after("trap '' TERM", "while :; do /bin/sleep 1; done"),
+        StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: Some(Duration::from_secs(12)),
+        },
+    );
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the job to be up with SIGTERM ignored");
+
+    mgr.stop(&spec.common().id, None)
+        .expect("the stop waits for launchd's SIGKILL at the end of the 12 s, which a 10 s wait would not");
+
+    assert_eq!(
+        mgr.status(&spec.common().id).expect("status after stop").common().state,
+        State::Stopped,
+        "launchd no longer has the job"
     );
 }
 
