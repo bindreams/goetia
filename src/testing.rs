@@ -163,8 +163,7 @@ pub fn cron_matches(schedule: &Schedule, minute: u8, hour: u8, day: u8, month: u
 /// The cron schedules a task's triggers must fire for exactly when the cron says, in three groups: one
 /// time and repeated times a day, times with no single progression, and a weekday that has a fifth
 /// occurrence. The unit tests of the compilation check each against a model of Task Scheduler, and the
-/// Windows integration test checks each against Task Scheduler's own run times, over the two years 2027
-/// and 2028, cut to January 2027 for a schedule with more than 100,000 run times in them (applied in
+/// Windows integration test checks each against Task Scheduler's own run times (see
 /// `tests/scm_integration/task_schedule.rs`).
 pub const FIRING_SCHEDULES: [&[&str]; 3] = [
     &[
@@ -183,7 +182,7 @@ pub const FIRING_SCHEDULES: [&[&str]; 3] = [
         "5,35 */3 * * *",
     ],
     &[
-        // A class of minutes over two runs of hours, a lone minute, and hours in no run.
+        // Minutes with no single progression, over runs of hours and hours in no run.
         "0,15,30,45 9-11,14-16 * * *",
         "1,2,4,7 0,1,3,5,7,9,11 * * *",
         "0,15,30,45,7 9-17 * * 1-5",
@@ -191,6 +190,9 @@ pub const FIRING_SCHEDULES: [&[&str]; 3] = [
         "*/7 3 * * *",
         "*/7 9-17 * * 1-5",
         "0,10,20 22,23,0 * * *",
+        // Several groups in each hour: a lone :00 and a repetition, and a repetition and a lone minute.
+        "0,7,30 * * * *",
+        "5,17,40 * * * *",
         "17 */5 * * *",
         "0 * * * *",
         "0 0-4,7,9-12,14,17,20-23 * * 1",

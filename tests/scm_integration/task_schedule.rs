@@ -138,26 +138,26 @@ fn a_date_no_month_has_is_installed_armed_and_never_fires(#[fixture(scm_group)] 
 
 // The run times =======================================================================================================
 
-/// The end of 2028, a leap year: the range is 2027 and 2028.
+/// The end of 2028, a leap year.
 fn end_of_two_years() -> DateTime {
     civil::date(2028, 12, 31).at(23, 59, 0, 0)
 }
 
-/// The end of January 2027, the range of a schedule with more than [`MANY_RUN_TIMES`] run times in two
-/// years.
+/// The end of January 2027.
 fn end_of_january() -> DateTime {
     civil::date(2027, 1, 31).at(23, 59, 0, 0)
 }
 
-/// More run times in the two years than this, and a schedule is checked over January 2027 only. Measured
-/// on CI's Windows runner, `GetRunTimes` grows with the square of the run times it returns: 4.6 s for 39,000,
-/// 20 s for 79,000, 83 s for 158,000 (`*/7 * * * *`) and 134 to 152 s for 261,000, which is 6 months of
-/// `* * * * *` (two years is about an hour). The nextest `ci` profile kills a test after 300 s. No other
-/// schedule checked has more than 42,201 run times (`*/7 9-17 * * 1-5`, about 5 s); only `* * * * *` and
-/// `*/7 * * * *` are over this.
+/// More run times in the two years than this, and a schedule is checked over January 2027 only.
+/// `GetRunTimes` cost grows with the square of the run times it returns (about 150 s for 261,000), and the
+/// nextest `ci` profile kills a test after 300 s.
 const MANY_RUN_TIMES: usize = 100_000;
 
-/// Whether the cron names `minute`.
+/// The schedules of [`FIRING_SCHEDULES`] with more than [`MANY_RUN_TIMES`] run times in the two years,
+/// and so the only ones cut to January 2027. A new one over the limit fails the check instead of being
+/// cut unseen.
+const CUT_TO_JANUARY: [&str; 2] = ["* * * * *", "*/7 * * * *"];
+
 fn cron_names(schedule: &Schedule, minute: DateTime) -> bool {
     cron_matches(
         schedule,
@@ -169,12 +169,9 @@ fn cron_names(schedule: &Schedule, minute: DateTime) -> bool {
     )
 }
 
-/// The civil minutes, in the machine's zone, that Task Scheduler runs the task `text` at in the two years
-/// 2027 and 2028 (January 2027 for a schedule of more than [`MANY_RUN_TIMES`] run times in them),
-/// compared with every minute of them against the cron's own reading of it, in both directions: a run
-/// time the cron does not name and a minute it names that has none. The range is fixed and not derived
-/// from today's date; the zone is the machine's, and the comparison assumes it has no daylight-saving
-/// change in those years (CI's is UTC).
+/// Compares Task Scheduler's run times with the cron's own reading, every minute of the range, both
+/// directions: an extra run time and a missing one. The zone is the machine's and must have no DST change
+/// in the range (CI's is UTC).
 fn assert_runs_as_cron_says(texts: &[&str]) {
     let mgr = support::stock_shim_manager();
     let zone = TimeZone::system();
@@ -196,11 +193,13 @@ fn assert_runs_as_cron_says(texts: &[&str]) {
                 .take_while(move |&minute| minute <= last)
                 .filter(|&minute| cron_names(&schedule, minute))
         };
-        let last = if named_until(end).count() > MANY_RUN_TIMES {
-            end_of_january()
-        } else {
-            end
-        };
+        let many = named_until(end).count() > MANY_RUN_TIMES;
+        assert_eq!(
+            many,
+            CUT_TO_JANUARY.contains(text),
+            "`{text}`: over {MANY_RUN_TIMES} run times in the two years is {many}, and CUT_TO_JANUARY must agree"
+        );
+        let last = if many { end_of_january() } else { end };
         let named: BTreeSet<DateTime> = named_until(last).collect();
         let (from, to) = (instant(first - 1.minute()), instant(last));
 
