@@ -3419,6 +3419,25 @@ command: [bin/frpc]
         assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
     }
 
+    /// The path rules of `command[0]` are a service's: the same four forms resolve for a task.
+    #[cfg(unix)]
+    #[skuld::test]
+    fn a_systemd_host_refuses_a_special_command_zero_for_a_service_and_not_for_a_task() {
+        for command in [r"/opt/a\b", "/opt/a\"b", "/opt/a'b", "/opt/a "] {
+            let service = format!(
+                "id: frpc\ncommand: [\"{}\"]\n",
+                command.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+            let task = format!("{service}type: task\nschedule: '0 3 * * *'\n");
+            let msg = resolve_yaml_as(BackendKind::Systemd, &service)
+                .expect_err(command)
+                .to_string();
+            assert!(msg.contains("`command[0]`"), "{command:?}: {msg}");
+            let (spec, _) = resolve_yaml_as(BackendKind::Systemd, &task).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+            assert_eq!(spec.common().command, [command], "{command:?}");
+        }
+    }
+
     #[skuld::test]
     fn edge_whitespace_in_dash_f_is_blamed_on_dash_f_for_cwd_and_logs() {
         let dir = abs("a ");

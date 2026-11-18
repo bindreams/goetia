@@ -362,6 +362,13 @@ fn resolve_shape(
         },
         Phase::Authored,
     );
+    // The paths are judged before `type` is parsed below, and `command[0]`'s systemd rules depend on
+    // it. A `type` that is deferred or does not parse is read as a service here, the stricter reading:
+    // the pass that parses it reports it.
+    let kind = match shape(id, Field::Type, raw.daemon_type.clone(), substitution, parse_type) {
+        Ok(Shaped::Parsed(kind)) => kind,
+        _ => DaemonKind::Service,
+    };
     let mut command = raw.command;
     let mut cwd = raw.cwd;
     let mut logs = raw.logs;
@@ -376,6 +383,7 @@ fn resolve_shape(
             PathField::Logs => logs.as_mut(),
         };
         if let Some(text) = slot {
+            let native = native.map(|backend| (backend, kind));
             *text = resolve_path_string(id, path_field, text, base_dir, substitution, native, &mut warnings)?;
         }
     }
@@ -727,7 +735,7 @@ fn resolve_path_string(
     raw: &str,
     base_dir: &Path,
     substitution: Substitution,
-    native: Option<BackendKind>,
+    native: Option<(BackendKind, DaemonKind)>,
     warnings: &mut Vec<Warning>,
 ) -> Result<String, Refused> {
     let name = field.name();
@@ -782,8 +790,8 @@ fn resolve_path_string(
         .into_os_string()
         .into_string()
         .expect("`check_resolved` refused a path that is not valid UTF-8");
-    if let Some(native) = native {
-        native.refuse_path(id, &field.field(), raw, &joined, base_dir)?;
+    if let Some((native, kind)) = native {
+        native.refuse_path(id, kind, &field.field(), raw, &joined, base_dir)?;
     }
     Ok(joined)
 }
