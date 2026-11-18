@@ -342,28 +342,6 @@ fn a_default_log_that_could_not_be_held_still_has_the_outputs_open_failure_told(
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
-/// Each start of the daemon is a launch of its own: a fault the log told in an earlier one is told again when
-/// this one meets it.
-#[skuld::test]
-fn a_daemon_start_tells_a_log_fault_that_an_earlier_start_told() {
-    let fake = FakeGuard::new();
-    fake.will_make_thread();
-    fake.will_refuse_spawn(not_found());
-    fake.will_fail_open_log(Path::new(DAEMON_LOG));
-    let supervisor = supervisor(&fake);
-    supervisor
-        .log
-        .open_failed(ID, Path::new(DAEMON_LOG), &std::io::Error::other(OPEN_LOG_FAILED));
-    assert_eq!(fake.take_failures().len(), 1, "the earlier start's line");
-
-    run_daemon(&spec(), &supervisor, || {});
-
-    let told = fake.take_failures();
-    assert_eq!(told.len(), 2, "the open's line, then the refused spawn's: {told:?}");
-    assert!(told[0].contains(OPEN_LOG_FAILED), "{told:?}");
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-}
-
 #[skuld::test]
 fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs() {
     let fake = FakeGuard::new();

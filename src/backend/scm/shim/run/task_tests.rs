@@ -21,7 +21,7 @@ use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::shim::run::os::LogKind;
 use crate::backend::scm::shim::run::os::fake::{
-    FAKE_LOGS, FakeGuard, FakeProcess, KillReply, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd,
+    FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
 };
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
@@ -588,8 +588,8 @@ fn the_marker_goes_to_the_default_log_when_logs_is_the_default_log() {
 }
 
 /// A marker whose log cannot be opened is said, so that a reader who cannot find the run's output in the log
-/// knows why, even when the program's own open then succeeds. The program's open of the same file is the same
-/// fault and says nothing more (`a_log_that_cannot_be_opened_is_reported_once`).
+/// knows why, even when the program's own open then succeeds. The program's open of the same file is told for its
+/// own cost (`a_log_that_cannot_be_opened_is_reported_for_the_marker_and_for_the_output`).
 #[skuld::test]
 fn a_marker_whose_log_cannot_be_opened_is_reported() {
     let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(0));
@@ -625,10 +625,10 @@ fn a_run_with_no_instance_writes_no_marker() {
     run.finish();
 }
 
-/// The marker's open and the program's own open are of one file: when it cannot be opened that is
-/// one fault of one launch, said once, by the marker's open, which comes first.
+/// The marker's open and the program's own open are of one file, and each fails and is told for what it costs:
+/// the marker's line first, then the output's. A failed marker does not silence the output's failure.
 #[skuld::test]
-fn a_log_that_cannot_be_opened_is_reported_once() {
+fn a_log_that_cannot_be_opened_is_reported_for_the_marker_and_for_the_output() {
     let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(0));
     run.fake.will_fail_open_log(Path::new(LOGS));
     run.fake.will_fail_open_log(Path::new(LOGS));
@@ -636,31 +636,17 @@ fn a_log_that_cannot_be_opened_is_reported_once() {
     assert_eq!(run.run(), 0);
 
     let failures = run.finish();
-    assert_eq!(failures.len(), 1, "{failures:?}");
-    assert!(
-        failures[0].starts_with(&format!("goetia-shim[{ID}]: open log file {LOGS}: ")),
-        "{failures:?}"
-    );
-}
-
-/// A run is a launch of its own: a fault the log told in an earlier one is told again when this run meets it.
-#[skuld::test]
-fn a_run_tells_a_log_fault_that_an_earlier_run_told() {
-    let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(0));
-    run.fake.will_fail_open_log(Path::new(LOGS));
-    run.supervisor
-        .log
-        .marker_open_failed(ID, Path::new(LOGS), &io::Error::other(OPEN_LOG_FAILED));
-    assert_eq!(run.fake.take_failures().len(), 1, "the earlier run's line");
-
-    assert_eq!(run.run(), 0);
-
-    let failures = run.finish();
-    assert_eq!(failures.len(), 1, "{failures:?}");
-    assert!(
-        failures[0].contains("the run marker could not be written"),
-        "{failures:?}"
-    );
+    let [marker, output] = failures.as_slice() else {
+        panic!("the marker's line and the output's: {failures:?}");
+    };
+    for line in [marker, output] {
+        assert!(
+            line.starts_with(&format!("goetia-shim[{ID}]: open log file {LOGS}: ")),
+            "{line}"
+        );
+    }
+    assert!(marker.contains("the run marker could not be written"), "{marker}");
+    assert!(output.contains("this daemon's output will not be captured"), "{output}");
 }
 
 /// A record says when the run began, as a `FILETIME` of the machine's clock.

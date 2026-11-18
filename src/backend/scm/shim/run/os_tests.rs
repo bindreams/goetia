@@ -540,29 +540,59 @@ fn a_held_default_log_that_was_deleted_is_opened_again_for_the_next_line(#[fixtu
     assert_eq!(std::fs::read_to_string(&log).expect("the new log"), "first\nsecond\n");
 }
 
-/// A delete that waits for the last handle (the name stays until it is closed) leaves the held handle as the one
-/// thing that keeps the name. It is released before the path is opened again, so that an open that fails leaves
-/// nothing holding the name, and the install that makes the log again can.
-#[skuld::test]
-fn a_held_default_log_that_was_deleted_is_released_before_it_is_opened_again(#[fixture(temp_dir)] dir: &Path) {
+/// Marks the file at `path` for deletion and closes the handle that did it: the delete is pending until the last
+/// other handle closes (the name stays the file's until then), where `std`'s `remove_file` frees the name at once.
+fn mark_for_deletion(path: &Path) {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_DELETE_ON_CLOSE};
 
+    OpenOptions::new()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path)
+        .expect("mark the file for deletion");
+}
+
+/// With no daemon running, the shim's held handle is the one thing that keeps the name of a log whose delete is
+/// pending. It is released before the path is opened again, so that an open that fails leaves nothing of the
+/// shim's holding the name, and the install that makes the log again can.
+#[skuld::test]
+fn a_held_default_log_that_was_deleted_is_released_before_it_is_opened_again(#[fixture(temp_dir)] dir: &Path) {
     let log = dir.join("x.log");
     std::fs::write(&log, "").expect("the file an install made");
     let real = Real::default();
     real.hold_default(&log).expect("hold the default log");
-    // Closed at once: the delete is pending on the held handle.
-    OpenOptions::new()
-        .access_mode(DELETE)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-        .open(&log)
-        .expect("mark the file for deletion");
+    mark_for_deletion(&log);
 
     real.append(&log, "lost", LogKind::Default)
         .expect_err("nothing is there to write");
 
     std::fs::write(&log, "").expect("the install makes the log again: the held handle keeps no name");
+}
+
+/// A daemon's output handle is a clone of the held one, and it keeps the name of a deleted log until the daemon
+/// exits, whatever the shim releases: an install cannot make the log again meanwhile (and says why), and can
+/// once the daemon's handle is closed.
+#[skuld::test]
+fn a_daemons_output_handle_keeps_the_name_of_a_deleted_log_until_it_is_closed(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("x.log");
+    std::fs::write(&log, "").expect("the file an install made");
+    let real = Real::default();
+    real.hold_default(&log).expect("hold the default log");
+    let output = real.open_log(&log, LogKind::Default).expect("the daemon's output");
+    mark_for_deletion(&log);
+
+    real.append(&log, "lost", LogKind::Default)
+        .expect_err("nothing is there to write");
+
+    assert_eq!(
+        std::fs::write(&log, "")
+            .expect_err("the daemon still holds the name")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    drop(output);
+    std::fs::write(&log, "").expect("the install makes the log again once the daemon's handle is closed");
 }
 
 /// The same for the daemon's output: a daemon started after the recovery writes the new file.

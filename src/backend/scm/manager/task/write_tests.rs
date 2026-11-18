@@ -1608,35 +1608,102 @@ fn a_service_with_no_account_to_name_adds_none_to_the_log() {
     fake.finish();
 }
 
-/// The service's account is looked up before anything is retired: a lookup that fails fails the install with the
-/// service and its log as they were.
+/// A snapshot of the service `frpc` of `protocol` that is registered as `account` (`None`: LocalSystem), as
+/// `read` makes one, with its configuration queried already when `queried`: a service that is not hosted has
+/// none, so a snapshot without it shows that nothing asked for it.
+fn service_registered_as(protocol: crate::spec::Protocol, account: Option<&str>, queried: bool) -> ScmSnapshot {
+    use windows_service::service::{ServiceConfig, ServiceErrorControl, ServiceStartType, ServiceType};
+
+    let blob = crate::backend::scm::test_support::blob_of(protocol);
+    let snapshot = ScmSnapshot::new(blob.spec.common().id.clone(), Ok(blob), Default::default());
+    if queried {
+        let config = ServiceConfig {
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::OnDemand,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: PathBuf::from("host.exe"),
+            load_order_group: None,
+            tag_id: 0,
+            dependencies: vec![],
+            account_name: account.map(Into::into),
+            display_name: "frpc".into(),
+        };
+        assert!(snapshot.config.set(config).is_ok());
+    }
+    snapshot
+}
+
+const LOCAL_SERVICE_NAME: &str = r"NT AUTHORITY\LocalService";
+const NO_SUCH_ACCOUNT: &str = "goetia-no-such-account-7f3a";
+
+/// A native service has no default log, so there is no account of it to name, and its configuration is not
+/// asked for.
 #[skuld::test]
-fn a_service_whose_account_cannot_be_looked_up_is_not_changed_into_a_task() {
-    let spec = task_spec(Some("30 3 * * *"));
-    let (dir, runs) = made_records();
-    let fake = Fake::new();
+fn a_native_service_has_no_account_the_log_keeps() {
+    let native = service_registered_as(crate::spec::Protocol::Native, Some(LOCAL_SERVICE_NAME), false);
 
-    let refused = scm(&fake)
-        .retype_to_task_with(
-            &spec,
-            &definition(&spec),
-            &runs,
-            prepared(users(), None),
-            || {
-                Err(Error::AccountLookup {
-                    detail: "no such account".to_string(),
-                    source: None,
-                })
-            },
-            || panic!("the service is not retired when its account cannot be looked up"),
-        )
-        .unwrap_err();
+    let kept = kept_service_account(&native, &TaskAccount::User(NO_SUCH_ACCOUNT.to_string()));
 
-    assert!(matches!(refused, Error::AccountLookup { .. }), "{refused:?}");
-    assert_eq!(fake.calls(), []);
-    assert!(
-        !trustees_of(&default_log(&dir)).contains(&users()),
-        "the log was not touched"
+    assert_eq!(kept.unwrap(), None);
+}
+
+/// A service whose account no longer exists (deleted since) has no one to name: nothing runs as it, and the
+/// retype goes on.
+#[skuld::test]
+fn a_service_whose_account_is_gone_has_no_account_the_log_keeps() {
+    let gone = service_registered_as(crate::spec::Protocol::Plain, Some(NO_SUCH_ACCOUNT), true);
+
+    let kept = kept_service_account(&gone, &TaskAccount::Service("S-1-5-19".to_string()));
+
+    assert_eq!(kept.unwrap(), None);
+}
+
+/// A service that runs as the task's account has no other account to keep, and nothing is looked up for it:
+/// the account a lookup would find is the task's.
+#[skuld::test]
+fn a_service_that_runs_as_the_tasks_account_has_no_account_the_log_keeps() {
+    for (registered, task) in [
+        (Some(LOCAL_SERVICE_NAME), TaskAccount::Service("S-1-5-19".to_string())),
+        (None, TaskAccount::Service("S-1-5-18".to_string())),
+        (Some(NO_SUCH_ACCOUNT), TaskAccount::User(NO_SUCH_ACCOUNT.to_string())),
+    ] {
+        let service = service_registered_as(crate::spec::Protocol::Plain, registered, true);
+
+        let kept = kept_service_account(&service, &task);
+
+        assert_eq!(kept.unwrap(), None, "{registered:?} for {task:?}");
+    }
+}
+
+/// A hosted service that runs as another account than the task's keeps its account in the log until the retype
+/// lands.
+#[skuld::test]
+fn a_service_that_runs_as_another_account_than_the_tasks_has_its_account_kept() {
+    let service = service_registered_as(crate::spec::Protocol::Plain, Some(LOCAL_SERVICE_NAME), true);
+
+    let kept = kept_service_account(&service, &TaskAccount::Service("S-1-5-20".to_string()));
+
+    assert_eq!(kept.unwrap(), Some(local_service()));
+}
+
+/// The task's account as a service's registration spells it, which is what the service's own is compared with.
+#[skuld::test]
+fn a_task_account_is_spelled_as_a_service_registers_it() {
+    assert_eq!(
+        service_account_name(&TaskAccount::Service("S-1-5-18".to_string())),
+        None
+    );
+    assert_eq!(
+        service_account_name(&TaskAccount::Service("S-1-5-19".to_string())).as_deref(),
+        Some(LOCAL_SERVICE_NAME)
+    );
+    assert_eq!(
+        service_account_name(&TaskAccount::Service("S-1-5-20".to_string())).as_deref(),
+        Some(r"NT AUTHORITY\NetworkService")
+    );
+    assert_eq!(
+        service_account_name(&TaskAccount::User(r"DOMAIN\alice".to_string())).as_deref(),
+        Some(r"DOMAIN\alice")
     );
 }
 

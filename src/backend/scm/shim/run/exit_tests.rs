@@ -218,3 +218,48 @@ fn an_end_that_cannot_terminate_the_process_is_logged_to_the_runs_default_log() 
         ]
     );
 }
+
+/// A run whose log is kept before its name is known (`service_main`: SCM's name may be unusable) logs the end's
+/// failure into that log under the shim's table name, and into no other: a second log built for the end would
+/// tell the machine's faults, which the first told, again.
+#[skuld::test]
+fn an_end_that_fails_before_the_run_is_named_goes_to_the_kept_log_under_the_table_name() {
+    let fake = FakeGuard::new();
+    let run = Run::new(fake.log());
+    let line = "goetia-shim[goetia-shim]: end the shim's process with code 7: refused";
+
+    end_failure_in(Some(&run), 7, &io::Error::other("refused"));
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![
+            ChannelCall::Append {
+                path: Path::new(FAKE_LOGS).join("goetia-shim.log"),
+                line: line.to_string(),
+                kind: LogKind::Default,
+                ok: true,
+            },
+            ChannelCall::EventLog {
+                severity: Severity::Error,
+                line: line.to_string(),
+            },
+        ]
+    );
+}
+
+/// Once the run's id is known it is the id the end's failure is logged under.
+#[skuld::test]
+fn an_end_that_fails_after_the_run_is_named_goes_under_its_id() {
+    let fake = FakeGuard::new();
+    let run = Run::new(fake.log());
+    run.name("svc");
+
+    end_failure_in(Some(&run), 7, &io::Error::other("refused"));
+
+    let calls = fake.take_channel_calls();
+    let [ChannelCall::Append { path, line, .. }, ChannelCall::EventLog { .. }] = calls.as_slice() else {
+        panic!("a line to the file and one to the Event Log: {calls:?}");
+    };
+    assert_eq!(path, &Path::new(FAKE_LOGS).join("svc.log"));
+    assert!(line.starts_with("goetia-shim[svc]: "), "{line}");
+}

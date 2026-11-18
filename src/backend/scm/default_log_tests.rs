@@ -13,7 +13,9 @@ use super::*;
 use crate::backend::scm::folder::logs_folder;
 use crate::backend::scm::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, read_path};
 use crate::backend::scm::sid::{sid_display, sid_from_parts};
-use crate::backend::scm::test_support::{permit_only, set_dacl, set_reparse_point, short, withdraw_append};
+use crate::backend::scm::test_support::{
+    delete_pending, permit_only, set_dacl, set_reparse_point, short, withdraw_append,
+};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -170,6 +172,27 @@ fn a_log_that_is_a_link_is_refused_and_its_permissions_are_left_alone() {
         refused.report()
     );
     assert!(!read_path(&log).unwrap().protected, "its permissions are as they were");
+}
+
+/// A log whose delete is pending, because a run of the daemon still holds a handle on it, keeps its name until
+/// that run ends, and Windows answers an open of it with access denied: the install says what it is, and the
+/// way out, not only that access was denied.
+#[skuld::test]
+fn a_log_that_is_being_deleted_while_a_run_writes_it_is_refused_with_the_way_out() {
+    let (dir, log) = program_data_with_logs();
+    let _writer = delete_pending(&log);
+
+    let refused = ensure(dir.path(), &id(), &[process_user_sid()])
+        .unwrap_err()
+        .report()
+        .to_string();
+
+    assert!(refused.contains(&log.display().to_string()), "{refused}");
+    assert!(
+        refused.contains("being deleted while a run of the daemon still writes it"),
+        "{refused}"
+    );
+    assert!(refused.contains("stop the daemon, then install"), "{refused}");
 }
 
 /// A tag that names no other file is data on this one, which the install sets the permissions of like any.

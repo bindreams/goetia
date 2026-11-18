@@ -233,27 +233,48 @@ fn a_default_log_that_could_not_be_held_does_not_silence_the_open_that_fails_too
     assert!(opened.contains("this daemon's output will not be captured"), "{opened}");
 }
 
-/// One fault is told once in a launch, whoever meets it: the marker's open and the output's open of one file,
-/// failing alike, are one line. Another file's fault is another line.
+/// A fault is told once, however often it is met: the same open of the same file failing the same way is one line.
 #[skuld::test]
-fn a_fault_in_one_file_is_told_once_in_a_launch_whoever_meets_it() {
+fn an_open_that_fails_again_the_same_way_is_told_once() {
     let fake = FakeGuard::new();
     let log = log_over(&fake);
     let daemon = Path::new("elsewhere").join("daemon.log");
     let other = Path::new("elsewhere").join("other.log");
     let fault = std::io::Error::other("denied");
 
-    log.marker_open_failed("svc", &daemon, &fault);
+    log.open_failed("svc", &daemon, &fault);
     log.open_failed("svc", &daemon, &fault);
     log.open_failed("svc", &other, &fault);
-    log.open_failed("svc", &other, &fault);
+    log.marker_open_failed("svc", &daemon, &fault);
+    log.marker_open_failed("svc", &daemon, &fault);
+
+    let told = fake.take_failures();
+    let [first, second, marker] = told.as_slice() else {
+        panic!("one line for each file's output, and the marker's: {told:?}");
+    };
+    assert!(first.contains(&daemon.display().to_string()), "{first}");
+    assert!(second.contains(&other.display().to_string()), "{second}");
+    assert!(marker.contains("the run marker could not be written"), "{marker}");
+}
+
+/// The marker's open and the output's open of one file, failing alike, are two facts with two consequences: a
+/// marker not written, and an output not captured. A failed marker does not silence the output's failure.
+#[skuld::test]
+fn a_failed_marker_and_a_failed_output_of_one_file_are_both_told() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("elsewhere").join("daemon.log");
+    let fault = std::io::Error::other("denied");
+
+    log.marker_open_failed("svc", &daemon, &fault);
+    log.open_failed("svc", &daemon, &fault);
 
     let told = fake.take_failures();
     let [marker, output] = told.as_slice() else {
-        panic!("one line for each of the two files: {told:?}");
+        panic!("the marker's line and the output's: {told:?}");
     };
-    assert!(marker.contains(&daemon.display().to_string()), "{marker}");
-    assert!(output.contains(&other.display().to_string()), "{output}");
+    assert!(marker.contains("the run marker could not be written"), "{marker}");
+    assert!(output.contains("this daemon's output will not be captured"), "{output}");
 }
 
 /// A different fault in the same file is another fact, told in its own right.
@@ -269,22 +290,6 @@ fn a_fault_of_another_kind_in_the_same_file_is_told_too() {
         &daemon,
         &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
     );
-
-    assert_eq!(fake.take_failures().len(), 2);
-}
-
-/// A shim that starts its daemon again (one launch after another) tells a later open failure of the same file:
-/// the fault told in the first is no one's knowledge of the second.
-#[skuld::test]
-fn a_fault_in_a_file_is_told_again_in_the_next_launch() {
-    let fake = FakeGuard::new();
-    let log = log_over(&fake);
-    let daemon = Path::new("elsewhere").join("daemon.log");
-    let fault = std::io::Error::other("denied");
-
-    log.open_failed("svc", &daemon, &fault);
-    log.begin_launch();
-    log.open_failed("svc", &daemon, &fault);
 
     assert_eq!(fake.take_failures().len(), 2);
 }
