@@ -92,7 +92,7 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Occupant, PutBackFound, Reason, Result, carried};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
-use crate::spec::{DaemonKind, DaemonSpec, Id, Restart, StopAction};
+use crate::spec::{DaemonKind, DaemonSpec, Id, Restart};
 
 pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
@@ -400,11 +400,6 @@ impl Plist {
 
     fn is_task(&self) -> bool {
         matches!(&self.blob, Ok(blob) if blob.spec.kind() == DaemonKind::Task)
-    }
-
-    /// The `stop-action` the job's metadata carries, or `None` where it does not decode.
-    fn stop_action(&self) -> Option<StopAction> {
-        self.blob.as_ref().ok().map(|blob| *blob.spec.stop_action())
     }
 
     /// Where a task is enabled: see [`enabled_in`].
@@ -1830,7 +1825,7 @@ impl backend::Backend for Launchd {
     /// `stop_task`). A service is booted out, whatever the label holds.
     fn stop(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
         if snapshot.kind() == DaemonKind::Task {
-            return self.stop_task(snapshot.id(), snapshot.stop_action(), budget, reservation);
+            return self.stop_task(snapshot.id(), snapshot.stop_action().ok(), budget, reservation);
         }
         // First, so the wait is counted from the verb's entry. A budget that does not wait gets an
         // unbounded deadline (see `verb_deadline`); under a bounded one an expiry leaves the

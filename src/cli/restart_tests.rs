@@ -59,7 +59,8 @@ fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
 /// long the run takes.
 fn restart_with_a_spent_deadline(fake: &Fake) -> String {
     let id = Id::try_from("frpc").unwrap();
-    let e = restart_until(fake, &id, Some(THIRTY), Budget::Immediate.start()).expect_err("a spent budget is a timeout");
+    let e =
+        restart_until(fake, &id, Some((THIRTY, Budget::Immediate.start()))).expect_err("a spent budget is a timeout");
     assert!(e.is_indeterminate(), "{}", e.report());
     e.report().to_string()
 }

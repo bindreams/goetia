@@ -284,11 +284,12 @@ records the end as it does.
   `protocol: native` service handles SCM's own stop itself, so it refuses
   `send-signal`; its `timeout` still sets the wait of `stop` and `restart`.
 
-`goetia daemon stop` waits for the daemon's `timeout` plus 10 s (the stop's own
-teardown), and `restart` for that plus 10 s for the start; both wait unbounded
-for `null`, and as before (`10s`) for `kill`. `--timeout` and `--no-timeout`
-override it, and a daemon whose definition cannot be read gets the old default. `goetia daemon show` prints the
-leaves that differ from the default.
+With no flag, `goetia daemon stop` waits for the daemon's `timeout` plus 10 s (the stop's own teardown): without
+bound for `null`, and 10 s for `send-signal: kill`. `goetia daemon restart` waits that long for its stop, and 10 s
+for its start. `--timeout` and `--no-timeout` override both, and then bound the whole restart. A daemon whose
+definition cannot be read has no stop action to take the wait from: `stop` and `restart` with no flag fail,
+naming why, and with `--timeout` or `--no-timeout` they run. `goetia daemon show` prints the leaves that differ
+from the default.
 
 **Upgrading.** A stop used to wait 90 s on systemd (its own default), 5 s on
 launchd and nothing on Windows; the default is now `30s` on systemd and launchd

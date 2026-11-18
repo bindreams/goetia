@@ -19,7 +19,7 @@ use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
 use crate::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step, flow};
-use crate::spec::{DaemonKind, DaemonSpec, Id};
+use crate::spec::{DaemonKind, DaemonSpec, Id, StopAction};
 
 /// A marked artifact's metadata as `read` decoded it, or the failure kept in its place. Shared, so
 /// every verb that reports the failure hands out the one error.
@@ -36,6 +36,12 @@ pub(crate) trait InstalledService {
     /// marker alone is proof of ownership, so `uninstall` and the other verbs must still work on a
     /// service whose blob will not decode.
     fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>>;
+
+    /// The `stop-action` the metadata carries, or the failure to decode it: the one reader of it, for the
+    /// default wait of a stop ([`flow::stop_budget`]) and for a launchd task's stop.
+    fn stop_action(&self) -> std::result::Result<StopAction, &Arc<Error>> {
+        self.blob().map(|blob| *blob.spec.stop_action())
+    }
 }
 
 /// One platform's primitives. See the module doc.
@@ -470,7 +476,7 @@ impl<B: Backend> ServiceManager for B {
 
     fn stop(&self, id: &Id, budget: Option<Budget>) -> Result<()> {
         let snapshot = flow::owned(self, id)?;
-        let budget = flow::stop_budget(&snapshot, budget);
+        let budget = flow::stop_budget(&snapshot, budget)?;
         let mut reservation = flow::reserved(self, id, &[Step::Stop], budget)?;
         Backend::stop(self, snapshot, budget, &mut reservation)
     }
@@ -539,7 +545,7 @@ impl<B: Backend> Sequence for Reserved<'_, B> {
 
     fn stop(&mut self, id: &Id, budget: Option<Budget>) -> Result<()> {
         let snapshot = flow::owned(self.backend, id)?;
-        let budget = flow::stop_budget(&snapshot, budget);
+        let budget = flow::stop_budget(&snapshot, budget)?;
         self.spend(&[Step::Stop]);
         Backend::stop(self.backend, snapshot, budget, &mut self.reservation)
     }

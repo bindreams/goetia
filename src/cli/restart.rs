@@ -65,11 +65,11 @@ pub fn run(
 
 /// One daemon's restart, under one deadline started here when a budget is `given`.
 fn restart(mgr: &dyn ServiceManager, id: &Id, given: Option<Budget>) -> Result<()> {
-    restart_until(mgr, id, given, given.unwrap_or(Budget::Unbounded).start())
+    restart_until(mgr, id, given.map(|given| (given, given.start())))
 }
 
-/// [`restart`], under a `deadline` that may already be spent. The `deadline` is read only for a `given`
-/// budget: with none, each leg takes its own default, and nothing is spread over the two.
+/// [`restart`], under a `given` budget and the `Deadline` already started for it, which may be spent. With no
+/// budget given there is no deadline: each leg takes its own default, and nothing is spread over the two.
 ///
 /// Under a budget that waits the legs need nothing between them: the stop leg
 /// is only ever handed a budget that waits (see [`stop_leg`]), so a `stop` that
@@ -77,14 +77,15 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, given: Option<Budget>) -> Result<(
 /// `WaitTimeout` or `ProcessWaitTimeout`, so the start is never reached. Under a budget that does not
 /// wait, nothing is confirmed or read. Either way no state is queried between
 /// the legs, which keeps the exit code from being a stopwatch question.
-fn restart_until(mgr: &dyn ServiceManager, id: &Id, given: Option<Budget>, deadline: Deadline) -> Result<()> {
-    // What the legs reserve for: the budget given, else a wait, which is all a reservation reads of the
-    // default.
-    let budget = given.unwrap_or(Budget::DEFAULT);
+fn restart_until(mgr: &dyn ServiceManager, id: &Id, given: Option<(Budget, Deadline)>) -> Result<()> {
+    let named = given.map(|(budget, _)| budget);
     // Before either leg sends anything, so that nothing either leg needs can
-    // run out between the stop and the start and leave the daemon stopped.
-    let mut sequence = mgr.prepare(&[Step::Stop, Step::Start], budget)?;
-    if !budget.waits() {
+    // run out between the stop and the start and leave the daemon stopped. A reservation is made for one
+    // budget for both legs, and the stop leg's own wait is read from the snapshot only when it is issued
+    // (`ServiceManager::stop` with `None`), after this: a daemon whose stop waits without bound is reserved
+    // for a bounded one, one stop listener set it does not use.
+    let mut sequence = mgr.prepare(&[Step::Stop, Step::Start], named.unwrap_or(Budget::DEFAULT))?;
+    if named.is_some_and(|named| !named.waits()) {
         // One request where the manager has one; a refusal changed nothing, so
         // its error stands as it is.
         if let Some(requested) = mgr.request_restart(id) {
@@ -92,22 +93,28 @@ fn restart_until(mgr: &dyn ServiceManager, id: &Id, given: Option<Budget>, deadl
         }
     }
     sequence
-        .stop(id, given.map(|given| stop_leg(given, budget_for(deadline))))
-        .map_err(|e| abandoned_before_start(id, e, given))?;
+        .stop(
+            id,
+            given.map(|(requested, deadline)| stop_leg(requested, budget_for(deadline))),
+        )
+        .map_err(|e| abandoned_before_start(id, e, named))?;
 
     let start_leg = match given {
-        Some(given) => leg(given, budget_for(deadline)),
-        None => Leg::Under(Budget::DEFAULT),
+        Some((requested, deadline)) => match leg(requested, budget_for(deadline)) {
+            Leg::Under(left) => left,
+            Leg::Spent => return Err(spent_before_start(id, requested)),
+        },
+        None => Budget::DEFAULT,
     };
-    let started = match start_leg {
-        Leg::Under(left) if left.waits() => sequence.start(id, left),
+    let started = if start_leg.waits() {
+        sequence.start(id, start_leg)
+    } else {
         // Not the idempotent `start`: over a stop nobody confirmed, a manager
         // answering "already running" may be seeing the instance that stop is
         // taking down, and that answer must not read as a restart.
-        Leg::Under(_) => sequence.request_start_after_stop(id),
-        Leg::Spent => return Err(spent_before_start(id, budget)),
+        sequence.request_start_after_stop(id)
     };
-    started.map_err(|e| after_start_failed(id, given, e))
+    started.map_err(|e| after_start_failed(id, named, e))
 }
 
 // the abandonment rule ================================================================================================

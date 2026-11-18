@@ -5171,14 +5171,20 @@ fn a_wait_flag_overrides_the_stop_actions_wait() {
     }
 }
 
+/// The daemon's own wait is read from its stop action, and a definition that will not decode has none: the
+/// stop fails with the decode failure and reserves nothing. A wait the user names needs no definition.
 #[skuld::test]
-fn a_daemon_whose_definition_will_not_decode_is_stopped_under_the_previous_default() {
-    // The stop action cannot be read, and a stop does not need it: the wait is what it always was.
+fn a_daemon_whose_definition_will_not_decode_is_stopped_only_under_a_wait_the_user_names() {
     let fake = Fake::new();
     fake.seed_unusable("frpc");
-    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert_eq!(fake.prepared().last().unwrap().1, Budget::DEFAULT);
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("blob"), "the decode failure: {err}");
+    assert!(fake.prepared().is_empty(), "nothing was reserved");
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc", "--timeout", "3s"], &fake);
+    assert_eq!(code, 0, "{err}");
 }
 
 #[skuld::test]

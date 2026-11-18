@@ -23,7 +23,7 @@ use crate::manager::Budget;
 pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
     /// state asked for. Defaults to 10s; for `stop`, the daemon's own stop timeout plus 10s, and for
-    /// `restart` that plus 10s for the start (see `stop-action` in the README). `--timeout 0` issues
+    /// `restart` that for the stop and 10s for the start (see `stop-action` in the README). `--timeout 0` issues
     /// the request and returns without waiting, establishing nothing. On macOS, a stop and
     /// some starts and installs also wait for launchd to remove a job; see the
     /// README. Write a compound duration unspaced (`2m30s`), or quote it as

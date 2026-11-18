@@ -28,10 +28,10 @@ enum Pass {
     /// Read again: a start launchd had accepted has forked, after a wait of this long under no budget.
     /// That wait is not the caller's to spend, so the caller's budget is extended by it.
     Queued(Duration),
-    /// Read again, paced: launchd shows a pid that is no run of the job's that the stop can reach: the run
-    /// ended and launchd has not cleared it, or launchd has moved on to another run. The pause is
-    /// [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing, and never runs past
-    /// the deadline.
+    /// Launchd shows a pid that is no run of the job's that the stop can reach: the run ended and launchd has
+    /// not cleared it, or launchd has moved on to another run. Read again, paced by [`UNLOAD_POLL`], as for a
+    /// wait on `print`: it spaces the reads and decides nothing, and never runs past the deadline. `Immediate`
+    /// waits for no exit, so it does not read again: [`unreached`].
     Behind,
 }
 
@@ -235,6 +235,18 @@ fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> Error {
     }
 }
 
+/// What an `Immediate` stop ends with when launchd shows a pid it could not reach: it sent nothing, and cannot
+/// tell that no run is left. Indeterminate, like any [`Error::StopUnconfirmed`].
+fn unreached(id: &Id) -> Error {
+    Error::StopUnconfirmed {
+        id: id.to_string(),
+        shown: format!(
+            "launchd shows a process ID for the job that this stop could not reach (it has ended, or it is not \
+             the job's), and nothing was sent; run `goetia daemon stop {id}` again"
+        ),
+    }
+}
+
 /// What `print` and the process it shows say is up for a stop: [`Launchd::read_up`].
 enum Up<'a> {
     /// No process, and launchd holds no start: [`Quiet::Idle`].
@@ -258,10 +270,9 @@ impl Launchd {
     /// Ends the run in flight, and returns once launchd shows no process. The stop is always issued, as every
     /// backend's is, whatever the budget: the first pass always runs, and the wait for a queued start and the
     /// signal to the run found after it are part of it. A spent deadline ends it ([`Course::spent`]).
-    /// `Immediate` waits for no exit: it signals the run it finds and returns. While launchd shows a pid the stop cannot reach it reads again, paced by
-    /// [`UNLOAD_POLL`], until a reading shows no process (`Ok`) or a run it can hold (signalled as in any pass,
-    /// then `Ok`); it has no other end, so it lasts as long as launchd shows that pid. Otherwise the pass reads
-    /// `print`:
+    /// `Immediate` waits for no exit, and not for launchd's view either: it signals the run it finds and returns
+    /// `Ok`; a pid launchd shows that it cannot reach is [`Error::StopUnconfirmed`] ([`unreached`]), on that
+    /// reading. Otherwise the pass reads `print`:
     ///
     /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
     ///   No process and any other state, or a `print` that failed or was not whole, is
@@ -309,9 +320,10 @@ impl Launchd {
                 Pass::Done => return Ok(()),
                 Pass::Again => course.first_pass_over(),
                 Pass::Queued(waited) => course.extend(waited),
+                Pass::Behind if course.counted == Budget::Immediate => return Err(unreached(id)),
                 Pass::Behind => {
                     course.first_pass_over();
-                    // The pause never crosses the deadline; `Immediate` has none, and paces by `UNLOAD_POLL`.
+                    // The pause never crosses a bounded deadline.
                     let pause = match (course.counted, course.deadline().remaining()) {
                         (Budget::Bounded(_), Some(left)) => left.min(UNLOAD_POLL),
                         _ => UNLOAD_POLL,

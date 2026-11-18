@@ -376,10 +376,17 @@ pub(crate) fn kind_of<S: InstalledService>(snapshot: &S) -> Result<DaemonKind> {
 
 /// The wait of a `stop` of the marked service `snapshot`: `given`, or, where the caller named none,
 /// [`Budget::for_stop`] of the stop action in the blob this `snapshot` holds, the one the stop then acts on.
-/// A blob that will not decode has no stop action to read, which `stop` does not need (the marker alone is
-/// proof of ownership): the wait is then [`Budget::DEFAULT`], what it was before stop actions.
-pub(crate) fn stop_budget<S: InstalledService>(snapshot: &S, given: Option<Budget>) -> Budget {
-    given.unwrap_or_else(|| Budget::for_stop(snapshot.blob().ok().map(|blob| blob.spec.stop_action())))
+/// A blob that will not decode has no stop action to take the wait from: the decode failure, as
+/// [`kind_of`] reports it. A caller that names the wait needs no blob, and the marker alone is proof of
+/// ownership.
+pub(crate) fn stop_budget<S: InstalledService>(snapshot: &S, given: Option<Budget>) -> Result<Budget> {
+    match given {
+        Some(given) => Ok(given),
+        None => snapshot
+            .stop_action()
+            .map(|action| Budget::for_stop(&action))
+            .map_err(|e| Error::Kept(Arc::clone(e))),
+    }
 }
 
 /// The thread that waits for a run, made before the run is requested.

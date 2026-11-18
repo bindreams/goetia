@@ -411,18 +411,11 @@ fn a_stop_with_no_budget_waits_the_stop_actions_timeout_plus_the_teardown_margin
         timeout: timeout.map(Duration::from_secs),
     };
 
+    assert_eq!(Budget::for_stop(&action(StopSignal::Terminate, Some(30))), secs(40));
+    assert_eq!(Budget::for_stop(&action(StopSignal::Interrupt, Some(5))), secs(15));
     assert_eq!(
-        Budget::for_stop(Some(&action(StopSignal::Terminate, Some(30)))),
-        secs(40)
-    );
-    assert_eq!(
-        Budget::for_stop(Some(&action(StopSignal::Interrupt, Some(5)))),
-        secs(15)
-    );
-    assert_eq!(
-        Budget::for_stop(Some(&action(StopSignal::Terminate, None))),
+        Budget::for_stop(&action(StopSignal::Terminate, None)),
         Budget::Unbounded
     );
-    assert_eq!(Budget::for_stop(Some(&action(StopSignal::Kill, None))), Budget::DEFAULT);
-    assert_eq!(Budget::for_stop(None), Budget::DEFAULT);
+    assert_eq!(Budget::for_stop(&action(StopSignal::Kill, None)), Budget::DEFAULT);
 }

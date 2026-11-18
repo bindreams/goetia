@@ -29,14 +29,11 @@ impl Budget {
     /// The wait of a `stop` that names none: the daemon's own stop action, with
     /// [`StopAction::TEARDOWN_MARGIN`] to be torn down and recorded ([`StopAction::longest_stop`]); no bound
     /// for a stop action with no `timeout`; and [`Self::DEFAULT`], what it always was, for `kill`, which
-    /// sends nothing to answer, and for a daemon with no stop action to read (`None`: its definition does
-    /// not decode).
-    pub fn for_stop(action: Option<&StopAction>) -> Budget {
-        match action {
-            Some(action) if action.send_signal != StopSignal::Kill => {
-                action.longest_stop().map_or(Budget::Unbounded, Budget::Bounded)
-            }
-            _ => Budget::DEFAULT,
+    /// sends nothing to answer.
+    pub fn for_stop(action: &StopAction) -> Budget {
+        match action.send_signal {
+            StopSignal::Kill => Budget::DEFAULT,
+            _ => action.longest_stop().map_or(Budget::Unbounded, Budget::Bounded),
         }
     }
 
@@ -47,9 +44,10 @@ impl Budget {
     /// exception is a launchd task's `stop`, which matches on the budget itself:
     /// under every budget it waits for a queued start's pid and sends the run its
     /// first signal, as every backend's stop is issued. Under `Immediate` it
-    /// then returns `Ok`, but waits for no exit: it reads launchd again, paced,
-    /// for as long as launchd shows a pid it cannot hold, and returns `Ok` when a
-    /// reading shows no process; a zero bound is a bound that has run out, so after
+    /// returns `Ok` once it has sent the run its signal, without waiting for the
+    /// exit; where launchd shows a pid the stop cannot reach, it sends nothing
+    /// and returns [`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed),
+    /// reading nothing again. A zero bound is a bound that has run out, so after
     /// that signal it sends nothing more, does one reading (`read_up`), and
     /// returns `Ok` if the job is idle, else
     /// [`Error::WaitTimeout`](crate::Error::WaitTimeout), a pid launchd has
