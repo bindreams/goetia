@@ -320,11 +320,9 @@ fn shut(wake: Wake) -> u32 {
     #[cfg(test)]
     let probe = wake.probe.clone();
     WAKE.store(-1, Ordering::SeqCst);
-    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
-        #[cfg(test)]
-        probe.waited();
-        std::thread::yield_now();
-    }
+    #[cfg(test)]
+    _ = &probe;
+    // MUTANT A: no wait loop
     drop(wake);
     OPEN.store(false, Ordering::SeqCst);
     claim(ALL)
