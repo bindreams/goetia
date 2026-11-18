@@ -540,6 +540,31 @@ fn a_held_default_log_that_was_deleted_is_opened_again_for_the_next_line(#[fixtu
     assert_eq!(std::fs::read_to_string(&log).expect("the new log"), "first\nsecond\n");
 }
 
+/// A delete that waits for the last handle (the name stays until it is closed) leaves the held handle as the one
+/// thing that keeps the name. It is released before the path is opened again, so that an open that fails leaves
+/// nothing holding the name, and the install that makes the log again can.
+#[skuld::test]
+fn a_held_default_log_that_was_deleted_is_released_before_it_is_opened_again(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_DELETE_ON_CLOSE};
+
+    let log = dir.join("x.log");
+    std::fs::write(&log, "").expect("the file an install made");
+    let real = Real::default();
+    real.hold_default(&log).expect("hold the default log");
+    // Closed at once: the delete is pending on the held handle.
+    OpenOptions::new()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(&log)
+        .expect("mark the file for deletion");
+
+    real.append(&log, "lost", LogKind::Default)
+        .expect_err("nothing is there to write");
+
+    std::fs::write(&log, "").expect("the install makes the log again: the held handle keeps no name");
+}
+
 /// The same for the daemon's output: a daemon started after the recovery writes the new file.
 #[skuld::test]
 fn the_daemons_output_after_the_held_log_was_deleted_goes_to_the_new_file(#[fixture(temp_dir)] dir: &Path) {

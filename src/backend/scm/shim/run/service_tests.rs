@@ -29,7 +29,7 @@ use crate::backend::scm::shim::run::os::fake::{
     tree_kill_refused, wait_failed, wait_failed_with_code,
 };
 use crate::backend::scm::shim::run::test_support::{
-    assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
+    assert_failures, assert_one_failure, chained, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
@@ -315,10 +315,10 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     assert!(daemon.dropped());
 }
 
-/// A default log that is not there is one fault: the shim's hold of it says so, and the daemon's output open
-/// that follows fails for the same reason and says nothing more.
+/// A default log that is not there: the shim's hold of it says so, and the daemon's output open that follows
+/// fails for the same reason and says what that costs. The hold's line does not silence it.
 #[skuld::test]
-fn a_default_log_that_could_not_be_held_is_not_told_again_when_the_output_cannot_open_it() {
+fn a_default_log_that_could_not_be_held_still_has_the_outputs_open_failure_told() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new();
     fake.will_make_thread();
@@ -333,9 +333,34 @@ fn a_default_log_that_could_not_be_held_is_not_told_again_when_the_output_cannot
 
     assert!(launched.is_ok(), "the daemon still runs");
     let told = fake.take_failures();
-    assert_eq!(told.len(), 1, "{told:?}");
-    assert!(told[0].contains("hold the default log"), "{told:?}");
+    let [held, opened] = told.as_slice() else {
+        panic!("the hold's line and the open's: {told:?}");
+    };
+    assert!(held.contains("hold the default log"), "{held}");
+    assert!(opened.contains("this daemon's output will not be captured"), "{opened}");
     drop(launched);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
+/// Each start of the daemon is a launch of its own: a fault the log told in an earlier one is told again when
+/// this one meets it.
+#[skuld::test]
+fn a_daemon_start_tells_a_log_fault_that_an_earlier_start_told() {
+    let fake = FakeGuard::new();
+    fake.will_make_thread();
+    fake.will_refuse_spawn(not_found());
+    fake.will_fail_open_log(Path::new(DAEMON_LOG));
+    let supervisor = supervisor(&fake);
+    supervisor
+        .log
+        .open_failed(ID, Path::new(DAEMON_LOG), &std::io::Error::other(OPEN_LOG_FAILED));
+    assert_eq!(fake.take_failures().len(), 1, "the earlier start's line");
+
+    run_daemon(&spec(), &supervisor, || {});
+
+    let told = fake.take_failures();
+    assert_eq!(told.len(), 2, "the open's line, then the refused spawn's: {told:?}");
+    assert!(told[0].contains(OPEN_LOG_FAILED), "{told:?}");
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -1507,11 +1532,6 @@ fn a_failed_dispatcher_connection_names_the_os_reason() {
     );
 }
 
-/// A cause that has a cause: `Chain` prints `context: cause`.
-fn chained() -> std::io::Error {
-    crate::error::within("the context", std::io::Error::other("the cause"))
-}
-
 #[skuld::test]
 fn a_refused_thread_prints_the_cause_of_the_refusal() {
     let text = thread_refused(&["daemon".to_string()], &chained());
@@ -1519,16 +1539,6 @@ fn a_refused_thread_prints_the_cause_of_the_refusal() {
     assert_eq!(
         text,
         r#"make the thread that waits on ["daemon"]: the context: the cause; it was not spawned, so nothing of this daemon is running"#
-    );
-}
-
-#[skuld::test]
-fn a_log_file_that_cannot_be_opened_prints_the_cause_of_the_failure() {
-    let text = log_open_failed(Path::new("daemon.log"), &chained());
-
-    assert_eq!(
-        text,
-        "open log file daemon.log: the context: the cause (this daemon's output will not be captured; it is still being run)"
     );
 }
 

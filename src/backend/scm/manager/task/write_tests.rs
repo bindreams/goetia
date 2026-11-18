@@ -1390,6 +1390,7 @@ fn a_service_that_runs_is_not_changed_into_a_task() {
             &runs,
             |_| panic!("nothing is acquired for a retype that is refused"),
             || refuse_running(&id(), DaemonKind::Service, State::Running),
+            || panic!("nothing is looked up for a retype that is refused"),
             || panic!("the service is not removed"),
         )
         .unwrap_err();
@@ -1428,6 +1429,7 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
                 })
             },
             || Ok(()),
+            || Ok(None),
             || panic!("the service is not removed when what the task needs is missing"),
         )
         .unwrap_err();
@@ -1445,6 +1447,7 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
         &blocked,
         prepared_alice(),
         || Ok(()),
+        || Ok(None),
         || panic!("the service is not removed when its record directory cannot be made"),
     );
     assert!(refused.is_err());
@@ -1469,6 +1472,7 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
             &runs,
             prepared(process_user_sid(), None),
             || Ok(()),
+            || Ok(None),
             || {
                 assert_eq!(
                     fake.calls(),
@@ -1491,43 +1495,100 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
     fake.finish();
 }
 
-/// A service changed into a task: the service is retired first, and only then is its log made for the task's
-/// account, alone. A retirement that fails leaves the log naming the service's own account, which still runs
-/// the service; nothing is looked up for it. What the log held is not carried.
+/// A service changed into a task never leaves what is registered without its log. The service's account and the
+/// task's are named before the service is retired, and the task's alone once the task is registered: a retirement
+/// that fails leaves the service, and a registration that fails or is raced leaves the service gone and the
+/// task's account to be, and either way both accounts may append until an install that lands corrects it. What
+/// the file held is not read: an entry no install names is gone.
 #[skuld::test]
-fn a_service_changed_into_a_task_has_its_log_made_for_the_tasks_account_after_the_service_is_retired() {
+fn a_service_changed_into_a_task_that_does_not_land_leaves_both_accounts_their_log() {
+    let spec = task_spec(Some("30 3 * * *"));
+    for step in ["retire", "register", "raced"] {
+        let (dir, runs) = made_records();
+        log_with_an_entry_no_install_names(&dir);
+        let fake = Fake::new();
+        match step {
+            "register" => {
+                fake.on_register(Err(Error::os("register", std::io::Error::other("denied"))));
+            }
+            "raced" => {
+                fake.on_register(Ok(Registration::Raced));
+            }
+            _ => {}
+        }
+
+        let _ = scm(&fake).retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            prepared(users(), None),
+            || Ok(()),
+            || Ok(Some(local_service())),
+            || {
+                if step == "retire" {
+                    Err(Error::os("retire", std::io::Error::other("denied")))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        let trustees = trustees_of(&default_log(&dir));
+        assert!(
+            trustees.contains(&local_service()),
+            "{step}: the service's account keeps its log"
+        );
+        assert!(trustees.contains(&users()), "{step}: the task's account has its own");
+        assert!(
+            !trustees.contains(&process_user_sid()),
+            "{step}: an entry nothing names was carried over"
+        );
+    }
+}
+
+/// Both accounts are named when the service is retired, and the task's alone once the task is registered.
+#[skuld::test]
+fn a_service_changed_into_a_task_leaves_the_tasks_account_alone_in_the_log_once_it_is_registered() {
     let spec = task_spec(Some("30 3 * * *"));
     let (dir, runs) = made_records();
-    // The service's account, the one nothing else names.
     log_with_an_entry_no_install_names(&dir);
     let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
 
-    let failed = scm(&fake)
+    let wrote = scm(&fake)
         .retype_to_task_with(
             &spec,
             &definition(&spec),
             &runs,
             prepared(users(), None),
             || Ok(()),
-            || Err(Error::os("retire", std::io::Error::other("denied"))),
+            || Ok(Some(local_service())),
+            || {
+                let trustees = trustees_of(&default_log(&dir));
+                assert!(
+                    trustees.contains(&local_service()) && trustees.contains(&users()),
+                    "both accounts are named when the service is retired"
+                );
+                Ok(())
+            },
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
-    assert_eq!(
-        trustees_of(&default_log(&dir))
-            .iter()
-            .filter(|t| **t == process_user_sid())
-            .count(),
-        1,
-        "the service's log still names its own account"
-    );
-    assert!(
-        !trustees_of(&default_log(&dir)).contains(&users()),
-        "the task's account was named early"
-    );
+    assert!(matches!(wrote, WriteOutcome::Done), "{wrote:?}");
+    assert_names_the_task_alone(&dir);
+    fake.finish();
+}
 
+/// A service with no account to name (its account is gone, or it is not a hosted one) adds no entry: the log
+/// names the task's account alone from the start.
+#[skuld::test]
+fn a_service_with_no_account_to_name_adds_none_to_the_log() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let (dir, runs) = made_records();
+    log_with_an_entry_no_install_names(&dir);
+    let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
+
     scm(&fake)
         .retype_to_task_with(
             &spec,
@@ -1535,11 +1596,16 @@ fn a_service_changed_into_a_task_has_its_log_made_for_the_tasks_account_after_th
             &runs,
             prepared(users(), None),
             || Ok(()),
+            || Ok(None),
             || {
-                assert!(
-                    !trustees_of(&default_log(&dir)).contains(&users()),
-                    "the log is made for the task after the service is gone"
+                assert_eq!(
+                    trustees_of(&default_log(&dir))
+                        .iter()
+                        .filter(|t| **t == users())
+                        .count(),
+                    1
                 );
+                assert!(!trustees_of(&default_log(&dir)).contains(&process_user_sid()));
                 Ok(())
             },
         )
@@ -1547,6 +1613,39 @@ fn a_service_changed_into_a_task_has_its_log_made_for_the_tasks_account_after_th
 
     assert_names_the_task_alone(&dir);
     fake.finish();
+}
+
+/// The service's account is looked up before anything is retired: a lookup that fails fails the install with the
+/// service and its log as they were.
+#[skuld::test]
+fn a_service_whose_account_cannot_be_looked_up_is_not_changed_into_a_task() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let (dir, runs) = made_records();
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            prepared(users(), None),
+            || Ok(()),
+            || {
+                Err(Error::AccountLookup {
+                    detail: "no such account".to_string(),
+                    source: None,
+                })
+            },
+            || panic!("the service is not retired when its account cannot be looked up"),
+        )
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::AccountLookup { .. }), "{refused:?}");
+    assert_eq!(fake.calls(), []);
+    assert!(
+        !trustees_of(&default_log(&dir)).contains(&users()),
+        "the log was not touched"
+    );
 }
 
 /// The default log in `dir` names the task's account, and neither the service's nor an entry nothing names.

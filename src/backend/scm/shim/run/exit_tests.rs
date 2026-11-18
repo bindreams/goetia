@@ -7,7 +7,7 @@ use skuld::TempDir;
 
 use super::*;
 use crate::backend::scm::shim::run::logging::Log;
-use crate::backend::scm::shim::run::os::fake::FakeGuard;
+use crate::backend::scm::shim::run::os::fake::{ChannelCall, FAKE_LOGS, FakeGuard};
 use crate::backend::scm::shim::run::os::{Channels, LogKind, Real, Severity};
 use crate::backend::scm::shim::run::service::finish;
 
@@ -193,14 +193,28 @@ fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed
     assert!(logged.contains("report SERVICE_STOPPED to SCM: refused"), "{logged}");
 }
 
-/// The failure an end that cannot terminate the process logs goes through the log the run kept, so through the
-/// handle the run holds on its default log, not through a fresh one that opens the path.
+/// The failure an end that cannot terminate the process logs goes under the run's id, to the run's default log
+/// (through the handle the run holds on it), not under the shim's table name, whose log no install makes.
 #[skuld::test]
-fn the_end_logs_through_the_log_the_run_kept() {
+fn an_end_that_cannot_terminate_the_process_is_logged_to_the_runs_default_log() {
     let fake = FakeGuard::new();
-    let kept = fake.log();
+    let line = "goetia-shim[svc]: end the shim's process with code 7: refused";
 
-    keep_log(Arc::clone(&kept));
+    end_failure(&fake.log(), "svc", 7, &io::Error::other("refused"));
 
-    assert!(Arc::ptr_eq(&failure_log(), &kept));
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![
+            ChannelCall::Append {
+                path: Path::new(FAKE_LOGS).join("svc.log"),
+                line: line.to_string(),
+                kind: LogKind::Default,
+                ok: true,
+            },
+            ChannelCall::EventLog {
+                severity: Severity::Error,
+                line: line.to_string(),
+            },
+        ]
+    );
 }

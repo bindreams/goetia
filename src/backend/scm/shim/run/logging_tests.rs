@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard, HOLD_FAILED};
+use crate::backend::scm::shim::run::test_support::chained;
 use crate::error::Error;
 
 const LINE: &str = "goetia-shim[svc]: the line";
@@ -192,31 +193,125 @@ fn a_default_log_that_cannot_be_held_is_reported_to_the_event_log_once_and_lines
     );
 }
 
-/// One fault is told once per start, whoever meets it: a file the shim could not hold, and then could not open
-/// for the daemon's output either, is one line; so is a file the marker and the output both fail to open. Another
-/// file's fault is another line.
+/// What the shim says of a default log it could not hold is the hold's own, and promises nothing of what the
+/// opens that follow will meet.
 #[skuld::test]
-fn a_fault_in_one_file_is_told_once_whoever_meets_it() {
+fn the_hold_of_the_default_log_says_what_it_met_and_nothing_of_what_follows() {
     let fake = FakeGuard::new();
     let log = log_over(&fake);
     let default = Path::new("logs").join("svc.log");
-    let other = Path::new("elsewhere").join("daemon.log");
-    let fault = std::io::Error::other("denied");
     fake.will_fail_hold(&default);
 
     log.hold_default("svc");
-    log.open_failed("svc", &default, &fault);
+
+    assert_eq!(
+        fake.take_failures(),
+        vec![format!(
+            "goetia-shim[svc]: hold the default log {}: {HOLD_FAILED}",
+            default.display()
+        )]
+    );
+}
+
+/// A fault the shim could not hold the file for does not silence the open that fails for it: that open says
+/// what it costs (the output is not captured), which the hold's line does not.
+#[skuld::test]
+fn a_default_log_that_could_not_be_held_does_not_silence_the_open_that_fails_too() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+    log.open_failed("svc", &default, &std::io::Error::other("denied"));
+
+    let told = fake.take_failures();
+    let [held, opened] = told.as_slice() else {
+        panic!("the hold's line and the open's: {told:?}");
+    };
+    assert!(held.contains("hold the default log"), "{held}");
+    assert!(opened.contains("this daemon's output will not be captured"), "{opened}");
+}
+
+/// One fault is told once in a launch, whoever meets it: the marker's open and the output's open of one file,
+/// failing alike, are one line. Another file's fault is another line.
+#[skuld::test]
+fn a_fault_in_one_file_is_told_once_in_a_launch_whoever_meets_it() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("elsewhere").join("daemon.log");
+    let other = Path::new("elsewhere").join("other.log");
+    let fault = std::io::Error::other("denied");
+
+    log.marker_open_failed("svc", &daemon, &fault);
+    log.open_failed("svc", &daemon, &fault);
     log.open_failed("svc", &other, &fault);
     log.open_failed("svc", &other, &fault);
 
     let told = fake.take_failures();
-    let [held, opened] = told.as_slice() else {
+    let [marker, output] = told.as_slice() else {
         panic!("one line for each of the two files: {told:?}");
     };
-    assert!(held.contains("hold the default log"), "{held}");
-    assert!(
-        opened.starts_with(&format!("goetia-shim[svc]: open log file {}: denied", other.display())),
-        "{opened}"
+    assert!(marker.contains(&daemon.display().to_string()), "{marker}");
+    assert!(output.contains(&other.display().to_string()), "{output}");
+}
+
+/// A different fault in the same file is another fact, told in its own right.
+#[skuld::test]
+fn a_fault_of_another_kind_in_the_same_file_is_told_too() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("elsewhere").join("daemon.log");
+
+    log.open_failed("svc", &daemon, &std::io::Error::from(std::io::ErrorKind::NotFound));
+    log.open_failed(
+        "svc",
+        &daemon,
+        &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    );
+
+    assert_eq!(fake.take_failures().len(), 2);
+}
+
+/// A shim that starts its daemon again (one launch after another) tells a later open failure of the same file:
+/// the fault told in the first is no one's knowledge of the second.
+#[skuld::test]
+fn a_fault_in_a_file_is_told_again_in_the_next_launch() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("elsewhere").join("daemon.log");
+    let fault = std::io::Error::other("denied");
+
+    log.open_failed("svc", &daemon, &fault);
+    log.begin_launch();
+    log.open_failed("svc", &daemon, &fault);
+
+    assert_eq!(fake.take_failures().len(), 2);
+}
+
+/// The marker says what its own failure costs: the run cannot be found in the log. It does not say the output
+/// is not captured, which the marker's open does not know.
+#[skuld::test]
+fn the_markers_failed_open_says_the_marker_could_not_be_written() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+
+    log.marker_open_failed("svc", Path::new("daemon.log"), &chained());
+
+    assert_eq!(
+        fake.take_failures(),
+        vec![
+            "goetia-shim[svc]: open log file daemon.log: the context: the cause (the run marker could not be written; the program is still run)"
+                .to_string()
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_log_file_that_cannot_be_opened_prints_the_cause_of_the_failure() {
+    assert_eq!(
+        log_open_failed(Path::new("daemon.log"), &chained()),
+        "open log file daemon.log: the context: the cause (this daemon's output will not be captured; it is still being run)"
     );
 }
 
