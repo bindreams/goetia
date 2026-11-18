@@ -318,23 +318,6 @@ fn measure(texts: &[&str], ends: &[DateTime]) -> String {
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn measure_group0(#[fixture(scm_group)] _group: &Group) {
-    let texts: Vec<&str> = FIRING_SCHEDULES[0].iter().copied().filter(|t| !["* * * * *", "*/7 * * * *"].contains(t)).collect();
-    panic!("{}", measure(&texts, &[end_of_two_years()]));
-}
-
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn measure_group1(#[fixture(scm_group)] _group: &Group) {
-    panic!("{}", measure(FIRING_SCHEDULES[1], &[end_of_two_years()]));
-}
-
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn measure_heavy_every_minute(#[fixture(scm_group)] _group: &Group) {
-    let ends = [end_of_january(), civil::date(2027, 3, 31).at(23, 59, 0, 0), civil::date(2027, 6, 30).at(23, 59, 0, 0), civil::date(2027, 12, 31).at(23, 59, 0, 0)];
-    panic!("{}", measure(&["* * * * *"], &ends));
-}
-
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn measure_heavy_every_seven(#[fixture(scm_group)] _group: &Group) {
     let ends = [end_of_january(), civil::date(2027, 3, 31).at(23, 59, 0, 0), civil::date(2027, 6, 30).at(23, 59, 0, 0), civil::date(2027, 12, 31).at(23, 59, 0, 0), end_of_two_years()];
     panic!("{}", measure(&["*/7 * * * *"], &ends));
