@@ -144,13 +144,17 @@ fn end_of_two_years() -> DateTime {
 }
 
 /// The end of January 2027, the range of a schedule with more than [`MANY_RUN_TIMES`] run times in two
-/// years: `GetRunTimes` of the many triggers of such a task took over 300 s for the two years.
+/// years.
 fn end_of_january() -> DateTime {
     civil::date(2027, 1, 31).at(23, 59, 0, 0)
 }
 
-/// More run times in the two years than this, and a schedule is checked over January 2027 only.
-const MANY_RUN_TIMES: usize = 10_000;
+/// More run times in the two years than this, and a schedule is checked over January 2027 only. Measured
+/// on CI's Windows runner, `GetRunTimes` grows with the square of the run times it returns: 4.6 s for 39,000,
+/// 20 s for 79,000, 83 s for 158,000 (`*/7 * * * *`) and 134 to 152 s for 261,000, which is 6 months of
+/// `* * * * *` (two years is about an hour). The nextest `ci` profile kills a test after 300 s. No other
+/// schedule checked has more than 42,000 run times (5 s); only `* * * * *` and `*/7 * * * *` are over this.
+const MANY_RUN_TIMES: usize = 100_000;
 
 /// Whether the cron names `minute`.
 fn cron_names(schedule: &Schedule, minute: DateTime) -> bool {
@@ -275,50 +279,4 @@ fn a_refused_schedule_writes_nothing(#[fixture(scm_group)] _group: &Group) {
             "`{text}`: {absent:?}"
         );
     }
-}
-
-// MEASUREMENT (temporary) ==============================================================================================
-
-fn measure(texts: &[&str], ends: &[DateTime]) -> String {
-    let mgr = support::stock_shim_manager();
-    let zone = TimeZone::system();
-    let first = civil::date(2027, 1, 1).at(0, 0, 0, 0);
-    let instant = |at: DateTime| SystemTime::from(at.to_zoned(zone.clone()).expect("zone").timestamp());
-    let mut report = String::new();
-    for text in texts {
-        let guard = TaskGuard::new();
-        let id = &guard.id;
-        let seed = HashSeed { hostname: "testing", id };
-        let schedule = Schedule::parse(text, &seed).unwrap();
-        let t0 = std::time::Instant::now();
-        mgr.install(&task_as(id, User::Root, Some(text)), false).unwrap();
-        let install = t0.elapsed();
-        for &end in ends {
-            let mut named = 0usize;
-            let mut minute = first;
-            while minute <= end {
-                named += usize::from(cron_names(&schedule, minute));
-                minute += 1.minute();
-            }
-            let t = std::time::Instant::now();
-            let times = task_run_times(id, instant(first - 1.minute()), instant(end)).unwrap();
-            let line = format!(
-                "MEASURE `{text}` to {end}: named {named}, scheduler {}, GetRunTimes {:.1}s, install {:.1}s
-",
-                times.len(),
-                t.elapsed().as_secs_f64(),
-                install.as_secs_f64()
-            );
-            eprintln!("{line}");
-            report.push_str(&line);
-        }
-        mgr.uninstall(id).expect("uninstall");
-    }
-    report
-}
-
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn measure_heavy_every_seven(#[fixture(scm_group)] _group: &Group) {
-    let ends = [end_of_january(), civil::date(2027, 3, 31).at(23, 59, 0, 0), civil::date(2027, 6, 30).at(23, 59, 0, 0), civil::date(2027, 12, 31).at(23, 59, 0, 0), end_of_two_years()];
-    panic!("{}", measure(&["*/7 * * * *"], &ends));
 }
