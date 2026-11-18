@@ -608,6 +608,101 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
 }
 
+/// A start judged without its blob says so in the words it always did, for each vocabulary it was
+/// judged by, and the blob's own failure is one the one search reaches.
+#[skuld::test]
+fn a_failed_start_judged_without_its_blob_says_so_and_the_blob_is_searched() {
+    use crate::error::error_tests::finds_error;
+
+    let id = Id::try_from("frpc").unwrap();
+    let start_failed = || {
+        Error::os(
+            "start `frpc`",
+            std::io::Error::other("service stopped before reaching Running"),
+        )
+    };
+    let tail = ": failed to start `frpc`: service stopped before reaching Running";
+
+    for (protocol, words) in [
+        (
+            Protocol::Native,
+            "its spec blob could not be read, so the start was judged as a `protocol: native` service's",
+        ),
+        (
+            Protocol::Plain,
+            "`frpc`'s spec blob could not be read, so the start was judged as a goetia shim's, by the registered image",
+        ),
+    ] {
+        let said = failed_start(
+            &id,
+            start_failed(),
+            protocol,
+            Some(Arc::new(Error::blob("invalid blob JSON: EOF"))),
+        )
+        .report()
+        .to_string();
+        assert_eq!(
+            said,
+            format!("{words} (blob: invalid blob JSON: EOF){tail}"),
+            "{protocol:?}"
+        );
+
+        let failed = failed_start(
+            &id,
+            start_failed(),
+            protocol,
+            Some(Arc::new(Error::blob("undecodable"))),
+        );
+        assert!(
+            finds_error(
+                &failed,
+                |e| matches!(e, Error::Blob { message, .. } if message == "undecodable")
+            ),
+            "{protocol:?}: the blob's failure is found: {failed:?}"
+        );
+    }
+}
+
+/// A wait for the process that failed after goetia's attempt to end it had failed too says both, and
+/// only the wait is the failure's cause: the terminate is mentioned, as in a wait that timed out.
+#[skuld::test]
+fn a_failed_process_wait_after_a_failed_terminate_says_both_and_only_the_wait_is_a_cause() {
+    use crate::error::error_tests::finds_os_code;
+
+    let id = Id::try_from("frpc").unwrap();
+    let failure = |wait: std::io::Error, terminate: std::io::Error| ProcessWaitFailure {
+        wait_failed: wait,
+        terminate_failed: Some(Arc::new(terminate)),
+    };
+
+    let said = process_wait_failed(
+        &id,
+        "stop `frpc`".to_string(),
+        failure(
+            std::io::Error::other("wait denied"),
+            std::io::Error::other("terminate denied"),
+        ),
+    )
+    .report()
+    .to_string();
+    assert_eq!(
+        said,
+        "`frpc` is stopped, but goetia could not tell that its process exited, and terminating it failed: terminate denied. The wait for it failed: failed to stop `frpc`: wait denied"
+    );
+
+    let error = process_wait_failed(
+        &id,
+        "stop `frpc`".to_string(),
+        failure(
+            std::io::Error::from_raw_os_error(5),
+            std::io::Error::from_raw_os_error(6),
+        ),
+    );
+    assert!(finds_os_code(&error, 5), "{error:?}");
+    assert!(!finds_os_code(&error, 6), "{error:?}");
+    assert_eq!(error.raw_os_error(), Some(5), "{error:?}");
+}
+
 /// A blob that says `restart: always` decodes, and a `protocol: plain` one starts by the shim's vocabulary like
 /// any other.
 #[skuld::test]
@@ -997,6 +1092,30 @@ fn a_stop_error_says_when_the_process_could_not_be_waited_for() {
         "{said}"
     );
     assert!(said.contains("goetia stopped waiting"), "{said}");
+}
+
+/// The words of a `stop` whose process could not be opened, and the failure to open it, which is a
+/// cause the one search reaches.
+#[skuld::test]
+fn a_stop_that_could_not_open_its_process_says_so_and_the_open_failure_is_searched() {
+    use crate::error::error_tests::finds_os_code;
+
+    let id = Id::try_from("frpc").unwrap();
+    let timeout = || budget::timed_out("frpc", "stopped", Budget::Bounded(std::time::Duration::from_secs(1)));
+
+    let said = unwaited(&id, std::io::Error::other("access denied"), timeout())
+        .report()
+        .to_string();
+    assert_eq!(
+        said,
+        format!(
+            "goetia could not open `frpc`'s process (access denied), so it could not wait for the process to exit: {}",
+            timeout().report()
+        )
+    );
+
+    let error = unwaited(&id, std::io::Error::from_raw_os_error(5), timeout());
+    assert!(finds_os_code(&error, 5), "{error:?}");
 }
 
 /// Every refusal `render_for_install` makes comes before the lock is taken and before the provider

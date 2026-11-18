@@ -284,6 +284,20 @@ pub(crate) fn os(what: &str, path: &str, cause: &str) -> Error {
     }
 }
 
+/// Whether [`find`](crate::error::find) reaches an [`io::Error`](std::io::Error) of OS code `code` in `e`.
+pub(crate) fn finds_os_code(e: &(dyn std::error::Error + 'static), code: i32) -> bool {
+    crate::error::find(e, &|e| {
+        e.downcast_ref::<std::io::Error>()
+            .filter(|io| io.raw_os_error() == Some(code))
+    })
+    .is_some()
+}
+
+/// Whether [`find`](crate::error::find) reaches a goetia error that satisfies `is` in `e`.
+pub(crate) fn finds_error(e: &(dyn std::error::Error + 'static), is: impl Fn(&Error) -> bool) -> bool {
+    crate::error::find(e, &|e| e.downcast_ref::<Error>().filter(|e| is(e))).is_some()
+}
+
 pub(crate) fn not_installed() -> Error {
     Error::NotInstalled { id: "x".to_string() }
 }

@@ -470,6 +470,31 @@ fn wait_decodes_each_exit() {
     }
 }
 
+/// An exit entry that does not say how the run ended is an unrecorded exit that says what the entry
+/// lacked in the words it always did, and the failure to read the entry is the error's cause, which the
+/// one search reaches. A unit that failed with no exit has no such cause.
+#[skuld::test]
+fn an_exit_entry_that_cannot_be_read_is_an_unrecorded_exit_with_that_failure_as_its_cause() {
+    let read = |entries| begun(&running(entries)).wait().expect_err("no exit was established");
+    let lacking =
+        |e: &Error| crate::error::error_tests::finds_error(e, |e| matches!(e, Error::IncompleteAnswer { .. }));
+
+    let unreadable = read(vec![main_exited("inv", "exited", "x")]);
+    assert!(matches!(unreadable, Error::RunUnrecorded { .. }), "{unreadable:?}");
+    assert!(lacking(&unreadable), "{unreadable:?}");
+    assert_eq!(
+        unreadable.report().to_string(),
+        "the run of `x` ended without recording its exit status: `journalctl` answered without an exit status, so goetia cannot tell its live state"
+    );
+
+    let failed = read(vec![failed_with("inv", "resources")]);
+    assert!(!lacking(&failed), "{failed:?}");
+    assert_eq!(
+        failed.report().to_string(),
+        "the run of `x` ended without recording its exit status: systemd failed the unit as `resources` and recorded no exit for the run"
+    );
+}
+
 /// "Failed with result": the unit failed.
 fn failed_with(invocation: &str, result: &str) -> Entry {
     Entry::of(&[

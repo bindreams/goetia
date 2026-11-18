@@ -1427,6 +1427,49 @@ fn a_wait_error_and_a_stream_error_are_both_reported_and_an_open_outcome_stays_o
     }
 }
 
+/// An `out` that refuses every write with the OS error `code`.
+struct RefusesWith(i32);
+
+impl std::io::Write for RefusesWith {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(self.0))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An open outcome stays open when the output failed too, and the output's failure is said once, in the
+/// words it always was, as one the one search reaches. The wait is the failure's source.
+#[skuld::test]
+fn the_output_that_also_failed_is_a_cause_found_beside_an_open_wait() {
+    use crate::error::error_tests::finds_os_code;
+
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_wait_fails("nightly", || Error::RequestInDoubt {
+        request: "systemctl start nightly.service".to_string(),
+        reached: true,
+        note: None,
+        source: Box::new(std::io::Error::from_raw_os_error(5)),
+    });
+
+    let e = fake
+        .run(&Id::try_from("nightly").unwrap(), &mut RefusesWith(7))
+        .expect_err("neither the exit nor the output");
+
+    assert!(e.is_indeterminate(), "{e:?}");
+    assert!(finds_os_code(&e, 5), "the wait's cause: {e:?}");
+    assert!(finds_os_code(&e, 7), "the output's cause: {e:?}");
+    let report = e.report().to_string();
+    assert!(
+        report.starts_with("goetia could not show the output of `nightly` either: "),
+        "{report}"
+    );
+    assert_eq!(report.matches("(os error 7)").count(), 1, "{report}");
+}
+
 #[skuld::test]
 fn a_stream_error_after_a_good_wait_names_the_exit() {
     let fake = Fake::new();

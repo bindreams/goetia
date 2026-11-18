@@ -3362,6 +3362,75 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
     );
 }
 
+/// The words of an incomplete stop that ended the held process, as `end` left it, and the errors in
+/// them: a failed wait is a cause the one search reaches, a failed terminate is only mentioned.
+#[skuld::test]
+fn an_incomplete_stops_held_process_is_told_in_words_and_its_errors_are_searched() {
+    use crate::error::Error;
+    use crate::error::error_tests::finds_os_code;
+
+    let ran = |terminate: io::Result<()>, exit: io::Result<Waited>| {
+        let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
+        stop_and_await_exit(
+            &mut fake,
+            spent(),
+            &mut HoldOutcome::Held(7u32),
+            true,
+            ending(|_| terminate, |_, _, _| exit),
+        )
+        .unwrap_err()
+    };
+    let plain = ran(Ok(()), Ok(Waited::Confirmed)).to_string();
+    let held = format!("{plain}; goetia held the shim's process to end it, and ");
+
+    let lingers = ran(Ok(()), Ok(Waited::Expired));
+    assert_eq!(
+        lingers.to_string(),
+        format!("{held}it had not exited when the wait for it ended")
+    );
+    let refused = ran(Err(io::Error::other("denied")), Ok(Waited::Expired));
+    assert_eq!(
+        refused.to_string(),
+        format!("{held}it had not exited when the wait for it ended, and terminating it failed: denied")
+    );
+    let failed = ran(Ok(()), Err(io::Error::other("wait failed")));
+    assert_eq!(
+        failed.to_string(),
+        format!("{held}waiting for it to exit failed: wait failed")
+    );
+    let both = ran(Err(io::Error::other("denied")), Err(io::Error::other("wait failed")));
+    assert_eq!(
+        both.to_string(),
+        format!("{held}waiting for it to exit failed: wait failed, and terminating it failed: denied")
+    );
+
+    let reported = Error::os("stop `frpc`", both).report().to_string();
+    assert_eq!(
+        reported,
+        format!(
+            "failed to stop `frpc`: {held}waiting for it to exit failed: wait failed, and terminating it failed: denied"
+        )
+    );
+
+    let coded = Error::os(
+        "stop `frpc`",
+        ran(
+            Err(io::Error::from_raw_os_error(32)),
+            Err(io::Error::from_raw_os_error(31)),
+        ),
+    );
+    assert!(finds_os_code(&coded, 31), "the failed wait is a cause: {coded:?}");
+    assert!(
+        !finds_os_code(&coded, 32),
+        "the failed terminate is only mentioned: {coded:?}"
+    );
+    let lingered = Error::os(
+        "stop `frpc`",
+        ran(Err(io::Error::from_raw_os_error(32)), Ok(Waited::Expired)),
+    );
+    assert!(!finds_os_code(&lingered, 32), "{lingered:?}");
+}
+
 // the process held across an incomplete stop --------------------------------------------------------------------------
 
 /// The process `end_on_incomplete_stop` ended, with what `held` was left as.
