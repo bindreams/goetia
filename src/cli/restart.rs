@@ -80,10 +80,9 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, given: Option<Budget>) -> Result<(
 fn restart_until(mgr: &dyn ServiceManager, id: &Id, given: Option<(Budget, Deadline)>) -> Result<()> {
     let named = given.map(|(budget, _)| budget);
     // Before either leg sends anything, so that nothing either leg needs can
-    // run out between the stop and the start and leave the daemon stopped. A reservation is made for one
-    // budget for both legs, and the stop leg's own wait is read from the snapshot only when it is issued
-    // (`ServiceManager::stop` with `None`), after this: a daemon whose stop waits without bound is reserved
-    // for a bounded one, one stop listener set it does not use.
+    // run out between the stop and the start and leave the daemon stopped. With no budget given it
+    // reserves for a bounded stop, so a daemon whose stop waits without bound (`timeout: null`) holds two
+    // listener threads it does not use.
     let mut sequence = mgr.prepare(&[Step::Stop, Step::Start], named.unwrap_or(Budget::DEFAULT))?;
     if named.is_some_and(|named| !named.waits()) {
         // One request where the manager has one; a refusal changed nothing, so

@@ -28,7 +28,9 @@ pub struct WaitArgs {
     /// some starts and installs also wait for launchd to remove a job; see the
     /// README. Write a compound duration unspaced (`2m30s`), or quote it as
     /// one argument: every verb taking this flag also takes a variadic id
-    /// list, so `--timeout 2m 30s` passes `2m` here and `30s` as a daemon id.
+    /// list, so `--timeout 2m 30s` passes `2m` here and `30s` as a daemon id. A `stop` or `restart` with no
+    /// flag needs the daemon's stop action for its wait, so it fails on a definition goetia cannot read:
+    /// `--timeout` or `--no-timeout` runs it anyway.
     #[arg(long, value_name = "DURATION", value_parser = parse_timeout)]
     pub timeout: Option<Duration>,
     /// Wait indefinitely instead of giving up at a bound.

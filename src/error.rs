@@ -1052,6 +1052,12 @@ impl Error {
         report::write_report(self, out)
     }
 
+    /// The error a snapshot kept, handed out again: what each verb that reads a blob that will not
+    /// decode returns for it.
+    pub(crate) fn kept(kept: &Arc<Error>) -> Error {
+        Error::Kept(Arc::clone(kept))
+    }
+
     /// This error, or the error it hands out if it is a [`Kept`](Error::Kept) one.
     pub(crate) fn unkept(&self) -> &Error {
         match self {

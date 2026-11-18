@@ -1304,9 +1304,9 @@ fn a_stop_under_immediate_waits_for_the_job_to_be_gone(#[fixture(launchd_group)]
     );
 }
 
-/// `stop(id, None)` waits for the daemon's own stop: its `timeout` plus the teardown margin, here 12 s of
-/// grace for a job that ignores SIGTERM and so 22 s, where [`Budget::DEFAULT`] would give up at 10 s with the
-/// job still there.
+/// `stop(id, None)` waits longer than [`Budget::DEFAULT`]: the job ignores SIGTERM and launchd kills it only
+/// after its 12 s of grace, so a stop that waited 10 s would give up with the job still there. That the wait
+/// is the stop action's `timeout` plus the teardown margin (22 s) is pinned by the `stop_budget` unit tests.
 #[skuld::test]
 fn a_stop_that_names_no_budget_waits_for_the_daemons_own_stop(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();

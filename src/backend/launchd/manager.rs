@@ -393,7 +393,7 @@ impl Plist {
     /// act on a job's file return: its blob is that error.
     fn job(&self) -> Result<&Artifact> {
         self.job.as_ref().ok_or_else(|| match &self.blob {
-            Err(e) => Error::Kept(Arc::clone(e)),
+            Err(e) => Error::kept(e),
             Ok(_) => Error::blob("the job's plist is missing"),
         })
     }
