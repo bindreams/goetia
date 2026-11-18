@@ -142,7 +142,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Chain, Error, Reason, Result, terminating_failed};
+use crate::error::{Error, Reason, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
@@ -990,18 +990,12 @@ fn start_kind(answer: &ShimAnswer) -> (Protocol, Option<Arc<Error>>) {
 /// the start was judged without it, as `kind` says, and the error says why: neither is what a service
 /// whose blob reads would have been told.
 fn failed_start(id: &Id, failed: Error, kind: Protocol, unreadable: Option<Arc<Error>>) -> Error {
-    match (kind, unreadable) {
-        (_, None) => failed,
-        (Protocol::Native, Some(blob)) => Error::StartAsManaged {
+    match unreadable {
+        None => failed,
+        Some(blob) => Error::StartJudgedWithoutBlob {
+            id: id.to_string(),
+            judged_as: kind,
             blob,
-            source: Box::new(failed),
-        },
-        (Protocol::Plain, Some(blob)) => Error::Step {
-            what: format!(
-                "`{id}`'s spec blob could not be read, so the start was judged as a goetia shim's, by the \
-                 registered image ({})",
-                Chain(&*blob)
-            ),
             source: Box::new(failed),
         },
     }
@@ -1708,7 +1702,7 @@ fn end_held(
 
 /// The error of a wait for `id`'s process to exit that failed: `what` failed with the wait's own error,
 /// its OS code intact. When goetia's attempt to end the process had failed too, the error leads with
-/// that, worded as every report of a failed terminate words it (see [`terminating_failed`]).
+/// that ([`Error::ProcessExitUnconfirmed`]).
 fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Error {
     let ProcessWaitFailure {
         wait_failed,
@@ -1718,13 +1712,9 @@ fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Er
     let Some(terminate_failed) = terminate_failed else {
         return error;
     };
-    Error::Step {
-        what: terminating_failed(
-            format!("`{id}` is stopped, but goetia could not tell that its process exited"),
-            Some(&*terminate_failed),
-            ". The wait for it failed",
-        )
-        .to_string(),
+    Error::ProcessExitUnconfirmed {
+        id: id.to_string(),
+        terminate_failed,
         source: Box::new(error),
     }
 }
@@ -1732,11 +1722,9 @@ fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Er
 /// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not open, for
 /// `reason`: led by what that left undone, with the class of `error`.
 fn unwaited(id: &Id, reason: std::io::Error, error: Error) -> Error {
-    Error::Step {
-        what: format!(
-            "goetia could not open `{id}`'s process ({}), so it could not wait for the process to exit",
-            Chain(&reason)
-        ),
+    Error::ProcessNotOpened {
+        id: id.to_string(),
+        open_failed: reason,
         source: Box::new(error),
     }
 }

@@ -196,6 +196,7 @@ fn unrecorded(id: &Id, reason: String) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
         reason,
+        source: None,
     }
 }
 

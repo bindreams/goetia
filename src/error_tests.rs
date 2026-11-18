@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::error::Error as _;
+
 use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
 use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
 use crate::spec::DaemonKind;
@@ -61,6 +63,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::RunUnrecorded {
             id: id(),
             reason: String::new(),
+            source: None,
         },
     ];
     for e in &in_doubt {
@@ -127,7 +130,9 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             detail: String::new(),
             source: None,
         },
-        Error::StartAsManaged {
+        Error::StartJudgedWithoutBlob {
+            id: "x".to_string(),
+            judged_as: crate::spec::Protocol::Native,
             blob: Arc::new(Error::blob(String::new())),
             source: Box::new(not_installed()),
         },
@@ -221,13 +226,89 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
 }
 
 #[skuld::test]
-fn a_start_judged_as_managed_is_indeterminate_when_the_failed_start_is() {
-    let over = |source: Error| Error::StartAsManaged {
+fn a_start_judged_without_its_blob_is_indeterminate_when_the_failed_start_is() {
+    let over = |source: Error| Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob(String::new())),
         source: Box::new(source),
     };
     assert!(over(in_doubt()).is_indeterminate());
     assert!(!over(not_installed()).is_indeterminate());
+}
+
+/// The variants that set an error inside their words and wrap another are wrappers: classification and
+/// `cause` read through them as through a `Step`, and `map_cause` keeps them around the result.
+#[skuld::test]
+fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is() {
+    let wrappers: [(&str, fn(Error) -> Error); 4] = [
+        ("StartJudgedWithoutBlob", |source| Error::StartJudgedWithoutBlob {
+            id: "x".to_string(),
+            judged_as: crate::spec::Protocol::Plain,
+            blob: Arc::new(Error::blob("b")),
+            source: Box::new(source),
+        }),
+        ("ProcessExitUnconfirmed", |source| Error::ProcessExitUnconfirmed {
+            id: "x".to_string(),
+            terminate_failed: Arc::new(std::io::Error::other("t")),
+            source: Box::new(source),
+        }),
+        ("ProcessNotOpened", |source| Error::ProcessNotOpened {
+            id: "x".to_string(),
+            open_failed: std::io::Error::other("o"),
+            source: Box::new(source),
+        }),
+        ("OutputAlsoFailed", |source| Error::OutputAlsoFailed {
+            id: "x".to_string(),
+            shown: Box::new(Error::blob("s")),
+            source: Box::new(source),
+        }),
+    ];
+    for (name, over) in wrappers {
+        assert!(over(in_doubt()).is_indeterminate(), "{name}");
+        assert!(!over(not_installed()).is_indeterminate(), "{name}");
+        assert!(
+            matches!(over(not_installed()).cause(), Error::NotInstalled { .. }),
+            "{name}"
+        );
+        let mapped = over(not_installed()).map_cause(|_| in_doubt());
+        assert!(
+            mapped.is_indeterminate(),
+            "{name}: the wrapper stays around the mapped cause"
+        );
+        assert!(mapped.source().is_some(), "{name}");
+    }
+}
+
+/// A run that ended without a recorded exit says why in `reason`, and a failed read of the record is its
+/// `source`: nothing to say beside it is no reason.
+#[skuld::test]
+fn an_unrecorded_run_says_its_reason_and_returns_the_failed_read_as_its_source() {
+    let said = Error::RunUnrecorded {
+        id: "x".to_string(),
+        reason: "why".to_string(),
+        source: None,
+    };
+    assert_eq!(
+        said.to_string(),
+        "the run of `x` ended without recording its exit status: why"
+    );
+    assert!(said.source().is_none());
+
+    let read = Error::RunUnrecorded {
+        id: "x".to_string(),
+        reason: String::new(),
+        source: Some(Box::new(Error::blob("unreadable"))),
+    };
+    assert_eq!(
+        read.to_string(),
+        "the run of `x` ended without recording its exit status"
+    );
+    assert_eq!(
+        read.report().to_string(),
+        "the run of `x` ended without recording its exit status: blob: unreadable"
+    );
+    assert!(read.is_indeterminate());
 }
 
 #[skuld::test]
@@ -455,7 +536,9 @@ fn step(what: &str, source: Error) -> Error {
 }
 
 fn start_as_managed(source: Error) -> Error {
-    Error::StartAsManaged {
+    Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob("corrupt")),
         source: Box::new(source),
     }
@@ -1164,7 +1247,9 @@ fn report_of_an_account_lookup_ends_in_its_cause_when_it_has_one() {
 
 #[skuld::test]
 fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_failure() {
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob("invalid blob JSON: EOF".to_string())),
         source: Box::new(os("start", "/p", "stopped")),
     };
@@ -1204,7 +1289,9 @@ fn a_failed_read_of_the_installed_host_is_found_under_every_wrapper_and_only_the
         what: "regenerate".to_string(),
         source: Box::new(source),
     };
-    let start = |source: Error| Error::StartAsManaged {
+    let start = |source: Error| Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob(String::new())),
         source: Box::new(source),
     };
@@ -1274,7 +1361,9 @@ fn the_os_error_of_an_embedded_error_is_found() {
         read_failed: Box::new(os_code(8)),
         restore_failed: None,
     };
-    let blob_unreadable = Error::StartAsManaged {
+    let blob_unreadable = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(os_code(9)),
         source: Box::new(not_installed()),
     };
@@ -1336,7 +1425,9 @@ fn the_os_error_inside_any_payload_of_an_io_error_is_found() {
 /// embeds as causes.
 #[skuld::test]
 fn the_os_error_of_a_source_is_found_before_that_of_an_embedded_error() {
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(os_code(9)),
         source: Box::new(os_code(10)),
     };
@@ -1446,6 +1537,7 @@ fn error_messages_and_exit_class() {
             Error::RunUnrecorded {
                 id: id(),
                 reason: "the journal has no exit".to_string(),
+                source: None,
             },
             "the run of `nightly` ended without recording its exit status: the journal has no exit",
             true,

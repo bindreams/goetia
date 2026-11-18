@@ -29,7 +29,9 @@ fn an_embedded_errors_remedy_prints_last_not_inside_the_sentence() {
             read_failed: Box::new(undetermined("re-run as root")),
             restore_failed: Some(Box::new(os("write", "/q", "disk full"))),
         },
-        Error::StartAsManaged {
+        Error::StartJudgedWithoutBlob {
+            id: "x".to_string(),
+            judged_as: crate::spec::Protocol::Native,
             blob: Arc::new(undetermined("re-run as root")),
             source: Box::new(os("start", "/q", "stopped")),
         },
@@ -46,7 +48,9 @@ fn an_embedded_errors_remedy_prints_last_not_inside_the_sentence() {
 
 #[skuld::test]
 fn a_remedy_met_both_embedded_and_down_the_chain_prints_once() {
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(undetermined("re-run as root")),
         source: Box::new(undetermined("re-run as root")),
     };
@@ -236,7 +240,9 @@ fn a_reason_wrapping_a_command_error_prints_its_stderr_as_the_report_does() {
 #[skuld::test]
 fn an_embedded_errors_stderr_keeps_its_layout() {
     let status = exit_status(1);
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(command("a\nerror: forged")),
         source: Box::new(os("start", "/q", "stopped")),
     };
@@ -268,7 +274,9 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
 #[skuld::test]
 fn display_of_a_sentence_variant_leaves_out_the_embedded_errors_stderr() {
     let status = exit_status(1);
-    let blob = Error::StartAsManaged {
+    let blob = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(command("secret\ndiagnostic")),
         source: Box::new(os("start", "/q", "stopped")),
     };
@@ -309,7 +317,9 @@ fn a_kept_both_prints_both_halves_and_its_remedies() {
 /// error's stderr, which only the report writes.
 #[skuld::test]
 fn display_of_a_sentence_variant_and_its_report_agree_on_the_words() {
-    let blob = Error::StartAsManaged {
+    let blob = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(os("read", "/p", "denied")),
         source: Box::new(os("start", "/q", "stopped")),
     };
@@ -387,7 +397,9 @@ fn a_standard_printer_shows_each_failure_of_a_composite_once() {
         "and then",
         std::io::Error::other("second failure"),
     );
-    let blob = Error::StartAsManaged {
+    let blob = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob_from("unreadable", std::io::Error::other("blob failure"))),
         source: Box::new(os("start", "/s", "start failure")),
     };
@@ -429,7 +441,9 @@ fn a_boths_display_is_its_two_halves() {
 /// sentence first.
 #[skuld::test]
 fn a_sentence_with_a_source_prints_the_sentence_then_the_source() {
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(os("read", "/p", "blob failure")),
         source: Box::new(os("start", "/q", "start failure")),
     };

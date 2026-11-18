@@ -68,7 +68,9 @@ pub enum Error {
         source: BoxError,
     },
 
-    /// A goetia operation failed because a step under it did.
+    /// A goetia operation failed because a step under it did. `what` is words only: it holds no error.
+    /// Words that set an error inside them are a variant of their own, whose shape [`Error::pieces`]
+    /// states, so that the printer and the search reach the error.
     #[error("{what}")]
     Step {
         what: String,
@@ -576,8 +578,19 @@ pub enum Error {
     /// where goetia reads it, the manager failed it with no exit recorded, or its launch ended before goetia
     /// could follow it (launchd). Exit `4` (indeterminate): the run may have happened, so repeating `run`
     /// may repeat it.
-    #[error("the run of `{id}` ended without recording its exit status: {reason}")]
-    RunUnrecorded { id: String, reason: String },
+    ///
+    /// `reason` says why, and is empty when `source`, the failed read of what the manager recorded,
+    /// is all there is to say.
+    #[error(
+        "the run of `{id}` ended without recording its exit status{}",
+        unrecorded_reason(reason)
+    )]
+    RunUnrecorded {
+        id: String,
+        reason: String,
+        #[source]
+        source: Option<Box<Error>>,
+    },
 
     /// Steps goetia issued whose outcome nobody established. Produced only
     /// by `cli::restart` under a budget that does not wait, on a manager with
@@ -718,12 +731,46 @@ pub enum Error {
         source: Option<BoxError>,
     },
 
-    /// A `start` was judged as a `protocol: native` service's, because the service's spec blob could not
-    /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
+    /// A `start` of `id` was judged as a service of protocol `judged_as`, without its spec blob, which
+    /// could not be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
-    #[error("{}", start_as_managed_message(blob))]
-    StartAsManaged {
+    #[error("{}", start_judged_without_blob_message(id, *judged_as, blob))]
+    StartJudgedWithoutBlob {
+        id: String,
+        judged_as: crate::spec::Protocol,
         blob: Arc<Error>,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// A `stop` of `id` whose wait for the process failed, `source`, when goetia's attempt to end the
+    /// process had failed too: `terminate_failed`, which the message only mentions. The service is
+    /// stopped, and whether its process exited is not established. The error has the wait's class.
+    #[error("{}", process_exit_unconfirmed_message(id, terminate_failed))]
+    ProcessExitUnconfirmed {
+        id: String,
+        terminate_failed: Arc<std::io::Error>,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// A `stop` of `id` that could not wait for the service's process, because goetia could not open
+    /// it: `open_failed`, a cause. `source` is the stop's failure, whose class the error has.
+    #[error("{}", process_not_opened_message(id, open_failed))]
+    ProcessNotOpened {
+        id: String,
+        open_failed: std::io::Error,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// A run of `id` whose wait failed, `source`, and whose output could not be shown either: `shown`,
+    /// printed in the message. The wait's class is the error's, so a wait that left the outcome open
+    /// stays open, which a [`Both`](Error::Both) of the two would not.
+    #[error("{}", output_also_failed_message(id, shown))]
+    OutputAlsoFailed {
+        id: String,
+        shown: Box<Error>,
         #[source]
         source: Box<Error>,
     },
@@ -742,7 +789,10 @@ pub enum Error {
 macro_rules! wrapper {
     ($source:ident) => {
         Error::Step { source: $source, .. }
-            | Error::StartAsManaged { source: $source, .. }
+            | Error::StartJudgedWithoutBlob { source: $source, .. }
+            | Error::ProcessExitUnconfirmed { source: $source, .. }
+            | Error::ProcessNotOpened { source: $source, .. }
+            | Error::OutputAlsoFailed { source: $source, .. }
             | Error::InstalledUnreadable { source: $source, .. }
     };
 }
@@ -822,9 +872,9 @@ impl Error {
         }
     }
 
-    /// The error a chain of [`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged) and
-    /// [`InstalledUnreadable`](Error::InstalledUnreadable) ends in, which classification reads: a step
-    /// over [`NotInstalled`](Error::NotInstalled) is still "not installed". An error that carries
+    /// The error a chain of [`Step`](Error::Step) and the other wrappers (those of `wrapper!`) ends in,
+    /// which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is still "not
+    /// installed". An error that carries
     /// another one in any other variant ([`Kept`](Error::Kept), [`Undetermined`](Error::Undetermined),
     /// [`Both`](Error::Both), and the rest) is itself the cause.
     /// [`map_cause`](Error::map_cause) walks the same chain.
@@ -832,9 +882,8 @@ impl Error {
         self.wrapped().map_or(self, Error::cause)
     }
 
-    /// Whether this error, or what it wraps in a [`Step`](Error::Step),
-    /// [`StartAsManaged`](Error::StartAsManaged) or [`Kept`](Error::Kept), is an
-    /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
+    /// Whether this error, or what it wraps in a [`Step`](Error::Step) or another wrapper (those of
+    /// `wrapper!`) or a [`Kept`](Error::Kept), is an [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
     /// walks through that variant. The errors carried by any other variant are not walked.
     pub(crate) fn wraps_unreadable_host(&self) -> bool {
         match self {
@@ -946,7 +995,14 @@ impl Error {
                 read_failed,
                 restore_failed,
             } => Some(loaded_state_in_doubt(id, read_failed, restore_failed.is_some())),
-            Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
+            Error::StartJudgedWithoutBlob {
+                id, judged_as, blob, ..
+            } => Some(start_judged_without_blob_message(id, *judged_as, blob)),
+            Error::ProcessExitUnconfirmed {
+                id, terminate_failed, ..
+            } => Some(process_exit_unconfirmed_message(id, terminate_failed)),
+            Error::ProcessNotOpened { id, open_failed, .. } => Some(process_not_opened_message(id, open_failed)),
+            Error::OutputAlsoFailed { id, shown, .. } => Some(output_also_failed_message(id, shown)),
             Error::ProcessWaitTimeout {
                 id,
                 pid,
@@ -1338,25 +1394,64 @@ fn stale_job_booted_out<'a>(id: &str, path: &Path, found: &'a Occupant) -> Piece
 /// [`Error::ProcessWaitTimeout`] and the notice of a wait for the process say the process is still
 /// running because goetia could not end it. The failed terminate is only mentioned.
 pub(crate) fn terminating_failed<'a>(
-    lead: String,
+    lead: Pieces<'a>,
     terminate_failed: Option<&'a std::io::Error>,
     tail: impl Into<Cow<'a, str>>,
 ) -> Pieces<'a> {
     match terminate_failed {
-        None => Pieces::new().text(lead),
-        Some(e) => Pieces::new()
-            .text(format!("{lead}, and terminating it failed: "))
-            .mentioned(e),
+        None => lead,
+        Some(e) => lead.text(", and terminating it failed: ").mentioned(e),
     }
     .text(tail)
 }
 
-/// The message of [`Error::StartAsManaged`]: `blob` is the unreadable blob's error.
-fn start_as_managed_message(blob: &Error) -> Pieces<'_> {
+/// The message of [`Error::StartJudgedWithoutBlob`]: `blob` is the unreadable blob's error.
+fn start_judged_without_blob_message<'a>(id: &str, judged_as: crate::spec::Protocol, blob: &'a Error) -> Pieces<'a> {
+    use crate::spec::Protocol;
+    match judged_as {
+        Protocol::Native => Pieces::new()
+            .text("its spec blob could not be read, so the start was judged as a `protocol: native` service's ("),
+        Protocol::Plain => Pieces::new().text(format!(
+            "`{id}`'s spec blob could not be read, so the start was judged as a goetia shim's, by the registered image ("
+        )),
+    }
+    .cause(blob)
+    .text(")")
+}
+
+/// The message of [`Error::ProcessExitUnconfirmed`]: `terminate_failed` is only mentioned.
+fn process_exit_unconfirmed_message<'a>(id: &str, terminate_failed: &'a std::io::Error) -> Pieces<'a> {
+    terminating_failed(
+        Pieces::new().text(format!(
+            "`{id}` is stopped, but goetia could not tell that its process exited"
+        )),
+        Some(terminate_failed),
+        ". The wait for it failed",
+    )
+}
+
+/// The message of [`Error::ProcessNotOpened`]: `open_failed` is why the process could not be opened.
+fn process_not_opened_message<'a>(id: &str, open_failed: &'a std::io::Error) -> Pieces<'a> {
     Pieces::new()
-        .text("its spec blob could not be read, so the start was judged as a `protocol: native` service's (")
-        .cause(blob)
-        .text(")")
+        .text(format!("goetia could not open `{id}`'s process ("))
+        .cause(open_failed)
+        .text("), so it could not wait for the process to exit")
+}
+
+/// The message of [`Error::OutputAlsoFailed`]: `shown` is why the output could not be shown.
+fn output_also_failed_message<'a>(id: &str, shown: &'a Error) -> Pieces<'a> {
+    Pieces::new()
+        .text(format!("goetia could not show the output of `{id}` either: "))
+        .cause(shown)
+}
+
+/// [`Error::RunUnrecorded`]'s tail: `: reason`, or nothing when `source` says it all.
+fn unrecorded_reason(reason: &str) -> String {
+    if reason.is_empty() {
+        String::new()
+    } else {
+        format!(": {reason}")
+    }
 }
 
 /// The message of [`Error::ProcessWaitTimeout`]: `terminate_failed` is why goetia's attempt to end
@@ -1369,10 +1464,10 @@ fn process_wait_timeout_message<'a>(
     recovery: &'a str,
 ) -> Pieces<'a> {
     terminating_failed(
-        format!(
+        Pieces::new().text(format!(
             "`{id}` is stopped, but its process (pid {pid}) had not exited within {}",
             humantime::format_duration(waited)
-        ),
+        )),
         terminate_failed,
         format!(". {recovery}"),
     )

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use super::Error;
 use super::escape::{write_escaped, write_escaped_keeping_layout};
 use super::within::PairedFailure;
+use crate::backend::scm::wait::IncompleteStop;
 
 /// What [`Error::report`] and `Error::report_unescaped` return: the chain, formatted on `Display`.
 pub(super) struct Report<'a> {
@@ -214,8 +215,8 @@ pub(super) struct Node<'a> {
 /// What only carries another error is looked through, so that the node is the carried error: an
 /// [`io::Error`](std::io::Error) with a custom payload (its `source()` is the payload's, which skips the
 /// payload), an `Arc<io::Error>`, a `Box<Error>` and an [`Error::Kept`]. A `cosca` error is
-/// [`Shape::Cosca`]. A goetia error that sets another inside its message, and a `PairedFailure`, are
-/// [`Shape::Pieces`]. Any other is its own `Display` and `source()`.
+/// [`Shape::Cosca`]. A goetia error that sets another inside its message, a `PairedFailure` and an
+/// `IncompleteStop` are [`Shape::Pieces`]. Any other is its own `Display` and `source()`.
 pub(super) fn parts<'a>(e: &'a Dyn) -> Node<'a> {
     if let Some(payload) = e.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref) {
         return parts(payload);
@@ -237,6 +238,7 @@ pub(super) fn parts<'a>(e: &'a Dyn) -> Node<'a> {
     } else if let Some(pieces) = ours
         .and_then(Error::pieces)
         .or_else(|| error.downcast_ref::<PairedFailure>().map(PairedFailure::pieces))
+        .or_else(|| error.downcast_ref::<IncompleteStop>().map(IncompleteStop::pieces))
     {
         Shape::Pieces(pieces)
     } else {

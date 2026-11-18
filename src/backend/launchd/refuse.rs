@@ -110,6 +110,7 @@ pub(crate) fn run_unfollowed(id: &Id, pid: u32) -> Error {
             "the `launchctl kickstart` goetia made for it launched process {pid} with no hold on it, so goetia \
              does not follow it"
         ),
+        source: None,
     }
 }
 
@@ -119,6 +120,7 @@ pub(crate) fn run_ended_without_status(id: &Id) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
         reason: "the kernel did not report it".to_string(),
+        source: None,
     }
 }
 
@@ -137,6 +139,7 @@ pub(crate) fn run_ended_unfollowed(id: &Id, status: Option<i32>) -> Error {
             "its launch ended before goetia could follow it{status}: its program may have failed to start or \
              exited at once, or a `goetia daemon stop` or `kill` ended it"
         ),
+        source: None,
     }
 }
 
@@ -183,6 +186,7 @@ pub(crate) fn run_unresumed(id: &Id) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
         reason: "it was ended before goetia could resume it".to_string(),
+        source: None,
     }
 }
 

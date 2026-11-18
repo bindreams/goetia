@@ -19,7 +19,7 @@
 use std::io;
 use std::time::Duration;
 
-use crate::error::{Error, carried, paired, terminating_failed, within};
+use crate::error::{Error, Pieces, carried, paired, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
 #[cfg(unix)]
@@ -112,7 +112,12 @@ pub trait KillTarget {
 /// the process is still running when ending it failed. Text on purpose: a line for stderr, with no
 /// error under it that anything could search or take a remedy from.
 pub(crate) fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> String {
-    terminating_failed(format!("{id}: waiting for process {pid} to exit"), terminate_failed, "").to_string()
+    terminating_failed(
+        Pieces::new().text(format!("{id}: waiting for process {pid} to exit")),
+        terminate_failed,
+        "",
+    )
+    .to_string()
 }
 
 /// How long a kill waits before saying why it is still waiting. Cosmetic: the wait does not end at it.
