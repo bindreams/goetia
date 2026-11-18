@@ -768,6 +768,42 @@ fn a_repetition_trigger_reads_back_in_task_schedulers_order() {
     assert!(!installed.to_string().contains("Unrecognised"), "{installed}");
 }
 
+/// A group that names minute 0 compiles to a lone `:00` trigger and a repetition from the next minute in
+/// the same hour: both are written, and Task Scheduler's readback of them is the task that was built.
+#[skuld::test]
+fn a_lone_zero_trigger_and_a_repetition_in_one_hour_read_back_unchanged() {
+    let spec = spec_of(User::Root, Some("*/15 9 * * *"));
+    let task = built(&spec);
+    let xml = task.to_xml(true);
+    let document = Document::parse(&xml).unwrap();
+    assert_eq!(
+        names_under(&document, "Task/Triggers"),
+        ["CalendarTrigger", "CalendarTrigger"]
+    );
+    let triggers = r#"<Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2000-01-01T09:00:00</StartBoundary>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+    <CalendarTrigger>
+      <StartBoundary>2000-01-01T09:15:00</StartBoundary>
+      <Repetition>
+        <Interval>PT15M</Interval>
+        <Duration>PT30M</Duration>
+      </Repetition>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>"#;
+    let installed = TaskXml::parse(&readback(&spec, &host(), triggers), &data_of(&spec)).unwrap();
+    assert_eq!(installed, task);
+    assert_eq!(installed.to_string(), task.to_string());
+    assert_eq!(TaskXml::parse(&xml, &data_of(&spec)).unwrap(), task);
+}
+
 #[skuld::test]
 fn a_schedule_that_never_fires_has_a_trigger_and_can_be_armed() {
     let spec = spec_of(User::Root, Some("0 0 31 4,6 *"));
