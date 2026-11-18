@@ -321,7 +321,7 @@ fn shut(wake: Wake) -> u32 {
     let probe = wake.probe.clone();
     WAKE.store(-1, Ordering::SeqCst);
     #[cfg(test)]
-    _ = &probe;
+    let _probe = probe;
     // MUTANT A: no wait loop
     drop(wake);
     OPEN.store(false, Ordering::SeqCst);
