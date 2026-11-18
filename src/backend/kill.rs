@@ -109,7 +109,8 @@ pub trait KillTarget {
 }
 
 /// What an unbounded wait for `id`'s process `pid` says it is blocked on. `terminate_failed` is why
-/// the process is still running when ending it failed.
+/// the process is still running when ending it failed. Text on purpose: a line for stderr, with no
+/// error under it that anything could search or take a remedy from.
 pub(crate) fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> String {
     terminating_failed(format!("{id}: waiting for process {pid} to exit"), terminate_failed, "").to_string()
 }

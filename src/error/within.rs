@@ -1,7 +1,8 @@
 use std::fmt;
 use std::io;
 
-use super::{Chain, Error};
+use super::Error;
+use super::report::Pieces;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]
@@ -24,9 +25,10 @@ pub(crate) fn within(context: impl Into<String>, source: io::Error) -> io::Error
     )
 }
 
-/// Two failures of one operation, the second told after the first: `primary (phrase second)`. The
-/// primary is the [`source`](std::error::Error::source), so its OS code is found through the pair, and
-/// the second is written once, where `Display` and [`Error::report`](crate::Error::report) both put it.
+/// Two failures of one operation, the second told after the first: `primary (phrase second)`. Both are
+/// rendered by `Display` and neither is the [`source`](std::error::Error::source), as the standard
+/// library asks. The primary is the cause, so its OS code is the pair's; the second is only mentioned,
+/// and never searched.
 #[derive(Debug)]
 pub(super) struct PairedFailure {
     pub(super) primary: io::Error,
@@ -34,17 +36,24 @@ pub(super) struct PairedFailure {
     pub(super) second: io::Error,
 }
 
-impl fmt::Display for PairedFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({} {})", Chain(&self.primary), self.phrase, Chain(&self.second))
+impl PairedFailure {
+    /// What `Display` renders: the one place its format is stated.
+    pub(super) fn pieces(&self) -> Pieces<'_> {
+        Pieces::new()
+            .cause(&self.primary)
+            .text(format!(" ({} ", self.phrase))
+            .mentioned(&self.second)
+            .text(")")
     }
 }
 
-impl std::error::Error for PairedFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.primary)
+impl fmt::Display for PairedFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.pieces().fmt(f)
     }
 }
+
+impl std::error::Error for PairedFailure {}
 
 /// `primary` with `second` told after it, in the words `phrase` (which ends where `second` begins),
 /// with `primary`'s kind kept. Not a goetia [`Error`], so [`carried`] leaves it alone and its context

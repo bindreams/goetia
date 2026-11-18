@@ -15,11 +15,13 @@ pub(crate) use escape::EscapedStream;
 #[cfg(any(feature = "cli", unix))]
 pub(crate) use escape::escape;
 pub use reason::Reason;
-pub(crate) use report::Chain;
 #[cfg(feature = "cli")]
 pub(crate) use report::Sink;
+#[cfg(any(unix, windows))]
+pub(crate) use report::find;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
+pub(crate) use report::{Chain, Pieces};
 pub(crate) use within::{carried, paired, within};
 
 use report::Report;
@@ -32,7 +34,10 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type SharedError = Arc<dyn std::error::Error + Send + Sync>;
 
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
-/// own context only, never its source's text: print the whole chain with [`Error::report`].
+/// own message, with the errors that message sets inside it (a [`Both`](Error::Both)'s two halves, the
+/// failed read in a sentence), never its source's text: print the whole chain with [`Error::report`].
+/// An error is rendered by its `Display` or returned by its `source()`, never both, as the standard
+/// library asks of an error that wraps another.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An OS call (filesystem, registry, Win32, a syscall) failed. `what` is the action
@@ -89,13 +94,10 @@ pub enum Error {
 
     /// Several steps failed, each after the ones before it: `first` is what failed earlier, `then`
     /// the failure after it. Any number nest to the left (`Both { Both { a, b }, c }`), built by
-    /// `Error::both_all`; `report()` prints them in order.
-    #[error("several steps failed")]
-    Both {
-        #[source]
-        first: Box<Error>,
-        then: Box<Error>,
-    },
+    /// `Error::both_all`. `Display` and `report()` print them in order, `first; then: then`, and neither
+    /// is the `source()`, which is `None`: both are rendered, so neither is returned.
+    #[error("{}", both_message(first, then))]
+    Both { first: Box<Error>, then: Box<Error> },
 
     /// What goetia read at `id` changed before it acted on it, so it did nothing further: re-run.
     #[error(
@@ -507,7 +509,8 @@ pub enum Error {
     ///
     /// `terminate_failed` is not the source: the timeout is not an OS failure, and a source would
     /// have [`raw_os_error`](Error::raw_os_error) answer with the terminate's code. The `Display`
-    /// sets it inside its sentence (see `Error::sentence`) and ends with `recovery`.
+    /// sets it inside its message (see `Error::pieces`), where it is only mentioned, and ends with
+    /// `recovery`.
     #[error("{}", process_wait_timeout_message(id, *pid, *waited, terminate_failed.as_deref(), recovery))]
     ProcessWaitTimeout {
         id: String,
@@ -672,11 +675,7 @@ pub enum Error {
     /// the job is gone and the daemon is not installed. launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error(
-        "`{id}`: a job loaded under that label was booted out, but {found} appeared at {path} before the plist \
-         could be created, so the daemon is not installed: re-run install, which decides against what is there",
-        path = path.display()
-    )]
+    #[error("{}", stale_job_booted_out(id, path, found))]
     StaleJobBootedOut { id: String, path: PathBuf, found: Occupant },
 
     /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
@@ -930,14 +929,18 @@ impl Error {
         }
     }
 
-    /// The sentence `Display` writes around an embedded error that is not the `source`, so `report`
-    /// can write that error with its remedies last; `None` otherwise. A [`Kept`](Error::Kept) error
-    /// answers as the error it holds.
+    /// The message `Display` writes with errors set inside it, which `report` writes as it writes any
+    /// error, so as to collect their remedies; `None` for an error whose `Display` is its own text. Where
+    /// it is `Some`, none of the errors in it is the `source`. A [`Kept`](Error::Kept) error answers as
+    /// the error it holds.
     ///
-    /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
+    /// The one place the shape of such a variant is stated, with [`parts`](report::parts), which reads
+    /// it. Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
     /// be classified here before it compiles.
-    pub(crate) fn sentence(&self) -> Option<Sentence<'_>> {
+    pub(crate) fn pieces(&self) -> Option<Pieces<'_>> {
         match self {
+            Error::Both { first, then } => Some(both_message(first, then)),
+            Error::StaleJobBootedOut { id, path, found } => Some(stale_job_booted_out(id, path, found)),
             Error::LoadedStateInDoubt {
                 id,
                 read_failed,
@@ -963,7 +966,6 @@ impl Error {
             | Error::Step { .. }
             | Error::InstalledUnreadable { .. }
             | Error::ServiceImageUnreadable { .. }
-            | Error::Both { .. }
             | Error::ConcurrentChange { .. }
             | Error::QuarantineStranded { .. }
             | Error::AmbiguousInstall { .. }
@@ -1014,13 +1016,12 @@ impl Error {
             | Error::Unestablished { .. }
             | Error::RequestInDoubt { .. }
             | Error::LoadedJobInDoubt { .. }
-            | Error::StaleJobBootedOut { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
             | Error::UnsupportedPlatform { .. }
             | Error::AccountLookup { .. }
             | Error::AlreadyExists { .. } => None,
-            Error::Kept(kept) => kept.sentence(),
+            Error::Kept(kept) => kept.pieces(),
         }
     }
 
@@ -1171,15 +1172,28 @@ pub enum Occupant {
     Unreadable(std::io::Error),
 }
 
+impl Occupant {
+    /// What `Display` renders; the error of an unreadable one is only mentioned in it.
+    fn pieces(&self) -> Pieces<'_> {
+        let text = match self {
+            Occupant::File => "a file",
+            Occupant::Directory => "a directory",
+            Occupant::Symlink => "a symlink",
+            Occupant::Special => "a special file",
+            Occupant::Unreadable(e) => {
+                return Pieces::new()
+                    .text("something that could not be read (")
+                    .mentioned(e)
+                    .text(")");
+            }
+        };
+        Pieces::new().text(text)
+    }
+}
+
 impl fmt::Display for Occupant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Occupant::File => f.write_str("a file"),
-            Occupant::Directory => f.write_str("a directory"),
-            Occupant::Symlink => f.write_str("a symlink"),
-            Occupant::Special => f.write_str("a special file"),
-            Occupant::Unreadable(e) => write!(f, "something that could not be read ({})", Chain(e)),
-        }
+        self.pieces().fmt(f)
     }
 }
 
@@ -1304,56 +1318,45 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
     }
 }
 
-/// A message with an error set inside it, when there is one: `before`, the error, `after`.
-/// `Display` writes the error as [`Chain`] does, without its stderr; [`Error::report`] and
-/// [`Reason`] write it as they write any error (see [`Error::sentence`]).
-pub(crate) struct Sentence<'a> {
-    pub(crate) before: Cow<'a, str>,
-    pub(crate) error: Option<&'a (dyn std::error::Error + 'static)>,
-    /// Whether `error` is a cause of the failure the sentence states, so that its OS code is the
-    /// failure's ([`Error::raw_os_error`]). It is not for an error the sentence mentions in passing,
-    /// as the failed attempt to end a process under a timeout that is no OS failure.
-    pub(crate) error_is_cause: bool,
-    pub(crate) after: Cow<'a, str>,
+/// [`Error::Both`]'s message: `first; then: then`, each written as any error is.
+fn both_message<'a>(first: &'a Error, then: &'a Error) -> Pieces<'a> {
+    Pieces::new().cause(first).text("; then: ").cause(then)
 }
 
-impl fmt::Display for Sentence<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.before)?;
-        if let Some(error) = self.error {
-            write!(f, "{}", Chain(error))?;
-        }
-        f.write_str(&self.after)
-    }
+/// [`Error::StaleJobBootedOut`]'s message.
+fn stale_job_booted_out<'a>(id: &str, path: &Path, found: &'a Occupant) -> Pieces<'a> {
+    Pieces::new()
+        .text(format!("`{id}`: a job loaded under that label was booted out, but "))
+        .then(found.pieces())
+        .text(format!(
+            " appeared at {} before the plist could be created, so the daemon is not installed: re-run install, which decides against what is there",
+            path.display()
+        ))
 }
 
 /// `lead`, then, if ending a process failed, that it did and `terminate_failed`, then `tail`: how
 /// [`Error::ProcessWaitTimeout`] and the notice of a wait for the process say the process is still
-/// running because goetia could not end it.
+/// running because goetia could not end it. The failed terminate is only mentioned.
 pub(crate) fn terminating_failed<'a>(
     lead: String,
     terminate_failed: Option<&'a std::io::Error>,
     tail: impl Into<Cow<'a, str>>,
-) -> Sentence<'a> {
-    Sentence {
-        before: match terminate_failed {
-            None => lead.into(),
-            Some(_) => format!("{lead}, and terminating it failed: ").into(),
-        },
-        error: terminate_failed.map(|e| e as &(dyn std::error::Error + 'static)),
-        error_is_cause: false,
-        after: tail.into(),
+) -> Pieces<'a> {
+    match terminate_failed {
+        None => Pieces::new().text(lead),
+        Some(e) => Pieces::new()
+            .text(format!("{lead}, and terminating it failed: "))
+            .mentioned(e),
     }
+    .text(tail)
 }
 
 /// The message of [`Error::StartAsManaged`]: `blob` is the unreadable blob's error.
-fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
-    Sentence {
-        before: "its spec blob could not be read, so the start was judged as a `protocol: native` service's (".into(),
-        error: Some(blob),
-        error_is_cause: true,
-        after: ")".into(),
-    }
+fn start_as_managed_message(blob: &Error) -> Pieces<'_> {
+    Pieces::new()
+        .text("its spec blob could not be read, so the start was judged as a `protocol: native` service's (")
+        .cause(blob)
+        .text(")")
 }
 
 /// The message of [`Error::ProcessWaitTimeout`]: `terminate_failed` is why goetia's attempt to end
@@ -1364,7 +1367,7 @@ fn process_wait_timeout_message<'a>(
     waited: std::time::Duration,
     terminate_failed: Option<&'a std::io::Error>,
     recovery: &'a str,
-) -> Sentence<'a> {
+) -> Pieces<'a> {
     terminating_failed(
         format!(
             "`{id}` is stopped, but its process (pid {pid}) had not exited within {}",
@@ -1420,14 +1423,13 @@ fn loaded_job_in_doubt(id: &str, restore_failed: bool) -> String {
 }
 
 /// The message of [`Error::LoadedStateInDoubt`]; `read_failed` is the failed read.
-fn loaded_state_in_doubt<'a>(id: &str, read_failed: &'a Error, restore_failed: bool) -> Sentence<'a> {
-    Sentence {
-        before: format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read (")
-            .into(),
-        error: Some(read_failed),
-        error_is_cause: true,
-        after: format!("){}", loaded_in_doubt_tail(id, restore_failed)).into(),
-    }
+fn loaded_state_in_doubt<'a>(id: &str, read_failed: &'a Error, restore_failed: bool) -> Pieces<'a> {
+    Pieces::new()
+        .text(format!(
+            "`{id}`'s plist was written, but whether launchd has its job loaded could not be read ("
+        ))
+        .cause(read_failed)
+        .text(format!("){}", loaded_in_doubt_tail(id, restore_failed)))
 }
 
 /// What both in-doubt messages end with. `restore_failed` is whether the put-back of the plist

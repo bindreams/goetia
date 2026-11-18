@@ -1,10 +1,12 @@
 //! Printing an [`Error`]: its chain of causes, then each remedy found along it.
 
+use std::borrow::Cow;
 use std::fmt::{self, Write as _};
+use std::sync::Arc;
 
+use super::Error;
 use super::escape::{write_escaped, write_escaped_keeping_layout};
 use super::within::PairedFailure;
-use super::{Error, Sentence};
 
 /// What [`Error::report`] and `Error::report_unescaped` return: the chain, formatted on `Display`.
 pub(super) struct Report<'a> {
@@ -97,7 +99,7 @@ impl fmt::Write for Sink<'_> {
 
 /// An error and its causes, without the remedies [`Report`] prints after them and without a failed
 /// command's stderr, as [`Error::Command`]'s own `Display` leaves it out: how an error that sits
-/// inside another's sentence is written to `Display`.
+/// inside another's message is written to `Display`.
 ///
 /// Not escaped: error reports escape at the sink; log lines and stderr warnings print it raw.
 pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
@@ -108,102 +110,204 @@ impl fmt::Display for Chain<'_> {
     }
 }
 
-/// Writes `e` and its causes, collecting the remedies met on the way into `remedies`, outermost
-/// first and each once: a [`Both`](Error::Both)'s halves can carry the same one. An error `e` sets
-/// inside its own sentence (see [`Error::sentence`]) is written there, with its remedies collected.
+type Dyn = dyn std::error::Error + 'static;
+
+// The shape of an error ===============================================================================================
+
+/// One piece of a message that has errors set inside it.
+pub(crate) enum Piece<'a> {
+    Text(Cow<'a, str>),
+    /// An error the message renders. `cause` is whether it is a cause of the failure the message states,
+    /// so that its OS code is the failure's ([`find`]); it is not for an error mentioned in passing, as
+    /// the failed attempt to end a process under a timeout that is no OS failure.
+    Error {
+        error: &'a Dyn,
+        cause: bool,
+    },
+}
+
+/// A message with errors set inside it: text and errors, in the order they are said. The one thing
+/// that renders such a message, whether it is an error's `Display` or a [`Reason`](super::Reason):
+/// the errors are written as any error is, so their remedies are collected.
+pub(crate) struct Pieces<'a>(Vec<Piece<'a>>);
+
+impl<'a> Pieces<'a> {
+    pub(crate) fn new() -> Self {
+        Pieces(Vec::new())
+    }
+
+    pub(crate) fn text(mut self, text: impl Into<Cow<'a, str>>) -> Self {
+        self.0.push(Piece::Text(text.into()));
+        self
+    }
+
+    /// `error`, a cause of the failure this message states.
+    pub(crate) fn cause(mut self, error: &'a Dyn) -> Self {
+        self.0.push(Piece::Error { error, cause: true });
+        self
+    }
+
+    /// `error`, which the message mentions and is not a cause of what it states.
+    pub(crate) fn mentioned(mut self, error: &'a Dyn) -> Self {
+        self.0.push(Piece::Error { error, cause: false });
+        self
+    }
+
+    /// All of `other`, after what is here.
+    pub(crate) fn then(mut self, other: Pieces<'a>) -> Self {
+        self.0.extend(other.0);
+        self
+    }
+
+    /// The errors set inside the message, each with whether it is a cause.
+    pub(crate) fn errors(&self) -> impl Iterator<Item = (&'a Dyn, bool)> + '_ {
+        self.0.iter().filter_map(|piece| match piece {
+            Piece::Error { error, cause } => Some((*error, *cause)),
+            Piece::Text(_) => None,
+        })
+    }
+
+    /// Writes the message into `out`, collecting into `remedies` those of the errors in it.
+    pub(super) fn write(&self, out: &mut Sink, remedies: &mut Vec<&'a str>) -> fmt::Result {
+        for piece in &self.0 {
+            match piece {
+                Piece::Text(text) => out.write_str(text)?,
+                Piece::Error { error, .. } => write_chain(*error, out, remedies)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// As [`Chain`] writes each error in it: no remedies, no stderr.
+impl fmt::Display for Pieces<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write(&mut Sink::without_stderr(f), &mut Vec::new())
+    }
+}
+
+/// How an error renders itself.
+pub(super) enum Shape<'a> {
+    /// Its own `Display`.
+    Own,
+    /// Through [`cosca::error::Report`]: a `cosca` list's members and its cleanup are not on `source()`.
+    Cosca,
+    /// Text with errors set inside it. What `Display` renders is exactly this, and none of the errors in
+    /// it is also the [`source`](Node::source): an error is rendered by its `Display` or returned by
+    /// `source()`, never both, as the standard library asks.
+    Pieces(Pieces<'a>),
+}
+
+/// An error, as everything that walks one sees it: how it renders and what it returns from `source()`.
+pub(super) struct Node<'a> {
+    /// The error itself, as it is after [`parts`] has looked through what carries it.
+    pub(super) error: &'a Dyn,
+    /// The goetia error this is, which knows its remedy and its stderr.
+    pub(super) ours: Option<&'a Error>,
+    pub(super) shape: Shape<'a>,
+    pub(super) source: Option<&'a Dyn>,
+}
+
+/// `e`'s [`Node`]: the one description of the shape of any error, which the printer and the search
+/// both read.
 ///
-/// An [`io::Error`](std::io::Error) with a custom payload is written as its payload, whatever the
-/// payload is, as its `source()` skips the payload: a goetia [`Error`] it carries is written in full.
-/// A [`PairedFailure`] is written as its primary, then the phrase and the second in parentheses.
-///
-/// A `cosca` error and everything below it is written by [`cosca::error::Report`], since a `source()`
-/// walk shows only the first member of a list and never a `cleanup`.
-pub(super) fn write_chain<'a>(
-    e: &'a (dyn std::error::Error + 'static),
-    out: &mut Sink,
-    remedies: &mut Vec<&'a str>,
-) -> fmt::Result {
+/// What only carries another error is looked through, so that the node is the carried error: an
+/// [`io::Error`](std::io::Error) with a custom payload (its `source()` is the payload's, which skips the
+/// payload), an `Arc<io::Error>`, a `Box<Error>` and an [`Error::Kept`]. A `cosca` error is
+/// [`Shape::Cosca`]. A goetia error that sets another inside its message, and a `PairedFailure`, are
+/// [`Shape::Pieces`]. Any other is its own `Display` and `source()`.
+pub(super) fn parts<'a>(e: &'a Dyn) -> Node<'a> {
     if let Some(payload) = e.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref) {
-        return write_chain(payload, out, remedies);
+        return parts(payload);
     }
-    if e.is::<cosca::error::Error>() {
-        return write!(out, "{}", cosca::error::Report::new(e));
-    }
-    if let Some(pair) = e.downcast_ref::<PairedFailure>() {
-        write_chain(&pair.primary, out, remedies)?;
-        write!(out, " ({} ", pair.phrase)?;
-        write_chain(&pair.second, out, remedies)?;
-        return out.write_str(")");
+    if let Some(shared) = e.downcast_ref::<Arc<std::io::Error>>() {
+        return parts(&**shared);
     }
     // A `#[source]` of type `Box<Error>` reaches here as the box.
     let ours = e
         .downcast_ref::<Error>()
-        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
-    // The one place a `Kept` is looked through by hand: a kept `Both` is a `Both`.
-    if let Some(Error::Both { first, then }) = ours.map(Error::unkept) {
-        write_chain(first.as_ref(), out, remedies)?;
-        out.write_str("; then: ")?;
-        return write_chain(then.as_ref(), out, remedies);
+        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b))
+        .map(Error::unkept);
+    let error: &Dyn = match ours {
+        Some(ours) => ours,
+        None => e,
+    };
+    let shape = if error.is::<cosca::error::Error>() {
+        Shape::Cosca
+    } else if let Some(pieces) = ours
+        .and_then(Error::pieces)
+        .or_else(|| error.downcast_ref::<PairedFailure>().map(PairedFailure::pieces))
+    {
+        Shape::Pieces(pieces)
+    } else {
+        Shape::Own
+    };
+    Node {
+        error,
+        ours,
+        shape,
+        source: error.source(),
     }
-    if let Some(remedy) = ours.and_then(Error::remedy)
+}
+
+// Printing ============================================================================================================
+
+/// Writes `e` and its causes, collecting the remedies met on the way into `remedies`, outermost
+/// first and each once: a [`Both`](Error::Both)'s halves can carry the same one. What is written is
+/// what [`parts`] says: the error's message (with the errors set inside it written as `e` is), its
+/// child's stderr where the sink takes it, then its `source()`.
+///
+/// A `cosca` error and everything below it is written by [`cosca::error::Report`], since a `source()`
+/// walk shows only the first member of a list and never a `cleanup`.
+pub(super) fn write_chain<'a>(e: &'a Dyn, out: &mut Sink, remedies: &mut Vec<&'a str>) -> fmt::Result {
+    let node = parts(e);
+    if let Some(remedy) = node.ours.and_then(Error::remedy)
         && !remedies.contains(&remedy)
     {
         remedies.push(remedy);
     }
-    match ours.and_then(Error::sentence) {
-        Some(sentence) => write_sentence(sentence, out, remedies)?,
-        None => write!(out, "{e}")?,
+    match &node.shape {
+        Shape::Cosca => return write!(out, "{}", cosca::error::Report::new(node.error)),
+        Shape::Own => write!(out, "{}", node.error)?,
+        Shape::Pieces(pieces) => pieces.write(out, remedies)?,
     }
     if out.stderr
-        && let Some(stderr) = ours.and_then(Error::stderr).filter(|stderr| !stderr.is_empty())
+        && let Some(stderr) = node.ours.and_then(Error::stderr).filter(|stderr| !stderr.is_empty())
     {
         out.write_str(": ")?;
         out.write_layout(stderr)?;
     }
-    if let Some(source) = e.source() {
+    if let Some(source) = node.source {
         out.write_str(": ")?;
         write_chain(source, out, remedies)?;
     }
     Ok(())
 }
 
-/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. An
-/// [`io::Error`](std::io::Error) with a custom payload is searched as that payload, whatever it is:
-/// its `source()` skips the payload. A [`Both`](Error::Both) is searched first half first;
-/// [`Error::Kept`] is searched as the error it holds. A `cosca` list's later members, a
-/// `MembersLeft`'s `others` and a `MayHaveStarted`'s `cleanup` are not on the `source()` chain and are
-/// not searched.
-pub(crate) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
-    if let Some(io) = e.downcast_ref::<std::io::Error>() {
-        if let Some(code) = io.raw_os_error() {
-            return Some(code);
-        }
-        if let Some(payload) = io.get_ref() {
-            return os_error_in(payload);
-        }
-    }
-    let ours = e
-        .downcast_ref::<Error>()
-        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
-    match ours {
-        Some(Error::Both { first, then }) => return os_error_in(first.as_ref()).or_else(|| os_error_in(then.as_ref())),
-        Some(Error::Kept(kept)) => return os_error_in(kept.as_ref()),
-        _ => {}
-    }
-    e.source().and_then(os_error_in).or_else(|| {
-        let sentence = ours.and_then(Error::sentence)?;
-        os_error_in(sentence.error.filter(|_| sentence.error_is_cause)?)
-    })
+// Searching ===========================================================================================================
+
+/// The first thing `found` finds in `e`, searching depth first: the error itself, then its `source()`
+/// chain, then the errors its message sets inside it as causes ([`Piece::Error`]), each searched the same
+/// way. The one search of an error: what it sees of each error is [`parts`]', as the printer sees it.
+///
+/// A `cosca` error is searched through its `source()`, so only a list's first member is. What is found
+/// borrows from `e`.
+pub(crate) fn find<'a, T>(e: &'a Dyn, found: &impl Fn(&'a Dyn) -> Option<T>) -> Option<T> {
+    let node = parts(e);
+    found(node.error)
+        .or_else(|| node.source.and_then(|source| find(source, found)))
+        .or_else(|| match &node.shape {
+            Shape::Pieces(pieces) => pieces
+                .errors()
+                .filter(|(_, cause)| *cause)
+                .find_map(|(error, _)| find(error, found)),
+            Shape::Own | Shape::Cosca => None,
+        })
 }
 
-/// Writes `sentence`: its error is written as any error is, so its remedies are collected into
-/// `remedies`.
-pub(super) fn write_sentence<'a>(sentence: Sentence<'a>, out: &mut Sink, remedies: &mut Vec<&'a str>) -> fmt::Result {
-    out.write_str(&sentence.before)?;
-    if let Some(error) = sentence.error {
-        write_chain(error, out, remedies)?;
-    }
-    out.write_str(&sentence.after)
+/// The first OS error code in `e`, searched as [`find`] searches.
+pub(crate) fn os_error_in(e: &Dyn) -> Option<i32> {
+    find(e, &|e| e.downcast_ref::<std::io::Error>()?.raw_os_error())
 }
 
 /// Writes each of `remedies` with [`Sink::write_remedy`].

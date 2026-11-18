@@ -503,10 +503,10 @@ fn a_kept_error_reads_as_the_error_it_keeps() {
     assert!(undetermined.is_indeterminate());
 }
 
-/// The errors written into a variant's own `Display` are exactly those `sentence` names, so
+/// The errors written into a variant's own `Display` are exactly those `pieces` names, so
 /// `report` can collect their remedies.
 #[skuld::test]
-fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
+fn pieces_name_the_errors_a_variant_writes_into_its_own_text() {
     let inner = || undetermined("re-run as root");
     let loaded = Error::LoadedStateInDoubt {
         id: id(),
@@ -514,7 +514,9 @@ fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
         restore_failed: None,
     };
     fn embedded(e: &Error) -> Option<&Error> {
-        e.sentence().and_then(|s| s.error?.downcast_ref::<Error>())
+        e.pieces()?
+            .errors()
+            .find_map(|(error, _)| error.downcast_ref::<Error>())
     }
     assert!(matches!(embedded(&loaded), Some(Error::Undetermined { .. })));
     assert!(matches!(
@@ -525,8 +527,8 @@ fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
         embedded(&Error::Kept(Arc::new(loaded))),
         Some(Error::Undetermined { .. })
     ));
-    assert!(not_installed().sentence().is_none());
-    assert!(step("a", inner()).sentence().is_none());
+    assert!(not_installed().pieces().is_none());
+    assert!(step("a", inner()).pieces().is_none());
 }
 
 /// A kept error answers `stderr` as the error it holds, however deep.
