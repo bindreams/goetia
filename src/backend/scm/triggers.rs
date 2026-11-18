@@ -48,14 +48,15 @@
 //! Minute 0, if the schedule names it, is a lone trigger in each hour, and costs that whether or not
 //! other minutes go with it. The other minutes are split into groups, each an ascending progression:
 //! the longest progression that starts at the smallest minute left, until none is left. That is greedy
-//! and does not always give the fewest groups. In each hour the schedule names, a group costs a lone
-//! trigger if it is one minute, else one repetition from its first minute to its last, inside the hour.
+//! and does not always give the fewest groups: a schedule refused for it may fit when split across two
+//! tasks. In each hour the schedule names, a group costs a lone trigger if it is one minute, else one
+//! repetition from its first minute to its last, inside the hour.
 //!
 //! So `*/15 * * * *`, `* * * * *` and `0,7,30 * * * *` are 48 triggers (a lone `:00` and a repetition,
 //! in each of 24 hours), `5,10 * * * *` and `5,10,15 * * * *` are 24, and `0 9-17 * * *` is nine lone
-//! triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused: `0-10,30 * * * *` is 72, and
-//! so is `*/20,5 * * * *`, which would be 48 if `:00` joined the `:20` and `:40` it steps with. A
-//! repetition ends inside its day, so it never runs into a day the trigger does not name.
+//! triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused: `0-10,30 * * * *` and
+//! `*/20,5 * * * *` are 72. A repetition ends inside its day, so it never runs into a day the trigger
+//! does not name.
 
 use std::collections::BTreeSet;
 use std::fmt;
