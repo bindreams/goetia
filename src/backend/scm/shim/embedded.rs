@@ -47,26 +47,24 @@ pub(in crate::backend::scm) use stock::folder_in;
 
 #[cfg(windows)]
 mod stock {
-    use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write as _};
-    use std::os::windows::ffi::OsStringExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
     use sha2::{Digest as _, Sha256};
     use tempfile::Builder;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
 
     use super::super::acl::{
-        Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
+        Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, missing_components, read_object,
+        require_acls_under,
     };
     use super::super::marker::read_retrying;
     use super::super::provider::{ShimProvider, require_absolute};
     use super::super::sweep::{SweepFailure, sweep_folder};
-    use crate::backend::scm::wide::units_until_nul;
+    use crate::backend::scm::folder::known_folder;
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
 
@@ -239,33 +237,7 @@ mod stock {
 
     /// `%ProgramFiles%\Goetia`.
     pub(super) fn default_dir() -> Result<PathBuf> {
-        let mut path: *mut u16 = std::ptr::null_mut();
-        // SAFETY: the folder ID is a static; `KF_FLAG_DEFAULT` and no token ask for the machine's
-        // folder; `path` is a valid out-pointer.
-        let hresult = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut path) };
-        let found = if hresult >= 0 {
-            // SAFETY: on success `path` is a NUL-terminated string that is live until freed below.
-            Ok(PathBuf::from(OsString::from_wide(unsafe { units_until_nul(path) })))
-        } else {
-            Err(locate_error(hresult))
-        };
-        // SAFETY: `path` is null or what `SHGetKnownFolderPath` allocated, which the caller frees
-        // with `CoTaskMemFree` whether or not the call succeeded.
-        unsafe { CoTaskMemFree(path.cast()) };
-        found.map(|program_files| program_files.join(DEFAULT_FOLDER))
-    }
-
-    /// The error for `SHGetKnownFolderPath` failing with `hresult`. A Win32 error wrapped as an
-    /// `HRESULT` is read as that error.
-    pub(super) fn locate_error(hresult: i32) -> Error {
-        const FACILITY_WIN32: u32 = 0x8007_0000;
-        let code = hresult as u32;
-        let source = if code & 0xFFFF_0000 == FACILITY_WIN32 {
-            io::Error::from_raw_os_error((code & 0xFFFF) as i32)
-        } else {
-            io::Error::other(format!("HRESULT {code:#010x}"))
-        };
-        Error::os("locate %ProgramFiles%", source)
+        known_folder(&FOLDERID_ProgramFiles, "%ProgramFiles%").map(|program_files| program_files.join(DEFAULT_FOLDER))
     }
 
     /// The folder a stock shim goes in: `dir`, or the default one. A relative one is
@@ -317,54 +289,11 @@ mod stock {
     /// Creates the folders of `dir` that do not exist, outermost first, with the permissions of a
     /// shim folder.
     fn create_missing(dir: &Path) -> Result<()> {
-        create_each(&missing_components(dir)?)
-    }
-
-    /// The folders of `dir` that do not exist, outermost first: those below its first existing
-    /// ancestor.
-    pub(super) fn missing_components(dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut missing = Vec::new();
-        for ancestor in dir.ancestors() {
-            match fs::symlink_metadata(ancestor) {
-                Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(ancestor.to_path_buf()),
-                Err(e) => return Err(Error::os_at("read the type of", ancestor, e)),
-            }
-        }
-        missing.reverse();
-        Ok(missing)
-    }
-
-    /// Creates each of `paths` in order, as a shim folder, each one with a call that fails when it
-    /// exists, so that goetia never adopts a folder it did not make: see [`created`].
-    pub(super) fn create_each(paths: &[PathBuf]) -> Result<()> {
-        if paths.is_empty() {
+        let missing = missing_components(dir)?;
+        if missing.is_empty() {
             return Ok(());
         }
-        let folder = Descriptor::for_folder()?;
-        for path in paths {
-            folder.create_dir(path).map_err(|e| created(path, e))?;
-        }
-        Ok(())
-    }
-
-    /// The error for `error`, from creating `path`, which was found missing. A folder that exists
-    /// now was made by someone else since, and goetia cannot tell a hostile one from another's (a
-    /// non-administrator can add folders under `C:\`, and could leave a link): it is refused.
-    pub(super) fn created(path: &Path, error: io::Error) -> Error {
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Error::os_at("create", path, error);
-        }
-        Error::Step {
-            what: format!(
-                "refusing `{}` for the shim: it appeared after goetia found it missing, so goetia did not make it \
-                 and cannot vouch for it",
-                path.display()
-            ),
-            source: Box::new(Error::AlreadyExists {
-                path: path.to_path_buf(),
-            }),
-        }
+        Descriptor::for_folder()?.create_each(&missing)
     }
 
     /// What `inspect` found at the file's path.

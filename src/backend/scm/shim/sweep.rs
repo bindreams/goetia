@@ -1,11 +1,11 @@
 //! The sweep of shim files nothing references: which files, what references a file, and the
 //! deletion.
 //!
-//! A shim file is referenced by a service whose `ImagePath` names it and by a process that runs it
-//! as its image. Neither is enough alone: SCM records a service `STOPPED` before its host exits, and
-//! a host that was updated to a new file keeps running the old one until it restarts. So a file is
-//! swept only when no registered service and no running process names it, and a failed delete is
-//! reported rather than read as "in use".
+//! A shim file is referenced by a service whose `ImagePath` names it, by a task whose action runs it
+//! and by a process that runs it as its image. None is enough alone: SCM records a service `STOPPED`
+//! before its host exits, and a host that was updated to a new file keeps running the old one until
+//! it restarts. So a file is swept only when no registered service, no task and no running process
+//! names it, and a failed delete is reported rather than read as "in use".
 //!
 //! [`unreferenced`] is pure over paths and builds on every host; the rest is Windows-only.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -333,7 +333,10 @@ mod system {
     use windows_service::service_manager::ServiceManagerAccess;
 
     use super::{SweepFailure, image_of, image_references, same_path, unreferenced};
+    use crate::backend::scm::instance::TaskPath;
+    use crate::backend::scm::manager::task::TaskApi;
     use crate::backend::scm::manager::{open_scm, read_image_through_scm, registry};
+    use crate::backend::scm::task_xml::TaskXml;
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
 
@@ -371,18 +374,56 @@ mod system {
                 read_image_through_scm(scm, &name)
             };
             match image_of(&name, registry::read_registered_image(services, &name), through_scm) {
-                Ok(Some(image)) => hosts.extend(image_references(&image, &expand_environment(&image)).iter().map(
-                    // A bare file name stands for every file of that name: it is not a path to resolve.
-                    |reference| match reference.contains(['\\', '/']) {
-                        true => normalise(Path::new(reference)),
-                        false => PathBuf::from(reference),
-                    },
-                )),
+                Ok(Some(image)) => hosts.extend(referenced_by(&image)),
                 Ok(None) => {}
                 Err(e) => failed.push(e),
             }
         });
         scan_outcome(hosts, failed, unfinished, "read which services run which host")
+    }
+
+    /// What a registered `image` (a service's `ImagePath`, a task's `Command`) references, as paths.
+    fn referenced_by(image: &str) -> impl Iterator<Item = PathBuf> {
+        image_references(image, &expand_environment(image))
+            .into_iter()
+            // A bare file name stands for every file of that name: it is not a path to resolve.
+            .map(|reference| match reference.contains(['\\', '/']) {
+                true => normalise(Path::new(&reference)),
+                false => PathBuf::from(reference),
+            })
+    }
+
+    /// Every executable a task in `\Goetia` runs, from its stored XML alone, so that a task that is not
+    /// goetia's is read too, as [`registered_hosts`] reads a service that is not. A task whose
+    /// enumeration or read failed is an error: what the unread tasks run is unknown, and it must not
+    /// be taken for nothing. Every task is tried, and each failure is reported. A name that is no id
+    /// is not goetia's, and a task gone since it was listed runs nothing.
+    pub(super) fn task_hosts(tasks: &dyn TaskApi) -> Result<Vec<PathBuf>> {
+        let mut hosts = Vec::new();
+        let mut failed = Vec::new();
+        let step = |name: &str, source: Error| Error::Step {
+            what: format!("read what task `{name}` runs"),
+            source: Box::new(source),
+        };
+        match tasks.names() {
+            Ok(names) => {
+                for name in names {
+                    let Some(id) = TaskPath::id(&name) else {
+                        continue;
+                    };
+                    match tasks.get(&TaskPath::of(&id)) {
+                        Ok(None) => {}
+                        Ok(Some(registered)) => match TaskXml::executables(&registered.xml) {
+                            Ok(commands) => hosts.extend(commands.iter().flat_map(|command| referenced_by(command))),
+                            Err(e) => failed.push(step(&name, e)),
+                        },
+                        Err(e) => failed.push(step(&name, e)),
+                    }
+                }
+            }
+            Err(e) => failed.push(e),
+        }
+        scan_outcome(hosts, failed, None, "read which tasks run which host")
     }
 
     /// What a pass over the services found, or, when any read failed or the enumeration did not
@@ -443,10 +484,12 @@ mod system {
         }
     }
 
-    /// Every file a registered service or a running process names: [`registered_hosts`] and
-    /// [`running_images`].
-    pub(crate) fn referenced_hosts() -> Result<Vec<PathBuf>> {
-        let mut referenced = registered_hosts()?;
+    /// Every file a registered service, a task or a running process names: [`registered_hosts`],
+    /// [`task_hosts`] over `tasks`, and [`running_images`]. The tasks come first, so a Task Scheduler
+    /// that cannot be read fails the read before the registry is scanned.
+    pub(crate) fn referenced_hosts(tasks: &dyn TaskApi) -> Result<Vec<PathBuf>> {
+        let mut referenced = task_hosts(tasks)?;
+        referenced.extend(registered_hosts()?);
         referenced.extend(running_images()?);
         Ok(referenced)
     }

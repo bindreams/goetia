@@ -1,5 +1,7 @@
 //! Pure generation of the SCM registration from a resolved spec, and extraction of
-//! the embedded metadata blob back out of one.
+//! the embedded metadata blob back out of one. [`registration`] and [`install_registration`] are the
+//! one entry of both kinds of daemon: a service is an [`ScmRegistration`] and a task a `TaskXml`
+//! (Task Scheduler's definition, in `task_xml`), as a [`WindowsDefinition`].
 //!
 //! Not `#[cfg]`-gated: this compiles and its tests run on every platform.
 //!
@@ -45,8 +47,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::backend::Identity;
 use crate::backend::scm::parameters::{Stray, field_named_utf16, is_string_type, type_name};
-use crate::backend::{Identity, cannot_run_tasks};
+use crate::backend::scm::task_xml::TaskXml;
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
@@ -134,38 +137,69 @@ pub struct FailureActions {
 
 // Building ============================================================================================================
 
-/// Build the [`ScmRegistration`] for `spec`. A `restart-delay` is rounded up to whole
+/// What the Windows backend registers for a daemon: a service's SCM registration or a task's Task
+/// Scheduler definition. [`Display`](fmt::Display) is the canonical text of either, for diffing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsDefinition {
+    Service(ScmRegistration),
+    Task(TaskXml),
+}
+
+impl fmt::Display for WindowsDefinition {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WindowsDefinition::Service(registration) => registration.fmt(out),
+            WindowsDefinition::Task(task) => task.fmt(out),
+        }
+    }
+}
+
+/// Build the [`WindowsDefinition`] for `spec`. A `restart-delay` is rounded up to whole
 /// milliseconds and clamped to what `SC_ACTION.Delay` can express, rather than left to
 /// panic at install time — see `scm_restart_delay`; the advisories for those
 /// fire at resolve time, from `BackendKind::Scm.warn`, when scm is the native backend.
 ///
 /// `id` is the account already resolved by the effectful install path (see
-/// [`Identity`]) — this function does no lookup of its own. `host` is called at most once, and
-/// only for a `hosted` service, where the host (not the spec's own command) is what SCM launches,
-/// with the host's own arguments; it is not judged here: see [`install_registration`]. Its error is
-/// this function's.
+/// [`Identity`]) — this function does no lookup of its own; a task's account is read from the spec
+/// alone, so that the definition read back says the same. `host` is called at most once, and only
+/// for a daemon that runs under the shim host (a `protocol: plain` service or a task), where the host
+/// (not the spec's own command) is what runs, with the host's own arguments; it is not judged here:
+/// see [`install_registration`]. Its error is this function's.
 ///
 /// Refuses, with [`Error::Invalid`]:
 ///
 /// - a `protocol: native` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
-///   could only run on-failure semantics.
+///   could only run on-failure semantics;
+/// - for a task, a virtual service account, a `%` in the host's path or arguments (Task Scheduler
+///   expands it), a schedule whose day-of-month and day-of-week fields are both restricted (an AND, or
+///   an either-or whose two triggers would coincide: see `triggers::compile`), and a schedule that
+///   needs more than 48 triggers.
 pub fn registration(
     spec: &DaemonSpec,
     id: &Identity,
     host: &dyn Fn() -> Result<HostCommand, Error>,
-) -> Result<ScmRegistration, Error> {
-    refuse_task(spec)?;
-    let host = resolve_host(spec, host)?;
-    build(spec, id, host.as_ref())
+) -> Result<WindowsDefinition, Error> {
+    definition(spec, id, host, false)
 }
 
-/// The service in `spec`; a task is refused until the Windows service manager runs tasks. Asked
-/// before the host is, so a task never reaches the host's own failures.
-fn refuse_task(spec: &DaemonSpec) -> Result<&ServiceSpec, Error> {
+/// The one entry of both generators: matches the spec once. `for_install` judges a service's host
+/// path too.
+fn definition(
+    spec: &DaemonSpec,
+    id: &Identity,
+    host: &dyn Fn() -> Result<HostCommand, Error>,
+    for_install: bool,
+) -> Result<WindowsDefinition, Error> {
     match spec {
-        DaemonSpec::Service(service) => Ok(service),
-        DaemonSpec::Task(_) => Err(cannot_run_tasks("the Windows service manager", &spec.common().id)),
+        DaemonSpec::Service(service) => {
+            let host = if hosted(spec) { Some(host()?) } else { None };
+            if for_install && let Some(host) = &host {
+                refuse_unwritable_executable(&service.common.id, ExecutablePath::ServiceHost, &host.exe)?;
+            }
+            build(spec, service, id, host.as_ref()).map(WindowsDefinition::Service)
+        }
+        DaemonSpec::Task(_) => TaskXml::new(spec, host()?).map(WindowsDefinition::Task),
     }
 }
 
@@ -181,22 +215,19 @@ pub(crate) fn hosted(spec: &DaemonSpec) -> bool {
     }
 }
 
-/// The host `spec` is installed with: asked for once, and only for a [`hosted`] service.
-fn resolve_host(
+/// The service registration of `spec`, which is the service `s`, for the `host` its [`hosted`]-ness
+/// asks for.
+fn build(
     spec: &DaemonSpec,
-    host: &dyn Fn() -> Result<HostCommand, Error>,
-) -> Result<Option<HostCommand>, Error> {
-    if hosted(spec) { host().map(Some) } else { Ok(None) }
-}
-
-/// [`registration`] for a `host` already resolved by [`resolve_host`].
-fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
+    s: &ServiceSpec,
+    id: &Identity,
+    host: Option<&HostCommand>,
+) -> Result<ScmRegistration, Error> {
     debug_assert_eq!(
         host.is_some(),
-        hosted(spec),
-        "a hosted spec's host is resolved before it is built, and only a hosted spec's"
+        s.protocol == Protocol::Plain,
+        "a hosted service's host is resolved before it is built, and only a hosted service's"
     );
-    let s = refuse_task(spec)?;
     // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
     // for a hosted one.
     let (executable, arguments, environment) = match host {
@@ -284,18 +315,14 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
 /// host's path would be written as another path. The path is the host's, not the daemon's, so this is
 /// the install's refusal and not the rendering's: `list` and `status` render every daemon, and must
 /// not report one as having an unusable embedded spec because of where goetia itself is installed.
-/// A `protocol: native` daemon never runs the host, so its path is not judged.
+/// A `protocol: native` daemon never runs the host, so its path is not judged, and a task's host
+/// path goes into the task's XML, which has no writer to rewrite it.
 pub fn install_registration(
     spec: &DaemonSpec,
     id: &Identity,
     host: &dyn Fn() -> Result<HostCommand, Error>,
-) -> Result<ScmRegistration, Error> {
-    let s = refuse_task(spec)?;
-    let host = resolve_host(spec, host)?;
-    if let Some(host) = &host {
-        refuse_unwritable_executable(&s.common.id, ExecutablePath::ServiceHost, &host.exe)?;
-    }
-    build(spec, id, host.as_ref())
+) -> Result<WindowsDefinition, Error> {
+    definition(spec, id, host, true)
 }
 
 /// What makes `windows-service` wrap an argument in quotes (an empty one is wrapped too), each with
@@ -410,7 +437,7 @@ pub fn canonical_account(resolved: &str) -> Option<String> {
 /// `canonical_account` has already run. `every_canonical_builtin_needs_no_password`
 /// additionally pins that composing the two always answers `false` for
 /// every built-in spelling, which is what `manager::apply`'s password gate
-/// and `grant_service_logon_right`'s skip both depend on.
+/// and the logon-right grant's skip both depend on.
 ///
 /// `NT SERVICE\<id>` accounts are not in `windows_builtin`'s table — they
 /// are virtual per-service accounts, not built-ins — so they are checked

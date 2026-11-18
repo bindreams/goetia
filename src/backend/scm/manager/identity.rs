@@ -1,15 +1,16 @@
-//! Windows account resolution and `SeServiceLogonRight` provisioning.
+//! Windows account resolution and logon-right provisioning.
 //!
 //! Identity resolution is effectful (`spec::User -> backend::Identity`): a
 //! Windows SID needs `LookupAccountSidW`, so it cannot happen inside the
 //! pure generator (`generate::registration`) — see the crate-level design
 //! notes on this (`backend::Identity`'s doc comment).
 //!
-//! **A real account needs `SeServiceLogonRight`.** `CreateServiceW` succeeds
-//! without it, and the service's first start then fails with error 1069
-//! (`ERROR_LOGON_FAILURE`) — install reports success, boot fails silently.
-//! `sc.exe` does not grant this either. [`grant_service_logon_right`] grants
-//! it via `LsaAddAccountRights`, idempotently (adding a right an account
+//! **A real account needs a logon right.** `CreateServiceW` succeeds
+//! without `SeServiceLogonRight`, and the service's first start then fails with error 1069
+//! (`ERROR_LOGON_FAILURE`) — install reports success, boot fails silently. A task's
+//! first start without `SeBatchLogonRight` starts nothing and raises nothing.
+//! `sc.exe` does not grant either. [`grant_logon_right`] grants
+//! one via `LsaAddAccountRights`, idempotently (adding a right an account
 //! already has is not an error) — `LocalSystem` is exempt (see `resolve`'s
 //! caller in `manager.rs`), and neither reference repo (`hole`, `wsm`) has
 //! solved this for any other account.
@@ -26,11 +27,10 @@ use windows_sys::Win32::Security::{
     LookupAccountNameW, LookupAccountSidW, PSID, SidTypeAlias, SidTypeComputer, SidTypeDeletedAccount, SidTypeDomain,
     SidTypeGroup, SidTypeLabel, SidTypeLogonSession, SidTypeUser, SidTypeWellKnownGroup,
 };
-use windows_sys::core::w;
 
 use crate::backend::Identity;
 use crate::backend::scm::sid::{Sid, copy_sid, is_whole_sid, sid_display};
-use crate::backend::scm::wide::{units_until_nul, wide_null};
+use crate::backend::scm::wide::wide_null;
 use crate::error::{BoxError, Error, Result};
 use crate::spec::{AccountId, User};
 
@@ -136,7 +136,15 @@ fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
 
 /// The SID a `user.id` string spells, the account's name, and its `SID_NAME_USE`.
 fn resolve_sid_string(sid_str: &str) -> Result<(Sid, String, i32)> {
-    let parse = || format!("parse {} as a SID string", subject(Some("user.id"), "SID", sid_str));
+    let sid = sid_from_string(sid_str, Some("user.id"))?;
+    let (name, use_) = lookup_account_sid(sid.as_ptr() as PSID, Some("user.id"), || sid_str.to_string())?;
+    Ok((sid, name, use_))
+}
+
+/// The SID that `sid_str` spells (`S-1-5-32-544`), by `ConvertStringSidToSidW`: no account is looked up,
+/// so the SID of a deleted account is still a SID. `field` is the spec field it came from, if any.
+fn sid_from_string(sid_str: &str, field: Option<&str>) -> Result<Sid> {
+    let parse = || format!("parse {} as a SID string", subject(field, "SID", sid_str));
     let wide_sid = wide_null(sid_str).map_err(|e| refused_input(parse(), e))?;
     let mut psid: PSID = std::ptr::null_mut();
     // SAFETY: `wide_sid` is a valid null-terminated wide string; `psid` is a
@@ -153,9 +161,17 @@ fn resolve_sid_string(sid_str: &str) -> Result<(Sid, String, i32)> {
     unsafe {
         LocalFree(psid);
     }
-    let sid = sid.expect("ConvertStringSidToSidW writes a valid SID");
-    let (name, use_) = lookup_account_sid(sid.as_ptr() as PSID, Some("user.id"), || sid_str.to_string())?;
-    Ok((sid, name, use_))
+    Ok(sid.expect("ConvertStringSidToSidW writes a valid SID"))
+}
+
+/// The SID of the account a task's stored principal names, as Task Scheduler stores it: a SID string as
+/// the SID it spells, anything else as an account name, looked up. An error when a name names no account.
+pub(in crate::backend::scm) fn sid_of_principal(principal: &str) -> Result<Sid> {
+    if principal.starts_with("S-1-") {
+        sid_from_string(principal, None)
+    } else {
+        sid_for_account_name(principal, None).map(|(sid, _kind)| sid)
+    }
 }
 
 /// The domain-qualified name of the account a binary SID names. An error when the bytes are not
@@ -346,6 +362,13 @@ pub struct UserSid {
     account: String,
 }
 
+impl UserSid {
+    /// The SID of the account.
+    pub fn sid(&self) -> &Sid {
+        &self.sid
+    }
+}
+
 /// The account of a spec, as the user wrote it.
 #[derive(Clone, Copy, Debug)]
 pub enum Written<'a> {
@@ -388,7 +411,7 @@ pub fn require_user_account(account: &str, written: Option<Written>) -> Result<U
     })
 }
 
-// SeServiceLogonRight =================================================================================================
+// Logon rights ========================================================================================================
 
 fn nt_error(context: &str, status: i32) -> Error {
     // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS` value and
@@ -397,16 +420,37 @@ fn nt_error(context: &str, status: i32) -> Error {
     Error::os(context, std::io::Error::from_raw_os_error(win32 as i32))
 }
 
-/// Grant `user` the right to log on as a service
-/// (`SeServiceLogonRight`), via `LsaAddAccountRights`. Idempotent: an
+/// A logon right an install grants the account its daemon runs as: what the account must hold for
+/// Windows to start the daemon under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Right {
+    /// To log on as a service: a service run as a real account.
+    Service,
+    /// To log on as a batch job: a Task Scheduler task run as a real account. Without it a task's
+    /// first start starts nothing and raises nothing.
+    Batch,
+}
+
+impl Right {
+    /// The right's name, as `LsaAddAccountRights` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Right::Service => "SeServiceLogonRight",
+            Right::Batch => "SeBatchLogonRight",
+        }
+    }
+}
+
+/// Grant `user` `right`, via `LsaAddAccountRights`. Idempotent: an
 /// account that already has the right is unaffected, so this is safe to
 /// call again on a later install of the same account. `user` is the account [`require_user_account`]
 /// checked; the grant does no lookup of its own.
-pub fn grant_service_logon_right(user: &UserSid) -> Result<()> {
+pub fn grant_logon_right(user: &UserSid, right: Right) -> Result<()> {
     let UserSid {
         sid: sid_buf,
         account: account_name,
     } = user;
+    let right_name = right.name();
 
     let mut policy_handle: isize = 0;
     let object_attributes = LSA_OBJECT_ATTRIBUTES::default();
@@ -423,19 +467,18 @@ pub fn grant_service_logon_right(user: &UserSid) -> Result<()> {
     };
     if status != 0 {
         return Err(nt_error(
-            &format!("open the local security policy to grant `{account_name}` SeServiceLogonRight"),
+            &format!("open the local security policy to grant `{account_name}` {right_name}"),
             status,
         ));
     }
 
     // `LSA_UNICODE_STRING::Length`/`MaximumLength` are byte counts.
-    let right_text = w!("SeServiceLogonRight");
-    // SAFETY: `w!` yields a NUL-terminated static string.
-    let right_len = unsafe { units_until_nul(right_text) }.len();
+    let mut right_text: Vec<u16> = right_name.encode_utf16().collect();
+    let right_len = right_text.len();
     let right = LSA_UNICODE_STRING {
         Length: (right_len * 2) as u16,
-        MaximumLength: ((right_len + 1) * 2) as u16,
-        Buffer: right_text as *mut u16,
+        MaximumLength: (right_len * 2) as u16,
+        Buffer: right_text.as_mut_ptr(),
     };
 
     // SAFETY: `policy_handle` was just opened with `POLICY_CREATE_ACCOUNT`;
@@ -450,10 +493,7 @@ pub fn grant_service_logon_right(user: &UserSid) -> Result<()> {
     }
 
     if add_status != 0 {
-        return Err(nt_error(
-            &format!("grant `{account_name}` SeServiceLogonRight"),
-            add_status,
-        ));
+        return Err(nt_error(&format!("grant `{account_name}` {right_name}"), add_status));
     }
     Ok(())
 }

@@ -12,8 +12,12 @@ pub use crate::backend::scm::shim::standalone::StandaloneShim;
 #[cfg(windows)]
 pub use crate::backend::scm::shim::sweep::SweepFailure;
 
-/// The shim's entry point: hands control to SCM and never returns. On every other platform it
-/// prints that the shim is Windows-only and exits 1.
+/// The shim's entry point: never returns. On Windows it runs as a service host and hands control to
+/// SCM, unless the process's arguments end in `--goetia-task <id>`: Task Scheduler then started it as
+/// the action of goetia's task `<id>`, and it runs that task's program and records how the run ended.
+/// A program that calls this from its own `main` must let those two trailing arguments through
+/// its own argument parser, and leave them last. On every other platform it prints that the shim is
+/// Windows-only and exits 1.
 pub fn main() -> ! {
     #[cfg(windows)]
     crate::backend::scm::shim::run::run();

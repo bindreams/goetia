@@ -464,7 +464,7 @@ fn the_nearest_object_to_the_target_is_reported_first() {
 }
 
 #[cfg(windows)]
-pub(in crate::backend::scm::shim) mod windows {
+pub(in crate::backend::scm) mod windows {
     use super::system::{
         ObjectId, copy_sid, display_path, identity_of, is_unreadable, kernel_object_dacl, kernel_object_owner, parse,
         read_chain, resolve_target,
@@ -528,7 +528,7 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(
             matches!(
                 refusal,
-                Error::ShimFolderUnsafe {
+                Error::FolderUnsafe {
                     right: BYPASS_ACCESS_CONTROL_ON,
                     ..
                 }
@@ -568,7 +568,7 @@ pub(in crate::backend::scm::shim) mod windows {
         let exe = folder.join("host.exe");
         std::fs::write(&exe, b"x").unwrap();
 
-        let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&exe) else {
+        let Err(Error::FolderUnsafe { path, .. }) = enabled().check(&exe) else {
             panic!("a file in a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&folder));
@@ -598,7 +598,7 @@ pub(in crate::backend::scm::shim) mod windows {
     }
 
     /// A junction (no privilege needed, unlike a symlink) at `link` to the existing `target`.
-    pub(in crate::backend::scm::shim) fn junction(link: &Path, target: &Path) {
+    pub(in crate::backend::scm) fn junction(link: &Path, target: &Path) {
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(link)
@@ -799,7 +799,7 @@ pub(in crate::backend::scm::shim) mod windows {
         let dir = tempfile::tempdir().unwrap();
         let target = world_writable_folder(dir.path());
 
-        let Err(Error::ShimFolderUnsafe { path, account, right }) = enabled().check(&target) else {
+        let Err(Error::FolderUnsafe { path, account, right }) = enabled().check(&target) else {
             panic!("a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&target));

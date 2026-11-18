@@ -23,6 +23,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::*;
+use crate::backend::scm::shim::run::os::Parents;
 use crate::backend::scm::shim::run::os::fake::{
     FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, tree_kill_refused,
     wait_failed, wait_failed_with_code,
@@ -48,6 +49,11 @@ const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.
 /// A `protocol: plain` daemon. Nothing runs it: the `Fake` states what happens to it, and opens its
 /// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
+    spec_logging_to(Some(PathBuf::from(DAEMON_LOG)))
+}
+
+/// [`spec`], with the `logs:` that is given.
+fn spec_logging_to(logs: Option<PathBuf>) -> DaemonSpec {
     let command = [
         POWERSHELL,
         "-NoProfile",
@@ -60,7 +66,7 @@ fn spec() -> DaemonSpec {
         ServiceFields {
             common: DaemonFields {
                 name: "goetia-shim launch test".to_string(),
-                logs: Some(PathBuf::from(DAEMON_LOG)),
+                logs,
                 ..base.common
             },
             restart: Restart::Always,
@@ -307,6 +313,56 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     drop(launched);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert!(daemon.dropped());
+}
+
+#[skuld::test]
+fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new();
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+    let log = Arc::new(Log::from_program_data(
+        fake.channels(),
+        Err(crate::error::Error::os(
+            "locate %ProgramData%",
+            std::io::Error::other("x"),
+        )),
+    ));
+    // What `from_program_data` said of itself.
+    assert_eq!(fake.take_failures().len(), 1);
+
+    let launched = launch(&spec_logging_to(None), &Supervisor::new(fake.os(), log), ID);
+
+    assert!(launched.is_ok(), "a daemon with nowhere to log was not run");
+    assert_one_failure(&fake.take_failures(), ID, NO_LOG_FILE);
+    assert_eq!(fake.calls(Op::Spawn), 1);
+
+    // The un-handed waiter ends on drop; consume its end.
+    drop(launched);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
+/// A service's output goes where its `logs:` says, whose folders are the user's own to name and are made;
+/// with no `logs:` it goes to the default log, whose folder an elevated install made and the shim, which
+/// runs as the service's account, makes no folder for.
+#[skuld::test]
+fn the_daemons_log_has_its_folders_made_only_when_it_is_the_users_own() {
+    for (logs, parents) in [
+        (Some(PathBuf::from(DAEMON_LOG)), Parents::Create),
+        (None, Parents::Never),
+    ] {
+        let fake = FakeGuard::new();
+        let daemon = FakeProcess::new();
+        fake.will_make_thread();
+        fake.will_spawn(daemon.clone());
+
+        let launched = launch(&spec_logging_to(logs.clone()), &supervisor(&fake), ID);
+
+        assert!(launched.is_ok(), "{logs:?}");
+        assert_eq!(fake.opened_log_parents(0), parents, "{logs:?}");
+        drop(launched);
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    }
 }
 
 // run_daemon ==========================================================================================================
@@ -569,6 +625,95 @@ fn a_clean_exit_whose_tree_is_terminated_is_clean() {
     assert_eq!(reported, Reported::Clean);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
+/// What a pass ended as, for one way a pass can end: the process the fake spawns (`None`: the
+/// spawn is refused), whether a stop is requested once the daemon is running, and the outcome the
+/// pass must have and the report SCM must be told for it.
+struct Ending {
+    spawn: fn() -> Option<FakeProcess>,
+    stop: bool,
+    outcome: PassOutcome,
+    reported: Reported,
+}
+
+fn endings() -> Vec<Ending> {
+    fn tree_ends(process: FakeProcess) -> Option<FakeProcess> {
+        Some(process.send_kill_tree(KillReply::Ends))
+    }
+    vec![
+        Ending {
+            spawn: || tree_ends(FakeProcess::new().exited(7)),
+            stop: false,
+            outcome: PassOutcome::Exited(Some(7)),
+            reported: Reported::DaemonExit(7),
+        },
+        Ending {
+            spawn: || tree_ends(FakeProcess::new().exited(0)),
+            stop: false,
+            outcome: PassOutcome::Exited(Some(0)),
+            reported: Reported::Clean,
+        },
+        Ending {
+            spawn: || Some(FakeProcess::running()),
+            stop: true,
+            outcome: PassOutcome::Stopped,
+            reported: Reported::Clean,
+        },
+        Ending {
+            spawn: || tree_ends(FakeProcess::new().wait(WaitReply::Fails(Some(5)))),
+            stop: false,
+            outcome: PassOutcome::WaitFailed(Some(5)),
+            reported: Reported::shim_failure(Some(5)),
+        },
+        Ending {
+            spawn: || None,
+            stop: false,
+            outcome: PassOutcome::NotRun(Reported::shim_failure(Some(ERROR_FILE_NOT_FOUND as i32))),
+            reported: Reported::shim_failure(Some(ERROR_FILE_NOT_FOUND as i32)),
+        },
+    ]
+}
+
+/// One pass over a fresh `Fake` set up as `ending` says, with `pass` run on it.
+fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) -> T) -> T {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    match (ending.spawn)() {
+        Some(process) => fake.will_spawn(process),
+        None => fake.will_refuse_spawn(not_found()),
+    }
+    let stop = ending.stop;
+    let bus = Arc::clone(&supervisor.bus);
+    let mut on_running = move || {
+        if stop {
+            assert!(bus.request_stop());
+        }
+    };
+    let passed = pass(&supervisor, &mut on_running);
+    // The failures a pass logs are the same in both, and pinned by the tests that provoke them.
+    let _ = fake.take_failures();
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    passed
+}
+
+/// `run_daemon` is `run_pass` with its outcome turned into what SCM is told, however a pass ends,
+/// so the task mode that reads the outcome and the service that reads the report see one pass.
+#[skuld::test]
+fn run_daemon_is_run_pass_then_reported() {
+    for ending in endings() {
+        let outcome = pass_of(&ending, |supervisor, on_running| {
+            run_pass(&spec(), supervisor, ID, on_running, || {})
+        });
+        let reported = pass_of(&ending, |supervisor, on_running| {
+            super::run_daemon(&spec(), supervisor, ID, on_running, || {})
+        });
+
+        assert_eq!(outcome, ending.outcome);
+        assert_eq!(outcome.reported(), ending.reported);
+        assert_eq!(reported, ending.reported);
+    }
 }
 
 // STOP_PENDING --------------------------------------------------------------------------------------------------------
