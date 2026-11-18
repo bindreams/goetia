@@ -87,14 +87,14 @@ impl Drop for Marked {
 }
 
 extern "C" fn stand_in(signal: libc::c_int) {
-    // Before the count, so that a test that waits for the count finds this set. `pthread_self` is
-    // async-signal-safe.
+    // The count is the last write: a test that waits on another thread for the count to leave zero then
+    // finds every other fact of this run set. `pthread_self` is async-signal-safe.
     // SAFETY: `pthread_self` has no preconditions.
     if MARKED_THREAD.load(Ordering::SeqCst) == unsafe { libc::pthread_self() } {
         SEEN_ON_MARKED.store(true, Ordering::SeqCst);
     }
-    SEEN.fetch_add(1, Ordering::SeqCst);
     SEEN_BITS.fetch_or(1 << signal, Ordering::SeqCst);
+    SEEN.fetch_add(1, Ordering::SeqCst);
 }
 
 fn stand_in_address() -> libc::sighandler_t {
@@ -201,12 +201,6 @@ fn readable(fd: RawFd) -> bool {
     ready == 1 && asked.revents & libc::POLLIN != 0
 }
 
-/// Whether `fd` is an open descriptor of this process.
-fn is_open(fd: RawFd) -> bool {
-    // SAFETY: `fcntl` with `F_GETFD` only reads the descriptor's flags.
-    unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
-}
-
 fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().expect("an OS error")
 }
@@ -232,7 +226,8 @@ impl Drop for Planted {
     }
 }
 
-/// A handler stood in for as running: [`IN_FLIGHT`] counts it until this drops.
+/// A handler stood in for as running: [`IN_FLIGHT`] counts it until this drops. `IN_FLIGHT` is process-wide,
+/// so a test that does this takes `SERIAL`, as every test that opens a window does.
 struct Running;
 
 impl Running {
@@ -483,32 +478,57 @@ fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
 
 /// The last drop un-publishes the write end and then waits for a handler that is running before it closes
 /// the pipe, so a handler never writes to a closed descriptor. A running handler is stood in for by a count
-/// that the test holds; the drop is observed at its un-publishing, which is a fact of the state and not a
-/// wait of a chosen length.
+/// that the test holds, and the window's pipe reports how its close went ([`test_hook::Probe`]): the wait
+/// loop reports each pass, and the pipe reports its own drop, wherever that is. The test waits for the
+/// close to leave idle, or for the closing thread to end, which it must not do. A close that waits is
+/// waiting with the pipe open and the descriptor un-published; a close that does not wait, or drops the
+/// pipe before it, is in another state, whatever the schedule. After the handler is out, the pipe is closed,
+/// after the wait.
 #[skuld::test]
 fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
+    use test_hook::Closing::{Idle, Waiting};
+
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
-    let wake = deferred.wake();
+    let probe = SHARED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .open
+        .as_ref()
+        .expect("the window is open")
+        .wake
+        .probe
+        .clone();
     let mut closing = Joined::default();
     let running = Running::enter();
 
     closing.0 = Some(std::thread::spawn(move || drop(deferred)));
-    // The closing thread must block while the handler runs: it ending at all, with or without a panic, is
-    // the failure, and ends the wait rather than hanging it.
-    while WAKE.load(Ordering::SeqCst) != -1 {
+    // A close that waits leaves idle before the thread can end: a thread that has ended with the close
+    // still idle never waited and never closed.
+    while probe.state() == Idle {
         if closing.ended() {
             closing.fail("the closing thread ended while a handler was running");
         }
         std::thread::yield_now();
     }
-    if closing.ended() {
-        closing.fail("the closing thread ended while a handler was running");
-    }
-    assert!(is_open(wake), "a handler is running, so the pipe is still open");
+    assert_eq!(
+        WAKE.load(Ordering::SeqCst),
+        -1,
+        "the write end is un-published before the wait"
+    );
+    assert_eq!(
+        probe.state(),
+        Waiting,
+        "a handler is running, so the close waits with the pipe open"
+    );
 
     drop(running);
     closing.finish();
+    assert_eq!(
+        probe.state(),
+        test_hook::Closing::ClosedAfterWait,
+        "the pipe is closed after the wait"
+    );
     before.assert_back();
 }
 
