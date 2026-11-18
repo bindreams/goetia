@@ -45,17 +45,16 @@
 //!
 //! # The time of day
 //!
-//! The minutes are split into groups, each an ascending progression: the longest progression that
-//! starts at the smallest minute left, until none is left. That is greedy and does not always give the
-//! fewest groups. In each hour the schedule names, a group costs:
+//! Minute 0, if the schedule names it, is a lone trigger in each hour, and costs that whether or not
+//! other minutes go with it. The other minutes are split into groups, each an ascending progression:
+//! the longest progression that starts at the smallest minute left, until none is left. That is greedy
+//! and does not always give the fewest groups. In each hour the schedule names, a group costs a lone
+//! trigger if it is one minute, else one repetition from its first minute to its last, inside the hour.
 //!
-//! - a lone trigger at minute 0, if the group has it;
-//! - for the rest of the group, a lone trigger if it is one minute, else one repetition from its first
-//!   minute to its last, inside the hour.
-//!
-//! So `*/15 * * * *` and `* * * * *` are 48 triggers (a lone `:00` and a repetition from `:15` or `:01`,
+//! So `*/15 * * * *`, `* * * * *` and `0,7,30 * * * *` are 48 triggers (a lone `:00` and a repetition,
 //! in each of 24 hours), `5,10 * * * *` and `5,10,15 * * * *` are 24, and `0 9-17 * * *` is nine lone
-//! triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused: `0-10,30 * * * *` is 72. A
+//! triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused: `0-10,30 * * * *` is 72, and
+//! so is `*/20,5 * * * *`, which would be 48 if `:00` joined the `:20` and `:40` it steps with. A
 //! repetition ends inside its day, so it never runs into a day the trigger does not name.
 
 use std::collections::BTreeSet;
@@ -154,9 +153,10 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The triggers that fire exactly when `schedule` does, one per hour for each group of minutes (see "The
-/// time of day" in the module doc). A schedule that never fires (no month of its month set has any of its days) is `[Trigger::Never]`:
-/// the result is never empty.
+/// The triggers that fire exactly when `schedule` does: in each hour, a lone trigger for minute 0 if the
+/// schedule names it, and one trigger for each group of the other minutes (see "The time of day" in the
+/// module doc). A schedule that never fires (no month of its month set has any of its days) is
+/// `[Trigger::Never]`: the result is never empty.
 ///
 /// Refused with [`Error::Invalid`] for `id`: a day of the month and a day of the week that must both
 /// match, with neither full (Task Scheduler's day forms are either-or); a day of the month and a day
@@ -272,26 +272,23 @@ struct Time {
     repeat: Option<Repeat>,
 }
 
-/// The triggers of each group of `minutes` in each hour of `hours`: a lone trigger for minute 0, if the
-/// group has it, then for the rest of the group a lone trigger for one minute or a repetition inside the
-/// hour from its first minute to its last.
+/// The triggers of `minutes` in each hour of `hours`: a lone trigger for minute 0, if `minutes` has it,
+/// then for each group of the other minutes a lone trigger for one minute or a repetition inside the hour
+/// from its first minute to its last.
 fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     let mut times = Vec::new();
-    for group in groups(minutes) {
-        let rest = match group.split_first() {
-            Some((0, rest)) => {
-                times.extend(hours.iter().map(|&hour| Time {
-                    at: (hour, 0),
-                    repeat: None,
-                }));
-                rest
-            }
-            _ => &group[..],
-        };
-        let Some((&first, &last)) = rest.first().zip(rest.last()) else {
+    if minutes.contains(&0) {
+        times.extend(hours.iter().map(|&hour| Time {
+            at: (hour, 0),
+            repeat: None,
+        }));
+    }
+    let rest: BTreeSet<u8> = minutes.iter().copied().filter(|&minute| minute != 0).collect();
+    for group in groups(&rest) {
+        let (Some(&first), Some(&last)) = (group.first(), group.last()) else {
             continue;
         };
-        let repeat = rest.get(1).map(|second| Repeat {
+        let repeat = group.get(1).map(|second| Repeat {
             every_minutes: u32::from(second - first),
             for_minutes: u32::from(last - first),
         });

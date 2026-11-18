@@ -266,6 +266,23 @@ fn minute_zero_of_a_group_is_a_lone_trigger_and_the_repetition_starts_after_it()
     );
 }
 
+/// Minute 0 is taken out before the rest is grouped, so it never pairs with a minute that a progression
+/// through 0 would have taken from the rest.
+#[skuld::test]
+fn minute_zero_does_not_strand_the_rest_of_its_progression() {
+    // 0, 7, 30 is a progression of step 7 or 30 through 0; without 0 the 7 and the 30 are one repetition.
+    assert_eq!(
+        triggers("0,7,30 * * * *"),
+        lone_zero_then_repeat(0..24, 7, repeat(23, 23))
+    );
+    assert_eq!(triggers("0,7,30 * * * *").len(), TRIGGER_LIMIT);
+    assert_eq!(
+        triggers("0,1,3,5 * * * *"),
+        lone_zero_then_repeat(0..24, 1, repeat(2, 4))
+    );
+    assert_eq!(triggers("0,1,3,5 * * * *").len(), TRIGGER_LIMIT);
+}
+
 #[skuld::test]
 fn a_progression_is_one_repetition_inside_each_hour() {
     assert_eq!(
