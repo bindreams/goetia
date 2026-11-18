@@ -463,7 +463,10 @@ impl Status {
 }
 
 /// How a task's run ended: the code the program exited with, or the signal that killed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as `{"code": n}` or `{"signal": n}`, the `--json` form of `last-result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Exit {
     Code(i32),
     Signal(i32),

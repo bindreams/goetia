@@ -96,6 +96,11 @@ crossbeam-channel = "0.5.17"
 # The host name that seeds `H` in a task's `schedule` (`spec::schedule`).
 gethostname = "1.1.0"
 humantime = "2"
+# The times `daemon status` and `daemon list` print, RFC 3339 in the system time zone (`cli::report`); and on
+# macOS `backend::launchd::next`, the next fire of a task's calendar entries in that zone, which `launchd`
+# (calendar intervals only, no next-fire query) cannot tell, with zones read from `/etc/localtime`'s bytes.
+# The default features bundle a zone database where the host has none (Windows).
+jiff = "0.2.43"
 # The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
 # costs one fast pass.
 memchr = "2"
@@ -134,10 +139,6 @@ nix = { version = "0.31", features = ["fs", "dir", "user"] }
 # CLI's own optional deps are pulled in.
 libc = "0.2"
 nix = { version = "0.31", features = ["user", "fs", "dir", "event"] }
-# `backend::launchd::next`: the next fire of a task's calendar entries in the system time zone, which
-# `launchd` (calendar intervals only, no next-fire query) cannot tell. Zones are read from
-# `/etc/localtime`'s bytes.
-jiff = "0.2.43"
 
 [target.'cfg(windows)'.dependencies]
 # The real SCM backend (`src/backend/scm/manager.rs`). Not `optional`/`cli`-gated:
@@ -210,9 +211,6 @@ libsearch-guard.workspace = true
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
-# `backend::launchd::next`'s tests, on every host: the default features bundle a zone database where the
-# host has none (Windows).
-jiff = "0.2.43"
 libsearch-guard.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]

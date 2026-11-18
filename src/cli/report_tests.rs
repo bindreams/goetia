@@ -1,4 +1,10 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use jiff::tz::{Offset, TimeZone};
+
 use super::*;
+use crate::manager::{DaemonStatus, Exit, State, TaskStatus};
+use crate::spec::DaemonKind;
 
 fn report(kinds: &[Kind]) -> Report {
     Report {
@@ -28,9 +34,13 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
     let report = Report {
         daemons: vec![DaemonReport {
             id: "frpc".to_string(),
+            kind: DaemonKind::Service,
             state: "running",
             enabled: true,
             pid: Some(1234),
+            last_result: None,
+            last_run: None,
+            next_run: None,
         }],
         errors: vec![ErrorReport::said(
             Some("corrupt".to_string()),
@@ -47,7 +57,8 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
     assert_eq!(
         text,
         concat!(
-            r#"{"daemons":[{"id":"frpc","state":"running","enabled":true,"pid":1234}],"#,
+            r#"{"daemons":[{"id":"frpc","type":"service","state":"running","enabled":true,"pid":1234,"#,
+            r#""last-result":null,"last-run":null,"next-run":null}],"#,
             r#""errors":[{"id":"corrupt","kind":"unusable","message":"why"}],"#,
             r#""undetermined":[]}"#,
             "\n"
@@ -333,4 +344,213 @@ fn every_rendering_of_an_unusable_entry_has_the_same_prefix_and_reason() {
         assert_eq!(String::from_utf8(err).unwrap(), format!("error: x: {message}\n"));
         assert_eq!(String::from_utf8(warn).unwrap(), format!("warning: x: {message}\n"));
     }
+}
+
+// Daemons =============================================================================================================
+
+/// 2026-01-15T12:00:00Z.
+const NOON: u64 = 1_768_478_400;
+
+fn at(seconds: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+fn zone(offset_seconds: i32) -> TimeZone {
+    Offset::from_seconds(offset_seconds)
+        .expect("an offset in range")
+        .to_time_zone()
+}
+
+fn common(state: State, pid: Option<u32>, enabled: bool) -> DaemonStatus {
+    DaemonStatus { state, pid, enabled }
+}
+
+fn task_status(
+    common: DaemonStatus,
+    last_result: Option<Exit>,
+    last_run: Option<SystemTime>,
+    next_run: Option<SystemTime>,
+) -> Status {
+    Status::Task(TaskStatus {
+        common,
+        last_result,
+        last_run,
+        next_run,
+    })
+}
+
+/// The document of one daemon, as `status` and `list` write it.
+fn document(status: &Status) -> serde_json::Value {
+    serde_json::to_value(daemon_in("job", status, &TimeZone::UTC)).expect("a DaemonReport serializes infallibly")
+}
+
+/// One shape for every daemon: a consumer reads the same keys of a service and of a task.
+#[skuld::test]
+fn a_service_entry_carries_type_service_and_null_task_fields() {
+    let status = Status::Service(common(State::Running, Some(1234), true));
+
+    let json = serde_json::to_string(&daemon_in("frpc", &status, &TimeZone::UTC)).unwrap();
+
+    assert_eq!(
+        json,
+        concat!(
+            r#"{"id":"frpc","type":"service","state":"running","enabled":true,"pid":1234,"#,
+            r#""last-result":null,"last-run":null,"next-run":null}"#
+        )
+    );
+}
+
+#[skuld::test]
+fn a_task_that_never_ran_is_idle_with_null_results() {
+    let status = task_status(common(State::Idle, None, false), None, None, None);
+
+    let json = serde_json::to_string(&daemon_in("job", &status, &TimeZone::UTC)).unwrap();
+
+    assert_eq!(
+        json,
+        concat!(
+            r#"{"id":"job","type":"task","state":"idle","enabled":false,"pid":null,"#,
+            r#""last-result":null,"last-run":null,"next-run":null}"#
+        )
+    );
+}
+
+#[skuld::test]
+fn a_finished_task_run_shows_code_signal_and_times() {
+    for (exit, expected) in [
+        (Exit::Code(3), serde_json::json!({"code": 3})),
+        (Exit::Signal(15), serde_json::json!({"signal": 15})),
+        // A Windows `stop`: `TERMINATED`, `0xC000013A`, as the signed 32-bit value.
+        (Exit::Code(-1_073_741_510), serde_json::json!({"code": -1_073_741_510})),
+    ] {
+        let status = task_status(common(State::Idle, None, true), Some(exit), None, None);
+        assert_eq!(document(&status)["last-result"], expected, "for {exit}");
+    }
+
+    // A time is RFC 3339 with the zone's offset, to the second: the fraction is dropped.
+    let started = at(NOON) + Duration::from_millis(999);
+    let status = task_status(
+        common(State::Idle, None, true),
+        Some(Exit::Code(0)),
+        Some(started),
+        Some(at(NOON + 3600)),
+    );
+    for (offset, last_run, next_run) in [
+        (-5 * 3600, "2026-01-15T07:00:00-05:00", "2026-01-15T08:00:00-05:00"),
+        (19_800, "2026-01-15T17:30:00+05:30", "2026-01-15T18:30:00+05:30"),
+        (0, "2026-01-15T12:00:00+00:00", "2026-01-15T13:00:00+00:00"),
+    ] {
+        let json = serde_json::to_value(daemon_in("job", &status, &zone(offset))).unwrap();
+        assert_eq!(json["last-run"], last_run);
+        assert_eq!(json["next-run"], next_run);
+    }
+}
+
+/// The production path formats in the host's zone, not UTC: `daemon` is `daemon_in` with the system zone.
+#[skuld::test]
+fn a_timestamp_is_formatted_in_the_system_zone() {
+    let status = task_status(common(State::Idle, None, true), None, Some(at(NOON)), None);
+
+    let production = daemon("job", &status);
+
+    let system = TimeZone::system();
+    let instant = jiff::Timestamp::from_second(NOON as i64).unwrap();
+    assert_eq!(
+        production.last_run.as_deref(),
+        Some(
+            instant
+                .display_with_offset(system.to_offset(instant))
+                .to_string()
+                .as_str()
+        )
+    );
+}
+
+/// systemd: the journal's newest run has no terminal entry while the run is in flight, so `last-result` is
+/// null, and `last-run` is that run's start.
+#[skuld::test]
+fn a_systemd_shaped_run_in_flight_has_last_run_and_null_last_result() {
+    let status = task_status(
+        common(State::Running, Some(77), true),
+        None,
+        Some(at(NOON)),
+        Some(at(NOON + 60)),
+    );
+
+    let json = document(&status);
+
+    assert_eq!(json["state"], "running");
+    assert_eq!(json["pid"], 77);
+    assert_eq!(json["last-result"], serde_json::Value::Null);
+    assert_eq!(json["last-run"], "2026-01-15T12:00:00+00:00");
+}
+
+/// systemd: a run the manager failed before the program exited (a resource or timeout failure) leaves no
+/// result and a start; the task is idle again.
+#[skuld::test]
+fn a_systemd_run_the_manager_failed_has_last_run_and_null_last_result() {
+    let status = task_status(
+        common(State::Idle, None, true),
+        None,
+        Some(at(NOON)),
+        Some(at(NOON + 60)),
+    );
+
+    let json = document(&status);
+
+    assert_eq!(json["state"], "idle");
+    assert_eq!(json["last-result"], serde_json::Value::Null);
+    assert_eq!(json["last-run"], "2026-01-15T12:00:00+00:00");
+}
+
+/// launchd: while a run is in flight `last-result` is still the previous run's, and `last-run` is never known.
+#[skuld::test]
+fn a_launchd_shaped_run_in_flight_shows_the_previous_runs_result_and_null_last_run() {
+    let status = task_status(
+        common(State::Running, Some(77), true),
+        Some(Exit::Code(7)),
+        None,
+        Some(at(NOON + 60)),
+    );
+
+    let json = document(&status);
+
+    assert_eq!(json["state"], "running");
+    assert_eq!(json["last-result"], serde_json::json!({"code": 7}));
+    assert_eq!(json["last-run"], serde_json::Value::Null);
+}
+
+/// A null `last-run` beside a `next-run` and a result is launchd's shape, not a fault.
+#[skuld::test]
+fn a_launchd_shaped_task_has_null_last_run_and_a_next_run() {
+    let status = task_status(
+        common(State::Idle, None, true),
+        Some(Exit::Code(0)),
+        None,
+        Some(at(NOON + 60)),
+    );
+
+    let json = document(&status);
+
+    assert_eq!(json["last-run"], serde_json::Value::Null);
+    assert_eq!(json["next-run"], "2026-01-15T12:01:00+00:00");
+    assert_eq!(json["last-result"], serde_json::json!({"code": 0}));
+}
+
+/// Windows: `LastTaskResult` reads running while a run is in flight, which is no result; `last-run` is the
+/// run's start.
+#[skuld::test]
+fn a_windows_shaped_run_in_flight_has_null_last_result_and_a_last_run() {
+    let status = task_status(
+        common(State::Running, Some(4040), true),
+        None,
+        Some(at(NOON)),
+        Some(at(NOON + 60)),
+    );
+
+    let json = document(&status);
+
+    assert_eq!(json["state"], "running");
+    assert_eq!(json["last-result"], serde_json::Value::Null);
+    assert_eq!(json["last-run"], "2026-01-15T12:00:00+00:00");
 }

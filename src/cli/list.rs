@@ -48,8 +48,9 @@ fn print_text(index: &InstalledIndex, out: &mut dyn Write, err: &mut dyn Write) 
     for (id, (spec, status)) in &index.ours {
         let _ = writeln!(
             out,
-            "{id}\t{}\t{}\tenabled={}",
+            "{id}\t{}\t{}\t{}\tenabled={}",
             spec.common().name,
+            status.kind().as_str(),
             state_str(status.common().state),
             status.common().enabled
         );

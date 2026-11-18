@@ -3,11 +3,18 @@
 //! One compact JSON object, newline-terminated, on stdout:
 //!
 //! ```json
-//! {"daemons":[{"id":"frpc","state":"running","enabled":true,"pid":1234}],"errors":[],"undetermined":[]}
+//! {"daemons":[{"id":"frpc","type":"service","state":"running","enabled":true,"pid":1234,"last-result":null,
+//! "last-run":null,"next-run":null},{"id":"backup","type":"task","state":"idle","enabled":true,"pid":null,
+//! "last-result":{"code":0},"last-run":"2026-11-18T03:30:00+02:00","next-run":"2026-11-19T03:30:00+02:00"}],
+//! "errors":[],"undetermined":[]}
 //! ```
 //!
-//! `daemons`, `errors` and `undetermined` are always present, as arrays,
-//! possibly empty. A `daemons` entry carries no `name`:
+//! (One line in the real document.) `daemons`, `errors` and `undetermined` are always present, as arrays,
+//! possibly empty. A `daemons` entry is a service or a task, told by `type`, in one shape: `last-result`,
+//! `last-run` and `next-run` are `null` on a service, and `null` on a task for what its manager does not
+//! know (no run yet, a run in flight, no armed schedule). `last-result` is `{"code": n}` or
+//! `{"signal": n}`. A time is RFC 3339 with the offset of the system time zone at that instant, to the
+//! second. A `daemons` entry carries no `name`:
 //! [`crate::manager::ServiceManager::status`] returns a [`Status`] with no
 //! spec, so only `list` could supply it, and the two subcommands must not
 //! differ in fields. `pid` is an integer or `null`; `null` means the manager
@@ -27,11 +34,16 @@
 
 use std::fmt::{self, Write as _};
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use super::ExitCode;
 use super::support::{InstalledIndex, print_line, state_str};
 use crate::error::{Chain, Error, Reason, Sink};
-use crate::manager::Status;
+use crate::manager::{Exit, Status};
+use crate::spec::DaemonKind;
 
 // Wire format =========================================================================================================
 
@@ -54,12 +66,25 @@ pub(crate) struct UndeterminedReport {
     pub reason: String,
 }
 
+/// One daemon, a service or a task, in one shape: the three task keys are `null` on a service, never
+/// absent.
 #[derive(serde::Serialize)]
 pub(crate) struct DaemonReport {
     pub id: String,
+    #[serde(rename = "type")]
+    pub kind: DaemonKind,
     pub state: &'static str,
     pub enabled: bool,
     pub pid: Option<u32>,
+    /// How the most recent finished run ended: `{"code": n}` or `{"signal": n}`.
+    #[serde(rename = "last-result")]
+    pub last_result: Option<Exit>,
+    /// When the most recent run started, as [`format_time`] writes it.
+    #[serde(rename = "last-run")]
+    pub last_run: Option<String>,
+    /// When the manager will start the task next, as [`format_time`] writes it.
+    #[serde(rename = "next-run")]
+    pub next_run: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -254,14 +279,40 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
     }
 }
 
-/// One daemon, from a successful `ServiceManager::status(&id)`.
+/// One daemon, from a successful `ServiceManager::status(&id)`, with its times in the system time zone.
 pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
+    daemon_in(id, status, &TimeZone::system())
+}
+
+/// [`daemon`] with its times in `zone`.
+pub(crate) fn daemon_in(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport {
+    let common = status.common();
+    let (last_result, last_run, next_run) = match status {
+        Status::Service(_) => (None, None, None),
+        Status::Task(task) => (task.last_result, task.last_run, task.next_run),
+    };
     DaemonReport {
         id: id.to_string(),
-        state: state_str(status.common().state),
-        enabled: status.common().enabled,
-        pid: status.common().pid,
+        kind: status.kind(),
+        state: state_str(common.state),
+        enabled: common.enabled,
+        pid: common.pid,
+        last_result,
+        last_run: last_run.map(|time| format_time(time, zone)),
+        next_run: next_run.map(|time| format_time(time, zone)),
     }
+}
+
+/// `time` as RFC 3339 with `zone`'s offset at that instant, to the second (`2026-11-18T03:30:00+02:00`).
+/// A time beyond `jiff`'s range (years -9999 to 9999), which no manager reports, is written as the nearest bound.
+fn format_time(time: SystemTime, zone: &TimeZone) -> String {
+    let instant = Timestamp::try_from(time).unwrap_or(if time < UNIX_EPOCH {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    });
+    let whole = Timestamp::from_second(instant.as_second()).expect("a whole second of a Timestamp is in range");
+    whole.display_with_offset(zone.to_offset(whole)).to_string()
 }
 
 /// Classify a failure of `ServiceManager::status(&id)` — and of nothing
