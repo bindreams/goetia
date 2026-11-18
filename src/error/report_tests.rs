@@ -4,6 +4,7 @@ use std::sync::Arc;
 use super::*;
 use crate::error::Reason;
 use crate::error::error_tests::{exit_status, id, os, undetermined};
+use crate::error::paired;
 
 /// A remedy is its own sentence: it follows a period the words before it already ended with, and
 /// supplies one when they did not.
@@ -349,6 +350,95 @@ fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
     let text = Error::spawn("tool", cosca_error()).report().to_string();
 
     assert_eq!(text, format!("failed to run `tool`: {expected}"));
+}
+
+// The rule ------------------------------------------------------------------------------------------------------------
+
+/// What a standard printer shows of `e`: its `Display`, then each error down its `source()` chain.
+fn standard_print(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = e.to_string();
+    let mut next = e.source();
+    while let Some(source) = next {
+        text.push_str(": ");
+        text.push_str(&source.to_string());
+        next = source.source();
+    }
+    text
+}
+
+/// A composite renders the errors it holds in its own `Display` and returns none of them from
+/// `source()`, so a walker that follows `source()` and prints each `Display` shows every failure
+/// once.
+#[skuld::test]
+fn a_standard_printer_shows_each_failure_of_a_composite_once() {
+    let both = Error::Both {
+        first: Box::new(os("read", "/p", "first failure")),
+        then: Box::new(os("write", "/q", "then failure")),
+    };
+    let nested = Error::Both {
+        first: Box::new(Error::Both {
+            first: Box::new(os("read", "/p", "first failure")),
+            then: Box::new(os("write", "/q", "then failure")),
+        }),
+        then: Box::new(os("stat", "/r", "last failure")),
+    };
+    let pair = paired(
+        std::io::Error::other("primary failure"),
+        "and then",
+        std::io::Error::other("second failure"),
+    );
+    let blob = Error::StartAsManaged {
+        blob: Arc::new(Error::blob_from("unreadable", std::io::Error::other("blob failure"))),
+        source: Box::new(os("start", "/s", "start failure")),
+    };
+    let loaded = Error::LoadedStateInDoubt {
+        id: id(),
+        read_failed: Box::new(os("read", "/t", "read failure")),
+        restore_failed: Some(Box::new(os("write", "/u", "restore failure"))),
+    };
+    let shown: [(&(dyn std::error::Error + 'static), &[&str]); 5] = [
+        (&both, &["first failure", "then failure"]),
+        (&nested, &["first failure", "then failure", "last failure"]),
+        (&pair, &["primary failure", "second failure"]),
+        (&blob, &["blob failure", "start failure"]),
+        (&loaded, &["read failure", "restore failure"]),
+    ];
+    for (e, failures) in shown {
+        let text = standard_print(e);
+        for failure in failures {
+            assert_eq!(text.matches(failure).count(), 1, "`{failure}` in {text}");
+        }
+    }
+}
+
+/// `Both` renders both its halves, first first, and has no `source()` of its own.
+#[skuld::test]
+fn a_boths_display_is_its_two_halves() {
+    let both = Error::Both {
+        first: Box::new(os("read", "/p", "first failure")),
+        then: Box::new(undetermined("re-run as root")),
+    };
+    assert_eq!(
+        both.to_string(),
+        "failed to read /p: first failure; then: cannot determine whether daemon `x` is installed: failed to read /p: denied"
+    );
+    assert!(std::error::Error::source(&both).is_none());
+}
+
+/// A sentence variant's source is another error than the one in its sentence: both are written, the
+/// sentence first.
+#[skuld::test]
+fn a_sentence_with_a_source_prints_the_sentence_then_the_source() {
+    let e = Error::StartAsManaged {
+        blob: Arc::new(os("read", "/p", "blob failure")),
+        source: Box::new(os("start", "/q", "start failure")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        format!("{e}: failed to start /q: start failure")
+    );
+    assert!(e.to_string().contains("blob failure"));
+    assert!(!e.to_string().contains("start failure"));
 }
 
 // os_error_in ---------------------------------------------------------------------------------------------------------

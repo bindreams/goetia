@@ -1316,6 +1316,58 @@ fn the_os_error_inside_any_payload_of_an_io_error_is_found() {
     );
 }
 
+/// The search looks at an error, then at its `source()` chain, then at the errors its own text
+/// embeds as causes.
+#[skuld::test]
+fn the_os_error_of_a_source_is_found_before_that_of_an_embedded_error() {
+    let e = Error::StartAsManaged {
+        blob: Arc::new(os_code(9)),
+        source: Box::new(os_code(10)),
+    };
+    assert_eq!(e.raw_os_error(), Some(10));
+}
+
+/// A failed attempt to end a process, which a timeout's text only mentions, is not what the timeout is.
+#[skuld::test]
+fn the_os_error_of_an_error_a_sentence_only_mentions_is_not_found() {
+    let timeout = |terminate_failed| Error::ProcessWaitTimeout {
+        id: "x".to_string(),
+        pid: 1,
+        waited: Duration::ZERO,
+        terminate_failed,
+        recovery: "wait".to_string(),
+    };
+    let failed = Arc::new(std::io::Error::from_raw_os_error(5));
+    assert!(
+        timeout(Some(Arc::clone(&failed)))
+            .to_string()
+            .contains("terminating it failed")
+    );
+    assert_eq!(timeout(Some(failed)).raw_os_error(), None);
+}
+
+/// The primary failure of a pair is the pair's cause, and the second only told after it.
+#[skuld::test]
+fn the_os_error_of_a_pair_is_its_primarys_and_never_its_seconds() {
+    let pair = |primary: std::io::Error, second: std::io::Error| {
+        Error::os("kill", crate::error::paired(primary, "and also", second))
+    };
+    let coded = |code| std::io::Error::from_raw_os_error(code);
+    assert_eq!(pair(coded(5), coded(8)).raw_os_error(), Some(5));
+    assert_eq!(pair(std::io::Error::other("no code"), coded(8)).raw_os_error(), None);
+}
+
+/// An `Arc<io::Error>` (how `cosca` shares one) is looked through as the `io::Error` it holds.
+#[skuld::test]
+fn the_os_error_inside_a_shared_io_error_is_found() {
+    let shared = || Arc::new(std::io::Error::from_raw_os_error(8));
+    assert_eq!(Error::os("read", shared()).raw_os_error(), Some(8));
+    assert_eq!(
+        Error::os("read", std::io::Error::other(shared())).raw_os_error(),
+        Some(8)
+    );
+}
+
 #[skuld::test]
 fn error_messages_and_exit_class() {
     let id = || "nightly".to_string();
