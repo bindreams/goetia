@@ -82,6 +82,17 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 struct Wake {
     read: OwnedFd,
     write: OwnedFd,
+    /// What the close of this window did, for the test of its order.
+    #[cfg(test)]
+    probe: std::sync::Arc<test_hook::Probe>,
+}
+
+/// The window's pipe is closed by dropping it: a test sees that happen, wherever the drop is.
+#[cfg(test)]
+impl Drop for Wake {
+    fn drop(&mut self) {
+        self.probe.closed();
+    }
 }
 
 impl Wake {
@@ -97,7 +108,12 @@ impl Wake {
             let flags = OFlag::from_bits_truncate(fcntl(end, FcntlArg::F_GETFL).map_err(io::Error::from)?);
             fcntl(end, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
         }
-        Ok(Wake { read, write })
+        Ok(Wake {
+            read,
+            write,
+            #[cfg(test)]
+            probe: Default::default(),
+        })
     }
 }
 
@@ -301,14 +317,14 @@ impl Drop for Deferred {
 /// so that a handler that finds it clear raises to the previous handlers, and every recorded bit is
 /// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
+    #[cfg(test)]
+    let probe = wake.probe.clone();
     WAKE.store(-1, Ordering::SeqCst);
     while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
         #[cfg(test)]
-        test_hook::waited();
+        probe.waited();
         std::thread::yield_now();
     }
-    #[cfg(test)]
-    test_hook::closing();
     drop(wake);
     OPEN.store(false, Ordering::SeqCst);
     claim(ALL)
@@ -415,7 +431,7 @@ fn restore(previous: &[libc::sigaction], taken: u32) {
 #[cfg(test)]
 mod test_hook {
     use std::cell::Cell;
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     use crate::backend::test_allowance::{Allowance, spend};
 
@@ -433,45 +449,62 @@ mod test_hook {
         spend(&STEPS, "no step of opening a window may be taken (test hook)")
     }
 
-    /// What a close did, in order.
+    /// How the close of one window went, as far as its order: set by the wait loop and by the drop of the
+    /// window's pipe, so it says what happened and not where a call sits.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum Event {
-        /// A pass of the wait for a handler that is counted in.
-        Waited,
-        /// About to close the pipe, the wait over.
-        Closing,
+    pub(super) enum Closing {
+        /// Neither a wait nor the close has happened.
+        Idle,
+        /// The close is waiting for a handler, and the pipe is open.
+        Waiting,
+        /// The pipe was closed after the close waited.
+        ClosedAfterWait,
+        /// The pipe was closed with no wait before it.
+        ClosedFirst,
     }
 
-    /// The events of closes since [`forget_events`], in order, a run of waits being one. It is process-wide,
-    /// so it is reliable only while every test that opens a window takes `SERIAL`.
-    static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+    /// One window's [`Closing`]: the window's `Wake` carries it, so a close of another window cannot touch
+    /// it.
+    #[derive(Default)]
+    pub(super) struct Probe(AtomicU8);
 
-    fn record(event: Event) {
-        let mut events = EVENTS.lock().unwrap_or_else(PoisonError::into_inner);
-        if event != Event::Waited || events.last() != Some(&Event::Waited) {
-            events.push(event);
+    impl Probe {
+        const IDLE: u8 = 0;
+        const WAITING: u8 = 1;
+        const CLOSED_AFTER_WAIT: u8 = 2;
+        const CLOSED_FIRST: u8 = 3;
+
+        /// A pass of the wait for a handler: called on each, so a close that does not wait never calls it. A
+        /// wait after the pipe is closed changes nothing.
+        pub(super) fn waited(&self) {
+            _ = self
+                .0
+                .compare_exchange(Self::IDLE, Self::WAITING, Ordering::SeqCst, Ordering::SeqCst);
         }
-    }
 
-    /// The close is waiting for a handler: called on each pass of its wait, so a close that does not wait
-    /// never calls it.
-    pub(super) fn waited() {
-        record(Event::Waited);
-    }
+        /// The pipe is being closed.
+        pub(super) fn closed(&self) {
+            let after = self.0.compare_exchange(
+                Self::WAITING,
+                Self::CLOSED_AFTER_WAIT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            if after.is_err() {
+                _ = self
+                    .0
+                    .compare_exchange(Self::IDLE, Self::CLOSED_FIRST, Ordering::SeqCst, Ordering::SeqCst);
+            }
+        }
 
-    /// The close is about to close the pipe.
-    pub(super) fn closing() {
-        record(Event::Closing);
-    }
-
-    /// The events since [`forget_events`]; see [`EVENTS`] for when this can be relied on.
-    pub(super) fn events() -> Vec<Event> {
-        EVENTS.lock().unwrap_or_else(PoisonError::into_inner).clone()
-    }
-
-    /// Clears [`EVENTS`]; see it for when that is reliable. The caller holds `SERIAL`.
-    pub(super) fn forget_events() {
-        EVENTS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        pub(super) fn state(&self) -> Closing {
+            match self.0.load(Ordering::SeqCst) {
+                Self::IDLE => Closing::Idle,
+                Self::WAITING => Closing::Waiting,
+                Self::CLOSED_AFTER_WAIT => Closing::ClosedAfterWait,
+                _ => Closing::ClosedFirst,
+            }
+        }
     }
 }
 

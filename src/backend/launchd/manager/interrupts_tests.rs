@@ -226,7 +226,8 @@ impl Drop for Planted {
     }
 }
 
-/// A handler stood in for as running: [`IN_FLIGHT`] counts it until this drops.
+/// A handler stood in for as running: [`IN_FLIGHT`] counts it until this drops. `IN_FLIGHT` is process-wide,
+/// so a test that does this takes `SERIAL`, as every test that opens a window does.
 struct Running;
 
 impl Running {
@@ -477,25 +478,34 @@ fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
 
 /// The last drop un-publishes the write end and then waits for a handler that is running before it closes
 /// the pipe, so a handler never writes to a closed descriptor. A running handler is stood in for by a count
-/// that the test holds, and the close reports its steps in order ([`test_hook::events`]). The test waits for
-/// the close to report a wait, or for the closing thread to end, which it must not do. Once it waits, the
-/// descriptor is un-published and the close has not reached the pipe; after the handler is out, it has,
-/// and only after the wait. A close that does not wait never reports one, and one that closes first reports
-/// that first, so each fails whatever the schedule.
+/// that the test holds, and the window's pipe reports how its close went ([`test_hook::Probe`]): the wait
+/// loop reports each pass, and the pipe reports its own drop, wherever that is. The test waits for the
+/// close to leave idle, or for the closing thread to end, which it must not do. A close that waits is
+/// waiting with the pipe open and the descriptor un-published; a close that does not wait, or drops the
+/// pipe before it, is in another state, whatever the schedule. After the handler is out, the pipe is closed,
+/// after the wait.
 #[skuld::test]
 fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
-    use test_hook::Event::{Closing, Waited};
+    use test_hook::Closing::{Idle, Waiting};
 
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
+    let probe = SHARED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .open
+        .as_ref()
+        .expect("the window is open")
+        .wake
+        .probe
+        .clone();
     let mut closing = Joined::default();
     let running = Running::enter();
-    test_hook::forget_events();
 
     closing.0 = Some(std::thread::spawn(move || drop(deferred)));
-    // The wait is reported on a pass of it, which comes before the thread can end: a thread that has ended
-    // with no wait reported never waited.
-    while !test_hook::events().contains(&Waited) {
+    // A close that waits leaves idle before the thread can end: a thread that has ended with the close
+    // still idle never waited and never closed.
+    while probe.state() == Idle {
         if closing.ended() {
             closing.fail("the closing thread ended while a handler was running");
         }
@@ -507,16 +517,16 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
         "the write end is un-published before the wait"
     );
     assert_eq!(
-        test_hook::events(),
-        [Waited],
-        "a handler is running, so the close has not reached the pipe"
+        probe.state(),
+        Waiting,
+        "a handler is running, so the close waits with the pipe open"
     );
 
     drop(running);
     closing.finish();
     assert_eq!(
-        test_hook::events(),
-        [Waited, Closing],
+        probe.state(),
+        test_hook::Closing::ClosedAfterWait,
         "the pipe is closed after the wait"
     );
     before.assert_back();
