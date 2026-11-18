@@ -310,7 +310,11 @@ fn the_markers_failed_open_says_the_marker_could_not_be_written() {
 #[skuld::test]
 fn a_log_file_that_cannot_be_opened_prints_the_cause_of_the_failure() {
     assert_eq!(
-        log_open_failed(Path::new("daemon.log"), &chained()),
+        log_open_failed(
+            Path::new("daemon.log"),
+            &chained(),
+            "this daemon's output will not be captured; it is still being run"
+        ),
         "open log file daemon.log: the context: the cause (this daemon's output will not be captured; it is still being run)"
     );
 }

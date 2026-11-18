@@ -25,11 +25,12 @@
 //! file does not.
 
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::os::{Channels, LogKind, Real, Severity};
-use super::service::{TABLE_NAME, log_open_failed};
+use super::service::TABLE_NAME;
 use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{logs_folder, program_data};
 use crate::error::{Chain, Result};
@@ -41,8 +42,9 @@ pub(crate) struct Log {
     /// `None` when the machine's `%ProgramData%` could not be located: there is then no default file.
     default_dir: Option<PathBuf>,
     daemon_log: OnceLock<PathBuf>,
-    /// The files whose open fault has been told ([`Log::open_failed`]), so a fault in one file is told once.
-    told: Mutex<HashSet<PathBuf>>,
+    /// The open faults told in this launch ([`Log::begin_launch`]), by file and kind, so one fault is told once
+    /// whichever of the launch's opens meets it.
+    told: Mutex<HashSet<(PathBuf, ErrorKind)>>,
 }
 
 impl Log {
@@ -100,43 +102,54 @@ impl Log {
     /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
     /// ([`Channels::hold_default`]). Call it once, when the shim starts and
     /// knows its `id`, before anything an install can change. A log that cannot be held is told to the Event
-    /// Log, once, with the error: the shim goes on, and each line, and the daemon's output, open the file by its
-    /// path. That is the same fault as a failed open of the file that follows, which [`Log::open_failed`] does
-    /// not tell again.
+    /// Log, once, with the error: the shim goes on. What the opens that follow meet is theirs to tell.
     pub(crate) fn hold_default(&self, id: &str) {
         let Some(path) = self.default_log_path(id) else {
             return;
         };
         if let Err(e) = self.channels.hold_default(&path) {
-            self.first_fault(&path);
-            let line = failure_line(
-                id,
-                &format!(
-                    "hold the default log {}: {} (the shim's lines and the daemon's output open it by its path instead)",
-                    path.display(),
-                    Chain(&e)
-                ),
-            );
+            let line = failure_line(id, &format!("hold the default log {}: {}", path.display(), Chain(&e)));
             eprintln!("{line}");
             self.channels.event_log(Severity::Error, &line);
         }
     }
 
-    /// Tells that the log file `path` could not be opened, with `e`, and that the daemon's output is not captured
-    /// in it, unless a fault in that file was told already ([`Log::hold_default`], or an earlier open): one fault
-    /// is one line, whichever of the shim's uses of the file met it first.
-    pub(crate) fn open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
-        if self.first_fault(path) {
-            self.failure(id, &log_open_failed(path, e));
-        }
+    /// Starts a launch, one start of the daemon: what [`Log::open_failed`] and [`Log::marker_open_failed`] told
+    /// in an earlier one is told again if this one meets it.
+    pub(crate) fn begin_launch(&self) {
+        self.told.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
 
-    /// Whether this is the first fault told in `path`; it is recorded as told.
-    fn first_fault(&self, path: &Path) -> bool {
-        self.told
+    /// Tells that the log file `path` could not be opened for the daemon's output, with `e`, unless this launch told
+    /// that fault (the same file, the same kind of error) already: one fault is one line, whichever open met it first.
+    pub(crate) fn open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
+        self.tell_open_failure(
+            id,
+            path,
+            e,
+            "this daemon's output will not be captured; it is still being run",
+        );
+    }
+
+    /// [`Log::open_failed`] for the open of the run's marker, which has its own consequence.
+    pub(crate) fn marker_open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
+        self.tell_open_failure(
+            id,
+            path,
+            e,
+            "the run marker could not be written; the program is still run",
+        );
+    }
+
+    fn tell_open_failure(&self, id: &str, path: &Path, e: &std::io::Error, consequence: &str) {
+        let first = self
+            .told
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(path.to_path_buf())
+            .insert((path.to_path_buf(), e.kind()));
+        if first {
+            self.failure(id, &log_open_failed(path, e, consequence));
+        }
     }
 
     /// The daemon's log and its kind: `logs` from its spec, which is the user's own, unless it is the default
@@ -196,6 +209,11 @@ impl Log {
 
 fn failure_line(id: &str, message: &str) -> String {
     format!("goetia-shim[{id}]: {message}")
+}
+
+/// An open of the log file `path` that failed with `e`, and what `consequence` says it costs.
+fn log_open_failed(path: &Path, e: &std::io::Error, consequence: &str) -> String {
+    format!("open log file {}: {} ({consequence})", path.display(), Chain(e))
 }
 
 /// The files to try for a line, in order, with the kind of each: the daemon's own log when its spec sets

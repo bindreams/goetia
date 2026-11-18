@@ -24,7 +24,7 @@ use windows_sys::core::BOOL;
 
 use super::exit;
 use super::logging::Log;
-use super::os::{LogKind, Real};
+use super::os::Real;
 use super::service::{PassOutcome, SpecStop, run_pass, set_daemon_log};
 use super::stop_bus::{StopBus, Supervisor};
 use crate::backend::scm::exit_status::Reported;
@@ -60,9 +60,9 @@ pub(super) fn run(id: &str) -> ! {
     // One `Real` for the run, as a service's shim has (`service::service_main`).
     let real = Arc::new(Real::default());
     let log = Arc::new(Log::real(Arc::clone(&real)));
-    exit::keep_log(Arc::clone(&log));
     // Held for the whole run, as a service's shim does (`service::run_service`).
     log.hold_default(id);
+    exit::keep_run(Arc::clone(&log), id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
     // Before anything is read: from here on a stop is held by the bus until the run reaches it.
     if let Err(e) = register_close_handler(&supervisor.bus) {
@@ -115,6 +115,8 @@ pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs:
             return STOPPED_EXIT;
         }
     };
+    // The marker's open and the program's open are of one launch.
+    log.begin_launch();
     set_daemon_log(log, id, &spec);
     if let (Some(logs), Some(instance)) = (spec.common().logs.as_deref(), &instance) {
         write_marker(supervisor, id, logs, instance);
@@ -266,15 +268,16 @@ fn own_instance(
 /// Writes the run's marker as a line of its own into the log, before the program is spawned: the
 /// program's output is appended after it. The log is the one the program's output goes to ([`Log::daemon_log`]):
 /// the default log, through the handle the shim holds on it, when `logs` is that. A log that cannot be opened,
-/// and a write that fails, are logged (a log's open fault is told once, [`Log::open_failed`]) and the program runs.
+/// and a write that fails, are logged (an open fault is told once in a launch, [`Log::marker_open_failed`]) and
+/// the program runs.
 fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &InstanceId) {
     let log = &*supervisor.log;
     let (path, kind) = log
         .daemon_log(id, Some(logs))
-        .unwrap_or_else(|| (logs.to_path_buf(), LogKind::Own));
+        .expect("a `logs` path is the daemon's own log or the default log");
     let mut file = match supervisor.os.open_log(&path, kind) {
         Ok(file) => file,
-        Err(e) => return log.open_failed(id, &path, &e),
+        Err(e) => return log.marker_open_failed(id, &path, &e),
     };
     let line = format!("{}\n", instance.marker());
     if let Err(e) = file.write_all(line.as_bytes()) {

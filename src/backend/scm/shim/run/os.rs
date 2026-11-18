@@ -103,15 +103,18 @@ pub(crate) struct Real {
 
 impl Real {
     /// The default log at `path` through the handle held on it: the one [`Channels::hold_default`] opened,
-    /// unless its file has been deleted, or none is held; then the path is opened ([`default_log::open_for_append`],
-    /// which makes nothing) and that handle is held. The new handle is held by the same call that made it, so
-    /// two uses at once cannot each open one.
+    /// unless its file has been deleted (the handle is then released) or none is held; then the path is opened
+    /// ([`default_log::open_for_append`], which makes nothing) and that handle is held. The new handle is held by
+    /// the same call that made it, so two uses at once cannot each open one.
     fn default_log(&self, path: &Path) -> io::Result<Arc<File>> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(file) = held.get(path)
-            && !default_log::is_deleted(file)?
-        {
-            return Ok(Arc::clone(file));
+        if let Some(file) = held.get(path) {
+            if !default_log::is_deleted(file)? {
+                return Ok(Arc::clone(file));
+            }
+            // Released before the open, so that an open that fails leaves no handle on the deleted file: while
+            // one is open the name is still the file's, and an install cannot make the log again.
+            held.remove(path);
         }
         let file = Arc::new(default_log::open_for_append(path)?);
         held.insert(path.to_path_buf(), Arc::clone(&file));
