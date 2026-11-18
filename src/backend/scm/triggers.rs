@@ -1,8 +1,8 @@
 //! Compiles a cron schedule into Task Scheduler triggers, or refuses it.
 //!
-//! The triggers fire at the minutes the schedule names, in local civil time, by Task Scheduler's rule
-//! for a time that does not exist, except around a clock change (see "Clock changes"). No repetition
-//! crosses a local hour boundary or starts at minute 0 (see "The time of day").
+//! The triggers fire at the minutes the schedule names, in local civil time; around a clock change they
+//! follow Task Scheduler's rules (see "Clock changes"). No repetition crosses a local hour boundary or
+//! starts at minute 0 (see "The time of day").
 //!
 //! # Clock changes
 //!
@@ -23,11 +23,11 @@
 //!
 //! Not clean: in spring, a `PT1M` repetition starting at `:01` (the shape of `* * * * *` and any
 //! step-1 group) ran once a minute from registration to its first start, at minutes the trigger does
-//! not name (8 extra runs in the measured case, so the count follows the registration lead); when the
-//! previous hour is also named, those minutes start twice. This is a stated limit; the open
-//! measurements of the registration window are issue #285.
+//! not name (registered 8 minutes ahead, it ran 8 extra times); when the previous hour is also named,
+//! those minutes start twice. How this depends on the time of registration is open (issue #285).
 //!
-//! A change off the hour, or by other than one hour (Lord Howe's 30 minutes), was not measured.
+//! A change off the hour, at midnight, or by other than one hour (Lord Howe's 30 minutes) was not
+//! measured (issue #285).
 //!
 //! A trigger names days (every day, weekdays, days of the month, in some months or all), a start time
 //! and optionally a repetition that restarts at its start each day. What the shapes rest on was
@@ -285,8 +285,10 @@ fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     }
     let rest: BTreeSet<u8> = minutes.iter().copied().filter(|&minute| minute != 0).collect();
     for group in groups(&rest) {
-        let first = *group.first().expect("groups never makes an empty group");
-        let last = *group.last().expect("groups never makes an empty group");
+        let (&first, &last) = group
+            .first()
+            .zip(group.last())
+            .expect("groups never makes an empty group");
         let repeat = group.get(1).map(|second| Repeat {
             every_minutes: u32::from(second - first),
             for_minutes: u32::from(last - first),

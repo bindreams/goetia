@@ -251,7 +251,7 @@ fn every_cron_shape_matches_the_schedulers_run_times(#[fixture(scm_group)] _grou
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_time_with_no_single_progression_matches_the_schedulers_run_times(#[fixture(scm_group)] _group: &Group) {
+fn irregular_times_of_day_match_the_schedulers_run_times(#[fixture(scm_group)] _group: &Group) {
     assert_runs_as_cron_says(FIRING_SCHEDULES[1]);
 }
 

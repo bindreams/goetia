@@ -161,8 +161,8 @@ pub fn cron_matches(schedule: &Schedule, minute: u8, hour: u8, day: u8, month: u
 }
 
 /// The cron schedules a task's triggers must fire for exactly when the cron says, in three groups: one
-/// time and repeated times a day, times of day beyond one progression of minutes in one run of hours,
-/// and a weekday that has a fifth occurrence. The unit tests of the compilation check each against a
+/// time and repeated times a day; irregular times of day (several groups of minutes in an hour, a step
+/// that does not divide 60, hours in no single run); and a weekday that has a fifth occurrence. The unit tests of the compilation check each against a
 /// model of Task Scheduler, and the Windows integration test checks each against Task Scheduler's own run
 /// times (see `tests/scm_integration/task_schedule.rs`).
 pub const FIRING_SCHEDULES: [&[&str]; 3] = [
@@ -182,15 +182,15 @@ pub const FIRING_SCHEDULES: [&[&str]; 3] = [
         "5,35 */3 * * *",
     ],
     &[
-        // Several groups in an hour, a lone :00 beside a repetition or a repetition beside a lone minute
-        // (`* * * * *` and `*/7 * * * *` above are the first kind too).
+        // Several groups in an hour: a lone :00 beside a repetition or a lone minute, or a repetition
+        // beside a lone minute (`* * * * *` and `*/7 * * * *` above are the first kind too).
         "0,15,30,45 9-11,14-16 * * *",
         "1,2,4,7 0,1,3,5,7,9,11 * * *",
         "0,15,30,45,7 9-17 * * 1-5",
         "0,1 * * * *",
         "0,1 0,1,2,3,5,6,8,10,11,13,14,16,17,19,21,22 * * *",
         "0,10,20 22,23,0 * * *",
-        // A step that does not divide 60, in one hour and in all of them.
+        // A step that does not divide 60, in one hour and in a run of hours.
         "*/7 3 * * *",
         "*/7 9-17 * * 1-5",
         // One minute in hours in no run (a lone trigger in each), and in every hour.

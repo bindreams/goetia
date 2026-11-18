@@ -191,7 +191,7 @@ fn compiled_triggers_fire_exactly_when_the_cron_says() {
 }
 
 #[skuld::test]
-fn a_time_with_no_single_progression_still_fires_exactly_when_the_cron_says() {
+fn irregular_times_of_day_still_fire_exactly_when_the_cron_says() {
     assert_fires_as_cron_says(FIRING_SCHEDULES[1]);
 }
 
