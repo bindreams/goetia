@@ -163,8 +163,9 @@ pub fn cron_matches(schedule: &Schedule, minute: u8, hour: u8, day: u8, month: u
 /// The cron schedules a task's triggers must fire for exactly when the cron says, in three groups: one
 /// time and repeated times a day, times with no single progression, and a weekday that has a fifth
 /// occurrence. The unit tests of the compilation check each against a model of Task Scheduler, and the
-/// Windows integration test checks each against Task Scheduler's own run times, over the range it
-/// names (`end_of_two_years` and `MANY_RUN_TIMES` in `tests/scm_integration/task_schedule.rs`).
+/// Windows integration test checks each against Task Scheduler's own run times, over the two years 2027
+/// and 2028, cut to January 2027 for a schedule with more than 100,000 run times in them (applied in
+/// `tests/scm_integration/task_schedule.rs`).
 pub const FIRING_SCHEDULES: [&[&str]; 3] = [
     &[
         "30 3 * * *",

@@ -153,7 +153,8 @@ fn end_of_january() -> DateTime {
 /// on CI's Windows runner, `GetRunTimes` grows with the square of the run times it returns: 4.6 s for 39,000,
 /// 20 s for 79,000, 83 s for 158,000 (`*/7 * * * *`) and 134 to 152 s for 261,000, which is 6 months of
 /// `* * * * *` (two years is about an hour). The nextest `ci` profile kills a test after 300 s. No other
-/// schedule checked has more than 42,000 run times (5 s); only `* * * * *` and `*/7 * * * *` are over this.
+/// schedule checked has more than 42,201 run times (`*/7 9-17 * * 1-5`, about 5 s); only `* * * * *` and
+/// `*/7 * * * *` are over this.
 const MANY_RUN_TIMES: usize = 100_000;
 
 /// Whether the cron names `minute`.
@@ -190,27 +191,24 @@ fn assert_runs_as_cron_says(texts: &[&str]) {
             id,
         };
         let schedule = Schedule::parse(text, &seed).unwrap_or_else(|e| panic!("`{text}`: {e}"));
-        let mut named_in_two_years = BTreeSet::new();
-        let mut minute = first;
-        while minute <= end {
-            if cron_names(&schedule, minute) {
-                named_in_two_years.insert(minute);
-            }
-            minute += 1.minute();
-        }
-        let last = if named_in_two_years.len() > MANY_RUN_TIMES {
+        let named_until = |last: DateTime| {
+            std::iter::successors(Some(first), |&minute| Some(minute + 1.minute()))
+                .take_while(move |&minute| minute <= last)
+                .filter(|&minute| cron_names(&schedule, minute))
+        };
+        let last = if named_until(end).count() > MANY_RUN_TIMES {
             end_of_january()
         } else {
             end
         };
-        let named: BTreeSet<DateTime> = named_in_two_years.range(..=last).copied().collect();
+        let named: BTreeSet<DateTime> = named_until(last).collect();
         let (from, to) = (instant(first - 1.minute()), instant(last));
 
         mgr.install(&task_as(id, User::Root, Some(text)), false)
             .unwrap_or_else(|e| panic!("`{text}` is refused: {}", e.report()));
         let times =
             task_run_times(id, from, to).unwrap_or_else(|e| panic!("the run times of `{text}`: {}", e.report()));
-        let fired: BTreeSet<DateTime> = times
+        let mut listed: Vec<DateTime> = times
             .into_iter()
             .map(|time| {
                 Timestamp::try_from(time)
@@ -219,6 +217,12 @@ fn assert_runs_as_cron_says(texts: &[&str]) {
                     .datetime()
             })
             .collect();
+        // A minute listed twice would be a double start: a set would merge it.
+        listed.sort();
+        if let Some(twice) = listed.windows(2).find(|pair| pair[0] == pair[1]) {
+            panic!("`{text}`: Task Scheduler lists {} twice", twice[0]);
+        }
+        let fired: BTreeSet<DateTime> = listed.into_iter().collect();
 
         let wrong: BTreeSet<DateTime> = named.symmetric_difference(&fired).copied().collect();
         if let Some(minute) = wrong.first() {

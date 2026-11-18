@@ -227,8 +227,8 @@ fn one_time_of_day_is_one_trigger() {
 }
 
 /// A lone trigger due at the instant of a change of clocks does not run, and a repetition that starts
-/// at that instant loses every tick (module doc): minute 0 of a group is a lone trigger of its own, and
-/// the repetition starts at the group's next minute, which is after any hour's start.
+/// at that instant loses every tick (module doc): minute 0 is a lone trigger of its own, and the
+/// repetitions are of the other minutes, so none starts at an hour's start.
 #[skuld::test]
 fn minute_zero_of_a_group_is_a_lone_trigger_and_the_repetition_starts_after_it() {
     assert_eq!(
@@ -238,7 +238,7 @@ fn minute_zero_of_a_group_is_a_lone_trigger_and_the_repetition_starts_after_it()
     assert_eq!(triggers("*/15 * * * *").len(), TRIGGER_LIMIT);
     assert_eq!(triggers("* * * * *"), lone_zero_then_repeat(0..24, 1, repeat(1, 58)));
     assert_eq!(triggers("* * * * *").len(), TRIGGER_LIMIT);
-    // A group of minute 0 and one more minute is two lone triggers.
+    // Minute 0 and one other minute are two lone triggers.
     assert_eq!(triggers("0,30 3 * * *"), [daily(3, 0, None), daily(3, 30, None)]);
     // The last tick of the hour's repetition is its :45.
     assert_eq!(
