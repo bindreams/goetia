@@ -728,12 +728,12 @@ fn stop_under_immediate_ends_unconfirmed_on_an_unreachable_pid_shown_after_a_que
     let mut zombie = Held::new(0);
     let a = zombie.pid();
     zombie.exit_unreaped();
-    let fake = Fake::new([print(QUEUED), print(QUEUED), print(&running(a))]);
+    let fake = Fake::new([print(QUEUED), print(QUEUED), print(&running(a)), print(&running(a))]);
 
     let e = stopping(&fake, Budget::Immediate).expect_err("a pid that cannot be reached");
 
     assert_unreached(&e);
-    fake.assert_spent("the queued start and its fork, and the one reading of the pid");
+    fake.assert_spent("the queued start and its fork, and the one reading of the pid after it");
 }
 
 /// A later pass can find the run that was sent SIGTERM again: here launchd's lookup did not name the process
