@@ -1095,8 +1095,8 @@ otherwise up to date. `goetia daemon uninstall` keeps the file.
 
 The shim opens `<id>.log` once, when it starts, and writes through that handle, so an install that
 changes the account (SCM does not restart the service) leaves the running shim its log. If you delete
-`<id>.log` and run `goetia daemon install` while the service runs, the shim's next line goes to the new
-file; the daemon's own output goes to the deleted file until the service restarts.
+`<id>.log` while the service runs, the daemon's output handle keeps the name until the daemon exits, and
+`goetia daemon install` fails saying so: stop the daemon, then install again.
 
 A `logs:` that is inside `%ProgramData%\Goetia\logs` is refused at install, whichever file it
 names (the folder is the shim's default logs, which a daemon's own account cannot make a file in).

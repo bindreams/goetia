@@ -20,17 +20,18 @@ use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::{self, Right, Written};
 use crate::backend::scm::manager::{
-    Scm, ScmSnapshot, apply_gated, make_default_log, registered_account_sid, registry, service_gate, written_user,
+    Scm, ScmSnapshot, accounts_kept_before_change, apply_gated, make_default_log, registered_account,
+    registered_account_sid, registry, service_gate, written_user,
 };
 use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::sid::{Sid, sid_from_parts};
-use crate::backend::scm::task_xml::TaskXml;
+use crate::backend::scm::task_xml::{TaskXml, builtin_sid};
 use crate::backend::{Identity, InstalledService, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::manager::State;
-use crate::spec::{DaemonKind, DaemonSpec, Id};
+use crate::spec::{Builtin, DaemonKind, DaemonSpec, Id};
 
 /// What the machine holds for a task's account once an install has seen to it.
 pub(super) struct Prepared {
@@ -349,6 +350,32 @@ fn landed(id: &Id, runs: &Runs, prepared: &Prepared, wrote: WriteOutcome) -> Res
     Ok(wrote)
 }
 
+/// The SID of the account of the service `old` that its default log names beside the task's, `task`, until the
+/// retype lands: the one rule of a service's account change ([`accounts_kept_before_change`]). A native service has
+/// no default log, a service whose account is gone has no one to name, and one that runs as the task's account has
+/// no other; the system is asked of the account only for a hosted service that runs as another one.
+fn kept_service_account(old: &ScmSnapshot, task: &TaskAccount) -> Result<Option<Sid>> {
+    if old.blob().is_ok_and(|blob| !generate::hosted(&blob.spec)) {
+        return Ok(None);
+    }
+    let config = old.config()?;
+    accounts_kept_before_change(true, &registered_account(config), &service_account_name(task), || {
+        registered_account_sid(config)
+    })
+}
+
+/// The account `task` runs as, as the registration of a service that runs as it spells it: `None` is LocalSystem.
+/// An account that is no well-known one is as it is named.
+fn service_account_name(task: &TaskAccount) -> Option<String> {
+    match task {
+        TaskAccount::User(name) => generate::canonical_account(name),
+        TaskAccount::Service(sid) => [Builtin::LocalSystem, Builtin::LocalService, Builtin::NetworkService]
+            .into_iter()
+            .find(|builtin| builtin_sid(*builtin).eq_ignore_ascii_case(sid))
+            .map_or_else(|| Some(sid.clone()), |builtin| builtin.canonical().map(str::to_string)),
+    }
+}
+
 /// The default log of the task `installed`, for the account it is registered as: what an install that finds
 /// the task up to date makes again if it is gone, since the shim makes none.
 pub(in crate::backend::scm) fn task_default_log(installed: &TaskSnapshot) -> Result<()> {
@@ -456,7 +483,7 @@ impl Scm {
     }
 
     /// An install that changes a service into a task: the service is refused while it runs; its account is looked
-    /// up; everything the task needs is acquired; the default log is made for both accounts; the service is
+    /// up, unless it is the task's; everything the task needs is acquired; the default log is made for both accounts; the service is
     /// stopped and deleted; the task is registered; the default log is made for the task's account alone. The
     /// task's install holds the lock already. See [`Self::retype_to_service`].
     pub(in crate::backend::scm) fn retype_to_task(
@@ -479,11 +506,7 @@ impl Scm {
                     DaemonKind::Service,
                     self.service_live_status(old)?.common().state,
                 )?;
-                // A native service has no default log; a service whose account is gone has no one to name.
-                match old.blob() {
-                    Ok(blob) if !generate::hosted(&blob.spec) => Ok(None),
-                    _ => registered_account_sid(old.config()?),
-                }
+                kept_service_account(old, &definition.account())
             },
             || self.service_retire(old),
         )?;

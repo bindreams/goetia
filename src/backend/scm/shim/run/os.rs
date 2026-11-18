@@ -112,8 +112,10 @@ impl Real {
             if !default_log::is_deleted(file)? {
                 return Ok(Arc::clone(file));
             }
-            // Released before the open, so that an open that fails leaves no handle on the deleted file: while
-            // one is open the name is still the file's, and an install cannot make the log again.
+            // Released before the open, so that an open that fails leaves no handle of the shim's own on the deleted
+            // file: while one is open the name is still the file's, and an install cannot make the log again. A
+            // daemon's output handle is a clone of this one and keeps the name until the daemon exits; the install
+            // says so ([`default_log::ensure`]).
             held.remove(path);
         }
         let file = Arc::new(default_log::open_for_append(path)?);

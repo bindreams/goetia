@@ -62,7 +62,8 @@ pub(super) fn run(id: &str) -> ! {
     let log = Arc::new(Log::real(Arc::clone(&real)));
     // Held for the whole run, as a service's shim does (`service::run_service`).
     log.hold_default(id);
-    exit::keep_run(Arc::clone(&log), id);
+    exit::keep_log(Arc::clone(&log));
+    exit::name_run(id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
     // Before anything is read: from here on a stop is held by the bus until the run reaches it.
     if let Err(e) = register_close_handler(&supervisor.bus) {
@@ -115,8 +116,6 @@ pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs:
             return STOPPED_EXIT;
         }
     };
-    // The marker's open and the program's open are of one launch.
-    log.begin_launch();
     set_daemon_log(log, id, &spec);
     if let (Some(logs), Some(instance)) = (spec.common().logs.as_deref(), &instance) {
         write_marker(supervisor, id, logs, instance);

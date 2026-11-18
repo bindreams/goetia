@@ -14,9 +14,10 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_STANDARD_INFO, FileStandardInfo,
+    GetFileInformationByHandleEx,
 };
 
 use super::folder::logs_folder;
@@ -53,7 +54,7 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, accounts: &[Sid]) -> Result<(
     let permissions = Descriptor::for_default_log(&named)?;
     let (file, made) = permissions
         .open_always_for_dacl(&path)
-        .map_err(|e| Error::os_at("make", &path, e))?;
+        .map_err(|e| make_error(&path, e))?;
     if is_link(&file).map_err(|e| Error::os_at("read the type of", &path, e))? {
         return Err(Error::os("use the default log", link_error(&path)));
     }
@@ -63,6 +64,34 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, accounts: &[Sid]) -> Result<(
     permissions
         .set_dacl_of(&file)
         .map_err(|e| Error::os_at("set the permissions of", &path, e))
+}
+
+/// The error of a make of the default log at `path` that failed with `e`. A log that was deleted while a run of
+/// the daemon still writes it (the README's recovery) keeps its name until that run ends, since the daemon's
+/// output handle is on the file, and Windows answers an open of the name with access denied; the error then says so,
+/// and the way out.
+fn make_error(path: &Path, e: io::Error) -> Error {
+    if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) && is_delete_pending(path) {
+        return Error::os(
+            "use the default log",
+            io::Error::other(format!(
+                "{} is being deleted while a run of the daemon still writes it; stop the daemon, then install it again",
+                path.display()
+            )),
+        );
+    }
+    Error::os_at("make", path, e)
+}
+
+/// Whether the file at `path` has its delete pending: even its attributes cannot be opened, which a file that
+/// is not deleted allows to the account that lists its folder (a permission that refuses a write does not
+/// refuse this).
+fn is_delete_pending(path: &Path) -> bool {
+    OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .is_err_and(|e| e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32))
 }
 
 /// Refuses a daemon's `logs:` that lies in goetia's logs folder under `program_data`, where the default logs

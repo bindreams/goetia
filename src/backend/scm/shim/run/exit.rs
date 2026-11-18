@@ -18,14 +18,44 @@ use super::service::TABLE_NAME;
 /// What the service thread reports to SCM, for the main thread's exit.
 static EXIT: OnceLock<Reported> = OnceLock::new();
 
-/// The log of the run and the id it logs under, for [`end_process`]. The log holds the handle on the default
-/// log, so the failure line reaches the log even when an install has taken the account out of its permissions.
-static RUN: OnceLock<(Arc<Log>, String)> = OnceLock::new();
+/// The run, for [`end_process`].
+static RUN: OnceLock<Run> = OnceLock::new();
 
-/// Keep `log`, the one the run `id` writes through, for [`end_process`]. Only the run's start calls it
-/// (`service::run_service`, `task::run`), once, as the id is known.
-pub(super) fn keep_run(log: Arc<Log>, id: &str) {
-    let _ = RUN.set((log, id.to_string()));
+/// The log the shim writes through and the id it logs under, once the id is known. The log holds the handle on
+/// the default log, so the failure line reaches the log even when an install has taken the account out of its
+/// permissions; it is kept before the id is, so that an end that fails while the id is unusable (SCM named no
+/// usable service) reuses it and does not build a second log that tells the machine's faults again.
+struct Run {
+    log: Arc<Log>,
+    id: OnceLock<String>,
+}
+
+impl Run {
+    fn new(log: Arc<Log>) -> Run {
+        Run {
+            log,
+            id: OnceLock::new(),
+        }
+    }
+
+    fn name(&self, id: &str) {
+        let first = self.id.set(id.to_string()).is_ok();
+        debug_assert!(first, "the run was named twice");
+    }
+}
+
+/// Keep `log`, the one the shim writes through, for [`end_process`]. The shim's entry (`service::service_main`,
+/// `task::run`) calls it once, before anything can fail.
+pub(super) fn keep_log(log: Arc<Log>) {
+    let first = RUN.set(Run::new(log)).is_ok();
+    debug_assert!(first, "the run's log was kept twice");
+}
+
+/// Name the run `id`, which [`end_process`] logs a failure under from now on. Called once, when the id is known.
+pub(super) fn name_run(id: &str) {
+    if let Some(run) = RUN.get() {
+        run.name(id);
+    }
 }
 
 /// Record what the service thread is about to report to SCM. Once per process, before `STOPPED`.
@@ -42,17 +72,21 @@ pub(super) fn stopping(reported: Reported) {
 pub(super) fn end_process(code: i32) -> ! {
     // SAFETY: the pseudo handle of the current process is always valid.
     if unsafe { TerminateProcess(GetCurrentProcess(), code as u32) } == 0 {
-        let e = std::io::Error::last_os_error();
-        match RUN.get() {
-            Some((log, id)) => end_failure(log, id, code, &e),
-            // No run began (the dispatcher failed to connect, or SCM named no service): no id, and no handle held.
-            None => end_failure(&Log::real(Arc::default()), TABLE_NAME, code, &e),
-        }
+        end_failure_in(RUN.get(), code, &std::io::Error::last_os_error());
     }
     std::process::exit(code)
 }
 
-/// The line for an end that failed with `e`: under the run's `id`, into `log`, the run's.
+/// The line for an end that failed with `e`, into the log of `run` under its id, or under [`TABLE_NAME`] while it is
+/// not named. With no run (the dispatcher failed to connect: no log was kept, and no handle held) a log of its own.
+fn end_failure_in(run: Option<&Run>, code: i32, e: &std::io::Error) {
+    match run {
+        Some(run) => end_failure(&run.log, run.id.get().map_or(TABLE_NAME, String::as_str), code, e),
+        None => end_failure(&Log::real(Arc::default()), TABLE_NAME, code, e),
+    }
+}
+
+/// The line for an end that failed with `e`: under `id`, into `log`.
 fn end_failure(log: &Log, id: &str, code: i32, e: &std::io::Error) {
     log.failure(id, &format!("end the shim's process with code {code}: {}", Chain(e)));
 }

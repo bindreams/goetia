@@ -42,9 +42,9 @@ pub(crate) struct Log {
     /// `None` when the machine's `%ProgramData%` could not be located: there is then no default file.
     default_dir: Option<PathBuf>,
     daemon_log: OnceLock<PathBuf>,
-    /// The open faults told in this launch ([`Log::begin_launch`]), by file and kind, so one fault is told once
-    /// whichever of the launch's opens meets it.
-    told: Mutex<HashSet<(PathBuf, ErrorKind)>>,
+    /// The open faults told, by file, kind of error and what the failed open costs, so that one fault is told once
+    /// however often it is met. A shim process makes one launch of its daemon, so what is told is told for it.
+    told: Mutex<HashSet<(PathBuf, ErrorKind, &'static str)>>,
 }
 
 impl Log {
@@ -114,14 +114,9 @@ impl Log {
         }
     }
 
-    /// Starts a launch, one start of the daemon: what [`Log::open_failed`] and [`Log::marker_open_failed`] told
-    /// in an earlier one is told again if this one meets it.
-    pub(crate) fn begin_launch(&self) {
-        self.told.lock().unwrap_or_else(PoisonError::into_inner).clear();
-    }
-
-    /// Tells that the log file `path` could not be opened for the daemon's output, with `e`, unless this launch told
-    /// that fault (the same file, the same kind of error) already: one fault is one line, whichever open met it first.
+    /// Tells that the log file `path` could not be opened for the daemon's output, with `e`, unless that was told
+    /// already (the same file, the same kind of error, the same open): the marker's open of the same file failing
+    /// alike is another fact, with its own cost ([`Log::marker_open_failed`]).
     pub(crate) fn open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
         self.tell_open_failure(
             id,
@@ -141,12 +136,12 @@ impl Log {
         );
     }
 
-    fn tell_open_failure(&self, id: &str, path: &Path, e: &std::io::Error, consequence: &str) {
-        let first = self
-            .told
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((path.to_path_buf(), e.kind()));
+    fn tell_open_failure(&self, id: &str, path: &Path, e: &std::io::Error, consequence: &'static str) {
+        let first = self.told.lock().unwrap_or_else(PoisonError::into_inner).insert((
+            path.to_path_buf(),
+            e.kind(),
+            consequence,
+        ));
         if first {
             self.failure(id, &log_open_failed(path, e, consequence));
         }

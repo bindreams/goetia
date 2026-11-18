@@ -58,6 +58,7 @@ fn service_main(scm_args: Vec<OsString>) {
     // One `Real` for the run: the supervisor's `Os` and the log's channels share the handle held on the default log.
     let real = Arc::new(Real::default());
     let log = Arc::new(Log::real(Arc::clone(&real)));
+    exit::keep_log(Arc::clone(&log));
     match service_name(&log, &scm_args) {
         Ok(id) => run_service(id, log, real),
         Err(code) => exit::end_process(code),
@@ -82,7 +83,7 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
     // Before anything is read or registered: an install that changes the account can take it out of the log's
     // permissions from the moment it changes the service, and a handle opened now keeps working.
     log.hold_default(id);
-    exit::keep_run(Arc::clone(&log), id);
+    exit::name_run(id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
@@ -318,8 +319,7 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 // One pass ============================================================================================================
 
 /// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
-/// stop, and tell SCM how it ended: [`run_pass`], reported. It starts a launch of the log ([`Log::begin_launch`]):
-/// a fault told in an earlier start is told again.
+/// stop, and tell SCM how it ended: [`run_pass`], reported.
 pub(super) fn run_daemon(
     spec: &DaemonSpec,
     supervisor: &Supervisor,
@@ -327,7 +327,6 @@ pub(super) fn run_daemon(
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(),
 ) -> Reported {
-    supervisor.log.begin_launch();
     run_pass(spec, supervisor, id, on_running, on_stopping).reported()
 }
 
