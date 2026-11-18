@@ -296,22 +296,22 @@ fn the_design_settings_are_written() {
 
 #[skuld::test]
 fn a_trigger_is_written_with_local_time_and_no_zone() {
-    let xml = built(&spec_of(User::Root, Some("*/15 9 * 3-5 1-5"))).to_xml(true);
+    let xml = built(&spec_of(User::Root, Some("15,30,45 9 * 3-5 1-5"))).to_xml(true);
     let document = Document::parse(&xml).unwrap();
 
     let trigger = "Task/Triggers/CalendarTrigger";
     assert_eq!(
         at(&document, &format!("{trigger}/StartBoundary")).unwrap(),
-        "2000-01-01T09:00:00"
+        "2000-01-01T09:15:00"
     );
     assert_eq!(
         at(&document, &format!("{trigger}/Repetition/Interval")).unwrap(),
         "PT15M"
     );
-    // 09:00 to 09:45, the last tick included.
+    // 09:15 to 09:45, the last tick included.
     assert_eq!(
         at(&document, &format!("{trigger}/Repetition/Duration")).unwrap(),
-        "PT45M"
+        "PT30M"
     );
     assert!(
         node_at(&document, &format!("{trigger}/Repetition/StopAtDurationEnd")).is_none(),
@@ -335,7 +335,7 @@ fn a_trigger_is_written_with_local_time_and_no_zone() {
         ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     );
     assert!(
-        !xml.contains("T09:00:00Z") && !xml.contains("T09:00:00+"),
+        !xml.contains("T09:15:00Z") && !xml.contains("T09:15:00+"),
         "no zone suffix"
     );
 }
@@ -748,13 +748,13 @@ fn a_trigger_with_no_start_boundary_is_armed_and_disarmed_like_any_other() {
 #[skuld::test]
 fn a_repetition_trigger_reads_back_in_task_schedulers_order() {
     // Task Scheduler's order inside the schedule: `Months` before `Weeks` and `DaysOfWeek`.
-    let spec = spec_of(User::Root, Some("*/15 9 * 3-5 1-5"));
+    let spec = spec_of(User::Root, Some("15,30,45 9 * 3-5 1-5"));
     let triggers = r#"<Triggers>
     <CalendarTrigger>
-      <StartBoundary>2000-01-01T09:00:00</StartBoundary>
+      <StartBoundary>2000-01-01T09:15:00</StartBoundary>
       <Repetition>
         <Interval>PT15M</Interval>
-        <Duration>PT45M</Duration>
+        <Duration>PT30M</Duration>
       </Repetition>
       <ScheduleByMonthDayOfWeek>
         <Months><March /><April /><May /></Months>

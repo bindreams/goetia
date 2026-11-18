@@ -211,25 +211,35 @@ fn daily(hour: u8, minute: u8, repeat: Option<Repeat>) -> Trigger {
     }
 }
 
+/// The triggers of a group that names minute 0 and more, over `hours`: a lone trigger at :00 in each
+/// hour, then in each hour the repetition `repeat` from minute `first`.
+fn lone_zero_then_repeat(hours: impl Iterator<Item = u8> + Clone, first: u8, repeat: Option<Repeat>) -> Vec<Trigger> {
+    hours
+        .clone()
+        .map(|hour| daily(hour, 0, None))
+        .chain(hours.map(|hour| daily(hour, first, repeat)))
+        .collect()
+}
+
 #[skuld::test]
 fn one_time_of_day_is_one_trigger() {
     assert_eq!(triggers("30 3 * * *"), [daily(3, 30, None)]);
 }
 
-/// Task Scheduler runs a repetition across a change of clocks on both the civil grid and elapsed time
-/// (module doc), so none may cross a local hour boundary: a minute class over consecutive hours is one
-/// repetition inside each hour.
+/// A lone trigger due at the instant of a change of clocks does not run, and a repetition that starts
+/// at that instant loses every tick (module doc): minute 0 of a group is a lone trigger of its own, and
+/// the repetition starts at the group's next minute, which is after any hour's start.
 #[skuld::test]
-fn a_minute_class_over_hours_is_one_repetition_per_hour() {
+fn minute_zero_of_a_group_is_a_lone_trigger_and_the_repetition_starts_after_it() {
     assert_eq!(
         triggers("*/15 * * * *"),
-        (0..24).map(|h| daily(h, 0, repeat(15, 45))).collect::<Vec<_>>()
+        lone_zero_then_repeat(0..24, 15, repeat(15, 30))
     );
-    // The every-minute schedule: 24 triggers, one repetition of 60 ticks in each hour.
-    assert_eq!(
-        triggers("* * * * *"),
-        (0..24).map(|h| daily(h, 0, repeat(1, 59))).collect::<Vec<_>>()
-    );
+    assert_eq!(triggers("*/15 * * * *").len(), TRIGGER_LIMIT);
+    assert_eq!(triggers("* * * * *"), lone_zero_then_repeat(0..24, 1, repeat(1, 58)));
+    assert_eq!(triggers("* * * * *").len(), TRIGGER_LIMIT);
+    // A group of minute 0 and one more minute is two lone triggers.
+    assert_eq!(triggers("0,30 3 * * *"), [daily(3, 0, None), daily(3, 30, None)]);
     // The last tick of the hour's repetition is its :45.
     assert_eq!(
         triggers("*/15 9-17 * * 1-5"),
@@ -237,8 +247,13 @@ fn a_minute_class_over_hours_is_one_repetition_per_hour() {
             .map(|hour| Trigger::Weekly {
                 weekdays: set([1, 2, 3, 4, 5]),
                 at: (hour, 0),
-                repeat: repeat(15, 45)
+                repeat: None
             })
+            .chain((9..=17).map(|hour| Trigger::Weekly {
+                weekdays: set([1, 2, 3, 4, 5]),
+                at: (hour, 15),
+                repeat: repeat(15, 30)
+            }))
             .collect::<Vec<_>>()
     );
     // The two minutes of a half-hour step, every third hour.
@@ -267,11 +282,8 @@ fn a_progression_is_one_repetition_inside_each_hour() {
         (0..24).map(|h| daily(h, 5, repeat(5, 10))).collect::<Vec<_>>()
     );
     // A step that does not divide 60 restarts each hour, on the minutes' own grid.
-    assert_eq!(
-        triggers("*/7 * * * *"),
-        (0..24).map(|h| daily(h, 0, repeat(7, 56))).collect::<Vec<_>>()
-    );
-    assert_eq!(triggers("*/7 3 * * *"), [daily(3, 0, repeat(7, 56))]);
+    assert_eq!(triggers("*/7 * * * *"), lone_zero_then_repeat(0..24, 7, repeat(7, 49)));
+    assert_eq!(triggers("*/7 3 * * *"), [daily(3, 0, None), daily(3, 7, repeat(7, 49))]);
 }
 
 #[skuld::test]
@@ -296,8 +308,9 @@ fn a_minute_over_hours_is_a_lone_trigger_per_hour() {
     );
 }
 
+/// No repetition crosses a local hour boundary or starts at minute 0 (module doc).
 #[skuld::test]
-fn no_repetition_crosses_a_local_hour_boundary() {
+fn no_repetition_crosses_a_local_hour_boundary_or_starts_on_the_hour() {
     for text in FIRING_SCHEDULES.iter().flat_map(|texts| texts.iter()) {
         for trigger in triggers(text) {
             if let Trigger::Daily {
@@ -325,6 +338,7 @@ fn no_repetition_crosses_a_local_hour_boundary() {
                     u32::from(at.1) + repeat.for_minutes < 60,
                     "{text:?}: {trigger} crosses the hour"
                 );
+                assert_ne!(at.1, 0, "{text:?}: {trigger} starts on the hour");
             }
         }
     }
@@ -332,14 +346,17 @@ fn no_repetition_crosses_a_local_hour_boundary() {
 
 #[skuld::test]
 fn more_than_48_triggers_is_refused_naming_the_limit() {
-    // Two groups of minutes in every hour: 48 triggers, the cap, which is accepted.
+    // Two triggers in every hour: 48, the cap, which is accepted.
     assert_eq!(triggers("5,17,40 * * * *").len(), TRIGGER_LIMIT);
-    // Three groups make 72.
-    let text = "1,2,4,8,16 * * * *";
-    assert_eq!(
-        refusal(text),
-        format!("daemon `{ID}`: schedule `{text}` compiles to 72 Task Scheduler triggers, and a task holds at most 48")
-    );
+    // Three make 72.
+    for text in ["1,2,4,8,16 * * * *", "0-10,30 * * * *"] {
+        assert_eq!(
+            refusal(text),
+            format!(
+                "daemon `{ID}`: schedule `{text}` compiles to 72 Task Scheduler triggers, and a task holds at most 48"
+            )
+        );
+    }
 }
 
 #[skuld::test]

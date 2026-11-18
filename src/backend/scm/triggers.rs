@@ -1,23 +1,29 @@
 //! Compiles a cron schedule into Task Scheduler triggers, or refuses it.
 //!
 //! The triggers fire at the minutes the schedule names, in local civil time, by Task Scheduler's rule
-//! for a time that does not exist. No repetition crosses a local hour boundary (see "The time of day").
+//! for a time that does not exist. No repetition crosses a local hour boundary or starts at minute 0
+//! (see "The time of day").
 //!
 //! # Clock changes
 //!
-//! Measured on Windows Server 2025 with the change on an hour boundary (the knowledge base's
-//! "A repetition across a DST change runs twice a minute for part of its span ..." and "Task Scheduler
-//! runs a repetition that stays inside one hour across a DST change ..."):
+//! Measured on Windows Server 2025 with the change on an hour boundary, in a custom zone with the tasks
+//! registered after it (the knowledge base's "A repetition across a DST change runs twice a minute for
+//! part of its span ...", "Task Scheduler runs a repetition that stays inside one hour across a DST
+//! change ..." and "Task Scheduler runs every tick of a repetition that starts after the instant of a
+//! DST change ..."):
 //!
 //! - A repetition that spans the change runs on both the civil grid and elapsed time, so some minutes
 //!   run twice, and under `IgnoreNew` a doubled run is dropped only while the first is still going.
-//!   That is why none spans an hour boundary, where a change is; a change off the hour was not measured.
-//! - A repetition inside one hour, or a lone trigger, has `IgnoreNew` run exactly what `Parallel` runs.
-//!   An hour a change skips runs nothing that day. An hour it repeats runs in both passes.
-//! - Except a trigger due at the instant of the change: a repetition starting on the hour that ends
-//!   the skipped hour, or the second pass of a repeated hour, does not run at all (every tick) in that
-//!   pass. A repetition at `:05` or a lone trigger at `:30` of the same hours ran. A lone trigger at
-//!   `:00` was not measured.
+//!   That is why none spans an hour boundary, where a change is.
+//! - A lone trigger, or a repetition inside one hour, has `IgnoreNew` run exactly what `Parallel` runs.
+//!   An hour a change skips runs nothing that day; an hour it repeats runs in both passes.
+//! - A trigger due at the instant of the change does not run, and a repetition that starts at that
+//!   instant loses every tick: the first minute after a skipped hour, and the start of the second pass
+//!   of a repeated hour. A repetition that starts a minute later (`:01`, `:15`) runs every tick.
+//!
+//! So minute 0 of a group is a lone trigger of its own and the repetition starts at its next minute: the
+//! lone `:00` is the only run a change at the hour costs, instead of the whole hour's.
+//! A change off the hour was not measured.
 //!
 //! A trigger names days (every day, weekdays, days of the month, in some months or all), a start time
 //! and optionally a repetition that restarts at its start each day. What the shapes rest on was
@@ -39,16 +45,18 @@
 //!
 //! # The time of day
 //!
-//! The minutes are split into progressions, longest first (a class like `*/15` is one), then single
-//! minutes. Each group costs one trigger per hour the schedule names, none of which crosses an hour
-//! boundary:
+//! The minutes are split into groups, each an ascending progression: the longest progression that
+//! starts at the smallest minute left, until none is left. That is greedy and does not always give the
+//! fewest groups. In each hour the schedule names, a group costs:
 //!
-//! - a progression is one repetition from its first minute to its last, inside the hour;
-//! - a lone minute is one trigger without a repetition.
+//! - a lone trigger at minute 0, if the group has it;
+//! - for the rest of the group, a lone trigger if it is one minute, else one repetition from its first
+//!   minute to its last, inside the hour.
 //!
-//! So `*/15 * * * *` is 24 triggers, `5,10 * * * *` and `5,10,15 * * * *` too, and `0 9-17 * * *` is
-//! nine lone triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused. A repetition ends
-//! inside its day, so it never runs into a day the trigger does not name.
+//! So `*/15 * * * *` and `* * * * *` are 48 triggers (a lone `:00` and a repetition from `:15` or `:01`,
+//! in each of 24 hours), `5,10 * * * *` and `5,10,15 * * * *` are 24, and `0 9-17 * * *` is nine lone
+//! triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused: `0-10,30 * * * *` is 72. A
+//! repetition ends inside its day, so it never runs into a day the trigger does not name.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -264,13 +272,26 @@ struct Time {
     repeat: Option<Repeat>,
 }
 
-/// A trigger per hour of `hours` for each group of `minutes`: a repetition inside the hour for a
-/// progression, a lone trigger for a minute.
+/// The triggers of each group of `minutes` in each hour of `hours`: a lone trigger for minute 0, if the
+/// group has it, then for the rest of the group a lone trigger for one minute or a repetition inside the
+/// hour from its first minute to its last.
 fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     let mut times = Vec::new();
     for group in groups(minutes) {
-        let (first, last) = (group[0], group[group.len() - 1]);
-        let repeat = group.get(1).map(|second| Repeat {
+        let rest = match group.split_first() {
+            Some((0, rest)) => {
+                times.extend(hours.iter().map(|&hour| Time {
+                    at: (hour, 0),
+                    repeat: None,
+                }));
+                rest
+            }
+            _ => &group[..],
+        };
+        let Some((&first, &last)) = rest.first().zip(rest.last()) else {
+            continue;
+        };
+        let repeat = rest.get(1).map(|second| Repeat {
             every_minutes: u32::from(second - first),
             for_minutes: u32::from(last - first),
         });
