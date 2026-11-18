@@ -478,9 +478,7 @@ impl Scm {
                     old.id(),
                     DaemonKind::Service,
                     self.service_live_status(old)?.common().state,
-                )
-            },
-            || {
+                )?;
                 // A native service has no default log; a service whose account is gone has no one to name.
                 match old.blob() {
                     Ok(blob) if !generate::hosted(&blob.spec) => Ok(None),
@@ -494,29 +492,27 @@ impl Scm {
     }
 
     /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare` (what the machine must hold for
-    /// the task's account), `refuse` (the service runs: [`Error::RetypeRunning`]), `service_account` (the SID of the
-    /// account the service runs as, if a default log names it) and `retire` (the service is removed).
+    /// the task's account), `inspect` (refuses a service that runs, [`Error::RetypeRunning`], and gives the SID of
+    /// the account it runs as, if a default log names it) and `retire` (the service is removed).
     ///
     /// The default log names the service's account and the task's before the service is retired, and the task's
     /// alone once the task is registered ([`landed`]): the service runs as its account until it is retired, so
     /// neither a failed retirement nor a failed or raced registration leaves the log unusable by what is
-    /// registered, and the next install corrects what a failure left. The order is the contract: `refuse`, then
-    /// `service_account`, then `prepare` and the record directory, then the log for both accounts, then `retire`,
-    /// then the registration, then the log for the task's account alone. A refusal, a failed lookup, a failed
-    /// preparation or a failed log leaves the service as it was.
+    /// registered, and the next install corrects what a failure left. The order is the contract: `inspect`, then
+    /// `prepare` and the record directory, then the log for both accounts, then `retire`, then the registration,
+    /// then the log for the task's account alone. A refusal, a failed lookup, a failed preparation or a failed
+    /// log leaves the service as it was.
     pub(super) fn retype_to_task_with(
         &self,
         spec: &DaemonSpec,
         definition: &TaskXml,
         runs: &Runs,
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
-        refuse: impl FnOnce() -> Result<()>,
-        service_account: impl FnOnce() -> Result<Option<Sid>>,
+        inspect: impl FnOnce() -> Result<Option<Sid>>,
         retire: impl FnOnce() -> Result<()>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        refuse()?;
-        let service = service_account()?;
+        let service = inspect()?;
         let prepared = prepare(&definition.account())?;
         task_records(id, runs, &prepared, service.as_slice())?;
         retire()?;

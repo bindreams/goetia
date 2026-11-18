@@ -1389,8 +1389,7 @@ fn a_service_that_runs_is_not_changed_into_a_task() {
             &definition(&spec),
             &runs,
             |_| panic!("nothing is acquired for a retype that is refused"),
-            || refuse_running(&id(), DaemonKind::Service, State::Running),
-            || panic!("nothing is looked up for a retype that is refused"),
+            || refuse_running(&id(), DaemonKind::Service, State::Running).map(|()| None),
             || panic!("the service is not removed"),
         )
         .unwrap_err();
@@ -1428,7 +1427,6 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
                     password,
                 })
             },
-            || Ok(()),
             || Ok(None),
             || panic!("the service is not removed when what the task needs is missing"),
         )
@@ -1446,7 +1444,6 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
         &definition(&spec),
         &blocked,
         prepared_alice(),
-        || Ok(()),
         || Ok(None),
         || panic!("the service is not removed when its record directory cannot be made"),
     );
@@ -1471,7 +1468,6 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
             &definition(&spec),
             &runs,
             prepared(process_user_sid(), None),
-            || Ok(()),
             || Ok(None),
             || {
                 assert_eq!(
@@ -1522,7 +1518,6 @@ fn a_service_changed_into_a_task_that_does_not_land_leaves_both_accounts_their_l
             &definition(&spec),
             &runs,
             prepared(users(), None),
-            || Ok(()),
             || Ok(Some(local_service())),
             || {
                 if step == "retire" {
@@ -1561,7 +1556,6 @@ fn a_service_changed_into_a_task_leaves_the_tasks_account_alone_in_the_log_once_
             &definition(&spec),
             &runs,
             prepared(users(), None),
-            || Ok(()),
             || Ok(Some(local_service())),
             || {
                 let trustees = trustees_of(&default_log(&dir));
@@ -1595,7 +1589,6 @@ fn a_service_with_no_account_to_name_adds_none_to_the_log() {
             &definition(&spec),
             &runs,
             prepared(users(), None),
-            || Ok(()),
             || Ok(None),
             || {
                 assert_eq!(
@@ -1629,7 +1622,6 @@ fn a_service_whose_account_cannot_be_looked_up_is_not_changed_into_a_task() {
             &definition(&spec),
             &runs,
             prepared(users(), None),
-            || Ok(()),
             || {
                 Err(Error::AccountLookup {
                     detail: "no such account".to_string(),
