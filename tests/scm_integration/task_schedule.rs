@@ -154,8 +154,8 @@ fn end_of_january() -> DateTime {
 const MANY_RUN_TIMES: usize = 100_000;
 
 /// The schedules of [`FIRING_SCHEDULES`] with more than [`MANY_RUN_TIMES`] run times in the two years,
-/// and so the only ones cut to January 2027. A new one over the limit fails the check instead of being
-/// cut unseen.
+/// and so the only ones cut to January 2027. The check is two-way: a schedule over the limit that is not
+/// listed fails, and so does a listed one that is not in [`FIRING_SCHEDULES`] or no longer over it.
 const CUT_TO_JANUARY: [&str; 2] = ["* * * * *", "*/7 * * * *"];
 
 fn cron_names(schedule: &Schedule, minute: DateTime) -> bool {
@@ -180,6 +180,12 @@ fn assert_runs_as_cron_says(texts: &[&str]) {
     let instant = |at: DateTime| SystemTime::from(at.to_zoned(zone.clone()).expect("a time in the zone").timestamp());
 
     let end = end_of_two_years();
+    for text in CUT_TO_JANUARY {
+        assert!(
+            FIRING_SCHEDULES.iter().any(|group| group.contains(&text)),
+            "`{text}` is in CUT_TO_JANUARY but not in FIRING_SCHEDULES"
+        );
+    }
     for text in texts {
         let guard = TaskGuard::new();
         let id = &guard.id;

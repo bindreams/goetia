@@ -1,13 +1,13 @@
 //! Compiles a cron schedule into Task Scheduler triggers, or refuses it.
 //!
 //! The triggers fire at the minutes the schedule names, in local civil time, by Task Scheduler's rule
-//! for a time that does not exist. No repetition crosses a local hour boundary or starts at minute 0
-//! (see "The time of day").
+//! for a time that does not exist, except around a clock change (see "Clock changes"). No repetition
+//! crosses a local hour boundary or starts at minute 0 (see "The time of day").
 //!
 //! # Clock changes
 //!
 //! Measured on Windows Server 2025 with the change on an hour boundary, in a custom zone with the tasks
-//! registered after it (knowledge base, through commit 83cf440):
+//! registered after it (measured in the knowledge-base repository, commit 83cf440):
 //!
 //! - A repetition that spans the change runs on both the civil grid and elapsed time, so some minutes
 //!   run twice, and under `IgnoreNew` a doubled run is dropped only while the first is still going.
@@ -18,12 +18,14 @@
 //!   instant loses every tick: the first minute after a skipped hour, and the start of the second pass
 //!   of a repeated hour. A repetition that starts a minute later (`:01`, `:15`) runs every tick.
 //!
-//! The lone `:00` is the only run a change at the hour costs, instead of the whole hour's.
+//! The lone `:00` is the only run a change at the hour costs, instead of the whole hour's, apart from
+//! the case below.
 //!
 //! Not clean: in spring, a `PT1M` repetition starting at `:01` (the shape of `* * * * *` and any
-//! step-1 group) ran once a minute from registration to its first start, 8 extra runs, at minutes the
-//! trigger does not name; when the previous hour is also named, those minutes start twice. This is a
-//! stated limit for the README, and the registration-window measurement is filed.
+//! step-1 group) ran once a minute from registration to its first start, at minutes the trigger does
+//! not name (8 extra runs in the measured case, so the count follows the registration lead); when the
+//! previous hour is also named, those minutes start twice. This is a stated limit; the open
+//! measurements of the registration window are issue #285.
 //!
 //! A change off the hour, or by other than one hour (Lord Howe's 30 minutes), was not measured.
 //!
@@ -154,8 +156,9 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The triggers that fire exactly when `schedule` does (see "The time of day" in the module doc). A schedule that never fires (no month of its month set has any of its days) is
-/// `[Trigger::Never]`: the result is never empty.
+/// The triggers that fire exactly when `schedule` does, except around a clock change (see "The time of
+/// day" and "Clock changes" in the module doc). A schedule that never fires (no month of its month set
+/// has any of its days) is `[Trigger::Never]`: the result is never empty.
 ///
 /// Refused with [`Error::Invalid`] for `id`: a day of the month and a day of the week that must both
 /// match, with neither full (Task Scheduler's day forms are either-or); a day of the month and a day
@@ -282,8 +285,8 @@ fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     }
     let rest: BTreeSet<u8> = minutes.iter().copied().filter(|&minute| minute != 0).collect();
     for group in groups(&rest) {
-        // `groups` never makes an empty group.
-        let (first, last) = (group[0], group[group.len() - 1]);
+        let first = *group.first().expect("groups never makes an empty group");
+        let last = *group.last().expect("groups never makes an empty group");
         let repeat = group.get(1).map(|second| Repeat {
             every_minutes: u32::from(second - first),
             for_minutes: u32::from(last - first),
