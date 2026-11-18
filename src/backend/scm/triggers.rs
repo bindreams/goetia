@@ -7,10 +7,7 @@
 //! # Clock changes
 //!
 //! Measured on Windows Server 2025 with the change on an hour boundary, in a custom zone with the tasks
-//! registered after it (the knowledge base's "A repetition across a DST change runs twice a minute for
-//! part of its span ...", "Task Scheduler runs a repetition that stays inside one hour across a DST
-//! change ..." and "Task Scheduler runs every tick of a repetition that starts after the instant of a
-//! DST change ..."):
+//! registered after it (knowledge base, through commit 83cf440):
 //!
 //! - A repetition that spans the change runs on both the civil grid and elapsed time, so some minutes
 //!   run twice, and under `IgnoreNew` a doubled run is dropped only while the first is still going.
@@ -21,9 +18,14 @@
 //!   instant loses every tick: the first minute after a skipped hour, and the start of the second pass
 //!   of a repeated hour. A repetition that starts a minute later (`:01`, `:15`) runs every tick.
 //!
-//! So minute 0 of a group is a lone trigger of its own and the repetition starts at its next minute: the
-//! lone `:00` is the only run a change at the hour costs, instead of the whole hour's.
-//! A change off the hour was not measured.
+//! The lone `:00` is the only run a change at the hour costs, instead of the whole hour's.
+//!
+//! Not clean: in spring, a `PT1M` repetition starting at `:01` (the shape of `* * * * *` and any
+//! step-1 group) ran once a minute from registration to its first start, 8 extra runs, at minutes the
+//! trigger does not name; when the previous hour is also named, those minutes start twice. This is a
+//! stated limit for the README, and the registration-window measurement is filed.
+//!
+//! A change off the hour, or by other than one hour (Lord Howe's 30 minutes), was not measured.
 //!
 //! A trigger names days (every day, weekdays, days of the month, in some months or all), a start time
 //! and optionally a repetition that restarts at its start each day. What the shapes rest on was
@@ -52,11 +54,9 @@
 //! tasks. In each hour the schedule names, a group costs a lone trigger if it is one minute, else one
 //! repetition from its first minute to its last, inside the hour.
 //!
-//! So `*/15 * * * *`, `* * * * *` and `0,7,30 * * * *` are 48 triggers (a lone `:00` and a repetition,
-//! in each of 24 hours), `5,10 * * * *` and `5,10,15 * * * *` are 24, and `0 9-17 * * *` is nine lone
-//! triggers. A schedule of more than [`TRIGGER_LIMIT`] triggers is refused: `0-10,30 * * * *` and
-//! `*/20,5 * * * *` are 72. A repetition ends inside its day, so it never runs into a day the trigger
-//! does not name.
+//! So `*/15 * * * *` is 48 triggers (a lone `:00` and a repetition, in each of 24 hours). A schedule of
+//! more than [`TRIGGER_LIMIT`] triggers is refused: `0-10,30 * * * *` is 72. A repetition ends inside its
+//! day, so it never runs into a day the trigger does not name.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -154,9 +154,7 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The triggers that fire exactly when `schedule` does: in each hour, a lone trigger for minute 0 if the
-/// schedule names it, and one trigger for each group of the other minutes (see "The time of day" in the
-/// module doc). A schedule that never fires (no month of its month set has any of its days) is
+/// The triggers that fire exactly when `schedule` does (see "The time of day" in the module doc). A schedule that never fires (no month of its month set has any of its days) is
 /// `[Trigger::Never]`: the result is never empty.
 ///
 /// Refused with [`Error::Invalid`] for `id`: a day of the month and a day of the week that must both
@@ -273,9 +271,7 @@ struct Time {
     repeat: Option<Repeat>,
 }
 
-/// The triggers of `minutes` in each hour of `hours`: a lone trigger for minute 0, if `minutes` has it,
-/// then for each group of the other minutes a lone trigger for one minute or a repetition inside the hour
-/// from its first minute to its last.
+/// The triggers of `minutes` in each hour of `hours` (see "The time of day" in the module doc).
 fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     let mut times = Vec::new();
     if minutes.contains(&0) {
@@ -286,9 +282,8 @@ fn times(hours: &BTreeSet<u8>, minutes: &BTreeSet<u8>) -> Vec<Time> {
     }
     let rest: BTreeSet<u8> = minutes.iter().copied().filter(|&minute| minute != 0).collect();
     for group in groups(&rest) {
-        let (Some(&first), Some(&last)) = (group.first(), group.last()) else {
-            continue;
-        };
+        // `groups` never makes an empty group.
+        let (first, last) = (group[0], group[group.len() - 1]);
         let repeat = group.get(1).map(|second| Repeat {
             every_minutes: u32::from(second - first),
             for_minutes: u32::from(last - first),

@@ -226,9 +226,7 @@ fn one_time_of_day_is_one_trigger() {
     assert_eq!(triggers("30 3 * * *"), [daily(3, 30, None)]);
 }
 
-/// A lone trigger due at the instant of a change of clocks does not run, and a repetition that starts
-/// at that instant loses every tick (module doc): minute 0 is a lone trigger of its own, and the
-/// repetitions are of the other minutes, so none starts at an hour's start.
+/// No repetition starts at an hour's start (module doc).
 #[skuld::test]
 fn minute_zero_of_a_group_is_a_lone_trigger_and_the_repetition_starts_after_it() {
     assert_eq!(
@@ -293,7 +291,7 @@ fn a_progression_is_one_repetition_inside_each_hour() {
         triggers("5,10 * * * *"),
         (0..24).map(|h| daily(h, 5, repeat(5, 5))).collect::<Vec<_>>()
     );
-    // Three minutes of one progression are still one repetition per hour: 24 triggers, accepted.
+    // Three minutes of one progression are still one repetition per hour: 24 triggers.
     assert_eq!(
         triggers("5,10,15 * * * *"),
         (0..24).map(|h| daily(h, 5, repeat(5, 10))).collect::<Vec<_>>()
@@ -363,7 +361,7 @@ fn no_repetition_crosses_a_local_hour_boundary_or_starts_on_the_hour() {
 
 #[skuld::test]
 fn more_than_48_triggers_is_refused_naming_the_limit() {
-    // Two triggers in every hour: 48, the cap, which is accepted.
+    // Two triggers in every hour: 48, the cap.
     assert_eq!(triggers("5,17,40 * * * *").len(), TRIGGER_LIMIT);
     // Three make 72.
     for text in ["1,2,4,8,16 * * * *", "0-10,30 * * * *"] {
