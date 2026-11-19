@@ -3,7 +3,7 @@
 //! second: it computes the run times of a disarmed task too (M2), so those tests arm nothing.
 
 use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
@@ -11,7 +11,7 @@ use goetia::spec::{HashSeed, Schedule, User};
 use goetia::testing::{FIRING_SCHEDULES, cron_matches, task_run_times};
 use jiff::civil::{self, DateTime};
 use jiff::tz::TimeZone;
-use jiff::{Timestamp, ToSpan as _};
+use jiff::{Timestamp, ToSpan as _, Zoned};
 
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::CONNECT_BACK;
@@ -58,15 +58,17 @@ fn the_scheduler_fires_the_task_by_itself(#[fixture(scm_group)] _group: &Group) 
 }
 
 /// Re-arming a task makes up no run its schedule named while it was disarmed, though `StartWhenAvailable`
-/// is set: the task runs by itself once, is disarmed, a minute boundary passes, and is armed again. The
-/// next run to begin is a scheduled one, at or after the next run read at the re-arming; a run made up
-/// for the minute that passed would begin before it.
+/// is set: the task is armed and disarmed, the time its schedule names passes, and it is armed again.
+/// Read at the re-arming, its stored state is that of a task that never ran: no `last_run`, idle, and
+/// next due the day after. A run made up some time after the re-arming is not seen here: Task Scheduler
+/// documents a 10-minute delay for `StartWhenAvailable`, which the knowledge base's measurement watched
+/// for 20 minutes.
 ///
-/// The re-arming waits for Task Scheduler to have handled the boundary, not for the clock to reach it: a
-/// task armed in the second after the boundary may still be started for it, which is a scheduled run and
-/// not a made-up one. A second task of the same schedule, armed throughout, shows the boundary was
-/// handled when it has started for it. A run made up long after the re-arming (the documented delay of
-/// `StartWhenAvailable` is 10 minutes) is no part of this: see the knowledge base's measurement.
+/// The schedule is one daily time, not `* * * * *`: a disarmed task whose repetition is in progress
+/// goes on starting at every tick (measured), and one armed just after a tick may be started for it,
+/// neither of which is a made-up run. The re-arming waits for Task Scheduler to have handled the time,
+/// not for the clock to reach it: a second task of the same schedule, armed throughout, has started for
+/// it when it has.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn rearming_a_task_makes_up_no_missed_run(#[fixture(scm_group)] _group: &Group) {
     let guard = TaskGuard::new();
@@ -74,11 +76,18 @@ fn rearming_a_task_makes_up_no_missed_run(#[fixture(scm_group)] _group: &Group) 
     let (id, witness) = (&guard.id, &witness_guard.id);
     let mgr = support::stock_shim_manager();
     let (listener, witness_listener) = (ConnectBack::listen(), ConnectBack::listen());
+    // A minute two to three minutes ahead, local time: time to arm both before it.
+    let at = Zoned::now()
+        .checked_add(3.minutes())
+        .and_then(|ahead| ahead.with().second(0).subsec_nanosecond(0).build())
+        .expect("a minute ahead");
+    let schedule = format!("{} {} * * *", at.minute(), at.hour());
+    let due = SystemTime::from(at.timestamp());
     mgr.install(
         &task_spec(
             witness,
             connects_back(&witness_listener),
-            Some("* * * * *"),
+            Some(&schedule),
             User::Root,
             None,
         ),
@@ -86,45 +95,25 @@ fn rearming_a_task_makes_up_no_missed_run(#[fixture(scm_group)] _group: &Group) 
     )
     .expect("install the witness");
     mgr.install(
-        &task_spec(id, connects_back(&listener), Some("* * * * *"), User::Root, None),
+        &task_spec(id, connects_back(&listener), Some(&schedule), User::Root, None),
         false,
     )
     .expect("install");
     mgr.enable(witness).expect("enable the witness");
     mgr.enable(id).expect("enable");
-    listener.accept_unbounded();
-    let first = status_once_ended(&mgr, id);
     mgr.disable(id).expect("disable");
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_secs();
-    let passed = UNIX_EPOCH + Duration::from_secs((secs / 60 + 1) * 60);
-    kill::until(|| task_status(&mgr, witness).last_run.is_some_and(|began| began >= passed));
+    assert!(!task_status(&mgr, id).common.enabled, "precondition: disarmed");
+    kill::until(|| task_status(&mgr, witness).last_run.is_some_and(|began| began >= due));
 
     mgr.enable(id).expect("enable again");
 
-    let scheduled = task_status(&mgr, id).next_run.expect("an armed task has a next run");
+    let status = task_status(&mgr, id);
+    assert!(status.common.enabled, "{status:?}");
+    assert_eq!(status.last_run, None, "nothing was made up for {due:?}: {status:?}");
+    assert_eq!(status.common.state, State::Idle, "{status:?}");
     assert!(
-        scheduled > passed,
-        "the next run {scheduled:?} is after the minute that passed {passed:?}"
-    );
-    listener.accept_unbounded();
-    let mut second = None;
-    kill::until(|| {
-        let status = task_status(&mgr, id);
-        let ended =
-            status.common.state == State::Idle && status.last_result.is_some() && status.last_run != first.last_run;
-        second = Some(status);
-        ended
-    });
-    let began = second
-        .expect("a status was read")
-        .last_run
-        .expect("a run that ended began");
-    assert!(
-        began >= scheduled,
-        "the run began at {began:?}, before the scheduled {scheduled:?}: a run made up for {passed:?}"
+        status.next_run.is_some_and(|next| next > due),
+        "the next run is after {due:?}: {status:?}"
     );
     mgr.disable(witness).expect("disable the witness");
     mgr.disable(id).expect("disable");
