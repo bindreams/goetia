@@ -206,7 +206,7 @@ fn installed_fixture(mgr: &Scm, id: &str, started: &ConnectBack, stopped: &Conne
     }
 }
 
-// Q1 and Q2: one registration, a delete, a re-arm -------------------------------------------------------------------
+// Q1 and Q2: one registration, a delete, a re-arm ---------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum Mask {
