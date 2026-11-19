@@ -163,7 +163,10 @@ mod windows {
     #[skuld::test]
     fn the_runs_descriptor_names_the_owner_and_the_principal() {
         let me = users();
-        let wanted = Descriptor::for_runs(std::slice::from_ref(&me)).unwrap().wanted().unwrap();
+        let wanted = Descriptor::for_runs(std::slice::from_ref(&me))
+            .unwrap()
+            .wanted()
+            .unwrap();
         let inherit = OBJECT_INHERIT | CONTAINER_INHERIT;
         let mut expected = vec![
             allow(system(), FULL, inherit),

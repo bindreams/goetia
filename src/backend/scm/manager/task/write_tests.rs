@@ -909,7 +909,7 @@ fn an_unchanged_install_names_the_account_alone_in_the_log() {
     assert!(!trustees.contains(&process_user_sid()));
 }
 
-// An install that finds the task up to date --------------------------------------------------------------------------
+// An install that finds the task up to date ---------------------------------------------------------------------------
 
 /// A task of `Users`, whose record directory and default log an install made (the folders as `disabled` judges
 /// them: the temporary `%ProgramData%` is no place goetia's own check could pass), and what `task_beside_with`

@@ -1441,7 +1441,7 @@ fn ensure_for_another_principal_rewrites_the_dacl() {
     // `Users` has this test's account among its members, so it still reaches what it made.
     let users = sid_from_parts(5, &[32, 545]);
 
-    runs.ensure(&[users.clone()]).unwrap();
+    runs.ensure(std::slice::from_ref(&users)).unwrap();
 
     assert_eq!(entries_of(&runs.dir), dacl_for(users));
     assert_eq!(runs.read(&first.instance).unwrap(), Some(first));
