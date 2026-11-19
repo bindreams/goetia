@@ -20,7 +20,10 @@ use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 use serde_json::Value;
 
-use crate::linux::{CreatedRoot, UNIT_DIR_EXCLUSIVE, create_root, exiting, main_pid, timer_path, timer_wants_symlink};
+use crate::linux::{
+    CreatedRoot, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, journal, main_pid, started_invocations,
+    timer_path, timer_wants_symlink, unit_of,
+};
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
 use crate::support::cron_oracle::assert_next_run;
 use crate::support::tasks::{
@@ -32,14 +35,7 @@ use crate::support::{self, Group, ServiceGuard, cmd, cron_oracle, kill, systemd_
 #[skuld::label]
 pub(crate) const JOURNALD_CONFIG: skuld::Label;
 
-/// "Starting `<unit>`...": the manager began a run.
-const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
-
 // Fixtures ============================================================================================================
-
-fn unit_of(id: &str) -> String {
-    format!("{id}.service")
-}
 
 fn task(id: &str, command: Vec<String>, schedule: Option<&str>) -> DaemonSpec {
     goetia::testing::task(id, command, schedule)
@@ -115,36 +111,6 @@ impl Drop for JournaldConf {
         remove_or_warn(&self.path, false);
         warn_left_behind(restart_journald());
     }
-}
-
-/// The entries `journalctl` holds for `matches`, oldest first, as JSON objects.
-fn journal(matches: &[&str]) -> Vec<Value> {
-    cmd::run("journalctl", &["--sync"]).expect_ok();
-    let mut args = vec!["-a", "-o", "json", "--no-pager"];
-    args.extend_from_slice(matches);
-    cmd::run("journalctl", &args)
-        .expect_ok()
-        .stdout
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("journalctl JSON `{line}`: {e}")))
-        .collect()
-}
-
-fn field<'a>(entry: &'a Value, name: &str) -> Option<&'a str> {
-    entry.get(name)?.as_str()
-}
-
-/// The invocation of every run of `id`'s unit the manager started, oldest first.
-pub(crate) fn started_invocations(id: &str) -> Vec<String> {
-    let unit = format!("UNIT={}", unit_of(id));
-    journal(&[&unit, &format!("MESSAGE_ID={STARTING}")])
-        .iter()
-        .map(|entry| {
-            field(entry, "INVOCATION_ID")
-                .expect("a Starting entry has an invocation")
-                .to_string()
-        })
-        .collect()
 }
 
 /// `(invocation, EXIT_CODE, EXIT_STATUS)` of every "Main process exited" entry of `id`'s unit.

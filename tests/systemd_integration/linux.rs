@@ -19,6 +19,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
 use goetia::testing::service_fields;
+use serde_json::Value;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::tasks::{mkfifo, task_status};
@@ -2812,6 +2813,48 @@ pub(crate) fn timer_wants_symlink(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR)
         .join("timers.target.wants")
         .join(format!("{id}.timer"))
+}
+
+/// "Starting `<unit>`...": the manager began a run.
+pub(crate) const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
+
+/// What the manager's entries are all written by, as `goetia` asks for them: a unit's own process can
+/// write an entry with any `MESSAGE_ID` and `UNIT`.
+const FROM_PID_1: &str = "_PID=1";
+
+pub(crate) fn unit_of(id: &str) -> String {
+    format!("{id}.service")
+}
+
+/// The entries `journalctl` holds for `matches`, oldest first, as JSON objects.
+pub(crate) fn journal(matches: &[&str]) -> Vec<Value> {
+    cmd::run("journalctl", &["--sync"]).expect_ok();
+    let mut args = vec!["-a", "-o", "json", "--no-pager"];
+    args.extend_from_slice(matches);
+    cmd::run("journalctl", &args)
+        .expect_ok()
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("journalctl JSON `{line}`: {e}")))
+        .collect()
+}
+
+pub(crate) fn field<'a>(entry: &'a Value, name: &str) -> Option<&'a str> {
+    entry.get(name)?.as_str()
+}
+
+/// The invocation of every run of `id`'s unit the manager started, oldest first: the entries `goetia`
+/// reads `last-run` from (`UNIT=`, `MESSAGE_ID=` and `_PID=1`).
+pub(crate) fn started_invocations(id: &str) -> Vec<String> {
+    let unit = format!("UNIT={}", unit_of(id));
+    journal(&[&unit, &format!("MESSAGE_ID={STARTING}"), FROM_PID_1])
+        .iter()
+        .map(|entry| {
+            field(entry, "INVOCATION_ID")
+                .expect("a Starting entry has an invocation")
+                .to_string()
+        })
+        .collect()
 }
 
 /// A task that exits with `code` the moment it starts, and runs daily at 03:30.
