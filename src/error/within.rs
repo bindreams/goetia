@@ -1,7 +1,8 @@
 use std::io;
+use std::sync::Arc;
 
-use super::Error;
-use super::report::{Seen, seen};
+use super::report::{Dyn, Seen, seen};
+use super::{Error, SharedError};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]
@@ -38,8 +39,32 @@ fn said_within(context: String, delivered: bool, source: io::Error) -> io::Error
     )
 }
 
+/// Whether `e` holds a goetia [`Error`] or a [`within`] context under a shared payload (an `Arc<io::Error>` or
+/// a [`SharedError`]), which [`told`] cannot move out of it.
+fn goetia_under_shared_payload(e: &io::Error) -> bool {
+    let mut at: &Dyn = e;
+    let mut shared = false;
+    loop {
+        at = if let Some(payload) = at.downcast_ref::<io::Error>().and_then(io::Error::get_ref) {
+            payload
+        } else if let Some(inner) = at.downcast_ref::<Arc<io::Error>>() {
+            shared = true;
+            &**inner
+        } else if let Some(inner) = at.downcast_ref::<SharedError>() {
+            shared = true;
+            &**inner
+        } else {
+            return shared && (at.is::<Error>() || at.is::<Box<Error>>() || at.is::<Within>());
+        };
+    }
+}
+
 /// What an [`io::Error`] is, one layer down, as [`seen`] looks through what carries it: the one place that
 /// knows how [`within`] is laid in it.
+///
+/// Nothing goetia lays in an [`io::Error`], neither an [`Error`] nor a [`within`] context, sits under a
+/// shared payload (an `Arc<io::Error>` or a [`SharedError`]): a shared payload is only ever an OS failure, which
+/// [`seen`] still looks through for the printer. A debug build asserts it.
 enum Layer<'a> {
     Context(&'a Within),
     Carried(&'a Error),
@@ -47,6 +72,10 @@ enum Layer<'a> {
 }
 
 fn layer(e: &io::Error) -> Layer<'_> {
+    debug_assert!(
+        !goetia_under_shared_payload(e),
+        "a goetia error or a context is laid in a shared payload: {e:?}"
+    );
     match seen(e) {
         Seen::Ours(carried) => Layer::Carried(carried),
         Seen::Other(inner) => inner.downcast_ref::<Within>().map_or(Layer::Os, Layer::Context),
@@ -56,8 +85,7 @@ fn layer(e: &io::Error) -> Layer<'_> {
 
 /// What one look at an [`io::Error`] found, through its contexts: the one read of what an error says of its
 /// signal and of the goetia error it carries, which [`target_failed`] and `debug_privilege_also_failed`
-/// (Windows) both take their answers from, and [`Error::is_indeterminate`] for an error [`told`] could not
-/// move.
+/// (Windows) both take their answers from.
 pub(super) struct Looked<'a> {
     /// A context said by [`within_delivered`] is among those the error is said within: see there.
     delivered: bool,
@@ -97,9 +125,8 @@ fn take_payload<T: std::error::Error + 'static>(e: io::Error) -> Result<T, io::E
 
 /// `e` as an [`Error`]: the goetia error it carries, else its failure alone as [`Error::RawOs`]. A
 /// context it is said within is a [`Error::Step`] over what is under it. An `io::Error` that holds
-/// another is its carrier, and is looked through. What a shared payload holds cannot be moved out of it:
-/// it is `e` alone as [`Error::RawOs`], which [`Error::is_indeterminate`] and the printer and the search
-/// read through, and [`Error::cause`] does not.
+/// another is its carrier, and is looked through. A shared payload holds no goetia error (see [`Layer`]),
+/// so `e` over one is [`Error::RawOs`].
 fn told(e: io::Error) -> Error {
     if matches!(layer(&e), Layer::Os) {
         return Error::RawOs { os: e };

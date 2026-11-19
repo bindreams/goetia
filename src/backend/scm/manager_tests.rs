@@ -1092,7 +1092,7 @@ fn a_provider_whose_folder_and_sweep_fail_alike_is_reported_once_with_no_retry()
     assert!(!said.contains("could not be determined"), "{said}");
 }
 
-/// A `stop` whose process could not be opened says so in the error that follows, led by it, and the
+/// A `stop` whose process could not be held says so in the error that follows, led by it, and the
 /// error under it keeps its class: a timeout is still indeterminate.
 #[skuld::test]
 fn a_stop_error_says_when_the_process_could_not_be_waited_for() {
@@ -1109,7 +1109,7 @@ fn a_stop_error_says_when_the_process_could_not_be_waited_for() {
     assert!(said.contains("goetia stopped waiting"), "{said}");
 }
 
-/// The words of a `stop` whose process could not be opened, and the failure to open it, which is a
+/// The words of a `stop` whose process could not be held, and the failure to hold it, which is a
 /// cause the one search reaches.
 #[skuld::test]
 fn a_stop_that_could_not_open_its_process_says_so_and_the_open_failure_is_searched() {

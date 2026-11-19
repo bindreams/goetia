@@ -110,7 +110,7 @@ impl fmt::Display for Chain<'_> {
     }
 }
 
-type Dyn = dyn std::error::Error + 'static;
+pub(super) type Dyn = dyn std::error::Error + 'static;
 
 // The shape of an error ===============================================================================================
 
@@ -215,6 +215,9 @@ pub(super) struct Node<'a> {
 /// What is looked through: an `io::Error`'s custom payload (its `source()` is the payload's, which skips
 /// the payload), an `Arc<io::Error>` or [`SharedError`], and a `Box<Error>`. A [`Carrier`] is its
 /// composite. A goetia [`Error`] is itself, a [`Kept`](Error::Kept) one as the error it holds.
+///
+/// A shared payload is looked through for printing, where an error another crate shares (`cosca`'s) is
+/// real. A walk that classifies (`within`) does not rely on it for a goetia error: none is laid there.
 pub(super) enum Seen<'a> {
     Ours(&'a Error),
     Composite(&'a dyn Composite),

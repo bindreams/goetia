@@ -3,7 +3,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::*;
-use crate::error::{Error, SharedError};
+use crate::error::Error;
 
 fn denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "denied")
@@ -142,11 +142,6 @@ fn carried_in_each_payload(carried: fn() -> Error) -> Vec<(&'static str, io::Err
             "an io::Error in an io::Error",
             io::Error::other(io::Error::other(io::Error::other(Box::new(carried())))),
         ),
-        ("a SharedError", io::Error::other(Arc::new(carried()) as SharedError)),
-        (
-            "an Arc<io::Error>",
-            io::Error::other(Arc::new(io::Error::other(carried()))),
-        ),
     ]
 }
 
@@ -194,22 +189,6 @@ fn a_targets_failure_is_the_goetia_error_it_carries_in_whatever_payload() {
             "{how}"
         );
     }
-}
-
-/// A delivered signal told in an `io::Error` that an `Arc` holds is as delivered as one held directly.
-#[skuld::test]
-fn a_delivered_signal_in_a_shared_error_still_says_it_was_delivered() {
-    let shared = io::Error::other(Arc::new(within_delivered(
-        "process 7 was signalled, but waiting failed",
-        denied(),
-    )));
-
-    let report = target_failed("kill `x`", within("outer", shared)).report().to_string();
-
-    assert!(
-        report.starts_with("kill `x`: outer: process 7 was signalled, but waiting failed: "),
-        "{report}"
-    );
 }
 
 /// The class of the error a failure carries is the failure's, in whatever payload it is carried, said within

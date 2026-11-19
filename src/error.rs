@@ -59,10 +59,6 @@ pub enum Error {
     /// An OS failure that says nothing of its own: the words of the error around it say what failed, as
     /// those of [`ManagerUnreadAfterOpenRefused`](Error::ManagerUnreadAfterOpenRefused) do. `os` is
     /// rendered as any error is, and is not the [`source`](std::error::Error::source).
-    ///
-    /// It is also the goetia error that a shared payload of `os` holds, which cannot be moved out of it: the
-    /// text, the remedies, the search and [`is_indeterminate`](Error::is_indeterminate) read that error
-    /// through `os`; [`cause`](Error::cause) and [`map_cause`](Error::map_cause) do not.
     #[error("{}", Written(self))]
     RawOs { os: std::io::Error },
 
@@ -846,10 +842,9 @@ impl Error {
             | Error::RunUnrecorded { .. } => true,
             wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
-            // The goetia error a shared payload holds, which `within::told` could not move out.
-            Error::RawOs { os } => within::look(os).carried.is_some_and(Error::is_indeterminate),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
+            | Error::RawOs { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
             | Error::ConcurrentChange { .. }
@@ -1581,18 +1576,15 @@ fn loaded_in_doubt_tail(id: &str, restore_failed: bool) -> String {
 }
 
 /// What `Display` writes for a variant whose message sets errors inside it: its [`pieces`](Error::pieces).
-/// A variant that `pieces` leaves unclassified is written as its `Debug`, and a debug build asserts: no
-/// `Display` fails or panics in a release build, and a test renders every such variant.
+/// A variant that `pieces` leaves unclassified is written as its `Debug`: `Display` never panics, and a
+/// test renders every such variant.
 struct Written<'a>(&'a Error);
 
 impl fmt::Display for Written<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0.pieces() {
             Some(pieces) => pieces.fmt(f),
-            None => {
-                debug_assert!(false, "a variant written from its pieces is classified by `pieces`");
-                write!(f, "{:?}", self.0)
-            }
+            None => write!(f, "{:?}", self.0),
         }
     }
 }

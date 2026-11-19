@@ -4,7 +4,7 @@
 //! by the pid the listing gives and held, the listing is read again, and only a pid it still names is
 //! the run's, since Task Scheduler holds its own handle to the process for as long as it lists the pid,
 //! so no stranger can have the number (L1, M5). [`RunTarget`] is that for one run, a
-//! [`KillTarget`]: `kill` is [`kill_service_naming`] over it, and `stop` holds through the same
+//! [`KillTarget`]: `kill` is [`kill_service`] over it, and `stop` holds through the same
 //! [`hold_once`].
 //!
 //! Three things differ from a service.
@@ -24,7 +24,7 @@ use super::live::{Liveness, probe};
 use super::read::live_runs;
 use super::{TaskApi, TaskPath};
 use crate::backend::kill::{
-    Hold, HoldError, KillTarget, Waited, hold_once, kill_failed, kill_service_naming, wait_saying, waiting_notice,
+    Hold, HoldError, KillTarget, Waited, hold_once, kill_failed, kill_service, wait_saying, waiting_notice,
 };
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::InstanceId;
@@ -87,6 +87,11 @@ struct RunTarget<'a, P: Processes> {
     tasks: &'a dyn TaskApi,
     path: &'a TaskPath,
     instance: InstanceId,
+    /// The pid the listing gave the run when the verb began, which only names the run in a failed read.
+    pid: u32,
+    /// Whether the listing has been read for this run: the first read alone is made before it names a
+    /// process, so it alone says which run it was for.
+    listed: bool,
     processes: &'a mut P,
     /// The run's process, when a caller opened it beforehand ([`hold_all`]): the machine takes it in
     /// place of an open, and confirms it as it confirms any.
@@ -94,11 +99,13 @@ struct RunTarget<'a, P: Processes> {
 }
 
 impl<'a, P: Processes> RunTarget<'a, P> {
-    fn new(tasks: &'a dyn TaskApi, path: &'a TaskPath, instance: InstanceId, processes: &'a mut P) -> Self {
+    fn new(tasks: &'a dyn TaskApi, path: &'a TaskPath, instance: &Instance, processes: &'a mut P) -> Self {
         Self {
             tasks,
             path,
-            instance,
+            instance: instance.id,
+            pid: instance.pid,
+            listed: false,
             processes,
             held: None,
         }
@@ -108,14 +115,25 @@ impl<'a, P: Processes> RunTarget<'a, P> {
 impl<P: Processes> KillTarget for RunTarget<'_, P> {
     type Process = P::Held;
 
-    /// The pid the listing gives the run, read afresh: `None` once the entry is gone, or the task is.
+    /// The pid the listing gives the run, read afresh: `None` once the entry is gone, or the task is. The
+    /// failure of the first read says which run it was for; later reads follow a pid the hold's own words
+    /// name.
     fn service_pid(&mut self) -> io::Result<Option<u32>> {
+        let first = !std::mem::replace(&mut self.listed, true);
         match self.tasks.instances(self.path) {
             Ok(listed) => Ok(listed
                 .iter()
                 .find(|listed| listed.id == self.instance)
                 .map(|listed| listed.pid)),
             Err(e) if gone(&e) => Ok(None),
+            Err(e) if first => Err(within(
+                format!(
+                    "failed to list the instances of `{}` for its run (pid {})",
+                    self.path.name(),
+                    self.pid
+                ),
+                io::Error::other(e),
+            )),
             Err(e) => Err(io::Error::other(e)),
         }
     }
@@ -158,7 +176,7 @@ pub(super) fn hold_run<P: Processes>(
     instance: &Instance,
     processes: &mut P,
 ) -> Result<Option<P::Held>> {
-    let mut target = RunTarget::new(tasks, path, instance.id, processes);
+    let mut target = RunTarget::new(tasks, path, instance, processes);
     match hold_once(&mut target, Budget::Unbounded.start()) {
         Ok(Hold::Held { process, .. }) => Ok(Some(process)),
         Ok(Hold::NoProcess | Hold::Ended { .. }) => Ok(None),
@@ -168,12 +186,7 @@ pub(super) fn hold_run<P: Processes>(
             &format!("hold the process of `{id}`'s run to wait for its exit"),
             e,
         )),
-        // The first read is made before the listing names a process, and the caller knows which run it is for.
-        Err(HoldError::Unread(e)) => Err(target_failed(
-            format!("hold the process of `{id}`'s run (pid {})", instance.pid),
-            e,
-        )),
-        // The other errors of a hold name the pid.
+        // The first read of the run says which run it was for, and the other errors of a hold name the pid.
         Err(e) => Err(target_failed(
             format!("hold the process of `{id}`'s run"),
             io::Error::from(e),
@@ -221,7 +234,7 @@ fn send_stops<'a>(
 
 /// The process of every run in `live`, held, each confirmed by a second read of the listing. A run
 /// with no process any more (see [`hold_run`]) is left out. Held before anything is done to any of them,
-/// so a run whose process cannot be opened fails the call with nothing sent.
+/// so a run whose process cannot be held fails the call with nothing sent.
 fn hold_all<P: Processes>(
     tasks: &dyn TaskApi,
     operation: &str,
@@ -269,7 +282,7 @@ fn await_run<P: Processes>(
 /// process is waited for until `budget` runs out. Returns the runs whose process was waited for, which
 /// is none under a budget that does not wait.
 ///
-/// Every process is held before the first `Stop` is sent, so a run whose process cannot be opened
+/// Every process is held before the first `Stop` is sent, so a run whose process cannot be held
 /// fails the call with nothing sent. A run that ended on its own, or that no longer has a process, is
 /// not touched: the listing is no proof of a run, and a pid it no longer names may be a stranger's. A
 /// task that is gone has no runs.
@@ -304,7 +317,7 @@ pub(super) fn stop_runs<P: Processes>(
     }
     send_stops(tasks, &path, held.iter().map(|(instance, _)| instance))?;
     for (instance, process) in &held {
-        let mut target = RunTarget::new(tasks, &path, instance.id, &mut *processes);
+        let mut target = RunTarget::new(tasks, &path, instance, &mut *processes);
         await_run(&mut target, id, instance.pid, process, budget, deadline)?;
     }
     Ok(held.into_iter().map(|(instance, _)| instance.id).collect())
@@ -418,8 +431,8 @@ impl Scm {
         self.task_kill_with(id, &mut System)
     }
 
-    /// Ends every run of the task that is alive through its held process ([`kill_service_naming`] over each).
-    /// Every process is held before the first is terminated, so a run whose process cannot be opened
+    /// Ends every run of the task that is alive through its held process ([`kill_service`] over each).
+    /// Every process is held before the first is terminated, so a run whose process cannot be held
     /// fails the call with nothing killed; once they are, a run that cannot be ended is an error beside
     /// the ones that were. None alive is [`Error::NotRunning`]; a run with no process any more has
     /// ended.
@@ -436,14 +449,10 @@ impl Scm {
         let held = hold_all(&*self.tasks, "kill", id, &path, live, processes)?;
         let mut failures = Vec::new();
         for (instance, process) in held {
-            let mut target = RunTarget::new(&*self.tasks, &path, instance.id, &mut *processes);
+            let mut target = RunTarget::new(&*self.tasks, &path, &instance, &mut *processes);
             target.held = Some(process);
             // `NotRunning` is a run the listing dropped since: it is over.
-            // The first read is made before the listing names a process: this loop knows which run it is for.
-            let killed = kill_service_naming(&mut target, id.as_str(), |e| {
-                within(format!("reading the process of the run (pid {})", instance.pid), e)
-            });
-            if let Err(e) = killed.map_err(|e| kill_failed(id.as_str(), e)) {
+            if let Err(e) = kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e)) {
                 failures.push(e);
             }
         }

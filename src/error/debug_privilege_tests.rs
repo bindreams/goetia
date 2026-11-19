@@ -30,11 +30,3 @@ fn a_goetia_error_carried_directly_is_not_an_os_failure_of_a_pair() {
 fn a_goetia_error_carried_in_a_box_is_not_an_os_failure_of_a_pair() {
     let _ = debug_privilege_also_failed(denied(), io::Error::other(Box::new(Error::blob("carried"))));
 }
-
-#[cfg(debug_assertions)]
-#[skuld::test]
-#[should_panic(expected = "a pair is two OS failures")]
-fn a_goetia_error_carried_in_a_shared_error_is_not_an_os_failure_of_a_pair() {
-    let shared: std::sync::Arc<io::Error> = std::sync::Arc::new(io::Error::other(Error::blob("carried")));
-    let _ = debug_privilege_also_failed(denied(), io::Error::other(shared));
-}

@@ -169,16 +169,6 @@ fn wait_unbounded_saying<T: KillTarget>(
 ///
 /// The signal is sent before any wait, so a caller that dies in the wait still has the process ended.
 pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillOutcome> {
-    kill_service_naming(target, id, |e| e)
-}
-
-/// [`kill_service`], where the failure of the first read of the manager is told by `unread`: a caller that
-/// kills one of several processes of `id` says which in it.
-pub(crate) fn kill_service_naming<T: KillTarget>(
-    target: &mut T,
-    id: &str,
-    unread: impl FnOnce(io::Error) -> io::Error,
-) -> io::Result<KillOutcome> {
     match hold_once(target, Budget::Bounded(NOTICE_AFTER).start()) {
         // The hold's wait for the record of a process gone before it could be opened is the kill's own.
         Err(HoldError::Expired { pid }) => {
@@ -188,8 +178,7 @@ pub(crate) fn kill_service_naming<T: KillTarget>(
             .map_err(|e| of_process(pid, Step::Recording, e))?;
             Ok(KillOutcome::Ended)
         }
-        Err(HoldError::Unread(e)) => Err(unread(e)),
-        Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
+        Err(HoldError::Unread(e) | HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
         Ok(Hold::NoProcess) => Ok(KillOutcome::NotRunning),
         // The process held is not the service's, or was gone: it is not signalled, and a manager may
         // still report its pid for a moment, so the kill waits for the record as after a signal.
