@@ -308,10 +308,7 @@ fn a_timer_that_changes_is_disarmed_by_its_activity_and_armed_again_by_its_link(
             active: false,
             enabled: true,
         },
-        TimerArming {
-            active: false,
-            enabled: false,
-        },
+        TimerArming::default(),
     );
     for (what, new, dropins, arming, disarm, rearm) in [
         ("its text changes", &moved, false, on, true, true),
@@ -2232,7 +2229,13 @@ fn a_task_status_is_read_from_the_job_the_timer_and_the_journal() {
                 "--",
                 "x.service"
             ]),
-            call(&["show", "--property", "UnitFileState,LoadState", "--", "x.timer"]),
+            call(&[
+                "show",
+                "--property",
+                "ActiveState,UnitFileState,LoadState",
+                "--",
+                "x.timer"
+            ]),
         ]
     );
 }

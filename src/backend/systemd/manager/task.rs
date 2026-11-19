@@ -196,10 +196,7 @@ pub(super) fn before_replacing(
     let timer = if timer_changes {
         arming()?
     } else {
-        TimerArming {
-            active: false,
-            enabled: false,
-        }
+        TimerArming::default()
     };
     Ok(Before {
         disable_job: old.kind() == Some(DaemonKind::Service) && spec.kind() == DaemonKind::Task,
@@ -247,7 +244,7 @@ impl Systemd {
             },
             || {
                 self.systemctl.require_supported(held)?;
-                self.systemctl.timer_arming(id)
+                self.systemctl.timer_arming(id, held)
             },
         )?;
 
@@ -510,7 +507,7 @@ impl Systemd {
         let (enabled, next_run) = match snapshot.timer() {
             None => (false, None),
             Some(_) => (
-                self.systemctl.timer_enabled(id)?,
+                self.systemctl.timer_arming(id, &mut Held::default())?.enabled,
                 self.busctl.next_elapse(&unit_name(id, UnitKind::Timer))?,
             ),
         };

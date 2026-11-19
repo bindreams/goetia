@@ -9,7 +9,7 @@ use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::kill::process::process_tests::Sleeper;
 use crate::backend::kill::{KillOutcome, KillTarget as _, kill_failed, kill_service};
 use crate::backend::systemd::manager::Systemd;
-use crate::backend::systemd::manager::systemctl::systemctl_tests::{booted, gate_then, on_booted};
+use crate::backend::systemd::manager::systemctl::systemctl_tests::{booted, gate_passes, gate_then, on_booted};
 use crate::backend::systemd::manager::task::task_tests::{fragment, service_spec};
 use crate::error::Error;
 use crate::manager::budget::Budget as Bound;
@@ -23,6 +23,16 @@ fn show(pid: u32) -> Entry {
 /// `systemctl show` of a unit it does not have loaded.
 fn not_loaded() -> Entry {
     reply(&["show"], exited(0, "MainPID=0\nLoadState=not-found\n", ""))
+}
+
+/// A unit systemd has not loaded and still cannot after the reload a read makes of it: the `show`, the
+/// version gate the reload asks, the reload, and the `show` again.
+fn not_loaded_after_a_reload() -> Vec<Entry> {
+    let mut entries = vec![not_loaded()];
+    entries.extend(gate_passes());
+    entries.push(reply(&["daemon-reload"], exited(0, "", "")));
+    entries.push(not_loaded());
+    entries
 }
 
 /// The target of `x.service`, over `systemctl`.
@@ -68,7 +78,7 @@ fn a_unit_with_no_main_process_has_no_pid() {
 /// gives, never a state.
 #[skuld::test]
 fn a_unit_systemd_has_not_loaded_is_an_error_and_never_no_process() {
-    let systemctl = on_booted(Fake::new([not_loaded()]));
+    let systemctl = on_booted(Fake::new(not_loaded_after_a_reload()));
 
     let e = kill_failed("x", target(&systemctl).service_pid().unwrap_err());
 
@@ -168,7 +178,7 @@ fn a_reaped_process_the_manager_still_shows_is_waited_for() {
 fn an_unloaded_unit_in_the_wait_is_an_error_and_not_the_record() {
     let (run, held) = unreaped();
     let pid = run.pid();
-    let systemctl = on_booted(Fake::new([show(pid), not_loaded()]));
+    let systemctl = on_booted(Fake::new(std::iter::once(show(pid)).chain(not_loaded_after_a_reload())));
 
     let e = kill_failed(
         "x",
@@ -245,7 +255,7 @@ fn kill_of_a_unit_with_no_main_process_is_not_running() {
 /// What `status` says of a unit systemd has not loaded, `kill` says: it is not "not running".
 #[skuld::test]
 fn kill_of_a_unit_systemd_has_not_loaded_is_the_error_status_gives() {
-    let fake = gate_then([not_loaded()]);
+    let fake = gate_then(not_loaded_after_a_reload());
     let mgr = Systemd::with(Systemctl::new(Box::new(fake.clone()), booted));
     let mut held = Backend::reserve(&mgr, &[Step::Kill], Budget::Unbounded).expect("reserve");
 
