@@ -340,6 +340,11 @@ struct State {
     opened_logs: Vec<(PathBuf, LogKind, File)>,
     append_failures: Vec<PathBuf>,
     hold_failures: Vec<PathBuf>,
+    /// The default logs held, by path: by a successful `hold_default`, or by an `append` that opened one,
+    /// as the real channels hold what they open.
+    held_defaults: Vec<PathBuf>,
+    /// The `append`s to a default log that was not held, which the real channels open and hold.
+    default_log_opens: usize,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
     processes: Vec<Arc<Proc>>,
@@ -418,6 +423,11 @@ impl Fake {
     /// A `Log` over this `Fake`'s channels.
     pub(crate) fn log(&self) -> Arc<Log> {
         Arc::new(Log::new(self.channels(), PathBuf::from(FAKE_LOGS)))
+    }
+
+    /// A task-mode `Log` over this `Fake`'s channels: closed to the default log until it is held.
+    pub(crate) fn task_log(&self) -> Arc<Log> {
+        Arc::new(Log::new(self.channels(), PathBuf::from(FAKE_LOGS)).closed_until_held())
     }
 
     // Tables ----------------------------------------------------------------------------------------------------------
@@ -551,6 +561,11 @@ impl Fake {
             _ => true,
         });
         taken
+    }
+
+    /// How many `append`s to a default log found it not held: the opens the real channels would have made.
+    pub(crate) fn default_log_opens(&self) -> usize {
+        lock(&self.shared.state).default_log_opens
     }
 
     /// Every call on the channels, in the order made, removed.
@@ -720,6 +735,14 @@ impl Channels for Fake {
             }
             None => false,
         };
+        // As the real channels: each append that finds the default log not held tries to open it, and only an
+        // open that succeeds holds it.
+        if kind == LogKind::Default && !state.held_defaults.iter().any(|held| held == path) {
+            state.default_log_opens += 1;
+            if !failing {
+                state.held_defaults.push(path.to_path_buf());
+            }
+        }
         state.channel_calls.push(ChannelCall::Append {
             path: path.to_path_buf(),
             line: line.to_string(),
@@ -743,7 +766,12 @@ impl Channels for Fake {
                 state.hold_failures.remove(i);
                 Err(io::Error::other(HOLD_FAILED))
             }
-            None => Ok(()),
+            None => {
+                if !state.held_defaults.iter().any(|held| held == path) {
+                    state.held_defaults.push(path.to_path_buf());
+                }
+                Ok(())
+            }
         }
     }
 
