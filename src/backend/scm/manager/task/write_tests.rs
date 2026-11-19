@@ -15,7 +15,9 @@ use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::shim::acl::read_object;
 use crate::backend::scm::sid::{Sid, sid_from_parts, system};
-use crate::backend::scm::test_support::{registered_task, task_host, task_spec, task_spec_as, task_token};
+use crate::backend::scm::test_support::{
+    TASK_TOKEN, registered_task, registered_task_with, task_host, task_spec, task_spec_as, task_token,
+};
 use crate::blob::Blob;
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::elevation::test_support::process_user_sid;
@@ -28,6 +30,7 @@ fn id() -> Id {
 }
 
 const PATH: &str = r"\Goetia\nightly";
+const ID: &str = "nightly";
 
 fn blob(spec: &DaemonSpec) -> Blob {
     Blob {
@@ -84,10 +87,19 @@ fn prepared(principal: Sid, password: Option<&str>) -> impl FnOnce(&TaskAccount)
     move |_| Ok(Prepared { principal, password })
 }
 
-fn register_call(spec: &DaemonSpec, armed: bool, who: TaskAccount, password: Option<&str>, update: bool) -> Call {
+/// The call a registration under `token` makes. A test of an update passes the token it kept; a test of a create
+/// passes the one the create wrote ([`registered_token`]) and asserts separately that it is a new one.
+fn register_call(
+    spec: &DaemonSpec,
+    armed: bool,
+    who: TaskAccount,
+    password: Option<&str>,
+    update: bool,
+    token: &Token,
+) -> Call {
     Call::Register {
         path: PATH.to_owned(),
-        xml: definition(spec).to_xml(armed, &task_token()),
+        xml: definition(spec).to_xml(armed, token),
         who,
         password: password.map(str::to_owned),
         update,
@@ -98,50 +110,22 @@ fn root() -> TaskAccount {
     TaskAccount::Service("S-1-5-18".to_owned())
 }
 
-/// The calls the fake saw, a registered token read as the fixture's ([`task_token`]): a create's is fresh, so a
-/// test that compares the whole call reads it as the one `register_call` writes.
-fn calls_of(fake: &Fake) -> Vec<Call> {
-    fake.calls()
-        .into_iter()
-        .map(|call| match call {
-            Call::Register {
-                path,
-                xml,
-                who,
-                password,
-                update,
-            } => {
-                let xml = match TaskXml::token_of(&xml) {
-                    Ok(Some(token)) => xml.replace(token.as_str(), task_token().as_str()),
-                    _ => xml,
-                };
-                Call::Register {
-                    path,
-                    xml,
-                    who,
-                    password,
-                    update,
-                }
-            }
-            other => other,
-        })
-        .collect()
-}
-
-/// The token of the one registration the fake saw.
+/// The token of the one registration the fake saw: the argument the action's arguments end with.
 fn registered_token(fake: &Fake) -> Token {
     let tokens: Vec<_> = fake
         .calls()
         .iter()
         .filter_map(|call| match call {
-            Call::Register { xml, .. } => Some(TaskXml::token_of(xml).unwrap().expect("a registration has a token")),
+            Call::Register { xml, .. } => {
+                Some(TaskXml::token_of(xml, ID).unwrap().expect("a registration has a token"))
+            }
             _ => None,
         })
         .collect();
     let [token] = tokens.as_slice() else {
         panic!("one registration expected: {tokens:?}")
     };
-    token.clone()
+    *token
 }
 
 // Install =============================================================================================================
@@ -165,7 +149,17 @@ fn install_of_a_task_creates_it_disarmed() {
         .unwrap();
 
     assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
-    assert_eq!(calls_of(&fake), [register_call(&spec, false, root(), None, false)]);
+    assert_eq!(
+        fake.calls(),
+        [register_call(
+            &spec,
+            false,
+            root(),
+            None,
+            false,
+            &registered_token(&fake)
+        )]
+    );
     fake.finish();
 }
 
@@ -192,7 +186,7 @@ fn reinstall_keeps_the_armed_state() {
         assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
         assert_eq!(
             fake.calls(),
-            [register_call(&spec, armed, root(), None, true)],
+            [register_call(&spec, armed, root(), None, true, &task_token())],
             "an update of an armed={armed} task"
         );
         fake.finish();
@@ -208,14 +202,8 @@ fn reinstall_of_an_identical_task_writes_nothing() {
     let desired = definition(&spec).to_string();
     for armed in [true, false] {
         // Another registration's token is no difference.
-        let stored = registered_task(&spec, armed);
-        let stored = Registered {
-            xml: stored
-                .xml
-                .replace(task_token().as_str(), "00112233445566778899aabbccddeeff"),
-            ..stored
-        };
-        let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), stored);
+        let other = Token::parse("00112233445566778899aabbccddeeff").unwrap();
+        let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_task_with(&spec, armed, &other));
         let on_disk = scm.task_installed(&installed).unwrap().definition.to_string();
         let regenerated = scm.task_regenerate(&spec, &installed).unwrap().to_string();
 
@@ -239,34 +227,6 @@ fn reinstall_of_an_identical_task_writes_nothing() {
     }
 }
 
-/// A registration made before the token is read as different, so that an install writes it again with one.
-#[skuld::test]
-fn a_registration_without_a_token_is_not_up_to_date() {
-    let spec = task_spec(Some("30 3 * * *"));
-    let stored = registered_task(&spec, false);
-    let without = Registered {
-        xml: stored.xml.replace(&format!(" {}", task_token().as_str()), ""),
-        ..stored
-    };
-    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), without);
-    let scm = Scm::new();
-
-    let outcome = decide::decide(
-        &Ownership::Ours {
-            blob: blob(&spec),
-            regenerated: scm.task_regenerate(&spec, &installed).unwrap().to_string(),
-            on_disk: scm.task_installed(&installed).unwrap().definition.to_string(),
-        },
-        &definition(&spec).to_string(),
-        &spec,
-        crate::version(),
-        false,
-        &ExternalConfig::Absent,
-    );
-
-    assert!(!matches!(outcome, decide::Outcome::UpToDate), "{outcome:?}");
-}
-
 #[skuld::test]
 fn a_changed_task_is_updated_in_place_over_the_installed_one() {
     let spec = task_spec(Some("30 3 * * *"));
@@ -287,7 +247,10 @@ fn a_changed_task_is_updated_in_place_over_the_installed_one() {
         )
         .unwrap();
 
-    assert_eq!(fake.calls(), [register_call(&rescheduled, false, root(), None, true)]);
+    assert_eq!(
+        fake.calls(),
+        [register_call(&rescheduled, false, root(), None, true, &task_token())]
+    );
 }
 
 // The registration's token --------------------------------------------------------------------------------------------
@@ -391,20 +354,19 @@ fn retype_service_to_task_makes_a_new_token() {
     assert_ne!(tokens[0], tokens[1]);
 }
 
+/// A stored registration whose last argument is no token (a hand edit) has none to keep: the update writes one.
 #[skuld::test]
-fn a_registration_without_a_token_gets_one_on_update() {
+fn an_update_of_a_registration_with_a_malformed_token_writes_a_new_one() {
     let (_dir, runs) = made_records();
     let spec = task_spec(Some("30 3 * * *"));
     let stored = registered_task(&spec, true);
-    let without = Registered {
-        xml: stored.xml.replace(&format!(" {}", task_token().as_str()), ""),
-        ..stored.clone()
+    let malformed = Registered {
+        xml: stored
+            .xml
+            .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
+        ..stored
     };
-    assert_eq!(
-        TaskXml::token_of(&without.xml).unwrap(),
-        None,
-        "the fixture has no token"
-    );
+    assert_eq!(TaskXml::token_of(&malformed.xml, ID).unwrap(), None);
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
 
@@ -412,15 +374,42 @@ fn a_registration_without_a_token_gets_one_on_update() {
         .task_write_with(
             &spec,
             &definition(&spec),
-            Some(&TaskSnapshot::new(id(), Ok(blob(&spec)), without)),
+            Some(&TaskSnapshot::new(id(), Ok(blob(&spec)), malformed)),
             &runs,
             &mut Running(vec![]),
             prepared(system(), None),
         )
         .unwrap();
 
-    assert_eq!(fake.calls().len(), 1);
-    registered_token(&fake);
+    assert!(matches!(fake.calls().as_slice(), [Call::Register { update: true, .. }]));
+    assert_ne!(registered_token(&fake), task_token());
+}
+
+/// A token that cannot be read is no licence to write a different one: the update fails and registers nothing.
+#[skuld::test]
+fn an_update_whose_stored_token_cannot_be_read_fails() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let broken = Registered {
+        xml: "<Task><Actions>".to_owned(),
+        ..registered_task(&spec, true)
+    };
+    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), broken);
+    let fake = Fake::new();
+
+    let failed = scm(&fake)
+        .task_register(
+            &id(),
+            &definition(&spec),
+            &Prepared {
+                principal: system(),
+                password: None,
+            },
+            Registering::Update(&installed),
+        )
+        .unwrap_err();
+
+    assert!(matches!(failed, Error::Blob { .. }), "{failed:?}");
+    assert_eq!(fake.calls(), []);
 }
 
 // A change of account -------------------------------------------------------------------------------------------------
@@ -476,13 +465,19 @@ fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_sta
         assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
         // The disable is first: a scheduled fire between the check of the old account's runs and the delete
         // would start a run as the old account that nothing waits for.
+        let token = registered_token(&fake);
+        assert_ne!(
+            token,
+            task_token(),
+            "a create: the old registration's token is not kept"
+        );
         assert_eq!(
-            calls_of(&fake),
+            fake.calls(),
             [
                 Call::SetEnabled(PATH.to_owned(), false),
                 Call::Instances(PATH.to_owned()),
                 Call::Delete(PATH.to_owned()),
-                register_call(&new, armed, service("S-1-5-20"), None, false),
+                register_call(&new, armed, service("S-1-5-20"), None, false, &token),
             ],
             "armed={armed}: disabled, checked, deleted, created"
         );
@@ -629,7 +624,14 @@ fn a_task_installed_as_the_same_account_is_updated_in_place() {
 
     assert_eq!(
         fake.calls(),
-        [register_call(&new, false, service("S-1-5-20"), None, true)]
+        [register_call(
+            &new,
+            false,
+            service("S-1-5-20"),
+            None,
+            true,
+            &task_token()
+        )]
     );
 }
 
@@ -1413,13 +1415,14 @@ fn install_of_a_real_user_task_grants_the_batch_right_before_the_first_write() {
 
     assert!(granted.get());
     assert_eq!(
-        calls_of(&fake),
+        fake.calls(),
         [register_call(
             &spec,
             false,
             TaskAccount::User("alice".to_owned()),
             Some("secret"),
-            false
+            false,
+            &registered_token(&fake)
         )]
     );
 }
@@ -2009,8 +2012,15 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
     assert!(matches!(wrote, WriteOutcome::Done), "{wrote:?}");
     assert!(retired.get());
     assert_eq!(
-        calls_of(&fake),
-        [register_call(&spec, false, root(), None, false)],
+        fake.calls(),
+        [register_call(
+            &spec,
+            false,
+            root(),
+            None,
+            false,
+            &registered_token(&fake)
+        )],
         "a create, disarmed"
     );
     fake.finish();

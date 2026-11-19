@@ -17,7 +17,7 @@ use std::fmt;
 
 use cosca::quote::windows::join_wide;
 
-use crate::backend::scm::instance::TaskAccount;
+use crate::backend::scm::instance::{TaskAccount, bytes_of_hex, hex_of};
 use crate::backend::scm::triggers::{Repeat, Trigger, compile};
 use crate::backend::xml_escape;
 use crate::blob::{self, Blob};
@@ -35,23 +35,23 @@ pub(crate) const TASK_MODE_ARG: &str = "--goetia-task";
 /// fresh one and an update keeps it, so a shim started under a registration that has since been
 /// replaced finds another in the task it reads, and starts no program. It is no part of a
 /// [`TaskXml`]: what an install compares is the definition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Token(String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Token([u8; 16]);
 
 impl Token {
-    /// A token no earlier one equals: 128 random bits as 32 lower-case hex digits.
+    /// A token no earlier one equals: 128 random bits.
     pub(crate) fn fresh() -> Token {
-        Token(format!("{:032x}", rand::random::<u128>()))
+        Token(rand::random::<u128>().to_be_bytes())
     }
 
-    /// `text` as a token: exactly 32 lower-case hex digits.
+    /// `text` as a token: exactly 32 hex digits.
     pub(crate) fn parse(text: &str) -> Option<Token> {
-        let valid = text.len() == 32 && text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
-        valid.then(|| Token(text.to_owned()))
+        bytes_of_hex(text).map(Token)
     }
 
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
+    /// The 32 lower-case hex digits the action's arguments end with.
+    pub(crate) fn hex(&self) -> String {
+        hex_of(&self.0)
     }
 }
 
@@ -294,7 +294,7 @@ impl TaskXml {
             .args
             .iter()
             .map(String::as_str)
-            .chain([TASK_MODE_ARG, self.id.as_str(), token.as_str()])
+            .chain([TASK_MODE_ARG, self.id.as_str(), token.hex().as_str()])
             .map(|arg| arg.encode_utf16().collect())
             .collect();
         let borrowed: Vec<&[u16]> = wide.iter().map(Vec::as_slice).collect();

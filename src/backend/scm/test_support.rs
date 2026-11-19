@@ -86,9 +86,19 @@ pub(crate) fn registered_task(
     spec: &crate::spec::DaemonSpec,
     armed: bool,
 ) -> crate::backend::scm::manager::task::api::Registered {
+    registered_task_with(spec, armed, &task_token())
+}
+
+/// [`registered_task`] under the registration `token`.
+#[cfg(windows)]
+pub(crate) fn registered_task_with(
+    spec: &crate::spec::DaemonSpec,
+    armed: bool,
+    token: &crate::backend::scm::task_xml::Token,
+) -> crate::backend::scm::manager::task::api::Registered {
     let definition = crate::backend::scm::task_xml::TaskXml::new(spec, task_host()).unwrap();
     crate::backend::scm::manager::task::api::Registered {
-        xml: definition.to_xml(armed, &task_token()),
+        xml: definition.to_xml(armed, token),
         data: crate::blob::metadata_text(spec),
         enabled: Some(true),
     }

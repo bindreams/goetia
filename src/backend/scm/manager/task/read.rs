@@ -13,7 +13,9 @@ use super::live::{Liveness, live_instances, probe};
 use super::status::{run_state, task_status};
 use super::{TaskApi, TaskPath};
 use crate::backend::scm::generate::{self, WindowsDefinition};
-use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, open_refused};
+use crate::backend::scm::instance::TaskAccount;
+use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, identity, open_refused};
+use crate::backend::scm::sid::Sid;
 use crate::backend::scm::task_xml::{TaskXml, Token, extract_from_data};
 use crate::backend::{Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed};
 use crate::blob::Blob;
@@ -27,11 +29,26 @@ pub(crate) struct TaskSnapshot {
     id: Id,
     blob: Decoded,
     registered: Registered,
+    /// What the stored XML says of the registration's token, read once: `Err` carries why it could not be.
+    token: std::result::Result<Option<Token>, String>,
+    /// The SID of the account the stored principal names, `None` when it cannot be told (no principal, or a
+    /// name that names no account): not known to be any account being installed.
+    principal: Option<Sid>,
 }
 
 impl TaskSnapshot {
     pub(in crate::backend::scm) fn new(id: Id, blob: Decoded, registered: Registered) -> Self {
-        Self { id, blob, registered }
+        let token = TaskXml::token_of(&registered.xml, id.as_str()).map_err(|e| e.report().to_string());
+        let principal = TaskXml::principal(&registered.xml)
+            .ok()
+            .and_then(|(TaskAccount::Service(text) | TaskAccount::User(text))| identity::sid_of_principal(&text).ok());
+        Self {
+            id,
+            blob,
+            registered,
+            token,
+            principal,
+        }
     }
 
     /// The installed definition, read back from the stored XML.
@@ -39,9 +56,17 @@ impl TaskSnapshot {
         TaskXml::parse(&self.registered.xml, &self.registered.data)
     }
 
-    /// The token the stored registration carries, `None` for one made before the token.
-    pub(super) fn token(&self) -> Option<Token> {
-        TaskXml::token_of(&self.registered.xml).ok().flatten()
+    /// The token the stored registration carries, `None` when its arguments end with none (a hand edit).
+    /// An error when the XML could not be read: no token is then no licence to write another.
+    pub(super) fn token(&self) -> Result<Option<Token>> {
+        self.token
+            .clone()
+            .map_err(|why| Error::blob(format!("read the token of the registration of `{}`: {why}", self.id)))
+    }
+
+    /// The SID of the account the stored principal names, `None` when it cannot be told.
+    pub(super) fn principal(&self) -> Option<&Sid> {
+        self.principal.as_ref()
     }
 
     /// Whether every trigger is enabled.

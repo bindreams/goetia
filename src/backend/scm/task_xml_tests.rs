@@ -205,24 +205,26 @@ fn arguments_end_with_the_flag_the_id_and_the_token() {
 }
 
 #[skuld::test]
-fn the_token_is_32_lower_case_hex_and_two_fresh_ones_differ() {
+fn the_token_is_32_hex_digits_and_two_fresh_ones_differ() {
     let (first, second) = (Token::fresh(), Token::fresh());
     assert_ne!(first, second);
     for token in [&first, &second] {
-        let text = token.as_str();
+        let text = token.hex();
         assert_eq!(text.len(), 32, "{text}");
         assert!(
             text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
             "{text}"
         );
-        assert_eq!(Token::parse(text).as_ref(), Some(token));
+        assert_eq!(Token::parse(&text).as_ref(), Some(token));
     }
+    assert_eq!(token().hex(), TOKEN);
     for refused in [
         "",
         "0123456789abcdef",
-        &TOKEN.to_uppercase(),
         &format!("{TOKEN}0"),
         &"g".repeat(32),
+        &format!("+{}", &TOKEN[1..]),
+        &format!("{{{TOKEN}}}"),
     ] {
         assert_eq!(Token::parse(refused), None, "{refused:?}");
     }
@@ -232,15 +234,22 @@ fn the_token_is_32_lower_case_hex_and_two_fresh_ones_differ() {
 fn token_of_reads_the_token_the_xml_carries() {
     let spec = spec();
     assert_eq!(
-        TaskXml::token_of(&built(&spec).to_xml(true, &token())).unwrap(),
+        TaskXml::token_of(&built(&spec).to_xml(true, &token()), ID).unwrap(),
         Some(token())
     );
     // As Task Scheduler reads it back.
     assert_eq!(
-        TaskXml::token_of(&readback(&spec, &host(), DAILY_AT_0330)).unwrap(),
+        TaskXml::token_of(&readback(&spec, &host(), DAILY_AT_0330), ID).unwrap(),
         Some(token())
     );
-    assert!(TaskXml::token_of("<Task><Actions>").is_err());
+    assert!(TaskXml::token_of("<Task><Actions>", ID).is_err());
+}
+
+/// The ending is the one of the task whose XML it is: the id before the token is the task's.
+#[skuld::test]
+fn token_of_reads_only_an_ending_that_names_the_task() {
+    let xml = readback(&spec(), &host(), DAILY_AT_0330);
+    assert_eq!(TaskXml::token_of(&xml, "other").unwrap(), None);
 }
 
 #[skuld::test]
@@ -497,28 +506,23 @@ fn parse_ignores_the_token_so_equal_definitions_stay_equal() {
 }
 
 #[skuld::test]
-fn a_registration_without_a_token_reads_as_unrecognised() {
+fn an_ending_that_is_not_goetias_reads_as_unrecognised_and_is_no_part_of_the_host() {
     let spec = spec();
-    let legacy = readback(&spec, &host(), DAILY_AT_0330).replace(&format!(" {TOKEN}"), "");
-    assert_eq!(TaskXml::token_of(&legacy).unwrap(), None);
-
-    let installed = TaskXml::parse(&legacy, &data_of(&spec)).unwrap();
-    assert!(
-        installed
-            .to_string()
-            .contains(&format!("Arguments do not end with {TASK_MODE_ARG} {ID} <token>")),
-        "{installed}"
-    );
-    assert_ne!(installed.to_string(), built(&spec).to_string());
-    // The old ending is no part of the host, so that an install writes the host's own arguments again.
-    assert_eq!(installed.host(), host());
-
-    // A last argument that is no token is none.
-    for wrong in [TOKEN.to_uppercase(), "0123".to_owned()] {
-        let xml = readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, &wrong);
-        assert_eq!(TaskXml::token_of(&xml).unwrap(), None, "{wrong}");
+    // A last argument that is no token, and an id that is not the task's.
+    for xml in [
+        readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123"),
+        readback(&spec, &host(), DAILY_AT_0330).replace(&format!(" {ID} "), " other "),
+    ] {
+        assert_eq!(TaskXml::token_of(&xml, ID).unwrap(), None, "{xml}");
         let installed = TaskXml::parse(&xml, &data_of(&spec)).unwrap();
-        assert_ne!(installed.to_string(), built(&spec).to_string(), "{wrong}");
+        assert!(
+            installed
+                .to_string()
+                .contains(&format!("Arguments do not end with {TASK_MODE_ARG} {ID} <token>")),
+            "{installed}"
+        );
+        assert_ne!(installed.to_string(), built(&spec).to_string());
+        assert_ne!(installed.host(), host(), "none of it is taken for the ending");
     }
 }
 

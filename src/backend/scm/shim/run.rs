@@ -12,8 +12,9 @@
 //! process tree on `SERVICE_STOP`.
 //!
 //! **Task mode** ([`task`]): Task Scheduler runs the shim as a task's action, and its arguments end
-//! in the task-mode argument, the task's id and the registration's token. It reads its own task, runs the program the same way,
-//! and records how the run ended.
+//! in the task-mode argument, the task's id and the registration's token. It reads its own task, and
+//! starts no program (a shim failure) when the task's registration is not the one it was started
+//! under. Otherwise it runs the program the same way and records how the run ended.
 
 use std::ffi::OsString;
 
