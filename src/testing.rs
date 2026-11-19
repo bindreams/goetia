@@ -58,6 +58,13 @@ pub fn program_data() -> PathBuf {
         .unwrap_or_else(|e| panic!("cannot locate %ProgramData%: {}", e.report()))
 }
 
+/// The version marker every service host carries and an install checks for, which a program that is no host
+/// (a test binary a test installs as one) is given by appending it.
+#[cfg(windows)]
+pub fn host_marker() -> Vec<u8> {
+    crate::backend::scm::shim::marker::MARKER.to_vec()
+}
+
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
 /// a test never takes a placeholder for a SID.
 #[cfg(windows)]

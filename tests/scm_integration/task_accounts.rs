@@ -13,7 +13,7 @@ use crate::fixture::FIXTURE;
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT, PRINT_WHEN_RELEASED, RUN_UNTIL_KILLED};
-use crate::support::windows_tasks::{ServiceAccountHost, task_spec};
+use crate::support::windows_tasks::{ServiceAccountHost, manager_hosted_by, task_spec, this_binary_as_a_service_host};
 use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, cleanup, kill, scm_group};
 use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
 
@@ -503,17 +503,20 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     let id = &test_id();
-    let host = ServiceAccountHost::new(id);
+    let host = this_binary_as_a_service_host(&format!("{id}-host"));
     let _guard = ServiceGuard::new(id.as_str());
     let reached = ConnectBack::listen();
-    let mgr = host.manager_hosted_by_this_binary(vec![
-        FIXTURE.to_owned(),
-        id.to_string(),
-        reached.port().to_string(),
-        "1".to_owned(),
-        "before-dispatcher".to_owned(),
-    ]);
-    let as_account = |account: &str| service_running(id, account, vec![host.exe.path_str()]);
+    let mgr = manager_hosted_by(
+        &host,
+        vec![
+            FIXTURE.to_owned(),
+            id.to_string(),
+            reached.port().to_string(),
+            "1".to_owned(),
+            "before-dispatcher".to_owned(),
+        ],
+    );
+    let as_account = |account: &str| service_running(id, account, vec![host.path_str()]);
     let local_service = sid_of(5, &LOCAL_SERVICE);
     let network_service = sid_of(5, &NETWORK_SERVICE);
     mgr.install(&as_account("LocalService"), false)

@@ -38,19 +38,32 @@ impl ServiceAccountHost {
         shim_manager_at(self.shim.path_str().into())
     }
 
-    /// A manager whose `protocol: plain` services run the copy of this binary with `args` as their host, so
-    /// that a test decides what the host does before and after SCM's dispatcher.
-    pub fn manager_hosted_by_this_binary(&self, args: Vec<String>) -> Scm {
-        Scm::with_shim(
-            goetia::shim::StandaloneShim::new(self.exe.path_str().into(), args),
-            goetia::shim::CheckPermissions::Disable,
-        )
-    }
-
     /// The path of the shim copy, for a child process that makes its own manager.
     pub fn shim_path(&self) -> String {
         self.shim.path_str()
     }
+}
+
+/// A copy of this test binary that an install accepts as a service host: it carries the version marker, which a
+/// test binary built from the library alone does not. What it does when SCM starts it is the test's.
+pub fn this_binary_as_a_service_host(name: &str) -> WorldReadableExe {
+    use std::io::Write as _;
+
+    let host = WorldReadableExe::new(name);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(host.path_str())
+        .and_then(|mut file| file.write_all(&goetia::testing::host_marker()))
+        .unwrap_or_else(|e| panic!("append the host marker to {}: {e}", host.path_str()));
+    host
+}
+
+/// A manager whose `protocol: plain` services run `host` with `args`.
+pub fn manager_hosted_by(host: &WorldReadableExe, args: Vec<String>) -> Scm {
+    Scm::with_shim(
+        goetia::shim::StandaloneShim::new(host.path_str().into(), args),
+        goetia::shim::CheckPermissions::Disable,
+    )
 }
 
 /// The task `id`, run by `user`, that starts `command` on `schedule` (`None`: only a test starts it)
