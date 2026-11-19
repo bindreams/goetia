@@ -18,7 +18,6 @@ use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
-use serde_json::Value;
 
 use crate::linux::{
     CreatedRoot, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, journal, main_pid, started_invocations,
