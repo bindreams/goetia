@@ -52,17 +52,11 @@ fn to_the_second(time: SystemTime) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-/// `time` cut down to the minute it is in.
-fn to_the_minute(time: SystemTime) -> SystemTime {
-    let secs = to_the_second(time)
-        .duration_since(UNIX_EPOCH)
-        .expect("a time after the epoch")
-        .as_secs();
-    UNIX_EPOCH + Duration::from_secs(secs / 60 * 60)
-}
-
 /// The next time after `after` that the clock of the machine's zone reads the hour and minute of
 /// `daily` (`M H * * *`): its civil date, hour and minute worked out here, not read from Task Scheduler.
+///
+/// The zone's rules are jiff's tzdb mapping of the Windows zone, and the CI runners run in UTC, where
+/// that and Windows agree. A host whose Windows zone rules differ from tzdb is outside what the test covers.
 fn next_civil_time(daily: &str, after: SystemTime) -> SystemTime {
     let fields: Vec<&str> = daily.split(' ').collect();
     let [minute, hour, "*", "*", "*"] = fields[..] else {
@@ -151,12 +145,21 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     cli.daemon(&["enable", id]);
     // The program connects when the schedule fires, at a minute Task Scheduler chooses: no bound fits.
     let held = listener.accept_unbounded();
+    // Disarmed at once: a later fire, which `IgnoreNew` rejects while the run is held, cannot touch
+    // `LastTaskResult` or `LastRunTime` under the reads below, and none can come between the end of the run
+    // and the reads that follow it.
+    cli.daemon(&["disable", id]);
     let fires = task_run_times(&task_id, enabling_at, SystemTime::now())
         .unwrap_or_else(|e| panic!("the run times of `{EVERY_MINUTE}`: {}", e.report()));
     let (Some(&first), Some(&last)) = (fires.first(), fires.last()) else {
         panic!("a run started and Task Scheduler lists no run time since {enabling_at:?}");
     };
-    let (first, last) = (to_the_second(first), last + Duration::from_secs(60));
+    // A second before the first listed time: `LastRunTime` may precede the boundary by a few ms, which
+    // truncates to the second before.
+    let (first, last) = (
+        to_the_second(first) - Duration::from_secs(1),
+        last + Duration::from_secs(60),
+    );
     let assert_fired_in_range = |form: &str, time: &str| {
         let fired = instant(time);
         assert!(
@@ -164,45 +167,32 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
             "{form}: last-run {fired:?} is not in [{first:?}, {last:?}) of {fires:?}"
         );
     };
-    // The run is in flight: `last-result` reads null (`LastTaskResult` says it is running), `last-run` is
-    // the run's start, and the armed schedule still has a next run, a later minute.
-    let upcoming = |read: &str| {
-        task_run_times(&task_id, enabling_at, SystemTime::now() + Duration::from_secs(600))
-            .unwrap_or_else(|e| panic!("{read}: the run times: {}", e.report()))
-            .into_iter()
-            .map(to_the_second)
-            .collect::<Vec<_>>()
-    };
+    // The run is in flight and disarmed: `last-result` reads null (`LastTaskResult` says it is running),
+    // `last-run` is the run's start, there is no next run, and the three forms show the same start.
     let running = read_in_the_zone(&in_zone, id);
     assert_task_fields(
         &running.json,
         id,
         Expect {
             state: "running",
-            enabled: true,
+            enabled: false,
             pid: Time::Present,
             last_result: LastResult::Null,
             last_run: Time::Present,
-            next_run: Time::Present,
+            next_run: Time::Null,
         },
     );
-    let times = upcoming("running");
-    let mut fire_minute = None;
+    running.assert_state("running");
+    let started = running.json_read.last_run.as_deref().expect("a run is in flight");
     for read in running.reads() {
-        let started = read.last_run.as_deref().unwrap_or_else(|| {
-            panic!("a run is in flight, and a read shows no last-run: {running:?}");
-        });
+        assert_eq!(
+            read.last_run.as_deref(),
+            Some(started),
+            "{}: the forms disagree on last-run: {running:?}",
+            read.form
+        );
         assert_fired_in_range(read.form, started);
-        let minute = to_the_minute(instant(started));
-        fire_minute = Some(fire_minute.map_or(minute, |earliest: SystemTime| earliest.min(minute)));
     }
-    let fire_minute = fire_minute.expect("three reads");
-    // Not strictly after the fire: `NextRunTime` may not have moved past it when the program connects.
-    running.assert_next_run("running", |_, _| {
-        times.iter().copied().filter(|time| *time >= fire_minute).collect()
-    });
-    // No fire can come between the end of the run and the reads that follow it.
-    cli.daemon(&["disable", id]);
     drop(held);
     status_once_ended(&mgr, &task_id);
     let finished = read_in_the_zone(&in_zone, id);
