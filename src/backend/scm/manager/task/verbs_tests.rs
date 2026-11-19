@@ -503,7 +503,7 @@ fn a_hold_whose_first_read_failed_names_which_run_it_was_for() {
 
     assert_eq!(
         failed.report().to_string(),
-        "failed to hold the process of `nightly`'s run: finding the run with process 200: failed to list the runs \
+        "failed to hold the process of `nightly`'s run: reading the run with process 200: failed to list the runs \
          of `nightly`: listing failed"
     );
 }
@@ -526,7 +526,11 @@ fn a_hold_names_the_run_of_its_first_read_whatever_the_target_was_asked_before()
         panic!("the first read of the hold did not fail unread");
     };
 
-    assert_eq!(e.to_string(), "finding the run with process 100");
+    assert_eq!(
+        Error::os("hold", e).report().to_string(),
+        "failed to hold: reading the run with process 100: failed to list the runs of `nightly`: listing failed"
+    );
+    fake.finish();
 }
 
 /// A plain failure of the read that confirms a run's process says which of the runs it was for.
@@ -691,8 +695,8 @@ fn a_kill_whose_first_read_of_each_run_failed_names_each_run() {
 
     assert_eq!(
         failed.report().to_string(),
-        "failed to kill `nightly`: finding the run with process 100: failed to list the instances: listing failed; \
-         then: failed to kill `nightly`: finding the run with process 200: failed to list the instances: listing \
+        "failed to kill `nightly`: reading the run with process 100: failed to list the instances: listing failed; \
+         then: failed to kill `nightly`: reading the run with process 200: failed to list the instances: listing \
          failed"
     );
     assert!(machine.terminated.is_empty(), "{failed}");

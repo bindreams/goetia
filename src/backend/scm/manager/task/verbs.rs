@@ -126,7 +126,7 @@ impl<P: Processes> KillTarget for RunTarget<'_, P> {
     /// The first read of a hold is made before the listing names a process, so its failure says which run
     /// it was for; the failures of later reads follow a pid the hold's own words name.
     fn unread(&self, e: io::Error) -> io::Error {
-        within(format!("finding the run with process {}", self.pid), e)
+        within(format!("reading the run with process {}", self.pid), e)
     }
 
     fn open(&mut self, pid: u32) -> io::Result<Option<P::Held>> {
