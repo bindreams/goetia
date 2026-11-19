@@ -536,4 +536,5 @@ fn a_failed_append_to_the_default_log_holds_nothing_and_each_attempt_is_an_open(
     assert_eq!(fake.default_log_opens(), 2, "the failed append held the log");
     log.failure("svc", "the line");
     assert_eq!(fake.default_log_opens(), 2, "the open that succeeded holds it");
+    fake.take_channel_calls();
 }
