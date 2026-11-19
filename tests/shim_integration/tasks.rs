@@ -117,8 +117,8 @@ fn the_programs_run_as_the_tasks_principal(#[fixture(scm_group)] _group: &Group)
 }
 
 /// The shim runs as an account that is no administrator, and reads its own task through Task Scheduler's
-/// COM to find its instance: a read that is refused starts the program all the same and writes no
-/// record, so `run` would report the run unrecorded.
+/// COM to find its instance: a read that is refused starts no program, so `run` would report the run
+/// unrecorded.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_task_reads_its_own_task_unelevated(#[fixture(scm_group)] _group: &Group) {
     let (exit, _) = run_as_local_service("exit", &["3"]);
