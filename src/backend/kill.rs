@@ -260,8 +260,8 @@ pub(crate) fn hold_once<T: KillTarget>(
     }
 }
 
-/// A step of holding the daemon's process, as a failure of it says so. The words of a recorded wait are
-/// those of [`recording_notice`]: the process may not be gone, only no longer the daemon's.
+/// A step of holding the daemon's process, as a failure of it says so. The record wait says what
+/// [`recording_notice`] says of it: a process the manager moved off is not known to be gone.
 #[derive(Clone, Copy)]
 enum Step {
     Opening,
