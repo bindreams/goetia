@@ -19,6 +19,7 @@ use std::path::Path;
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
+use super::read::StoredRegistration;
 use super::verbs::{Processes, System, gone};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::scm::default_log::{self, Naming, Step};
@@ -34,7 +35,7 @@ use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::sid::{Sid, distinct, sid_from_parts};
-use crate::backend::scm::task_xml::{TaskXml, builtin_sid};
+use crate::backend::scm::task_xml::{TaskXml, Token, builtin_sid};
 use crate::backend::{Identity, InstalledService, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::manager::State;
@@ -132,7 +133,7 @@ pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>, reads
 pub(crate) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
     match TaskXml::parse(&registered.xml, &registered.data) {
         Ok(definition) => Ok(definition.account()),
-        Err(_) => TaskXml::principal(&registered.xml),
+        Err(_) => TaskXml::principal(&registered.xml)?.ok_or_else(|| Error::blob("the task's XML names no principal")),
     }
 }
 
@@ -177,15 +178,19 @@ impl Scm {
     /// before the first request to Task Scheduler. [`WriteOutcome::Raced`] when the task existed for a
     /// create or was gone for an update.
     ///
-    /// An account is the same when the stored principal's SID is the new account's, and then the task
-    /// is updated in place. Otherwise (a stored principal that cannot be told is a change) Task
-    /// Scheduler would keep the security descriptor the task was registered with, which names the old
-    /// account only and so leaves the task unreadable by the new account's shim. So the task is
-    /// registered again ([`Self::task_register_again`]): disabled, refused while the old one runs (its
-    /// shim still writes its record), then, with the record directory made to name the old account and the
-    /// new one, the registration alone is deleted (its records stay) and created with the armed state it
-    /// had. A failure between the delete and the create leaves nothing at the id, which an install that runs
-    /// again creates (disarmed: `enable` arms it).
+    /// An account is the same when the stored principal's SID is the new account's, and then the task is
+    /// updated in place under the registration's own token (see [`Self::task_register`]). When the account
+    /// differs, or the stored XML names no principal or one that names no account (which is a change), an
+    /// update in place would keep the security descriptor the task was registered with, which names the old
+    /// account only and so leaves the task unreadable by the new account's shim. So the task is registered
+    /// again ([`Self::task_register_again`]): disabled, refused while the old one runs (its shim still writes
+    /// its record), then, with the record directory made to name the old account and the new one, the
+    /// registration alone is deleted (its records stay) and created, under a fresh token, with the armed
+    /// state it had.
+    ///
+    /// A stored registration whose XML cannot be read at all, or whose account lookup failed for a reason other
+    /// than "no such account", fails the write before anything is sent to Task Scheduler: that is not a change of
+    /// account.
     pub(super) fn task_write_with<P: Processes>(
         &self,
         spec: &DaemonSpec,
@@ -196,21 +201,23 @@ impl Scm {
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
+        // Read before `prepare` touches the machine.
+        let stored = snapshot
+            .map(|old| old.stored().map(|stored| (old, stored)))
+            .transpose()?;
         let prepared = prepare(&definition.account())?;
-        let changed = snapshot.filter(|old| stored_principal(old.registered()).as_ref() != Some(&prepared.principal));
-        match changed {
-            None => {
-                task_records(id, runs, &prepared.principal, &Kept::default())?;
-                self.task_register(
-                    id,
-                    definition,
-                    snapshot.is_some_and(TaskSnapshot::armed),
-                    snapshot.is_some(),
-                    &prepared,
-                )
+        let registering = match stored {
+            Some((old, stored)) if stored.principal.as_ref() != Some(&prepared.principal) => {
+                return self.task_register_again(old, &stored, definition, runs, processes, &prepared);
             }
-            Some(old) => self.task_register_again(old, definition, runs, processes, &prepared),
-        }
+            Some((_, stored)) => Registering::Update {
+                armed: stored.armed,
+                token: stored.token,
+            },
+            None => Registering::Create { armed: false },
+        };
+        task_records(id, runs, &prepared.principal, &Kept::default())?;
+        self.task_register(id, definition, &prepared, registering)
     }
 
     /// The account change of [`Self::task_write_with`]. The task is disabled first (its own flag, as an
@@ -219,10 +226,12 @@ impl Scm {
     /// ([`Error::AccountChangeRunning`]), the record directory is made, the task is deleted, and created
     /// with the armed state it had. A failure after the disable puts the flag back as it was found (a task
     /// found disabled, or whose flag was not read, is not touched), and a flag that cannot be put back is
-    /// reported with the failure.
+    /// reported with the failure. A failure between the delete and the create leaves nothing at the id,
+    /// which an install that runs again creates (disarmed: `enable` arms it).
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
+        stored: &StoredRegistration,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -239,7 +248,7 @@ impl Scm {
                 Err(e) if gone(&e) => false,
                 Err(e) => return Err(e),
             };
-        match self.replace_task(old, definition, runs, processes, prepared) {
+        match self.replace_task(old, stored, definition, runs, processes, prepared) {
             Err(failed) if disabled => Err(match self.tasks.set_enabled(&path, true) {
                 Ok(()) => failed,
                 Err(e) if gone(&e) => failed,
@@ -260,6 +269,7 @@ impl Scm {
     fn replace_task<P: Processes>(
         &self,
         old: &TaskSnapshot,
+        stored: &StoredRegistration,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -269,15 +279,15 @@ impl Scm {
         self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
         // The task is registered as the old account until the create lands, so its records and its log name it
         // too.
-        let registered = stored_principal(old.registered());
-        let kept = Kept::both(registered.as_slice());
+        let kept = Kept::both(stored.principal.as_slice());
         task_records(id, runs, &prepared.principal, &kept)?;
         match self.tasks.delete(&TaskPath::of(id)) {
             // The task is gone; a folder that stays is still there for the create.
             Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
             Err(e) => return Err(e),
         }
-        let wrote = self.task_register(id, definition, old.armed(), false, prepared)?;
+        let registering = Registering::Create { armed: stored.armed };
+        let wrote = self.task_register(id, definition, prepared, registering)?;
         landed(id, runs, prepared, &kept, wrote)
     }
 
@@ -296,19 +306,21 @@ impl Scm {
         }
     }
 
-    /// The registration itself, once what it needs is acquired: the task as `armed` says, an update of
-    /// the one there is or a create.
+    /// The registration itself, once what it needs is acquired. The one place a token is chosen.
     fn task_register(
         &self,
         id: &Id,
         definition: &TaskXml,
-        armed: bool,
-        update: bool,
         prepared: &Prepared,
+        registering: Registering,
     ) -> Result<WriteOutcome> {
+        let (armed, token, update) = match registering {
+            Registering::Create { armed } => (armed, Token::fresh(), false),
+            Registering::Update { armed, token } => (armed, token.unwrap_or_else(Token::fresh), true),
+        };
         let registered = self.tasks.register(
             &TaskPath::of(id),
-            &definition.to_xml(armed),
+            &definition.to_xml(armed, &token),
             &definition.account(),
             prepared.password.as_deref(),
             update,
@@ -320,17 +332,13 @@ impl Scm {
     }
 }
 
-/// The SID of the account a stored task runs as: its principal's, as Task Scheduler stores it. `None`
-/// when it cannot be told (no principal, or a name that names no account), which is not known to be
-/// the account being installed.
-fn stored_principal(registered: &Registered) -> Option<Sid> {
-    principal_sid(registered).ok()
-}
-
-/// The SID of the account a stored task runs as, or why it cannot be told.
-fn principal_sid(registered: &Registered) -> Result<Sid> {
-    let (TaskAccount::Service(text) | TaskAccount::User(text)) = TaskXml::principal(&registered.xml)?;
-    identity::sid_of_principal(&text)
+/// What [`Scm::task_register`] registers.
+enum Registering {
+    /// A new registration of the task, armed or not, under a fresh token.
+    Create { armed: bool },
+    /// The stored task written again in place: as armed as it is (`armed`), under its own `token`; or, where
+    /// it has none (a hand edit), a fresh one.
+    Update { armed: bool, token: Option<Token> },
 }
 
 /// The record directory of `id` with permissions that name `accounts`. Nothing is read back.
@@ -635,7 +643,7 @@ impl Scm {
         };
         task_records(id, runs, &prepared.principal, &kept)?;
         retire()?;
-        let wrote = self.task_register(id, definition, false, false, &prepared)?;
+        let wrote = self.task_register(id, definition, &prepared, Registering::Create { armed: false })?;
         landed(id, runs, &prepared, &kept, wrote)
     }
 

@@ -506,7 +506,9 @@ fn the_run_times_of_a_disarmed_task_restore_its_stored_xml(#[fixture(scm_group)]
 
     for (schedule, listed) in [(Some("*/5 * * * *"), true), (None, false)] {
         let spec: DaemonSpec = crate::testing::task("goetia-com-run-times", vec![PING.to_owned()], schedule);
-        let text = TaskXml::new(&spec, host.clone()).unwrap().to_xml(false);
+        let text = TaskXml::new(&spec, host.clone())
+            .unwrap()
+            .to_xml(false, &crate::backend::scm::test_support::task_token());
         Com.register(&path, &text, &system(), None, false)
             .unwrap_or_else(|e| panic!("{schedule:?}: {}", e.report()));
         let before = Com.get(&path).unwrap().expect("the task is registered");
