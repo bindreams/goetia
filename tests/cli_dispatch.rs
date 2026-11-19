@@ -5171,9 +5171,10 @@ fn a_wait_flag_overrides_the_stop_actions_wait() {
     }
 }
 
-/// What a refused flagless stop of a definition that will not decode tells the user to pass: both flags that name
-/// the wait, and the decode failure it stands on.
+/// What a refused flagless stop of a definition that will not decode tells the user: the stop was refused and
+/// nothing was sent, both flags that name the wait, and the decode failure it stands on.
 fn assert_names_the_flags_that_name_the_wait(err: &str) {
+    assert!(err.contains("the stop was refused and nothing was sent"), "{err}");
     assert!(err.contains("--timeout <duration>"), "{err}");
     assert!(err.contains("--no-timeout"), "{err}");
     assert!(err.contains("blob"), "the decode failure: {err}");

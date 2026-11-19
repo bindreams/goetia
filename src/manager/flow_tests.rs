@@ -1546,11 +1546,23 @@ fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_reports_what_was_
 
     let e = ServiceManager::stop(&fake, &id, None).expect_err("no stop action to wait by");
 
+    let Error::StopActionUnreadable { source, .. } = &e else {
+        panic!("{e:?}");
+    };
+    // The kept failure's own text, each link of its chain, as the report writes them; the remedy follows a
+    // sentence end.
+    let kept_failure = std::iter::successors(Some(&**source as &dyn std::error::Error), |e| e.source())
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(": ");
+    let kept_failure = kept_failure.trim_end_matches(['.', '!', '?']);
     assert_eq!(
         e.report().to_string(),
-        "the stop of `odd` was refused and nothing was sent, because with no `--timeout` or `--no-timeout` the \
-         wait comes from the daemon's stop action, which could not be taken from its installed definition: blob: \
-         invalid base64: Invalid symbol 45, offset 3. Pass `--timeout <duration>` or `--no-timeout` to stop it anyway"
+        format!(
+            "the stop was refused and nothing was sent: with no `--timeout` or `--no-timeout` the wait comes from \
+             the daemon's stop action, which could not be taken from its installed definition: {kept_failure}. Pass \
+             `--timeout <duration>` or `--no-timeout` to name the wait yourself."
+        )
     );
     assert!(!e.is_indeterminate());
     assert!(fake.prepared().is_empty(), "nothing was reserved");
@@ -1585,7 +1597,7 @@ fn a_stop_budget_refusal_carries_the_failure_the_snapshot_kept() {
     }
     assert_eq!(
         e.remedy(),
-        Some("Pass `--timeout <duration>` or `--no-timeout` to stop it anyway")
+        Some("Pass `--timeout <duration>` or `--no-timeout` to name the wait yourself.")
     );
 }
 

@@ -370,10 +370,12 @@ pub enum Error {
     /// The `stop` of `id` named no wait, so it takes the daemon's stop action for one, and the installed
     /// definition that holds it will not decode; `source` is the decode failure. Nothing was sent. A stop
     /// that names its wait does not read the definition, so the remedy, which [`report`](Error::report)
-    /// prints last, is the flags that name one. A wrapper, as `wrapper!` lists.
+    /// prints last, is the flags that name one. `source` is always [`Kept`](Error::Kept), which ends every
+    /// walk of the chain, so this is no wrapper of `wrapper!`; it is as indeterminate as `source` is. The
+    /// message leaves `id` out: the CLI prefixes it.
     #[error(
-        "the stop of `{id}` was refused and nothing was sent, because with no `--timeout` or `--no-timeout` the \
-         wait comes from the daemon's stop action, which could not be taken from its installed definition"
+        "the stop was refused and nothing was sent: with no `--timeout` or `--no-timeout` the wait comes from \
+         the daemon's stop action, which could not be taken from its installed definition"
     )]
     StopActionUnreadable {
         id: String,
@@ -759,7 +761,6 @@ macro_rules! wrapper {
         Error::Step { source: $source, .. }
             | Error::StartAsManaged { source: $source, .. }
             | Error::InstalledUnreadable { source: $source, .. }
-            | Error::StopActionUnreadable { source: $source, .. }
     };
 }
 
@@ -783,7 +784,9 @@ impl Error {
             | Error::StopUnconfirmed { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunUnrecorded { .. } => true,
-            wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
+            wrapper!(source)
+            | Error::ServiceImageUnreadable { source, .. }
+            | Error::StopActionUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
@@ -839,8 +842,7 @@ impl Error {
     }
 
     /// The error a chain of [`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged),
-    /// [`InstalledUnreadable`](Error::InstalledUnreadable) and
-    /// [`StopActionUnreadable`](Error::StopActionUnreadable) ends in, which classification reads: a step
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable) ends in, which classification reads: a step
     /// over [`NotInstalled`](Error::NotInstalled) is still "not installed". An error that carries
     /// another one in any other variant ([`Kept`](Error::Kept), [`Undetermined`](Error::Undetermined),
     /// [`Both`](Error::Both), and the rest) is itself the cause.
@@ -850,8 +852,7 @@ impl Error {
     }
 
     /// Whether this error, or what it wraps in a [`Step`](Error::Step),
-    /// [`StartAsManaged`](Error::StartAsManaged), [`StopActionUnreadable`](Error::StopActionUnreadable) or
-    /// [`Kept`](Error::Kept), is an
+    /// [`StartAsManaged`](Error::StartAsManaged) or [`Kept`](Error::Kept), is an
     /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
     /// walks through that variant. The errors carried by any other variant are not walked.
     pub(crate) fn wraps_unreadable_host(&self) -> bool {
@@ -943,7 +944,7 @@ impl Error {
                  (`SERVICE_QUERY_CONFIG`)",
             ),
             Error::StopActionUnreadable { .. } => {
-                Some("Pass `--timeout <duration>` or `--no-timeout` to stop it anyway")
+                Some("Pass `--timeout <duration>` or `--no-timeout` to name the wait yourself.")
             }
             Error::Kept(kept) => kept.remedy(),
             _ => None,

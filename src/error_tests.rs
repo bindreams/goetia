@@ -266,31 +266,26 @@ fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_
     );
 }
 
-/// The stop refused for want of a readable stop action is as indeterminate as the decode failure under it,
-/// and is that failure's `cause`, `map_cause` and host-read classification, as a `Step` over it would be.
+/// The refusal of a stop for want of a readable stop action, as the stop builds it (over a kept failure), is as
+/// indeterminate as the failure under it. The kept error ends every walk, so the refusal is no wrapper: it is its
+/// own `cause`, and `map_cause` hands it whole to the mapper.
 #[skuld::test]
-fn an_unreadable_stop_action_reads_as_the_decode_failure_under_it() {
+fn an_unreadable_stop_action_is_as_indeterminate_as_the_kept_failure_and_is_its_own_cause() {
     let over = |source: Error| Error::StopActionUnreadable {
         id: "x".to_string(),
-        source: Box::new(source),
+        source: Box::new(Error::kept(&Arc::new(source))),
     };
-    assert!(!over(Error::Kept(Arc::new(Error::blob("bad")))).is_indeterminate());
-    assert!(over(Error::Kept(Arc::new(in_doubt()))).is_indeterminate());
-    assert!(matches!(over(not_installed()).cause(), Error::NotInstalled { .. }));
+    assert!(!over(Error::blob("bad")).is_indeterminate());
+    assert!(over(in_doubt()).is_indeterminate());
 
-    let mapped = over(not_installed()).map_cause(|leaf| {
-        assert!(matches!(leaf, Error::NotInstalled { .. }), "{leaf:?}");
+    let refusal = over(not_installed());
+    assert!(matches!(refusal.cause(), Error::StopActionUnreadable { .. }), "{refusal:?}");
+    assert!(!refusal.wraps_unreadable_host());
+    let mapped = refusal.map_cause(|leaf| {
+        assert!(matches!(leaf, Error::StopActionUnreadable { .. }), "{leaf:?}");
         in_doubt()
     });
-    assert!(matches!(mapped, Error::StopActionUnreadable { .. }), "{mapped:?}");
-    assert!(matches!(mapped.cause(), Error::WaitTimeout { .. }), "{mapped:?}");
-
-    let unreadable = || Error::InstalledUnreadable {
-        id: "x".to_string(),
-        source: Box::new(not_installed()),
-    };
-    assert!(over(unreadable()).wraps_unreadable_host());
-    assert!(!over(Error::blob("bad")).wraps_unreadable_host());
+    assert!(matches!(mapped, Error::WaitTimeout { .. }), "{mapped:?}");
 }
 
 #[cfg(unix)]
