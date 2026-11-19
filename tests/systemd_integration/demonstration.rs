@@ -45,7 +45,6 @@ impl Read {
         }
         self
     }
-
 }
 
 /// Whether `<id>.timer` has triggered, by systemd's own `LastTriggerUSec` (empty before the first
@@ -181,7 +180,10 @@ impl Zoned {
     /// The `next-run` the armed reads show, which is one minute: the timer is armed until it fires.
     /// `None` where every read saw the run in flight.
     fn armed_minute(&self) -> Option<SystemTime> {
-        let mut shown = self.reads().into_iter().filter_map(|read| read.next_run.as_deref().map(instant));
+        let mut shown = self
+            .reads()
+            .into_iter()
+            .filter_map(|read| read.next_run.as_deref().map(instant));
         let first = shown.next()?;
         for next in shown {
             assert_eq!(next, first, "armed reads name different minutes: {self:?}");
@@ -268,7 +270,9 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
     armed.judge_next_runs(&id);
     // The first run begins in the minute `next-run` named; where every read saw it in flight, in one of
     // the minutes the cron could have named (the first is for a clock that steps back).
-    let first_minutes = armed.armed_minute().map_or_else(|| expected.to_vec(), |minute| vec![minute]);
+    let first_minutes = armed
+        .armed_minute()
+        .map_or_else(|| expected.to_vec(), |minute| vec![minute]);
 
     // 3. The schedule fires with nothing started by the test: the program announces itself. systemd has no
     // next run for a timer whose service is running, and the run is held, so any later fire is dropped by
