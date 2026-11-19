@@ -29,26 +29,11 @@ pub(crate) struct TaskSnapshot {
     id: Id,
     blob: Decoded,
     registered: Registered,
-    /// What the stored XML says of the registration's token, read once: `Err` carries why it could not be.
-    token: std::result::Result<Option<Token>, String>,
-    /// The SID of the account the stored principal names, `None` when it cannot be told (no principal, or a
-    /// name that names no account): not known to be any account being installed.
-    principal: Option<Sid>,
 }
 
 impl TaskSnapshot {
     pub(in crate::backend::scm) fn new(id: Id, blob: Decoded, registered: Registered) -> Self {
-        let token = TaskXml::token_of(&registered.xml, id.as_str()).map_err(|e| e.report().to_string());
-        let principal = TaskXml::principal(&registered.xml)
-            .ok()
-            .and_then(|(TaskAccount::Service(text) | TaskAccount::User(text))| identity::sid_of_principal(&text).ok());
-        Self {
-            id,
-            blob,
-            registered,
-            token,
-            principal,
-        }
+        Self { id, blob, registered }
     }
 
     /// The installed definition, read back from the stored XML.
@@ -56,17 +41,27 @@ impl TaskSnapshot {
         TaskXml::parse(&self.registered.xml, &self.registered.data)
     }
 
-    /// The token the stored registration carries, `None` when its arguments end with none (a hand edit).
-    /// An error when the XML could not be read: no token is then no licence to write another.
+    /// The token the stored registration carries, `None` when its arguments end with no goetia ending for
+    /// this task (a hand edit). An error when the XML cannot be read or the token is malformed: that is no
+    /// licence to write another. Read from the XML on each call, for the write path alone.
     pub(super) fn token(&self) -> Result<Option<Token>> {
-        self.token
-            .clone()
-            .map_err(|why| Error::blob(format!("read the token of the registration of `{}`: {why}", self.id)))
+        TaskXml::token_of(&self.registered.xml, self.id.as_str())
     }
 
-    /// The SID of the account the stored principal names, `None` when it cannot be told.
-    pub(super) fn principal(&self) -> Option<&Sid> {
-        self.principal.as_ref()
+    /// The SID of the account the stored principal names, `None` when the XML names no principal or the
+    /// name names no account: not known to be any account being installed. An error when the XML cannot
+    /// be read, or the account could not be looked up for any other reason (a transient RPC or domain
+    /// controller failure): the registration is then not known to be another account's. Read from the XML
+    /// and looked up on each call, for the write path alone.
+    pub(super) fn principal(&self) -> Result<Option<Sid>> {
+        let Some(TaskAccount::Service(text) | TaskAccount::User(text)) = TaskXml::principal(&self.registered.xml)?
+        else {
+            return Ok(None);
+        };
+        known_account(identity::sid_of_principal(&text)).map_err(|e| Error::Step {
+            what: format!("look up the account of the registration of `{}`", self.id),
+            source: Box::new(e),
+        })
     }
 
     /// Whether every trigger is enabled.
@@ -99,6 +94,16 @@ fn classify(registered: Registered) -> ReadOutcome<Unnamed<Registered>> {
         Err(e) => Err(Arc::new(e)),
     };
     ReadOutcome::Marked(Unnamed { blob, body: registered })
+}
+
+/// The SID a principal lookup found, `None` when the system says no such account exists: not known to be
+/// any account being installed. Any other failure of the lookup is the error.
+pub(super) fn known_account(lookup: Result<Sid>) -> Result<Option<Sid>> {
+    match lookup {
+        Ok(sid) => Ok(Some(sid)),
+        Err(Error::AccountLookup { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn snapshot_of(id: Id, blob: Decoded, registered: Registered) -> WindowsSnapshot {

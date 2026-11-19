@@ -212,8 +212,8 @@ fn own_spec(id: &str, token: &Token, api: &dyn TaskApi) -> Result<(DaemonSpec, T
             path.as_str()
         ))),
         Ok(None) => Err(not_started_under(format!(
-            "the task {}'s registration carries no goetia token, so it is not the one this shim was started under; \
-             `goetia daemon install {id}` registers it again: no program was started",
+            "the task {}'s registration carries no goetia ending for this task, so it is not the one this shim was \
+             started under; `goetia daemon install {id}` registers it again: no program was started",
             path.as_str()
         ))),
         Err(e) => Err(not_started_under(format!(

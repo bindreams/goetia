@@ -86,27 +86,29 @@ impl TaskXml {
 
     /// The account `xml`'s principal names, for registering the task again when its blob cannot say
     /// (see [`TaskXml::parse`], which reads it from the blob): a password logon is a user's, any other
-    /// a service account's. The name is as Task Scheduler stores it, usually a SID.
-    pub(crate) fn principal(xml: &str) -> Result<TaskAccount, Error> {
+    /// a service account's. The name is as Task Scheduler stores it, usually a SID. `None` when the XML
+    /// names no principal; an error only for XML that cannot be read.
+    pub(crate) fn principal(xml: &str) -> Result<Option<TaskAccount>, Error> {
         let document = document(xml)?;
         let principal = child(document.root_element(), "Principals")
             .and_then(|principals| child(principals, "Principal"))
             .and_then(|principal| child(principal, "UserId").map(|user| (principal, text(user))))
             .filter(|(_, user)| !user.is_empty());
         let Some((principal, user)) = principal else {
-            return Err(Error::blob("the task's XML names no principal"));
+            return Ok(None);
         };
         let password = child(principal, "LogonType").is_some_and(|logon| text(logon).eq_ignore_ascii_case("Password"));
-        Ok(if password {
+        Ok(Some(if password {
             TaskAccount::User(user)
         } else {
             TaskAccount::Service(user)
-        })
+        }))
     }
 
     /// The token the first action's arguments end with (`... --goetia-task <id> <token>`), the
-    /// registration's own, for the task `id`. `None` when they end otherwise ([`ending_of`]). An error
-    /// only for XML that cannot be read.
+    /// registration's own, for the task `id`. `None` when they end with no goetia ending for `id`
+    /// ([`ending_of`]: a hand edit, or another task's). An error for XML that cannot be read and for an
+    /// ending whose token is malformed.
     pub(crate) fn token_of(xml: &str, id: &str) -> Result<Option<Token>, Error> {
         let document = document(xml)?;
         let arguments = child(document.root_element(), "Actions")
@@ -115,7 +117,15 @@ impl TaskXml {
             .and_then(|exec| child(exec, "Arguments"))
             .map(text)
             .unwrap_or_default();
-        Ok(ending_of(&split_arguments(&arguments), id))
+        let arguments = split_arguments(&arguments);
+        let Some(text) = ending_of(&arguments, id) else {
+            return Ok(None);
+        };
+        Token::parse(text).map(Some).ok_or_else(|| {
+            Error::blob(format!(
+                "the task's arguments end with `{TASK_MODE_ARG} {id}` and a malformed token"
+            ))
+        })
     }
 
     /// The program of every `Exec` action of `xml`, as written. Read from the XML alone, so it names
@@ -295,7 +305,7 @@ fn action_of(root: Node<'_, '_>, id: &Id, unrecognised: &mut Vec<String>) -> Res
     }
 
     let mut args = split_arguments(&child(exec, "Arguments").map(text).unwrap_or_default());
-    if ending_of(&args, id.as_str()).is_some() {
+    if ending_of(&args, id.as_str()).and_then(Token::parse).is_some() {
         args.truncate(args.len() - 3);
     } else {
         unrecognised.push(format!("Arguments do not end with {TASK_MODE_ARG} {id} <token>"));
@@ -306,12 +316,12 @@ fn action_of(root: Node<'_, '_>, id: &Id, unrecognised: &mut Vec<String>) -> Res
     })
 }
 
-/// The registration's token, when `args` end as an install writes them: [`TASK_MODE_ARG`], the task's
-/// `id` and a well-formed token. The one definition of goetia's ending; its three arguments are no part
-/// of the host.
-fn ending_of(args: &[String], id: &str) -> Option<Token> {
+/// The last argument, the token's text, when `args` end as an install writes them: [`TASK_MODE_ARG`], the
+/// task's `id` and a token (which [`Token::parse`] judges). The one definition of goetia's ending; its three
+/// arguments are no part of the host.
+fn ending_of<'a>(args: &'a [String], id: &str) -> Option<&'a str> {
     match args {
-        [.., flag, named, token] if flag == TASK_MODE_ARG && named == id => Token::parse(token),
+        [.., flag, named, token] if flag == TASK_MODE_ARG && named == id => Some(token),
         _ => None,
     }
 }

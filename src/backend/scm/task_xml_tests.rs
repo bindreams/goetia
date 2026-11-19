@@ -509,11 +509,20 @@ fn parse_ignores_the_token_so_equal_definitions_stay_equal() {
 fn an_ending_that_is_not_goetias_reads_as_unrecognised_and_is_no_part_of_the_host() {
     let spec = spec();
     // A last argument that is no token, and an id that is not the task's.
-    for xml in [
-        readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123"),
-        readback(&spec, &host(), DAILY_AT_0330).replace(&format!(" {ID} "), " other "),
+    for (xml, malformed) in [
+        (readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123"), true),
+        (
+            readback(&spec, &host(), DAILY_AT_0330).replace(&format!(" {ID} "), " other "),
+            false,
+        ),
     ] {
-        assert_eq!(TaskXml::token_of(&xml, ID).unwrap(), None, "{xml}");
+        // A malformed token is an error from `token_of`; an ending of another id is none.
+        let read = TaskXml::token_of(&xml, ID);
+        if malformed {
+            assert!(read.is_err(), "{xml}");
+        } else {
+            assert_eq!(read.unwrap(), None, "{xml}");
+        }
         let installed = TaskXml::parse(&xml, &data_of(&spec)).unwrap();
         assert!(
             installed
@@ -546,24 +555,25 @@ fn a_stored_principal_names_the_account_to_register_again_as() {
     let service = built(&spec()).to_xml(true, &token());
     assert_eq!(
         TaskXml::principal(&service).unwrap(),
-        TaskAccount::Service("S-1-5-18".to_owned())
+        Some(TaskAccount::Service("S-1-5-18".to_owned()))
     );
 
     let user = built(&spec_of(User::Name("alice".into()), Some(SCHEDULE))).to_xml(true, &token());
     assert_eq!(
         TaskXml::principal(&user).unwrap(),
-        TaskAccount::User("alice".to_owned())
+        Some(TaskAccount::User("alice".to_owned()))
     );
 
     // As Task Scheduler reads it back: the account a SID.
     let normalised = user.replace("<UserId>alice</UserId>", "<UserId>S-1-5-21-1-2-3-1001</UserId>");
     assert_eq!(
         TaskXml::principal(&normalised).unwrap(),
-        TaskAccount::User("S-1-5-21-1-2-3-1001".to_owned())
+        Some(TaskAccount::User("S-1-5-21-1-2-3-1001".to_owned()))
     );
 
+    // No principal is an answer; XML that cannot be read is an error.
     let none = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions/></Task>";
-    assert!(TaskXml::principal(none).is_err());
+    assert_eq!(TaskXml::principal(none).unwrap(), None);
     assert!(TaskXml::principal("<Task><Principals>").is_err());
 }
 

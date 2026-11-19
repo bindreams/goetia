@@ -97,6 +97,30 @@ fn a_task_reads_as_ours_and_its_status_is_idle() {
     fake.finish();
 }
 
+/// Only an account the system says does not exist is "no account known": any other failure of the lookup (a
+/// transient RPC or domain-controller error) is the error, so that it is no licence to delete the task.
+#[skuld::test]
+fn a_failed_lookup_of_the_principal_is_a_change_only_when_the_account_does_not_exist() {
+    let sid = crate::backend::scm::sid::system();
+    assert_eq!(known_account(Ok(sid.clone())).unwrap(), Some(sid));
+
+    let none_mapped = Error::AccountLookup {
+        detail: "cannot resolve SID for account `gone`".to_owned(),
+        source: None,
+    };
+    assert_eq!(known_account(Err(none_mapped)).unwrap(), None);
+
+    let transient = Error::os(
+        "resolve SID for account `alice`",
+        io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32),
+    );
+    let failed = known_account(Err(transient)).unwrap_err();
+    assert!(
+        std::error::Error::source(&failed).is_some(),
+        "the lookup's own error is kept: {failed:?}"
+    );
+}
+
 #[skuld::test]
 fn a_task_that_is_armed_reports_enabled_and_its_next_run() {
     let spec = task_spec(Some("30 3 * * *"));

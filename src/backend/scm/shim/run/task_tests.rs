@@ -299,28 +299,63 @@ fn a_registration_with_another_token_starts_no_program() {
     run.api.finish();
 }
 
-/// A registration whose last argument is no token (a hand edit) is not the one the shim was started under.
+/// A registration whose arguments end with no goetia ending for this task (a hand edit: no ending, or the ending
+/// of another id) is not the one the shim was started under.
 #[skuld::test]
-fn a_registration_with_no_token_starts_no_program() {
+fn a_registration_with_no_ending_for_this_task_starts_no_program() {
     let stored = registered_task(&spec_logging_to(None), false);
-    let malformed = Registered {
+    for edited in [
+        stored
+            .xml
+            .replace(&format!(" {ID} {TASK_TOKEN}</Arguments>"), "</Arguments>"),
+        stored.xml.replace(
+            &format!(" {ID} {TASK_TOKEN}</Arguments>"),
+            &format!(" other {TASK_TOKEN}</Arguments>"),
+        ),
+    ] {
+        let run = Run::reading(Ok(Some(Registered {
+            xml: edited,
+            ..stored.clone()
+        })));
+
+        let code = run.run();
+
+        assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
+        assert_one_failure(
+            &run.fake.take_failures(),
+            ID,
+            &format!(
+                "the task \\Goetia\\{ID}'s registration carries no goetia ending for this task, so it is not the \
+                 one this shim was started under; `goetia daemon install {ID}` registers it again: no program \
+                 was started"
+            ),
+        );
+        assert_eq!(run.fake.calls(Op::Spawn), 0);
+        run.api.finish();
+    }
+}
+
+/// A registration whose token is malformed (a hand edit) cannot be read, so no program starts under it.
+#[skuld::test]
+fn a_registration_with_a_malformed_token_starts_no_program() {
+    let stored = registered_task(&spec_logging_to(None), false);
+    let run = Run::reading(Ok(Some(Registered {
         xml: stored
             .xml
             .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
         ..stored
-    };
-    let run = Run::reading(Ok(Some(malformed)));
+    })));
 
     let code = run.run();
 
     assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
-    assert_one_failure(
-        &run.fake.take_failures(),
-        ID,
-        &format!(
-            "the task \\Goetia\\{ID}'s registration carries no goetia token, so it is not the one this shim was \
-             started under; `goetia daemon install {ID}` registers it again: no program was started"
-        ),
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!(
+                "goetia-shim[{ID}]: read the registration of the task \\Goetia\\{ID}: "
+            )),
+        "{failures:?}"
     );
     assert_eq!(run.fake.calls(Op::Spawn), 0);
     run.api.finish();
