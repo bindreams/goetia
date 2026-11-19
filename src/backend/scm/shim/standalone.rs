@@ -11,8 +11,8 @@ use crate::error::{Error, Result};
 /// itself started with an argument that makes it call `goetia::shim::main()`. It writes nothing
 /// and removes nothing.
 ///
-/// A task is run by this host with `--goetia-task <id>` after `args`. A program that is its own
-/// host must let those two arguments through its argument parser, and not read the last two arguments
+/// A task is run by this host with `--goetia-task <id> <token>` after `args`. A program that is its own
+/// host must let those three arguments through its argument parser, and not read the last three arguments
 /// as anything else (`goetia::shim::main` says what it does with them).
 pub struct StandaloneShim {
     exe: PathBuf,
