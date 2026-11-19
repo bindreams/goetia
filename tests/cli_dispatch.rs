@@ -2573,6 +2573,176 @@ fn status_json_reports_a_null_pid_for_a_stopped_daemon() {
     assert_eq!(daemons(&doc)[0]["pid"], serde_json::Value::Null);
 }
 
+/// A task's entry carries its type and what the manager knows of its runs; the times are RFC 3339 with
+/// an offset, whatever zone the host is in.
+#[skuld::test]
+fn status_json_of_a_task_carries_type_results_and_times() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    let at = |seconds| std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+    fake.seed_task_status(
+        "nightly",
+        Some(Exit::Signal(15)),
+        Some(at(1_768_478_400)),
+        Some(at(1_768_478_460)),
+    );
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "nightly"], &fake);
+
+    assert_eq!(code, 0, "{out}");
+    let doc = parse_json(&out);
+    let entry = &daemons(&doc)[0];
+    assert_eq!(entry["type"], "task");
+    assert_eq!(entry["state"], "idle");
+    assert_eq!(entry["last-result"], serde_json::json!({"signal": 15}));
+    let instant = |key: &str| -> i64 {
+        let text = entry[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{key}` is a string: {entry}"));
+        text.parse::<jiff::Timestamp>()
+            .unwrap_or_else(|e| panic!("`{key}` = {text} is not RFC 3339: {e}"))
+            .as_second()
+    };
+    assert_eq!(instant("last-run"), 1_768_478_400);
+    assert_eq!(instant("next-run"), 1_768_478_460);
+}
+
+/// `status <id>`, `status` and `list` all write a task's times with the offset of the system zone at that
+/// instant, not UTC.
+#[skuld::test]
+fn every_form_writes_a_tasks_times_in_the_system_zone() {
+    let zone = jiff::tz::TimeZone::system();
+
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    let seconds = 1_768_478_400;
+    let instant = jiff::Timestamp::from_second(seconds).unwrap();
+    // 2026's zones have whole-minute offsets; the unknown zone writes UTC with `Z`.
+    let expected = match zone.is_unknown() {
+        true => instant.to_string(),
+        false => instant.display_with_offset(zone.to_offset(instant)).to_string(),
+    };
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(seconds as u64);
+    fake.seed_task_status("nightly", Some(Exit::Code(0)), Some(at), Some(at));
+
+    for args in [
+        ["goetia", "--json", "daemon", "status", "nightly"].as_slice(),
+        ["goetia", "--json", "daemon", "status"].as_slice(),
+        ["goetia", "--json", "daemon", "list"].as_slice(),
+    ] {
+        let (code, out, _err) = dispatch_read_only(args, &fake);
+
+        assert_eq!(code, 0, "{args:?}: {out}");
+        let doc = parse_json(&out);
+        let entry = &daemons(&doc)[0];
+        assert_eq!(entry["last-run"], expected, "{args:?}");
+        assert_eq!(entry["next-run"], expected, "{args:?}");
+    }
+}
+
+/// A task that has never run is idle, and `status` of it succeeds.
+#[skuld::test]
+fn status_json_of_a_task_that_never_ran_is_idle_with_null_results() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "nightly"], &fake);
+
+    assert_eq!(code, 0, "{out}");
+    let doc = parse_json(&out);
+    let entry = &daemons(&doc)[0];
+    assert_eq!(entry["state"], "idle");
+    for key in ["last-result", "last-run", "next-run"] {
+        assert_eq!(entry.get(key), Some(&serde_json::Value::Null), "{key}: {entry}");
+    }
+}
+
+/// A service's entry has the three task keys, null.
+#[skuld::test]
+fn status_json_of_a_service_has_type_service_and_null_task_keys() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
+
+    assert_eq!(code, 0, "{out}");
+    let doc = parse_json(&out);
+    let entry = &daemons(&doc)[0];
+    assert_eq!(entry["type"], "service");
+    for key in ["last-result", "last-run", "next-run"] {
+        assert_eq!(entry.get(key), Some(&serde_json::Value::Null), "{key}: {entry}");
+    }
+}
+
+#[skuld::test]
+fn status_json_with_no_ids_equals_list_json_with_a_task_installed() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&a_task("nightly"), false).unwrap();
+    let at = |seconds| std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+    fake.seed_task_status(
+        "nightly",
+        Some(Exit::Code(3)),
+        Some(at(1_768_478_400)),
+        Some(at(1_768_478_460)),
+    );
+
+    let (list_code, list_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+    let (status_code, status_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "status"], &fake);
+
+    assert_eq!(list_code, status_code);
+    let doc = parse_json(&list_out);
+    assert_eq!(doc, parse_json(&status_out));
+    assert_eq!(
+        field_strings(daemons(&doc), "type"),
+        ["service", "task"],
+        "both kinds are in the document that was compared"
+    );
+    let task = &daemons(&doc)[1];
+    assert_eq!(task["last-result"], serde_json::json!({"code": 3}));
+    for (key, seconds) in [("last-run", 1_768_478_400), ("next-run", 1_768_478_460)] {
+        let text = task[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{key}` is a string: {task}"));
+        let parsed: jiff::Timestamp = text.parse().unwrap_or_else(|e| panic!("`{key}` = {text}: {e}"));
+        assert_eq!(parsed.as_second(), seconds, "{key}");
+    }
+}
+
+/// `list`'s text row names the type in a last column, so the columns that were there keep their positions.
+#[skuld::test]
+fn list_text_of_a_task_has_its_type_column_last() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
+
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out,
+        "frpc\tfrpc\tstopped\tenabled=false\tservice\nnightly\tnightly\tidle\tenabled=false\ttask\n"
+    );
+}
+
+/// A task whose status cannot be read is a warning, as a service's is, and has no row.
+#[skuld::test]
+fn list_text_of_a_task_whose_status_is_unreadable_prints_the_warning_and_no_row() {
+    let inner = Fake::new();
+    inner.install(&a_task("nightly"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        unqueryable: Some("nightly".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "list"], &mgr, &never_elevated);
+
+    assert_eq!(code, 4, "{err}");
+    assert_eq!(out, "");
+    assert!(err.starts_with("warning: nightly: "), "{err}");
+}
+
 /// The two subcommands must describe one machine identically, or a consumer
 /// has to know which verb produced the document it is reading. The fixture
 /// populates all three keys, so the equality covers the third rather than

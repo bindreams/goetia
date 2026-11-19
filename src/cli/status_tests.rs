@@ -1,5 +1,6 @@
 use super::*;
 use crate::cli::report::{ErrorReport, Kind};
+use crate::manager::{DaemonStatus, Exit, State, Status, TaskStatus};
 
 fn rendered(id: Option<&str>, message: &str) -> (String, String) {
     let report = Report {
@@ -14,6 +15,81 @@ fn rendered(id: Option<&str>, message: &str) -> (String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     print_text(&report, &mut out, &mut err);
     (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+}
+
+fn line_of(status: &Status) -> String {
+    format_status_line(&report::daemon("job", status, &jiff::tz::TimeZone::UTC))
+}
+
+/// A service's line is `id: state (enabled=, pid=)`.
+#[skuld::test]
+fn status_text_of_a_service_has_no_task_suffix() {
+    let status = Status::Service(DaemonStatus {
+        state: State::Running,
+        pid: Some(1234),
+        enabled: true,
+    });
+
+    assert_eq!(line_of(&status), "job: running (enabled=true, pid=1234)");
+}
+
+#[skuld::test]
+fn status_text_of_a_task_names_its_type_results_and_times() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let at = |seconds| UNIX_EPOCH + Duration::from_secs(seconds);
+    let task = |last_result, last_run, next_run| {
+        Status::Task(TaskStatus {
+            common: DaemonStatus {
+                state: State::Idle,
+                pid: None,
+                enabled: true,
+            },
+            last_result,
+            last_run,
+            next_run,
+        })
+    };
+
+    assert_eq!(
+        line_of(&task(
+            Some(Exit::Code(0)),
+            Some(at(1_768_478_400)),
+            Some(at(1_768_478_460))
+        )),
+        concat!(
+            "job: idle (task, enabled=true, pid=-, last-result=exit code 0, ",
+            "last-run=2026-01-15T12:00:00+00:00, next-run=2026-01-15T12:01:00+00:00)"
+        )
+    );
+    assert_eq!(
+        line_of(&task(Some(Exit::Signal(15)), None, None)),
+        "job: idle (task, enabled=true, pid=-, last-result=signal 15, last-run=-, next-run=-)"
+    );
+    assert_eq!(
+        line_of(&task(None, None, None)),
+        "job: idle (task, enabled=true, pid=-, last-result=-, last-run=-, next-run=-)"
+    );
+
+    // A running task has a pid; a Windows `stop` exit code is the signed value; a time outside RFC 3339's years
+    // is `-`.
+    let running = Status::Task(TaskStatus {
+        common: DaemonStatus {
+            state: State::Running,
+            pid: Some(4321),
+            enabled: true,
+        },
+        last_result: Some(Exit::Code(-1_073_741_510)),
+        last_run: Some(at(1_768_478_400)),
+        next_run: Some(at(300_000_000_000)),
+    });
+    assert_eq!(
+        line_of(&running),
+        concat!(
+            "job: running (task, enabled=true, pid=4321, last-result=exit code -1073741510, ",
+            "last-run=2026-01-15T12:00:00+00:00, next-run=-)"
+        )
+    );
 }
 
 /// The report carries the exact text for `--json`; this is the human sink, which escapes it, and
