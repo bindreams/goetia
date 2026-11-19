@@ -178,10 +178,12 @@ impl TaskXml {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn without_triggers(_xml: &str) -> Result<String, Error> {
         todo!()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_triggers(_xml: &str, _spec: &DaemonSpec) -> Result<String, Error> {
         todo!()
     }
