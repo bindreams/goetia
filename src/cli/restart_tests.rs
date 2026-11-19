@@ -307,7 +307,9 @@ fn a_step_over_a_leg_in_doubt_is_reworded_under_the_step() {
 #[skuld::test]
 fn a_start_judged_as_managed_over_a_leg_in_doubt_is_reworded_under_it() {
     let id = Id::try_from("frpc").unwrap();
-    let judged = || Error::StartAsManaged {
+    let judged = || Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: std::sync::Arc::new(Error::blob("corrupt")),
         source: Box::new(in_doubt()),
     };
@@ -315,7 +317,7 @@ fn a_start_judged_as_managed_over_a_leg_in_doubt_is_reworded_under_it() {
     for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
         let started = after_start_failed(&id, budget, judged());
         assert!(
-            matches!(started, Error::StartAsManaged { .. }),
+            matches!(started, Error::StartJudgedWithoutBlob { .. }),
             "{budget:?}: {started:?}"
         );
         assert!(

@@ -185,6 +185,21 @@ fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
     }
 }
 
+/// A denial that the failed SeDebugPrivilege step is told after is still a denial: the open's code is the
+/// pair's, as the pair's `raw_os_error` says.
+#[skuld::test]
+fn a_denied_open_that_a_failed_privilege_step_is_told_after_is_named_a_denial() {
+    let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+    let step = std::io::Error::from_raw_os_error(1300);
+    let e = crate::error::debug_privilege_also_failed(denied, step);
+
+    let err = open_refused("kill", "service `x`", "open service `x` to kill it", e);
+
+    let report = err.report().to_string();
+    assert!(report.contains("`kill` was denied access to service `x`"), "{report}");
+    assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{report}");
+}
+
 #[skuld::test]
 fn is_access_denied_matches_only_error_access_denied() {
     let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
@@ -608,6 +623,101 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
 }
 
+/// A start judged without its blob says so in the words it always did, for each vocabulary it was
+/// judged by, and the blob's own failure is one the one search reaches.
+#[skuld::test]
+fn a_failed_start_judged_without_its_blob_says_so_and_the_blob_is_searched() {
+    use crate::error::error_tests::finds_error;
+
+    let id = Id::try_from("frpc").unwrap();
+    let start_failed = || {
+        Error::os(
+            "start `frpc`",
+            std::io::Error::other("service stopped before reaching Running"),
+        )
+    };
+    let tail = ": failed to start `frpc`: service stopped before reaching Running";
+
+    for (protocol, words) in [
+        (
+            Protocol::Native,
+            "its spec blob could not be read, so the start was judged as a `protocol: native` service's",
+        ),
+        (
+            Protocol::Plain,
+            "`frpc`'s spec blob could not be read, so the start was judged as a goetia shim's, by the registered image",
+        ),
+    ] {
+        let said = failed_start(
+            &id,
+            start_failed(),
+            protocol,
+            Some(Arc::new(Error::blob("invalid blob JSON: EOF"))),
+        )
+        .report()
+        .to_string();
+        assert_eq!(
+            said,
+            format!("{words} (blob: invalid blob JSON: EOF){tail}"),
+            "{protocol:?}"
+        );
+
+        let failed = failed_start(
+            &id,
+            start_failed(),
+            protocol,
+            Some(Arc::new(Error::blob("undecodable"))),
+        );
+        assert!(
+            finds_error(
+                &failed,
+                |e| matches!(e, Error::Blob { message, .. } if message == "undecodable")
+            ),
+            "{protocol:?}: the blob's failure is found: {failed:?}"
+        );
+    }
+}
+
+/// A wait for the process that failed after goetia's attempt to end it had failed too says both, and
+/// only the wait is the failure's cause: the terminate is mentioned, as in a wait that timed out.
+#[skuld::test]
+fn a_failed_process_wait_after_a_failed_terminate_says_both_and_only_the_wait_is_a_cause() {
+    use crate::error::error_tests::finds_os_code;
+
+    let id = Id::try_from("frpc").unwrap();
+    let failure = |wait: std::io::Error, terminate: std::io::Error| ProcessWaitFailure {
+        wait_failed: wait,
+        terminate_failed: Some(Arc::new(terminate)),
+    };
+
+    let said = process_wait_failed(
+        &id,
+        "stop `frpc`".to_string(),
+        failure(
+            std::io::Error::other("wait denied"),
+            std::io::Error::other("terminate denied"),
+        ),
+    )
+    .report()
+    .to_string();
+    assert_eq!(
+        said,
+        "`frpc` is stopped, but goetia could not tell that its process exited, and terminating it failed: terminate denied. The wait for it failed: failed to stop `frpc`: wait denied"
+    );
+
+    let error = process_wait_failed(
+        &id,
+        "stop `frpc`".to_string(),
+        failure(
+            std::io::Error::from_raw_os_error(5),
+            std::io::Error::from_raw_os_error(6),
+        ),
+    );
+    assert!(finds_os_code(&error, 5), "{error:?}");
+    assert!(!finds_os_code(&error, 6), "{error:?}");
+    assert_eq!(error.raw_os_error(), Some(5), "{error:?}");
+}
+
 /// A blob that says `restart: always` decodes, and a `protocol: plain` one starts by the shim's vocabulary like
 /// any other.
 #[skuld::test]
@@ -982,7 +1092,7 @@ fn a_provider_whose_folder_and_sweep_fail_alike_is_reported_once_with_no_retry()
     assert!(!said.contains("could not be determined"), "{said}");
 }
 
-/// A `stop` whose process could not be opened says so in the error that follows, led by it, and the
+/// A `stop` whose process could not be held says so in the error that follows, led by it, and the
 /// error under it keeps its class: a timeout is still indeterminate.
 #[skuld::test]
 fn a_stop_error_says_when_the_process_could_not_be_waited_for() {
@@ -997,6 +1107,30 @@ fn a_stop_error_says_when_the_process_could_not_be_waited_for() {
         "{said}"
     );
     assert!(said.contains("goetia stopped waiting"), "{said}");
+}
+
+/// The words of a `stop` whose process could not be held, and the failure to hold it, which is a
+/// cause the one search reaches.
+#[skuld::test]
+fn a_stop_that_could_not_open_its_process_says_so_and_the_open_failure_is_searched() {
+    use crate::error::error_tests::finds_os_code;
+
+    let id = Id::try_from("frpc").unwrap();
+    let timeout = || budget::timed_out("frpc", "stopped", Budget::Bounded(std::time::Duration::from_secs(1)));
+
+    let said = unwaited(&id, std::io::Error::other("access denied"), timeout())
+        .report()
+        .to_string();
+    assert_eq!(
+        said,
+        format!(
+            "goetia could not hold `frpc`'s process (access denied), so it could not wait for the process to exit: {}",
+            timeout().report()
+        )
+    );
+
+    let error = unwaited(&id, std::io::Error::from_raw_os_error(5), timeout());
+    assert!(finds_os_code(&error, 5), "{error:?}");
 }
 
 /// Every refusal `render_for_install` makes comes before the lock is taken and before the provider
@@ -1087,6 +1221,43 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     assert_eq!(reg.executable, PathBuf::from(r"C:\Program Files\App\app.exe"));
     assert_eq!(reg.arguments, ["--service-host"]);
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
+}
+
+/// A hold whose reads of SCM failed after a refused open reports both failures, behind what the
+/// hold was for.
+#[skuld::test]
+fn a_failed_hold_reports_the_read_and_the_refused_open_it_followed() {
+    let read = std::io::Error::from_raw_os_error(1722);
+    let open = std::io::Error::from_raw_os_error(5);
+    let (read_text, open_text) = (read.to_string(), open.to_string());
+    let e = crate::error::unread_after_open_refused(100, open, read);
+
+    let error = hold_failed(&Id::try_from("frpc").unwrap(), e);
+
+    assert_eq!(error.raw_os_error(), Some(1722));
+    assert_eq!(
+        error.report().to_string(),
+        format!(
+            "failed to hold `frpc`'s process to wait for its exit: the process (pid 100) could not be opened \
+             ({open_text}), and the re-read of what runs the daemon failed: {read_text}"
+        )
+    );
+}
+
+/// A hold whose read of SCM failed with a goetia error that left the outcome open is that error: the
+/// CLI exits `4`, not `1`.
+#[skuld::test]
+fn a_failed_hold_keeps_the_class_of_the_goetia_error_the_read_carried() {
+    let read = Error::Undetermined {
+        id: "frpc".to_string(),
+        reason: Box::new(Error::os("read", std::io::Error::other("SCM did not answer"))),
+        recovery: "re-run".to_string(),
+    };
+
+    let error = hold_failed(&Id::try_from("frpc").unwrap(), std::io::Error::other(read));
+
+    assert!(error.is_indeterminate(), "{error:?}");
+    assert!(matches!(error.cause(), Error::Undetermined { .. }), "{error:?}");
 }
 
 /// A stop whose hold expired and whose STOP was sent is the wait that ran out, led by the process SCM

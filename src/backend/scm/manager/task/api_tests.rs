@@ -80,6 +80,40 @@ fn a_run_refused_for_a_disabled_task_says_an_uninstall_did_not_finish() {
     );
 }
 
+// The code is found wherever the error carries the COM failure: in an `io::Error`'s payload and in either half of
+// a `Both`.
+#[skuld::test]
+fn a_com_code_is_found_in_a_payload_and_in_each_half_of_a_both() {
+    use windows::Win32::Foundation::{E_ACCESSDENIED, SCHED_E_TASK_NOT_RUNNING};
+
+    let com = || windows::core::Error::from(SCHED_E_TASK_NOT_RUNNING);
+    let other = || Error::os("read", std::io::Error::other("no code"));
+    let both = |first, then| Error::Both {
+        first: Box::new(first),
+        then: Box::new(then),
+    };
+    let in_payload = Error::os("stop an instance", std::io::Error::other(com()));
+
+    assert_eq!(com_code(&in_payload), Some(SCHED_E_TASK_NOT_RUNNING));
+    assert!(is_not_running(&in_payload));
+    assert_eq!(
+        com_code(&both(Error::os("stop", com()), other())),
+        Some(SCHED_E_TASK_NOT_RUNNING)
+    );
+    assert_eq!(
+        com_code(&both(other(), Error::os("stop", com()))),
+        Some(SCHED_E_TASK_NOT_RUNNING)
+    );
+    assert_eq!(
+        com_code(&both(
+            Error::os("stop", windows::core::Error::from(E_ACCESSDENIED)),
+            Error::os("stop", com())
+        )),
+        Some(E_ACCESSDENIED),
+        "the first half's code comes first"
+    );
+}
+
 // The one failure of a `Stop` a caller takes as a stop: the run ended before it was asked to.
 #[skuld::test]
 fn only_task_schedulers_not_running_code_says_the_run_had_ended() {

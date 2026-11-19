@@ -118,7 +118,7 @@ use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_de
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
-    carried, end_on_incomplete_stop, end_process,
+    end_on_incomplete_stop, end_process,
 };
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::scm::default_log;
@@ -144,7 +144,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Chain, Error, Reason, Result, terminating_failed};
+use crate::error::{Error, Reason, Result, carried_composite, os_error_in, target_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
@@ -585,7 +585,7 @@ impl Scm {
     /// tree may still be running) is a failed stop, once the process is ended; `uninstall` fails the
     /// same way, and leaves the service stopped, disabled and not deleted (see [`uninstall_stop_on`]).
     ///
-    /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
+    /// A process that cannot be held is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
     ///
     /// The gap: if the held process crashes and Windows' recovery restarts the service before the
@@ -995,7 +995,7 @@ pub(super) fn stop_on<A: super::wait::ScmActor, P: HeldProcess>(
                 Err(process_wait_failed(id, format!("stop `{id}`"), failure))
             }
         });
-    // A process that cannot be opened is not waited for (see `stop_and_await_exit`), and a `stop`
+    // A process that cannot be held is not waited for (see `stop_and_await_exit`), and a `stop`
     // that succeeds has no channel to say so: the reason leads the error of one that fails.
     stopped.map_err(|error| match held {
         HoldOutcome::Refused(reason) => unwaited(id, reason, error),
@@ -1019,18 +1019,12 @@ fn start_kind(answer: &ShimAnswer) -> (Protocol, Option<Arc<Error>>) {
 /// the start was judged without it, as `kind` says, and the error says why: neither is what a service
 /// whose blob reads would have been told.
 fn failed_start(id: &Id, failed: Error, kind: Protocol, unreadable: Option<Arc<Error>>) -> Error {
-    match (kind, unreadable) {
-        (_, None) => failed,
-        (Protocol::Native, Some(blob)) => Error::StartAsManaged {
+    match unreadable {
+        None => failed,
+        Some(blob) => Error::StartJudgedWithoutBlob {
+            id: id.to_string(),
+            judged_as: kind,
             blob,
-            source: Box::new(failed),
-        },
-        (Protocol::Plain, Some(blob)) => Error::Step {
-            what: format!(
-                "`{id}`'s spec blob could not be read, so the start was judged as a goetia shim's, by the \
-                 registered image ({})",
-                Chain(&*blob)
-            ),
             source: Box::new(failed),
         },
     }
@@ -1508,7 +1502,7 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
 /// before the process exits, and reports no pid after it. It may be running an older file than the
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
-/// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
+/// process that cannot be held is none (see [`hold_if_possible`]). The service handle each hold
 /// uses is closed before it returns, or the service could not be deleted.
 fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
@@ -1622,7 +1616,7 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
         Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
-            let state = match (carried::<IncompleteStop>(&e).is_some(), marked) {
+            let state = match (carried_composite::<IncompleteStop>(&e).is_some(), marked) {
                 (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
@@ -1794,7 +1788,7 @@ fn is_gone_or_marked(error: &Error) -> bool {
 /// before the process exits, and reports no pid after it. For an uninstall it may be running an
 /// older file than the one registered (an `Update` it has not restarted into), which no read of the
 /// registry shows. [`HoldOutcome::NoProcess`] when SCM reports none, and [`HoldOutcome::Refused`],
-/// with why, when the process cannot be opened (see [`hold_if_possible`]): the caller goes on, and
+/// with why, when the process cannot be held (see [`hold_if_possible`]): the caller goes on, and
 /// what that process runs stays referenced by its image until it exits. A failure to read SCM is an
 /// error, led by `not_done`, what the caller did not do. The wait for SCM to let go of a pid whose
 /// process is gone ends at `deadline`, and is [`HoldOutcome::Expired`]: a `stop` sends its STOP all
@@ -1812,8 +1806,13 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
         Err(e) => return Err(not_done(e)),
     };
     let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
-    hold_if_possible(&mut target, deadline)
-        .map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
+    hold_if_possible(&mut target, deadline).map_err(|e| not_done(hold_failed(id, e)))
+}
+
+/// The failure `e` to hold `id`'s process, as `hold_process` reports it: a [`Step`](Error::Step) around
+/// the goetia error that `e` carries, with its class, or else an OS failure of the hold.
+fn hold_failed(id: &Id, e: std::io::Error) -> Error {
+    target_failed(format!("hold `{id}`'s process to wait for its exit"), e)
 }
 
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
@@ -1837,7 +1836,7 @@ fn end_held(
 
 /// The error of a wait for `id`'s process to exit that failed: `what` failed with the wait's own error,
 /// its OS code intact. When goetia's attempt to end the process had failed too, the error leads with
-/// that, worded as every report of a failed terminate words it (see [`terminating_failed`]).
+/// that ([`Error::ProcessExitUnconfirmed`]).
 fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Error {
     let ProcessWaitFailure {
         wait_failed,
@@ -1847,25 +1846,19 @@ fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Er
     let Some(terminate_failed) = terminate_failed else {
         return error;
     };
-    Error::Step {
-        what: terminating_failed(
-            format!("`{id}` is stopped, but goetia could not tell that its process exited"),
-            Some(&*terminate_failed),
-            ". The wait for it failed",
-        )
-        .to_string(),
+    Error::ProcessExitUnconfirmed {
+        id: id.to_string(),
+        terminate_failed,
         source: Box::new(error),
     }
 }
 
-/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not open, for
+/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not hold, for
 /// `reason`: led by what that left undone, with the class of `error`.
 fn unwaited(id: &Id, reason: std::io::Error, error: Error) -> Error {
-    Error::Step {
-        what: format!(
-            "goetia could not open `{id}`'s process ({}), so it could not wait for the process to exit",
-            Chain(&reason)
-        ),
+    Error::ProcessNotHeld {
+        id: id.to_string(),
+        hold_failed: reason,
         source: Box::new(error),
     }
 }
@@ -2001,7 +1994,7 @@ impl Scm {
             // Not waited for, and said so: the file it runs stays until it exits, and the sweep below
             // keeps it by its image.
             HoldOutcome::Refused(reason) => {
-                failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
+                failures.push(Error::os(format!("hold `{id}`'s process to wait for its exit"), reason).into())
             }
             HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
         }
@@ -2372,7 +2365,7 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
 /// `context` is the open, as [`to_error`] takes it, and `e` its failure: a process's, for a task's run
 /// that a caller who is not an Administrator may not open (see `task::read`).
 fn open_refused(operation: &str, target: &str, context: &str, e: std::io::Error) -> Error {
-    let access_denied = e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    let access_denied = os_error_in(&e) == Some(ERROR_ACCESS_DENIED as i32);
     let failed = Error::os(context, e);
     if !access_denied {
         return failed;

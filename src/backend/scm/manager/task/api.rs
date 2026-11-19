@@ -15,7 +15,7 @@ use windows::core::HRESULT;
 
 use super::clock::local_to_system_in;
 use crate::backend::scm::instance::{InstanceId, TaskAccount, TaskPath};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, find};
 
 /// One run of a task that Task Scheduler lists. A listing is not proof the run is alive: the entry
 /// outlives the process.
@@ -117,21 +117,16 @@ pub(crate) trait TaskApi: Send + Sync {
 }
 
 /// Whether `error`, from [`TaskApi::stop`], says the run had ended: the one failure of a `Stop` that a
-/// caller takes as a stop. Task Scheduler's own code is in the error's source chain.
+/// caller takes as a stop. Task Scheduler's own code is found in the error ([`com_code`]).
 pub(crate) fn is_not_running(error: &Error) -> bool {
     com_code(error) == Some(SCHED_E_TASK_NOT_RUNNING)
 }
 
-/// The code of the Task Scheduler (COM) failure in `error`'s source chain, if there is one.
+/// The code of the Task Scheduler (COM) failure in `error`, if there is one: the first [`find`] finds.
 pub(crate) fn com_code(error: &Error) -> Option<HRESULT> {
-    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(error) = next {
-        if let Some(com) = error.downcast_ref::<windows::core::Error>() {
-            return Some(com.code());
-        }
-        next = error.source();
-    }
-    None
+    find(error, &|e| {
+        e.downcast_ref::<windows::core::Error>().map(windows::core::Error::code)
+    })
 }
 
 /// `error`, from the start of the task `id`, worded for a task whose own flag is false (`Run` refuses

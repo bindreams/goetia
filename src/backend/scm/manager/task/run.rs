@@ -170,14 +170,15 @@ where
             }
             Following::Ended(instance) => instance,
             Following::Done(record) => return exit_of(&id, record.outcome),
-            Following::Unrecorded => return Err(unrecorded(&id, UNRECORDED.to_owned())),
+            Following::Unrecorded => return Err(unrecorded(&id, UNRECORDED, None)),
         };
         match runs.read(&instance) {
             Ok(Some(record)) => exit_of(&id, record.outcome),
-            Ok(None) => Err(unrecorded(&id, UNRECORDED.to_owned())),
+            Ok(None) => Err(unrecorded(&id, UNRECORDED, None)),
             Err(e) => Err(unrecorded(
                 &id,
-                format!("its record could not be read: {}", Error::os("read it", e).report()),
+                "its record could not be read",
+                Some(Error::os("read it", e)),
             )),
         }
     }
@@ -192,16 +193,18 @@ fn exit_of(id: &Id, outcome: RunOutcome) -> Result<Exit> {
     }
 }
 
-fn unrecorded(id: &Id, reason: String) -> Error {
+/// A run whose exit was not recorded, for `reason`, which `source` (the failure that left it so) follows.
+fn unrecorded(id: &Id, reason: &str, source: Option<Error>) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
-        reason,
+        reason: reason.to_owned(),
+        source: source.map(Box::new),
     }
 }
 
 /// A run that began, whose exit goetia cannot establish because `what` failed with `cause`.
-fn unfollowed(id: &Id, what: &str, cause: &Error) -> Error {
-    unrecorded(id, format!("goetia could not {what}: {}", cause.report()))
+fn unfollowed(id: &Id, what: &str, cause: Error) -> Error {
+    unrecorded(id, &format!("goetia could not {what}"), Some(cause))
 }
 
 /// The wait for the run of `id`'s process failed: the run may still be going, so this is in doubt, as a
@@ -264,19 +267,19 @@ impl Scm {
         let started = self.tasks.run(&path)?;
 
         let live = live_runs(&*self.tasks, "run", &id, &path, |pid| processes.alive(pid))
-            .map_err(|e| unfollowed(&id, "tell which run it began", &e))?;
+            .map_err(|e| unfollowed(&id, "tell which run it began", e))?;
         let appeared = pin.appeared().map_err(|e| {
             unfollowed(
                 &id,
                 "tell which run it began",
-                &Error::os(format!("read the run records of `{id}`"), e),
+                Error::os(format!("read the run records of `{id}`"), e),
             )
         })?;
         let following = match identify(Some(&started), &live, &appeared) {
             Identity::Live { id: instance, pid } => {
                 let listed = Instance { id: instance, pid };
                 match hold_run(&*self.tasks, "run", &id, &path, &listed, &mut processes)
-                    .map_err(|e| unfollowed(&id, "hold the process of the run it began", &e))?
+                    .map_err(|e| unfollowed(&id, "hold the process of the run it began", e))?
                 {
                     Some(process) => Following::Process { instance, process },
                     None => Following::Ended(instance),
