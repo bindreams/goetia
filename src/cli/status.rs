@@ -46,7 +46,7 @@ pub fn run(
         // classify is that id's own entry in `errors`.
         undetermined: Vec::new(),
     };
-    let zone = report::system_zone();
+    let zone = report::display_zone();
     for id_str in &args.ids {
         match parse_id(id_str) {
             Err(e) => report.errors.push(report::invalid_id(id_str, e)),
@@ -79,7 +79,7 @@ fn unavailable(e: Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -
 fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let (index, report) = match mgr.list().map(partition_installed) {
         Ok(index) => {
-            let report = report::from_index(&index, &report::system_zone());
+            let report = report::from_index(&index, &report::display_zone());
             (Some(index), report)
         }
         Err(e) => (None, report::unavailable(e)),

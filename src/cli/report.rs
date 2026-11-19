@@ -287,7 +287,7 @@ pub(crate) fn from_index(index: &InstalledIndex, zone: &TimeZone) -> Report {
 /// The zone a document's times are written in, which a caller resolves once per document so every entry carries
 /// the same offset rule. It is `jiff`'s system zone on every platform, which honours `TZ`; a printed time is an
 /// exact instant whatever offset it carries.
-pub(crate) fn system_zone() -> TimeZone {
+pub(crate) fn display_zone() -> TimeZone {
     TimeZone::system()
 }
 

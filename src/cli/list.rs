@@ -22,7 +22,7 @@ pub fn run(
     // from it — see [`report`]'s module doc comment.
     let (index, report) = match get_manager().and_then(|mgr| mgr.list()).map(partition_installed) {
         Ok(index) => {
-            let report = report::from_index(&index, &report::system_zone());
+            let report = report::from_index(&index, &report::display_zone());
             (Some(index), report)
         }
         Err(e) => (None, report::unavailable(e)),
