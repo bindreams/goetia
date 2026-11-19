@@ -14,7 +14,8 @@
 //! `last-run` and `next-run` are `null` on a service, and `null` on a task for what its manager does not
 //! know (no run yet, a run in flight, no armed schedule). `last-result` is `{"code": n}` or
 //! `{"signal": n}`. A time is RFC 3339 with the offset of the system time zone at that instant, to the
-//! second. A `daemons` entry carries no `name`:
+//! second; a time `jiff` cannot represent (years beyond -9999 to 9999) is `null`. A `daemons` entry
+//! carries no `name`:
 //! [`crate::manager::ServiceManager::status`] returns a [`Status`] with no
 //! spec, so only `list` could supply it, and the two subcommands must not
 //! differ in fields. `pid` is an integer or `null`; `null` means the manager
@@ -36,8 +37,8 @@ use std::fmt::{self, Write as _};
 use std::io::Write;
 use std::time::SystemTime;
 
-use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 
 use super::ExitCode;
 use super::support::{InstalledIndex, print_line, state_str};
@@ -283,6 +284,18 @@ pub(crate) fn from_index(index: &InstalledIndex, zone: &TimeZone) -> Report {
     }
 }
 
+/// The zone a document's times are written in, which a caller resolves once per document so every entry carries
+/// the same offset rule. On macOS it is the zone the backend computed `next-run` in
+/// (`launchd::next::system_zone`, read from `/etc/localtime`), so the time is printed in the zone it was computed
+/// in; where that cannot be read, and elsewhere, `jiff`'s own.
+pub(crate) fn system_zone() -> TimeZone {
+    #[cfg(target_os = "macos")]
+    if let Ok(zone) = crate::backend::launchd::next::system_zone() {
+        return zone;
+    }
+    TimeZone::system()
+}
+
 /// One daemon, from a successful `ServiceManager::status(&id)`, with its times in `zone`. A caller resolves
 /// the system zone once per document, so every entry of it carries the same offset rule.
 pub(crate) fn daemon(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport {
@@ -307,10 +320,10 @@ pub(crate) fn daemon(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport
 /// A fraction is dropped toward the earlier second, before the epoch as after it. A time `jiff` cannot represent
 /// (years beyond -9999 to 9999), which no manager reports, is `None`: unknown, never a bound that reads as a time.
 fn format_time(time: SystemTime, zone: &TimeZone) -> Option<String> {
-    let instant = Timestamp::try_from(time).ok()?;
-    // `as_second` truncates toward zero, and a negative timestamp carries a negative fraction.
-    let floor = instant.as_second() - i64::from(instant.subsec_nanosecond() < 0);
-    let whole = Timestamp::from_second(floor).ok()?;
+    let whole = Timestamp::try_from(time)
+        .ok()?
+        .round(TimestampRound::new().smallest(Unit::Second).mode(RoundMode::Floor))
+        .ok()?;
     Some(whole.display_with_offset(zone.to_offset(whole)).to_string())
 }
 

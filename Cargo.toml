@@ -213,6 +213,9 @@ libsearch-guard.workspace = true
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
+# `backend::launchd::next`'s tests and `tests/scm_integration/task_schedule.rs`, on every host and without `cli`: the
+# default features bundle a zone database where the host has none (Windows).
+jiff = "0.2.43"
 libsearch-guard.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]

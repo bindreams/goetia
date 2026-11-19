@@ -4,8 +4,6 @@
 
 use std::io::Write;
 
-use jiff::tz::TimeZone;
-
 use super::ExitCode;
 use super::report;
 use super::support::{
@@ -24,7 +22,7 @@ pub fn run(
     // from it — see [`report`]'s module doc comment.
     let (index, report) = match get_manager().and_then(|mgr| mgr.list()).map(partition_installed) {
         Ok(index) => {
-            let report = report::from_index(&index, &TimeZone::system());
+            let report = report::from_index(&index, &report::system_zone());
             (Some(index), report)
         }
         Err(e) => (None, report::unavailable(e)),

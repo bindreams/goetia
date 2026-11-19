@@ -2607,6 +2607,38 @@ fn status_json_of_a_task_carries_type_results_and_times() {
     assert_eq!(instant("next-run"), 1_768_478_460);
 }
 
+/// `status <id>`, `status` and `list` all write a task's times with the offset of the system zone at that
+/// instant (on macOS, the zone the backend computes `next-run` in), not UTC.
+#[skuld::test]
+fn every_form_writes_a_tasks_times_in_the_system_zone() {
+    #[cfg(target_os = "macos")]
+    let zone = goetia::testing::system_zone().expect("the system time zone");
+    #[cfg(not(target_os = "macos"))]
+    let zone = jiff::tz::TimeZone::system();
+
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    let seconds = 1_768_478_400;
+    let instant = jiff::Timestamp::from_second(seconds).unwrap();
+    let expected = instant.display_with_offset(zone.to_offset(instant)).to_string();
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(seconds as u64);
+    fake.seed_task_status("nightly", Some(Exit::Code(0)), Some(at), Some(at));
+
+    for args in [
+        ["goetia", "--json", "daemon", "status", "nightly"].as_slice(),
+        ["goetia", "--json", "daemon", "status"].as_slice(),
+        ["goetia", "--json", "daemon", "list"].as_slice(),
+    ] {
+        let (code, out, _err) = dispatch_read_only(args, &fake);
+
+        assert_eq!(code, 0, "{args:?}: {out}");
+        let doc = parse_json(&out);
+        let entry = &daemons(&doc)[0];
+        assert_eq!(entry["last-run"], expected, "{args:?}");
+        assert_eq!(entry["next-run"], expected, "{args:?}");
+    }
+}
+
 /// A task that has never run is idle, and `status` of it succeeds.
 #[skuld::test]
 fn status_json_of_a_task_that_never_ran_is_idle_with_null_results() {
