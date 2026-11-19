@@ -494,3 +494,55 @@ fn a_run_that_never_writes_its_marker_still_ends_and_is_unrecorded() {
     assert_eq!(marker.unwrap().line, format!("goetia-run {}", instance_id(1).hex()));
     assert!(matches!(run.wait().unwrap_err(), Error::RunUnrecorded { .. }));
 }
+
+// The error of a run that could not be followed is the unrecorded run's source ----------------------------------------
+
+/// A run that began and could not be told apart: the failure that said so is the error's source, so its OS
+/// code is found and its remedy is collected, and the text is as it was.
+#[skuld::test]
+fn an_unfollowed_run_returns_the_failure_that_left_it_unfollowed() {
+    let (_dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Err(Error::os("list the runs", io::Error::from_raw_os_error(1722))));
+
+    let failed = failure(begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])));
+
+    assert_eq!(failed.raw_os_error(), Some(1722), "{failed:?}");
+    assert!(std::error::Error::source(&failed).is_some(), "{failed:?}");
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "the run of `nightly` ended without recording its exit status: goetia could not tell which run it \
+             began: failed to list the runs: {}",
+            io::Error::from_raw_os_error(1722)
+        )
+    );
+}
+
+/// A record that cannot be read leaves the run unrecorded, and the failed read is the error's source.
+#[skuld::test]
+fn a_run_whose_record_cannot_be_read_returns_the_failed_read() {
+    let (_dir, path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let mut machine = Machine::new(&fake, &[4242]);
+    let record_path = path.join(format!("{}.json", instance_id(1).hex()));
+    machine.on_exit = Box::new(move |_| fs::write(&record_path, b"not a record").unwrap());
+
+    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
+    let failed = run.wait().unwrap_err();
+
+    assert!(matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
+    assert!(std::error::Error::source(&failed).is_some(), "{failed:?}");
+    let report = failed.report().to_string();
+    assert!(
+        report.starts_with(
+            "the run of `nightly` ended without recording its exit status: its record could not be read: failed to read it: "
+        ),
+        "{report}"
+    );
+}

@@ -2454,7 +2454,7 @@ fn kill_over_a_procinfo_that_cannot_be_run_is_a_failure_and_signals_nothing() {
     let (result, _script, _) = kill_over([printed_running(pid), printed_running(pid), fail(&["procinfo"], not_run)]);
 
     let e = result.expect_err("no lookup");
-    assert!(matches!(&e, Error::Spawn { .. }), "{e:?}");
+    assert!(matches!(e.cause(), Error::Spawn { .. }), "{e:?}");
     assert_eq!(run.finish(), Some(0), "nothing was signalled");
 }
 
@@ -2481,7 +2481,7 @@ fn kill_over_a_print_that_fails_is_a_plain_failure() {
     let (result, _script, _) = kill_over([answer("print", UNREADABLE)]);
 
     let e = result.expect_err("an unreadable job");
-    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
+    assert!(matches!(e.cause(), Error::Command { .. }), "{e:?}");
 }
 
 /// A read that fails after the signal is delivered says so: the process is ending, and a caller must not
