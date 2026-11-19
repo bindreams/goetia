@@ -7,8 +7,11 @@
 //! **No clock decides anything.** A record is pruned when a later run writes, and only when nobody
 //! waits for what it holds: a waiting `run` takes a [`Pin`] before it asks Task Scheduler to start the
 //! task, and while any pin is live a write prunes nothing. With none, a write removes every record
-//! but its own. A pin is a file held open with no sharing: it goes when its holder does, however it
-//! ends, and while it is held nothing can delete it, whoever tries. One left by a power cut is held by
+//! but its own. **A run pins too:** the shim takes a pin before it reads anything, and holds it until its
+//! own record is renamed into place; it releases it before its own prune, so a run's pin never stops its
+//! own prune. So a run in flight stops every other run's prune, and its own record's prune comes when it
+//! ends: records pile up only for as long as runs overlap. A pin is a file held open with no sharing: it
+//! goes when its holder does, however it ends, and while it is held nothing can delete it, whoever tries. One left by a power cut is held by
 //! nothing, and the next write finds it by deleting it: a sharing violation says it is live
 //! ([`files::delete`] reads every failed delete, here and in the removal). What a
 //! pin's holder did not see yet is whatever [`Pin::appeared`] lists: the records written after the
@@ -317,6 +320,11 @@ impl Runs {
         self.marker.try_exists()
     }
 
+    /// The task's directory of records, for a message that names it.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Writes the record of a run, replacing one of the same instance, then prunes. The record is
     /// whole once this returns `Ok`; a prune that cannot remove a file leaves it for the next write.
     /// What the prune could not do, and a failure of its own (not a file that is gone or held), is
@@ -410,7 +418,8 @@ impl Runs {
         if matches!(removing, Ok(true)) {
             return Err(io::Error::new(
                 io::ErrorKind::ResourceBusy,
-                "the task's run records are being removed (uninstall or a change of type)",
+                "the task's run records are being removed or handed to another account (an uninstall, or a change \
+                 of the task's type or account)",
             ));
         }
         let (file, _path) = made?.into_parts();

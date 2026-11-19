@@ -1374,10 +1374,7 @@ fn a_directory_that_becomes_a_link_after_it_was_opened_is_a_link_to_a_pin_and_a_
     let (held, target) = held_and_then_linked(&runs);
 
     let read = read_in(&held, &instance(9)).unwrap_err();
-    let pin = runs
-        .hold_in(held, MarkerCheck::Refuse)
-        .err()
-        .expect("a pin is refused");
+    let pin = runs.hold_in(held, MarkerCheck::Refuse).err().expect("a pin is refused");
 
     assert_eq!(read.kind(), io::ErrorKind::NotADirectory, "{read}");
     assert_eq!(pin.kind(), io::ErrorKind::NotADirectory, "{pin}");
@@ -1392,10 +1389,7 @@ fn a_pin_that_cannot_be_made_while_the_records_are_being_removed_says_so() {
     let (held, _target) = held_and_then_linked(&runs);
     leave_marker(&runs);
 
-    let refused = runs
-        .hold_in(held, MarkerCheck::Refuse)
-        .err()
-        .expect("a pin is refused");
+    let refused = runs.hold_in(held, MarkerCheck::Refuse).err().expect("a pin is refused");
 
     assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy, "{refused}");
     assert!(refused.to_string().contains("being removed"), "{refused}");
