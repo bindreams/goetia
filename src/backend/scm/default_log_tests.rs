@@ -311,42 +311,65 @@ fn a_system_account_keeps_its_full_control_of_the_log() {
     );
 }
 
-/// What the install says when it made the log while the daemon ran: only then, only for a daemon whose output goes to
-/// the default log (no `logs:`), and the words say what to do.
+/// What the install says when it made the log while a run of the daemon was live: only then, only where the run's
+/// output goes to the default log (its definition names no `logs:`), and the words say what to do. A run that is
+/// starting may not hold the log yet, so it is told as a possibility.
 #[skuld::test]
-fn a_log_made_while_the_daemon_runs_is_told_and_no_other_is() {
+fn a_log_made_under_a_live_run_is_told_and_no_other_is() {
     let program_data = Path::new(r"C:\ProgramData");
-    let told = |logs: Option<&Path>, outcome, running| made_while_running(program_data, &id(), logs, outcome, running);
+    let told = |outcome, run, logs_elsewhere| {
+        made_while_running(program_data, &id(), &LogChange { outcome, run }, logs_elsewhere)
+    };
 
-    let said = told(None, EnsureOutcome::Made, true).expect("made while it runs");
-
-    assert!(said.contains("nightly"), "{said}");
-    assert!(said.contains(r"C:\ProgramData\Goetia\logs\nightly.log"), "{said}");
-    assert!(said.contains("deleted log until it is restarted"), "{said}");
-    assert!(said.contains("restart it"), "{said}");
-    for (outcome, running) in [
-        (EnsureOutcome::Made, false),
-        (EnsureOutcome::Set, true),
-        (EnsureOutcome::Kept, true),
-    ] {
-        assert_eq!(told(None, outcome, running), None, "{outcome:?}, running: {running}");
-    }
-    // The daemon's output goes to its own `logs:`, not to the file the install made.
-    assert_eq!(
-        told(Some(Path::new(r"D:\out.log")), EnsureOutcome::Made, true),
-        None,
-        "a daemon with `logs:` writes elsewhere"
+    let up = told(EnsureOutcome::Made, Run::Up, false).expect("made while it runs");
+    assert!(up.contains("nightly"), "{up}");
+    assert!(up.contains(r"C:\ProgramData\Goetia\logs\nightly.log"), "{up}");
+    assert!(
+        up.contains("its output goes to the deleted log until it is restarted"),
+        "{up}"
     );
+    assert!(up.contains("restart it"), "{up}");
+
+    let starting = told(EnsureOutcome::Made, Run::Starting, false).expect("made while it starts");
+    assert!(
+        starting.contains(r"C:\ProgramData\Goetia\logs\nightly.log"),
+        "{starting}"
+    );
+    assert!(
+        starting.contains("its output may go to the deleted log until it is restarted"),
+        "{starting}"
+    );
+    assert!(starting.contains("restart it"), "{starting}");
+
+    for (outcome, run) in [
+        (EnsureOutcome::Made, Run::Stopped),
+        (EnsureOutcome::Set, Run::Up),
+        (EnsureOutcome::Kept, Run::Up),
+        (EnsureOutcome::Set, Run::Starting),
+        (EnsureOutcome::Kept, Run::Starting),
+    ] {
+        assert_eq!(told(outcome, run, false), None, "{outcome:?}, {run:?}");
+    }
+    // The run's output goes to its own `logs:`, not to the file the install made.
+    for run in [Run::Starting, Run::Up] {
+        assert_eq!(
+            told(EnsureOutcome::Made, run, true),
+            None,
+            "a run with `logs:` writes elsewhere, {run:?}"
+        );
+    }
 }
 
-/// A run is up once its shim has reported past its hold on the log: a start in progress is not, since that shim
-/// opens the log the install made, and a stopped service has no run.
+/// A run is live from the launch of its shim: a start in progress is, since the shim opens the log and spawns the
+/// daemon before it reports `RUNNING`, and so is any run past it. A stopped service has none.
 #[skuld::test]
-fn only_a_run_past_its_start_is_up() {
+fn a_run_is_live_from_its_launch_until_it_ends() {
     use windows_service::service::ServiceState;
 
     assert_eq!(Run::of(ServiceState::Stopped), Run::Stopped);
     assert_eq!(Run::of(ServiceState::StartPending), Run::Starting);
+    assert!(!Run::Stopped.is_live());
+    assert!(Run::Starting.is_live());
     for up in [
         ServiceState::Running,
         ServiceState::StopPending,
@@ -355,7 +378,34 @@ fn only_a_run_past_its_start_is_up() {
         ServiceState::Paused,
     ] {
         assert_eq!(Run::of(up), Run::Up, "{up:?}");
+        assert!(Run::of(up).is_live(), "{up:?}");
     }
+}
+
+/// An install makes a log that is missing under a live run, widened for the change of account, and its own second
+/// step, after the change lands, does not narrow what the first made: the run's shim may reopen it as the old
+/// account until the next install. Under no run the second step narrows it, as nothing holds it.
+#[skuld::test]
+fn a_log_made_under_a_live_run_is_not_narrowed_by_the_installs_own_second_call(#[fixture(scm_group)] _group: &Group) {
+    let (old, new) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
+    let kept = std::slice::from_ref(&old);
+    let both = entries_wanted_for(&[old.clone(), new.clone()]);
+    for run in [Run::Starting, Run::Up] {
+        let (dir, log) = program_data_with_logs();
+
+        let first = make(dir.path(), &id(), Step::Widen, run, kept, &new).unwrap();
+        assert!(first.under_live_run(), "{run:?}");
+        let second = make(dir.path(), &id(), first.step_after(), run, kept, &new).unwrap();
+
+        assert_eq!(entries_of(&log), both, "{run:?}");
+        assert!(!second.under_live_run(), "{run:?}: the file was there");
+    }
+
+    let (dir, log) = program_data_with_logs();
+    let first = make(dir.path(), &id(), Step::Widen, Run::Stopped, kept, &new).unwrap();
+    assert!(!first.under_live_run());
+    make(dir.path(), &id(), first.step_after(), Run::Stopped, kept, &new).unwrap();
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&new)));
 }
 
 /// A directory at the log's name is a directory, which Windows refuses to open as a file with access denied, as it

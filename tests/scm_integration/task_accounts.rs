@@ -629,7 +629,8 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
     assert_eq!(
         status.current_state,
         ServiceState::StartPending,
-        "SCM reports START_PENDING from the launch of the process until its first status report, with the          dispatcher connected and no control handler registered"
+        "SCM reports START_PENDING from the launch of the process until its first status report, with the \
+         dispatcher connected and no control handler registered"
     );
 
     mgr.install(&as_account("NetworkService"), false)
