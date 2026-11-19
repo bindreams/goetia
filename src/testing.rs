@@ -81,10 +81,34 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
 
 /// When Task Scheduler itself says the task `id` runs between `from` and `to`: its `GetRunTimes`, the
 /// oracle the schedule tests compare the cron they translated with.
+///
+/// A disarmed task has no triggers, so there is nothing to ask. Its schedule's triggers are written for
+/// the question with the task's own flag false, which no start can come of (`GetRunTimes` lists a
+/// disabled task's times, M2), and taken out again after; an armed task is asked as it is.
 #[cfg(windows)]
 pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
     use crate::backend::scm::instance::TaskPath;
-    crate::backend::scm::manager::task::Com.run_times(&TaskPath::of(id), from, to)
+    use crate::backend::scm::manager::task::{Com, TaskApi as _};
+    use crate::backend::scm::task_xml::{TaskXml, extract_from_data};
+    use crate::error::Error;
+
+    let path = TaskPath::of(id);
+    let registered = Com
+        .get(&path)?
+        .ok_or_else(|| Error::NotInstalled { id: id.to_string() })?;
+    if TaskXml::armed(&registered.xml) {
+        return Com.run_times(&path, from, to);
+    }
+    let blob = extract_from_data(&registered.data)?.ok_or_else(|| Error::blob("the task's `Data` is not goetia's"))?;
+    let account = TaskXml::principal(&registered.xml)?;
+    let triggered = TaskXml::with_triggers(&registered.xml, &blob.spec)?;
+    let held = triggered.replacen("<Settings>", "<Settings><Enabled>false</Enabled>", 1);
+    Com.register(&path, &held, &account, None, true)?;
+    let times = Com.run_times(&path, from, to);
+    let back = Com.register(&path, &TaskXml::without_triggers(&held)?, &account, None, true);
+    let times = times?;
+    back?;
+    Ok(times)
 }
 
 /// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for

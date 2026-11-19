@@ -5,15 +5,19 @@
 //! password and the logon right of a real user, the event source, and the record directory with its
 //! permissions. A failure of any is a failure with nothing sent.
 //!
-//! A task is armed when its triggers are enabled; an install makes it disarmed and keeps what is
-//! installed, and `enable` and `disable` change the flags of the stored XML and nothing else, so a hand
-//! edit survives them. Re-registering a task that logs on with a password takes the password (M3): `enable`
-//! and `disable` of a real user's task read `GOETIA_SERVICE_PASSWORD` as an install does.
+//! A task is armed when it has triggers; an install makes it disarmed and keeps what is installed. `disable`
+//! registers the stored XML with no `Triggers`, and `enable` with the ones the blob's schedule compiles to;
+//! everything outside `<Triggers>` is the stored XML's, so a hand edit of it survives, and a hand-added
+//! trigger goes at `disable`, as it does at the next install. Re-registering a task that logs on with a
+//! password takes the password (M3): `enable` and `disable` of a real user's task read
+//! `GOETIA_SERVICE_PASSWORD` as an install does.
+
+use std::sync::Arc;
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
 use super::verbs::{Processes, System, gone};
-use super::{TaskApi, TaskPath, TaskSnapshot};
+use super::{TaskPath, TaskSnapshot};
 use crate::backend::scm::default_log::{self, Naming, Step};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
@@ -113,20 +117,6 @@ pub(super) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
         Ok(definition) => Ok(definition.account()),
         Err(_) => TaskXml::principal(&registered.xml),
     }
-}
-
-/// `registered` registered again as `account`, with its triggers armed or not and nothing else changed.
-/// `password` is the real user's, which Task Scheduler needs to register a password-logon task again.
-pub(super) fn set_armed(
-    tasks: &dyn TaskApi,
-    path: &TaskPath,
-    registered: &Registered,
-    armed: bool,
-    account: &TaskAccount,
-    password: Option<&str>,
-) -> Result<Registration> {
-    let xml = TaskXml::with_armed(&registered.xml, armed)?;
-    tasks.register(path, &xml, account, password, true)
 }
 
 /// Refuses a retype of a daemon that runs: `old` is what is installed, `state` its state.
@@ -397,7 +387,9 @@ impl Scm {
         self.task_set_armed_with(snapshot, false, identity::service_password)
     }
 
-    /// Registers `snapshot`'s task again with its triggers armed or not, and nothing else changed.
+    /// Registers `snapshot`'s task again armed or not, and nothing else changed: armed, with the
+    /// triggers its blob's schedule compiles to (a blob that will not decode names none, so it is
+    /// the error); not armed, with none. The task's own flag stays true.
     /// `password` reads the real user's password, which is asked before anything is sent.
     pub(super) fn task_set_armed_with(
         &self,
@@ -406,10 +398,16 @@ impl Scm {
         password: impl FnOnce() -> Result<Option<String>>,
     ) -> Result<()> {
         let registered = snapshot.registered();
+        let xml = if armed {
+            let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+            TaskXml::with_triggers(&registered.xml, &blob.spec)?
+        } else {
+            TaskXml::without_triggers(&registered.xml)?
+        };
         let account = stored_account(registered)?;
         let password = password_of(&account, password)?;
         let path = TaskPath::of(snapshot.id());
-        match set_armed(&*self.tasks, &path, registered, armed, &account, password.as_deref())? {
+        match self.tasks.register(&path, &xml, &account, password.as_deref(), true)? {
             Registration::Created => Ok(()),
             Registration::Raced => Err(Error::NotInstalled {
                 id: snapshot.id().to_string(),

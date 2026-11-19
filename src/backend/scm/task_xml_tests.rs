@@ -590,7 +590,11 @@ fn arming_writes_the_blobs_triggers_into_the_stored_xml() {
 
         assert!(TaskXml::armed(&armed), "{stored}: {armed}");
         let installed = TaskXml::parse(&armed, &data_of(&spec)).unwrap();
-        assert_eq!(installed.to_string(), desired, "{stored}: the spec's triggers, and no other");
+        assert_eq!(
+            installed.to_string(),
+            desired,
+            "{stored}: the spec's triggers, and no other"
+        );
         let document = Document::parse(&armed).unwrap();
         let children = names_under(&document, "Task");
         let at = |name: &str| children.iter().position(|child| child == name).unwrap();
@@ -601,7 +605,11 @@ fn arming_writes_the_blobs_triggers_into_the_stored_xml() {
         );
         assert!(at("Triggers") < at("Actions"), "{stored}: {children:?}");
         let squashed = |xml: &str| without_triggers_element(xml).split_whitespace().collect::<String>();
-        assert_eq!(squashed(&armed), squashed(&xml), "{stored}: nothing but the triggers differs");
+        assert_eq!(
+            squashed(&armed),
+            squashed(&xml),
+            "{stored}: nothing but the triggers differs"
+        );
     }
 
     // A hand edit made elsewhere survives.
@@ -713,7 +721,10 @@ fn to_xml_writes_triggers_only_when_armed() {
     assert!(TaskXml::armed(&armed));
     assert!(!has_triggers_element(&disarmed), "{disarmed}");
     assert!(!TaskXml::armed(&disarmed));
-    assert!(!disarmed.contains("<Enabled>false</Enabled>"), "no trigger flag is written: {disarmed}");
+    assert!(
+        !disarmed.contains("<Enabled>false</Enabled>"),
+        "no trigger flag is written: {disarmed}"
+    );
     assert_eq!(
         armed.split_whitespace().collect::<String>(),
         {
@@ -771,7 +782,10 @@ fn a_hand_added_trigger_is_armed_and_drift_until_a_disable() {
     assert!(installed.to_string().contains("Unrecognised:"), "{installed}");
 
     let disarmed = TaskXml::without_triggers(&xml).unwrap();
-    assert!(!disarmed.contains("S-1-5-21-1-2-3-1001"), "the hand edit goes at `disable`");
+    assert!(
+        !disarmed.contains("S-1-5-21-1-2-3-1001"),
+        "the hand edit goes at `disable`"
+    );
     let installed = TaskXml::parse(&disarmed, &data_of(&spec)).unwrap();
     assert!(!installed.to_string().contains("Unrecognised:"), "{installed}");
 }
@@ -841,7 +855,7 @@ fn a_schedule_that_never_fires_has_a_trigger_and_can_be_armed() {
     let task = built(&spec);
     assert!(!TaskXml::armed(&task.to_xml(false)));
     assert!(TaskXml::armed(&task.to_xml(true)));
-    let armed = TaskXml::with_armed(&task.to_xml(false), true).unwrap();
+    let armed = TaskXml::with_triggers(&task.to_xml(false), &spec).unwrap();
     assert!(TaskXml::armed(&armed));
 }
 
