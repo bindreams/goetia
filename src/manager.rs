@@ -47,6 +47,10 @@ pub trait ServiceManager {
     /// [`Error::LoadedJobInDoubt`] or
     /// [`Error::LoadedStateInDoubt`]
     /// (exit `4`).
+    ///
+    /// A run due while `install` changes an enabled task's schedule is missed on systemd and
+    /// launchd: the task is disarmed and armed again around the change, and arming makes up no run
+    /// the schedule named meanwhile. `goetia daemon start <id>` runs it.
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
     /// What [`Self::install`] would do for `spec`, without doing it, always
@@ -68,10 +72,13 @@ pub trait ServiceManager {
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
     /// `id` is not managed by Goetia. A task's `enable` arms its schedule; a task with no schedule
-    /// has nothing to arm, and its `enable` is [`Error::Invalid`] before the manager is asked.
+    /// has nothing to arm, and its `enable` is [`Error::Invalid`] before the manager is asked. Arming
+    /// again starts no run for a time the schedule named while goetia's `disable` had the task
+    /// disarmed: a missed start is made up only for time the machine was off or asleep.
     fn enable(&self, id: &Id) -> Result<()>;
 
-    /// Disable the service at boot. Does not stop it if running.
+    /// Disable the service at boot. Does not stop it if running. A task's `disable` disarms its
+    /// schedule and leaves a run in flight.
     fn disable(&self, id: &Id) -> Result<()>;
 
     /// Start the service now, waiting up to `budget` for it. Does not
