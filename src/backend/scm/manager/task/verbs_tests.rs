@@ -439,9 +439,125 @@ fn an_instance_that_cannot_be_opened_fails_the_stop_before_any_stop_is_sent() {
 
     let failed = stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap_err();
 
-    assert!(failed.report().to_string().contains("denied access"), "{failed}");
+    let report = failed.report().to_string();
+    assert!(report.contains("denied access"), "{failed}");
+    assert!(report.contains("process 200"), "{failed}");
+    assert_eq!(report.matches("open").count(), 1, "{failed}");
     assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
     assert!(machine.waited.is_empty());
+}
+
+/// A hold whose re-read of the listing failed after a refused open names the pid once: the error that
+/// tells the refusal says it, and the hold's own words do not repeat it.
+#[skuld::test]
+fn a_hold_whose_re_read_failed_after_a_refused_open_names_the_pid_once() {
+    let fake = Fake::new();
+    fake.on_instances(one(100)).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100]);
+    machine.denied = vec![100];
+    let denied = io::Error::from_raw_os_error(5);
+
+    let failed = hold_run(
+        &fake,
+        "kill",
+        &id(),
+        &TaskPath::of(&id()),
+        &instance(1, 100),
+        &mut machine,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "failed to hold the process of `nightly`'s run: the process (pid 100) could not be opened ({denied}), \
+             and the re-read of what runs the daemon failed: failed to list the runs of `nightly`: listing failed"
+        )
+    );
+}
+
+/// The first read of a hold is made before the listing has named the process, and the caller knows which
+/// run it is for: a failed first read says so, for the run it failed for.
+#[skuld::test]
+fn a_hold_whose_first_read_failed_names_which_run_it_was_for() {
+    let fake = Fake::new();
+    // The first run's hold and its second read, then the second run's first read, which fails.
+    fake.on_instances(two()).on_instances(two()).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100, 200]);
+
+    let failed = hold_all(
+        &fake,
+        "kill",
+        &id(),
+        &TaskPath::of(&id()),
+        vec![instance(1, 100), instance(2, 200)],
+        &mut machine,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        failed.report().to_string(),
+        "failed to hold the process of `nightly`'s run: reading the run with process 200: failed to list the runs \
+         of `nightly`: listing failed"
+    );
+}
+
+/// Which run a failed first read was for does not depend on what the target was asked before: the hold
+/// words its first read's failure itself.
+#[skuld::test]
+fn a_hold_names_the_run_of_its_first_read_whatever_the_target_was_asked_before() {
+    let fake = Fake::new();
+    fake.on_instances(one(100)).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100]);
+    let path = TaskPath::of(&id());
+    let mut target = RunTarget::new(&fake, &path, &instance(1, 100), &mut machine);
+    target.service_pid().unwrap();
+
+    let Err(HoldError::Unread(e)) = hold_once(&mut target, Budget::Unbounded.start()) else {
+        panic!("the first read of the hold did not fail unread");
+    };
+
+    assert_eq!(
+        Error::os("hold", e).report().to_string(),
+        "failed to hold: reading the run with process 100: failed to list the runs of `nightly`: listing failed"
+    );
+    fake.finish();
+}
+
+/// A plain failure of the read that confirms a run's process says which of the runs it was for.
+#[skuld::test]
+fn a_hold_whose_confirming_read_failed_names_which_run_it_was_for() {
+    let fake = Fake::new();
+    fake.on_instances(two()).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100, 200]);
+
+    let failed = hold_run(
+        &fake,
+        "kill",
+        &id(),
+        &TaskPath::of(&id()),
+        &instance(2, 200),
+        &mut machine,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        failed.report().to_string(),
+        "failed to hold the process of `nightly`'s run: confirming that process 200 is the daemon's: failed to \
+         list the runs of `nightly`: listing failed"
+    );
 }
 
 /// A `Stop` that fails for one run does not keep the others from being sent theirs: every run is asked,
@@ -559,6 +675,31 @@ fn a_refusal_on_the_second_run_leaves_the_first_unkilled() {
 
     assert!(failed.report().to_string().contains("denied access"), "{failed}");
     assert!(machine.terminated.is_empty(), "nothing is terminated");
+    fake.finish();
+}
+
+/// A run whose listing cannot be read at the kill's first read says which run it was, and each run's
+/// failure says its own: with two runs, the report names both, in the wording a failed hold gives.
+#[skuld::test]
+fn a_kill_whose_first_read_of_each_run_failed_names_each_run() {
+    let fake = Fake::new();
+    // The probe, each run's hold and its second read; then the kill's first read of each run.
+    for _ in 0..5 {
+        fake.on_instances(two());
+    }
+    fake.on_instances(Err(Error::os("list the instances", io::Error::other("listing failed"))))
+        .on_instances(Err(Error::os("list the instances", io::Error::other("listing failed"))));
+    let mut machine = Machine::new(&fake, &[100, 200]);
+
+    let failed = scm(&fake).task_kill_with(&id(), &mut machine).unwrap_err();
+
+    assert_eq!(
+        failed.report().to_string(),
+        "failed to kill `nightly`: reading the run with process 100: failed to list the instances: listing failed; \
+         then: failed to kill `nightly`: reading the run with process 200: failed to list the instances: listing \
+         failed"
+    );
+    assert!(machine.terminated.is_empty(), "{failed}");
     fake.finish();
 }
 

@@ -20,6 +20,10 @@ enum Open {
     Found,
     Gone,
     Fails,
+    /// Fails with an OS error of this code.
+    FailsWithOsError(i32),
+    /// Fails with this goetia error, passed through an `io::Error` as a manager's target does.
+    FailsCarrying(Error),
 }
 
 /// What the manager answers each `service_pid`, and what each `open` does. The signal and the waits
@@ -29,6 +33,11 @@ struct Scripted {
     opens: VecDeque<Open>,
     /// Which `service_pid` calls, counted from 1, fail instead of answering.
     failing_reads: Vec<usize>,
+    /// The OS error code the failed reads carry, if they carry one.
+    read_os_error: Option<i32>,
+    /// The goetia error the first failed read carries, passed through an `io::Error` as a manager's
+    /// target does.
+    read_carrying: Option<Error>,
     reads: usize,
     failing_terminate: bool,
     failing_exit: bool,
@@ -52,6 +61,8 @@ impl Scripted {
             pids: pids.into(),
             opens: opens.into(),
             failing_reads: Vec::new(),
+            read_os_error: None,
+            read_carrying: None,
             reads: 0,
             failing_terminate: false,
             failing_exit: false,
@@ -67,6 +78,18 @@ impl Scripted {
     /// The `n`th `service_pid` call (from 1) fails.
     fn failing_read(mut self, n: usize) -> Self {
         self.failing_reads.push(n);
+        self
+    }
+
+    /// The failed reads carry an OS error of this code.
+    fn reading_fails_with_os_error(mut self, code: i32) -> Self {
+        self.read_os_error = Some(code);
+        self
+    }
+
+    /// The failed read carries this goetia error.
+    fn reading_fails_carrying(mut self, error: Error) -> Self {
+        self.read_carrying = Some(error);
         self
     }
 
@@ -132,7 +155,13 @@ impl KillTarget for Scripted {
         self.log.borrow_mut().push("service_pid".to_string());
         self.reads += 1;
         if self.failing_reads.contains(&self.reads) {
-            return Err(io::Error::new(READ_FAILED_KIND, "manager read failed"));
+            if let Some(error) = self.read_carrying.take() {
+                return Err(io::Error::other(error));
+            }
+            return Err(match self.read_os_error {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::new(READ_FAILED_KIND, "manager read failed"),
+            });
         }
         Ok(if self.pids.len() > 1 {
             self.pids.pop_front().unwrap()
@@ -154,6 +183,8 @@ impl KillTarget for Scripted {
             })),
             Open::Gone => Ok(None),
             Open::Fails => Err(io::Error::other("access denied")),
+            Open::FailsWithOsError(code) => Err(io::Error::from_raw_os_error(code)),
+            Open::FailsCarrying(e) => Err(io::Error::other(e)),
         }
     }
 
@@ -191,6 +222,9 @@ impl KillTarget for Scripted {
             Some(_) => format!("await_recorded {pid}"),
             None => format!("await_recorded {pid} unheld"),
         });
+        if self.lagging_record && deadline.remaining().is_some() {
+            return Ok(Waited::Expired);
+        }
         if self.failing_recorded {
             return Err(io::Error::new(READ_FAILED_KIND, "manager read failed"));
         }
@@ -198,9 +232,6 @@ impl KillTarget for Scripted {
         // restart that happened under the kill is a state the machine could read, and does not.
         while self.pids.len() > 1 {
             self.pids.pop_front();
-        }
-        if self.lagging_record && deadline.remaining().is_some() {
-            return Ok(Waited::Expired);
         }
         if self.expiring_recorded {
             assert!(
@@ -317,7 +348,7 @@ fn the_waiting_notice_names_a_failed_terminate() {
 /// own alike.
 #[skuld::test]
 fn a_wait_for_the_manager_to_record_the_exit_says_why_before_it_blocks() {
-    let notice = "notice frpc: waiting for the manager to record that process 100 has exited";
+    let notice = "notice frpc: waiting for the manager to stop reporting process 100";
     let signalled = Scripted::new([Some(100), Some(100)], [Open::Found]).lagging_record();
     let ended = Scripted::new([Some(100), Some(100)], [Open::Found])
         .disowning()
@@ -360,7 +391,7 @@ fn a_wait_for_the_record_of_a_process_gone_before_it_was_opened_says_why_before_
             "service_pid",
             "open 100",
             "await_recorded 100 unheld",
-            "notice frpc: waiting for the manager to record that process 100 has exited",
+            "notice frpc: waiting for the manager to stop reporting process 100",
             "await_recorded 100 unheld",
         ])
     );
@@ -405,8 +436,9 @@ fn a_held_process_the_manager_does_not_name_is_not_signalled_and_the_record_is_w
     );
 }
 
-/// The wait for the record of an ended process fails: that is the kill's error, plain, for nothing
-/// was signalled.
+/// The wait for the record of a process the manager moved off, which is not known to be gone, fails:
+/// that is the kill's error, plain, for nothing was signalled, and it says no more than the notice of
+/// the same wait does.
 #[skuld::test]
 fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found])
@@ -415,7 +447,11 @@ fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "manager read failed");
+    assert_eq!(e.kind(), READ_FAILED_KIND);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
+    );
     assert!(!target.log().iter().any(|call| call.starts_with("terminate")));
 }
 
@@ -513,7 +549,11 @@ fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "access denied");
+    assert_eq!(e.kind(), io::ErrorKind::Other);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: opening process 100: access denied"
+    );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -530,22 +570,106 @@ fn a_failed_first_read_is_an_error_and_touches_nothing() {
     assert_eq!(target.log(), steps(["service_pid"]));
 }
 
-/// The read that decides whether an open refusal is the service's own: both errors reach the caller.
+/// The read that decides whether an open refusal is the service's own: both errors reach the caller,
+/// behind what the kill was for, with the read's kind.
 #[skuld::test]
 fn a_failed_read_after_a_refused_open_reports_both_errors() {
     let mut target = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(
-        e.to_string(),
-        "manager read failed (after the service's process could not be opened: access denied)"
-    );
     assert_eq!(e.kind(), READ_FAILED_KIND);
-    let report = crate::error::Error::os("kill", e).report().to_string();
-    assert_eq!(report.matches("manager read failed").count(), 1, "{report}");
-    assert_eq!(report.matches("access denied").count(), 1, "{report}");
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: the process (pid 100) could not be opened (access denied), and the re-read of \
+         what runs the daemon failed: manager read failed"
+    );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+/// The code of the failure is the read's, the primary error; the refused open is named after it. The
+/// kill's own context leads, as for any OS failure of a kill.
+#[skuld::test]
+fn the_os_code_of_a_failed_read_is_found_after_a_refused_open() {
+    const READ_CODE: i32 = 1722;
+    const OPEN_CODE: i32 = 5;
+    let mut target = Scripted::new([Some(100)], [Open::FailsWithOsError(OPEN_CODE)])
+        .failing_read(2)
+        .reading_fails_with_os_error(READ_CODE);
+
+    let e = kill_service(&mut target, ID).unwrap_err();
+    let failed = kill_failed(ID, e);
+
+    assert_eq!(failed.raw_os_error(), Some(READ_CODE));
+    let read = io::Error::from_raw_os_error(READ_CODE).to_string();
+    let open = io::Error::from_raw_os_error(OPEN_CODE).to_string();
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "failed to kill `{ID}`: the process (pid 100) could not be opened ({open}), and the re-read of what \
+             runs the daemon failed: {read}"
+        )
+    );
+}
+
+/// The class of the read is the failure's, and the refused open and the kill are told with it: none is
+/// dropped.
+#[skuld::test]
+fn a_failed_read_after_a_refused_open_is_the_reads_class_and_tells_the_open() {
+    let read = Error::Undetermined {
+        id: ID.to_string(),
+        reason: Box::new(Error::os("read", io::Error::other("manager read failed"))),
+        recovery: "re-run".to_string(),
+    };
+    let mut target = Scripted::new([Some(100)], [Open::Fails])
+        .failing_read(2)
+        .reading_fails_carrying(read);
+
+    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
+
+    assert!(failed.is_indeterminate(), "{failed:?}");
+    assert_eq!(
+        failed.report().to_string(),
+        "failed to kill `frpc`: the process (pid 100) could not be opened (access denied), and the re-read of \
+         what runs the daemon failed: cannot determine whether daemon `frpc` is installed: failed to read: \
+         manager read failed. re-run"
+    );
+}
+
+/// An error of goetia's that the refused open carries is written in full, as the report writes any:
+/// its child's stderr and its remedy are not lost to the parenthesis it sits in.
+#[skuld::test]
+fn a_carried_error_inside_the_refused_open_keeps_its_stderr_and_remedy() {
+    let open = Error::Undetermined {
+        id: ID.to_string(),
+        reason: Box::new(Error::Command {
+            command: "launchctl print".to_string(),
+            status: crate::error::error_tests::exit_status(1),
+            stderr: "no such
+service"
+                .to_string(),
+        }),
+        recovery: "re-run as root".to_string(),
+    };
+    let mut target = Scripted::new([Some(100)], [Open::FailsCarrying(open)]).failing_read(2);
+
+    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
+
+    let report = failed.report().to_string();
+    assert!(
+        report.starts_with(&format!(
+            "failed to kill `{ID}`: the process (pid 100) could not be opened ("
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            ": no such
+service), and the re-read of what runs the daemon failed: manager read failed"
+        ),
+        "{report}"
+    );
+    assert!(report.ends_with(". re-run as root"), "{report}");
 }
 
 /// The confirming read, with the process held: it is let go and nothing is signalled.
@@ -555,7 +679,11 @@ fn a_failed_confirming_read_closes_the_process_and_signals_nothing() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "manager read failed");
+    assert_eq!(e.kind(), READ_FAILED_KIND);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: confirming that process 100 is the daemon's: manager read failed"
+    );
     assert_eq!(
         target.log(),
         steps(["service_pid", "open 100", "service_pid", "close 100"])
@@ -615,7 +743,57 @@ fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "manager read failed");
+    assert_eq!(e.kind(), READ_FAILED_KIND);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
+    );
+}
+
+/// A kill that fails after the manager named the process says which process, whichever step failed and
+/// whenever: in the hold, or in the record wait after the hold found the process gone or not the service's.
+#[skuld::test]
+fn every_failure_of_a_kill_after_the_pid_is_read_says_which_process() {
+    let refused = Scripted::new([Some(100)], [Open::Fails]);
+    let confirming = Scripted::new([Some(100)], [Open::Found]).failing_read(2);
+    let recording = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+    let recording_after_expiry = Scripted::new([Some(100)], [Open::Gone])
+        .lagging_record()
+        .failing_recorded();
+    let recording_after_ended = Scripted::new([Some(100)], [Open::Found]).disowning().failing_recorded();
+    for (what, mut target) in [
+        ("refused open", refused),
+        ("confirming read", confirming),
+        ("record wait in the hold", recording),
+        ("record wait after Expired", recording_after_expiry),
+        ("record wait after Ended", recording_after_ended),
+    ] {
+        let e = kill_service(&mut target, ID).unwrap_err();
+
+        let report = kill_failed(ID, e).report().to_string();
+
+        assert!(report.contains("process 100"), "{what}: {report}");
+    }
+}
+
+/// The hold itself says which process, for every caller of it: the one that waits on the process and the
+/// one that kills it.
+#[skuld::test]
+fn every_failure_of_a_hold_after_the_pid_is_read_says_which_process() {
+    let refused = Scripted::new([Some(100)], [Open::Fails]);
+    let confirming = Scripted::new([Some(100)], [Open::Found]).failing_read(2);
+    let recording = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+    for (what, mut target) in [
+        ("refused open", refused),
+        ("confirming read", confirming),
+        ("record wait", recording),
+    ] {
+        let failed = hold_once(&mut target, Budget::Unbounded.start()).expect_err("a failed hold");
+
+        let report = target_failed("hold", io::Error::from(failed)).report().to_string();
+
+        assert!(report.contains("process 100"), "{what}: {report}");
+    }
 }
 
 #[skuld::test]
@@ -626,7 +804,7 @@ fn a_failed_signal_is_an_error_and_waits_for_nothing() {
 
     let text = crate::error::Chain(&e).to_string();
     assert!(
-        text.contains("process 100 was held and confirmed as the service's, but signalling it failed"),
+        text.contains("process 100 was held and confirmed as the daemon's, but signalling it failed"),
         "{text}"
     );
     assert!(text.ends_with("terminate failed"), "{text}");
@@ -671,47 +849,94 @@ fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
 
 // The error of a kill -------------------------------------------------------------------------------------------------
 
-/// An error of goetia's own that a target passed through an `io::Error` is itself again, so a caller
-/// matching on `NoManager` or `Command` still finds it.
+/// An error of goetia's own that a target passed through an `io::Error` is the cause of the kill's failure,
+/// so a caller matching `cause()` on `NoManager` or `Command` still finds it, and what was being killed is
+/// told before it.
 #[skuld::test]
-fn a_wrapped_error_comes_back_as_itself() {
+fn a_wrapped_error_is_the_cause_of_the_kills_failure_told_under_the_kill() {
     let e = io::Error::other(Error::NoManager {
         evidence: "x".to_string(),
     });
 
-    assert!(matches!(kill_failed("x", e), Error::NoManager { .. }));
+    let failed = kill_failed("x", e);
+
+    assert!(matches!(failed.cause(), Error::NoManager { .. }), "{failed:?}");
+    assert!(
+        failed.report().to_string().starts_with("failed to kill `x`: "),
+        "{}",
+        failed.report()
+    );
 }
 
 /// Any other failure is an OS failure of the kill, naming it.
 #[skuld::test]
 fn any_other_error_is_an_os_failure_of_the_kill() {
-    let after_the_signal = signalled_but(7, io::Error::other("wait failed"));
-    for e in [io::Error::other("access denied"), after_the_signal] {
-        let failed = kill_failed("x", e);
+    let failed = kill_failed("x", io::Error::other("access denied"));
 
-        assert!(
-            matches!(&failed, Error::Os { what, .. } if what == "kill `x`"),
-            "{failed:?}"
+    assert!(
+        matches!(&failed, Error::Os { what, .. } if what == "kill `x`"),
+        "{failed:?}"
+    );
+}
+
+/// A failure after the signal was delivered, plain or of goetia's own, is told under the kill without
+/// saying the kill failed: the signal stands. A failure to signal is a failed kill, whose context says
+/// how far it got.
+#[skuld::test]
+fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
+    let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
+    for (e, lead) in [
+        (
+            signalled_but(7, io::Error::other("wait failed")),
+            "kill `x`: process 7 was signalled, but waiting",
+        ),
+        (
+            signalled_but(7, wrapped()),
+            "kill `x`: process 7 was signalled, but waiting",
+        ),
+        (
+            not_signalled(7, io::Error::other("terminate failed")),
+            "failed to kill `x`: process 7 was held and confirmed",
+        ),
+        (
+            not_signalled(7, wrapped()),
+            "failed to kill `x`: process 7 was held and confirmed",
+        ),
+    ] {
+        let report = kill_failed("x", e).report().to_string();
+
+        assert!(report.starts_with(lead), "{report}");
+        assert_eq!(
+            report.contains("failed to kill"),
+            lead.starts_with("failed"),
+            "{report}"
         );
     }
 }
 
 /// A failure of goetia's own after the signal was delivered keeps its variant, as the source of a step
-/// that says the signal was delivered; the same for one that came before it.
+/// that says the signal was delivered, under the kill; the same for one that came before it.
 #[skuld::test]
 fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
-    for (e, context) in [
-        (signalled_but(7, wrapped()), "was signalled"),
-        (not_signalled(7, wrapped()), "signalling it failed"),
+    for (e, kill_what, context) in [
+        (signalled_but(7, wrapped()), "kill `x`", "was signalled"),
+        (
+            not_signalled(7, wrapped()),
+            "failed to kill `x`",
+            "signalling it failed",
+        ),
     ] {
         let failed = kill_failed("x", e);
 
-        let Error::Step { what, source } = &failed else {
+        let Error::Step { what: kill, source } = &failed else {
             panic!("a step: {failed:?}");
         };
+        let Error::Step { what, source } = &**source else {
+            panic!("a step under the kill: {failed:?}");
+        };
+        assert_eq!(kill, kill_what);
         assert!(what.contains(context), "{what}");
         assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
-        assert!(!failed.report().to_string().contains("kill `x`"), "{}", failed.report());
     }
 }
