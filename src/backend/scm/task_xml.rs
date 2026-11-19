@@ -8,7 +8,8 @@
 //! `UseUnifiedSchedulingEngine`, and rewrites the principal's account to a SID. So a readback is a
 //! [`TaskXml`] built from the elements goetia owns, with a dropped one read as its default, and the
 //! account is the blob's, never the principal's. [`Display`](fmt::Display) is the definition's
-//! canonical text: the same for what is generated and what is read back.
+//! canonical text: the same for what is generated and what is read back, with no registration
+//! [`Token`] ([`TaskXml::token_of`]).
 //!
 //! **A task is armed when it has triggers that are switched on** ([`TaskXml::armed`]; its own
 //! `Settings/Enabled` stays true, since Task Scheduler refuses a `Run` of a task whose own flag is false).
@@ -25,7 +26,7 @@ use std::fmt;
 
 use cosca::quote::windows::join_wide;
 
-use crate::backend::scm::instance::TaskAccount;
+use crate::backend::scm::instance::{TaskAccount, bytes_of_hex, hex_of};
 use crate::backend::scm::triggers::{Repeat, Trigger, compile};
 use crate::backend::xml_escape;
 use crate::blob::{self, Blob};
@@ -36,8 +37,57 @@ use crate::spec::{AccountId, Builtin, DaemonSpec, Id, User, invalid, windows_bui
 mod read;
 
 /// The argument that makes the shim run as a task: the action's arguments are the host's own, then
-/// this and the task's id.
+/// this, the task's id and the registration's [`Token`].
 pub(crate) const TASK_MODE_ARG: &str = "--goetia-task";
+
+/// What tells one registration of a task from another: the last argument of its action. Not part of a
+/// [`TaskXml`], which an install compares by definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Token([u8; 16]);
+
+impl Token {
+    /// 128 random bits.
+    pub(crate) fn fresh() -> Token {
+        Token(rand::random::<u128>().to_be_bytes())
+    }
+
+    /// `text` as a token: exactly 32 hex digits, of either case.
+    pub(crate) fn parse(text: &str) -> Option<Token> {
+        bytes_of_hex(text).map(Token)
+    }
+
+    /// The 32 lower-case hex digits the action's arguments end with.
+    pub(crate) fn hex(&self) -> String {
+        hex_of(&self.0)
+    }
+}
+
+/// The task-mode ending of `args`, the arguments after the program: [`TASK_MODE_ARG`], a task's id and,
+/// last, the registration's token, which is `None` when absent or not a [`Token`]. What an install writes
+/// (`args` of the stored XML) and what Task Scheduler passes the shim (its argv) are read by this one
+/// matcher. `None` when `args` end otherwise.
+pub(crate) fn ending<S: AsRef<str>>(args: &[S]) -> Option<(&str, Option<Token>)> {
+    let tail = |n: usize| args.len().checked_sub(n).map(|from| &args[from..]);
+    match (tail(3), tail(2)) {
+        (Some([flag, id, last]), _) if flag.as_ref() == TASK_MODE_ARG => {
+            Some((id.as_ref(), Token::parse(last.as_ref())))
+        }
+        (_, Some([flag, id])) if flag.as_ref() == TASK_MODE_ARG => Some((id.as_ref(), None)),
+        _ => None,
+    }
+}
+
+/// What the stored XML of a task says of its registration ([`TaskXml::stored`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Stored {
+    /// The account its principal names ([`TaskXml::principal`]).
+    pub principal: Option<TaskAccount>,
+    /// Whether it is armed ([`TaskXml::armed`]).
+    pub armed: bool,
+    /// The token its arguments end with, `None` when they end with no goetia ending for the task
+    /// ([`TaskXml::token_of`]).
+    pub token: Option<Token>,
+}
 
 /// Where a schedule that never fires is anchored: a one-time trigger at a fixed past instant fires
 /// nothing at registration or when it is enabled, and reads no next run.
@@ -189,7 +239,8 @@ impl TaskXml {
 
     /// The XML to register. The triggers are written only when `armed`, which is the installation's
     /// state and no part of the definition: an install over a disarmed task keeps it without any.
-    pub(crate) fn to_xml(&self, armed: bool) -> String {
+    /// `token` is the registration's, the action's last argument.
+    pub(crate) fn to_xml(&self, armed: bool, token: &Token) -> String {
         let mut out = String::new();
         out.push_str("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n");
         out.push_str("<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">");
@@ -214,7 +265,7 @@ impl TaskXml {
         out.push_str(&format!(
             "<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>",
             xml_escape(&self.host.exe.to_string_lossy()),
-            xml_escape(&self.arguments())
+            xml_escape(&self.arguments(token))
         ));
         out.push_str("</Task>");
         out
@@ -259,15 +310,15 @@ impl TaskXml {
         out
     }
 
-    /// The action's `Arguments`: the host's, the task-mode argument and the id, quoted as
+    /// The action's `Arguments`: the host's, the task-mode argument, the id and the token, quoted as
     /// `CommandLineToArgvW` reads them back (they arrive verbatim after the quoted command).
-    fn arguments(&self) -> String {
+    fn arguments(&self, token: &Token) -> String {
         let wide: Vec<Vec<u16>> = self
             .host
             .args
             .iter()
             .map(String::as_str)
-            .chain([TASK_MODE_ARG, self.id.as_str()])
+            .chain([TASK_MODE_ARG, self.id.as_str(), token.hex().as_str()])
             .map(|arg| arg.encode_utf16().collect())
             .collect();
         let borrowed: Vec<&[u16]> = wide.iter().map(Vec::as_slice).collect();
@@ -464,7 +515,7 @@ pub(crate) fn extract_from_data(data: &str) -> Result<Option<Blob>, Error> {
 // Rendering ===========================================================================================================
 
 /// The definition's canonical text, for diffing: the same for a generated definition and a readback
-/// of it, with no armed state. Every value goetia owns is shown, a default Task Scheduler dropped
+/// of it, with no armed state and no token. Every value goetia owns is shown, a default Task Scheduler dropped
 /// included; the account is a well-known account's name or the user's.
 impl fmt::Display for TaskXml {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {

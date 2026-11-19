@@ -65,6 +65,7 @@ mod stock {
     use super::super::provider::{ShimProvider, require_absolute};
     use super::super::sweep::{SweepFailure, sweep_folder};
     use crate::backend::scm::folder::known_folder;
+    use crate::backend::scm::instance::hex_of;
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
 
@@ -208,7 +209,7 @@ mod stock {
 
         /// The digest as 64 lowercase hexadecimal digits.
         pub(super) fn hex(&self) -> String {
-            self.digest.iter().map(|byte| format!("{byte:02x}")).collect()
+            hex_of(&self.digest)
         }
 
         fn file_name(&self) -> String {

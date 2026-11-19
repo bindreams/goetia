@@ -13,8 +13,10 @@ use super::live::{Liveness, live_instances, probe};
 use super::status::{run_state, task_status};
 use super::{TaskApi, TaskPath};
 use crate::backend::scm::generate::{self, WindowsDefinition};
-use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, open_refused};
-use crate::backend::scm::task_xml::{TaskXml, extract_from_data};
+use crate::backend::scm::instance::TaskAccount;
+use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, identity, open_refused};
+use crate::backend::scm::sid::Sid;
+use crate::backend::scm::task_xml::{TaskXml, Token, extract_from_data};
 use crate::backend::{Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed};
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
@@ -29,6 +31,18 @@ pub(crate) struct TaskSnapshot {
     registered: Registered,
 }
 
+/// What a task's stored registration says ([`TaskSnapshot::stored`]).
+pub(super) struct StoredRegistration {
+    /// The SID of the account its principal names; `None` when the XML names no principal or the name names no
+    /// account: not known to be any account being installed.
+    pub principal: Option<Sid>,
+    /// Whether it has triggers and is itself enabled.
+    pub armed: bool,
+    /// The token its arguments end with; `None` when they end with no goetia ending for this task (a hand
+    /// edit, a malformed token included).
+    pub token: Option<Token>,
+}
+
 impl TaskSnapshot {
     pub(in crate::backend::scm) fn new(id: Id, blob: Decoded, registered: Registered) -> Self {
         Self { id, blob, registered }
@@ -37,6 +51,28 @@ impl TaskSnapshot {
     /// The installed definition, read back from the stored XML.
     fn definition(&self) -> Result<TaskXml> {
         TaskXml::parse(&self.registered.xml, &self.registered.data)
+    }
+
+    /// What the stored registration says, from one read of its XML and one lookup of its account, for the write
+    /// path alone. An error when the XML cannot be read, or the account could not be looked up for any other
+    /// reason than "no such account" (a transient RPC or domain controller failure): the registration is then
+    /// not known to be another account's.
+    pub(super) fn stored(&self) -> Result<StoredRegistration> {
+        let stored = TaskXml::stored(&self.registered.xml, self.id.as_str())?;
+        let principal = match stored.principal {
+            Some(TaskAccount::Service(text) | TaskAccount::User(text)) => {
+                known_account(identity::sid_of_principal(&text)).map_err(|e| Error::Step {
+                    what: format!("look up the account of the registration of `{}`", self.id),
+                    source: Box::new(e),
+                })?
+            }
+            None => None,
+        };
+        Ok(StoredRegistration {
+            principal,
+            armed: stored.armed,
+            token: stored.token,
+        })
     }
 
     /// Whether the task has triggers and is itself enabled.
@@ -69,6 +105,16 @@ fn classify(registered: Registered) -> ReadOutcome<Unnamed<Registered>> {
         Err(e) => Err(Arc::new(e)),
     };
     ReadOutcome::Marked(Unnamed { blob, body: registered })
+}
+
+/// The SID a principal lookup found, `None` when the system says no such account exists: not known to be
+/// any account being installed. Any other failure of the lookup is the error.
+pub(super) fn known_account(lookup: Result<Sid>) -> Result<Option<Sid>> {
+    match lookup {
+        Ok(sid) => Ok(Some(sid)),
+        Err(Error::AccountLookup { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn snapshot_of(id: Id, blob: Decoded, registered: Registered) -> WindowsSnapshot {
