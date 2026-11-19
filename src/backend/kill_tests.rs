@@ -561,21 +561,20 @@ fn a_failed_first_read_is_an_error_and_touches_nothing() {
     assert_eq!(target.log(), steps(["service_pid"]));
 }
 
-/// The read that decides whether an open refusal is the service's own: both errors reach the caller.
+/// The read that decides whether an open refusal is the service's own: both errors reach the caller,
+/// each once, behind what the kill was for, with the read's kind.
 #[skuld::test]
 fn a_failed_read_after_a_refused_open_reports_both_errors() {
     let mut target = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(
-        e.to_string(),
-        "manager read failed (after the service's process could not be opened: access denied)"
-    );
     assert_eq!(e.kind(), READ_FAILED_KIND);
-    let report = crate::error::Error::os("kill", e).report().to_string();
-    assert_eq!(report.matches("manager read failed").count(), 1, "{report}");
-    assert_eq!(report.matches("access denied").count(), 1, "{report}");
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: the process (pid 100) could not be opened (access denied), and the re-read of \
+         what runs the daemon failed: failed to read it: manager read failed"
+    );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -597,46 +596,15 @@ fn the_os_code_of_a_failed_read_is_found_after_a_refused_open() {
     let open = io::Error::from_raw_os_error(OPEN_CODE).to_string();
     assert_eq!(
         failed.report().to_string(),
-        format!("failed to kill `{ID}`: {read} (after the service's process could not be opened: {open})")
-    );
-}
-
-/// A kill that fails with an OS error says what was being killed, whether or not the error is a
-/// pair of failures: the pair is not a goetia error that comes back as itself.
-#[skuld::test]
-fn a_failed_read_after_a_refused_open_keeps_the_kills_context() {
-    let mut target = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);
-
-    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
-
-    assert_eq!(
-        failed.report().to_string(),
         format!(
-            "failed to kill `{ID}`: manager read failed (after the service's process could not be opened: access denied)"
+            "failed to kill `{ID}`: the process (pid 100) could not be opened ({open}), and the re-read of what \
+             runs the daemon failed: failed to read it: {read}"
         )
     );
 }
 
-/// A read that failed with a goetia error that left the outcome open keeps that classification when a
-/// refused open is told after it: the CLI exits `4`, not `1`.
-#[skuld::test]
-fn a_failed_read_after_a_refused_open_keeps_what_the_read_carries() {
-    let read = Error::Undetermined {
-        id: ID.to_string(),
-        reason: Box::new(Error::os("read", io::Error::other("manager read failed"))),
-        recovery: "re-run".to_string(),
-    };
-    let mut target = Scripted::new([Some(100)], [Open::Fails])
-        .failing_read(2)
-        .reading_fails_carrying(read);
-
-    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
-
-    assert!(failed.is_indeterminate(), "{failed:?}");
-    assert!(matches!(failed.cause(), Error::Undetermined { .. }), "{failed:?}");
-}
-
-/// The class of the read is the failure's, and the refused open is told with it: neither is dropped.
+/// The class of the read is the failure's, and the refused open and the kill are told with it: none is
+/// dropped.
 #[skuld::test]
 fn a_failed_read_after_a_refused_open_is_the_reads_class_and_tells_the_open() {
     let read = Error::Undetermined {
@@ -653,8 +621,9 @@ fn a_failed_read_after_a_refused_open_is_the_reads_class_and_tells_the_open() {
     assert!(failed.is_indeterminate(), "{failed:?}");
     assert_eq!(
         failed.report().to_string(),
-        "reading the manager failed after the service's process could not be opened (access denied): cannot \
-         determine whether daemon `frpc` is installed: failed to read: manager read failed. re-run"
+        "failed to kill `frpc`: the process (pid 100) could not be opened (access denied), and the re-read of \
+         what runs the daemon failed: cannot determine whether daemon `frpc` is installed: failed to read: \
+         manager read failed. re-run"
     );
 }
 
@@ -679,17 +648,19 @@ service"
 
     let report = failed.report().to_string();
     assert!(
-        report.starts_with(&format!("failed to kill `{ID}`: manager read failed (")),
+        report.starts_with(&format!(
+            "failed to kill `{ID}`: the process (pid 100) could not be opened ("
+        )),
         "{report}"
     );
     assert!(
         report.contains(
             ": no such
-service)"
+service), and the re-read of what runs the daemon failed: failed to read it: manager read failed"
         ),
         "{report}"
     );
-    assert!(report.ends_with(". re-run as root"), "{report}");
+    assert!(report.contains(". re-run as root"), "{report}");
 }
 
 /// The confirming read, with the process held: it is let go and nothing is signalled.
@@ -815,15 +786,18 @@ fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
 
 // The error of a kill -------------------------------------------------------------------------------------------------
 
-/// An error of goetia's own that a target passed through an `io::Error` is itself again, so a caller
-/// matching on `NoManager` or `Command` still finds it.
+/// An error of goetia's own that a target passed through an `io::Error` is its cause again, so a caller
+/// matching on `NoManager` or `Command` still finds it, and what was being killed is told with it.
 #[skuld::test]
 fn a_wrapped_error_comes_back_as_itself() {
     let e = io::Error::other(Error::NoManager {
         evidence: "x".to_string(),
     });
 
-    assert!(matches!(kill_failed("x", e), Error::NoManager { .. }));
+    let failed = kill_failed("x", e);
+
+    assert!(matches!(failed.cause(), Error::NoManager { .. }), "{failed:?}");
+    assert!(failed.report().to_string().starts_with("failed to kill `x`: "), "{}", failed.report());
 }
 
 /// Any other failure is an OS failure of the kill, naming it.
@@ -841,7 +815,7 @@ fn any_other_error_is_an_os_failure_of_the_kill() {
 }
 
 /// A failure of goetia's own after the signal was delivered keeps its variant, as the source of a step
-/// that says the signal was delivered; the same for one that came before it.
+/// that says the signal was delivered, under the kill; the same for one that came before it.
 #[skuld::test]
 fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
@@ -851,11 +825,14 @@ fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
     ] {
         let failed = kill_failed("x", e);
 
-        let Error::Step { what, source } = &failed else {
+        let Error::Step { what: kill, source } = &failed else {
             panic!("a step: {failed:?}");
         };
+        let Error::Step { what, source } = &**source else {
+            panic!("a step under the kill: {failed:?}");
+        };
+        assert_eq!(kill, "failed to kill `x`");
         assert!(what.contains(context), "{what}");
         assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
-        assert!(!failed.report().to_string().contains("kill `x`"), "{}", failed.report());
     }
 }
