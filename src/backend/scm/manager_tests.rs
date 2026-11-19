@@ -1239,7 +1239,7 @@ fn a_failed_hold_reports_the_read_and_the_refused_open_it_followed() {
         error.report().to_string(),
         format!(
             "failed to hold `frpc`'s process to wait for its exit: the process (pid 100) could not be opened \
-             ({open_text}), and the re-read of what runs the daemon failed: failed to read it: {read_text}"
+             ({open_text}), and the re-read of what runs the daemon failed: {read_text}"
         )
     );
 }

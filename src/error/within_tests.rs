@@ -41,35 +41,30 @@ fn a_goetia_error_the_read_carries_is_the_source_of_a_hold_that_could_not_tell_a
         source: "no answer".into(),
     });
 
-    let back = carried(unread_after_open_refused(7, denied(), read)).expect("an error is carried");
+    let told = target_failed("hold", unread_after_open_refused(7, denied(), read));
 
-    assert!(back.is_indeterminate(), "{back:?}");
-    let Error::ManagerUnreadAfterOpenRefused {
-        pid,
-        open_refused,
-        source,
-    } = &back
-    else {
-        panic!("{back:?}");
-    };
-    assert_eq!(*pid, 7);
-    assert_eq!(open_refused.to_string(), "denied");
-    assert!(matches!(**source, Error::RequestInDoubt { .. }), "{back:?}");
+    assert!(told.is_indeterminate(), "{told:?}");
+    let report = told.report().to_string();
+    assert!(
+        report.starts_with(
+            "failed to hold: the process (pid 7) could not be opened (denied), and the re-read of what runs the \
+             daemon failed: "
+        ),
+        "{report}"
+    );
 }
 
-/// A plain read failure is an OS failure under the same error, and the failure has the read's kind.
+/// A plain read failure is the bare OS error under the hold's words, which already say the re-read failed,
+/// and the failure has the read's kind.
 #[skuld::test]
-fn a_plain_failed_read_after_a_refused_open_is_an_os_failure_under_the_same_error() {
-    let e = unread_after_open_refused(7, denied(), io::Error::new(io::ErrorKind::TimedOut, "read"));
+fn a_plain_failed_read_after_a_refused_open_is_the_bare_os_error_under_the_same_error() {
+    let e = unread_after_open_refused(7, denied(), io::Error::new(io::ErrorKind::TimedOut, "read failed"));
 
     assert_eq!(e.kind(), io::ErrorKind::TimedOut);
-    let back = carried(e).expect("an error is carried");
-    let Error::ManagerUnreadAfterOpenRefused { source, .. } = &back else {
-        panic!("{back:?}");
-    };
-    assert!(
-        matches!(&**source, Error::Os { what, .. } if what == "read it"),
-        "{back:?}"
+    assert_eq!(
+        target_failed("hold", e).report().to_string(),
+        "failed to hold: the process (pid 7) could not be opened (denied), and the re-read of what runs the \
+         daemon failed: read failed"
     );
 }
 
@@ -91,4 +86,31 @@ fn a_targets_failure_keeps_what_was_done_whether_or_not_it_carries_a_goetia_erro
 
     let plain = target_failed("kill `x`", denied());
     assert_eq!(plain.report().to_string(), "failed to kill `x`: denied");
+}
+
+/// An error that says how far the operation got (it is said within a context) is told under the
+/// operation's name with no verdict on it: its context may say the operation's signal was delivered.
+#[skuld::test]
+fn a_failure_said_within_a_context_is_told_under_the_operation_without_a_verdict() {
+    let carrying = target_failed(
+        "kill `x`",
+        within(
+            "process 7 was signalled, but the wait failed",
+            io::Error::other(Error::blob("carried")),
+        ),
+    );
+    assert_eq!(
+        carrying.report().to_string(),
+        "kill `x`: process 7 was signalled, but the wait failed: blob: carried"
+    );
+    assert!(matches!(carrying.cause(), Error::Blob { .. }), "{carrying:?}");
+
+    let plain = target_failed(
+        "kill `x`",
+        within("process 7 was signalled, but the wait failed", denied()),
+    );
+    assert_eq!(
+        plain.report().to_string(),
+        "kill `x`: process 7 was signalled, but the wait failed: denied"
+    );
 }

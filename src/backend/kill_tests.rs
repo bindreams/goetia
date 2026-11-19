@@ -573,7 +573,7 @@ fn a_failed_read_after_a_refused_open_reports_both_errors() {
     assert_eq!(
         kill_failed(ID, e).report().to_string(),
         "failed to kill `frpc`: the process (pid 100) could not be opened (access denied), and the re-read of \
-         what runs the daemon failed: failed to read it: manager read failed"
+         what runs the daemon failed: manager read failed"
     );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
@@ -598,7 +598,7 @@ fn the_os_code_of_a_failed_read_is_found_after_a_refused_open() {
         failed.report().to_string(),
         format!(
             "failed to kill `{ID}`: the process (pid 100) could not be opened ({open}), and the re-read of what \
-             runs the daemon failed: failed to read it: {read}"
+             runs the daemon failed: {read}"
         )
     );
 }
@@ -656,11 +656,11 @@ service"
     assert!(
         report.contains(
             ": no such
-service), and the re-read of what runs the daemon failed: failed to read it: manager read failed"
+service), and the re-read of what runs the daemon failed: manager read failed"
         ),
         "{report}"
     );
-    assert!(report.contains(". re-run as root"), "{report}");
+    assert!(report.ends_with(". re-run as root"), "{report}");
 }
 
 /// The confirming read, with the process held: it is let go and nothing is signalled.
@@ -786,10 +786,11 @@ fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
 
 // The error of a kill -------------------------------------------------------------------------------------------------
 
-/// An error of goetia's own that a target passed through an `io::Error` is its cause again, so a caller
-/// matching on `NoManager` or `Command` still finds it, and what was being killed is told with it.
+/// An error of goetia's own that a target passed through an `io::Error` is the cause of the kill's failure,
+/// so a caller matching `cause()` on `NoManager` or `Command` still finds it, and what was being killed is
+/// told before it.
 #[skuld::test]
-fn a_wrapped_error_comes_back_as_itself() {
+fn a_wrapped_error_is_the_cause_of_the_kills_failure_told_under_the_kill() {
     let e = io::Error::other(Error::NoManager {
         evidence: "x".to_string(),
     });
@@ -807,14 +808,41 @@ fn a_wrapped_error_comes_back_as_itself() {
 /// Any other failure is an OS failure of the kill, naming it.
 #[skuld::test]
 fn any_other_error_is_an_os_failure_of_the_kill() {
-    let after_the_signal = signalled_but(7, io::Error::other("wait failed"));
-    for e in [io::Error::other("access denied"), after_the_signal] {
-        let failed = kill_failed("x", e);
+    let failed = kill_failed("x", io::Error::other("access denied"));
 
-        assert!(
-            matches!(&failed, Error::Os { what, .. } if what == "kill `x`"),
-            "{failed:?}"
-        );
+    assert!(
+        matches!(&failed, Error::Os { what, .. } if what == "kill `x`"),
+        "{failed:?}"
+    );
+}
+
+/// A failure after the signal was delivered, plain or of goetia's own, is told under the kill without
+/// saying the kill failed: the signal stands. A failure to signal is told under it the same way.
+#[skuld::test]
+fn the_report_of_a_failure_around_the_signal_does_not_read_as_a_failed_kill() {
+    let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
+    for (e, lead) in [
+        (
+            signalled_but(7, io::Error::other("wait failed")),
+            "kill `x`: process 7 was signalled, but waiting",
+        ),
+        (
+            signalled_but(7, wrapped()),
+            "kill `x`: process 7 was signalled, but waiting",
+        ),
+        (
+            not_signalled(7, io::Error::other("terminate failed")),
+            "kill `x`: process 7 was held and confirmed",
+        ),
+        (
+            not_signalled(7, wrapped()),
+            "kill `x`: process 7 was held and confirmed",
+        ),
+    ] {
+        let report = kill_failed("x", e).report().to_string();
+
+        assert!(report.starts_with(lead), "{report}");
+        assert!(!report.contains("failed to kill"), "{report}");
     }
 }
 
@@ -835,7 +863,7 @@ fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
         let Error::Step { what, source } = &**source else {
             panic!("a step under the kill: {failed:?}");
         };
-        assert_eq!(kill, "failed to kill `x`");
+        assert_eq!(kill, "kill `x`");
         assert!(what.contains(context), "{what}");
         assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
     }

@@ -48,3 +48,7 @@ pub(crate) fn paired(open: io::Error, step: io::Error) -> io::Error {
 fn carries_goetia_error(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<super::Error>())
 }
+
+#[cfg(test)]
+#[path = "paired_tests.rs"]
+mod paired_tests;

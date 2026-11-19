@@ -444,6 +444,38 @@ fn an_instance_that_cannot_be_opened_fails_the_stop_before_any_stop_is_sent() {
     assert!(machine.waited.is_empty());
 }
 
+/// A hold whose re-read of the listing failed after a refused open names the pid once: the error that
+/// tells the refusal says it, and the hold's own words do not repeat it.
+#[skuld::test]
+fn a_hold_whose_re_read_failed_after_a_refused_open_names_the_pid_once() {
+    let fake = Fake::new();
+    fake.on_instances(one(100)).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100]);
+    machine.denied = vec![100];
+    let denied = io::Error::from_raw_os_error(5);
+
+    let failed = hold_run(
+        &fake,
+        "kill",
+        &id(),
+        &TaskPath::of(&id()),
+        &instance(1, 100),
+        &mut machine,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "failed to hold the process of `nightly`'s run: the process (pid 100) could not be opened ({denied}), \
+             and the re-read of what runs the daemon failed: failed to list the runs of `nightly`: listing failed"
+        )
+    );
+}
+
 /// A `Stop` that fails for one run does not keep the others from being sent theirs: every run is asked,
 /// and the failure is reported.
 #[skuld::test]
