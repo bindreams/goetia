@@ -71,7 +71,7 @@ pub(crate) fn task_host() -> crate::shim::HostCommand {
 }
 
 /// What Task Scheduler holds for `spec` run through [`task_host`]: the XML goetia registers, its
-/// triggers enabled or not, and the blob as its `Data`.
+/// triggers or none, and the blob as its `Data`.
 #[cfg(windows)]
 pub(crate) fn registered_task(
     spec: &crate::spec::DaemonSpec,

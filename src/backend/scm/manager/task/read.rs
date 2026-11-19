@@ -39,7 +39,7 @@ impl TaskSnapshot {
         TaskXml::parse(&self.registered.xml, &self.registered.data)
     }
 
-    /// Whether every trigger is enabled.
+    /// Whether the task has triggers and is itself enabled.
     pub(super) fn armed(&self) -> bool {
         TaskXml::armed(&self.registered.xml)
     }
