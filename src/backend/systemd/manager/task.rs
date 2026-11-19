@@ -24,13 +24,17 @@
 //!   there to read, and the link it leaves would run the task at every boot.
 //! - `uninstall` disarms the timer, stops the job, and removes the timer before the job: a crash
 //!   leaves a job without a timer, still ours.
-//! - An update that changes an armed task's schedule (the timer's text without its `[X-Goetia]`
-//!   section and `Description=`, or a drop-in directory the update deletes) disarms it with
-//!   `disable --now` before the write, reloads, and arms it again. A reload alone would let systemd
-//!   read a time between the timer's last elapse and now as missed, and start the job at once. A
-//!   crash between the disarm and the re-arm leaves the task disabled: `status` shows it, and
-//!   `enable` arms it. Any failure or lost race after the disarm tries to arm it again once before it
-//!   returns; if that fails too, the error says the task is disabled and that `goetia daemon enable
+//! - An update that changes an armed task's schedule disarms it with `disable --now` before the
+//!   write, reloads, and arms it again. The schedule changes when the old timer's text, or the text
+//!   to be written, does not contain the schedule part the generator renders
+//!   ([`generate::timer_schedule`]: the `[Timer]` and `[Install]` sections, without `Description=` and
+//!   `[X-Goetia]`), or when the update deletes a timer drop-in directory (read only when the schedule
+//!   is unchanged). A reload alone would let systemd read a time between the timer's last elapse and
+//!   now as missed, and start the job at once. A crash between the disarm and the re-arm leaves the
+//!   task disabled: `status` shows it, and `enable` arms it. A failed disarm is armed again too, since
+//!   `disable --now` may have removed the link before it failed, and so is any failure or lost race
+//!   after it: each tries once before the update returns. If that fails too, the error says the task
+//!   may not be armed, that `goetia daemon status <id>` shows which, and that `goetia daemon enable
 //!   <id>` arms it. A disabled task's changed timer is only written, and so is a changed command or
 //!   name, which the schedule does not carry.
 //! - Every arm goes through `Systemctl::arm_timer`, which clears the timer's stamp first while the
@@ -171,10 +175,13 @@ pub(super) struct Before {
 
 /// What `update_units` has to do before it replaces the job. `timer_dropins` is whether the id's timer
 /// has a drop-in in the directory the update deletes, and `armed` whether the timer is armed: each is
-/// asked only when the update replaces a timer by a timer, and `armed` only when that changes it.
+/// asked only when the update replaces a timer by a timer. `timer_dropins` is read only when the
+/// schedule is unchanged (a changed one re-arms whatever the directory holds), and `armed` only when
+/// the timer changes.
 ///
-/// The timers are compared as the reload acts on them ([`generate::timer_schedule`]), as launchd's
-/// `changes_loaded_job` compares plists: a changed command or a goetia upgrade rewrites the timer's
+/// The timers are compared as the reload acts on them: the schedule is unchanged when the old timer's
+/// text and the text to be written both contain [`generate::timer_schedule`], as launchd's
+/// `changes_loaded_job` compares plists. A changed command or a goetia upgrade rewrites the timer's
 /// metadata and not its schedule.
 pub(super) fn before_replacing(
     old: &Fragment,
@@ -183,8 +190,10 @@ pub(super) fn before_replacing(
     timer_dropins: impl FnOnce() -> Result<bool>,
     armed: impl FnOnce() -> Result<bool>,
 ) -> Result<Before> {
-    let timer_changes = match (old.timer(), &new.timer, generate::timer_schedule(spec)) {
-        (Some(old), Some(_), Some(schedule)) => !old.text.contains(&schedule) || timer_dropins()?,
+    let timer_changes = match (old.timer(), new.timer.as_deref(), generate::timer_schedule(spec)) {
+        (Some(old), Some(new), Some(schedule)) => {
+            !(old.text.contains(&schedule) && new.contains(&schedule)) || timer_dropins()?
+        }
         _ => false,
     };
     Ok(Before {
@@ -228,7 +237,7 @@ impl Systemd {
             || {
                 // The directory the update deletes; one under another root stays, and is no change.
                 let found = discover::dropin_marker_in(&dropin_dir(id, UnitKind::Timer));
-                Ok(!found.map_err(|failure| failure.into_os_error())?.is_empty())
+                Ok(!found.map_err(discover::unreadable_dropins)?.is_empty())
             },
             || {
                 self.systemctl.require_supported(held)?;
@@ -312,15 +321,16 @@ impl Systemd {
     }
 }
 
-/// The error for an update that disarmed `id`'s timer and could not arm it again: the task may not be
-/// armed, a retried install finds its files up to date and arms nothing, `status` shows which it is and
-/// `enable` arms it. `cause` is what ended the update, where something did (a lost race is none).
+/// The error for an update that tried to disarm `id`'s timer and could not arm it again, whether the
+/// disarming failed or a later step did: the task may not be armed, a retried install finds its files
+/// up to date and arms nothing, `status` shows which it is and `enable` arms it. `cause` is what ended
+/// the update, where something did (a lost race is none).
 fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
     let source = Error::both_all(cause.into_iter().chain([arming])).expect("the arming failure is one");
     Error::Step {
         what: format!(
-            "`{id}`'s timer was disarmed for this update and could not be armed again, so the task may not be \
-             armed: run `goetia daemon status {id}` to see, and `goetia daemon enable {id}` to arm it"
+            "`{id}`'s timer could not be armed again after this update disarmed it, or tried to, so the task may \
+             not be armed: run `goetia daemon status {id}` to see, and `goetia daemon enable {id}` to arm it"
         ),
         source: Box::new(source),
     }

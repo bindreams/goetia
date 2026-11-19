@@ -93,9 +93,10 @@ impl ReadFailure {
         undetermined(id, self.op, &self.path, self.source)
     }
 
-    /// The reading for a caller that already knows goetia owns the id, so "unusable" is a true
-    /// statement about it: `super::write::quarantine_if_still_ours`, which reaches this only after
-    /// `read` found the fragment marked.
+    /// The failure as the operating system's own, with no claim about the id: for a caller that
+    /// already knows goetia owns the id (`super::write::quarantine_if_still_ours`, `unreadable_dropins`,
+    /// which reach this only after `read` found the fragment marked), or that reports the read itself
+    /// (the manager's scan, and its comparison of a unit with a text).
     pub(super) fn into_os_error(self) -> Error {
         Error::os_at(self.op, self.path, self.source)
     }
@@ -483,7 +484,7 @@ pub(super) fn installed(snapshot: &Fragment) -> Result<InstalledDefinition<Units
 }
 
 /// The error for a drop-in directory that could not be read.
-fn unreadable_dropins(failure: ReadFailure) -> Error {
+pub(super) fn unreadable_dropins(failure: ReadFailure) -> Error {
     Error::Step {
         what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
         source: Box::new(failure.into_os_error()),

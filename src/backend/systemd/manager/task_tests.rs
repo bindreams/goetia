@@ -324,11 +324,12 @@ fn the_timer_is_asked_whether_it_is_armed_only_when_it_changes() {
     assert_eq!(asked.get(), 1);
 }
 
-/// The timer's drop-in directory is read only where the update replaces a timer by a timer: a task
-/// that gets or loses its timer, and a service, never ask.
+/// The timer's drop-in directory is read only where the update replaces a timer by a timer with the
+/// same schedule: a task that gets or loses its timer, a service, and a changed schedule never ask.
 #[skuld::test]
 fn the_timer_drop_in_directory_is_read_only_where_a_timer_replaces_a_timer() {
     let scheduled = task_spec("x", "/bin/a", Some("30 3 * * *"));
+    let moved = task_spec("x", "/bin/a", Some("30 5 * * *"));
     let unscheduled = task_spec("x", "/bin/a", None);
     let service = service_spec("x");
     let read = std::cell::Cell::new(0);
@@ -339,6 +340,7 @@ fn the_timer_drop_in_directory_is_read_only_where_a_timer_replaces_a_timer() {
 
     for (what, old, new, reads) in [
         ("a timer replaces a timer", &scheduled, &scheduled, 1),
+        ("its schedule changes", &scheduled, &moved, 0),
         ("a task gets a timer", &unscheduled, &scheduled, 0),
         ("a task loses its timer", &scheduled, &unscheduled, 0),
         ("a service stays one", &service, &service, 0),
@@ -1539,8 +1541,8 @@ fn a_reload_that_fails_arms_the_timer_again_and_is_the_failure(#[fixture(systemd
     armed_again(&id, &without_gate(&fake));
 }
 
-/// An arming that fails as well leaves the task disabled, and the error says so, how to arm it, and
-/// why the update failed.
+/// An arming that fails as well leaves the task possibly unarmed: the error says so, how to look and
+/// how to arm it, and why the update failed.
 #[skuld::test]
 fn a_failure_after_the_disarming_whose_arming_fails_too_names_the_recovery_and_the_cause(
     #[fixture(systemd_group)] _group: &Group,
@@ -1625,15 +1627,7 @@ fn a_disarming_that_fails_arms_the_timer_again_and_is_the_failure(#[fixture(syst
     let new = armed_task_whose_schedule_moves(&id);
     let fake = gate_then([
         timer_show("enabled"),
-        reply(
-            &["disable"],
-            exited(
-                1,
-                "",
-                "disable refused
-",
-            ),
-        ),
+        reply(&["disable"], exited(1, "", "disable refused\n")),
         stopped_with_stamp(),
         cleaned(),
         reply(&["enable"], exited(0, "", "")),
@@ -1667,26 +1661,10 @@ fn a_disarming_whose_arming_fails_too_names_the_recovery_and_both_causes(#[fixtu
     let new = armed_task_whose_schedule_moves(&id);
     let fake = gate_then([
         timer_show("enabled"),
-        reply(
-            &["disable"],
-            exited(
-                1,
-                "",
-                "disable refused
-",
-            ),
-        ),
+        reply(&["disable"], exited(1, "", "disable refused\n")),
         stopped_with_stamp(),
         cleaned(),
-        reply(
-            &["enable"],
-            exited(
-                1,
-                "",
-                "enable refused
-",
-            ),
-        ),
+        reply(&["enable"], exited(1, "", "enable refused\n")),
     ]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
