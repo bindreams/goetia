@@ -82,6 +82,7 @@ pub(super) fn password_of(
 }
 
 /// The password a registration of a task that runs as `account` needs, read as `enable` and `disable` read it.
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn registration_password(account: &TaskAccount) -> Result<Option<String>> {
     password_of(account, identity::service_password)
 }

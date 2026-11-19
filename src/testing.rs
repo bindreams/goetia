@@ -86,7 +86,7 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
 /// the question with the task's own flag false, which no start can come of (`GetRunTimes` lists a
 /// disabled task's times, M2), and the task is registered again as it was after; an armed task is asked as
 /// it is. A task that logs on with a password is registered again with `GOETIA_SERVICE_PASSWORD`, as the
-/// verbs do, and is [`Error::PasswordRequired`] without it, before anything is written.
+/// verbs do, and is [`PasswordRequired`](crate::error::Error::PasswordRequired) without it, before anything is written.
 #[cfg(windows)]
 pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
     use crate::backend::scm::instance::TaskPath;
