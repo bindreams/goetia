@@ -56,7 +56,7 @@ fn record(n: u8, started: u64) -> RunRecord {
 /// it with Administrators as its owner does, and is the tests of the `scm` group.
 fn made_for(runs: &Runs, principal: &crate::backend::scm::sid::Sid) {
     fs::create_dir_all(&runs.dir).unwrap();
-    runs.ensure(principal).unwrap();
+    runs.ensure(std::slice::from_ref(principal)).unwrap();
 }
 
 /// A task's directory, made for the account this test runs as, in a directory that is removed with
@@ -565,7 +565,7 @@ impl<'a> Undeletable<'a> {
 
 impl Drop for Undeletable<'_> {
     fn drop(&mut self) {
-        let restored = Descriptor::for_runs(&process_user_sid())
+        let restored = Descriptor::for_runs(&[process_user_sid()])
             .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
         if !matches!(restored, Ok(Ok(()))) {
             eprintln!(
@@ -1243,7 +1243,7 @@ fn ensure_refuses_a_link_and_leaves_what_it_points_to_alone() {
     let (_target_dir, target) = linked(&runs);
     let before = entries_of(&target.dir);
 
-    let refused = runs.ensure(&process_user_sid()).unwrap_err();
+    let refused = runs.ensure(&[process_user_sid()]).unwrap_err();
 
     assert_eq!(refused.kind(), io::ErrorKind::NotADirectory);
     assert!(
@@ -1401,7 +1401,7 @@ fn the_directory_is_made_owned_by_administrators_with_a_protected_dacl_naming_th
     let runs = Runs::of(dir.path(), &id());
     fs::create_dir_all(runs.dir.parent().unwrap()).unwrap();
 
-    runs.ensure(&process_user_sid()).unwrap();
+    runs.ensure(&[process_user_sid()]).unwrap();
 
     assert_eq!(security_of(&runs.dir).owner, administrators());
     assert_eq!(entries_of(&runs.dir), dacl_for(process_user_sid()));
@@ -1441,7 +1441,7 @@ fn ensure_for_another_principal_rewrites_the_dacl() {
     // `Users` has this test's account among its members, so it still reaches what it made.
     let users = sid_from_parts(5, &[32, 545]);
 
-    runs.ensure(&users).unwrap();
+    runs.ensure(&[users.clone()]).unwrap();
 
     assert_eq!(entries_of(&runs.dir), dacl_for(users));
     assert_eq!(runs.read(&first.instance).unwrap(), Some(first));
@@ -1471,7 +1471,7 @@ fn a_change_of_principal_leaves_what_is_in_the_directory_and_a_hard_links_target
     };
     let (record_before, target_before) = (entries_of_file(&kept), security_of(&target));
 
-    runs.ensure(&sid_from_parts(5, &[32, 545])).unwrap();
+    runs.ensure(&[sid_from_parts(5, &[32, 545])]).unwrap();
 
     assert_eq!(entries_of_file(&kept), record_before, "a record in the directory");
     assert_eq!(security_of(&target), target_before, "the target of a hard link in it");
@@ -1513,7 +1513,7 @@ fn ensure_clears_a_marker_a_cut_short_removal_left() {
     leave_marker(&runs);
     assert!(runs.pin().is_err());
 
-    runs.ensure(&process_user_sid()).unwrap();
+    runs.ensure(&[process_user_sid()]).unwrap();
 
     assert!(runs.pin().is_ok());
     assert!(!runs.marker.exists());
@@ -1524,7 +1524,7 @@ fn ensure_is_repeatable() {
     let (_dir, runs) = fixture();
     runs.write(&record(1, 1)).unwrap();
 
-    runs.ensure(&process_user_sid()).unwrap();
+    runs.ensure(&[process_user_sid()]).unwrap();
 
     assert!(runs.read(&instance(1)).unwrap().is_some());
 }

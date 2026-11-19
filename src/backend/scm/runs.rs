@@ -247,9 +247,11 @@ impl Runs {
     }
 
     /// Makes the directory, in `runs`, which [`Runs::ensure_roots`] saw to, with permissions that name
-    /// `principal`, the account the task runs as; or, when it is there, sets its permissions to name it
+    /// `principals`, the accounts the task runs as (more than one only while it changes from one account
+    /// to another); or, when it is there, sets its permissions to name them
     /// ([`Descriptor::set_dacl_of`]: the directory alone, never what is in it). Call it on every write of
-    /// the task, so that a reinstall that changes the account can still write.
+    /// the task, so that a reinstall that changes the account can still write, and on an install that
+    /// finds the task up to date, so that a directory that is gone is made again.
     ///
     /// A directory that is there and is a link (the account can make one: see the module's note) is
     /// refused ([`io::ErrorKind::NotADirectory`]) and nothing is written to what it points to; the
@@ -257,8 +259,8 @@ impl Runs {
     ///
     /// It also takes away a removal's marker that an uninstall left when it died ([`Runs::remove_all`]):
     /// the task is installed again, and its `run` must not back off.
-    pub(crate) fn ensure(&self, principal: &Sid) -> io::Result<()> {
-        let permissions = Descriptor::for_runs(principal).map_err(io::Error::other)?;
+    pub(crate) fn ensure(&self, principals: &[Sid]) -> io::Result<()> {
+        let permissions = Descriptor::for_runs(principals).map_err(io::Error::other)?;
         match permissions.create_dir(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 permissions.set_dacl_of(Dir::open_for_dacl(&self.dir)?.file())

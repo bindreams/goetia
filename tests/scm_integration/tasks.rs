@@ -101,6 +101,27 @@ fn an_up_to_date_install_of_a_task_makes_a_deleted_default_log_again(#[fixture(s
     assert!(log.is_file(), "the install made {} again", log.display());
 }
 
+/// An install that finds a task up to date makes its run-record directory again, which the shim only opens,
+/// and clears the marker a dead uninstall left, which would make a `run` of the task back off.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_of_a_task_makes_its_run_records_again(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let spec = task_as(id, User::Root, Some(SCHEDULE));
+    let records = records_of(id);
+    let marker = records.with_file_name(format!("{id}~removing"));
+    mgr.install(&spec, false).expect("install");
+    std::fs::remove_dir(&records).unwrap_or_else(|e| panic!("delete {}: {e}", records.display()));
+    std::fs::write(&marker, "").unwrap_or_else(|e| panic!("make {}: {e}", marker.display()));
+
+    let again = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(records.is_dir(), "the install made {} again", records.display());
+    assert!(!marker.exists(), "and took away {}", marker.display());
+}
+
 /// A `logs:` in goetia's log folder is refused at a task's install, as at a service's
 /// (`managed::a_logs_in_goetias_log_folder_is_refused_at_install`). Nothing is installed.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
