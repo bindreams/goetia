@@ -376,7 +376,7 @@ fn wait_is_unrecorded_when_the_process_ended_and_no_record_exists() {
     let failed = run.wait().unwrap_err();
 
     assert!(
-        matches!(&failed, Error::RunUnrecorded { reason: Some(reason), .. } if reason == UNRECORDED),
+        matches!(&failed, Error::RunUnrecorded { reason, .. } if reason == UNRECORDED),
         "{failed:?}"
     );
     assert_eq!(

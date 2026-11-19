@@ -197,7 +197,7 @@ fn exit_of(id: &Id, outcome: RunOutcome) -> Result<Exit> {
 fn unrecorded(id: &Id, reason: &str, source: Option<Error>) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
-        reason: Some(reason.to_owned()),
+        reason: reason.to_owned(),
         source: source.map(Box::new),
     }
 }

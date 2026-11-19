@@ -6,8 +6,8 @@ use std::io;
 use super::report::Pieces;
 
 /// An error that states several failures in its message, and so is not on any `source()` chain: what
-/// [`Carrier`] carries. The one place a composite's shape is stated is [`pieces`](Composite::pieces), which
-/// its `Display` and everything that walks it read; the walks know no composite by name.
+/// [`Carrier`] carries. Its shape is stated only by [`pieces`](Composite::pieces), which its `Display` and
+/// every walk read.
 pub(crate) trait Composite: std::error::Error + Send + Sync + 'static {
     /// What `Display` renders: its text and the errors set inside it, each a cause or only mentioned.
     fn pieces(&self) -> Pieces<'_>;

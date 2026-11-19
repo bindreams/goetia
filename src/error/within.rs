@@ -1,6 +1,7 @@
 use std::io;
 
 use super::Error;
+use super::report::{Seen, seen};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]
@@ -37,8 +38,8 @@ fn said_within(context: String, delivered: bool, source: io::Error) -> io::Error
     )
 }
 
-/// What an [`io::Error`] is, one layer down: the one place that knows how [`within`] and a carried goetia
-/// [`Error`] are laid in it.
+/// What an [`io::Error`] is, one layer down, as [`seen`] looks through what carries it: the one place that
+/// knows how [`within`] is laid in it.
 enum Layer<'a> {
     Context(&'a Within),
     Carried,
@@ -46,16 +47,21 @@ enum Layer<'a> {
 }
 
 fn layer(e: &io::Error) -> Layer<'_> {
-    let Some(inner) = e.get_ref() else {
-        return Layer::Os;
-    };
-    if let Some(within) = inner.downcast_ref::<Within>() {
-        Layer::Context(within)
-    } else if inner.is::<Error>() {
-        Layer::Carried
-    } else {
-        Layer::Os
+    match seen(e) {
+        Seen::Ours(_) => Layer::Carried,
+        Seen::Other(inner) => inner.downcast_ref::<Within>().map_or(Layer::Os, Layer::Context),
+        Seen::Composite(_) => Layer::Os,
     }
+}
+
+/// The `T` that `e` holds directly as its payload, moved out; `e` itself when it holds another, or a `T`
+/// under a shared payload, which cannot be moved out of it.
+fn take_payload<T: std::error::Error + 'static>(e: io::Error) -> Result<T, io::Error> {
+    if !e.get_ref().is_some_and(|payload| payload.is::<T>()) {
+        return Err(e);
+    }
+    let payload = e.into_inner().expect("a payload was just seen");
+    Ok(*payload.downcast::<T>().expect("a `T` was just seen"))
 }
 
 /// Whether `e` carries a goetia [`Error`], directly or under [`within`] contexts: the question
@@ -78,22 +84,25 @@ fn delivered(e: &io::Error) -> bool {
 }
 
 /// `e` as an [`Error`]: the goetia error it carries, else its failure alone as [`Error::RawOs`]. A
-/// context it is said within is a [`Error::Step`] over what is under it.
+/// context it is said within is a [`Error::Step`] over what is under it. What a shared payload holds
+/// cannot be moved out of it: it is `e` alone as [`Error::RawOs`], which every walk looks through.
 fn told(e: io::Error) -> Error {
     match layer(&e) {
         Layer::Os => Error::RawOs { os: e },
-        Layer::Carried => {
-            let inner = e.into_inner().expect("an error with a source was just seen");
-            *inner.downcast::<Error>().expect("an `Error` was just seen")
-        }
-        Layer::Context(_) => {
-            let inner = e.into_inner().expect("an error with a source was just seen");
-            let Within { context, source, .. } = *inner.downcast::<Within>().expect("a `Within` was just seen");
-            Error::Step {
+        Layer::Carried => match take_payload::<Error>(e) {
+            Ok(carried) => carried,
+            Err(e) => match take_payload::<Box<Error>>(e) {
+                Ok(carried) => *carried,
+                Err(e) => Error::RawOs { os: e },
+            },
+        },
+        Layer::Context(_) => match take_payload::<Within>(e) {
+            Ok(Within { context, source, .. }) => Error::Step {
                 what: context,
                 source: Box::new(told(source)),
-            }
-        }
+            },
+            Err(e) => Error::RawOs { os: e },
+        },
     }
 }
 

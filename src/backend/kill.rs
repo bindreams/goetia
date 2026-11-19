@@ -172,7 +172,7 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             .map_err(|e| of_process(pid, Step::Recording, e))?;
             Ok(KillOutcome::Ended)
         }
-        Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
+        Err(HoldError::Unread(e) | HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
         Ok(Hold::NoProcess) => Ok(KillOutcome::NotRunning),
         // The process held is not the service's, or was gone: it is not signalled, and a manager may
         // still report its pid for a moment, so the kill waits for the record as after a signal.
@@ -196,31 +196,31 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
     }
 }
 
-/// What one look at the service's process came to.
+/// What one look at the daemon's process came to.
 #[derive(Debug)]
 pub(crate) enum Hold<P> {
-    /// The manager reports the service with no process.
+    /// The manager reports the daemon with no process.
     NoProcess,
-    /// The service's process, opened, and confirmed by a second read of the manager.
+    /// The daemon's process, opened, and confirmed by a second read of the manager.
     Held { pid: u32, process: P },
-    /// The process `pid` the manager reported is not the service's: it was gone before it could be
+    /// The process `pid` the manager reported is not the daemon's: it was gone before it could be
     /// opened, the manager moved off the pid between the open and the confirmation, or the process
-    /// opened (`held`) is not the service's. Nothing is signalled. The manager may still report `pid`
+    /// opened (`held`) is not the daemon's. Nothing is signalled. The manager may still report `pid`
     /// for a moment, so a caller who needs its record waits with [`KillTarget::await_recorded`] over
     /// `pid` and `held`.
     Ended { pid: u32, held: Option<P> },
 }
 
-/// The service's process and its pid, opened and held, once: what everything that acts on a service's
+/// The daemon's process and its pid, opened and held, once: what everything that acts on a daemon's
 /// process starts from.
 ///
 /// A process gone before the open is waited for in the manager until `deadline`, which ends as
-/// [`HoldError::Expired`]; that is the hold's only wait. A service that moved on is [`Hold::Ended`].
+/// [`HoldError::Expired`]; that is the hold's only wait. A daemon that moved on is [`Hold::Ended`].
 pub(crate) fn hold_once<T: KillTarget>(
     target: &mut T,
     deadline: Deadline,
 ) -> std::result::Result<Hold<T::Process>, HoldError> {
-    let Some(pid) = target.service_pid().map_err(HoldError::Read)? else {
+    let Some(pid) = target.service_pid().map_err(HoldError::Unread)? else {
         return Ok(Hold::NoProcess);
     };
     let process = match target.open(pid) {
@@ -235,7 +235,7 @@ pub(crate) fn hold_once<T: KillTarget>(
                 Waited::Expired => Err(HoldError::Expired { pid }),
             };
         }
-        // A pid that cannot be opened is a refusal only while the manager still says it is the service's.
+        // A pid that cannot be opened is a refusal only while the manager still says it is the daemon's.
         Err(e) => {
             return match target.service_pid() {
                 Ok(Some(now)) if now == pid => Err(HoldError::Refused(of_process(pid, Step::Opening, e))),
@@ -260,7 +260,8 @@ pub(crate) fn hold_once<T: KillTarget>(
     }
 }
 
-/// A step of holding the daemon's process, as a failure of it says so.
+/// A step of holding the daemon's process, as a failure of it says so. The words of a recorded wait are
+/// those of [`recording_notice`]: the process may not be gone, only no longer the daemon's.
 #[derive(Clone, Copy)]
 enum Step {
     Opening,
@@ -276,20 +277,26 @@ fn of_process(pid: u32, step: Step, e: io::Error) -> io::Error {
         match step {
             Step::Opening => format!("opening process {pid}"),
             Step::Confirming => format!("confirming that process {pid} is the daemon's"),
-            Step::Recording => format!("waiting for the manager to record that process {pid} is gone"),
+            Step::Recording => format!("waiting for the manager to record that process {pid} has exited"),
         },
         e,
     )
 }
 
-/// Why [`hold_once`] could not hold the service's process.
+/// Why [`hold_once`] could not hold the daemon's process. The OS code of the error in a variant is read
+/// with `os_error_in`, which [`Error::raw_os_error`] searches with, and never with
+/// `io::Error::raw_os_error`: the error is said within contexts, or is a pair of failures, which only
+/// that search sees through.
 #[derive(Debug)]
 pub(crate) enum HoldError {
+    /// The manager could not be read for the process at all, so none is known: a caller that already
+    /// knows which it is says so.
+    Unread(io::Error),
     /// The manager vouches for the pid, and the process cannot be opened. The error says which process.
     Refused(io::Error),
-    /// The manager could not be read, so what the service runs is not known. A read made after the manager
-    /// named a pid says which process it was about; the failure of the read that follows a refused open says
-    /// it itself.
+    /// The manager could not be read after it named a pid, so what the daemon runs is not known. A read
+    /// made after the manager named a pid says which process it was about; the failure of the read that
+    /// follows a refused open says it itself.
     Read(io::Error),
     /// The manager still reported `pid`, whose process is gone, when the deadline ran out.
     Expired { pid: u32 },
@@ -298,10 +305,10 @@ pub(crate) enum HoldError {
 impl From<HoldError> for io::Error {
     fn from(error: HoldError) -> Self {
         match error {
-            HoldError::Refused(e) | HoldError::Read(e) => e,
+            HoldError::Unread(e) | HoldError::Refused(e) | HoldError::Read(e) => e,
             HoldError::Expired { pid } => io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("the manager still reported process {pid} as the service's when the wait ended"),
+                format!("the manager still reported process {pid} as the daemon's when the wait ended"),
             ),
         }
     }
@@ -316,11 +323,11 @@ fn signalled_but(pid: u32, e: io::Error) -> io::Error {
     )
 }
 
-/// `e`, the failure to signal the process `pid`, which was held and confirmed as the service's: the
+/// `e`, the failure to signal the process `pid`, which was held and confirmed as the daemon's: the
 /// signal was not delivered, and the error says which process it was.
 fn not_signalled(pid: u32, e: io::Error) -> io::Error {
     within(
-        format!("process {pid} was held and confirmed as the service's, but signalling it failed"),
+        format!("process {pid} was held and confirmed as the daemon's, but signalling it failed"),
         e,
     )
 }

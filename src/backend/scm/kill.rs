@@ -157,7 +157,7 @@ pub(crate) fn hold_if_possible<T: KillTarget>(
         Ok(None) => Ok(HoldOutcome::NoProcess),
         Err(HoldError::Refused(e)) => Ok(HoldOutcome::Refused(e)),
         Err(HoldError::Expired { pid }) => Ok(HoldOutcome::Expired { pid }),
-        Err(HoldError::Read(e)) => Err(e),
+        Err(HoldError::Unread(e) | HoldError::Read(e)) => Err(e),
     }
 }
 
@@ -350,7 +350,9 @@ pub(in crate::backend::scm) mod system {
     }
 
     /// Open `pid` with `access`, with the caller's `SeDebugPrivilege` enabled for the open, as
-    /// without it a `LocalService` service's process is refused. `None` if no process has that pid.
+    /// without it a `LocalService` service's process is refused. `None` if no process has that pid. A
+    /// denial that enabling the privilege also failed for is a pair of failures: its OS code is read
+    /// with `os_error_in`.
     pub(in crate::backend::scm) fn open_process_with(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
         let debug = DebugPrivilege::enable();
         // SAFETY: no pointers; a null return is the failure.

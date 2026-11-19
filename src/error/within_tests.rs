@@ -134,17 +134,16 @@ fn a_context_around_a_delivered_signal_still_says_it_was_delivered() {
 /// A goetia error held in each of the payloads the one description of an `io::Error` looks through, as an
 /// `io::Error` carries it.
 fn carried_in_each_payload() -> Vec<(&'static str, io::Error)> {
-    let kind = io::ErrorKind::Other;
     vec![
-        ("directly", io::Error::new(kind, Error::blob("carried"))),
-        ("a Box<Error>", io::Error::new(kind, Box::new(Error::blob("carried")))),
+        ("directly", io::Error::other(Error::blob("carried"))),
+        ("a Box<Error>", io::Error::other(Box::new(Error::blob("carried")))),
         (
             "a SharedError",
-            io::Error::new(kind, Arc::new(Error::blob("carried")) as SharedError),
+            io::Error::other(Arc::new(Error::blob("carried")) as SharedError),
         ),
         (
             "an Arc<io::Error>",
-            io::Error::new(kind, Arc::new(io::Error::other(Error::blob("carried")))),
+            io::Error::other(Arc::new(io::Error::other(Error::blob("carried")))),
         ),
     ]
 }
@@ -156,10 +155,7 @@ fn a_goetia_error_is_carried_through_every_payload_the_search_looks_through() {
         assert!(carries_error(&e), "{how}: {e:?}");
     }
     assert!(!carries_error(&denied()));
-    assert!(!carries_error(&io::Error::new(
-        io::ErrorKind::Other,
-        Arc::new(denied())
-    )));
+    assert!(!carries_error(&io::Error::other(Arc::new(denied()))));
 }
 
 /// A target's failure that carries a goetia error in any such payload is a step over it, as a directly
@@ -184,13 +180,10 @@ fn a_targets_failure_is_the_goetia_error_it_carries_in_whatever_payload() {
 /// A delivered signal told in an `io::Error` that an `Arc` holds is as delivered as one held directly.
 #[skuld::test]
 fn a_delivered_signal_in_a_shared_error_still_says_it_was_delivered() {
-    let shared = io::Error::new(
-        io::ErrorKind::Other,
-        Arc::new(within_delivered(
-            "process 7 was signalled, but waiting failed",
-            denied(),
-        )),
-    );
+    let shared = io::Error::other(Arc::new(within_delivered(
+        "process 7 was signalled, but waiting failed",
+        denied(),
+    )));
 
     let report = target_failed("kill `x`", within("outer", shared)).report().to_string();
 

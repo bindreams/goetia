@@ -59,7 +59,7 @@ pub enum Error {
     /// An OS failure that says nothing of its own: the words of the error around it say what failed, as
     /// those of [`ManagerUnreadAfterOpenRefused`](Error::ManagerUnreadAfterOpenRefused) do. `os` is
     /// rendered as any error is, and is not the [`source`](std::error::Error::source).
-    #[error("{}", raw_os_message(os))]
+    #[error("{}", Written(self))]
     RawOs { os: std::io::Error },
 
     /// A tool goetia runs (`systemctl`, `launchctl`, `plutil`, `sc.exe`) ran and exited
@@ -110,7 +110,7 @@ pub enum Error {
     /// the failure after it. Any number nest to the left (`Both { Both { a, b }, c }`), built by
     /// `Error::both_all`. `Display` and `report()` print them in order, `first; then: then`, and neither
     /// is the `source()`, which is `None`: both are rendered, so neither is returned.
-    #[error("{}", both_message(first, then))]
+    #[error("{}", Written(self))]
     Both { first: Box<Error>, then: Box<Error> },
 
     /// What goetia read at `id` changed before it acted on it, so it did nothing further: re-run.
@@ -525,7 +525,7 @@ pub enum Error {
     /// have [`raw_os_error`](Error::raw_os_error) answer with the terminate's code. The `Display`
     /// sets it inside its message (see `Error::pieces`), where it is only mentioned, and ends with
     /// `recovery`.
-    #[error("{}", process_wait_timeout_message(id, *pid, *waited, terminate_failed.as_deref(), recovery))]
+    #[error("{}", Written(self))]
     ProcessWaitTimeout {
         id: String,
         pid: u32,
@@ -592,15 +592,11 @@ pub enum Error {
     /// may repeat it.
     ///
     /// `reason` says why. `source` is the failure that left the exit unrecorded, when there was one:
-    /// the failed read of what the manager recorded. One of them is always there, and `reason` is
-    /// `None` only when `source` says it all.
-    #[error(
-        "the run of `{id}` ended without recording its exit status{}",
-        unrecorded_reason(reason.as_deref(), source.is_some())
-    )]
+    /// the failed read of what the manager recorded, which follows `reason` in the report.
+    #[error("the run of `{id}` ended without recording its exit status: {reason}")]
     RunUnrecorded {
         id: String,
-        reason: Option<String>,
+        reason: String,
         #[source]
         source: Option<Box<Error>>,
     },
@@ -688,7 +684,7 @@ pub enum Error {
     /// launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_state_in_doubt(id, read_failed, restore_failed.is_some()))]
+    #[error("{}", Written(self))]
     LoadedStateInDoubt {
         id: String,
         read_failed: Box<Error>,
@@ -701,7 +697,7 @@ pub enum Error {
     /// the job is gone and the daemon is not installed. launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", stale_job_booted_out(id, path, found))]
+    #[error("{}", Written(self))]
     StaleJobBootedOut { id: String, path: PathBuf, found: Occupant },
 
     /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
@@ -747,7 +743,7 @@ pub enum Error {
     /// A `start` of `id` was judged as a service of protocol `judged_as`, without its spec blob, which
     /// could not be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
-    #[error("{}", start_judged_without_blob_message(id, *judged_as, blob))]
+    #[error("{}", Written(self))]
     StartJudgedWithoutBlob {
         id: String,
         judged_as: crate::spec::Protocol,
@@ -759,7 +755,7 @@ pub enum Error {
     /// A `stop` of `id` whose wait for the process failed, `source`, when goetia's attempt to end the
     /// process had failed too: `terminate_failed`, which the message only mentions. The service is
     /// stopped, and whether its process exited is not established. The error has the wait's class.
-    #[error("{}", process_exit_unconfirmed_message(id, terminate_failed))]
+    #[error("{}", Written(self))]
     ProcessExitUnconfirmed {
         id: String,
         terminate_failed: Arc<std::io::Error>,
@@ -767,9 +763,9 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// A `stop` of `id` that could not wait for the service's process, because goetia could not open
+    /// A `stop` of `id` that could not wait for the service's process, because goetia could not hold
     /// it: `open_failed`, a cause. `source` is the stop's failure, whose class the error has.
-    #[error("{}", process_not_opened_message(id, open_failed))]
+    #[error("{}", Written(self))]
     ProcessNotOpened {
         id: String,
         open_failed: std::io::Error,
@@ -782,7 +778,7 @@ pub enum Error {
     /// listing of a run) failed after that, `source`, so that it is not known whether the refusal was the
     /// daemon's. The re-read's class is the error's: `source` is the goetia error it carried, else its OS
     /// failure alone ([`RawOs`](Error::RawOs)).
-    #[error("{}", manager_unread_after_open_refused_message(*pid, open_refused))]
+    #[error("{}", Written(self))]
     ManagerUnreadAfterOpenRefused {
         pid: u32,
         open_refused: std::io::Error,
@@ -793,7 +789,7 @@ pub enum Error {
     /// A run of `id` whose wait failed, `source`, and whose output could not be shown either: `shown`,
     /// printed in the message. The wait's class is the error's, so a wait that left the outcome open
     /// stays open, which a [`Both`](Error::Both) of the two would not.
-    #[error("{}", output_also_failed_message(id, shown))]
+    #[error("{}", Written(self))]
     OutputAlsoFailed {
         id: String,
         shown: Box<Error>,
@@ -1011,9 +1007,10 @@ impl Error {
     /// it is `Some`, none of the errors in it is the `source`. A [`Kept`](Error::Kept) error has none of
     /// its own: [`parts`](report::parts) reads the error it holds.
     ///
-    /// The one place the shape of such a variant is stated, with [`parts`](report::parts), which reads
-    /// it. Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
-    /// be classified here before it compiles.
+    /// The one place the shape of such a variant is stated: its `#[error]` is `"{}", Written(self)`, so
+    /// its text is these pieces, and [`parts`](report::parts) reads them. Exhaustive on purpose, like
+    /// [`is_indeterminate`](Error::is_indeterminate): a new variant must be classified here before it
+    /// compiles.
     pub(crate) fn pieces(&self) -> Option<Pieces<'_>> {
         match self {
             Error::Both { first, then } => Some(both_message(first, then)),
@@ -1465,7 +1462,7 @@ fn process_exit_unconfirmed_message<'a>(id: &str, terminate_failed: &'a std::io:
 /// The message of [`Error::ProcessNotOpened`]: `open_failed` is why the process could not be opened.
 fn process_not_opened_message<'a>(id: &str, open_failed: &'a std::io::Error) -> Pieces<'a> {
     Pieces::new()
-        .text(format!("goetia could not open `{id}`'s process ("))
+        .text(format!("goetia could not hold `{id}`'s process ("))
         .cause(open_failed)
         .text("), so it could not wait for the process to exit")
 }
@@ -1488,15 +1485,6 @@ fn output_also_failed_message<'a>(id: &str, shown: &'a Error) -> Pieces<'a> {
     Pieces::new()
         .text(format!("goetia could not show the output of `{id}` either: "))
         .cause(shown)
-}
-
-/// [`Error::RunUnrecorded`]'s tail: `: reason`, or nothing when `source` says it all.
-fn unrecorded_reason(reason: Option<&str>, has_source: bool) -> String {
-    debug_assert!(
-        reason.is_some() || has_source,
-        "an unrecorded run says why, in a reason or a source"
-    );
-    reason.map(|reason| format!(": {reason}")).unwrap_or_default()
 }
 
 /// The message of [`Error::ProcessWaitTimeout`]: `terminate_failed` is why goetia's attempt to end
@@ -1585,6 +1573,18 @@ fn loaded_in_doubt_tail(id: &str, restore_failed: bool) -> String {
         )
     };
     format!(", so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}")
+}
+
+/// What `Display` writes for a variant whose message sets errors inside it: its [`pieces`](Error::pieces).
+struct Written<'a>(&'a Error);
+
+impl fmt::Display for Written<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0
+            .pieces()
+            .expect("a variant written from its pieces is classified by `pieces`")
+            .fmt(f)
+    }
 }
 
 /// This crate's `Result` alias, used throughout [`crate::manager`] and

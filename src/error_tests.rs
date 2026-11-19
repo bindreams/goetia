@@ -62,7 +62,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::RunStateUnknown { id: id() },
         Error::RunUnrecorded {
             id: id(),
-            reason: Some("because".to_string()),
+            reason: "because".to_string(),
             source: None,
         },
     ];
@@ -335,12 +335,12 @@ fn the_search_finds_what_a_wrapper_says_in_its_words_and_what_it_wraps_but_not_w
 }
 
 /// A run that ended without a recorded exit says why in `reason`, and a failed read of the record is its
-/// `source`: nothing to say beside it is no reason.
+/// `source`, told after it.
 #[skuld::test]
 fn an_unrecorded_run_says_its_reason_and_returns_the_failed_read_as_its_source() {
     let said = Error::RunUnrecorded {
         id: "x".to_string(),
-        reason: Some("why".to_string()),
+        reason: "why".to_string(),
         source: None,
     };
     assert_eq!(
@@ -351,16 +351,16 @@ fn an_unrecorded_run_says_its_reason_and_returns_the_failed_read_as_its_source()
 
     let read = Error::RunUnrecorded {
         id: "x".to_string(),
-        reason: None,
+        reason: "its record could not be read".to_string(),
         source: Some(Box::new(Error::blob("unreadable"))),
     };
     assert_eq!(
         read.to_string(),
-        "the run of `x` ended without recording its exit status"
+        "the run of `x` ended without recording its exit status: its record could not be read"
     );
     assert_eq!(
         read.report().to_string(),
-        "the run of `x` ended without recording its exit status: blob: unreadable"
+        "the run of `x` ended without recording its exit status: its record could not be read: blob: unreadable"
     );
     assert!(read.is_indeterminate());
 }
@@ -1620,7 +1620,7 @@ fn error_messages_and_exit_class() {
         (
             Error::RunUnrecorded {
                 id: id(),
-                reason: Some("the journal has no exit".to_string()),
+                reason: "the journal has no exit".to_string(),
                 source: None,
             },
             "the run of `nightly` ended without recording its exit status: the journal has no exit",

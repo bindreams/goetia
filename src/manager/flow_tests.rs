@@ -1347,7 +1347,7 @@ fn a_run_whose_exit_is_not_recorded_shows_no_marker_note() {
     fake.seed_run_marker("nightly", "goetia-run", "goetia-run 0123456789abcdef0123456789abcdef");
     fake.seed_run_wait_fails("nightly", || Error::RunUnrecorded {
         id: "nightly".to_string(),
-        reason: Some("no record (seeded)".to_string()),
+        reason: "no record (seeded)".to_string(),
         source: None,
     });
 
@@ -1398,7 +1398,7 @@ fn a_wait_error_and_a_stream_error_are_both_reported_and_an_open_outcome_stays_o
     fn unrecorded() -> Error {
         Error::RunUnrecorded {
             id: "nightly".to_string(),
-            reason: Some("no record (seeded)".to_string()),
+            reason: "no record (seeded)".to_string(),
             source: None,
         }
     }

@@ -459,16 +459,14 @@ impl Run {
                 Some(Ending::Exit(exit)) => {
                     return exit.map_err(|e| Error::RunUnrecorded {
                         id: self.id.to_string(),
-                        reason: None,
+                        reason: "its exit entry in the journal does not say how it ended".to_string(),
                         source: Some(Box::new(e)),
                     });
                 }
                 Some(Ending::NoExit { result }) => {
                     return Err(Error::RunUnrecorded {
                         id: self.id.to_string(),
-                        reason: Some(format!(
-                            "systemd failed the unit as `{result}` and recorded no exit for the run"
-                        )),
+                        reason: format!("systemd failed the unit as `{result}` and recorded no exit for the run"),
                         source: None,
                     });
                 }

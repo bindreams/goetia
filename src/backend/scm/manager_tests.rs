@@ -1223,7 +1223,7 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
 }
 
-/// A hold whose reads of SCM failed after a refused open reports both failures, once, behind what the
+/// A hold whose reads of SCM failed after a refused open reports both failures, behind what the
 /// hold was for.
 #[skuld::test]
 fn a_failed_hold_reports_the_read_and_the_refused_open_it_followed() {

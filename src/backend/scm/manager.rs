@@ -1994,7 +1994,7 @@ impl Scm {
             // Not waited for, and said so: the file it runs stays until it exits, and the sweep below
             // keeps it by its image.
             HoldOutcome::Refused(reason) => {
-                failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
+                failures.push(Error::os(format!("hold `{id}`'s process to wait for its exit"), reason).into())
             }
             HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
         }

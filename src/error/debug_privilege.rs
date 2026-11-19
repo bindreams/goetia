@@ -8,8 +8,7 @@ use super::report::Pieces;
 use super::within::carries_error;
 
 /// An open that was denied and the step that enabling `SeDebugPrivilege` for it failed at, the second told
-/// after the first: `open (enabling SeDebugPrivilege for the open also failed: step)`. Both are rendered by
-/// `Display` and neither is the [`source`](std::error::Error::source), as the standard library asks. The
+/// after the first: `open (enabling SeDebugPrivilege for the open also failed: step)`. The
 /// open is the cause, so its OS code is the pair's; the step is only mentioned, and never searched.
 ///
 /// Both are raw OS errors: a failure that carries a goetia [`Error`](super::Error), directly or under a

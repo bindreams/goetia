@@ -403,7 +403,7 @@ fn our_launch_that_is_running_is_unfollowed_and_strands_nothing() {
 
     assert!(!is_stranded(&e), "{e:?}");
     assert!(
-        matches!(&e, Error::RunUnrecorded { id, reason: Some(reason), .. }
+        matches!(&e, Error::RunUnrecorded { id, reason, .. }
             if id == "frpc" && reason.contains(&format!("launched process {PID} with no hold on it"))),
         "{e:?}"
     );
@@ -441,7 +441,7 @@ fn our_launch_that_is_gone_ended_before_goetia_could_follow_it() {
         assert!(!is_stranded(&e), "{e:?}");
         let expected = format!("its launch ended before goetia could follow it{said}: ");
         assert!(
-            matches!(&e, Error::RunUnrecorded { id, reason: Some(reason), .. } if id == "frpc" && reason.starts_with(&expected)),
+            matches!(&e, Error::RunUnrecorded { id, reason, .. } if id == "frpc" && reason.starts_with(&expected)),
             "{e:?}"
         );
         assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);

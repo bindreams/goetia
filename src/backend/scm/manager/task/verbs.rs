@@ -165,10 +165,15 @@ pub(super) fn hold_run<P: Processes>(
         Err(HoldError::Refused(e)) => Err(open_refused(
             operation,
             &format!("the process of `{id}`'s run"),
-            &format!("open the process of `{id}`'s run to wait for its exit"),
+            &format!("hold the process of `{id}`'s run to wait for its exit"),
             e,
         )),
-        // The errors of a hold that has a pid name it.
+        // The first read is made before the listing names a process, and the caller knows which run it is for.
+        Err(HoldError::Unread(e)) => Err(target_failed(
+            format!("hold the process of `{id}`'s run (pid {})", instance.pid),
+            e,
+        )),
+        // The other errors of a hold name the pid.
         Err(e) => Err(target_failed(
             format!("hold the process of `{id}`'s run"),
             io::Error::from(e),

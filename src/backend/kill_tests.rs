@@ -571,7 +571,7 @@ fn a_failed_first_read_is_an_error_and_touches_nothing() {
 }
 
 /// The read that decides whether an open refusal is the service's own: both errors reach the caller,
-/// each once, behind what the kill was for, with the read's kind.
+/// behind what the kill was for, with the read's kind.
 #[skuld::test]
 fn a_failed_read_after_a_refused_open_reports_both_errors() {
     let mut target = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);

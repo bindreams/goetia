@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
-use super::composite::Carrier;
+use super::composite::{Carrier, Composite};
 use super::escape::{write_escaped, write_escaped_keeping_layout};
 use super::{Error, SharedError};
 
@@ -208,58 +208,78 @@ pub(super) struct Node<'a> {
     pub(super) source: Option<&'a Dyn>,
 }
 
-/// `e`'s [`Node`]: the one description of the shape of any error, which the printer and the search
-/// both read.
+/// What an error is once everything that only carries another has been looked through: the one
+/// description of how an [`io::Error`](std::io::Error) and the shared and boxed errors nest one, which
+/// [`parts`] and every other walk of an `io::Error` read.
 ///
-/// What only carries another error is looked through, so that the node is the carried error: an
-/// [`io::Error`](std::io::Error) with a custom payload (its `source()` is the payload's, which skips the
-/// payload), an `Arc<io::Error>` or [`SharedError`], a `Box<Error>` and an [`Error::Kept`]. A `cosca` error is
-/// [`Shape::Cosca`]. A goetia error that sets another inside its message, and any
+/// What is looked through: an `io::Error`'s custom payload (its `source()` is the payload's, which skips
+/// the payload), an `Arc<io::Error>` or [`SharedError`], and a `Box<Error>`. A [`Carrier`] is its
+/// composite. A goetia [`Error`] is itself, a [`Kept`](Error::Kept) one as the error it holds.
+pub(super) enum Seen<'a> {
+    Ours(&'a Error),
+    Composite(&'a dyn Composite),
+    Other(&'a Dyn),
+}
+
+pub(super) fn seen<'a>(mut e: &'a Dyn) -> Seen<'a> {
+    loop {
+        // An `Arc`'s `source()` is its content's, which skips the content: a shared error is looked
+        // through for the error it holds. `Arc<io::Error>` is how `cosca` shares one; `SharedError` is what
+        // `Blob` and `Invalid` keep. A `#[source]` of type `Box<Error>` reaches here as the box.
+        let inner: &'a Dyn = if let Some(payload) = e.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref)
+        {
+            payload
+        } else if let Some(carrier) = e.downcast_ref::<Carrier>() {
+            return Seen::Composite(carrier.composite());
+        } else if let Some(shared) = e.downcast_ref::<Arc<std::io::Error>>() {
+            &**shared
+        } else if let Some(shared) = e.downcast_ref::<SharedError>() {
+            &**shared
+        } else if let Some(ours) = e
+            .downcast_ref::<Error>()
+            .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b))
+        {
+            return Seen::Ours(ours.unkept());
+        } else {
+            return Seen::Other(e);
+        };
+        e = inner;
+    }
+}
+
+/// `e`'s [`Node`]: the one description of the shape of any error, which the printer and the search
+/// both read, over what [`seen`] says it is.
+///
+/// A `cosca` error is [`Shape::Cosca`]. A goetia error that sets another inside its message, and any
 /// [`Composite`](super::Composite) in its [`Carrier`], are [`Shape::Pieces`]. Any other is its own
 /// `Display` and `source()`.
 pub(super) fn parts<'a>(e: &'a Dyn) -> Node<'a> {
-    if let Some(payload) = e.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref) {
-        return parts(payload);
-    }
-    if let Some(carrier) = e.downcast_ref::<Carrier>() {
-        let composite = carrier.composite();
-        return Node {
+    match seen(e) {
+        Seen::Composite(composite) => Node {
             error: composite,
             ours: None,
             shape: Shape::Pieces(composite.pieces()),
             source: composite.source(),
-        };
-    }
-    // An `Arc`'s `source()` is its content's, which skips the content: a shared error is looked through
-    // for the error it holds. `Arc<io::Error>` is how `cosca` shares one; `SharedError` is what `Blob` and
-    // `Invalid` keep.
-    if let Some(shared) = e.downcast_ref::<Arc<std::io::Error>>() {
-        return parts(&**shared);
-    }
-    if let Some(shared) = e.downcast_ref::<SharedError>() {
-        return parts(&**shared);
-    }
-    // A `#[source]` of type `Box<Error>` reaches here as the box.
-    let ours = e
-        .downcast_ref::<Error>()
-        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b))
-        .map(Error::unkept);
-    let error: &Dyn = match ours {
-        Some(ours) => ours,
-        None => e,
-    };
-    let shape = if error.is::<cosca::error::Error>() {
-        Shape::Cosca
-    } else if let Some(pieces) = ours.and_then(Error::pieces) {
-        Shape::Pieces(pieces)
-    } else {
-        Shape::Own
-    };
-    Node {
-        error,
-        ours,
-        shape,
-        source: error.source(),
+        },
+        Seen::Ours(ours) => {
+            let error: &Dyn = ours;
+            Node {
+                error,
+                ours: Some(ours),
+                shape: ours.pieces().map_or(Shape::Own, Shape::Pieces),
+                source: error.source(),
+            }
+        }
+        Seen::Other(error) => Node {
+            error,
+            ours: None,
+            shape: if error.is::<cosca::error::Error>() {
+                Shape::Cosca
+            } else {
+                Shape::Own
+            },
+            source: error.source(),
+        },
     }
 }
 
@@ -301,7 +321,7 @@ pub(super) fn write_chain<'a>(e: &'a Dyn, out: &mut Sink, remedies: &mut Vec<&'a
 
 /// The first thing `found` finds in `e`, searching depth first: the error itself, then its `source()`
 /// chain, then the errors its message sets inside it as causes ([`Piece::Error`]), each searched the same
-/// way. The one search of an error: what it sees of each error is [`parts`]', as the printer sees it.
+/// way. What it sees of each error is [`parts`]', as the printer sees it.
 ///
 /// A `cosca` error is searched through its `source()`, so only a list's first member is. What is found
 /// borrows from `e`.
