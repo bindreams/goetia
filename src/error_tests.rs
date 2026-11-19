@@ -683,6 +683,63 @@ fn pieces_name_the_errors_a_variant_writes_into_its_own_text() {
     assert!(step("a", inner()).pieces().is_none());
 }
 
+/// A variant whose `#[error]` is `Written` renders its pieces, so `pieces` must classify it: none of them
+/// is left unclassified, which would be a `Display` with nothing to write.
+#[skuld::test]
+fn every_variant_written_from_its_pieces_is_classified_and_renders_as_them() {
+    let io = || std::io::Error::other("io");
+    let boxed = |e: Error| Box::new(e);
+    let written = [
+        Error::RawOs { os: io() },
+        Error::Both {
+            first: boxed(not_installed()),
+            then: boxed(not_installed()),
+        },
+        Error::ProcessWaitTimeout {
+            id: "x".to_string(),
+            pid: 1,
+            waited: Duration::ZERO,
+            terminate_failed: Some(Arc::new(io())),
+            recovery: "r".to_string(),
+        },
+        Error::LoadedStateInDoubt {
+            id: "x".to_string(),
+            read_failed: boxed(not_installed()),
+            restore_failed: None,
+        },
+        Error::StaleJobBootedOut {
+            id: "x".to_string(),
+            path: PathBuf::new(),
+            found: Occupant::File,
+        },
+        start_as_managed(not_installed()),
+        Error::ProcessExitUnconfirmed {
+            id: "x".to_string(),
+            terminate_failed: Arc::new(io()),
+            source: boxed(not_installed()),
+        },
+        Error::ProcessNotOpened {
+            id: "x".to_string(),
+            open_failed: io(),
+            source: boxed(not_installed()),
+        },
+        Error::ManagerUnreadAfterOpenRefused {
+            pid: 7,
+            open_refused: io(),
+            source: boxed(not_installed()),
+        },
+        Error::OutputAlsoFailed {
+            id: "x".to_string(),
+            shown: boxed(not_installed()),
+            source: boxed(not_installed()),
+        },
+    ];
+    for e in &written {
+        let pieces = e.pieces().unwrap_or_else(|| panic!("{e:?} is written from its pieces"));
+        assert_eq!(e.to_string(), pieces.to_string(), "{e:?}");
+    }
+}
+
 /// A kept error answers `stderr` as the error it holds, however deep.
 #[skuld::test]
 fn a_kept_commands_stderr_is_the_commands() {

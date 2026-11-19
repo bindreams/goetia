@@ -653,6 +653,27 @@ fn a_refusal_on_the_second_run_leaves_the_first_unkilled() {
     fake.finish();
 }
 
+/// A run whose listing cannot be read at the kill's first read says which run it was, and each run's
+/// failure says its own: with two runs, the report names both pids.
+#[skuld::test]
+fn a_kill_whose_first_read_of_each_run_failed_names_each_run() {
+    let fake = Fake::new();
+    // The probe, each run's hold and its second read; then the kill's first read of each run.
+    for _ in 0..5 {
+        fake.on_instances(two());
+    }
+    fake.on_instances(Err(Error::os("list the instances", io::Error::other("listing failed"))))
+        .on_instances(Err(Error::os("list the instances", io::Error::other("listing failed"))));
+    let mut machine = Machine::new(&fake, &[100, 200]);
+
+    let failed = scm(&fake).task_kill_with(&id(), &mut machine).unwrap_err();
+
+    let report = failed.report().to_string();
+    assert!(report.contains("(pid 100)") && report.contains("(pid 200)"), "{report}");
+    assert!(machine.terminated.is_empty(), "{report}");
+    fake.finish();
+}
+
 /// A pid the listing no longer names after the open may be a stranger's: nothing is terminated.
 #[skuld::test]
 fn kill_of_a_run_that_left_the_listing_after_it_was_held_terminates_nothing() {

@@ -131,27 +131,42 @@ fn a_context_around_a_delivered_signal_still_says_it_was_delivered() {
     }
 }
 
-/// A goetia error held in each of the payloads the one description of an `io::Error` looks through, as an
-/// `io::Error` carries it.
-fn carried_in_each_payload() -> Vec<(&'static str, io::Error)> {
+/// `carried`, a goetia error, held in each of the payloads the one description of an `io::Error` looks
+/// through, as an `io::Error` carries it.
+fn carried_in_each_payload(carried: fn() -> Error) -> Vec<(&'static str, io::Error)> {
     vec![
-        ("directly", io::Error::other(Error::blob("carried"))),
-        ("a Box<Error>", io::Error::other(Box::new(Error::blob("carried")))),
+        ("directly", io::Error::other(carried())),
+        ("a Box<Error>", io::Error::other(Box::new(carried()))),
+        ("an io::Error", io::Error::other(io::Error::other(carried()))),
         (
-            "a SharedError",
-            io::Error::other(Arc::new(Error::blob("carried")) as SharedError),
+            "an io::Error in an io::Error",
+            io::Error::other(io::Error::other(io::Error::other(Box::new(carried())))),
         ),
+        ("a SharedError", io::Error::other(Arc::new(carried()) as SharedError)),
         (
             "an Arc<io::Error>",
-            io::Error::other(Arc::new(io::Error::other(Error::blob("carried")))),
+            io::Error::other(Arc::new(io::Error::other(carried()))),
         ),
     ]
+}
+
+fn blob() -> Error {
+    Error::blob("carried")
+}
+
+fn in_doubt() -> Error {
+    Error::RequestInDoubt {
+        request: "read".to_string(),
+        reached: false,
+        note: None,
+        source: "no answer".into(),
+    }
 }
 
 /// What the search and the printer see through, every walk of an `io::Error` sees through.
 #[skuld::test]
 fn a_goetia_error_is_carried_through_every_payload_the_search_looks_through() {
-    for (how, e) in carried_in_each_payload() {
+    for (how, e) in carried_in_each_payload(blob) {
         assert!(carries_error(&e), "{how}: {e:?}");
     }
     assert!(!carries_error(&denied()));
@@ -162,7 +177,7 @@ fn a_goetia_error_is_carried_through_every_payload_the_search_looks_through() {
 /// carried one is, and its text is the same.
 #[skuld::test]
 fn a_targets_failure_is_the_goetia_error_it_carries_in_whatever_payload() {
-    for (how, e) in carried_in_each_payload() {
+    for (how, e) in carried_in_each_payload(blob) {
         let failed = target_failed("kill `x`", e);
 
         assert!(
@@ -191,4 +206,44 @@ fn a_delivered_signal_in_a_shared_error_still_says_it_was_delivered() {
         report.starts_with("kill `x`: outer: process 7 was signalled, but waiting failed: "),
         "{report}"
     );
+}
+
+/// The class of the error a failure carries is the failure's, in whatever payload it is carried, said within
+/// contexts or not: a hold or a kill that left the outcome open exits `4`.
+#[skuld::test]
+fn an_indeterminate_error_is_indeterminate_in_whatever_payload_it_is_carried() {
+    for (how, e) in carried_in_each_payload(in_doubt) {
+        let failed = target_failed("kill `x`", e);
+        assert!(failed.is_indeterminate(), "{how}: {failed:?}");
+        assert_eq!(
+            failed.report().to_string(),
+            format!("failed to kill `x`: {}", in_doubt().report()),
+            "{how}"
+        );
+    }
+    for (how, e) in carried_in_each_payload(in_doubt) {
+        let failed = target_failed("kill `x`", within("outer", e));
+        assert!(failed.is_indeterminate(), "{how} within a context: {failed:?}");
+    }
+}
+
+/// A delivered signal and a carried error are read from one look at the failure: the verdict is the same
+/// whatever the payload.
+#[skuld::test]
+fn a_delivered_signal_over_a_carried_error_in_whatever_payload_is_told_with_no_verdict() {
+    for (how, e) in carried_in_each_payload(in_doubt) {
+        let failed = target_failed(
+            "kill `x`",
+            within_delivered("process 7 was signalled, but waiting failed", e),
+        );
+        assert!(failed.is_indeterminate(), "{how}: {failed:?}");
+        assert!(
+            failed
+                .report()
+                .to_string()
+                .starts_with("kill `x`: process 7 was signalled, but waiting failed: "),
+            "{how}: {}",
+            failed.report()
+        );
+    }
 }

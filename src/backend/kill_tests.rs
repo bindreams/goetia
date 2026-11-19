@@ -348,7 +348,7 @@ fn the_waiting_notice_names_a_failed_terminate() {
 /// own alike.
 #[skuld::test]
 fn a_wait_for_the_manager_to_record_the_exit_says_why_before_it_blocks() {
-    let notice = "notice frpc: waiting for the manager to record that process 100 has exited";
+    let notice = "notice frpc: waiting for the manager to stop reporting process 100";
     let signalled = Scripted::new([Some(100), Some(100)], [Open::Found]).lagging_record();
     let ended = Scripted::new([Some(100), Some(100)], [Open::Found])
         .disowning()
@@ -391,7 +391,7 @@ fn a_wait_for_the_record_of_a_process_gone_before_it_was_opened_says_why_before_
             "service_pid",
             "open 100",
             "await_recorded 100 unheld",
-            "notice frpc: waiting for the manager to record that process 100 has exited",
+            "notice frpc: waiting for the manager to stop reporting process 100",
             "await_recorded 100 unheld",
         ])
     );
@@ -450,7 +450,7 @@ fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
     assert_eq!(e.kind(), READ_FAILED_KIND);
     assert_eq!(
         kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to record that process 100 has exited: manager read failed"
+        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
     );
     assert!(!target.log().iter().any(|call| call.starts_with("terminate")));
 }
@@ -746,7 +746,7 @@ fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
     assert_eq!(e.kind(), READ_FAILED_KIND);
     assert_eq!(
         kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to record that process 100 has exited: manager read failed"
+        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
     );
 }
 

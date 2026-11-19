@@ -210,19 +210,24 @@ fn a_denied_open_with_the_failed_step_keeps_the_kills_context() {
     );
 }
 
-/// The denial is read as the search reads any error's OS code, so a denial said within a context is
-/// explained as a bare one is.
+/// Only a bare OS error is a denial that is explained: the pair is two OS failures. An open said within a
+/// context, or one that carries a goetia error, is left as it is, as it is by the pair's own contract.
 #[skuld::test]
-fn a_denial_said_within_a_context_is_explained_as_a_bare_one_is() {
-    let e = failed_to_enable().explain_denial(within("opening process 7", denied()));
+fn an_open_that_is_not_a_bare_os_error_is_not_explained() {
+    for (how, open) in [
+        ("within a context", within("opening process 7", denied())),
+        ("carrying a goetia error", io::Error::other(Error::os("open", denied()))),
+    ] {
+        let e = failed_to_enable().explain_denial(open);
 
-    assert_eq!(os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
-    assert!(
-        Error::os("kill", e)
-            .report()
-            .to_string()
-            .contains("enabling SeDebugPrivilege for the open also failed"),
-    );
+        assert!(
+            !Error::os("kill", e)
+                .report()
+                .to_string()
+                .contains("enabling SeDebugPrivilege"),
+            "{how}"
+        );
+    }
 }
 
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.

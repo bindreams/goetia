@@ -583,7 +583,7 @@ fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() 
 
     assert_eq!(
         crate::backend::kill::kill_failed("frpc", e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to record that process 100 has exited: notifier could not be \
+        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: notifier could not be \
          opened"
     );
 }
