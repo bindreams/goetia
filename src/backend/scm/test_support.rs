@@ -104,6 +104,43 @@ pub(crate) fn set_dacl(
     descriptor.set_dacl_of(&object)
 }
 
+/// An account no test runs as.
+#[cfg(windows)]
+pub(crate) const A_STRANGER: &str = "S-1-5-21-1-2-3-1000";
+
+/// Makes the permissions of the existing file `path` one entry, full access for the account `sid` (SDDL
+/// text), and nothing else, administrators included. The file's owner may still change them.
+#[cfg(windows)]
+pub(crate) fn permit_only(path: &std::path::Path, sid: &str) {
+    set_entries(path, &[("FA", sid)]);
+}
+
+/// [`permit_only`] for an account no test runs as, with the account `sid` left only the rights to read the
+/// attributes and the permissions and to change them: it may not append, which is what a log's account loses
+/// when an install takes its entry out, and a test may still put the permissions back.
+#[cfg(windows)]
+pub(crate) fn withdraw_append(path: &std::path::Path, sid: &str) {
+    // Read the attributes and the permissions, change the permissions, and wait on the handle (every open asks
+    // for the last).
+    set_entries(path, &[("FA", A_STRANGER), ("0x160080", sid)]);
+}
+
+/// Makes the permissions of the existing file `path` `entries`, each rights in SDDL and the account's SID,
+/// set on a handle opened as an install opens a log to set them.
+#[cfg(windows)]
+fn set_entries(path: &std::path::Path, entries: &[(&str, &str)]) {
+    let sddl: String = entries
+        .iter()
+        .map(|(rights, sid)| format!("(A;;{rights};;;{sid})"))
+        .collect();
+    let descriptor = crate::backend::scm::shim::acl::Descriptor::from_sddl(&format!("D:P{sddl}")).unwrap();
+    let (file, made) = descriptor
+        .open_always_for_dacl(path, false)
+        .unwrap_or_else(|e| panic!("open {} to set {sddl}: {e}", path.display()));
+    assert!(!made, "{} was not there", path.display());
+    descriptor.set_dacl_of(&file).unwrap();
+}
+
 /// Makes a directory with a file in it at `path`. Where a file is expected, deleting it as a file fails
 /// for a reason that is no handle and no pending delete, whoever runs it. The tempdir the tests make it
 /// in removes it. A task's records directory names its account without the right to add a subdirectory,
@@ -194,6 +231,24 @@ pub(crate) fn set_reparse_point(dir: &std::path::Path, tag: u32, payload: &[u8])
     assert_ne!(ok, 0, "set the reparse point: {}", std::io::Error::last_os_error());
 }
 
+/// `path` by its 8.3 names where the volume keeps them, and unchanged where it does not.
+#[cfg(windows)]
+pub(crate) fn short(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide = crate::backend::scm::wide::wide_null(path).unwrap();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buf` is `buf.len()` writable units.
+    let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    assert!(
+        0 < len && len < buf.len(),
+        "GetShortPathNameW: {}",
+        std::io::Error::last_os_error()
+    );
+    std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]))
+}
+
 /// Makes the existing empty directory `dir` a mount point (a junction) to the existing `target`, in place:
 /// see [`set_reparse_point`]. `mklink /J` cannot, since it makes the directory.
 #[cfg(windows)]
@@ -218,4 +273,63 @@ pub(crate) fn make_mount_point(dir: &std::path::Path, target: &std::path::Path) 
     payload.extend_from_slice(&print);
     payload.extend_from_slice(&[0, 0]);
     set_reparse_point(dir, IO_REPARSE_TAG_MOUNT_POINT, &payload);
+}
+
+/// The rights the account `sid` has on the file `path` from its permissions alone, as
+/// `GetEffectiveRightsFromAclW` says: what an open for exactly those rights would be granted. The owner's implicit
+/// rights are not counted, which is why a test of them reads the owner.
+#[cfg(windows)]
+pub(crate) fn effective_rights(path: &std::path::Path, sid: &mut [u8]) -> u32 {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let wide = crate::backend::scm::wide::wide_null(path).unwrap();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out-pointers are locals; the descriptor is freed below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS, "read the permissions of {}", path.display());
+    // SAFETY: a zeroed `TRUSTEE_W` is filled by the call below; `sid` outlives the use of the trustee.
+    let mut trustee: TRUSTEE_W = unsafe { std::mem::zeroed() };
+    // SAFETY: `trustee` is a valid out-pointer and `sid` a whole SID.
+    unsafe { BuildTrusteeWithSidW(&mut trustee, sid.as_mut_ptr().cast()) };
+    let mut rights = 0u32;
+    // SAFETY: `dacl` points into `descriptor`, which is live; `trustee` and `rights` are locals.
+    let status = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+    // SAFETY: `descriptor` was allocated by `GetNamedSecurityInfoW`, and is freed once.
+    unsafe { LocalFree(descriptor) };
+    assert_eq!(status, ERROR_SUCCESS, "the rights of the account on {}", path.display());
+    rights
+}
+
+/// Makes the account `sid` (SDDL text) the owner of the existing file `path`, as `icacls /setowner` does, which
+/// takes the privilege an administrator needs for it. The test is elevated.
+#[cfg(windows)]
+pub(crate) fn set_owner(path: &std::path::Path, sid: &str) {
+    let output = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(["/setowner", &format!("*{sid}")])
+        .output()
+        .expect("run icacls.exe");
+    assert!(
+        output.status.success(),
+        "icacls /setowner *{sid} on {}: {}{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
