@@ -721,8 +721,7 @@ fn log_with_an_entry_no_install_names(dir: &TempDir) {
     crate::backend::scm::default_log::ensure(
         dir.path(),
         &id(),
-        &[process_user_sid()],
-        crate::backend::scm::default_log::Existing::Set,
+        &crate::backend::scm::default_log::Naming::alike(&[process_user_sid()]),
     )
     .unwrap();
 }

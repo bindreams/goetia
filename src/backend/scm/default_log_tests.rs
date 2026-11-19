@@ -14,7 +14,7 @@ use crate::backend::scm::folder::logs_folder;
 use crate::backend::scm::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, read_path};
 use crate::backend::scm::sid::{sid_display, sid_from_parts};
 use crate::backend::scm::test_support::{
-    delete_pending, effective_rights, permit_only, set_dacl, set_owner, set_reparse_point, short, withdraw_append,
+    delete_pending, effective_rights, make_mount_point, permit_only, set_dacl, set_owner, set_reparse_point, short, withdraw_append,
 };
 use crate::elevation::test_support::{ThreadTokenReset, process_user_sid, restricted_token_copy};
 use crate::testing::groups::{Group, scm_group};
@@ -33,9 +33,9 @@ fn id() -> Id {
     Id::try_from("nightly").unwrap()
 }
 
-/// [`super::ensure`] as an install that rewrites the file there is.
+/// [`super::ensure`] as an install that rewrites the file there is, and makes one, for `accounts`.
 fn ensure(program_data: &Path, id: &Id, accounts: &[Sid]) -> Result<EnsureOutcome> {
-    super::ensure(program_data, id, accounts, Existing::Set)
+    super::ensure(program_data, id, &Naming::alike(accounts))
 }
 
 /// A `%ProgramData%` with the logs folder made plainly, and the path of the log in it.
@@ -193,7 +193,11 @@ fn a_log_that_is_there_is_left_as_it_is_when_the_install_keeps_it() {
     ensure(dir.path(), &id(), &[old.clone(), new]).unwrap();
     let before = entries_of(&log);
 
-    let outcome = super::ensure(dir.path(), &id(), std::slice::from_ref(&old), Existing::Keep).unwrap();
+    let naming = Naming {
+        made: vec![old.clone()],
+        existing: Existing::Keep,
+    };
+    let outcome = super::ensure(dir.path(), &id(), &naming).unwrap();
 
     assert_eq!(outcome, EnsureOutcome::Kept);
     assert_eq!(entries_of(&log), before, "its permissions are as they were");
@@ -217,7 +221,11 @@ fn a_log_that_is_missing_is_made_even_when_the_install_keeps_what_is_there(#[fix
     let (dir, log) = program_data_with_logs();
     let (old, new) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
 
-    let outcome = super::ensure(dir.path(), &id(), &[old.clone(), new.clone()], Existing::Keep).unwrap();
+    let naming = Naming {
+        made: vec![old.clone(), new.clone()],
+        existing: Existing::Keep,
+    };
+    let outcome = super::ensure(dir.path(), &id(), &naming).unwrap();
 
     assert_eq!(outcome, EnsureOutcome::Made);
     assert_eq!(entries_of(&log), entries_wanted_for(&[old, new]));
@@ -302,13 +310,14 @@ fn a_system_account_keeps_its_full_control_of_the_log() {
     );
 }
 
-/// What the install says when it made the log while the daemon ran: only then, and the words say what to do.
+/// What the install says when it made the log while the daemon ran: only then, only for a daemon whose output goes to
+/// the default log (no `logs:`), and the words say what to do.
 #[skuld::test]
 fn a_log_made_while_the_daemon_runs_is_told_and_no_other_is() {
     let program_data = Path::new(r"C:\ProgramData");
-    let told = |outcome, running| made_while_running(program_data, &id(), outcome, running);
+    let told = |logs: Option<&Path>, outcome, running| made_while_running(program_data, &id(), logs, outcome, running);
 
-    let said = told(EnsureOutcome::Made, true).expect("made while it runs");
+    let said = told(None, EnsureOutcome::Made, true).expect("made while it runs");
 
     assert!(said.contains("nightly"), "{said}");
     assert!(said.contains(r"C:\ProgramData\Goetia\logs\nightly.log"), "{said}");
@@ -319,7 +328,32 @@ fn a_log_made_while_the_daemon_runs_is_told_and_no_other_is() {
         (EnsureOutcome::Set, true),
         (EnsureOutcome::Kept, true),
     ] {
-        assert_eq!(told(outcome, running), None, "{outcome:?}, running: {running}");
+        assert_eq!(told(None, outcome, running), None, "{outcome:?}, running: {running}");
+    }
+    // The daemon's output goes to its own `logs:`, not to the file the install made.
+    assert_eq!(
+        told(Some(Path::new(r"D:\out.log")), EnsureOutcome::Made, true),
+        None,
+        "a daemon with `logs:` writes elsewhere"
+    );
+}
+
+/// A run is up once its shim has reported past its hold on the log: a start in progress is not, since that shim
+/// opens the log the install made, and a stopped service has no run.
+#[skuld::test]
+fn only_a_run_past_its_start_is_up() {
+    use windows_service::service::ServiceState;
+
+    assert_eq!(Run::of(ServiceState::Stopped), Run::Stopped);
+    assert_eq!(Run::of(ServiceState::StartPending), Run::Starting);
+    for up in [
+        ServiceState::Running,
+        ServiceState::StopPending,
+        ServiceState::ContinuePending,
+        ServiceState::PausePending,
+        ServiceState::Paused,
+    ] {
+        assert_eq!(Run::of(up), Run::Up, "{up:?}");
     }
 }
 
@@ -340,6 +374,26 @@ fn a_directory_at_the_log_s_name_is_refused_as_a_directory() {
     assert!(!refused.contains("being deleted"), "{refused}");
 }
 
+/// A link at the log's name that the install's open refuses with access denied, as it does a directory it cannot
+/// open as a file, is a link: it is not followed to what it names, and the install says so.
+#[skuld::test]
+fn a_link_to_a_directory_at_the_log_s_name_is_refused_as_a_link() {
+    let (dir, log) = program_data_with_logs();
+    let target = dir.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::create_dir(&log).unwrap();
+    make_mount_point(&log, &target);
+
+    let refused = ensure(dir.path(), &id(), &[process_user_sid()])
+        .unwrap_err()
+        .report()
+        .to_string();
+
+    assert!(refused.contains(&log.display().to_string()), "{refused}");
+    assert!(refused.contains("is a link"), "{refused}");
+    assert!(!refused.contains("is a directory"), "{refused}");
+}
+
 /// A file whose permissions refuse the install even the attributes is no file with a delete pending: it is what
 /// Windows says of it, for the open that was refused.
 #[skuld::test]
@@ -356,32 +410,73 @@ fn a_log_whose_permissions_refuse_the_install_is_not_called_being_deleted() {
     assert!(!refused.contains("being deleted"), "{refused}");
 }
 
-/// What an install names in the log and whether it rewrites the one there, by its step and by whether a start of
-/// the service is in progress (`START_PENDING`, whose shim may not yet hold the log it opens as the account it
-/// was launched as).
+/// What an install names in the log, in the file it makes and in the one there, by its step and by how far the
+/// service's run is. A start in progress (`START_PENDING`) has a shim that may not yet hold the log it opens as the
+/// account it was launched as; an up run holds the file it opened, but reopens by path, as its own account, one that
+/// was made in its place.
 #[skuld::test]
-fn what_an_install_names_in_the_log_follows_its_step_and_a_start_in_progress() {
+fn what_an_install_names_in_the_log_follows_its_step_and_its_run() {
     let (old, new) = (sid_from_parts(5, &[19]), sid_from_parts(5, &[20]));
     let kept = std::slice::from_ref(&old);
+    let both = vec![old.clone(), new.clone()];
+    let new_alone = Naming::alike(std::slice::from_ref(&new));
 
-    // Before the change lands both accounts are named, whatever a start is doing.
-    for starting in [false, true] {
-        assert_eq!(
-            naming(Step::Widen, starting, kept, &new),
-            (vec![old.clone(), new.clone()], Existing::Set)
-        );
+    // Before the change lands both accounts are named, whatever the run is doing.
+    for run in [Run::Stopped, Run::Starting, Run::Up] {
+        assert_eq!(naming(Step::Widen, run, kept, &new), Naming::alike(&both), "{run:?}");
     }
     // After it, the new account alone: it is the one every later start runs as.
-    assert_eq!(
-        naming(Step::Narrow, false, kept, &new),
-        (vec![new.clone()], Existing::Set)
-    );
+    assert_eq!(naming(Step::Narrow, Run::Stopped, kept, &new), new_alone);
     // With a start in progress the file there is left, and one that has to be made names both.
     assert_eq!(
-        naming(Step::Narrow, true, kept, &new),
-        (vec![old, new.clone()], Existing::Keep)
+        naming(Step::Narrow, Run::Starting, kept, &new),
+        Naming {
+            made: both.clone(),
+            existing: Existing::Keep
+        }
     );
-    assert_eq!(naming(Step::Narrow, true, &[], &new), (vec![new], Existing::Keep));
+    // With a run up the file there is narrowed, as that run holds it; one that has to be made is the run's to
+    // reopen as its own account, so it names both.
+    assert_eq!(
+        naming(Step::Narrow, Run::Up, kept, &new),
+        Naming {
+            made: both,
+            existing: Existing::Set(vec![new.clone()])
+        }
+    );
+    // Where no account changes there is nothing else to name.
+    assert_eq!(naming(Step::Narrow, Run::Up, &[], &new), new_alone);
+    assert_eq!(
+        naming(Step::Narrow, Run::Starting, &[], &new),
+        Naming {
+            made: vec![new],
+            existing: Existing::Keep
+        }
+    );
+}
+
+/// A log the install has to make names what the naming says for a made file, and one that is there is set to what
+/// it says for that: the same naming does both.
+#[skuld::test]
+fn a_log_that_is_made_and_one_that_is_there_are_named_by_their_own_part_of_the_naming(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let (dir, log) = program_data_with_logs();
+    let (old, new) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
+    let naming = Naming {
+        made: vec![old.clone(), new.clone()],
+        existing: Existing::Set(vec![new.clone()]),
+    };
+
+    let made = super::ensure(dir.path(), &id(), &naming).unwrap();
+
+    assert_eq!(made, EnsureOutcome::Made);
+    assert_eq!(entries_of(&log), entries_wanted_for(&[old, new.clone()]));
+
+    let set = super::ensure(dir.path(), &id(), &naming).unwrap();
+
+    assert_eq!(set, EnsureOutcome::Set);
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&new)));
 }
 
 /// A log whose delete is pending, because a run of the daemon still holds a handle on it, keeps its name until
