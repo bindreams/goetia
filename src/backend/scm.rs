@@ -1,5 +1,7 @@
 //! The scm backend.
 
+#[cfg(windows)]
+pub(crate) mod default_log;
 pub mod exit_status;
 #[cfg(windows)]
 pub(crate) mod folder;
@@ -8,6 +10,8 @@ pub mod generate;
 #[cfg_attr(not(windows), allow(dead_code, reason = "off Windows nothing calls it"))]
 pub(crate) mod instance;
 pub(crate) mod kill;
+#[cfg(windows)]
+pub(crate) mod link;
 #[cfg(windows)]
 pub mod manager;
 pub mod parameters;

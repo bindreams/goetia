@@ -19,8 +19,10 @@ use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::{Instance, Registered, TaskApi};
 use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::backend::scm::shim::run::os::Parents;
-use crate::backend::scm::shim::run::os::fake::{FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd};
+use crate::backend::scm::shim::run::os::LogKind;
+use crate::backend::scm::shim::run::os::fake::{
+    FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
+};
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
@@ -544,8 +546,8 @@ fn the_marker_line_is_the_first_line_of_the_log() {
     );
     assert_eq!(run.fake.opened_log_path(0), Path::new(LOGS));
     assert_eq!(
-        run.fake.opened_log_parents(0),
-        Parents::Create,
+        run.fake.opened_log_kind(0),
+        LogKind::Own,
         "the user's own `logs` has its folders made"
     );
     assert_eq!(run.finish(), Vec::<String>::new());
@@ -563,6 +565,51 @@ fn without_logs_the_programs_output_goes_to_nul() {
     assert_eq!(run.finish(), Vec::<String>::new());
 }
 
+/// The marker goes where the program's output goes: a `logs:` equal to the task's default log as written is
+/// the default log, which the shim opens as an install made it (through the handle it holds), not as the user's
+/// own.
+#[skuld::test]
+fn the_marker_goes_to_the_default_log_when_logs_is_the_default_log() {
+    let default = format!(r"{FAKE_LOGS}\{ID}.log");
+    let run = Run::of(&spec_logging_to(Some(&default))).listed().program(exits(0));
+
+    assert_eq!(run.run(), 0);
+
+    assert_eq!(run.fake.calls(Op::OpenLog), 2);
+    for n in 0..2 {
+        assert_eq!(run.fake.opened_log_path(n), Path::new(&default), "open {n}");
+        assert_eq!(run.fake.opened_log_kind(n), LogKind::Default, "open {n}");
+    }
+    assert_eq!(
+        run.fake.opened_log_text(0),
+        "goetia-run 6f9619ff8b86d011b42d00c04fc964ff\n"
+    );
+    assert_eq!(run.finish(), Vec::<String>::new());
+}
+
+/// A marker whose log cannot be opened is said, so that a reader who cannot find the run's output in the log
+/// knows why, even when the program's own open then succeeds. The program's open of the same file is told for its
+/// own cost (`a_log_that_cannot_be_opened_is_reported_for_the_marker_and_for_the_output`).
+#[skuld::test]
+fn a_marker_whose_log_cannot_be_opened_is_reported() {
+    let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(0));
+    run.fake.will_fail_open_log(Path::new(LOGS));
+
+    assert_eq!(run.run(), 0);
+
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!("goetia-shim[{ID}]: open log file {LOGS}: ")),
+        "{failures:?}"
+    );
+    assert!(
+        failures[0].contains("the run marker could not be written"),
+        "{failures:?}"
+    );
+    assert!(!failures[0].contains("will not be captured"), "{failures:?}");
+}
+
 /// With no instance there is no marker to write, since no run can be named, and the program still
 /// runs. A listing that cannot be read is the one way a run has none.
 #[skuld::test]
@@ -578,10 +625,10 @@ fn a_run_with_no_instance_writes_no_marker() {
     run.finish();
 }
 
-/// The marker's open and the program's own open are of one file: when it cannot be opened that is
-/// one fault, said once (by the program's open, which names that its output is not captured).
+/// The marker's open and the program's own open are of one file, and each fails and is told for what it costs:
+/// the marker's line first, then the output's. A failed marker does not silence the output's failure.
 #[skuld::test]
-fn a_log_that_cannot_be_opened_is_reported_once() {
+fn a_log_that_cannot_be_opened_is_reported_for_the_marker_and_for_the_output() {
     let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(0));
     run.fake.will_fail_open_log(Path::new(LOGS));
     run.fake.will_fail_open_log(Path::new(LOGS));
@@ -589,11 +636,17 @@ fn a_log_that_cannot_be_opened_is_reported_once() {
     assert_eq!(run.run(), 0);
 
     let failures = run.finish();
-    assert_eq!(failures.len(), 1, "{failures:?}");
-    assert!(
-        failures[0].starts_with(&format!("goetia-shim[{ID}]: open log file {LOGS}: ")),
-        "{failures:?}"
-    );
+    let [marker, output] = failures.as_slice() else {
+        panic!("the marker's line and the output's: {failures:?}");
+    };
+    for line in [marker, output] {
+        assert!(
+            line.starts_with(&format!("goetia-shim[{ID}]: open log file {LOGS}: ")),
+            "{line}"
+        );
+    }
+    assert!(marker.contains("the run marker could not be written"), "{marker}");
+    assert!(output.contains("this daemon's output will not be captured"), "{output}");
 }
 
 /// A record says when the run began, as a `FILETIME` of the machine's clock.

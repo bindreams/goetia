@@ -57,8 +57,12 @@ pub(super) fn requested(args: &[OsString]) -> Option<&str> {
 
 /// Runs the task `id` and ends the process with the run's code. Never returns.
 pub(super) fn run(id: &str) -> ! {
-    let log = Arc::new(Log::real());
-    let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
+    let real = Arc::new(Real::default());
+    let log = Arc::new(Log::real(Arc::clone(&real)));
+    log.hold_default(id);
+    exit::keep_log(Arc::clone(&log));
+    exit::name_run(id);
+    let supervisor = Supervisor::new(real, Arc::clone(&log));
     // Before anything is read: from here on a stop is held by the bus until the run reaches it.
     if let Err(e) = register_close_handler(&supervisor.bus) {
         log.failure(id, &format!("register the console control handler: {}", Chain(&e)));
@@ -259,20 +263,26 @@ fn own_instance(
 // The run -------------------------------------------------------------------------------------------------------------
 
 /// Writes the run's marker as a line of its own into the log, before the program is spawned: the
-/// program's output is appended after it. A failed write is logged and the program runs. A log that
-/// cannot be opened is not said here: the program's own open of the same file, which follows, reports
-/// it, so one fault is one line.
+/// program's output is appended after it. The log is the one the program's output goes to ([`Log::daemon_log`]):
+/// the default log, through the handle the shim holds on it, when `logs` is that. A log that cannot be opened,
+/// and a write that fails, are logged (an open fault is told once in a launch, [`Log::marker_open_failed`]) and
+/// the program runs.
 fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &InstanceId) {
-    let line = format!("{}\n", instance.marker());
-    let Ok(mut file) = supervisor.os.open_log(logs, supervisor.log.parents_of(id, logs)) else {
-        return;
+    let log = &*supervisor.log;
+    let (path, kind) = log
+        .daemon_log(id, Some(logs))
+        .expect("a `logs` path is the daemon's own log or the default log");
+    let mut file = match supervisor.os.open_log(&path, kind) {
+        Ok(file) => file,
+        Err(e) => return log.marker_open_failed(id, &path, &e),
     };
+    let line = format!("{}\n", instance.marker());
     if let Err(e) = file.write_all(line.as_bytes()) {
-        supervisor.log.failure(
+        log.failure(
             id,
             &format!(
                 "write the run's marker to {}: {}; a reader cannot find this run's output in it",
-                logs.display(),
+                path.display(),
                 Chain(&e)
             ),
         );

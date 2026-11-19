@@ -4,7 +4,8 @@
 //! removes is created, in creation order: locals drop in reverse, so a thing is removed only
 //! after everything that uses it.
 //!
-//! On Windows it also removes a task of the same id and its run records (`testing::remove_task`).
+//! On Windows it also removes a task of the same id and its run records (`testing::remove_task`), and
+//! the default log an install makes for the daemon.
 //!
 //! On macOS it boots the job and a task's timer (`<id>@timer`) out and removes only
 //! `/Library/LaunchDaemons/<id>.plist` and `<id>@timer.plist`, not goetia's staging directory. A
@@ -107,5 +108,12 @@ fn cleanup(id: &str) -> Vec<String> {
     // 1072: `uninstall` may return while the record is only marked for deletion;
     // SCM drops it once its last handle closes. Nothing is left to delete.
     problems.extend(cmd::run_cleanup("sc.exe", &[&["delete", id]], &[1060, 1072]));
+
+    // The default log an install made for the daemon, which an uninstall keeps. Last: the service is
+    // stopped and deleted, so nothing holds it open or writes to it.
+    problems.extend(remove_path_retrying(
+        &super::shim_default_log(&super::program_data(), id),
+        false,
+    ));
     problems
 }

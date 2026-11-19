@@ -81,16 +81,14 @@ pub fn fixture_command_with_exe(exe: &str, mode: &str, args: &[&str]) -> Vec<Str
 /// Cleanup for a shim-hosted service `id`, in this order:
 /// 1. the product's `uninstall`, which disables the service, waits out a start that has begun,
 ///    stops it and deletes it. Its wait has no bound: a shim that never stops is a hung test;
-/// 2. a [`support::ServiceGuard`]'s `sc stop` and `sc delete`, for what `uninstall` does not own;
-/// 3. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
+/// 2. a [`support::ServiceGuard`]'s `sc stop` and `sc delete`, for what `uninstall` does not own, and
+///    then the default log an install made, which `uninstall` keeps.
 ///
-/// Step 1 is this type's `drop`; steps 2 and 3 are its fields, which drop in declaration order. A
-/// failure prints a line and never panics; unless `uninstall` confirmed the shim stopped, an
-/// existing log is kept and named.
+/// Step 1 is this type's `drop`; step 2 is its field, which drops after it. A failure prints a line and
+/// never panics.
 pub struct ShimGuard {
     id: String,
     _sc: support::ServiceGuard,
-    log: LeftoverLog,
 }
 
 impl ShimGuard {
@@ -98,34 +96,21 @@ impl ShimGuard {
         Self {
             id: id.to_string(),
             _sc: support::ServiceGuard::new(id),
-            log: LeftoverLog {
-                id: id.to_string(),
-                path: support::shim_default_log(&support::program_data(), id),
-                fate: Fate::Remove,
-            },
         }
     }
 
-    /// Step 1, and what it decides for the log.
-    fn uninstall(&self) -> Fate {
+    /// Step 1.
+    fn uninstall(&self) {
         use goetia::error::Error;
         use goetia::manager::ServiceManager as _;
 
-        let fail = |step: &str, e: &Error| {
-            eprintln!("ShimGuard[{}]: {step}: {}", self.id, e.report());
-            Fate::Keep(format!("{step} failed"))
-        };
+        let fail = |step: &str, e: &Error| eprintln!("ShimGuard[{}]: {step}: {}", self.id, e.report());
         let id = match goetia::spec::Id::try_from(self.id.as_str()) {
             Ok(id) => id,
             Err(e) => return fail("parse the id", &e),
         };
         match Scm::new().uninstall(&id) {
-            Ok(()) | Err(Error::NotInstalled { .. }) => Fate::Remove,
-            // Not goetia's, so nothing confirms its shim stopped; the `sc` guard owns the service.
-            Err(e @ Error::Foreign { .. }) => {
-                eprintln!("ShimGuard[{}]: uninstall: {}", self.id, e.report());
-                Fate::Keep("the service is not goetia's".to_string())
-            }
+            Ok(()) | Err(Error::NotInstalled { .. }) => {}
             Err(e) => fail("uninstall", &e),
         }
     }
@@ -133,42 +118,7 @@ impl ShimGuard {
 
 impl Drop for ShimGuard {
     fn drop(&mut self) {
-        self.log.fate = self.uninstall();
-    }
-}
-
-/// What [`LeftoverLog`] does with its file.
-enum Fate {
-    Remove,
-    /// `uninstall` did not confirm the shim stopped: the id did not parse, `uninstall` failed, or
-    /// the service is not goetia's.
-    Keep(String),
-}
-
-/// The default log of the shim of `id`, which [`ShimGuard`]'s `drop` decides the [`Fate`] of.
-struct LeftoverLog {
-    id: String,
-    path: PathBuf,
-    fate: Fate,
-}
-
-impl Drop for LeftoverLog {
-    fn drop(&mut self) {
-        match &self.fate {
-            Fate::Keep(why) => {
-                let problem = match self.path.try_exists() {
-                    Ok(false) => return,
-                    Ok(true) => format!("left {}: {why}", self.path.display()),
-                    Err(e) => format!("left {}, if it exists ({e}): {why}", self.path.display()),
-                };
-                eprintln!("ShimGuard[{}]: {problem}", self.id);
-            }
-            Fate::Remove => {
-                if let Some(problem) = support::cleanup::remove_path_retrying(&self.path, false) {
-                    eprintln!("ShimGuard[{}]: left behind: {problem}", self.id);
-                }
-            }
-        }
+        self.uninstall();
     }
 }
 

@@ -82,6 +82,54 @@ pub(crate) fn status_once_ended(mgr: &Scm, id: &Id) -> TaskStatus {
     found.expect("a status was read")
 }
 
+/// An install that finds a task up to date still sees that its default log is there: see
+/// `managed::an_up_to_date_install_makes_a_deleted_default_log_again`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_of_a_task_makes_a_deleted_default_log_again(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let spec = task_as(id, User::Root, Some(SCHEDULE));
+    let log = support::shim_default_log(&support::program_data(), id.as_str());
+    mgr.install(&spec, false).expect("install");
+    assert!(log.is_file(), "the install made {}", log.display());
+    std::fs::remove_file(&log).unwrap_or_else(|e| panic!("delete {}: {e}", log.display()));
+
+    let again = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(log.is_file(), "the install made {} again", log.display());
+}
+
+/// A `logs:` in goetia's log folder is refused at a task's install, as at a service's
+/// (`managed::a_logs_in_goetias_log_folder_is_refused_at_install`). Nothing is installed.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_logs_in_goetias_log_folder_is_refused_at_a_tasks_install(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    for named in [id.as_str(), "another-daemon"] {
+        let logs = support::shim_default_log(&support::program_data(), named);
+        let spec = task_spec(
+            id,
+            vec![support::current_exe_str()],
+            Some(SCHEDULE),
+            User::Root,
+            Some(&logs),
+        );
+
+        let refused = mgr.install(&spec, false).expect_err("a `logs:` in the logs folder");
+
+        let said = refused.report().to_string();
+        assert!(said.contains("is inside goetia's own log folder"), "{named}: {said}");
+        let absent = mgr.status(id).expect_err("nothing was installed");
+        assert!(
+            matches!(absent.cause(), Error::NotInstalled { .. }),
+            "{named}: {absent:?}"
+        );
+    }
+}
+
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_task_installs_and_uninstalls(#[fixture(scm_group)] _group: &Group) {
     let guard = TaskGuard::new();

@@ -1089,6 +1089,39 @@ that, or if the daemon's log cannot be opened, it writes to
 `%ProgramData%\Goetia\logs\<id>.log`. It also writes each to the Windows Event
 Log.
 
+`%ProgramData%\Goetia\logs` is readable by SYSTEM and Administrators only, so
+reading `<id>.log` needs an elevated shell. `goetia daemon install` makes the
+file, and the account the daemon runs as may only append to it; the shim never
+makes it, so a file that is missing is a failed write, and the Event Log still
+has the line; `goetia daemon install` makes it again, even when the daemon is
+otherwise up to date. `goetia daemon uninstall` keeps the file.
+
+The shim holds `<id>.log` open while it runs, and a service with no `logs:` gives its daemon a copy of that handle
+for its output when it is started. The shim never makes the file: it opens the name again when the file it holds
+was deleted, or when it holds none (an open failed). So an install that changes the account (SCM does not restart
+the service) leaves the running shim its log. An install that changes the account while the service is starting, or
+has to make the file for a running service, leaves the old account named beside the new one in the file's
+permissions until the next install.
+
+If you delete `<id>.log` while the service runs, the daemon of a service with no `logs:` goes on writing into the
+deleted file until you restart it, as with any file a running program holds. The shim's own lines go to the Event
+Log; those it writes to `<id>.log` go to the new file once `goetia daemon install` makes one, except for a run
+started before an earlier install changed the account, until that run restarts. Windows frees the name at once on
+current NTFS. Where the delete is deferred until every handle on the file closes, the shim's included, the name
+stays and `goetia daemon install` fails saying so: stop the daemon, then install again.
+
+A `logs:` that is inside `%ProgramData%\Goetia\logs` is refused at install, whichever file it
+names (the folder is the shim's default logs, which a daemon's own account cannot make a file in).
+Remove `logs:` to use the default log, or name a file elsewhere. A manifest that named
+`%ProgramData%\Goetia\logs\<id>.log` as its `logs:` must drop it; its output then goes to the same
+file. A service installed with that `logs:` by an earlier goetia keeps writing the default log.
+
+Goetia before this change left `%ProgramData%\Goetia\logs` readable by every
+user, and `goetia daemon install` refuses a folder it did not make this way. To
+upgrade, stop the services an earlier goetia installed, delete
+`%ProgramData%\Goetia\logs` (keep any log you want first), and run
+`goetia daemon install` for each daemon again.
+
 `sc query` shows the difference between your command failing and the shim
 failing:
 

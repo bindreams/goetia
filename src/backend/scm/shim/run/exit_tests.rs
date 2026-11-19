@@ -7,8 +7,8 @@ use skuld::TempDir;
 
 use super::*;
 use crate::backend::scm::shim::run::logging::Log;
-use crate::backend::scm::shim::run::os::fake::FakeGuard;
-use crate::backend::scm::shim::run::os::{Channels, Parents, Real, Severity};
+use crate::backend::scm::shim::run::os::fake::{ChannelCall, FAKE_LOGS, FakeGuard};
+use crate::backend::scm::shim::run::os::{Channels, LogKind, Real, Severity};
 use crate::backend::scm::shim::run::service::finish;
 
 /// Names what a child of this test binary does: a code to end itself with, or an index into [`reports`].
@@ -70,8 +70,12 @@ impl<'a> Children<'a> {
 struct FileChannels;
 
 impl Channels for FileChannels {
-    fn append(&self, path: &Path, line: &str, parents: Parents) -> io::Result<()> {
-        Real.append(path, line, parents)
+    fn hold_default(&self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
+        Real::default().append(path, line, kind)
     }
 
     fn event_log(&self, _severity: Severity, _line: &str) {}
@@ -168,7 +172,8 @@ fn finish_returns_when_the_stopped_report_succeeded() {
 /// process itself, with the code it was to report, after it logged why.
 ///
 /// The directory is the parent's, made after the child's branch: a child ends itself without
-/// dropping anything, so it creates nothing.
+/// dropping anything, so it creates nothing. The default log is the parent's too, as an install makes
+/// it: the shim only opens it.
 #[skuld::test]
 fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed() {
     if child_mode().is_some() {
@@ -179,10 +184,82 @@ fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed
     }
 
     let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(dir.path().join("frpc.log"), "").expect("the log an install made");
     let code = Children::of("finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed")
         .exit_logging(0, dir.path());
 
     assert_eq!(code, Some(Reported::incomplete_stop().process_exit_code()));
     let logged = std::fs::read_to_string(dir.path().join("frpc.log")).expect("the child's log");
     assert!(logged.contains("report SERVICE_STOPPED to SCM: refused"), "{logged}");
+}
+
+/// The failure an end that cannot terminate the process logs goes under the run's id, to the run's default log
+/// (through the handle the run holds on it), not under the shim's table name, whose log no install makes.
+#[skuld::test]
+fn an_end_that_cannot_terminate_the_process_is_logged_to_the_runs_default_log() {
+    let fake = FakeGuard::new();
+    let line = "goetia-shim[svc]: end the shim's process with code 7: refused";
+
+    end_failure(&fake.log(), "svc", 7, &io::Error::other("refused"));
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![
+            ChannelCall::Append {
+                path: Path::new(FAKE_LOGS).join("svc.log"),
+                line: line.to_string(),
+                kind: LogKind::Default,
+                ok: true,
+            },
+            ChannelCall::EventLog {
+                severity: Severity::Error,
+                line: line.to_string(),
+            },
+        ]
+    );
+}
+
+/// A run whose log is kept before its name is known (`service_main`: SCM's name may be unusable) logs the end's
+/// failure into that log under the shim's table name, and into no other: a second log built for the end would
+/// tell the machine's faults, which the first told, again.
+#[skuld::test]
+fn an_end_that_fails_before_the_run_is_named_goes_to_the_kept_log_under_the_table_name() {
+    let fake = FakeGuard::new();
+    let run = Run::new(fake.log());
+    let line = "goetia-shim[goetia-shim]: end the shim's process with code 7: refused";
+
+    end_failure_in(Some(&run), 7, &io::Error::other("refused"));
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![
+            ChannelCall::Append {
+                path: Path::new(FAKE_LOGS).join("goetia-shim.log"),
+                line: line.to_string(),
+                kind: LogKind::Default,
+                ok: true,
+            },
+            ChannelCall::EventLog {
+                severity: Severity::Error,
+                line: line.to_string(),
+            },
+        ]
+    );
+}
+
+/// Once the run's id is known it is the id the end's failure is logged under.
+#[skuld::test]
+fn an_end_that_fails_after_the_run_is_named_goes_under_its_id() {
+    let fake = FakeGuard::new();
+    let run = Run::new(fake.log());
+    run.name("svc");
+
+    end_failure_in(Some(&run), 7, &io::Error::other("refused"));
+
+    let calls = fake.take_channel_calls();
+    let [ChannelCall::Append { path, line, .. }, ChannelCall::EventLog { .. }] = calls.as_slice() else {
+        panic!("a line to the file and one to the Event Log: {calls:?}");
+    };
+    assert_eq!(path, &Path::new(FAKE_LOGS).join("svc.log"));
+    assert!(line.starts_with("goetia-shim[svc]: "), "{line}");
 }
