@@ -34,7 +34,6 @@ pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
 
-/// What a [`Fake::will_fail_hold`] hold fails with.
 pub(crate) const HOLD_FAILED: &str = "the log could not be held (fake)";
 
 /// A refused [`Spawned::kill`].
@@ -474,7 +473,6 @@ impl Fake {
         lock(&self.shared.state).opened_logs[n].0.clone()
     }
 
-    /// Which kind of log the `n`th log opened was asked for.
     pub(crate) fn opened_log_kind(&self, n: usize) -> LogKind {
         lock(&self.shared.state).opened_logs[n].1
     }

@@ -34,7 +34,7 @@
 //! through the shim host begins (a service or a task, a change between them included) and by
 //! [`Runs::ensure_roots`].
 
-mod dir;
+pub(in crate::backend::scm) mod dir;
 mod files;
 
 use std::collections::BTreeSet;
@@ -241,7 +241,6 @@ impl Runs {
         ensure_as_made(&self.root, &Descriptor::for_folder()?)
     }
 
-    /// The `%ProgramData%` the records are under.
     pub(crate) fn program_data(&self) -> &Path {
         let goetia = self.root.parent().expect("`runs` is in `Goetia`");
         goetia.parent().expect("`Goetia` is in `%ProgramData%`")

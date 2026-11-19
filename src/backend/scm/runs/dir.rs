@@ -50,7 +50,7 @@ use crate::backend::scm::wide::wide_null;
 
 /// What every handle in a records directory shares: all of it. A holder that shared less would make
 /// another party's open, the account's or the removal's, a sharing violation of its own.
-pub(super) const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+pub(in crate::backend::scm) const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
 /// What the handle on the directory is opened for: to list it, to make files in it and to open its
 /// entries. Deleting an entry needs no more of it ([`files::delete`](super::files::delete)), and the
@@ -76,7 +76,7 @@ pub(super) struct Listed {
 }
 
 /// A directory open for the elevated side's work on it, or for the account's own writes.
-pub(super) struct Dir {
+pub(in crate::backend::scm) struct Dir {
     file: File,
     path: PathBuf,
     link: bool,
@@ -86,7 +86,7 @@ impl Dir {
     /// Opens the directory `path` without following a link at it, and refuses one: a link where goetia made
     /// a directory is not goetia's ([`ErrorKind::NotADirectory`](io::ErrorKind::NotADirectory)). A directory
     /// that is not there is [`NotFound`](io::ErrorKind::NotFound).
-    pub(super) fn open(path: &Path) -> io::Result<Dir> {
+    pub(in crate::backend::scm) fn open(path: &Path) -> io::Result<Dir> {
         Self::open_with(path, ACCESS)?.not_a_link()
     }
 
@@ -219,7 +219,7 @@ impl Dir {
     /// [`SYNCHRONOUS_IO`]; one for a delete, a rename or a query has neither
     /// ([`files::delete`](super::files::delete)). The error is the `NTSTATUS`, which tells a pending delete
     /// from a refusal where the Win32 code does not; [`Dir::open_error`] words it.
-    pub(super) fn open_in(
+    pub(in crate::backend::scm) fn open_in(
         &self,
         name: &OsStr,
         access: u32,

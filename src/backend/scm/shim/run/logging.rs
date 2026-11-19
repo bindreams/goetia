@@ -16,9 +16,7 @@
 //!
 //! **The default log is told by its text.** A daemon writes the default log when its `logs:` is unset, or is
 //! the default path as written ([`Log::daemon_log`]): an install refuses a `logs:` in the folder of the
-//! default logs ([`default_log::refuse_logs_in_folder`]), but a service an earlier version installed may carry
-//! that one, and opened as the user's own it would be refused by the file's permissions. No other path is
-//! compared, and none is looked up.
+//! default logs ([`default_log::refuse_logs_in_folder`]). No other path is compared, and none is looked up.
 //!
 //! **Event Log.** Every failure also goes to the Windows Event Log, whose default ACL is far more
 //! permissive than a folder's, so it is the more likely of the two to still work exactly when the
@@ -126,7 +124,6 @@ impl Log {
         );
     }
 
-    /// [`Log::open_failed`] for the open of the run's marker, which has its own consequence.
     pub(crate) fn marker_open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
         self.tell_open_failure(
             id,

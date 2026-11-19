@@ -72,14 +72,9 @@ pub(crate) enum Severity {
 
 /// Where the shim's failure and warning lines go.
 pub(crate) trait Channels: Send + Sync {
-    /// Open the default log at `path` for the rest of the shim's run, as [`LogKind::Default`] says, and hold it:
-    /// a later [`Channels::append`] or [`Os::open_log`] of that path as the default log goes through this
-    /// handle. A handle keeps the rights it was opened with, so the shim's lines and the daemon's output are not
-    /// cut off when an install that changes the account takes the account out of the file's permissions while
-    /// the shim still runs. Called once, at the shim's start. A held log whose file was deleted (the README's
-    /// recovery does, and installs again) is opened again by its path, and that file held, the next time the
-    /// log is used. Where the log cannot be opened (it is not there) nothing is held, and a use opens the path
-    /// as it is, and fails likewise.
+    /// Opens the default log at `path` as [`LogKind::Default`] and holds it for the run, so later appends and
+    /// `open_log` of that path share one handle that survives an install taking the account out of the file's
+    /// permissions. Held again by path if the file was deleted. Nothing is held if it cannot be opened.
     fn hold_default(&self, path: &Path) -> io::Result<()>;
 
     /// Append `line` and a newline to the file at `path`, opening it as `kind` says (the held default log is
@@ -112,10 +107,9 @@ impl Real {
             if !default_log::is_deleted(file)? {
                 return Ok(Arc::clone(file));
             }
-            // Released before the open, so that an open that fails leaves no handle of the shim's own on the deleted
-            // file: while one is open the name is still the file's, and an install cannot make the log again. A
-            // daemon's output handle is a clone of this one and keeps the name until the daemon exits; the install
-            // says so ([`default_log::ensure`]).
+            // Released first: where the delete is not a POSIX one, a handle on the deleted file keeps its name
+            // and blocks the install's remake. A daemon's output handle is a clone of this one, and a new file made
+            // meanwhile is not what it writes ([`default_log::made_while_running`]).
             held.remove(path);
         }
         let file = Arc::new(default_log::open_for_append(path)?);
@@ -189,7 +183,6 @@ pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
     })
 }
 
-/// Open the daemon's own log `path` for append, its folders and the file made.
 fn open_own(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

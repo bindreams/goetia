@@ -57,10 +57,8 @@ pub(super) fn requested(args: &[OsString]) -> Option<&str> {
 
 /// Runs the task `id` and ends the process with the run's code. Never returns.
 pub(super) fn run(id: &str) -> ! {
-    // One `Real` for the run, as a service's shim has (`service::service_main`).
     let real = Arc::new(Real::default());
     let log = Arc::new(Log::real(Arc::clone(&real)));
-    // Held for the whole run, as a service's shim does (`service::run_service`).
     log.hold_default(id);
     exit::keep_log(Arc::clone(&log));
     exit::name_run(id);

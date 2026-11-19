@@ -80,8 +80,9 @@ fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32>
 }
 
 fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
-    // Before anything is read or registered: an install that changes the account can take it out of the log's
-    // permissions from the moment it changes the service, and a handle opened now keeps working.
+    // Before the control handler, and so before the first status this service reports: an install that changes
+    // the account leaves the log's permissions as they are while SCM reads this service `START_PENDING`, and
+    // narrows them once it reads any other state, since a handle opened now keeps working.
     log.hold_default(id);
     exit::name_run(id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
@@ -114,8 +115,7 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
 }
 
 /// From now on the shim's failures go to the daemon's own log, interleaved with its output: the spec's
-/// `logs`, tried before the default; with none set, or one that is the default log, the default log is the
-/// daemon's own and is always tried. Call right after the spec decodes.
+/// `logs`, tried before the default. Call right after the spec decodes.
 pub(super) fn set_daemon_log(log: &Log, id: &str, spec: &DaemonSpec) {
     if let Some((path, LogKind::Own)) = log.daemon_log(id, spec.common().logs.as_deref()) {
         log.set_daemon_log(path);

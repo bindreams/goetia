@@ -18,7 +18,6 @@ use super::service::TABLE_NAME;
 /// What the service thread reports to SCM, for the main thread's exit.
 static EXIT: OnceLock<Reported> = OnceLock::new();
 
-/// The run, for [`end_process`].
 static RUN: OnceLock<Run> = OnceLock::new();
 
 /// The log the shim writes through and the id it logs under, once the id is known. The log holds the handle on
@@ -86,7 +85,6 @@ fn end_failure_in(run: Option<&Run>, code: i32, e: &std::io::Error) {
     }
 }
 
-/// The line for an end that failed with `e`: under `id`, into `log`.
 fn end_failure(log: &Log, id: &str, code: i32, e: &std::io::Error) {
     log.failure(id, &format!("end the shim's process with code {code}: {}", Chain(e)));
 }

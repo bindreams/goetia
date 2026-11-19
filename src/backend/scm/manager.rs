@@ -748,10 +748,15 @@ impl Backend for Scm {
     ) -> Result<()> {
         match (definition, snapshot) {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
-                make_default_log(spec, definition, None, &[])
+                make_default_log(spec, definition, None, &[], default_log::Step::Narrow)
             }
-            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_default_log(installed),
-            // An install that changes a daemon's kind writes, and is not up to date.
+            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => {
+                let made = task_default_log(installed)?;
+                default_log::tell_if_made_while_running(&program_data()?, installed.id(), made, || {
+                    Ok(self.task_run_state(installed)? == State::Running)
+                });
+                Ok(())
+            }
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
             | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
         }
@@ -1071,14 +1076,9 @@ fn registered_account(cfg: &ServiceConfig) -> Option<String> {
     cfg.account_name
         .as_ref()
         .map(|a| a.to_string_lossy().into_owned())
-        // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
-        // doc comment) forces a live `LocalSystem` account to be written back
-        // as some spelling of it, not `None` — canonicalise it through the
-        // same table `generate::registration` uses so a `LocalSystem`
-        // service (whatever spelling SCM's own readback happens to use)
-        // reads as up-to-date rather than a permanent phantom diff. This is
-        // the `LocalSystem` row of that same table, folded in rather than a
-        // one-off `LocalSystem`-only filter.
+        // A live LocalSystem account is written back as a spelling of it, not `None` (ChangeServiceConfigW reads
+        // NULL as "unchanged"), canonicalised through `generate::registration`'s table so it never reads as a
+        // phantom diff.
         .and_then(|a| generate::canonical_account(&a))
 }
 
@@ -1191,10 +1191,11 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
 /// service exists, since a virtual account's SID resolves only then, before any start. An update that
 /// changes the account names the registered account and the new one before the configuration changes, and the
-/// new one alone once it has landed, so that a change that fails leaves the account the service still runs as
-/// its log, and the next install corrects what a failure left. The names come from what install knows (the
-/// snapshot's account, the new account), never from the file. A failure of the log after a create leaves the
-/// new service, and the next `install` finds it up to date and makes the log ([`Backend::ensure_beside`]).
+/// new one alone once it has landed, unless a start is in progress ([`default_log::naming`]), so that a change that
+/// fails leaves the account the service still runs as its log, and the next install corrects what a failure
+/// left. The names come from what install knows (the snapshot's account, the new account), never from the file.
+/// A failure of the log after a create leaves the new service, and the next `install` finds it up to date and
+/// makes the log ([`Backend::ensure_beside`]).
 /// `Parameters` follows create/update immediately, minimizing the window in which a crash leaves a service
 /// with no marker; a failure in the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the start type the service has, rather
@@ -1206,18 +1207,30 @@ fn apply(
     installed: Option<&ScmSnapshot>,
 ) -> Result<()> {
     let gated = service_gate(reg, written)?;
+    let mut before = None;
     if let Some(installed) = installed {
         let config = installed.config()?;
-        let before = accounts_kept_before_change(
+        before = accounts_kept_before_change(
             generate::hosted(spec),
             &registered_account(config),
             &reg.account,
             || registered_account_sid(config),
         )?;
-        make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice())?;
+        let step = if before.is_some() {
+            default_log::Step::Widen
+        } else {
+            default_log::Step::Narrow
+        };
+        make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
     }
     apply_gated(reg, gated.password, installed.is_none())?;
-    make_default_log(spec, reg, gated.checked.as_ref(), &[])
+    make_default_log(
+        spec,
+        reg,
+        gated.checked.as_ref(),
+        before.as_slice(),
+        default_log::Step::Narrow,
+    )
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of
@@ -1237,7 +1250,6 @@ fn accounts_kept_before_change(
     }
 }
 
-/// What [`service_gate`] settled for a service.
 struct Gated {
     /// What `CreateServiceW` and `ChangeServiceConfigW` log on with: a real user's password.
     password: Option<String>,
@@ -1300,10 +1312,17 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
 /// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
 /// account up again), else the one the spec gave as a SID, else the registered name's. `kept` are the accounts
-/// it names beside it, those the service may still run as. Call it once the service exists (a virtual
-/// account's SID resolves only then) and before it starts, or for the account an update is about to give a
-/// service that exists.
-fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&Sid>, kept: &[Sid]) -> Result<()> {
+/// it names beside it, those the service may still run as, at `step` ([`default_log::naming`]): a narrowing asks
+/// SCM whether a start is in progress, which a shim holds its log from before its first status report. Call it once
+/// the service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
+/// update is about to give a service that exists.
+fn make_default_log(
+    spec: &DaemonSpec,
+    reg: &ScmRegistration,
+    checked: Option<&Sid>,
+    kept: &[Sid],
+    step: default_log::Step,
+) -> Result<()> {
     if !generate::hosted(spec) {
         return Ok(());
     }
@@ -1311,8 +1330,27 @@ fn make_default_log(spec: &DaemonSpec, reg: &ScmRegistration, checked: Option<&S
         Some(sid) => sid.clone(),
         None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
     };
-    let accounts = [kept, &[account]].concat();
-    default_log::ensure(&program_data()?, &spec.common().id, &accounts)
+    let starting = step == default_log::Step::Narrow && service_state(&reg.name)? == WinState::StartPending;
+    let (accounts, existing) = default_log::naming(step, starting, kept, &account);
+    let program_data = program_data()?;
+    let id = &spec.common().id;
+    let made = default_log::ensure(&program_data, id, &accounts, existing)?;
+    default_log::tell_if_made_while_running(&program_data, id, made, || {
+        Ok(service_state(&reg.name)? != WinState::Stopped)
+    });
+    Ok(())
+}
+
+/// The state SCM reports for the service `name`.
+fn service_state(name: &str) -> Result<WinState> {
+    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
+    let service = scm
+        .open_service(name, ServiceAccess::QUERY_STATUS)
+        .map_err(|e| to_error(&format!("open service `{name}` to read its state"), e))?;
+    service
+        .query_status()
+        .map(|status| status.current_state)
+        .map_err(|e| to_error(&format!("query status for `{name}`"), e))
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it

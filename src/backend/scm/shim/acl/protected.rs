@@ -48,12 +48,13 @@ mod system {
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SetKernelObjectSecurity,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
+        SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_ALWAYS, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+        OPEN_ALWAYS, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
 
     use super::super::{ObjectSecurity, system::describe};
@@ -158,12 +159,13 @@ mod system {
             Self::from_sddl(&sddl)
         }
 
-        /// Opens the file `path` for `READ_CONTROL`, `WRITE_DAC` and attribute reads without following a link at
-        /// it, making it empty with this descriptor when it is not there (`OPEN_ALWAYS`); the flag says it was made,
-        /// and so has the descriptor's permissions already. What is there is not changed:
-        /// [`Descriptor::set_dacl_of`] on the handle sets its permissions. The file is shared for everything,
+        /// Opens the file `path` for `READ_CONTROL`, `WRITE_DAC`, attribute reads and, with `owner`, `WRITE_OWNER`,
+        /// without following a link at it, making it empty with this descriptor when it is not there
+        /// (`OPEN_ALWAYS`); the flag says it was made, and so has the descriptor's owner and permissions already.
+        /// What is there is not changed: [`Descriptor::set_dacl_of`] on the handle sets its permissions, and with
+        /// `owner`, [`Descriptor::set_owner_and_dacl_of`] its owner too. The file is shared for everything,
         /// so a shim that holds it open does not stop this.
-        pub(crate) fn open_always_for_dacl(&self, path: &Path) -> io::Result<(File, bool)> {
+        pub(crate) fn open_always_for_dacl(&self, path: &Path, owner: bool) -> io::Result<(File, bool)> {
             let wide = wide_null(path)?;
             let attributes = self.attributes();
             // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live for the
@@ -171,7 +173,7 @@ mod system {
             let handle = unsafe {
                 CreateFileW(
                     wide.as_ptr(),
-                    READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                    READ_CONTROL | WRITE_DAC | if owner { WRITE_OWNER } else { 0 } | FILE_READ_ATTRIBUTES,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     &attributes,
                     OPEN_ALWAYS,
@@ -284,14 +286,22 @@ mod system {
         /// which reaches through a hard link in the folder to its target wherever that is; the kernel's
         /// call does not.
         pub(crate) fn set_dacl_of(&self, file: &File) -> io::Result<()> {
-            // SAFETY: `file` is open with `WRITE_DAC`, and `self.raw` is a live descriptor.
-            let set = unsafe {
-                SetKernelObjectSecurity(
-                    file.as_raw_handle() as HANDLE,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    self.raw,
-                )
-            };
+            self.set_of(file, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION)
+        }
+
+        /// [`Descriptor::set_dacl_of`], and the owner this descriptor names. `file` must have been opened with
+        /// `WRITE_DAC` and `WRITE_OWNER`; the token must be able to assign the owner (an elevated administrator's can
+        /// assign Administrators).
+        pub(crate) fn set_owner_and_dacl_of(&self, file: &File) -> io::Result<()> {
+            self.set_of(
+                file,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            )
+        }
+
+        fn set_of(&self, file: &File, information: u32) -> io::Result<()> {
+            // SAFETY: `file` is open with the access `information` needs, and `self.raw` is a live descriptor.
+            let set = unsafe { SetKernelObjectSecurity(file.as_raw_handle() as HANDLE, information, self.raw) };
             if set == 0 {
                 return Err(io::Error::last_os_error());
             }
