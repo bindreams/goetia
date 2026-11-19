@@ -601,10 +601,10 @@ fn image_text(raw: &RegValue) -> Option<String> {
 #[path = "registry_tests.rs"]
 mod registry_tests;
 
-/// The key of the `Goetia` Event Log source under `HKEY_LOCAL_MACHINE` ([`register_event_source`]).
+/// The key of the `Goetia` Event Log source under `HKEY_LOCAL_MACHINE`.
 pub const EVENT_SOURCE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\EventLog\Application\Goetia";
 
-/// What [`register_event_source`] writes as the source's `TypesSupported`: errors, warnings and information.
+/// What `register_event_source` writes as the source's `TypesSupported`: errors, warnings and information.
 pub const EVENT_TYPES_SUPPORTED: u32 = 7;
 
 /// Register the `Goetia` Event Log source so Event Viewer can render what the
