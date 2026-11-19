@@ -130,7 +130,7 @@ fn format_status_line(daemon: &DaemonReport) -> String {
             "{}: {} ({}, enabled={}, pid={pid}, last-result={}, last-run={}, next-run={})",
             daemon.id,
             daemon.state,
-            DaemonKind::Task.as_str(),
+            daemon.kind.as_str(),
             daemon.enabled,
             or_dash(daemon.last_result.map(|exit| exit.to_string())),
             or_dash(daemon.last_run.clone()),

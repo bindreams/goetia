@@ -2608,12 +2608,9 @@ fn status_json_of_a_task_carries_type_results_and_times() {
 }
 
 /// `status <id>`, `status` and `list` all write a task's times with the offset of the system zone at that
-/// instant (on macOS, the zone the backend computes `next-run` in), not UTC.
+/// instant, not UTC.
 #[skuld::test]
 fn every_form_writes_a_tasks_times_in_the_system_zone() {
-    #[cfg(target_os = "macos")]
-    let zone = goetia::testing::system_zone().expect("the system time zone");
-    #[cfg(not(target_os = "macos"))]
     let zone = jiff::tz::TimeZone::system();
 
     let fake = Fake::new();

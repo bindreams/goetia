@@ -285,14 +285,9 @@ pub(crate) fn from_index(index: &InstalledIndex, zone: &TimeZone) -> Report {
 }
 
 /// The zone a document's times are written in, which a caller resolves once per document so every entry carries
-/// the same offset rule. On macOS it is the zone the backend computed `next-run` in
-/// (`launchd::next::system_zone`, read from `/etc/localtime`), so the time is printed in the zone it was computed
-/// in; where that cannot be read, and elsewhere, `jiff`'s own.
+/// the same offset rule. It is `jiff`'s system zone on every platform, which honours `TZ`; a printed time is an
+/// exact instant whatever offset it carries.
 pub(crate) fn system_zone() -> TimeZone {
-    #[cfg(target_os = "macos")]
-    if let Ok(zone) = crate::backend::launchd::next::system_zone() {
-        return zone;
-    }
     TimeZone::system()
 }
 
