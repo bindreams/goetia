@@ -269,8 +269,7 @@ impl Runs {
     }
 
     /// Makes the directory, in `runs`, which [`Runs::ensure_roots`] saw to, with permissions that name
-    /// `principals`, the accounts the task runs as (more than one only while it changes from one account
-    /// to another); or, when it is there, sets its permissions to name them
+    /// `principals`, the accounts the task runs as; or, when it is there, sets its permissions to name them
     /// ([`Descriptor::set_dacl_of`]: the directory alone, never what is in it). Call it on every write of
     /// the task, so that a reinstall that changes the account can still write.
     ///
@@ -278,8 +277,9 @@ impl Runs {
     /// refused ([`io::ErrorKind::NotADirectory`]) and nothing is written to what it points to; the
     /// uninstall removes it ([`Runs::remove_all`]).
     ///
-    /// It also takes away a removal's marker that an uninstall left when it died ([`Runs::remove_all`]):
-    /// the task is installed again, and its `run` must not back off.
+    /// It also takes away a removal's marker that an uninstall left when it died ([`Runs::remove_all`]), and the
+    /// one an account change placed ([`Runs::close`]) once it has deleted the old registration: the task is
+    /// installed again, and its `run` must not back off.
     pub(crate) fn ensure(&self, principals: &[Sid]) -> io::Result<()> {
         let permissions = Descriptor::for_runs(&distinct(principals)).map_err(io::Error::other)?;
         match permissions.create_dir(&self.dir) {

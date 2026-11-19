@@ -118,8 +118,27 @@ impl Fake {
         self.state(|s| &mut s.set_enabled, reply, None)
     }
 
+    /// [`Self::on_set_enabled`], where `during` happens when the flag is set, before the reply is given.
+    pub(crate) fn on_set_enabled_during(&self, reply: Result<()>, during: impl FnOnce() + Send + 'static) -> &Self {
+        self.state(|s| &mut s.set_enabled, reply, Some(Box::new(during)))
+    }
+
+    /// [`Self::on_register`], where `during` happens when the task is registered, before the reply is given.
+    pub(crate) fn on_register_during(
+        &self,
+        reply: Result<Registration>,
+        during: impl FnOnce() + Send + 'static,
+    ) -> &Self {
+        self.state(|s| &mut s.register, reply, Some(Box::new(during)))
+    }
+
     pub(crate) fn on_delete(&self, reply: Result<bool>) -> &Self {
         self.state(|s| &mut s.delete, reply, None)
+    }
+
+    /// [`Self::on_delete`], where `during` happens when the task is deleted, before the reply is given.
+    pub(crate) fn on_delete_during(&self, reply: Result<bool>, during: impl FnOnce() + Send + 'static) -> &Self {
+        self.state(|s| &mut s.delete, reply, Some(Box::new(during)))
     }
 
     pub(crate) fn on_instances(&self, reply: Result<Vec<Instance>>) -> &Self {

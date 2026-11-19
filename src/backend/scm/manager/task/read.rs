@@ -80,6 +80,13 @@ impl TaskSnapshot {
         TaskXml::armed(&self.registered.xml)
     }
 
+    /// Whether the stored XML has a trigger that is switched on, whatever the task's own flag is: the armed
+    /// state an account change gives the registration it makes, since the flag may be off only because an
+    /// earlier change or uninstall that was cut short disabled the task.
+    pub(super) fn has_triggers(&self) -> bool {
+        TaskXml::has_triggers(&self.registered.xml)
+    }
+
     /// The definition as Task Scheduler stores it: what a verb that registers the task again starts from.
     pub(super) fn registered(&self) -> &Registered {
         &self.registered
