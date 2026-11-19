@@ -718,7 +718,13 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
 /// The default log of `dir` with an entry for the test's own account, one that no install names now: what
 /// is on the file is computed by the install, so the entry is not carried over.
 fn log_with_an_entry_no_install_names(dir: &TempDir) {
-    crate::backend::scm::default_log::ensure(dir.path(), &id(), &[process_user_sid()]).unwrap();
+    crate::backend::scm::default_log::ensure(
+        dir.path(),
+        &id(),
+        &[process_user_sid()],
+        crate::backend::scm::default_log::Existing::Set,
+    )
+    .unwrap();
 }
 
 fn local_service() -> Sid {

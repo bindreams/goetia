@@ -9,6 +9,7 @@ use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 use goetia::testing::sid_of;
 
+use crate::fixture::FIXTURE;
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT, PRINT_WHEN_RELEASED, RUN_UNTIL_KILLED};
@@ -484,4 +485,86 @@ fn a_running_service_whose_account_changes_keeps_its_log_and_the_new_account_wri
         "both runs' lines: {lines:?}"
     );
     assert_eq!(accounts_of_default_log(id), [sid_of(5, &NETWORK_SERVICE)]);
+}
+
+/// SCM reads `START_PENDING` from its launch of a service's process until the process's first status report, which
+/// the shim makes only after it holds its log (before it registers its control handler). An install that changes the
+/// account of a service in that state therefore leaves both accounts in the log's permissions: a shim launched as the
+/// old account may not have opened it yet, and the narrowing would deny it, so the whole run would have no default
+/// log. The first install that finds the service in no such state names the new account alone.
+///
+/// The host here is this binary, which connects back and then waits, never reaching SCM's dispatcher: the state it
+/// is in is the measurement the narrowing rests on, and the test fails if it is not `START_PENDING`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_until_the_next_install(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let id = &test_id();
+    let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
+    let reached = ConnectBack::listen();
+    let mgr = host.manager_hosted_by_this_binary(vec![
+        FIXTURE.to_owned(),
+        id.to_string(),
+        reached.port().to_string(),
+        "1".to_owned(),
+        "before-dispatcher".to_owned(),
+    ]);
+    let as_account = |account: &str| service_running(id, account, vec![host.exe.path_str()]);
+    let local_service = sid_of(5, &LOCAL_SERVICE);
+    let network_service = sid_of(5, &NETWORK_SERVICE);
+    mgr.install(&as_account("LocalService"), false)
+        .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
+    assert_eq!(accounts_of_default_log(id), [local_service.clone()]);
+
+    // The start returns when the process dies: it never reaches the dispatcher.
+    let name = id.to_string();
+    let start = std::thread::spawn(move || {
+        let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+        let service = scm
+            .open_service(&name, ServiceAccess::START)
+            .expect("open the service to start it");
+        service.start::<&str>(&[])
+    });
+    reached.accept("the service's process, which has not reached the dispatcher");
+    let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+    let service = scm
+        .open_service(id.as_str(), ServiceAccess::QUERY_STATUS)
+        .expect("open the service to read it");
+    let status = service.query_status().expect("query the service");
+    assert_eq!(
+        status.current_state,
+        ServiceState::StartPending,
+        "SCM reports START_PENDING from the launch of the process until its first status report"
+    );
+
+    mgr.install(&as_account("NetworkService"), false)
+        .unwrap_or_else(|e| panic!("install as NetworkService, during a pending start: {}", e.report()));
+    let mut both = vec![local_service, network_service.clone()];
+    both.sort();
+    assert_eq!(
+        accounts_of_default_log(id),
+        both,
+        "a shim launched as the old account may still be about to open the log"
+    );
+
+    let pid = status.process_id.expect("a pending start has a process");
+    support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
+    start
+        .join()
+        .expect("the start thread")
+        .expect_err("a process that is killed does not start the service");
+
+    let again = mgr
+        .install(&as_account("NetworkService"), false)
+        .unwrap_or_else(|e| panic!("install as NetworkService again: {}", e.report()));
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert_eq!(
+        accounts_of_default_log(id),
+        [network_service],
+        "an install that finds no start in progress names the new account alone"
+    );
 }

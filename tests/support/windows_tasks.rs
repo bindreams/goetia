@@ -38,6 +38,15 @@ impl ServiceAccountHost {
         shim_manager_at(self.shim.path_str().into())
     }
 
+    /// A manager whose `protocol: plain` services run the copy of this binary with `args` as their host, so
+    /// that a test decides what the host does before and after SCM's dispatcher.
+    pub fn manager_hosted_by_this_binary(&self, args: Vec<String>) -> Scm {
+        Scm::with_shim(
+            goetia::shim::StandaloneShim::new(self.exe.path_str().into(), args),
+            goetia::shim::CheckPermissions::Disable,
+        )
+    }
+
     /// The path of the shim copy, for a child process that makes its own manager.
     pub fn shim_path(&self) -> String {
         self.shim.path_str()

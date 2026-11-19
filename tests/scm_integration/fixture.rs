@@ -20,6 +20,9 @@
 //!   `managed::uninstall_errors_when_service_will_not_stop`), connects to
 //!   `start-port`, then blocks forever on a channel nobody sends to. Killed
 //!   directly by its PID during that test's own cleanup, never via `stop`.
+//! - `before-dispatcher` - connect to `start-port` and wait, never reaching the dispatcher: the service
+//!   reads `START_PENDING` from SCM's launch of the process until it is killed. Run as the service host
+//!   of a `protocol: plain` daemon, it is a shim that has not yet opened its log.
 
 use std::ffi::OsString;
 use std::sync::mpsc;
@@ -40,6 +43,12 @@ pub fn run_if_requested() -> bool {
     // from `StartServiceW`'s own arguments — read back off this process's
     // own command line, exactly like `support::sentinel::SERVICE_HOST`.
     let name = args[2].clone();
+    if args.get(5).map(String::as_str) == Some("before-dispatcher") {
+        connect(args[3].parse().expect("start port"));
+        loop {
+            std::thread::park();
+        }
+    }
     service_dispatcher::start(&name, ffi_service_main).expect("connect to the SCM dispatcher");
     true
 }

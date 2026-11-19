@@ -274,3 +274,62 @@ pub(crate) fn make_mount_point(dir: &std::path::Path, target: &std::path::Path) 
     payload.extend_from_slice(&[0, 0]);
     set_reparse_point(dir, IO_REPARSE_TAG_MOUNT_POINT, &payload);
 }
+
+/// The rights the account `sid` has on the file `path` from its permissions alone, as
+/// `GetEffectiveRightsFromAclW` says: what an open for exactly those rights would be granted. The owner's implicit
+/// rights are not counted, which is why a test of them reads the owner.
+#[cfg(windows)]
+pub(crate) fn effective_rights(path: &std::path::Path, sid: &mut [u8]) -> u32 {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let wide = crate::backend::scm::wide::wide_null(path).unwrap();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out-pointers are locals; the descriptor is freed below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS, "read the permissions of {}", path.display());
+    // SAFETY: a zeroed `TRUSTEE_W` is filled by the call below; `sid` outlives the use of the trustee.
+    let mut trustee: TRUSTEE_W = unsafe { std::mem::zeroed() };
+    // SAFETY: `trustee` is a valid out-pointer and `sid` a whole SID.
+    unsafe { BuildTrusteeWithSidW(&mut trustee, sid.as_mut_ptr().cast()) };
+    let mut rights = 0u32;
+    // SAFETY: `dacl` points into `descriptor`, which is live; `trustee` and `rights` are locals.
+    let status = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+    // SAFETY: `descriptor` was allocated by `GetNamedSecurityInfoW`, and is freed once.
+    unsafe { LocalFree(descriptor) };
+    assert_eq!(status, ERROR_SUCCESS, "the rights of the account on {}", path.display());
+    rights
+}
+
+/// Makes the account `sid` (SDDL text) the owner of the existing file `path`, as `icacls /setowner` does, which
+/// takes the privilege an administrator needs for it. The test is elevated.
+#[cfg(windows)]
+pub(crate) fn set_owner(path: &std::path::Path, sid: &str) {
+    let output = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(["/setowner", &format!("*{sid}")])
+        .output()
+        .expect("run icacls.exe");
+    assert!(
+        output.status.success(),
+        "icacls /setowner *{sid} on {}: {}{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

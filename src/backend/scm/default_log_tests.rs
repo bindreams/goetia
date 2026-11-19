@@ -14,10 +14,11 @@ use crate::backend::scm::folder::logs_folder;
 use crate::backend::scm::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, read_path};
 use crate::backend::scm::sid::{sid_display, sid_from_parts};
 use crate::backend::scm::test_support::{
-    delete_pending, permit_only, set_dacl, set_reparse_point, short, withdraw_append,
+    delete_pending, effective_rights, permit_only, set_dacl, set_owner, set_reparse_point, short, withdraw_append,
 };
-use crate::elevation::test_support::process_user_sid;
+use crate::elevation::test_support::{ThreadTokenReset, process_user_sid, token_without_privileges};
 use crate::testing::groups::{Group, scm_group};
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
 /// `IO_REPARSE_TAG_HSM2`: a tag that names no other file, which an unelevated account can set on its own
 /// file. It is data on the file, not a way to another one.
@@ -29,6 +30,11 @@ const A_LINK_TAG: u32 = 0xA000_0001;
 
 fn id() -> Id {
     Id::try_from("nightly").unwrap()
+}
+
+/// [`super::ensure`] as an install that rewrites the file there is.
+fn ensure(program_data: &Path, id: &Id, accounts: &[Sid]) -> Result<EnsureOutcome> {
+    super::ensure(program_data, id, accounts, Existing::Set)
 }
 
 /// A `%ProgramData%` with the logs folder made plainly, and the path of the log in it.
@@ -172,6 +178,207 @@ fn a_log_that_is_a_link_is_refused_and_its_permissions_are_left_alone() {
         refused.report()
     );
     assert!(!read_path(&log).unwrap().protected, "its permissions are as they were");
+}
+
+/// An install that asks to keep what is there leaves the permissions of a log that is there as they are: the
+/// one made while a pending start may still need the account the file no longer names.
+#[skuld::test]
+fn a_log_that_is_there_is_left_as_it_is_when_the_install_keeps_it() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "kept\n").unwrap();
+    let (old, new) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
+    ensure(dir.path(), &id(), &[old.clone(), new]).unwrap();
+    let before = entries_of(&log);
+
+    let outcome = super::ensure(dir.path(), &id(), std::slice::from_ref(&old), Existing::Keep).unwrap();
+
+    assert_eq!(outcome, EnsureOutcome::Kept);
+    assert_eq!(entries_of(&log), before, "its permissions are as they were");
+    assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what is in the log is kept");
+}
+
+/// What an install says of the file: it made it, or set the permissions of the one there.
+#[skuld::test]
+fn an_install_says_whether_it_set_the_permissions_of_a_log_that_was_there() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+
+    let outcome = ensure(dir.path(), &id(), &[process_user_sid()]).unwrap();
+
+    assert_eq!(outcome, EnsureOutcome::Set);
+}
+
+/// A file that is missing is made even where the install keeps what is there, with the accounts it was given.
+#[skuld::test]
+fn a_log_that_is_missing_is_made_even_when_the_install_keeps_what_is_there(#[fixture(scm_group)] _group: &Group) {
+    let (dir, log) = program_data_with_logs();
+    let (old, new) = (process_user_sid(), sid_from_parts(5, &[32, 545]));
+
+    let outcome = super::ensure(dir.path(), &id(), &[old.clone(), new.clone()], Existing::Keep).unwrap();
+
+    assert_eq!(outcome, EnsureOutcome::Made);
+    assert_eq!(entries_of(&log), entries_wanted_for(&[old, new]));
+}
+
+/// A log whose owner is another account is Administrators' after the install, as the one the install made is: the
+/// owner has the right to change the permissions of its file, which the account must never be left with.
+#[skuld::test]
+fn the_owner_of_a_log_that_is_there_is_set_to_administrators(#[fixture(scm_group)] _group: &Group) {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "kept\n").unwrap();
+    let local_service = sid_from_parts(5, &[19]);
+    set_owner(&log, &sid_display(&local_service));
+    assert_eq!(
+        read_path(&log).unwrap().owner,
+        local_service,
+        "the file is another account's"
+    );
+
+    ensure(dir.path(), &id(), &[local_service]).unwrap();
+
+    assert_eq!(
+        read_path(&log).unwrap().owner,
+        crate::backend::scm::sid::administrators()
+    );
+    assert_eq!(fs::metadata(&log).unwrap().len(), 5, "what is in the log is kept");
+}
+
+/// What each account can do to a log, as its permissions grant it and not as they are spelt: the account the daemon
+/// runs as appends, reads the attributes and waits on the handle, and nothing else; no other account, a group or
+/// `OWNER RIGHTS` has any right; SYSTEM and Administrators have all.
+#[skuld::test]
+fn the_rights_each_account_has_on_a_log_are_the_ones_it_is_granted() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    let account = sid_from_parts(5, &[21, 1, 2, 3, 1001]);
+    ensure(dir.path(), &id(), std::slice::from_ref(&account)).unwrap();
+    let rights = |mut sid: Sid| effective_rights(&log, &mut sid);
+
+    assert_eq!(rights(account), DEFAULT_LOG_ACCESS);
+    for (what, sid) in [
+        ("another account", sid_from_parts(5, &[21, 1, 2, 3, 1000])),
+        ("Users", sid_from_parts(5, &[32, 545])),
+        ("Everyone", sid_from_parts(1, &[0])),
+        ("OWNER RIGHTS", sid_from_parts(3, &[4])),
+    ] {
+        assert_eq!(rights(sid), 0, "{what}");
+    }
+    for (what, sid) in [
+        ("SYSTEM", sid_from_parts(5, &[18])),
+        ("Administrators", sid_from_parts(5, &[32, 544])),
+    ] {
+        assert_eq!(rights(sid) & FILE_ALL_ACCESS, FILE_ALL_ACCESS, "{what}");
+    }
+}
+
+/// An account named twice has one entry.
+#[skuld::test]
+fn an_account_named_twice_has_one_entry() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    let me = process_user_sid();
+
+    ensure(dir.path(), &id(), &[me.clone(), me.clone()]).unwrap();
+
+    assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
+}
+
+/// A daemon that runs as SYSTEM is named in the log like any account, and the entry takes nothing from the
+/// full control SYSTEM has on every log.
+#[skuld::test]
+fn a_system_account_keeps_its_full_control_of_the_log() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    let system = sid_from_parts(5, &[18]);
+
+    ensure(dir.path(), &id(), std::slice::from_ref(&system)).unwrap();
+
+    assert_eq!(
+        effective_rights(&log, &mut system.clone()) & FILE_ALL_ACCESS,
+        FILE_ALL_ACCESS
+    );
+}
+
+/// What the install says when it made the log while the daemon ran: only then, and the words say what to do.
+#[skuld::test]
+fn a_log_made_while_the_daemon_runs_is_told_and_no_other_is() {
+    let program_data = Path::new(r"C:\ProgramData");
+    let told = |outcome, running| made_while_running(program_data, &id(), outcome, running);
+
+    let said = told(EnsureOutcome::Made, true).expect("made while it runs");
+
+    assert!(said.contains("nightly"), "{said}");
+    assert!(said.contains(r"C:\ProgramData\Goetia\logs\nightly.log"), "{said}");
+    assert!(said.contains("deleted log until it is restarted"), "{said}");
+    assert!(said.contains("restart it"), "{said}");
+    for (outcome, running) in [
+        (EnsureOutcome::Made, false),
+        (EnsureOutcome::Set, true),
+        (EnsureOutcome::Kept, true),
+    ] {
+        assert_eq!(told(outcome, running), None, "{outcome:?}, running: {running}");
+    }
+}
+
+/// A directory at the log's name is a directory, which Windows refuses to open as a file with access denied, as it
+/// does a delete that is pending: the install says what it is.
+#[skuld::test]
+fn a_directory_at_the_log_s_name_is_refused_as_a_directory() {
+    let (dir, log) = program_data_with_logs();
+    fs::create_dir(&log).unwrap();
+
+    let refused = ensure(dir.path(), &id(), &[process_user_sid()])
+        .unwrap_err()
+        .report()
+        .to_string();
+
+    assert!(refused.contains(&log.display().to_string()), "{refused}");
+    assert!(refused.contains("is a directory"), "{refused}");
+    assert!(!refused.contains("being deleted"), "{refused}");
+}
+
+/// A file whose permissions refuse the install even the attributes is no file with a delete pending: it is what
+/// Windows says of it, for the open that was refused.
+#[skuld::test]
+fn a_log_whose_permissions_refuse_the_install_is_not_called_being_deleted() {
+    let (dir, log) = program_data_with_logs();
+    fs::write(&log, "").unwrap();
+    let me = process_user_sid();
+    let only_change_permissions = Descriptor::from_sddl(&format!("D:P(A;;WD;;;{})", sid_display(&me))).unwrap();
+    set_dacl(&only_change_permissions, &log).unwrap();
+
+    let refused = ensure(dir.path(), &id(), &[me]).unwrap_err().report().to_string();
+
+    assert!(refused.contains(&log.display().to_string()), "{refused}");
+    assert!(!refused.contains("being deleted"), "{refused}");
+}
+
+/// What an install names in the log and whether it rewrites the one there, by its step and by whether a start of
+/// the service is in progress (`START_PENDING`, whose shim may not yet hold the log it opens as the account it
+/// was launched as).
+#[skuld::test]
+fn what_an_install_names_in_the_log_follows_its_step_and_a_start_in_progress() {
+    let (old, new) = (sid_from_parts(5, &[19]), sid_from_parts(5, &[20]));
+    let kept = std::slice::from_ref(&old);
+
+    // Before the change lands both accounts are named, whatever a start is doing.
+    for starting in [false, true] {
+        assert_eq!(
+            naming(Step::Widen, starting, kept, &new),
+            (vec![old.clone(), new.clone()], Existing::Set)
+        );
+    }
+    // After it, the new account alone: it is the one every later start runs as.
+    assert_eq!(
+        naming(Step::Narrow, false, kept, &new),
+        (vec![new.clone()], Existing::Set)
+    );
+    // With a start in progress the file there is left, and one that has to be made names both.
+    assert_eq!(
+        naming(Step::Narrow, true, kept, &new),
+        (vec![old, new.clone()], Existing::Keep)
+    );
+    assert_eq!(naming(Step::Narrow, true, &[], &new), (vec![new], Existing::Keep));
 }
 
 /// A log whose delete is pending, because a run of the daemon still holds a handle on it, keeps its name until
@@ -459,12 +666,30 @@ fn a_logs_elsewhere_is_accepted() {
     assert!(refuse_logs_in_folder(dir.path(), &id(), None).is_ok());
 }
 
+/// Only a part of the path that is not there is walked past: a name Windows refuses is no part that does not
+/// exist, and the install fails naming the step, whether the name is in the logs folder or elsewhere.
+#[skuld::test]
+fn a_logs_with_a_name_windows_refuses_is_an_error_and_not_a_walk_to_the_folder_above() {
+    let (dir, log) = program_data_with_logs();
+    let folder = log.parent().unwrap().to_path_buf();
+
+    for named in [dir.path().join("a*b"), folder.join("a*b")] {
+        let refused = refuse_logs_in_folder(dir.path(), &id(), Some(&named))
+            .expect_err(&format!("{} was accepted", named.display()))
+            .report()
+            .to_string();
+
+        assert!(refused.contains("resolve"), "{refused}");
+        assert!(refused.contains(&named.display().to_string()), "{refused}");
+    }
+}
+
 /// The check needs no more of a folder than `canonicalize` does, which opens it for no access at all: a folder
 /// the installer can pass through but may not read the permissions of (the owner's implicit right is withdrawn
 /// by an entry for `OWNER RIGHTS`) is not a failure of the install, and `logs:` in it is accepted. The entries
 /// grant what the temporary directory's removal needs. An elevated token holds `SeBackupPrivilege`, which opens
-/// any folder opened with backup semantics whatever its permissions, so the test can fail only for a
-/// non-elevated account (the unit suite on a developer's machine).
+/// any folder opened with backup semantics whatever its permissions, so the thread runs as this token with its
+/// privileges removed, as an unelevated account's is, and the test fails if that still reads the folder.
 #[skuld::test]
 fn a_logs_in_a_folder_whose_permissions_cannot_be_read_is_accepted() {
     let (dir, _log) = program_data_with_logs();
@@ -475,6 +700,9 @@ fn a_logs_in_a_folder_whose_permissions_cannot_be_read_is_accepted() {
     let me = sid_display(&process_user_sid());
     let descriptor = Descriptor::from_sddl(&format!("D:P(A;;{rights};;;{me})(A;;;;;OW)")).unwrap();
     set_dacl(&descriptor, &closed).unwrap();
+    // As an unelevated user, whatever this process is: an elevated token opens any folder with backup semantics.
+    let _unelevated = ThreadTokenReset::impersonate(&token_without_privileges());
+    read_path(&closed).expect_err("the premise: the permissions of the folder cannot be read");
 
     assert_eq!(refusal_of(&dir, &closed.join("x.log")), None);
 }
