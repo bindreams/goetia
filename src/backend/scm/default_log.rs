@@ -26,7 +26,7 @@ use super::folder::logs_folder;
 use super::link::is_link;
 use super::runs::dir::{Dir, SHARE_ALL};
 use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, ObjectId, index_at};
-use super::sid::Sid;
+use super::sid::{Sid, distinct};
 use crate::error::{Error, Result};
 use crate::spec::Id;
 
@@ -206,17 +206,6 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, naming: &Naming) -> Result<En
     };
     set.map_err(|e| Error::os_at("set the permissions of", &path, e))?;
     Ok(EnsureOutcome::Set)
-}
-
-/// `accounts`, each once.
-fn distinct(accounts: &[Sid]) -> Vec<Sid> {
-    let mut named: Vec<Sid> = Vec::new();
-    for account in accounts {
-        if !named.contains(account) {
-            named.push(account.clone());
-        }
-    }
-    named
 }
 
 /// A deleted log whose handle a daemon still holds keeps its name where the delete is not POSIX (the daemon's

@@ -304,7 +304,7 @@ impl<'a> Denied<'a> {
 
 impl Drop for Denied<'_> {
     fn drop(&mut self) {
-        let restored = Descriptor::for_runs(&process_user_sid())
+        let restored = Descriptor::for_runs(&[process_user_sid()])
             .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
         if !matches!(restored, Ok(Ok(()))) {
             eprintln!(
