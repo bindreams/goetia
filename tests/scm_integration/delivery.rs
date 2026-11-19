@@ -637,7 +637,7 @@ fn delivery_probe_load_delete(#[fixture(scm_group)] _group: &Group) {
     );
 }
 
-// Q3b: a stream of state changes, re-armed from the callback -----------------------------------------------------------
+// Q3b: a stream of state changes, re-armed from the callback ----------------------------------------------------------
 
 /// What the callbacks of a stream of re-arming registrations tally.
 struct Stream {
