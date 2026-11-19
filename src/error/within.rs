@@ -6,6 +6,8 @@ use super::Error;
 #[error("{context}")]
 struct Within {
     context: String,
+    /// The context says that the signal of the operation was delivered: see [`within_delivered`].
+    delivered: bool,
     #[source]
     source: io::Error,
 }
@@ -14,73 +16,98 @@ struct Within {
 /// [`source`](std::error::Error::source), which [`Error::report`](crate::Error::report) prints
 /// after it: `context: source`.
 pub(crate) fn within(context: impl Into<String>, source: io::Error) -> io::Error {
+    said_within(context.into(), false, source)
+}
+
+/// [`within`], for a `context` that says the signal of the operation was delivered. A [`target_failed`]
+/// operation is then not called a failure: the signal stands, and the context says what failed after it.
+/// Only a delivered signal is told so; every other `within` is a failure of the operation.
+pub(crate) fn within_delivered(context: impl Into<String>, source: io::Error) -> io::Error {
+    said_within(context.into(), true, source)
+}
+
+fn said_within(context: String, delivered: bool, source: io::Error) -> io::Error {
     io::Error::new(
         source.kind(),
         Within {
-            context: context.into(),
+            context,
+            delivered,
             source,
         },
     )
 }
 
-/// The goetia [`Error`] that `e` carries, directly or under [`within`] contexts.
-fn carried_error(e: &io::Error) -> Option<&Error> {
-    let inner = e.get_ref()?;
-    match inner.downcast_ref::<Within>() {
-        Some(within) => carried_error(&within.source),
-        None => inner.downcast_ref::<Error>(),
+/// What an [`io::Error`] is, one layer down: the one place that knows how [`within`] and a carried goetia
+/// [`Error`] are laid in it.
+enum Layer<'a> {
+    Context(&'a Within),
+    Carried,
+    Os,
+}
+
+fn layer(e: &io::Error) -> Layer<'_> {
+    let Some(inner) = e.get_ref() else {
+        return Layer::Os;
+    };
+    if let Some(within) = inner.downcast_ref::<Within>() {
+        Layer::Context(within)
+    } else if inner.is::<Error>() {
+        Layer::Carried
+    } else {
+        Layer::Os
     }
 }
 
-/// Whether `e` carries a goetia [`Error`], as [`target_failed`] and [`unread_after_open_refused`] look
-/// for one.
+/// Whether `e` carries a goetia [`Error`], directly or under [`within`] contexts: the question
+/// [`target_failed`] and [`debug_privilege_also_failed`](super::debug_privilege_also_failed) ask.
 pub(super) fn carries_error(e: &io::Error) -> bool {
-    carried_error(e).is_some()
+    match layer(e) {
+        Layer::Context(within) => carries_error(&within.source),
+        Layer::Carried => true,
+        Layer::Os => false,
+    }
 }
 
 /// `e` as an [`Error`]: the goetia error it carries, else its failure alone as [`Error::RawOs`]. A
 /// context it is said within is a [`Error::Step`] over what is under it.
 fn told(e: io::Error) -> Error {
-    let Some(inner) = e.get_ref() else {
-        return Error::RawOs { os: e };
-    };
-    if inner.is::<Error>() {
-        let inner = e.into_inner().expect("an error with a source was just seen");
-        return *inner.downcast::<Error>().expect("an `Error` was just seen");
+    match layer(&e) {
+        Layer::Os => Error::RawOs { os: e },
+        Layer::Carried => {
+            let inner = e.into_inner().expect("an error with a source was just seen");
+            *inner.downcast::<Error>().expect("an `Error` was just seen")
+        }
+        Layer::Context(_) => {
+            let inner = e.into_inner().expect("an error with a source was just seen");
+            let Within { context, source, .. } = *inner.downcast::<Within>().expect("a `Within` was just seen");
+            Error::Step {
+                what: context,
+                source: Box::new(told(source)),
+            }
+        }
     }
-    if inner.is::<Within>() {
-        let inner = e.into_inner().expect("an error with a source was just seen");
-        let Within { context, source } = *inner.downcast::<Within>().expect("a `Within` was just seen");
-        return Error::Step {
-            what: context,
-            source: Box::new(told(source)),
-        };
-    }
-    Error::RawOs { os: e }
 }
 
 /// The failure `e` of a target (a manager, a process), which reports through [`io::Error`], as an
 /// [`Error`], told under `what`, the operation:
 ///
-/// - an error said within a context (see [`within`]) says how far the operation got, so `what` names the
-///   operation with no verdict on it: the context may say that the signal of a kill was delivered;
+/// - an error said within a context by [`within_delivered`] says that the operation's signal was
+///   delivered and what failed after it, so `what` names the operation with no verdict on it;
 /// - any other failure is one of `what`: `failed to <what>`, over the goetia error it carries, else an OS
 ///   failure.
 pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
     let what = what.into();
-    if e.get_ref().is_some_and(|inner| inner.is::<Within>()) {
-        return Error::Step {
+    match layer(&e) {
+        Layer::Context(within) if within.delivered => Error::Step {
             what,
             source: Box::new(told(e)),
-        };
-    }
-    if carries_error(&e) {
-        return Error::Step {
+        },
+        _ if carries_error(&e) => Error::Step {
             what: format!("failed to {what}"),
             source: Box::new(told(e)),
-        };
+        },
+        _ => Error::os(what, e),
     }
-    Error::os(what, e)
 }
 
 /// The failure of a hold of the process `pid`, as a target reports it through [`io::Error`] with the

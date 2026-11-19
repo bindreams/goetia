@@ -567,7 +567,11 @@ fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() 
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
-    assert_eq!(e.to_string(), "notifier could not be opened");
+    assert_eq!(
+        crate::backend::kill::kill_failed("frpc", e).report().to_string(),
+        "failed to kill `frpc`: waiting for the manager to record that process 100 is gone: notifier could not be \
+         opened"
+    );
 }
 
 // The raw status ------------------------------------------------------------------------------------------------------

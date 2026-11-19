@@ -28,7 +28,7 @@ pub(crate) use report::find;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
 pub(crate) use report::{Chain, Pieces};
-pub(crate) use within::{target_failed, unread_after_open_refused, within};
+pub(crate) use within::{target_failed, unread_after_open_refused, within, within_delivered};
 
 use report::Report;
 

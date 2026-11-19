@@ -19,7 +19,9 @@
 use std::io;
 use std::time::Duration;
 
-use crate::error::{Error, Pieces, target_failed, terminating_failed, unread_after_open_refused, within};
+use crate::error::{
+    Error, Pieces, target_failed, terminating_failed, unread_after_open_refused, within, within_delivered,
+};
 use crate::manager::budget::{Budget, Deadline};
 
 #[cfg(unix)]
@@ -223,7 +225,13 @@ pub(crate) fn hold_once<T: KillTarget>(
         Ok(Some(process)) => process,
         // The process is gone and the manager has not yet recorded it.
         Ok(None) => {
-            return match target.await_recorded(pid, None, deadline).map_err(HoldError::Read)? {
+            let waited = target.await_recorded(pid, None, deadline).map_err(|e| {
+                HoldError::Read(within(
+                    format!("waiting for the manager to record that process {pid} is gone"),
+                    e,
+                ))
+            })?;
+            return match waited {
                 Waited::Confirmed => Ok(Hold::Ended { pid, held: None }),
                 Waited::Expired => Err(HoldError::Expired { pid }),
             };
@@ -240,7 +248,10 @@ pub(crate) fn hold_once<T: KillTarget>(
             };
         }
     };
-    if target.confirm(pid, &process).map_err(HoldError::Read)? {
+    let confirmed = target
+        .confirm(pid, &process)
+        .map_err(|e| HoldError::Read(within(format!("confirming that process {pid} is the service's"), e)))?;
+    if confirmed {
         Ok(Hold::Held { pid, process })
     } else {
         Ok(Hold::Ended {
@@ -255,7 +266,9 @@ pub(crate) fn hold_once<T: KillTarget>(
 pub(crate) enum HoldError {
     /// The manager vouches for the pid, and the process cannot be opened.
     Refused(io::Error),
-    /// The manager could not be read, so what the service runs is not known.
+    /// The manager could not be read, so what the service runs is not known. A read made after the manager
+    /// named a pid says which process it was about, as `within` does; the failure of the read that follows a
+    /// refused open says it itself.
     Read(io::Error),
     /// The manager still reported `pid`, whose process is gone, when the deadline ran out.
     Expired { pid: u32 },
@@ -276,7 +289,7 @@ impl From<HoldError> for io::Error {
 /// `e`, an error from the waits after the signal to `pid` was delivered: the error must not read as a
 /// failed kill.
 fn signalled_but(pid: u32, e: io::Error) -> io::Error {
-    within(
+    within_delivered(
         format!("process {pid} was signalled, but waiting for it to exit and for the manager to record that failed"),
         e,
     )
