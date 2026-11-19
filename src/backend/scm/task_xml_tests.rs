@@ -245,6 +245,23 @@ fn token_of_reads_the_token_the_xml_carries() {
     assert!(TaskXml::token_of("<Task><Actions>", ID).is_err());
 }
 
+/// One read of the stored XML says what its three single readers say.
+#[skuld::test]
+fn stored_reads_the_principal_the_armed_state_and_the_token_at_once() {
+    let spec = spec();
+    for armed in [true, false] {
+        let xml = built(&spec).to_xml(armed, &token());
+        let stored = TaskXml::stored(&xml, ID).unwrap();
+        assert_eq!(stored.principal, TaskXml::principal(&xml).unwrap());
+        assert_eq!(stored.principal, Some(TaskAccount::Service("S-1-5-18".to_owned())));
+        assert_eq!(stored.armed, armed);
+        assert_eq!(stored.token, Some(token()));
+    }
+    let tokenless = readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123");
+    assert_eq!(TaskXml::stored(&tokenless, ID).unwrap().token, None);
+    assert!(TaskXml::stored("<Task><Actions>", ID).is_err());
+}
+
 /// The ending is the one of the task whose XML it is: the id before the token is the task's.
 #[skuld::test]
 fn token_of_reads_only_an_ending_that_names_the_task() {
@@ -508,21 +525,12 @@ fn parse_ignores_the_token_so_equal_definitions_stay_equal() {
 #[skuld::test]
 fn an_ending_that_is_not_goetias_reads_as_unrecognised_and_is_no_part_of_the_host() {
     let spec = spec();
-    // A last argument that is no token, and an id that is not the task's.
-    for (xml, malformed) in [
-        (readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123"), true),
-        (
-            readback(&spec, &host(), DAILY_AT_0330).replace(&format!(" {ID} "), " other "),
-            false,
-        ),
+    // A last argument that is no token, and an id that is not the task's: neither is goetia's ending.
+    for xml in [
+        readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123"),
+        readback(&spec, &host(), DAILY_AT_0330).replace(&format!(" {ID} "), " other "),
     ] {
-        // A malformed token is an error from `token_of`; an ending of another id is none.
-        let read = TaskXml::token_of(&xml, ID);
-        if malformed {
-            assert!(read.is_err(), "{xml}");
-        } else {
-            assert_eq!(read.unwrap(), None, "{xml}");
-        }
+        assert_eq!(TaskXml::token_of(&xml, ID).unwrap(), None, "{xml}");
         let installed = TaskXml::parse(&xml, &data_of(&spec)).unwrap();
         assert!(
             installed

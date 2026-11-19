@@ -354,42 +354,77 @@ fn retype_service_to_task_makes_a_new_token() {
     assert_ne!(tokens[0], tokens[1]);
 }
 
-/// A stored registration whose token is malformed (a hand edit), or whose XML cannot be read, is no licence to
-/// write another: the write fails with that error before Task Scheduler is asked anything (no disable, delete or
-/// register), and no record directory is made. An unreadable XML does not read as a changed account either.
+/// A malformed token is a hand edit like any other: the task differs from what goetia wrote, and the update
+/// writes it again under a well-formed token, armed as it was.
 #[skuld::test]
-fn a_write_over_a_registration_whose_token_or_xml_cannot_be_read_fails_before_any_request() {
+fn an_update_over_a_malformed_token_writes_a_well_formed_one() {
     let spec = task_spec(Some("30 3 * * *"));
-    let stored = registered_task(&spec, true);
-    let malformed = Registered {
-        xml: stored
-            .xml
-            .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
-        ..stored.clone()
-    };
-    let unreadable = Registered {
-        xml: "<Task><Actions>".to_owned(),
-        ..stored
-    };
-    for (what, registered) in [("malformed", malformed), ("unreadable", unreadable)] {
-        let (dir, runs) = records();
+    for armed in [true, false] {
+        let (_dir, runs) = made_records();
+        let stored = registered_task(&spec, armed);
+        let malformed = Registered {
+            xml: stored
+                .xml
+                .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
+            ..stored
+        };
         let fake = Fake::new();
+        fake.on_register(Ok(Registration::Created));
 
-        let failed = scm(&fake)
+        scm(&fake)
             .task_write_with(
                 &spec,
                 &definition(&spec),
-                Some(&TaskSnapshot::new(id(), Ok(blob(&spec)), registered)),
+                Some(&TaskSnapshot::new(id(), Ok(blob(&spec)), malformed)),
                 &runs,
                 &mut Running(vec![]),
                 prepared(system(), None),
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(failed, Error::Blob { .. }), "{what}: {failed:?}");
-        assert_eq!(fake.calls(), [], "{what}");
-        assert!(!records_dir(&dir).exists(), "{what}");
+        // `registered_token` reads a token from the one registration the fake saw, so a well-formed one is there.
+        assert_eq!(
+            fake.calls(),
+            [register_call(
+                &spec,
+                armed,
+                root(),
+                None,
+                true,
+                &registered_token(&fake)
+            )],
+            "armed={armed}"
+        );
     }
+}
+
+/// A stored registration whose XML cannot be read at all is no licence to write another: the write fails
+/// before Task Scheduler is asked anything (no disable, delete or register), and no record directory is made.
+/// An unreadable XML does not read as a changed account either.
+#[skuld::test]
+fn a_write_over_a_registration_whose_xml_cannot_be_read_fails_before_any_request() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let unreadable = Registered {
+        xml: "<Task><Actions>".to_owned(),
+        ..registered_task(&spec, true)
+    };
+    let (dir, runs) = records();
+    let fake = Fake::new();
+
+    let failed = scm(&fake)
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            Some(&TaskSnapshot::new(id(), Ok(blob(&spec)), unreadable)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(system(), None),
+        )
+        .unwrap_err();
+
+    assert!(matches!(failed, Error::Blob { .. }), "{failed:?}");
+    assert_eq!(fake.calls(), []);
+    assert!(!records_dir(&dir).exists());
 }
 
 // A change of account -------------------------------------------------------------------------------------------------

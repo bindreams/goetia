@@ -299,12 +299,15 @@ fn a_registration_with_another_token_starts_no_program() {
     run.api.finish();
 }
 
-/// A registration whose arguments end with no goetia ending for this task (a hand edit: no ending, or the ending
-/// of another id) is not the one the shim was started under.
+/// A registration whose arguments end with no goetia ending for this task (a hand edit: no ending, the ending
+/// of another id, or a malformed token) is not the one the shim was started under.
 #[skuld::test]
 fn a_registration_with_no_ending_for_this_task_starts_no_program() {
     let stored = registered_task(&spec_logging_to(None), false);
     for edited in [
+        stored
+            .xml
+            .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
         stored
             .xml
             .replace(&format!(" {ID} {TASK_TOKEN}</Arguments>"), "</Arguments>"),
@@ -333,32 +336,6 @@ fn a_registration_with_no_ending_for_this_task_starts_no_program() {
         assert_eq!(run.fake.calls(Op::Spawn), 0);
         run.api.finish();
     }
-}
-
-/// A registration whose token is malformed (a hand edit) cannot be read, so no program starts under it.
-#[skuld::test]
-fn a_registration_with_a_malformed_token_starts_no_program() {
-    let stored = registered_task(&spec_logging_to(None), false);
-    let run = Run::reading(Ok(Some(Registered {
-        xml: stored
-            .xml
-            .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
-        ..stored
-    })));
-
-    let code = run.run();
-
-    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
-    let failures = run.fake.take_failures();
-    assert!(
-        failures.len() == 1
-            && failures[0].starts_with(&format!(
-                "goetia-shim[{ID}]: read the registration of the task \\Goetia\\{ID}: "
-            )),
-        "{failures:?}"
-    );
-    assert_eq!(run.fake.calls(Op::Spawn), 0);
-    run.api.finish();
 }
 
 /// XML that cannot be read says nothing of the registration, so no program is started under it.

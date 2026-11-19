@@ -64,6 +64,18 @@ impl Token {
     }
 }
 
+/// What the stored XML of a task says of its registration ([`TaskXml::stored`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Stored {
+    /// The account its principal names ([`TaskXml::principal`]).
+    pub principal: Option<TaskAccount>,
+    /// Whether it is armed ([`TaskXml::armed`]).
+    pub armed: bool,
+    /// The token its arguments end with, `None` when they end with no goetia ending for the task
+    /// ([`TaskXml::token_of`]).
+    pub token: Option<Token>,
+}
+
 /// Where a schedule that never fires is anchored: a one-time trigger at a fixed past instant fires
 /// nothing at registration or when it is enabled, and reads no next run.
 pub(crate) const NEVER_AT: &str = "2000-01-01T00:00:00";

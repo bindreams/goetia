@@ -19,6 +19,7 @@ use std::path::Path;
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
+use super::read::StoredRegistration;
 use super::verbs::{Processes, System, gone};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::scm::default_log::{self, Naming, Step};
@@ -188,9 +189,9 @@ impl Scm {
     /// state it had. A failure between the delete and the create leaves nothing at the id, which an install
     /// that runs again creates (disarmed: `enable` arms it).
     ///
-    /// A stored registration that cannot be read (its XML, or the token it ends with) or whose account
-    /// lookup failed for a reason other than "no such account" fails the write before anything is sent to
-    /// Task Scheduler: that is not a change of account.
+    /// A stored registration whose XML cannot be read at all, or whose account lookup failed for a reason other
+    /// than "no such account", fails the write before anything is sent to Task Scheduler: that is not a change of
+    /// account. A token that is not goetia's ending (a hand edit) is no failure: the update writes a fresh one.
     pub(super) fn task_write_with<P: Processes>(
         &self,
         spec: &DaemonSpec,
@@ -201,25 +202,24 @@ impl Scm {
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        // What the stored registration says is read here and nowhere else, before the machine is touched: a
-        // stored XML or token that cannot be read, or a lookup that failed, fails the write.
-        let old_principal = snapshot.map(TaskSnapshot::principal).transpose()?.flatten();
+        // The stored registration is read once, here, before `prepare` touches the machine: its principal, its
+        // armed state and its token.
+        let stored = snapshot
+            .map(|old| old.stored().map(|stored| (old, stored)))
+            .transpose()?;
         let prepared = prepare(&definition.account())?;
-        let changed = snapshot.filter(|_| old_principal.as_ref() != Some(&prepared.principal));
-        match changed {
-            None => {
-                let registering = match snapshot {
-                    Some(old) => Registering::Update {
-                        armed: old.armed(),
-                        token: old.token()?.unwrap_or_else(Token::fresh),
-                    },
-                    None => Registering::Create { armed: false },
-                };
-                task_records(id, runs, &prepared.principal, &Kept::default())?;
-                self.task_register(id, definition, &prepared, registering)
+        let registering = match stored {
+            Some((old, stored)) if stored.principal.as_ref() != Some(&prepared.principal) => {
+                return self.task_register_again(old, &stored, definition, runs, processes, &prepared);
             }
-            Some(old) => self.task_register_again(old, old_principal.as_ref(), definition, runs, processes, &prepared),
-        }
+            Some((_, stored)) => Registering::Update {
+                armed: stored.armed,
+                token: stored.token,
+            },
+            None => Registering::Create { armed: false },
+        };
+        task_records(id, runs, &prepared.principal, &Kept::default())?;
+        self.task_register(id, definition, &prepared, registering)
     }
 
     /// The account change of [`Self::task_write_with`]. The task is disabled first (its own flag, as an
@@ -232,7 +232,7 @@ impl Scm {
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
-        old_principal: Option<&Sid>,
+        stored: &StoredRegistration,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -249,7 +249,7 @@ impl Scm {
                 Err(e) if gone(&e) => false,
                 Err(e) => return Err(e),
             };
-        match self.replace_task(old, old_principal, definition, runs, processes, prepared) {
+        match self.replace_task(old, stored, definition, runs, processes, prepared) {
             Err(failed) if disabled => Err(match self.tasks.set_enabled(&path, true) {
                 Ok(()) => failed,
                 Err(e) if gone(&e) => failed,
@@ -270,7 +270,7 @@ impl Scm {
     fn replace_task<P: Processes>(
         &self,
         old: &TaskSnapshot,
-        old_principal: Option<&Sid>,
+        stored: &StoredRegistration,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -280,14 +280,14 @@ impl Scm {
         self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
         // The task is registered as the old account until the create lands, so its records and its log name it
         // too.
-        let kept = Kept::both(old_principal.map(std::slice::from_ref).unwrap_or_default());
+        let kept = Kept::both(stored.principal.as_slice());
         task_records(id, runs, &prepared.principal, &kept)?;
         match self.tasks.delete(&TaskPath::of(id)) {
             // The task is gone; a folder that stays is still there for the create.
             Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
             Err(e) => return Err(e),
         }
-        let registering = Registering::Create { armed: old.armed() };
+        let registering = Registering::Create { armed: stored.armed };
         let wrote = self.task_register(id, definition, prepared, registering)?;
         landed(id, runs, prepared, &kept, wrote)
     }
@@ -309,8 +309,7 @@ impl Scm {
 
     /// The registration itself, once what it needs is acquired. The token policy is here and nowhere
     /// else: a create is a new registration and takes a fresh token; an update keeps the one it replaces
-    /// (a stored registration with no goetia ending for the task gets a fresh one). A stored token that
-    /// cannot be read fails the write before this ([`Self::task_write_with`]).
+    /// and, where the stored registration has none (a hand edit), takes a fresh one.
     fn task_register(
         &self,
         id: &Id,
@@ -320,7 +319,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let (armed, token, update) = match registering {
             Registering::Create { armed } => (armed, Token::fresh(), false),
-            Registering::Update { armed, token } => (armed, token, true),
+            Registering::Update { armed, token } => (armed, token.unwrap_or_else(Token::fresh), true),
         };
         let registered = self.tasks.register(
             &TaskPath::of(id),
@@ -340,9 +339,9 @@ impl Scm {
 enum Registering {
     /// A new registration of the task, armed or not, under a fresh token.
     Create { armed: bool },
-    /// The stored task written again in place: as armed as it is (`armed`), under its own `token` (a
-    /// stored registration that carries none gets a fresh one, read by the caller).
-    Update { armed: bool, token: Token },
+    /// The stored task written again in place: as armed as it is (`armed`), under its own `token`, if it
+    /// carries one.
+    Update { armed: bool, token: Option<Token> },
 }
 
 /// The record directory of `id` with permissions that name `accounts`. Nothing is read back.

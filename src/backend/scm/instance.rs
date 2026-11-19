@@ -93,8 +93,9 @@ impl InstanceId {
     }
 }
 
-/// The 32 lower-case hex digits of 16 bytes, as [`InstanceId::hex`] and a task registration's token write them.
-pub(crate) fn hex_of(bytes: &[u8; 16]) -> String {
+/// The lower-case hex digits of `bytes`: 32 for the 16 bytes that [`InstanceId::hex`] and a task registration's token
+/// write, 64 for a SHA-256.
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

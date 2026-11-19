@@ -10,7 +10,7 @@ use cosca::quote::windows::split_wide;
 use roxmltree::{Document, Node};
 
 use super::{
-    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, TASK_MODE_ARG, TaskXml, Token, WEEKDAYS, account_of,
+    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, Stored, TASK_MODE_ARG, TaskXml, Token, WEEKDAYS, account_of,
     extract_from_data, triggers_of, triggers_xml,
 };
 use crate::backend::scm::instance::TaskAccount;
@@ -93,42 +93,25 @@ impl TaskXml {
     /// a service account's. The name is as Task Scheduler stores it, usually a SID. `None` when the XML
     /// names no principal; an error only for XML that cannot be read.
     pub(crate) fn principal(xml: &str) -> Result<Option<TaskAccount>, Error> {
-        let document = document(xml)?;
-        let principal = child(document.root_element(), "Principals")
-            .and_then(|principals| child(principals, "Principal"))
-            .and_then(|principal| child(principal, "UserId").map(|user| (principal, text(user))))
-            .filter(|(_, user)| !user.is_empty());
-        let Some((principal, user)) = principal else {
-            return Ok(None);
-        };
-        let password = child(principal, "LogonType").is_some_and(|logon| text(logon).eq_ignore_ascii_case("Password"));
-        Ok(Some(if password {
-            TaskAccount::User(user)
-        } else {
-            TaskAccount::Service(user)
-        }))
+        Ok(principal_in(&document(xml)?))
     }
 
     /// The token the first action's arguments end with (`... --goetia-task <id> <token>`), the
     /// registration's own, for the task `id`. `None` when they end with no goetia ending for `id`
-    /// ([`ending_of`]: a hand edit, or another task's). An error for XML that cannot be read and for an
-    /// ending whose token is malformed.
+    /// ([`ending_of`]: a hand edit, another task's, or a malformed token). An error only for XML that
+    /// cannot be read.
     pub(crate) fn token_of(xml: &str, id: &str) -> Result<Option<Token>, Error> {
+        Ok(token_in(&document(xml)?, id))
+    }
+
+    /// What the stored `xml` of the task `id` says of its registration, from one parse: [`TaskXml::principal`],
+    /// [`TaskXml::armed`] and [`TaskXml::token_of`]. An error only for XML that cannot be read.
+    pub(crate) fn stored(xml: &str, id: &str) -> Result<Stored, Error> {
         let document = document(xml)?;
-        let arguments = child(document.root_element(), "Actions")
-            .and_then(|actions| elements(actions).next())
-            .filter(|action| action.tag_name().name() == "Exec")
-            .and_then(|exec| child(exec, "Arguments"))
-            .map(text)
-            .unwrap_or_default();
-        let arguments = split_arguments(&arguments);
-        let Some(text) = ending_of(&arguments, id) else {
-            return Ok(None);
-        };
-        Token::parse(text).map(Some).ok_or_else(|| {
-            Error::blob(format!(
-                "the task's arguments end with `{TASK_MODE_ARG} {id}` and a malformed token"
-            ))
+        Ok(Stored {
+            principal: principal_in(&document),
+            armed: armed_in(&document),
+            token: token_in(&document, id),
         })
     }
 
@@ -149,10 +132,7 @@ impl TaskXml {
     /// (`Settings/Enabled`, which Task Scheduler leaves out while it is true). XML that cannot be read is
     /// not armed.
     pub(crate) fn armed(xml: &str) -> bool {
-        let Ok(document) = document(xml) else {
-            return false;
-        };
-        own_flag_is_true(document.root_element()) && has_triggers(&document)
+        document(xml).is_ok_and(|document| armed_in(&document))
     }
 
     /// Whether `xml` holds a trigger whose own flag is true or absent. XML that cannot be read holds none.
@@ -209,6 +189,33 @@ impl TaskXml {
         });
         Ok(edited(xml, edits))
     }
+}
+
+fn principal_in(document: &Document<'_>) -> Option<TaskAccount> {
+    let (principal, user) = child(document.root_element(), "Principals")
+        .and_then(|principals| child(principals, "Principal"))
+        .and_then(|principal| child(principal, "UserId").map(|user| (principal, text(user))))
+        .filter(|(_, user)| !user.is_empty())?;
+    let password = child(principal, "LogonType").is_some_and(|logon| text(logon).eq_ignore_ascii_case("Password"));
+    Some(if password {
+        TaskAccount::User(user)
+    } else {
+        TaskAccount::Service(user)
+    })
+}
+
+fn token_in(document: &Document<'_>, id: &str) -> Option<Token> {
+    let arguments = child(document.root_element(), "Actions")
+        .and_then(|actions| elements(actions).next())
+        .filter(|action| action.tag_name().name() == "Exec")
+        .and_then(|exec| child(exec, "Arguments"))
+        .map(text)
+        .unwrap_or_default();
+    ending_of(&split_arguments(&arguments), id).and_then(Token::parse)
+}
+
+fn armed_in(document: &Document<'_>) -> bool {
+    own_flag_is_true(document.root_element()) && has_triggers(document)
 }
 
 /// The edit that sets the task's own flag to `value`: first among the `Settings`. None for a true flag

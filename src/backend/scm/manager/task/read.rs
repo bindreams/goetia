@@ -31,6 +31,18 @@ pub(crate) struct TaskSnapshot {
     registered: Registered,
 }
 
+/// What a task's stored registration says ([`TaskSnapshot::stored`]).
+pub(super) struct StoredRegistration {
+    /// The SID of the account its principal names; `None` when the XML names no principal or the name names no
+    /// account: not known to be any account being installed.
+    pub principal: Option<Sid>,
+    /// Whether it has triggers and is itself enabled.
+    pub armed: bool,
+    /// The token its arguments end with; `None` when they end with no goetia ending for this task (a hand
+    /// edit, a malformed token included).
+    pub token: Option<Token>,
+}
+
 impl TaskSnapshot {
     pub(in crate::backend::scm) fn new(id: Id, blob: Decoded, registered: Registered) -> Self {
         Self { id, blob, registered }
@@ -41,26 +53,25 @@ impl TaskSnapshot {
         TaskXml::parse(&self.registered.xml, &self.registered.data)
     }
 
-    /// The token the stored registration carries, `None` when its arguments end with no goetia ending for
-    /// this task (a hand edit). An error when the XML cannot be read or the token is malformed: that is no
-    /// licence to write another. Read from the XML on each call, for the write path alone.
-    pub(super) fn token(&self) -> Result<Option<Token>> {
-        TaskXml::token_of(&self.registered.xml, self.id.as_str())
-    }
-
-    /// The SID of the account the stored principal names, `None` when the XML names no principal or the
-    /// name names no account: not known to be any account being installed. An error when the XML cannot
-    /// be read, or the account could not be looked up for any other reason (a transient RPC or domain
-    /// controller failure): the registration is then not known to be another account's. Read from the XML
-    /// and looked up on each call, for the write path alone.
-    pub(super) fn principal(&self) -> Result<Option<Sid>> {
-        let Some(TaskAccount::Service(text) | TaskAccount::User(text)) = TaskXml::principal(&self.registered.xml)?
-        else {
-            return Ok(None);
+    /// What the stored registration says, from one read of its XML and one lookup of its account, for the write
+    /// path alone. An error when the XML cannot be read, or the account could not be looked up for any other
+    /// reason than "no such account" (a transient RPC or domain controller failure): the registration is then
+    /// not known to be another account's.
+    pub(super) fn stored(&self) -> Result<StoredRegistration> {
+        let stored = TaskXml::stored(&self.registered.xml, self.id.as_str())?;
+        let principal = match stored.principal {
+            Some(TaskAccount::Service(text) | TaskAccount::User(text)) => {
+                known_account(identity::sid_of_principal(&text)).map_err(|e| Error::Step {
+                    what: format!("look up the account of the registration of `{}`", self.id),
+                    source: Box::new(e),
+                })?
+            }
+            None => None,
         };
-        known_account(identity::sid_of_principal(&text)).map_err(|e| Error::Step {
-            what: format!("look up the account of the registration of `{}`", self.id),
-            source: Box::new(e),
+        Ok(StoredRegistration {
+            principal,
+            armed: stored.armed,
+            token: stored.token,
         })
     }
 
