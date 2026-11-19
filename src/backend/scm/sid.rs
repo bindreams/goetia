@@ -5,6 +5,18 @@
 /// A security identifier in its binary form, as `LookupAccountNameW` and `GetAce` return it.
 pub(crate) type Sid = Vec<u8>;
 
+/// `accounts`, each once, in the order they first appear.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn distinct(accounts: &[Sid]) -> Vec<Sid> {
+    let mut named: Vec<Sid> = Vec::new();
+    for account in accounts {
+        if !named.contains(account) {
+            named.push(account.clone());
+        }
+    }
+    named
+}
+
 /// The binary SID with `authority` as its identifier authority and `subauthorities` after it.
 pub(crate) fn sid_from_parts(authority: u8, subauthorities: &[u32]) -> Sid {
     let mut sid = vec![1, subauthorities.len() as u8, 0, 0, 0, 0, 0, authority];

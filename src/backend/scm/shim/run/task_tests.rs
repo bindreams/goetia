@@ -96,7 +96,7 @@ impl Run {
         let runs = Runs::of(dir.path(), &id);
         // Made plainly: naming Administrators as an owner needs an elevated token.
         std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join(ID)).unwrap();
-        runs.ensure(&process_user_sid()).unwrap();
+        runs.ensure(&[process_user_sid()]).unwrap();
         let fake = FakeGuard::new();
         let supervisor = supervisor(&fake);
         let api = TaskFake::new();

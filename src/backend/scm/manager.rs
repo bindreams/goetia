@@ -99,6 +99,8 @@ pub(in crate::backend::scm) mod registry;
 pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use registry::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -114,7 +116,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_default_log, which};
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_beside, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
@@ -736,10 +738,8 @@ impl Backend for Scm {
         }
     }
 
-    /// The default log of a daemon that runs the shim host, which the shim only opens: where an install
-    /// finds the daemon up to date and its log gone (deleted, or its folder was), this makes it again,
-    /// which is what the shim's own message for a link or a missing log says to do. The account is the
-    /// one the definition registers, which is the one installed.
+    /// A service: the event source, a real user's logon right ([`service_gate`], no password) and, if it runs
+    /// the shim host, its default log. A task: [`task_beside`]. The account is the one the definition registers.
     fn ensure_beside(
         &self,
         spec: &DaemonSpec,
@@ -748,9 +748,12 @@ impl Backend for Scm {
     ) -> Result<()> {
         match (definition, snapshot) {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
-                make_default_log(spec, definition, None, &[], default_log::Step::Narrow).map(drop)
+                let gated = service_gate(definition, written_user(&spec.common().user), Password::Unneeded)?;
+                make_default_log(spec, definition, gated.checked.as_ref(), &[], default_log::Step::Narrow).map(drop)
             }
-            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_default_log(installed),
+            (WindowsDefinition::Task(definition), WindowsSnapshot::Task(installed)) => {
+                task_beside(spec, definition, installed)
+            }
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
             | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
         }
@@ -1194,7 +1197,7 @@ fn apply(
     written: Option<identity::Written>,
     installed: Option<&ScmSnapshot>,
 ) -> Result<()> {
-    let gated = service_gate(reg, written)?;
+    let gated = service_gate(reg, written, Password::Read)?;
     let mut before = None;
     let mut after = default_log::Step::Narrow;
     if let Some(installed) = installed {
@@ -1242,10 +1245,18 @@ struct Gated {
     checked: Option<Sid>,
 }
 
+/// Whether `prepare`/`service_gate` read a real user's password: `Read` before a registration, `Unneeded` when
+/// the daemon is already registered.
+#[derive(Clone, Copy)]
+enum Password {
+    Read,
+    Unneeded,
+}
+
 /// What a service of `reg` needs before it is written, which a change of a task into a service sees to
 /// before it removes the task: the account is a user and its right is granted, the password is read,
 /// and the event source is registered. See [`apply`].
-fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Result<Gated> {
+fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads: Password) -> Result<Gated> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -1276,12 +1287,15 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
         // success and every start would fail with error 1069 (`ERROR_LOGON_FAILURE`), so a missing
         // one is refused.
         let user = identity::require_user_account(account, written)?;
-        let pw = identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
-            account: account.to_string(),
-            kind: DaemonKind::Service,
-        })?;
+        let pw = match reads {
+            Password::Read => Some(identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
+                account: account.to_string(),
+                kind: DaemonKind::Service,
+            })?),
+            Password::Unneeded => None,
+        };
         identity::grant_logon_right(&user, identity::Right::Service)?;
-        (Some(pw), Some(user.sid().clone()))
+        (pw, Some(user.sid().clone()))
     } else {
         (None, None)
     };
