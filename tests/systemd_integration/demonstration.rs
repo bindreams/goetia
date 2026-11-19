@@ -28,6 +28,10 @@ const EVERY_MINUTE: &str = "* * * * *";
 /// that far away and nothing fires while it is read. A clock step of 12 hours is outside what the
 /// lanes do.
 fn daily_in_half_a_day() -> String {
+    assert!(
+        std::env::var_os("TZ").is_none(),
+        "the test process has a `TZ`, and systemd reads `OnCalendar` in /etc/localtime, not in `TZ`"
+    );
     let at = jiff::Zoned::now()
         .checked_add(jiff::Span::new().hours(12))
         .expect("12 hours from now");
@@ -190,8 +194,22 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
     cli.daemon(&["enable", &id]);
     let candidates = expected_next_runs(EVERY_MINUTE, &id_of(&id), enabling_at, SystemTime::now());
     held.wait_started();
-    // `last-run` is read from the journal, which need not hold the run's `Starting` entry yet: wait for it
-    // (the entry `goetia` matches), and then one read must show the `last-run`.
+    // The unit is active, and journald need not hold the run's `Starting` entry yet: the task is running
+    // with a pid and no next run, and `last-run` is there or not.
+    assert_task_fields(
+        &cli.status_json(&id),
+        &id,
+        Expect {
+            state: "running",
+            enabled: true,
+            pid: Time::Present,
+            last_result: LastResult::Null,
+            last_run: Time::Any,
+            next_run: Time::Null,
+        },
+    );
+    // `last-run` is read from the journal: wait for the `Starting` entry `goetia` matches, and then one
+    // read must show the `last-run`.
     wait_for_started(&id);
     let running = read_in_the_zone(&in_zone, &id);
     assert_task_fields(
@@ -212,11 +230,12 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
             panic!("journald holds the run's Starting entry, and a read shows no last-run: {running:?}")
         });
         let fired = instant(time);
+        // One range: `enable` may span a minute boundary or more, and the minutes between candidates are
+        // the schedule's too.
+        let (first, last) = (candidates[0], candidates[2] + Duration::from_secs(60));
         assert!(
-            candidates
-                .iter()
-                .any(|&at| fired >= at && fired < at + Duration::from_secs(60)),
-            "{}: last-run {fired:?} is not in a minute from any of {candidates:?}",
+            fired >= first && fired < last,
+            "{}: last-run {fired:?} is not in [{first:?}, {last:?}) of {candidates:?}",
             read.form
         );
     }
