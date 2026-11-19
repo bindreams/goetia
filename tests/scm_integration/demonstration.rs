@@ -10,8 +10,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use goetia::manager::Exit;
+use goetia::manager::{Exit, State};
 use goetia::testing::task_run_times;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
 use serde_json::Value;
 
 use crate::managed::UNIT_DIR_EXCLUSIVE;
@@ -26,7 +29,8 @@ use crate::tasks::{
 
 const EVERY_MINUTE: &str = "* * * * *";
 
-/// What `LastTaskResult` reads after a `stop`: `0xC000013A`, a console close event.
+/// What a `stop` leaves as `last-result`. `LastTaskResult` reads `0x41306` (`SCHED_S_TASK_TERMINATED`),
+/// which goetia reports as `0xC000013A`, a console close event.
 const STOPPED: i32 = 0xC000_013A_u32 as i32;
 
 /// This binary, told to connect to `listener` and then run until the test drops that connection, and
@@ -46,6 +50,40 @@ fn to_the_second(time: SystemTime) -> SystemTime {
         .expect("a time after the epoch")
         .as_secs();
     UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// `time` cut down to the minute it is in.
+fn to_the_minute(time: SystemTime) -> SystemTime {
+    let secs = to_the_second(time)
+        .duration_since(UNIX_EPOCH)
+        .expect("a time after the epoch")
+        .as_secs();
+    UNIX_EPOCH + Duration::from_secs(secs / 60 * 60)
+}
+
+/// The next time after `after` that the clock of the machine's zone reads the hour and minute of
+/// `daily` (`M H * * *`): its civil date, hour and minute worked out here, not read from Task Scheduler.
+fn next_civil_time(daily: &str, after: SystemTime) -> SystemTime {
+    let fields: Vec<&str> = daily.split(' ').collect();
+    let [minute, hour, "*", "*", "*"] = fields[..] else {
+        panic!("`{daily}` is not a daily schedule");
+    };
+    let at = |date: Date| {
+        date.at(hour.parse().expect("an hour"), minute.parse().expect("a minute"), 0, 0)
+            .to_zoned(TimeZone::system())
+            .unwrap_or_else(|e| panic!("`{daily}` on {date}: {e}"))
+    };
+    let after: Zoned = Timestamp::try_from(after)
+        .expect("a time jiff holds")
+        .to_zoned(TimeZone::system());
+    let today = at(after.date());
+    if today.timestamp() > after.timestamp() {
+        today.timestamp().into()
+    } else {
+        at(after.date().tomorrow().expect("a day after today"))
+            .timestamp()
+            .into()
+    }
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -78,6 +116,8 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
 
     // 2. Armed. Enabled with a schedule 12 hours away, it is idle with the next run Task Scheduler itself
     // lists first, never run, in every form and at the offset of `TZ`. Nothing fires, so one read is the read.
+    // That run time is also the next time the machine's clock reads the hour and minute of `daily`, which
+    // is worked out here from the civil time: a wrong translation of the cron is not Task Scheduler's own.
     let enabling_at = SystemTime::now();
     cli.daemon(&["enable", id]);
     let listed = task_run_times(&task_id, enabling_at, enabling_at + Duration::from_secs(36 * 3600))
@@ -86,6 +126,11 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
         *listed
             .first()
             .unwrap_or_else(|| panic!("`{daily}` has a run time within 36 hours")),
+    );
+    assert_eq!(
+        next,
+        next_civil_time(&daily, enabling_at),
+        "`{daily}`: Task Scheduler's first run time is not the next time the clock reads it"
     );
     let armed = read_in_the_zone(&in_zone, id);
     assert_task_fields(
@@ -127,6 +172,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     cli.install(&manifest);
     let enabling_at = SystemTime::now();
     cli.daemon(&["enable", id]);
+    // The program connects when the schedule fires, at a minute Task Scheduler chooses: no bound fits.
     let held = listener.accept_unbounded();
     let fires = task_run_times(&task_id, enabling_at, SystemTime::now())
         .unwrap_or_else(|e| panic!("the run times of `{EVERY_MINUTE}`: {}", e.report()));
@@ -175,9 +221,10 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
             .as_deref()
             .map(instant)
             .unwrap_or_else(|| panic!("an armed task has a next run: {running:?}"));
+        // Not strictly after the fire: `NextRunTime` may not have moved past it when the program connects.
         assert!(
-            times.contains(&next) && next > instant(started),
-            "{}: next-run {next:?} is not a later run time of {times:?}: {running:?}",
+            times.contains(&next) && next >= to_the_minute(instant(started)),
+            "{}: next-run {next:?} is not a run time of {times:?} at or after the fire's minute: {running:?}",
             read.form
         );
     }
@@ -199,10 +246,11 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
         },
     );
     finished.assert_state("idle", None);
-    for read in finished.reads() {
+    for (before, after) in running.reads().into_iter().zip(finished.reads()) {
+        assert_eq!(before.last_run, after.last_run, "{running:?} then {finished:?}");
         assert_fired_in_range(
-            read.form,
-            read.last_run.as_deref().expect("a finished run has a last-run"),
+            after.form,
+            after.last_run.as_deref().expect("a finished run has a last-run"),
         );
     }
 
@@ -223,9 +271,27 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     manifest.command = runs_until_ended(&listener);
     cli.install(&manifest);
     cli.daemon(&["start", id]);
-    listener.accept_unbounded();
+    listener.accept("the task's program to start");
     cli.daemon(&["stop", id]);
-    wait::until(|| task_status(&mgr, &task_id).last_result == Some(Exit::Code(STOPPED)));
+    // The run has ended once the task is idle with no pid and a result other than step 4's. The instance
+    // may stay listed for a few ms after the result is written, so the result is read once that is over,
+    // and a wrong result fails here with its value instead of hanging.
+    let mut ended = None;
+    wait::until(|| {
+        let status = task_status(&mgr, &task_id);
+        let done = status.common.state == State::Idle
+            && status.common.pid.is_none()
+            && status.last_result.is_some()
+            && status.last_result != Some(Exit::Code(7));
+        ended = Some(status);
+        done
+    });
+    let ended = ended.expect("a status was read");
+    assert_eq!(
+        ended.last_result,
+        Some(Exit::Code(STOPPED)),
+        "a stopped run's result: {ended:?}"
+    );
     assert_task_fields(
         &cli.status_json(id),
         id,
