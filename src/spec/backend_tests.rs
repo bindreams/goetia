@@ -1,12 +1,16 @@
 use std::time::Duration;
 
-use super::{BackendKind, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, windows_builtin, windows_only_account};
+use super::{
+    BackendKind, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, systemd_defect, windows_builtin,
+    windows_only_account,
+};
 use crate::error::Error;
 use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
 use crate::spec::test_support::{abs, assert_no_run_of_spaces};
 use crate::spec::{AccountId, Id, Protocol, Restart, User};
+use crate::spec::{DaemonFields, DaemonKind};
 
 fn parse(yaml: &str) -> Result<BackendKind, yaml_serde::Error> {
     yaml_serde::from_str(yaml)
@@ -375,6 +379,24 @@ fn shaped_with_env_key(key: &str) -> ShapedSpec {
     spec.command = Some(vec!["/bin/frpc".to_string()]);
     spec.env.insert(key.to_string(), "v".to_string());
     spec
+}
+
+#[skuld::test]
+fn command_zero_path_rules_apply_to_a_service_and_not_to_a_task() {
+    for path in [r"/bin/a\b", "/bin/a\"b", "/bin/a'b", "/bin/a "] {
+        let common = DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "frpc".to_string(),
+            command: vec![path.to_string()],
+            cwd: None,
+            env: Default::default(),
+            user: User::Root,
+            logs: None,
+        };
+        let service = systemd_defect(&common, DaemonKind::Service);
+        assert!(service.is_some_and(|m| m.contains("`command[0]`")), "{path:?}");
+        assert_eq!(systemd_defect(&common, DaemonKind::Task), None, "{path:?}");
+    }
 }
 
 #[skuld::test]
