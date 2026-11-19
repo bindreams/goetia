@@ -2390,7 +2390,8 @@ fn an_update_over_a_timer_systemd_has_not_loaded_writes_and_reloads(#[fixture(sy
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     let new = armed_task_whose_schedule_moves(&id);
-    let fake = gate_then([reply(&["show"], exited(0, "LoadState=not-found\n", "")), reload()]);
+    let not_found = "ActiveState=inactive\nUnitFileState=\nLoadState=not-found\n";
+    let fake = gate_then([reply(&["show"], exited(0, not_found, "")), reload()]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
