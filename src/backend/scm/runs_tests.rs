@@ -889,8 +889,7 @@ fn hold_with_the_marker_is_refused_busy_and_hold_ignoring_it_is_not() {
     drop(own);
 }
 
-/// The writer's own pin is held until its record is in place and gone before its prune, which a held pin
-/// would stop: so it never blocks its own prune, and a write with no pin of its own is as before.
+/// The writer's pin never blocks its own prune.
 #[skuld::test]
 fn write_with_its_own_pin_prunes_and_is_not_blocked_by_it() {
     let (_dir, runs) = fixture();
@@ -904,9 +903,7 @@ fn write_with_its_own_pin_prunes_and_is_not_blocked_by_it() {
     assert_eq!(names(&runs), [file_of(&instance(2))], "the pin is gone");
 }
 
-/// A write with the writer's own pin goes through the directory handle the pin was made through, as every
-/// read of a pin does, and not through the path again: a `Runs` whose path is another directory still lands
-/// the record where the pin is.
+/// A write with a pin lands where the pin's handle is, not at the path.
 #[skuld::test]
 fn write_with_its_own_pin_writes_through_the_pins_directory() {
     let (_pinned_dir, pinned) = fixture();

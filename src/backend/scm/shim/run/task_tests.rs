@@ -29,8 +29,8 @@ use crate::backend::scm::shim::run::test_support::{
 };
 use crate::backend::scm::task_xml::Token;
 use crate::backend::scm::test_support::{
-    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, directory_with_a_file, make_mount_point, registered_task,
-    registered_task_with, set_dacl, task_token,
+    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, delete_pending, directory_with_a_file, make_mount_point,
+    registered_task, registered_task_with, set_dacl, task_token,
 };
 use crate::elevation::test_support::process_user_sid;
 use crate::error::Error;
@@ -129,9 +129,14 @@ impl Run {
         run
     }
 
-    /// Another handle on the task's records, as the verbs hold one.
+    /// Another handle on the task's records.
     fn hand(&self) -> Runs {
         Runs::of(self._dir.path(), &Id::try_from(ID).unwrap())
+    }
+
+    /// The `%ProgramData%` the records are under.
+    fn program_data(&self) -> &Path {
+        self._dir.path()
     }
 
     /// The task's directory of records.
@@ -196,7 +201,7 @@ impl Run {
             Some(task_token()),
             &self.supervisor,
             &self.api,
-            Some(&self.runs),
+            Ok(self.program_data()),
             OWN_PID,
         )
     }
@@ -381,7 +386,14 @@ fn a_registration_with_another_token_starts_no_program() {
     let run = Run::of(&spec_logging_to(None));
 
     let other = Token::parse(OTHER_TOKEN).unwrap();
-    let code = run_in(ID, Some(other), &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+    let code = run_in(
+        ID,
+        Some(other),
+        &run.supervisor,
+        &run.api,
+        Ok(run.program_data()),
+        OWN_PID,
+    );
 
     assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
     assert_one_failure(&run.fake.take_failures(), ID, &not_the_registration_started_under());
@@ -421,7 +433,7 @@ fn a_registration_with_no_ending_for_this_task_starts_no_program() {
         })));
         let (id, token) = requested_of(argv).expect("an ending with the task flag is task mode");
 
-        let code = run_in(&id, token, &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+        let code = run_in(&id, token, &run.supervisor, &run.api, Ok(run.program_data()), OWN_PID);
 
         assert_eq!(
             code,
@@ -439,7 +451,7 @@ fn a_registration_with_no_ending_for_this_task_starts_no_program() {
 fn a_shim_started_with_no_token_under_a_registration_with_one_starts_no_program() {
     let run = Run::of(&spec_logging_to(None));
 
-    let code = run_in(ID, None, &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+    let code = run_in(ID, None, &run.supervisor, &run.api, Ok(run.program_data()), OWN_PID);
 
     assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
     assert_one_failure(&run.fake.take_failures(), ID, &not_the_registration_started_under());
@@ -550,10 +562,7 @@ fn a_task_that_cannot_be_read_is_a_logged_shim_failure_with_the_os_error_and_not
     run.api.finish();
 }
 
-// The pin =============================================================================================================
-
-/// The removal's marker stands, as an uninstall or an account change leaves it: the shim's pin is refused
-/// and it ends before it reads the task, lists its instances, holds a log or starts a program.
+/// The removal's marker stands, as an uninstall or an account change leaves it: the shim's pin is refused.
 #[skuld::test]
 fn refused_pin_ends_the_shim_before_it_reads_the_task() {
     let run = Run::unread();
@@ -649,7 +658,6 @@ fn pin_failure_starts_no_program(run: &Run) -> u32 {
     code
 }
 
-/// Gives the directory its permissions back when it ends, so that the fixture can be removed.
 struct Restore(PathBuf);
 
 impl Drop for Restore {
@@ -677,7 +685,9 @@ fn a_pin_in_a_directory_that_is_gone_starts_no_program() {
     let run = Run::unread();
     std::fs::remove_dir(run.records_dir()).unwrap();
 
-    pin_failure_starts_no_program(&run);
+    let code = pin_failure_starts_no_program(&run);
+
+    assert_eq!(code, ERROR_FILE_NOT_FOUND);
 }
 
 #[skuld::test]
@@ -686,8 +696,9 @@ fn a_pin_in_a_directory_that_is_a_link_starts_no_program() {
     let target = tempfile::tempdir().unwrap();
     make_mount_point(&run.records_dir(), target.path());
 
-    pin_failure_starts_no_program(&run);
+    let code = pin_failure_starts_no_program(&run);
 
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
     assert_eq!(
         std::fs::read_dir(target.path()).unwrap().count(),
         0,
@@ -717,6 +728,37 @@ fn shim_rechecks_the_marker_after_its_listing() {
                 run.records_dir().display()
             ))
             && failures[0].ends_with("no program was started"),
+        "{failures:?}"
+    );
+    run.started_nothing();
+    run.api.finish();
+}
+
+/// A look for the marker that cannot be made after the listing ends the shim with the error it met, with no
+/// program started and no log opened. Here the listing leaves a marker whose delete is pending, which Windows
+/// answers with access denied.
+#[skuld::test]
+fn a_marker_look_that_fails_starts_no_program() {
+    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    let marker = run.records_dir().with_file_name(format!("{ID}~removing"));
+    let held = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&held);
+    run.api.on_instances_during(Ok(listed()), move || {
+        *slot.lock().unwrap() = Some(delete_pending(&marker));
+    });
+
+    let code = run.run();
+    drop(held.lock().unwrap().take());
+
+    assert_eq!(code, ERROR_ACCESS_DENIED);
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!(
+                "goetia-shim[{ID}]: look for the removal's marker of the run records {}: ",
+                run.records_dir().display()
+            ))
+            && failures[0].ends_with(": no program was started"),
         "{failures:?}"
     );
     run.started_nothing();
@@ -956,7 +998,14 @@ fn a_stop_during_the_com_reads_is_not_lost() {
             at,
         };
 
-        let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+        let code = run_in(
+            ID,
+            Some(task_token()),
+            &run.supervisor,
+            &api,
+            Ok(run.program_data()),
+            OWN_PID,
+        );
 
         assert_eq!(code, STOPPED, "a stop during {at:?}");
         assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped), "{at:?}");
@@ -1286,7 +1335,14 @@ fn a_stop_while_the_instance_is_not_listed_starts_nothing_and_records_the_run_st
         at: Read::Instances,
     };
 
-    let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+    let code = run_in(
+        ID,
+        Some(task_token()),
+        &run.supervisor,
+        &api,
+        Ok(run.program_data()),
+        OWN_PID,
+    );
 
     assert_eq!(code, STOPPED);
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
@@ -1313,7 +1369,14 @@ fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded(
     };
     let pin = run.runs.pin().unwrap();
 
-    let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+    let code = run_in(
+        ID,
+        Some(task_token()),
+        &run.supervisor,
+        &api,
+        Ok(run.program_data()),
+        OWN_PID,
+    );
 
     assert_eq!(code, STOPPED);
     assert_eq!(pin.appeared().unwrap(), vec![]);
@@ -1360,6 +1423,7 @@ fn a_failed_record_write_still_returns_the_programs_code() {
     );
     assert_eq!(run.fake.waiter_end(0), WaiterEnd::Returned);
     run.api.finish();
+    run.no_pin_is_left();
 }
 
 /// A prune that cannot remove a record (here a directory where the record should be) is a warning in
@@ -1397,14 +1461,18 @@ fn a_prune_problem_is_logged_and_does_not_change_the_runs_end() {
 #[skuld::test]
 fn no_program_data_starts_no_program() {
     let run = Run::unread();
+    let cause = Error::os("locate %ProgramData%", io::Error::other("no such known folder"));
 
-    let code = run_in(ID, Some(task_token()), &run.supervisor, &run.api, None, OWN_PID);
+    let code = run_in(ID, Some(task_token()), &run.supervisor, &run.api, Err(&cause), OWN_PID);
 
     assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
     assert_one_failure(
         &run.fake.take_failures(),
         ID,
-        "no program was started: the run records cannot be held, since the machine's %ProgramData% could not be located",
+        &format!(
+            "no program was started: the run records cannot be held, since the machine's %ProgramData% could not be located: {}",
+            cause.report()
+        ),
     );
     assert_eq!(run.fake.calls(Op::Spawn), 0);
     assert_eq!(run.api.calls(), vec![], "the task was read");
@@ -1425,7 +1493,7 @@ fn an_id_that_is_not_an_id_reads_nothing_and_runs_nothing() {
         Some(task_token()),
         &supervisor(&fake),
         &api,
-        None,
+        Ok(Path::new("unused")),
         OWN_PID,
     );
 

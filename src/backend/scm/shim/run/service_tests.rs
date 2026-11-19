@@ -350,7 +350,7 @@ fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs()
     fake.will_spawn(daemon.clone());
     let log = Arc::new(Log::from_program_data(
         fake.channels(),
-        Err(crate::error::Error::os(
+        &Err(crate::error::Error::os(
             "locate %ProgramData%",
             std::io::Error::other("x"),
         )),

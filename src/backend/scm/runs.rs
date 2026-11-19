@@ -9,8 +9,7 @@
 //! task, and while any pin is live a write prunes nothing. With none, a write removes every record
 //! but its own. **A run pins too:** the shim takes a pin before it reads anything, and holds it until its
 //! own record is renamed into place; it releases it before its own prune, so a run's pin never stops its
-//! own prune. So a run in flight stops every other run's prune, and its own record's prune comes when it
-//! ends: records pile up only for as long as runs overlap. A pin is a file held open with no sharing: it
+//! own prune. A pin is a file held open with no sharing: it
 //! goes when its holder does, however it ends, and while it is held nothing can delete it, whoever tries.
 //! One left by a power cut is held by nothing, and the next write finds it by deleting it: a sharing
 //! violation says it is live ([`files::delete`] reads every failed delete, here and in the removal). What a
@@ -331,10 +330,9 @@ impl Runs {
     /// returned as one line each for the caller to log: it never fails the write. A directory that is a
     /// link is refused ([`Runs::ensure`]), and nothing is written.
     ///
-    /// `own` is the writer's own pin ([`Runs::hold`]): it is held until the record is renamed into place and
-    /// released before the prune, which a held pin would stop, so the writer's own pin never blocks its own
-    /// prune. A write that fails releases it too. With a pin, the write goes through the directory handle
-    /// the pin was made through, as every read of a pin does, and not through the path again.
+    /// `own` is the writer's pin: held until the record is renamed into place, then released before the
+    /// prune, which a held pin would stop. A failed write releases it too. The write goes through the pin's
+    /// directory handle, not the path.
     pub(crate) fn write(&self, record: &RunRecord, own: Option<Pin>) -> io::Result<Vec<String>> {
         let (dir, own) = match own {
             Some(Pin { _file, dir, .. }) => (dir, Some(_file)),

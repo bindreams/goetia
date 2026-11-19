@@ -62,9 +62,9 @@ impl Log {
         }
     }
 
-    /// This log with the default log closed to its lines until [`Log::hold_default`] has run: before then a line
-    /// goes to the Event Log and stderr alone, whichever step tells it. Task mode, whose shim takes its pin on
-    /// the run records before it holds any log, and which a refusal must leave with none held.
+    /// The default log stays closed to lines until [`Log::hold_default`] runs; before then a line goes to the
+    /// Event Log and stderr only. Task mode needs this: its pin precedes any log, and a refused shim must hold
+    /// none.
     pub(crate) fn closed_until_held(self) -> Log {
         self.default_open.store(false, Ordering::Release);
         self
@@ -74,16 +74,16 @@ impl Log {
     /// the shim's one [`Real`], which is also its [`Os`](super::os::Os): the daemon's output and this log's lines
     /// share the handle it holds on the default log.
     pub(crate) fn real(real: Arc<Real>) -> Log {
-        Log::from_program_data(real, program_data())
+        Log::from_program_data(real, &program_data())
     }
 
     /// A log over `channels` for the `%ProgramData%` that `found` says. When it was not found there
     /// is no default file, since no other place is the machine's: failures go to the daemon's own log
     /// once [`Log::set_daemon_log`] names one, and to the Event Log. The first Event Log line says
     /// why there is no default file.
-    pub(crate) fn from_program_data(channels: Arc<dyn Channels>, found: Result<PathBuf>) -> Log {
+    pub(crate) fn from_program_data(channels: Arc<dyn Channels>, found: &Result<PathBuf>) -> Log {
         match found {
-            Ok(program_data) => Log::new(channels, logs_folder(&program_data)),
+            Ok(program_data) => Log::new(channels, logs_folder(program_data)),
             Err(e) => {
                 let log = Log {
                     channels,
