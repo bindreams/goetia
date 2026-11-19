@@ -251,7 +251,7 @@ pub(super) fn seen<'a>(mut e: &'a Dyn) -> Seen<'a> {
 /// both read, over what [`seen`] says it is.
 ///
 /// A `cosca` error is [`Shape::Cosca`]. A goetia error that sets another inside its message, and any
-/// [`Composite`](super::Composite) in its [`Carrier`], are [`Shape::Pieces`]. Any other is its own
+/// [`Composite`] in its [`Carrier`], are [`Shape::Pieces`]. Any other is its own
 /// `Display` and `source()`.
 pub(super) fn parts<'a>(e: &'a Dyn) -> Node<'a> {
     match seen(e) {
