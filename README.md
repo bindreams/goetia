@@ -1093,17 +1093,19 @@ makes it, so a file that is missing is a failed write, and the Event Log still
 has the line; `goetia daemon install` makes it again, even when the daemon is
 otherwise up to date. `goetia daemon uninstall` keeps the file.
 
-The shim holds `<id>.log` open while it runs, and opens the name again only once the file is deleted, so an
-install that changes the account (SCM does not restart the service) leaves the running shim its log. An install
-that changes the account while the service is starting, or has to make the file for a running service, leaves the
-old account named beside the new one in the file's permissions until the next install. If you delete `<id>.log`
-after a service with no `logs:` has started writing to it, the daemon's output goes on into the deleted file until
-you restart the daemon, as with any file a running program holds; the shim's own lines go to the new file. Windows
-frees the name at once on current NTFS, and `goetia daemon install` makes a new `<id>.log`. Until that restart, a run
-started before an earlier install changed the account writes the shim's lines to the Event Log only, not to the new
-`<id>.log`. Where the delete is
-deferred until the daemon's handle closes, the name stays and `goetia daemon install` fails saying so: stop the
-daemon, then install again.
+The shim holds `<id>.log` open while it runs, and a daemon with no `logs:` gets a copy of that handle for its
+output when it is started. The shim never makes the file: it opens the name again when the file it holds was
+deleted, or when it holds none (the file was missing when it started). So an install that changes the account
+(SCM does not restart the service) leaves the running shim its log. An install that changes the account while the
+service is starting, or has to make the file for a running service, leaves the old account named beside the new one
+in the file's permissions until the next install.
+
+If you delete `<id>.log` while the service runs, a daemon with no `logs:` goes on writing into the deleted file until
+you restart it, as with any file a running program holds. The shim's own lines always reach the Event Log; those it
+writes to `<id>.log` go to the new file once `goetia daemon install` makes one, except for a run started before an
+earlier install changed the account, until that run restarts. Windows frees the name at once on current NTFS. Where
+the delete is deferred until every handle on the file closes, the shim's included, the name stays and
+`goetia daemon install` fails saying so: stop the daemon, then install again.
 
 A `logs:` that is inside `%ProgramData%\Goetia\logs` is refused at install, whichever file it
 names (the folder is the shim's default logs, which a daemon's own account cannot make a file in).

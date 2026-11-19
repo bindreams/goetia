@@ -8,9 +8,10 @@
 //!
 //! **The default file is an install's.** `%ProgramData%\Goetia\logs` and `<id>.log` in it are made, and
 //! judged, by the elevated install that registers the shim ([`default_log::ensure`]); the shim, which runs
-//! as the daemon's account, makes neither and opens the file for appending alone ([`LogKind::Default`]), once,
-//! when it starts ([`Log::hold_default`]): an install may take the account out of the file's permissions (an
-//! account change, which SCM does not apply to a running service), and a handle keeps what it was opened with.
+//! as the daemon's account, makes neither and opens the file for appending alone ([`LogKind::Default`]) when it
+//! starts ([`Log::hold_default`]), and again only when the file it holds was deleted or it holds none: an install
+//! may take the account out of the file's permissions (an account change, which SCM does not apply to a running
+//! service), and a handle keeps what it was opened with.
 //! Where the file is not there, or is a link, or the account cannot append to it, the append fails and the
 //! Event Log still gets the line.
 //!
