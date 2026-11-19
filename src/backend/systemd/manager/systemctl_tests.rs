@@ -1456,69 +1456,39 @@ fn not_loaded_then_reloaded(not_found: &str, after: &str) -> Fake {
 /// reloaded and asked about again, whichever read it was.
 #[skuld::test]
 fn a_unit_written_and_not_reloaded_is_reloaded_by_every_read_of_it() {
-    let status = "ActiveState=active
-MainPID=42
-UnitFileState=enabled
-LoadState=";
-    let job = "ActiveState=inactive
-MainPID=0
-InvocationID=
-LoadState=";
-    let pid = "MainPID=42
-LoadState=";
-    let arming = "ActiveState=active
-UnitFileState=enabled
-LoadState=";
-    let reads: [(&str, &str, Box<dyn Fn(&Systemctl) -> Result<()>>); 4] = [
+    let reads: [(&str, &str, fn(&Systemctl) -> Result<()>); 4] = [
         (
             "status",
-            status,
-            Box::new(|s| {
+            "ActiveState=active\nMainPID=42\nUnitFileState=enabled\nLoadState=",
+            |s| {
                 let status = s.status_from_unit("x.service")?;
                 assert_eq!(
                     (status.state, status.pid, status.enabled),
                     (State::Running, Some(42), true)
                 );
                 Ok(())
-            }),
+            },
         ),
         (
             "task",
-            job,
-            Box::new(|s| {
+            "ActiveState=inactive\nMainPID=0\nInvocationID=\nLoadState=",
+            |s| {
                 assert_eq!(s.task_state("x.service")?.state, State::Idle);
                 Ok(())
-            }),
+            },
         ),
-        (
-            "pid",
-            pid,
-            Box::new(|s| {
-                assert_eq!(s.main_pid_of("x.service")?, Some(42));
-                Ok(())
-            }),
-        ),
-        (
-            "arming",
-            arming,
-            Box::new(|s| {
-                let arming = s.timer_arming("x", &mut Held::default())?;
-                assert_eq!((arming.active, arming.enabled), (true, true));
-                Ok(())
-            }),
-        ),
+        ("pid", "MainPID=42\nLoadState=", |s| {
+            assert_eq!(s.main_pid_of("x.service")?, Some(42));
+            Ok(())
+        }),
+        ("arming", "ActiveState=active\nUnitFileState=enabled\nLoadState=", |s| {
+            let arming = s.timer_arming("x", &mut Held::default())?;
+            assert_eq!((arming.active, arming.enabled), (true, true));
+            Ok(())
+        }),
     ];
     for (name, answer, read) in reads {
-        let fake = not_loaded_then_reloaded(
-            &format!(
-                "{answer}not-found
-"
-            ),
-            &format!(
-                "{answer}loaded
-"
-            ),
-        );
+        let fake = not_loaded_then_reloaded(&format!("{answer}not-found\n"), &format!("{answer}loaded\n"));
         read(&on_booted(fake.clone())).unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let verbs: Vec<_> = fake.calls().iter().map(|call| call[0].clone()).collect();
         assert_eq!(verbs, ["show", "--version", "show", "daemon-reload", "show"], "{name}");
@@ -1528,11 +1498,7 @@ LoadState=";
 /// A unit systemd still cannot see after the reload is not loaded, as for any unit it cannot see.
 #[skuld::test]
 fn a_unit_still_not_loaded_after_the_reload_is_not_loaded() {
-    let answer = "ActiveState=inactive
-MainPID=0
-UnitFileState=
-LoadState=not-found
-";
+    let answer = "ActiveState=inactive\nMainPID=0\nUnitFileState=\nLoadState=not-found\n";
     let fake = not_loaded_then_reloaded(answer, answer);
 
     let e = on_booted(fake.clone())
@@ -1547,11 +1513,7 @@ LoadState=not-found
 /// the reload said, and a reload in doubt stays in doubt.
 #[skuld::test]
 fn a_reload_a_read_made_and_lost_keeps_its_context() {
-    let answer = "ActiveState=inactive
-MainPID=0
-UnitFileState=
-LoadState=not-found
-";
+    let answer = "ActiveState=inactive\nMainPID=0\nUnitFileState=\nLoadState=not-found\n";
     let mut entries = vec![reply(&["show"], exited(0, answer, ""))];
     entries.extend(gate_passes());
     entries.push(fail(&["daemon-reload"], lost(false)));
@@ -1566,15 +1528,7 @@ LoadState=not-found
 
     let mut entries = vec![reply(&["show"], exited(0, answer, ""))];
     entries.extend(gate_passes());
-    entries.push(reply(
-        &["daemon-reload"],
-        exited(
-            1,
-            "",
-            "Access denied
-",
-        ),
-    ));
+    entries.push(reply(&["daemon-reload"], exited(1, "", "Access denied\n")));
     let e = on_booted(Fake::new(entries))
         .status_from_unit("x.service")
         .expect_err("refused");
