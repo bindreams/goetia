@@ -14,7 +14,7 @@ use super::status::{run_state, task_status};
 use super::{TaskApi, TaskPath};
 use crate::backend::scm::generate::{self, WindowsDefinition};
 use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, open_refused};
-use crate::backend::scm::task_xml::{TaskXml, extract_from_data};
+use crate::backend::scm::task_xml::{TaskXml, Token, extract_from_data};
 use crate::backend::{Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed};
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
@@ -37,6 +37,11 @@ impl TaskSnapshot {
     /// The installed definition, read back from the stored XML.
     fn definition(&self) -> Result<TaskXml> {
         TaskXml::parse(&self.registered.xml, &self.registered.data)
+    }
+
+    /// The token the stored registration carries, `None` for one made before the token.
+    pub(super) fn token(&self) -> Option<Token> {
+        TaskXml::token_of(&self.registered.xml).ok().flatten()
     }
 
     /// Whether every trigger is enabled.

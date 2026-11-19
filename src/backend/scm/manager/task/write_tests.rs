@@ -207,7 +207,13 @@ fn reinstall_of_an_identical_task_writes_nothing() {
     let scm = Scm::new();
     let desired = definition(&spec).to_string();
     for armed in [true, false] {
-        let installed = snapshot_of(&spec, armed);
+        // Another registration's token is no difference.
+        let stored = registered_task(&spec, armed);
+        let stored = Registered {
+            xml: stored.xml.replace(task_token().as_str(), "00112233445566778899aabbccddeeff"),
+            ..stored
+        };
+        let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), stored);
         let on_disk = scm.task_installed(&installed).unwrap().definition.to_string();
         let regenerated = scm.task_regenerate(&spec, &installed).unwrap().to_string();
 
@@ -231,6 +237,34 @@ fn reinstall_of_an_identical_task_writes_nothing() {
     }
 }
 
+/// A registration made before the token is read as different, so that an install writes it again with one.
+#[skuld::test]
+fn a_registration_without_a_token_is_not_up_to_date() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let stored = registered_task(&spec, false);
+    let without = Registered {
+        xml: stored.xml.replace(&format!(" {}", task_token().as_str()), ""),
+        ..stored
+    };
+    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), without);
+    let scm = Scm::new();
+
+    let outcome = decide::decide(
+        &Ownership::Ours {
+            blob: blob(&spec),
+            regenerated: scm.task_regenerate(&spec, &installed).unwrap().to_string(),
+            on_disk: scm.task_installed(&installed).unwrap().definition.to_string(),
+        },
+        &definition(&spec).to_string(),
+        &spec,
+        crate::version(),
+        false,
+        &ExternalConfig::Absent,
+    );
+
+    assert!(!matches!(outcome, decide::Outcome::UpToDate), "{outcome:?}");
+}
+
 #[skuld::test]
 fn a_changed_task_is_updated_in_place_over_the_installed_one() {
     let spec = task_spec(Some("30 3 * * *"));
@@ -252,6 +286,131 @@ fn a_changed_task_is_updated_in_place_over_the_installed_one() {
         .unwrap();
 
     assert_eq!(fake.calls(), [register_call(&rescheduled, false, root(), None, true)]);
+}
+
+// The registration's token --------------------------------------------------------------------------------------------
+
+/// A create of `spec` over nothing, and the token it registers.
+fn token_of_a_create(spec: &DaemonSpec) -> Token {
+    let (_dir, runs) = made_records();
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    scm(&fake)
+        .task_write_with(
+            spec,
+            &definition(spec),
+            None,
+            &runs,
+            &mut Running(vec![]),
+            prepared(system(), None),
+        )
+        .unwrap();
+    registered_token(&fake)
+}
+
+#[skuld::test]
+fn create_makes_a_new_token() {
+    let spec = task_spec(Some("30 3 * * *"));
+    assert_ne!(token_of_a_create(&spec), token_of_a_create(&spec));
+}
+
+/// An update is the same registration: a shim that read the token before it is still the task's own.
+#[skuld::test]
+fn update_in_place_keeps_the_token() {
+    let (_dir, runs) = made_records();
+    let installed = snapshot_of(&task_spec(Some("30 3 * * *")), true);
+    let rescheduled = task_spec(Some("0 4 * * *"));
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .task_write_with(
+            &rescheduled,
+            &definition(&rescheduled),
+            Some(&installed),
+            &runs,
+            &mut Running(vec![]),
+            prepared(system(), None),
+        )
+        .unwrap();
+
+    assert_eq!(registered_token(&fake), task_token());
+}
+
+#[skuld::test]
+fn an_account_change_makes_a_new_token() {
+    let (_dir, runs) = made_records();
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap();
+
+    assert_ne!(registered_token(&fake), task_token(), "the old registration's is not carried over");
+}
+
+#[skuld::test]
+fn retype_service_to_task_makes_a_new_token() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let (_dir, runs) = made_records();
+        let fake = Fake::new();
+        fake.on_register(Ok(Registration::Created));
+        scm(&fake)
+            .retype_to_task_with(
+                &spec,
+                &definition(&spec),
+                &runs,
+                prepared(process_user_sid(), None),
+                || Ok(None),
+                || Ok(()),
+            )
+            .unwrap();
+        tokens.push(registered_token(&fake));
+    }
+    assert_ne!(tokens[0], tokens[1]);
+}
+
+#[skuld::test]
+fn a_registration_without_a_token_gets_one_on_update() {
+    let (_dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let stored = registered_task(&spec, true);
+    let without = Registered {
+        xml: stored.xml.replace(&format!(" {}", task_token().as_str()), ""),
+        ..stored.clone()
+    };
+    assert_eq!(TaskXml::token_of(&without.xml).unwrap(), None, "the fixture has no token");
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            Some(&TaskSnapshot::new(id(), Ok(blob(&spec)), without)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(system(), None),
+        )
+        .unwrap();
+
+    assert_eq!(fake.calls().len(), 1);
+    registered_token(&fake);
 }
 
 // A change of account -------------------------------------------------------------------------------------------------

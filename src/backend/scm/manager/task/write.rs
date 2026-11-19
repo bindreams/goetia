@@ -181,7 +181,8 @@ impl Scm {
     /// create or was gone for an update.
     ///
     /// An account is the same when the stored principal's SID is the new account's, and then the task
-    /// is updated in place. Otherwise (a stored principal that cannot be told is a change) Task
+    /// is updated in place, with the registration's token kept (a registration with none gets one).
+    /// Every create, a replacement included, makes a fresh token. Otherwise (a stored principal that cannot be told is a change) Task
     /// Scheduler would keep the security descriptor the task was registered with, which names the old
     /// account only and so leaves the task unreadable by the new account's shim. So the task is
     /// registered again ([`Self::task_register_again`]): disabled, refused while the old one runs (its
@@ -204,11 +205,16 @@ impl Scm {
         match changed {
             None => {
                 task_records(id, runs, &prepared.principal, &Kept::default())?;
+                // An update is the registration it was: it keeps the token, or gets one if it has none.
+                let token = snapshot
+                    .and_then(TaskSnapshot::token)
+                    .unwrap_or_else(Token::fresh);
                 self.task_register(
                     id,
                     definition,
                     snapshot.is_some_and(TaskSnapshot::armed),
                     snapshot.is_some(),
+                    &token,
                     &prepared,
                 )
             }
@@ -280,7 +286,7 @@ impl Scm {
             Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
             Err(e) => return Err(e),
         }
-        let wrote = self.task_register(id, definition, old.armed(), false, prepared)?;
+        let wrote = self.task_register(id, definition, old.armed(), false, &Token::fresh(), prepared)?;
         landed(id, runs, prepared, &kept, wrote)
     }
 
@@ -300,18 +306,20 @@ impl Scm {
     }
 
     /// The registration itself, once what it needs is acquired: the task as `armed` says, an update of
-    /// the one there is or a create.
+    /// the one there is or a create, carrying `token`. A create is a new registration and takes a fresh
+    /// token; an update keeps the one it replaces.
     fn task_register(
         &self,
         id: &Id,
         definition: &TaskXml,
         armed: bool,
         update: bool,
+        token: &Token,
         prepared: &Prepared,
     ) -> Result<WriteOutcome> {
         let registered = self.tasks.register(
             &TaskPath::of(id),
-            &definition.to_xml(armed, &Token::fresh()),
+            &definition.to_xml(armed, token),
             &definition.account(),
             prepared.password.as_deref(),
             update,
@@ -627,7 +635,7 @@ impl Scm {
         };
         task_records(id, runs, &prepared.principal, &kept)?;
         retire()?;
-        let wrote = self.task_register(id, definition, false, false, &prepared)?;
+        let wrote = self.task_register(id, definition, false, false, &Token::fresh(), &prepared)?;
         landed(id, runs, &prepared, &kept, wrote)
     }
 
