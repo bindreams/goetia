@@ -476,6 +476,33 @@ fn a_hold_whose_re_read_failed_after_a_refused_open_names_the_pid_once() {
     );
 }
 
+/// A plain failure of the read that confirms a run's process says which of the runs it was for, once.
+#[skuld::test]
+fn a_hold_whose_confirming_read_failed_names_which_run_it_was_for_once() {
+    let fake = Fake::new();
+    fake.on_instances(two()).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100, 200]);
+
+    let failed = hold_run(
+        &fake,
+        "kill",
+        &id(),
+        &TaskPath::of(&id()),
+        &instance(2, 200),
+        &mut machine,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        failed.report().to_string(),
+        "failed to hold the process of `nightly`'s run: confirming that process 200 is the service's: failed to \
+         list the runs of `nightly`: listing failed"
+    );
+}
+
 /// A `Stop` that fails for one run does not keep the others from being sent theirs: every run is asked,
 /// and the failure is reported.
 #[skuld::test]

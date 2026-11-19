@@ -670,7 +670,11 @@ fn a_failed_confirming_read_closes_the_process_and_signals_nothing() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "manager read failed");
+    assert_eq!(e.kind(), READ_FAILED_KIND);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: confirming that process 100 is the service's: manager read failed"
+    );
     assert_eq!(
         target.log(),
         steps(["service_pid", "open 100", "service_pid", "close 100"])
@@ -723,14 +727,34 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
     assert!(!target.log().contains(&"await_recorded 100".to_string()));
 }
 
-/// A process that was never signalled keeps the plain error: it is not a signalled one.
+/// A process that was never signalled keeps the plain error: it is not a signalled one. The hold names
+/// the process the read was about, once.
 #[skuld::test]
 fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
     let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "manager read failed");
+    assert_eq!(e.kind(), READ_FAILED_KIND);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: waiting for the manager to record that process 100 is gone: manager read failed"
+    );
+}
+
+/// A hold that fails after the manager named the process says which process, once, whichever step failed.
+#[skuld::test]
+fn every_failure_of_a_hold_with_a_pid_names_it_once() {
+    let confirming = Scripted::new([Some(100)], [Open::Found]).failing_read(2);
+    let recording = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+    let pair = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);
+    for mut target in [confirming, recording, pair] {
+        let failed = hold_once(&mut target, Budget::Unbounded.start()).expect_err("a failed hold");
+
+        let report = target_failed("hold", io::Error::from(failed)).report().to_string();
+
+        assert_eq!(report.matches("100").count(), 1, "{report}");
+    }
 }
 
 #[skuld::test]
@@ -817,9 +841,10 @@ fn any_other_error_is_an_os_failure_of_the_kill() {
 }
 
 /// A failure after the signal was delivered, plain or of goetia's own, is told under the kill without
-/// saying the kill failed: the signal stands. A failure to signal is told under it the same way.
+/// saying the kill failed: the signal stands. A failure to signal is a failed kill, whose context says
+/// how far it got.
 #[skuld::test]
-fn the_report_of_a_failure_around_the_signal_does_not_read_as_a_failed_kill() {
+fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
     for (e, lead) in [
         (
@@ -832,17 +857,21 @@ fn the_report_of_a_failure_around_the_signal_does_not_read_as_a_failed_kill() {
         ),
         (
             not_signalled(7, io::Error::other("terminate failed")),
-            "kill `x`: process 7 was held and confirmed",
+            "failed to kill `x`: process 7 was held and confirmed",
         ),
         (
             not_signalled(7, wrapped()),
-            "kill `x`: process 7 was held and confirmed",
+            "failed to kill `x`: process 7 was held and confirmed",
         ),
     ] {
         let report = kill_failed("x", e).report().to_string();
 
         assert!(report.starts_with(lead), "{report}");
-        assert!(!report.contains("failed to kill"), "{report}");
+        assert_eq!(
+            report.contains("failed to kill"),
+            lead.starts_with("failed"),
+            "{report}"
+        );
     }
 }
 
@@ -851,9 +880,13 @@ fn the_report_of_a_failure_around_the_signal_does_not_read_as_a_failed_kill() {
 #[skuld::test]
 fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
-    for (e, context) in [
-        (signalled_but(7, wrapped()), "was signalled"),
-        (not_signalled(7, wrapped()), "signalling it failed"),
+    for (e, kill_what, context) in [
+        (signalled_but(7, wrapped()), "kill `x`", "was signalled"),
+        (
+            not_signalled(7, wrapped()),
+            "failed to kill `x`",
+            "signalling it failed",
+        ),
     ] {
         let failed = kill_failed("x", e);
 
@@ -863,7 +896,7 @@ fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
         let Error::Step { what, source } = &**source else {
             panic!("a step under the kill: {failed:?}");
         };
-        assert_eq!(kill, "kill `x`");
+        assert_eq!(kill, kill_what);
         assert!(what.contains(context), "{what}");
         assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
     }

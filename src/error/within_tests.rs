@@ -34,14 +34,21 @@ fn a_report_prints_the_context_and_then_the_cause_once() {
 /// is the failure's, and the refused open is told with it.
 #[skuld::test]
 fn a_goetia_error_the_read_carries_is_the_source_of_a_hold_that_could_not_tell_a_refusal() {
-    let read = io::Error::other(Error::RequestInDoubt {
+    let carried = || Error::RequestInDoubt {
         request: "read".to_string(),
         reached: false,
         note: None,
         source: "no answer".into(),
-    });
+    };
+    let e = unread_after_open_refused(7, denied(), io::Error::other(carried()));
 
-    let told = target_failed("hold", unread_after_open_refused(7, denied(), read));
+    let Some(Error::ManagerUnreadAfterOpenRefused { source, .. }) = e.get_ref().and_then(|e| e.downcast_ref::<Error>())
+    else {
+        panic!("the unread variant: {e:?}");
+    };
+    assert!(matches!(**source, Error::RequestInDoubt { .. }), "{source:?}");
+
+    let told = target_failed("hold", e);
 
     assert!(told.is_indeterminate(), "{told:?}");
     let report = told.report().to_string();
@@ -52,6 +59,7 @@ fn a_goetia_error_the_read_carries_is_the_source_of_a_hold_that_could_not_tell_a
         ),
         "{report}"
     );
+    assert!(report.ends_with(&carried().report().to_string()), "{report}");
 }
 
 /// A plain read failure is the bare OS error under the hold's words, which already say the re-read failed,
@@ -88,29 +96,17 @@ fn a_targets_failure_keeps_what_was_done_whether_or_not_it_carries_a_goetia_erro
     assert_eq!(plain.report().to_string(), "failed to kill `x`: denied");
 }
 
-/// An error that says how far the operation got (it is said within a context) is told under the
-/// operation's name with no verdict on it: its context may say the operation's signal was delivered.
+/// `within` is a general helper (a stream's name, a privilege step): a failure said within a context is
+/// still a failure of the operation, which keeps `failed to`, whether it carries a goetia error or not.
 #[skuld::test]
-fn a_failure_said_within_a_context_is_told_under_the_operation_without_a_verdict() {
-    let carrying = target_failed(
-        "kill `x`",
-        within(
-            "process 7 was signalled, but the wait failed",
-            io::Error::other(Error::blob("carried")),
-        ),
-    );
+fn a_failure_said_within_a_context_by_a_target_is_still_a_failure_of_the_operation() {
+    let carrying = target_failed("kill `x`", within("stdout", io::Error::other(Error::blob("carried"))));
     assert_eq!(
         carrying.report().to_string(),
-        "kill `x`: process 7 was signalled, but the wait failed: blob: carried"
+        "failed to kill `x`: stdout: blob: carried"
     );
     assert!(matches!(carrying.cause(), Error::Blob { .. }), "{carrying:?}");
 
-    let plain = target_failed(
-        "kill `x`",
-        within("process 7 was signalled, but the wait failed", denied()),
-    );
-    assert_eq!(
-        plain.report().to_string(),
-        "kill `x`: process 7 was signalled, but the wait failed: denied"
-    );
+    let plain = target_failed("kill `x`", within("stdout", denied()));
+    assert_eq!(plain.report().to_string(), "failed to kill `x`: stdout: denied");
 }

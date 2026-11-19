@@ -392,6 +392,11 @@ fn a_standard_printer_shows_each_failure_of_a_composite_once() {
         }),
         then: Box::new(os("stat", "/r", "last failure")),
     };
+    #[cfg(windows)]
+    let pair = crate::error::debug_privilege_also_failed(
+        std::io::Error::other("primary failure"),
+        std::io::Error::other("second failure"),
+    );
     let blob = Error::StartJudgedWithoutBlob {
         id: "x".to_string(),
         judged_as: crate::spec::Protocol::Native,
@@ -403,12 +408,14 @@ fn a_standard_printer_shows_each_failure_of_a_composite_once() {
         read_failed: Box::new(os("read", "/t", "read failure")),
         restore_failed: Some(Box::new(os("write", "/u", "restore failure"))),
     };
-    let shown: [(&(dyn std::error::Error + 'static), &[&str]); 4] = [
+    let mut shown: Vec<(&(dyn std::error::Error + 'static), &[&str])> = vec![
         (&both, &["first failure", "then failure"]),
         (&nested, &["first failure", "then failure", "last failure"]),
         (&blob, &["blob failure", "start failure"]),
         (&loaded, &["read failure", "restore failure"]),
     ];
+    #[cfg(windows)]
+    shown.push((&pair, &["primary failure", "second failure"]));
     for (e, failures) in shown {
         let text = standard_print(e);
         for failure in failures {
