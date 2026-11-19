@@ -227,7 +227,8 @@ pub struct RemovalMarker(crate::backend::scm::runs::Runs);
 
 #[cfg(windows)]
 impl RemovalMarker {
-    /// Places the marker. Fails when the task has no run records, which there is no marker for.
+    /// Places the marker. Fails when the shared `Goetia\runs` folder is missing, which holds the marker and
+    /// every task's records: there are then no records to protect.
     pub fn place(id: &Id) -> Result<Self> {
         use crate::backend::scm::runs::{Closed, Runs};
 
@@ -237,7 +238,10 @@ impl RemovalMarker {
             Closed::Placed => Ok(Self(runs)),
             Closed::NoRecords => Err(crate::error::Error::os(
                 "place the removal's marker",
-                std::io::Error::other(format!("the task `{id}` has no run records")),
+                std::io::Error::other(format!(
+                    "the folder {} of the run records is missing",
+                    runs.dir().parent().unwrap_or(runs.dir()).display()
+                )),
             )),
         }
     }

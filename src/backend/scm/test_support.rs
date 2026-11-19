@@ -432,17 +432,22 @@ impl DirWatch {
         let mut changes = Vec::new();
         loop {
             let mut returned = 0u32;
+            // The kernel writes to the `OVERLAPPED`, so it is passed as a mutable pointer, not a shared reference.
+            let overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED = &raw mut *self.overlapped;
             // SAFETY: the handle and the `OVERLAPPED` of a request in flight; `1` waits for it.
-            let ok =
-                unsafe { GetOverlappedResult(self.dir.as_raw_handle() as HANDLE, &*self.overlapped, &mut returned, 1) };
+            let ok = unsafe { GetOverlappedResult(self.dir.as_raw_handle() as HANDLE, overlapped, &mut returned, 1) };
             assert!(
                 ok != 0,
                 "the watch of the directory failed: {}",
                 std::io::Error::last_os_error()
             );
             assert!(returned > 0, "the watch's buffer overflowed: changes were lost");
-            let bytes: Vec<u8> = self.buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
-            let bytes = &bytes[..returned as usize];
+            let bytes: Vec<u8> = self
+                .buffer
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .take(returned as usize)
+                .collect();
             self.issue();
             let mut at = 0usize;
             loop {
@@ -482,10 +487,12 @@ impl Drop for DirWatch {
         // The request in flight is cancelled and waited out, since the kernel still writes to the buffer.
         let handle = self.dir.as_raw_handle() as HANDLE;
         let mut returned = 0u32;
+        // The kernel writes to the `OVERLAPPED`, so it is passed as a mutable pointer, not a shared reference.
+        let overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED = &raw mut *self.overlapped;
         // SAFETY: the handle and `OVERLAPPED` are those of the request in flight.
         unsafe {
-            CancelIoEx(handle, &*self.overlapped);
-            GetOverlappedResult(handle, &*self.overlapped, &mut returned, 1);
+            CancelIoEx(handle, overlapped);
+            GetOverlappedResult(handle, overlapped, &mut returned, 1);
         }
     }
 }

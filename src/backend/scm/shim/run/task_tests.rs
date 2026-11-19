@@ -20,10 +20,10 @@ use crate::backend::scm::manager::task::api::{Instance, Registered, TaskApi};
 use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::shim::acl::Descriptor;
-use crate::backend::scm::shim::run::os::LogKind;
 use crate::backend::scm::shim::run::os::fake::{
     ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
 };
+use crate::backend::scm::shim::run::os::{LogKind, Severity};
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
@@ -112,7 +112,7 @@ impl Run {
         std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join(ID)).unwrap();
         runs.ensure(&[process_user_sid()]).unwrap();
         let fake = FakeGuard::new();
-        let supervisor = supervisor(&fake);
+        let supervisor = Arc::new(Supervisor::new(fake.os(), fake.task_log()));
         Run {
             fake,
             supervisor,
@@ -581,8 +581,13 @@ fn refused_shim_opens_no_log() {
         0,
         "the refusal's line opened the default log"
     );
-    assert_eq!(Run::default_log_holds(&run.fake.take_channel_calls()), 0);
-    run.fake.take_failures();
+    let calls = run.fake.take_channel_calls();
+    assert_eq!(Run::default_log_holds(&calls), 0);
+    assert!(
+        matches!(calls.as_slice(), [ChannelCall::EventLog { severity: Severity::Error, line }]
+            if line.contains("being removed or handed to another account")),
+        "the refusal is told to the Event Log alone: {calls:?}"
+    );
 }
 
 /// The pin is taken before the default log is held: a shim whose pin fails never holds it, and one whose

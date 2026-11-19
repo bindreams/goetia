@@ -59,7 +59,8 @@ pub(super) fn requested(args: &[OsString]) -> Option<(String, Option<Token>)> {
 /// Never returns.
 pub(super) fn run(id: &str, token: Option<Token>) -> ! {
     let real = Arc::new(Real::default());
-    let log = Arc::new(Log::real(Arc::clone(&real)));
+    // Closed to the default log until the pin is taken: a line before then tells the Event Log alone.
+    let log = Arc::new(Log::real(Arc::clone(&real)).closed_until_held());
     exit::keep_log(Arc::clone(&log));
     exit::name_run(id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
@@ -85,7 +86,8 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 /// The program starts only when every step below passed, in this order; a step that fails logs the case
 /// (the default log when it is held, the Event Log always), releases what the shim holds and ends the
 /// process with a shim failure, carrying the OS error the step met or none. A task that is not an id is
-/// refused first, and reads nothing. A step before the pin tells the Event Log alone ([`Log::refusal`]).
+/// refused first, and reads nothing. The shim's log is closed to the default file until the pin is taken
+/// ([`Log::closed_until_held`]), so a step before it tells the Event Log alone.
 ///
 /// 1. Takes a pin on the run records ([`Runs::hold`]): **any** failure ends the shim (the removal's marker
 ///    stands, the directory is denied, gone or a link, there is no `runs` since `%ProgramData%` could not be
@@ -118,23 +120,17 @@ pub(super) fn run_in(
         log.failure(id, &stop.message);
         stop.reported.process_exit_code() as u32
     };
-    // Before the pin the shim holds no log, and a file append would open the default one: a refusal here
-    // goes to the Event Log alone.
-    let refuse = |stop: SpecStop| {
-        log.refusal(id, &stop.message);
-        stop.reported.process_exit_code() as u32
-    };
     let task = match Id::try_from(id) {
         Ok(task) => task,
         Err(e) => {
-            return refuse(SpecStop {
+            return end(SpecStop {
                 message: format!("`{id}` is not a goetia id: {}", e.report()),
                 reported: Reported::Refused,
             });
         }
     };
     let Some(runs) = runs else {
-        return refuse(SpecStop {
+        return end(SpecStop {
             message: "no program was started: the run records cannot be held, since the machine's %ProgramData% \
                       could not be located"
                 .to_string(),
@@ -144,7 +140,7 @@ pub(super) fn run_in(
     let pin = match runs.hold() {
         Ok(pin) => pin,
         Err(e) => {
-            return refuse(SpecStop {
+            return end(SpecStop {
                 message: format!(
                     "hold the run records {}: {}: no program was started",
                     runs.dir().display(),

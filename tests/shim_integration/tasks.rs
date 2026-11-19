@@ -3,17 +3,15 @@
 //! program is this binary in a shim fixture mode (`fixture.rs`). The tasks of a service account run a
 //! copy of the shim and of this binary that the account can execute (`WorldReadableExe`).
 
-use std::time::Duration;
-
 use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
 
-use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status};
+use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{Id, User};
 use goetia::testing::RemovalMarker;
 
 use crate::common::{UNIT_DIR_EXCLUSIVE, fixture_command, fixture_command_with_exe, manager};
 use crate::supervisor_integration::pid_is_alive;
-use crate::support::windows_tasks::{EndsTheRunOnPanic, ServiceAccountHost, task_spec};
+use crate::support::windows_tasks::{EndsTheRunOnPanic, ServiceAccountHost, status_once_ended, task_spec};
 use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
 
 /// What a run that `Stop` ended exits as: Windows' code for a console process ended by its close event.
@@ -199,25 +197,12 @@ fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
     let command = fixture_command("exit", &[&reported.port().to_string(), "7"]);
     mgr.install(&task_spec(&id, command, None, User::Root, None), false)
         .expect("install");
-    let status_of = || match mgr.status(&id).expect("status") {
-        Status::Task(status) => status,
-        Status::Service(status) => panic!("`{id}` reads as a service: {status:?}"),
-    };
-    let before = status_of().last_run;
     let marker = RemovalMarker::place(&id).unwrap_or_else(|e| panic!("place the marker: {}", e.report()));
 
     goetia::testing::run_task(&id).unwrap_or_else(|e| panic!("run: {}", e.report()));
-    let mut ended = None;
-    wait::until_paced(Duration::from_millis(100), || {
-        let status = status_of();
-        let this_run = status.last_run != before && status.last_run.is_some();
-        let done = this_run && status.common.state == State::Idle && status.last_result.is_some();
-        ended = Some(status);
-        done
-    });
 
     assert_eq!(
-        ended.expect("a status was read").last_result,
+        status_once_ended(&mgr, &id).last_result,
         Some(Exit::Code(ERROR_GEN_FAILURE as i32)),
         "the shim's failure, not the program's 7"
     );

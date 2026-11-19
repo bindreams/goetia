@@ -458,3 +458,82 @@ fn program_data_is_the_known_folder_and_logging_uses_it() {
         Some(program_data.join("Goetia").join("logs").join("svc.log"))
     );
 }
+
+/// In task mode nothing is appended to the default log before the shim holds it, whatever the line is and
+/// whichever step tells it: an append would open the file, which a shim refused before its pin never does.
+#[skuld::test]
+fn a_log_closed_until_held_tells_the_event_log_alone_until_the_default_log_is_held() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake).closed_until_held();
+    let default = Path::new("logs").join("svc.log");
+
+    log.failure("svc", "the line");
+    log.warning("svc", "the line");
+
+    assert_eq!(fake.default_log_opens(), 0, "a line opened the default log");
+    let calls = fake.take_channel_calls();
+    assert!(
+        calls.iter().all(|call| matches!(call, ChannelCall::EventLog { .. })) && calls.len() == 2,
+        "the Event Log alone, both lines: {calls:?}"
+    );
+
+    log.hold_default("svc");
+    log.failure("svc", "the line");
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![
+            ChannelCall::HoldDefault { path: default.clone() },
+            appended_default(&default, true),
+            reported()
+        ],
+        "once held, a line goes to the file as in service mode"
+    );
+}
+
+/// A log that could not be held is still open to the path afterwards: the hold ran, and the shim goes on.
+#[skuld::test]
+fn a_default_log_that_could_not_be_held_opens_the_closed_log_all_the_same() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake).closed_until_held();
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+    fake.take_channel_calls();
+    log.failure("svc", "the line");
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![appended_default(&default, true), reported()]
+    );
+}
+
+/// A closed log still writes the daemon's own log once there is one: only the default is closed.
+#[skuld::test]
+fn a_log_closed_until_held_still_writes_the_daemons_own_log() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake).closed_until_held();
+    let own = Path::new("own.log");
+    log.set_daemon_log(own.to_path_buf());
+
+    log.failure("svc", "the line");
+
+    assert_eq!(fake.take_channel_calls(), vec![appended_own(own, true), reported()]);
+}
+
+/// The fake counts as the real channels do: an append that fails to open the default log holds nothing, and
+/// the next append tries the open again.
+#[skuld::test]
+fn a_failed_append_to_the_default_log_holds_nothing_and_each_attempt_is_an_open() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_append(&default);
+
+    log.failure("svc", "the line");
+    assert_eq!(fake.default_log_opens(), 1);
+    log.failure("svc", "the line");
+    assert_eq!(fake.default_log_opens(), 2, "the failed append held the log");
+    log.failure("svc", "the line");
+    assert_eq!(fake.default_log_opens(), 2, "the open that succeeded holds it");
+}

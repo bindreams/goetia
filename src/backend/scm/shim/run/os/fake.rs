@@ -425,6 +425,11 @@ impl Fake {
         Arc::new(Log::new(self.channels(), PathBuf::from(FAKE_LOGS)))
     }
 
+    /// A task-mode `Log` over this `Fake`'s channels: closed to the default log until it is held.
+    pub(crate) fn task_log(&self) -> Arc<Log> {
+        Arc::new(Log::new(self.channels(), PathBuf::from(FAKE_LOGS)).closed_until_held())
+    }
+
     // Tables ----------------------------------------------------------------------------------------------------------
 
     /// The next `spawn` succeeds with `process`.
@@ -730,9 +735,13 @@ impl Channels for Fake {
             }
             None => false,
         };
+        // As the real channels: each append that finds the default log not held tries to open it, and only an
+        // open that succeeds holds it.
         if kind == LogKind::Default && !state.held_defaults.iter().any(|held| held == path) {
             state.default_log_opens += 1;
-            state.held_defaults.push(path.to_path_buf());
+            if !failing {
+                state.held_defaults.push(path.to_path_buf());
+            }
         }
         state.channel_calls.push(ChannelCall::Append {
             path: path.to_path_buf(),

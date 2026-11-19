@@ -26,6 +26,7 @@
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::os::{Channels, LogKind, Real, Severity};
@@ -41,6 +42,9 @@ pub(crate) struct Log {
     /// `None` when the machine's `%ProgramData%` could not be located: there is then no default file.
     default_dir: Option<PathBuf>,
     daemon_log: OnceLock<PathBuf>,
+    /// Whether a line may be appended to the default log. Task mode starts it closed ([`Log::closed_until_held`]);
+    /// [`Log::hold_default`] opens it.
+    default_open: AtomicBool,
     /// The open faults told, by file, kind of error and what the failed open costs, so that one fault is told once
     /// however often it is met. A shim process makes one launch of its daemon, so what is told is told for it.
     told: Mutex<HashSet<(PathBuf, ErrorKind, &'static str)>>,
@@ -53,8 +57,17 @@ impl Log {
             channels,
             default_dir: Some(default_dir),
             daemon_log: OnceLock::new(),
+            default_open: AtomicBool::new(true),
             told: Mutex::default(),
         }
+    }
+
+    /// This log with the default log closed to its lines until [`Log::hold_default`] has run: before then a line
+    /// goes to the Event Log and stderr alone, whichever step tells it. Task mode, whose shim takes its pin on
+    /// the run records before it holds any log, and which a refusal must leave with none held.
+    pub(crate) fn closed_until_held(self) -> Log {
+        self.default_open.store(false, Ordering::Release);
+        self
     }
 
     /// The production log over `real`, defaulting to `%ProgramData%\Goetia\logs\` ([`program_data`]). `real` is
@@ -76,6 +89,7 @@ impl Log {
                     channels,
                     default_dir: None,
                     daemon_log: OnceLock::new(),
+                    default_open: AtomicBool::new(true),
                     told: Mutex::default(),
                 };
                 log.failure(
@@ -100,18 +114,19 @@ impl Log {
 
     /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
     /// ([`Channels::hold_default`]). Call it once, when the shim knows its `id`, before anything an install
-    /// can change; task mode calls it after its pin on the run records, so a refused shim holds none
-    /// ([`Log::refusal`]). A log that cannot be held is told to the Event
+    /// can change; task mode calls it after its pin on the run records, so a refused shim holds none, and its
+    /// log is closed to the default file until then ([`Log::closed_until_held`]). A log that cannot be held is told to the Event
     /// Log, once, with the error: the shim goes on. What the opens that follow meet is theirs to tell.
     pub(crate) fn hold_default(&self, id: &str) {
-        let Some(path) = self.default_log_path(id) else {
-            return;
-        };
-        if let Err(e) = self.channels.hold_default(&path) {
-            let line = failure_line(id, &format!("hold the default log {}: {}", path.display(), Chain(&e)));
-            eprintln!("{line}");
-            self.channels.event_log(Severity::Error, &line);
+        if let Some(path) = self.default_log_path(id)
+            && let Err(e) = self.channels.hold_default(&path)
+        {
+            self.event_log_only(
+                Severity::Error,
+                &failure_line(id, &format!("hold the default log {}: {}", path.display(), Chain(&e))),
+            );
         }
+        self.default_open.store(true, Ordering::Release);
     }
 
     /// Tells that the log file `path` could not be opened for the daemon's output, with `e`, unless that was told
@@ -177,14 +192,6 @@ impl Log {
         self.report(id, Severity::Error, message);
     }
 
-    /// [`Log::failure`] for a line told before the shim holds or opens any log file: it goes to the Event Log
-    /// alone, since a file append would open and hold the default log, which a refused shim never does.
-    pub(crate) fn refusal(&self, id: &str, message: &str) {
-        let line = failure_line(id, message);
-        eprintln!("{line}");
-        self.channels.event_log(Severity::Error, &line);
-    }
-
     /// [`Log::failure`] for a condition that does not stop the daemon from running: the Event Log
     /// entry is a warning.
     pub(crate) fn warning(&self, id: &str, message: &str) {
@@ -193,9 +200,12 @@ impl Log {
 
     fn report(&self, id: &str, severity: Severity, message: &str) {
         let line = failure_line(id, message);
-        eprintln!("{line}");
         let daemon_log = self.daemon_log.get().map(PathBuf::as_path);
-        let files = match self.default_log_path(id) {
+        // A default log not held yet is not appended to: the append would open it.
+        let default = self
+            .default_log_path(id)
+            .filter(|_| self.default_open.load(Ordering::Acquire));
+        let files = match default {
             Some(default) => log_destinations(daemon_log, default),
             None => daemon_log
                 .map(|path| (path.to_path_buf(), LogKind::Own))
@@ -205,7 +215,13 @@ impl Log {
         let _ = files
             .iter()
             .any(|(path, kind)| self.channels.append(path, &line, *kind).is_ok());
-        self.channels.event_log(severity, &line);
+        self.event_log_only(severity, &line);
+    }
+
+    /// `line` to stderr and the Event Log, the one place a line is sent to them.
+    fn event_log_only(&self, severity: Severity, line: &str) {
+        eprintln!("{line}");
+        self.channels.event_log(severity, line);
     }
 }
 
