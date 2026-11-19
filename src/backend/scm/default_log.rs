@@ -81,6 +81,9 @@ pub(crate) enum Step {
     Widen,
     /// Once it has, or where there is none: the log names the account the service now runs as.
     Narrow,
+    /// Once it has, after a step of the same install that made the log under a run that is up: that log stays as
+    /// it is, naming the kept accounts too, until the next install narrows it.
+    Leave,
 }
 
 /// How far a service's run is, from the state SCM reports for it.
@@ -120,7 +123,7 @@ pub(crate) fn naming(step: Step, run: Run, kept: &[Sid], new: &Sid) -> Naming {
     match (step, run) {
         (Step::Widen, _) => Naming::alike(&with_kept()),
         (Step::Narrow, Run::Stopped) => Naming::alike(std::slice::from_ref(new)),
-        (Step::Narrow, Run::Starting) => Naming {
+        (Step::Narrow, Run::Starting) | (Step::Leave, _) => Naming {
             made: with_kept(),
             existing: Existing::Keep,
         },

@@ -441,10 +441,21 @@ fn what_an_install_names_in_the_log_follows_its_step_and_its_run() {
     assert_eq!(
         naming(Step::Narrow, Run::Up, kept, &new),
         Naming {
-            made: both,
+            made: both.clone(),
             existing: Existing::Set(vec![new.clone()])
         }
     );
+    // What the install itself made under an up run stays as it is for the rest of that install.
+    for run in [Run::Stopped, Run::Starting, Run::Up] {
+        assert_eq!(
+            naming(Step::Leave, run, kept, &new),
+            Naming {
+                made: both.clone(),
+                existing: Existing::Keep
+            },
+            "{run:?}"
+        );
+    }
     // Where no account changes there is nothing else to name.
     assert_eq!(naming(Step::Narrow, Run::Up, &[], &new), new_alone);
     assert_eq!(

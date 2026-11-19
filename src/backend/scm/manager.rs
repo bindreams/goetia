@@ -748,7 +748,7 @@ impl Backend for Scm {
     ) -> Result<()> {
         match (definition, snapshot) {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
-                make_default_log(spec, definition, None, &[], default_log::Step::Narrow)
+                make_default_log(spec, definition, None, &[], default_log::Step::Narrow).map(drop)
             }
             (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => {
                 let made = task_default_log(installed)?;
@@ -1195,9 +1195,9 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
 /// service exists, since a virtual account's SID resolves only then, before any start. An update that
 /// changes the account names the registered account and the new one before the configuration changes, and the
-/// new one alone once it has landed, unless a start is in progress ([`default_log::naming`]), so that a change that
-/// fails leaves the account the service still runs as its log, and the next install corrects what a failure
-/// left. The names come from what install knows (the snapshot's account, the new account), never from the file.
+/// new one alone once it has landed, unless a start is in progress or this install made the log under a run that
+/// is up ([`default_log::naming`]), so that a change that fails leaves the account the service still runs as its
+/// log, and the next install corrects what a failure left. The names come from what install knows (the snapshot's account, the new account), never from the file.
 /// A failure of the log after a create leaves the new service, and the next `install` finds it up to date and
 /// makes the log ([`Backend::ensure_beside`]).
 /// `Parameters` follows create/update immediately, minimizing the window in which a crash leaves a service
@@ -1212,6 +1212,7 @@ fn apply(
 ) -> Result<()> {
     let gated = service_gate(reg, written)?;
     let mut before = None;
+    let mut after = default_log::Step::Narrow;
     if let Some(installed) = installed {
         let config = installed.config()?;
         before = accounts_kept_before_change(
@@ -1225,16 +1226,12 @@ fn apply(
         } else {
             default_log::Step::Narrow
         };
-        make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
+        if make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)? {
+            after = default_log::Step::Leave;
+        }
     }
     apply_gated(reg, gated.password, installed.is_none())?;
-    make_default_log(
-        spec,
-        reg,
-        gated.checked.as_ref(),
-        before.as_slice(),
-        default_log::Step::Narrow,
-    )
+    make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of
@@ -1320,16 +1317,17 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// service's run is ([`default_log::Run`]), which SCM is asked once: a shim holds its log from before its first status
 /// report, and reopens by path one that was deleted. Call it once
 /// the service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
-/// update is about to give a service that exists.
+/// update is about to give a service that exists. Whether it made the log under a run that is up, which a later
+/// step of the same install ([`default_log::Step::Leave`]) leaves naming the kept accounts.
 fn make_default_log(
     spec: &DaemonSpec,
     reg: &ScmRegistration,
     checked: Option<&Sid>,
     kept: &[Sid],
     step: default_log::Step,
-) -> Result<()> {
+) -> Result<bool> {
     if !generate::hosted(spec) {
-        return Ok(());
+        return Ok(false);
     }
     let account = match checked {
         Some(sid) => sid.clone(),
@@ -1343,7 +1341,7 @@ fn make_default_log(
     default_log::tell_if_made_while_running(&program_data, id, spec.common().logs.as_deref(), made, || {
         Ok(run == default_log::Run::Up)
     });
-    Ok(())
+    Ok(made == default_log::EnsureOutcome::Made && run == default_log::Run::Up)
 }
 
 /// How far the run of the service `id` is, from the state SCM reports for it.
