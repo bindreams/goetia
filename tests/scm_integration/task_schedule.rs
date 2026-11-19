@@ -15,11 +15,9 @@ use jiff::{Timestamp, ToSpan as _};
 
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::CONNECT_BACK;
-use crate::support::windows_tasks::task_spec;
+use crate::support::windows_tasks::{status_once_ended, task_spec, task_status};
 use crate::support::{self, ConnectBack, Group, scm_group, wait};
-use crate::tasks::{
-    SCHEDULE, TaskGuard, records_of, runs_until_ended, status_once_ended, task_as, task_exists, task_status,
-};
+use crate::tasks::{SCHEDULE, TaskGuard, records_of, runs_until_ended, task_as, task_exists};
 
 /// This binary, told to connect to `listener` and exit.
 fn connects_back(listener: &ConnectBack) -> Vec<String> {

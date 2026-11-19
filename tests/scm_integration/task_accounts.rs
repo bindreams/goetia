@@ -13,9 +13,11 @@ use crate::fixture::FIXTURE;
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT, PRINT_WHEN_RELEASED, RUN_UNTIL_KILLED};
-use crate::support::windows_tasks::{ServiceAccountHost, manager_hosted_by, task_spec, this_binary_as_a_service_host};
+use crate::support::windows_tasks::{
+    ServiceAccountHost, manager_hosted_by, task_spec, task_status, this_binary_as_a_service_host,
+};
 use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, cleanup, scm_group, wait};
-use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
+use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, test_id};
 
 /// The password of the accounts these tests make.
 const PASSWORD: &str = LocalUserGuard::PASSWORD;

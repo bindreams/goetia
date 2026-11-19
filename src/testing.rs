@@ -207,6 +207,57 @@ pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<S
     }
 }
 
+/// Starts the task `\Goetia\<id>` through Task Scheduler's own `Run`, and returns once Task Scheduler has
+/// accepted the request: for a test of the shim host as Task Scheduler starts it. A verb of goetia
+/// cannot be used for this, since it pins the run records before it asks for the run. The run's end is
+/// the caller's to wait for.
+#[cfg(windows)]
+pub fn run_task(id: &Id) -> Result<()> {
+    use crate::backend::scm::instance::TaskPath;
+    use crate::backend::scm::manager::task::{Com, TaskApi as _};
+
+    Com.run(&TaskPath::of(id)).map(drop)
+}
+
+/// The removal's marker of the task `id`'s run records, placed as an uninstall or an account change that
+/// began leaves it (`Runs::close`), and taken away when it drops (`Runs::reopen`). Never panics on drop.
+#[cfg(windows)]
+pub struct RemovalMarker(crate::backend::scm::runs::Runs);
+
+#[cfg(windows)]
+impl RemovalMarker {
+    /// Places the marker. Fails when the shared `Goetia\runs` folder is missing, which holds the marker and
+    /// every task's records: there are then no records to protect.
+    pub fn place(id: &Id) -> Result<Self> {
+        use crate::backend::scm::runs::{Closed, Runs};
+
+        let program_data = crate::backend::scm::folder::program_data()?;
+        let runs = Runs::of(&program_data, id);
+        match runs.close()? {
+            Closed::Placed => Ok(Self(runs)),
+            Closed::NoRecords => Err(crate::error::Error::os(
+                "place the removal's marker",
+                std::io::Error::other(format!(
+                    "the folder {} of the run records is missing",
+                    runs.dir().parent().unwrap_or(runs.dir()).display()
+                )),
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RemovalMarker {
+    fn drop(&mut self) {
+        cleanup::warn_left_behind(cleanup::retrying(|| {
+            self.0
+                .reopen()
+                .err()
+                .map(|e| format!("take the removal's marker away: {e}"))
+        }));
+    }
+}
+
 /// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for
 /// about five seconds and then warning. A task that is not there is done. Never panics: it is what a
 /// guard's `Drop` calls.

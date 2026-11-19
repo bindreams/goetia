@@ -161,6 +161,10 @@ impl Scm {
     /// `snapshot`'s task that keeps whether it is armed (a create is disarmed). A task installed over
     /// one of another account is registered again instead ([`Self::task_write_with`]). Write
     /// [`Self::task_write_with`] over the machine's own record directory, processes and account.
+    ///
+    /// **A limit, stated:** a task whose `runs\<id>` directory is gone or unusable starts no program: its
+    /// shim cannot pin the records, logs their path and ends as a shim failure. Any install makes the
+    /// directory again.
     pub(in crate::backend::scm) fn task_write(
         &self,
         spec: &DaemonSpec,

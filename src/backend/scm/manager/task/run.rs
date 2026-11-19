@@ -29,11 +29,13 @@ use crate::manager::budget::Budget;
 use crate::manager::{Exit, output};
 use crate::spec::Id;
 
-/// Why a run has no record of its end. A failed logon starts nothing and raises nothing (M8), so the
-/// reason names it.
-pub(super) const UNRECORDED: &str = "it was stopped or killed, Windows shut down, goetia-shim failed, or the task \
-     could not log on (a missing logon right or a changed password starts nothing and raises nothing); see the \
-     task's log";
+/// Why a run has no record of its end, with what is known: the cause is not. The program may have run and
+/// failed to record, the shim may have started none, or the shim may have been killed or the task not logged
+/// on (a missing logon right or a changed password starts nothing and raises nothing). The task's last
+/// result is not read, since a later run overwrites it.
+pub(super) const UNRECORDED: &str = "it left no record: its program may have run and failed to record, its shim \
+     may have started no program, or it may have been killed or failed to log on; the task's log and the Event \
+     Log may say more";
 
 // Which run ===========================================================================================================
 

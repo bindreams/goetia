@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
-use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, TaskStatus, conformance};
+use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, conformance};
 use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 use goetia::testing::{remove_task, service_fields};
 
 use crate::common::conformance_mk;
 use crate::managed::{EventSourceChanged, UNIT_DIR_EXCLUSIVE};
 use crate::support::sentinel::{PRINT_AND_EXIT, RUN_UNTIL_KILLED};
-use crate::support::windows_tasks::{EndsTheRunOnPanic, ProcessHandle, task_spec};
-use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
+use crate::support::windows_tasks::{EndsTheRunOnPanic, ProcessHandle, task_spec, task_status};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group};
 
 pub(crate) const SCHEDULE: &str = "30 3 * * *";
 
@@ -60,26 +60,6 @@ fn service_as(id: &Id, protocol: Protocol) -> DaemonSpec {
         ..service_fields(conformance_mk(id.as_str()))
     };
     DaemonSpec::from(ServiceSpec::new(fields).expect("a valid service"))
-}
-
-pub(crate) fn task_status(mgr: &Scm, id: &Id) -> TaskStatus {
-    match mgr.status(id).expect("status of a task") {
-        Status::Task(status) => status,
-        Status::Service(status) => panic!("`{id}` reads as a service: {status:?}"),
-    }
-}
-
-/// The status of `id` once its run has ended and Task Scheduler has recorded how: idle, with a last
-/// result. Read again with no cap, since the run's end is a state of the machine and not a time.
-pub(crate) fn status_once_ended(mgr: &Scm, id: &Id) -> TaskStatus {
-    let mut found = None;
-    wait::until(|| {
-        let status = task_status(mgr, id);
-        let ended = status.common.state == State::Idle && status.last_result.is_some();
-        found = Some(status);
-        ended
-    });
-    found.expect("a status was read")
 }
 
 /// An install that finds a task up to date still sees that its default log is there: see
