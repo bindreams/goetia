@@ -191,7 +191,7 @@ fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
 fn a_denied_open_that_a_failed_privilege_step_is_told_after_is_named_a_denial() {
     let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
     let step = std::io::Error::from_raw_os_error(1300);
-    let e = crate::error::paired(denied, crate::error::PairKind::DebugPrivilegeAlsoFailed, step);
+    let e = crate::error::paired(denied, step);
 
     let err = open_refused("kill", "service `x`", "open service `x` to kill it", e);
 
@@ -1230,7 +1230,7 @@ fn a_failed_hold_reports_the_read_and_the_refused_open_it_followed() {
     let read = std::io::Error::from_raw_os_error(1722);
     let open = std::io::Error::from_raw_os_error(5);
     let (read_text, open_text) = (read.to_string(), open.to_string());
-    let e = crate::error::paired(read, crate::error::PairKind::ManagerUnreadAfterOpenRefused, open);
+    let e = crate::error::unread_after_open_refused(100, open, read);
 
     let error = hold_failed(&Id::try_from("frpc").unwrap(), e);
 
@@ -1238,8 +1238,8 @@ fn a_failed_hold_reports_the_read_and_the_refused_open_it_followed() {
     assert_eq!(
         error.report().to_string(),
         format!(
-            "failed to hold `frpc`'s process to wait for its exit: {read_text} (after the service's process \
-             could not be opened: {open_text})"
+            "failed to hold `frpc`'s process to wait for its exit: the process (pid 100) could not be opened \
+             ({open_text}), and the re-read of what runs the daemon failed: failed to read it: {read_text}"
         )
     );
 }

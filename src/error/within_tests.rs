@@ -30,66 +30,49 @@ fn a_report_prints_the_context_and_then_the_cause_once() {
     assert_eq!(e.report().to_string(), "failed to capture: read stdout: denied");
 }
 
-/// A goetia error that a pair's primary carries comes back as the pair's [`PairKind`] around it: its
-/// class is the pair's, and the second is told with it.
+/// A read that failed with a goetia error is the source of the error the hold's failure becomes: its class
+/// is the failure's, and the refused open is told with it.
 #[skuld::test]
-fn a_goetia_error_carried_by_a_pairs_primary_is_the_source_of_the_error_the_pair_becomes() {
-    let primary = io::Error::other(Error::RequestInDoubt {
+fn a_goetia_error_the_read_carries_is_the_source_of_a_hold_that_could_not_tell_a_refusal() {
+    let read = io::Error::other(Error::RequestInDoubt {
         request: "read".to_string(),
         reached: false,
         note: None,
         source: "no answer".into(),
     });
-    let pair = paired(primary, PairKind::ManagerUnreadAfterOpenRefused, denied());
 
-    let back = carried(pair).expect("the primary carries a goetia error");
+    let back = carried(unread_after_open_refused(7, denied(), read)).expect("an error is carried");
 
     assert!(back.is_indeterminate(), "{back:?}");
-    let Error::ManagerUnreadAfterOpenRefused { open_refused, source } = &back else {
+    let Error::ManagerUnreadAfterOpenRefused { pid, open_refused, source } = &back else {
         panic!("{back:?}");
     };
+    assert_eq!(*pid, 7);
     assert_eq!(open_refused.to_string(), "denied");
     assert!(matches!(**source, Error::RequestInDoubt { .. }), "{back:?}");
 }
 
-/// A pair whose primary carries no goetia error is not one: it stays the pair, whole.
+/// A plain read failure is an OS failure under the same error, and the failure has the read's kind.
 #[skuld::test]
-fn a_pair_whose_primary_carries_no_goetia_error_stays_a_pair() {
-    let pair = paired(
-        denied(),
-        PairKind::ManagerUnreadAfterOpenRefused,
-        io::Error::other("second"),
-    );
+fn a_plain_failed_read_after_a_refused_open_is_an_os_failure_under_the_same_error() {
+    let e = unread_after_open_refused(7, denied(), io::Error::new(io::ErrorKind::TimedOut, "read"));
 
-    let back = carried(pair).expect_err("no goetia error is carried");
-
-    assert_eq!(
-        back.to_string(),
-        "denied (after the service's process could not be opened: second)"
-    );
-    assert_eq!(back.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+    let back = carried(e).expect("an error is carried");
+    let Error::ManagerUnreadAfterOpenRefused { source, .. } = &back else {
+        panic!("{back:?}");
+    };
+    assert!(matches!(&**source, Error::Os { what, .. } if what == "read it"), "{back:?}");
 }
 
-/// A pair of two OS failures has no goetia error to classify: even one its primary carries leaves it whole.
-#[cfg(windows)]
+/// A target's failure is the goetia error it carries, under a step that says what was done, else an OS
+/// failure of what was done.
 #[skuld::test]
-fn a_pair_of_a_denied_open_and_a_failed_step_stays_whole_whatever_its_primary_carries() {
-    let primary = io::Error::other(Error::blob("carried"));
-    let pair = paired(primary, PairKind::DebugPrivilegeAlsoFailed, denied());
-
-    let back = carried(pair).expect_err("this pair carries no class");
-
-    assert_eq!(
-        back.to_string(),
-        "blob: carried (enabling SeDebugPrivilege for the open also failed: denied)"
-    );
-}
-
-/// A target's failure is the goetia error it carries, else an OS failure of what was done.
-#[skuld::test]
-fn a_targets_failure_is_the_error_it_carries_else_an_os_failure_of_what_was_done() {
+fn a_targets_failure_keeps_what_was_done_whether_or_not_it_carries_a_goetia_error() {
     let carrying = target_failed("kill `x`", io::Error::other(Error::blob("carried")));
-    assert!(matches!(carrying, Error::Blob { .. }), "{carrying:?}");
+    assert!(matches!(&carrying, Error::Step { what, .. } if what == "failed to kill `x`"), "{carrying:?}");
+    assert!(matches!(carrying.cause(), Error::Blob { .. }), "{carrying:?}");
+    assert!(carrying.report().to_string().starts_with("failed to kill `x`: "), "{}", carrying.report());
 
     let plain = target_failed("kill `x`", denied());
     assert_eq!(plain.report().to_string(), "failed to kill `x`: denied");

@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 mod composite;
 mod escape;
+#[cfg(any(windows, test))]
+mod paired;
 mod reason;
 mod report;
 mod within;
@@ -24,7 +26,9 @@ pub(crate) use report::find;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
 pub(crate) use report::{Chain, Pieces};
-pub(crate) use within::{PairKind, paired, target_failed, within};
+#[cfg(any(windows, test))]
+pub(crate) use paired::paired;
+pub(crate) use within::{target_failed, unread_after_open_refused, within};
 
 use report::Report;
 
@@ -767,11 +771,13 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// A hold of a service's process whose open was refused, and whose manager could not be read after
-    /// that, `source`, so that it is not known whether the refusal was the service's: `open_refused`, which
-    /// the message only mentions. The read's class is the error's.
-    #[error("{}", manager_unread_after_open_refused_message(open_refused))]
+    /// A hold of the process `pid` of a daemon whose open was refused, `open_refused`, which the message only
+    /// mentions, and whose re-read of what runs the daemon (the service manager, or the Task Scheduler's
+    /// listing of a run) failed after that, `source`, so that it is not known whether the refusal was the
+    /// daemon's. The re-read's class is the error's.
+    #[error("{}", manager_unread_after_open_refused_message(*pid, open_refused))]
     ManagerUnreadAfterOpenRefused {
+        pid: u32,
         open_refused: std::io::Error,
         #[source]
         source: Box<Error>,
@@ -1016,8 +1022,8 @@ impl Error {
                 id, terminate_failed, ..
             } => Some(process_exit_unconfirmed_message(id, terminate_failed)),
             Error::ProcessNotOpened { id, open_failed, .. } => Some(process_not_opened_message(id, open_failed)),
-            Error::ManagerUnreadAfterOpenRefused { open_refused, .. } => {
-                Some(manager_unread_after_open_refused_message(open_refused))
+            Error::ManagerUnreadAfterOpenRefused { pid, open_refused, .. } => {
+                Some(manager_unread_after_open_refused_message(*pid, open_refused))
             }
             Error::OutputAlsoFailed { id, shown, .. } => Some(output_also_failed_message(id, shown)),
             Error::ProcessWaitTimeout {
@@ -1456,11 +1462,11 @@ fn process_not_opened_message<'a>(id: &str, open_failed: &'a std::io::Error) -> 
 }
 
 /// The message of [`Error::ManagerUnreadAfterOpenRefused`]: `open_refused` is only mentioned.
-fn manager_unread_after_open_refused_message(open_refused: &std::io::Error) -> Pieces<'_> {
+fn manager_unread_after_open_refused_message(pid: u32, open_refused: &std::io::Error) -> Pieces<'_> {
     Pieces::new()
-        .text("reading the manager failed after the service's process could not be opened (")
+        .text(format!("the process (pid {pid}) could not be opened ("))
         .mentioned(open_refused)
-        .text(")")
+        .text("), and the re-read of what runs the daemon failed")
 }
 
 /// The message of [`Error::OutputAlsoFailed`]: `shown` is why the output could not be shown.

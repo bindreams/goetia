@@ -261,6 +261,7 @@ fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is()
         }),
         ("ManagerUnreadAfterOpenRefused", |source| {
             Error::ManagerUnreadAfterOpenRefused {
+                pid: 7,
                 open_refused: std::io::Error::other("o"),
                 source: Box::new(source),
             }
@@ -325,6 +326,7 @@ fn the_search_finds_what_a_wrapper_says_in_its_words_and_what_it_wraps_but_not_w
         "{unopened:?}"
     );
     let unread = Error::ManagerUnreadAfterOpenRefused {
+        pid: 7,
         open_refused: std::io::Error::from_raw_os_error(6),
         source: Box::new(os_code(5)),
     };
@@ -1538,10 +1540,7 @@ fn the_os_error_of_an_error_a_sentence_only_mentions_is_not_found() {
 #[skuld::test]
 fn the_os_error_of_a_pair_is_its_primarys_and_never_its_seconds() {
     let pair = |primary: std::io::Error, second: std::io::Error| {
-        Error::os(
-            "kill",
-            crate::error::paired(primary, crate::error::PairKind::ManagerUnreadAfterOpenRefused, second),
-        )
+        Error::os("kill", crate::error::paired(primary, second))
     };
     let coded = |code| std::io::Error::from_raw_os_error(code);
     assert_eq!(pair(coded(5), coded(8)).raw_os_error(), Some(5));

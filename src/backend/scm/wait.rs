@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
 use crate::backend::scm::kill::HoldOutcome;
-use crate::error::{Composite, Error, Pieces, carried_composite, carry, terminating_failed};
+use crate::error::{Composite, Pieces, carried_composite, carry, terminating_failed};
 use crate::manager::budget::Deadline;
 use crate::spec::Protocol;
 
@@ -775,10 +775,6 @@ enum Unexited {
 }
 
 impl Composite for IncompleteStop {
-    fn into_carried(self: Box<Self>) -> Result<Error, Box<dyn Composite>> {
-        Err(self)
-    }
-
     /// The failed wait is a cause of the failure, the failed terminate is only mentioned.
     fn pieces(&self) -> Pieces<'_> {
         let start = if self.failed_start { " (failed start)" } else { "" };
