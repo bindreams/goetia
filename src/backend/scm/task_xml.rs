@@ -10,12 +10,15 @@
 //! account is the blob's, never the principal's. [`Display`](fmt::Display) is the definition's
 //! canonical text: the same for what is generated and what is read back.
 //!
-//! **A task is armed when it has triggers** ([`TaskXml::armed`]; its own `Settings/Enabled` stays true,
-//! since Task Scheduler refuses a `Run` of a task whose own flag is false). A disarmed task has none:
-//! disabling a trigger would leave a repetition in progress firing, and removing the triggers stops
-//! it. So [`TaskXml::to_xml`] writes the triggers only for an armed task, and what is read back of a
-//! task with none is the definition it would arm: the triggers its blob's schedule compiles to
-//! ([`TaskXml::without_triggers`], [`TaskXml::with_triggers`]).
+//! **A task is armed when it has triggers that are switched on** ([`TaskXml::armed`]; its own
+//! `Settings/Enabled` stays true, since Task Scheduler refuses a `Run` of a task whose own flag is false).
+//! A disarmed task has none: disabling a trigger would leave a repetition in progress firing, and
+//! removing the triggers stops it. So [`TaskXml::to_xml`] writes the triggers only for an armed task, and
+//! what is read back of a task with none is the definition it would arm: the triggers its blob's
+//! schedule compiles to. Three edits of the stored XML change the state:
+//! - [`TaskXml::without_triggers`] for `disable`;
+//! - [`TaskXml::with_triggers`] for `enable` of a task with no trigger switched on;
+//! - [`TaskXml::with_own_flag`] for `enable` of a task whose stored triggers are on, which are kept.
 
 use std::collections::BTreeSet;
 use std::fmt;

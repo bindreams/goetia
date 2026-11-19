@@ -681,6 +681,49 @@ fn setting_the_own_flag_false_states_it_once_and_changes_nothing_else() {
     assert_eq!(off, with_own_flag(&xml, false));
 }
 
+/// A false own flag is written whether the `Settings` is empty or missing, and the XML is no less goetia's for it.
+#[skuld::test]
+fn setting_the_own_flag_false_writes_the_settings_it_needs() {
+    let xml = readback(&spec(), &host(), DAILY_AT_0330);
+    let start = xml.find("<Settings>").unwrap();
+    let end = xml.find("</Settings>").unwrap() + "</Settings>".len();
+    for (what, settings) in [("empty", "<Settings />"), ("none", "")] {
+        let xml = format!("{}{settings}{}", &xml[..start], &xml[end..]);
+        let off = TaskXml::with_own_flag(&xml, false).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(off.matches("<Enabled>false</Enabled>").count(), 1, "{what}: {off}");
+        assert!(!TaskXml::armed(&off), "{what}: {off}");
+        assert!(
+            off.find("<Settings>").unwrap() < off.find("<Actions").unwrap(),
+            "{what}: {off}"
+        );
+        assert!(TaskXml::armed(&TaskXml::with_own_flag(&off, true).unwrap()), "{what}");
+    }
+}
+
+/// A trigger that is switched off starts nothing, so a task whose only triggers are off is not armed, and
+/// arming it writes the blob's schedule in place of them.
+#[skuld::test]
+fn a_task_whose_only_triggers_are_off_is_not_armed_and_is_armed_with_fresh_ones() {
+    let spec = spec();
+    let off = DAILY_AT_0330.replace("<CalendarTrigger>", "<CalendarTrigger>\n      <Enabled>false</Enabled>");
+    assert_ne!(off, DAILY_AT_0330);
+    let xml = readback(&spec, &host(), &off);
+    assert!(!TaskXml::has_triggers(&xml), "{xml}");
+    assert!(!TaskXml::armed(&xml), "{xml}");
+
+    let armed = TaskXml::with_triggers(&xml, &spec).unwrap();
+    assert!(TaskXml::armed(&armed), "{armed}");
+    assert!(!armed.contains("<Enabled>false</Enabled>"), "{armed}");
+
+    // One that is on among them is enough.
+    let mixed = readback(
+        &spec,
+        &host(),
+        &off.replace("</Triggers>", "<BootTrigger /></Triggers>"),
+    );
+    assert!(TaskXml::armed(&mixed), "{mixed}");
+}
+
 /// A blob that holds a service names no schedule, so arming from it is an error, not a panic.
 #[skuld::test]
 fn arming_from_a_services_blob_is_an_error_that_names_it() {

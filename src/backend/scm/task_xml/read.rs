@@ -1,6 +1,9 @@
 //! Reading a task's XML as Task Scheduler stores it: the definition ([`TaskXml::parse`]), the armed
-//! state, which is whether it has triggers ([`TaskXml::armed`]), and the two edits of the stored XML
-//! that arm and disarm it ([`TaskXml::with_triggers`], [`TaskXml::without_triggers`]).
+//! state, which is whether it has a trigger that is switched on ([`TaskXml::armed`]), and the three
+//! edits of the stored XML that arm and disarm it:
+//! - [`TaskXml::without_triggers`]: `disable`;
+//! - [`TaskXml::with_triggers`]: `enable` of a task with no trigger switched on (the blob's schedule);
+//! - [`TaskXml::with_own_flag`]: `enable` of a task whose stored triggers are on, kept as they are.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -122,9 +125,9 @@ impl TaskXml {
             .collect())
     }
 
-    /// Whether the task `xml` describes has a trigger and is itself enabled (`Settings/Enabled`,
-    /// which Task Scheduler leaves out while it is true): a task that is not enabled is started by
-    /// nothing, and one with no trigger has nothing to start it. XML that cannot be read is not armed.
+    /// Whether the task `xml` describes has a trigger that is switched on and is itself enabled
+    /// (`Settings/Enabled`, which Task Scheduler leaves out while it is true): a task that is not
+    /// enabled is started by nothing, and one with no live trigger has nothing to start it. XML that cannot be read is not armed.
     pub(crate) fn armed(xml: &str) -> bool {
         let Ok(document) = document(xml) else {
             return false;
@@ -132,7 +135,7 @@ impl TaskXml {
         own_flag_is_true(document.root_element()) && has_triggers(&document)
     }
 
-    /// Whether `xml` holds a trigger. XML that cannot be read holds none.
+    /// Whether `xml` holds a trigger whose own flag is true or absent. XML that cannot be read holds none.
     pub(crate) fn has_triggers(xml: &str) -> bool {
         document(xml).is_ok_and(|document| has_triggers(&document))
     }
@@ -190,7 +193,8 @@ impl TaskXml {
 
 /// The edit that sets the task's own flag to `value` where the XML states it, and for `false` where it
 /// does not (a flag that is not stated is true): first among the `Settings`, whose order is free. None
-/// for a true flag that is not stated.
+/// for a true flag that is not stated. A `Settings` that is empty is written with the flag in it, and one
+/// that is missing is written before `Actions`, as a trigger is.
 fn own_flag_edit(document: &Document<'_>, value: bool) -> Result<Vec<(Range<usize>, String)>, Error> {
     let settings = child(document.root_element(), "Settings");
     if let Some(flag) = settings.and_then(|settings| child(settings, "Enabled")) {
@@ -202,11 +206,22 @@ fn own_flag_edit(document: &Document<'_>, value: bool) -> Result<Vec<(Range<usiz
     if value {
         return Ok(Vec::new());
     }
-    let first = settings
-        .and_then(|settings| settings.first_child())
-        .ok_or_else(|| Error::blob("the task has no settings"))?;
-    let at = first.range().start;
-    Ok(vec![(at..at, "<Enabled>false</Enabled>".to_owned())])
+    let flag = "<Enabled>false</Enabled>";
+    Ok(vec![match settings {
+        Some(settings) => match settings.first_child() {
+            Some(first) => {
+                let at = first.range().start;
+                (at..at, flag.to_owned())
+            }
+            None => (settings.range(), format!("<Settings>{flag}</Settings>")),
+        },
+        None => {
+            let actions =
+                child(document.root_element(), "Actions").ok_or_else(|| Error::blob("the task has no actions"))?;
+            let at = actions.range().start;
+            (at..at, format!("<Settings>{flag}</Settings>"))
+        }
+    }])
 }
 
 /// `xml` with `edits` made, each a range of `xml` and its replacement.
@@ -255,8 +270,10 @@ fn only(node: Node<'_, '_>, allowed: &[&str]) -> Option<()> {
         .then_some(())
 }
 
+/// Whether the document holds a trigger that is not switched off (its own `Enabled`, as `trigger_of` reads it).
 fn has_triggers(document: &Document<'_>) -> bool {
-    child(document.root_element(), "Triggers").is_some_and(|triggers| elements(triggers).next().is_some())
+    child(document.root_element(), "Triggers")
+        .is_some_and(|triggers| elements(triggers).any(|trigger| flag_is_true(child(trigger, "Enabled"))))
 }
 
 /// Whether the task's own flag, `Settings/Enabled`, is true: it is when Task Scheduler states none.

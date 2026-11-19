@@ -3,7 +3,7 @@
 //! second: it computes the run times of a disarmed task too (M2), so those tests arm nothing.
 
 use std::collections::BTreeSet;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
@@ -93,10 +93,10 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
 
 /// `disable` stops a repetition that is in progress: a disabled `* * * * *` starts nothing at the boundaries
 /// that follow. Read in the stored state, with no window in which no run came: a second task, armed alike,
-/// starts at every boundary, so its last run moving past two boundaries is Task Scheduler's own sign that
-/// they have passed. The disabled task's last run is earlier than the first boundary after `disable`
-/// returned: a start dispatched at the boundary before it may still show up after it, and is no fault.
-/// `enable` then starts it again.
+/// starts at every boundary, so its last run reaching `B1 + 60 s` (`B1` the first boundary after `disable`)
+/// is Task Scheduler's own sign that `B1` has passed, where the bug would have started the disabled task.
+/// Its last run, if any, is earlier than `B1 - 1 s`: that allows a start dispatched at or before `disable`,
+/// and a `LastRunTime` that precedes its boundary by milliseconds. `enable` then starts it again.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixture(scm_group)] _group: &Group) {
     let (subject, control) = (TaskGuard::new(), TaskGuard::new());
@@ -117,29 +117,31 @@ fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixtu
     mgr.disable(&subject.id).expect("disable");
     let disabled_at = SystemTime::now();
 
-    let next_control_run = |after: SystemTime| {
-        let mut found = after;
-        wait::until(|| match task_status(&mgr, &control.id).last_run {
-            Some(run) if run > after => {
-                found = run;
-                true
-            }
-            _ => false,
-        });
-        found
-    };
-    let first = next_control_run(disabled_at);
-    let second = next_control_run(first);
+    let minute = Duration::from_secs(60);
+    let epoch_secs = disabled_at
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    let b1 = UNIX_EPOCH + minute * (epoch_secs / 60 + 1).try_into().expect("a minute count fits");
+    let slack = Duration::from_secs(1);
+    let mut seen = b1;
+    wait::until(|| match task_status(&mgr, &control.id).last_run {
+        Some(run) if run + slack >= b1 + minute => {
+            seen = run;
+            true
+        }
+        _ => false,
+    });
 
     // A run dispatched before the disable is over before the last start is read.
     let after = status_once_ended(&mgr, &subject.id);
     assert!(
-        after.last_run.is_some_and(|run| run < first),
-        "the disabled task started at a boundary the control started at ({first:?}): {after:?}"
+        after.last_run.is_none_or(|run| run + slack < b1),
+        "the disabled task started at or after the boundary {b1:?}, which the control passed: {after:?}"
     );
 
     mgr.enable(&subject.id).expect("enable again");
-    wait::until(|| task_status(&mgr, &subject.id).last_run.is_some_and(|run| run > second));
+    wait::until(|| task_status(&mgr, &subject.id).last_run.is_some_and(|run| run > seen));
 }
 
 /// A task that is not armed still starts when asked, and stays not armed.

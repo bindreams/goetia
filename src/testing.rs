@@ -90,7 +90,7 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
 #[cfg(windows)]
 pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
     use crate::backend::scm::instance::TaskPath;
-    use crate::backend::scm::manager::task::{Com, TaskApi as _, registration_password};
+    use crate::backend::scm::manager::task::{Com, TaskApi as _, registration_password, stored_account};
     use crate::backend::scm::task_xml::{TaskXml, extract_from_data};
     use crate::error::Error;
 
@@ -102,15 +102,18 @@ pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<S
         return Com.run_times(&path, from, to);
     }
     let blob = extract_from_data(&registered.data)?.ok_or_else(|| Error::blob("the task's `Data` is not goetia's"))?;
-    let account = TaskXml::principal(&registered.xml)?;
+    let account = stored_account(&registered)?;
     let password = registration_password(&account)?;
     let held = TaskXml::with_own_flag(&TaskXml::with_triggers(&registered.xml, &blob.spec)?, false)?;
     Com.register(&path, &held, &account, password.as_deref(), true)?;
     let times = Com.run_times(&path, from, to);
     let back = Com.register(&path, &registered.xml, &account, password.as_deref(), true);
-    let times = times?;
-    back?;
-    Ok(times)
+    match (times, back) {
+        (Ok(times), Ok(_)) => Ok(times),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        // The task is left held, which is what the caller must hear first.
+        (Err(times), Err(back)) => Err(Error::both_all([back, times]).expect("two errors")),
+    }
 }
 
 /// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for

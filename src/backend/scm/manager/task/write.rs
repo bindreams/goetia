@@ -119,7 +119,7 @@ pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>) -> Re
 /// The account a stored task is registered as: the blob's when it reads, which is what the install
 /// registered, and otherwise its principal's, so that a task whose blob will not decode can still be
 /// enabled and disabled.
-pub(super) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
+pub(crate) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
     match TaskXml::parse(&registered.xml, &registered.data) {
         Ok(definition) => Ok(definition.account()),
         Err(_) => TaskXml::principal(&registered.xml),
@@ -395,7 +395,7 @@ impl Scm {
     }
 
     /// Registers `snapshot`'s task again armed or not, and nothing else changed: armed, with the
-    /// triggers it holds, or when it holds none the ones its blob's schedule compiles to (a blob that
+    /// triggers it holds that are switched on, or when it holds none the ones its blob's schedule compiles to (a blob that
     /// will not decode names none, so it is the error); not armed, with none. Either way the task's
     /// own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
