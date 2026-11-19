@@ -34,6 +34,11 @@ fn strict_next_runs(schedule: &Schedule, before: SystemTime, after: SystemTime) 
     [next_minute_after(schedule, before), next_minute_after(schedule, after)]
 }
 
+/// [`strict_next_runs`] of the schedule `text`: for a caller that judges a time read from the CLI.
+pub fn strict_next_runs_of(text: &str, id: &Id, before: SystemTime, after: SystemTime) -> [SystemTime; 2] {
+    strict_next_runs(&parse(text, id), before, after)
+}
+
 fn parse(text: &str, id: &Id) -> Schedule {
     let seed = HashSeed {
         hostname: "testing",

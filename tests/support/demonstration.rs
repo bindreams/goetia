@@ -160,6 +160,15 @@ impl Cli {
         line.to_string()
     }
 
+    /// `id` is not installed: `daemon status <id> --json` exits 1 with a `not-installed` error.
+    #[track_caller]
+    pub fn assert_not_installed(&self, id: &str) {
+        let gone = self.run(&["daemon", "status", id, "--json"]);
+        assert_eq!(gone.code, Some(1), "{gone}");
+        let doc: Value = serde_json::from_str(&gone.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {gone}"));
+        assert_eq!(doc["errors"][0]["kind"], "not-installed", "{gone}");
+    }
+
     /// `id`'s entry in `daemon list --json`.
     #[track_caller]
     pub fn listed(&self, id: &str) -> Value {
@@ -201,6 +210,16 @@ pub struct Expect {
     pub last_run: Time,
     pub next_run: Time,
 }
+
+/// A task that is installed and disarmed and has never run: idle, no pid, no result, no time.
+pub const DISARMED: Expect = Expect {
+    state: "idle",
+    enabled: false,
+    pid: Time::Null,
+    last_result: LastResult::Null,
+    last_run: Time::Null,
+    next_run: Time::Null,
+};
 
 /// `entry` of the task `id` is as `expect` says. A time that is present is RFC 3339 here; its value is not judged.
 #[track_caller]
@@ -261,13 +280,15 @@ pub fn daily_in_half_a_day() -> String {
 }
 
 /// What one form of the task's status reported, read with the child's `TZ` set to [`ZONE`]. A time is
-/// `None` where the form shows none (the text form writes `-`).
+/// `None` where the form shows none (the text form writes `-`). `window` is the clock before and after
+/// this form's read: the reads are separate, and a minute boundary may fall between any two.
 #[derive(Debug)]
 pub struct Read {
     pub form: &'static str,
     pub state: String,
     pub last_run: Option<String>,
     pub next_run: Option<String>,
+    pub window: (SystemTime, SystemTime),
 }
 
 impl Read {
@@ -283,18 +304,19 @@ impl Read {
         self
     }
 
-    fn of_entry(form: &'static str, entry: &Value) -> Read {
+    fn of_entry(form: &'static str, entry: &Value, window: (SystemTime, SystemTime)) -> Read {
         let field = |key: &str| entry[key].as_str().map(str::to_string);
         Read {
             form,
             state: entry["state"].as_str().expect("a state").to_string(),
             last_run: field("last-run"),
             next_run: field("next-run"),
+            window,
         }
         .at_the_zone()
     }
 
-    fn of_text(line: &str) -> Read {
+    fn of_text(line: &str, window: (SystemTime, SystemTime)) -> Read {
         // The text form writes `-` for a time it has none of.
         let word = |key: &str| Some(text_field(line, key).to_string()).filter(|word| word != "-");
         Read {
@@ -302,9 +324,17 @@ impl Read {
             state: text_state(line).to_string(),
             last_run: word("last-run"),
             next_run: word("next-run"),
+            window,
         }
         .at_the_zone()
     }
+}
+
+/// `read`, and the clock before and after it.
+fn windowed<T>(read: impl FnOnce() -> T) -> (T, (SystemTime, SystemTime)) {
+    let before = SystemTime::now();
+    let value = read();
+    (value, (before, SystemTime::now()))
 }
 
 /// The three forms that print a task's times, each read once, at the offset of the child's `TZ`.
@@ -319,13 +349,13 @@ pub struct Zoned {
 
 /// `id` read once in each form through `in_zone`, a [`Cli::in_zone`] of [`ZONE`].
 pub fn read_in_the_zone(in_zone: &Cli, id: &str) -> Zoned {
-    let json = in_zone.status_json(id);
-    let text = in_zone.status_text(id);
-    let listed = in_zone.listed(id);
+    let (json, json_window) = windowed(|| in_zone.status_json(id));
+    let (text, text_window) = windowed(|| in_zone.status_text(id));
+    let (listed, list_window) = windowed(|| in_zone.listed(id));
     Zoned {
-        json_read: Read::of_entry("status --json", &json),
-        text_read: Read::of_text(&text),
-        list_read: Read::of_entry("list --json", &listed),
+        json_read: Read::of_entry("status --json", &json, json_window),
+        text_read: Read::of_text(&text, text_window),
+        list_read: Read::of_entry("list --json", &listed, list_window),
         json,
     }
 }
@@ -335,18 +365,37 @@ impl Zoned {
         [&self.json_read, &self.text_read, &self.list_read]
     }
 
-    /// Every form is in `state` with no `next-run`, or with the one `next_run`.
+    /// Every form is in `state` with no `next-run`.
     #[track_caller]
-    pub fn assert_state(&self, state: &str, next_run: Option<SystemTime>) {
-        self.assert_state_judged(state, |read| assert_eq!(read, next_run, "{self:?}"));
+    pub fn assert_state(&self, state: &str) {
+        for read in self.reads() {
+            assert_eq!(read.state, state, "{}: {self:?}", read.form);
+            assert_eq!(read.next_run.as_deref().map(instant), None, "{}: {self:?}", read.form);
+        }
     }
 
-    /// Every form is in `state`, and `judge` accepts each form's `next-run`.
+    /// Every form is in `state`, and its `next-run` is one of `candidates(before, after)`, the clock
+    /// before and after that form's own read.
     #[track_caller]
-    pub fn assert_state_judged(&self, state: &str, judge: impl Fn(Option<SystemTime>)) {
+    pub fn assert_next_run(&self, state: &str, candidates: impl Fn(SystemTime, SystemTime) -> Vec<SystemTime>) {
         for read in self.reads() {
-            assert_eq!(read.state, state, "{self:?}");
-            judge(read.next_run.as_deref().map(instant));
+            assert_eq!(read.state, state, "{}: {self:?}", read.form);
+            let next = read.next_run.as_deref().map(instant);
+            let (before, after) = read.window;
+            let expected = candidates(before, after);
+            assert!(
+                next.is_some_and(|next| expected.contains(&next)),
+                "{}: next-run {next:?} is none of {expected:?}, read in [{before:?}, {after:?}]: {self:?}",
+                read.form
+            );
+        }
+    }
+
+    /// No form shows a `last-run`.
+    #[track_caller]
+    pub fn assert_no_last_run(&self) {
+        for read in self.reads() {
+            assert!(read.last_run.is_none(), "{}: a last-run: {self:?}", read.form);
         }
     }
 }

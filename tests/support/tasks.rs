@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::manager::{Exit, ServiceManager, Status, TaskStatus};
 use goetia::spec::{DaemonSpec, Id, TaskSpec};
@@ -45,6 +46,7 @@ pub struct Held {
     started: BufReader<File>,
     hold: PathBuf,
     count: PathBuf,
+    at: PathBuf,
     pub command: Vec<String>,
     _dir: tempfile::TempDir,
 }
@@ -72,17 +74,21 @@ impl Held {
             .expect("open the announcing FIFO");
         // The count is replaced whole (a rename), so a read of it never meets a half-written one.
         let count = dir.path().join("count");
+        let at = dir.path().join("at");
         let script = format!(
             "{prelude}n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > \"{c}.new\"; \
-             mv \"{c}.new\" \"{c}\"; echo ready; echo started $n > \"{}\"; read line < \"{}\"; exit 0",
+             mv \"{c}.new\" \"{c}\"; date +%s > \"{at}\"; echo ready; echo started $n > \"{}\"; \
+             read line < \"{}\"; exit 0",
             started.display(),
             hold.display(),
-            c = count.display()
+            c = count.display(),
+            at = at.display()
         );
         Held {
             started: BufReader::new(announce),
             hold,
             count,
+            at,
             command: sh(&script),
             _dir: dir,
         }
@@ -106,6 +112,13 @@ impl Held {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => panic!("read the run count: {e}"),
         }
+    }
+
+    /// The whole second, by the clock, at which the newest run numbered itself. Read it after
+    /// [`Held::wait_started`] returned that run's number, and before another run can begin.
+    pub fn started_at(&self) -> SystemTime {
+        let text = std::fs::read_to_string(&self.at).expect("read the run's start time");
+        UNIX_EPOCH + Duration::from_secs(text.trim().parse().expect("the start time is whole seconds"))
     }
 
     /// Lets the run in flight end. Blocks until the run is waiting for it, so only call it while one is.

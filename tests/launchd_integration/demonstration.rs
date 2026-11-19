@@ -14,28 +14,19 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use goetia::backend::launchd::manager::Launchd;
-use serde_json::Value;
 
 use crate::launchd::{
     Guard, UNIT_DIR_EXCLUSIVE, enabled_path, is_loaded, staging_path, timer_enabled_path, timer_staging_path,
 };
 use crate::support::cleanup::DirGuard;
-use crate::support::cron_oracle::assert_next_run_strict_time;
+use crate::support::cron_oracle::strict_next_runs_of;
 use crate::support::demonstration::{
-    Cli, Expect, LastResult, Manifest, Time, ZONE, Zoned, assert_task_fields, daily_in_half_a_day, read_in_the_zone,
+    Cli, DISARMED, Expect, LastResult, Manifest, Time, ZONE, assert_task_fields, daily_in_half_a_day, read_in_the_zone,
 };
 use crate::support::tasks::{Held, id_of, sh, status_with_result};
 use crate::support::{self, Group, launchd_group};
 
 const EVERY_MINUTE: &str = "* * * * *";
-
-/// No form of the task's status shows a `last-run`: launchd keeps none.
-#[track_caller]
-fn assert_no_last_run(read: &Zoned) {
-    for form in read.reads() {
-        assert!(form.last_run.is_none(), "launchd has no last-run: {read:?}");
-    }
-}
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn the_demonstration_runs_through_the_binary(#[fixture(launchd_group)] _group: &Group) {
@@ -54,25 +45,12 @@ fn the_demonstration_runs_through_the_binary(#[fixture(launchd_group)] _group: &
 
     // 1. Installed, the task is idle and disarmed.
     cli.install(&manifest);
-    assert_task_fields(
-        &cli.status_json(&id),
-        &id,
-        Expect {
-            state: "idle",
-            enabled: false,
-            pid: Time::Null,
-            last_result: LastResult::Null,
-            last_run: Time::Null,
-            next_run: Time::Null,
-        },
-    );
+    assert_task_fields(&cli.status_json(&id), &id, DISARMED);
 
     // 2. Armed. Enabled with a schedule 12 hours away, it is idle with the next run the cron names, never
     // run, in every form and at the offset of `TZ`. Nothing fires, so one read is the read.
     cli.daemon(&["enable", &id]);
-    let before = SystemTime::now();
     let armed = read_in_the_zone(&in_zone, &id);
-    let after = SystemTime::now();
     assert_task_fields(
         &armed.json,
         &id,
@@ -85,38 +63,36 @@ fn the_demonstration_runs_through_the_binary(#[fixture(launchd_group)] _group: &
             next_run: Time::Present,
         },
     );
-    armed.assert_state_judged("idle", |next| {
-        assert_next_run_strict_time(next, &daily, &task_id, before, after);
+    armed.assert_next_run("idle", |before, after| {
+        strict_next_runs_of(&daily, &task_id, before, after).to_vec()
     });
-    assert_no_last_run(&armed);
+    armed.assert_no_last_run();
     cli.daemon(&["disable", &id]);
     let disarmed = read_in_the_zone(&in_zone, &id);
-    assert_task_fields(
-        &disarmed.json,
-        &id,
-        Expect {
-            state: "idle",
-            enabled: false,
-            pid: Time::Null,
-            last_result: LastResult::Null,
-            last_run: Time::Null,
-            next_run: Time::Null,
-        },
-    );
-    disarmed.assert_state("idle", None);
+    assert_task_fields(&disarmed.json, &id, DISARMED);
+    disarmed.assert_state("idle");
+    disarmed.assert_no_last_run();
 
     // 3. Fires. The same id, every minute, enabled: the schedule fires with nothing started by the test,
     // and the program announces itself. The run is held, so any later fire finds the job running and
     // starts nothing.
+    assert_eq!(held.begun(), 0, "step 2's `enable` started a run");
     manifest.schedule = EVERY_MINUTE.to_string();
     cli.install(&manifest);
+    let enabling_at = SystemTime::now();
     cli.daemon(&["enable", &id]);
-    held.wait_started();
+    assert_eq!(held.wait_started(), 1, "the run is not the first");
+    // The schedule fires at a minute boundary, so a run that began earlier than the first boundary after
+    // `enable` began was started by `enable`.
+    let [first_fire, _] = strict_next_runs_of(EVERY_MINUTE, &task_id, enabling_at, SystemTime::now());
+    let started_at = held.started_at();
+    assert!(
+        started_at >= first_fire,
+        "the run began at {started_at:?}, before the first fire {first_fire:?} after `enable` began at {enabling_at:?}"
+    );
     // Running, with a pid and the next fire of the armed schedule. It has never exited, so there is no
     // result.
-    let before = SystemTime::now();
     let running = read_in_the_zone(&in_zone, &id);
-    let after = SystemTime::now();
     assert_task_fields(
         &running.json,
         &id,
@@ -129,10 +105,10 @@ fn the_demonstration_runs_through_the_binary(#[fixture(launchd_group)] _group: &
             next_run: Time::Present,
         },
     );
-    running.assert_state_judged("running", |next| {
-        assert_next_run_strict_time(next, EVERY_MINUTE, &task_id, before, after);
+    running.assert_next_run("running", |before, after| {
+        strict_next_runs_of(EVERY_MINUTE, &task_id, before, after).to_vec()
     });
-    assert_no_last_run(&running);
+    running.assert_no_last_run();
     // No fire can come between the end of the run and the reads that follow it.
     cli.daemon(&["disable", &id]);
     held.release();
@@ -150,8 +126,8 @@ fn the_demonstration_runs_through_the_binary(#[fixture(launchd_group)] _group: &
             next_run: Time::Null,
         },
     );
-    finished.assert_state("idle", None);
-    assert_no_last_run(&finished);
+    finished.assert_state("idle");
+    finished.assert_no_last_run();
 
     // 4. `run` shows the output and exits with the run's result. The same id, installed again with another
     // command and a `logs` file: a disarmed task is replaced.
@@ -177,10 +153,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(launchd_group)] _group: &
 
     // 5. `uninstall` removes it.
     cli.daemon(&["uninstall", &id]);
-    let gone = cli.run(&["daemon", "status", &id, "--json"]);
-    assert_eq!(gone.code, Some(1), "{gone}");
-    let doc: Value = serde_json::from_str(&gone.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {gone}"));
-    assert_eq!(doc["errors"][0]["kind"], "not-installed", "{gone}");
+    cli.assert_not_installed(&id);
     for path in [
         staging_path(&id),
         enabled_path(&id),
