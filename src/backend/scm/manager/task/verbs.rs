@@ -89,9 +89,6 @@ struct RunTarget<'a, P: Processes> {
     instance: InstanceId,
     /// The pid the listing gave the run when the verb began, which only names the run in a failed read.
     pid: u32,
-    /// Whether the listing has been read for this run: the first read alone is made before it names a
-    /// process, so it alone says which run it was for.
-    listed: bool,
     processes: &'a mut P,
     /// The run's process, when a caller opened it beforehand ([`hold_all`]): the machine takes it in
     /// place of an open, and confirms it as it confirms any.
@@ -105,7 +102,6 @@ impl<'a, P: Processes> RunTarget<'a, P> {
             path,
             instance: instance.id,
             pid: instance.pid,
-            listed: false,
             processes,
             held: None,
         }
@@ -115,27 +111,22 @@ impl<'a, P: Processes> RunTarget<'a, P> {
 impl<P: Processes> KillTarget for RunTarget<'_, P> {
     type Process = P::Held;
 
-    /// The pid the listing gives the run, read afresh: `None` once the entry is gone, or the task is. The
-    /// failure of the first read says which run it was for; later reads follow a pid the hold's own words
-    /// name.
+    /// The pid the listing gives the run, read afresh: `None` once the entry is gone, or the task is.
     fn service_pid(&mut self) -> io::Result<Option<u32>> {
-        let first = !std::mem::replace(&mut self.listed, true);
         match self.tasks.instances(self.path) {
             Ok(listed) => Ok(listed
                 .iter()
                 .find(|listed| listed.id == self.instance)
                 .map(|listed| listed.pid)),
             Err(e) if gone(&e) => Ok(None),
-            Err(e) if first => Err(within(
-                format!(
-                    "failed to list the instances of `{}` for its run (pid {})",
-                    self.path.name(),
-                    self.pid
-                ),
-                io::Error::other(e),
-            )),
             Err(e) => Err(io::Error::other(e)),
         }
+    }
+
+    /// The first read of a hold is made before the listing names a process, so its failure says which run
+    /// it was for; the failures of later reads follow a pid the hold's own words name.
+    fn unread(&self, e: io::Error) -> io::Error {
+        within(format!("finding the run with process {}", self.pid), e)
     }
 
     fn open(&mut self, pid: u32) -> io::Result<Option<P::Held>> {

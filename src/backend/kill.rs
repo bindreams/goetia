@@ -70,6 +70,12 @@ pub trait KillTarget {
     /// reports none.
     fn service_pid(&mut self) -> io::Result<Option<u32>>;
 
+    /// `e`, the failure of the first read of a hold ([`HoldError::Unread`]), worded for the service it was
+    /// for: no process is known yet, so a target with many runs says which one. The default says nothing.
+    fn unread(&self, e: io::Error) -> io::Error {
+        e
+    }
+
     /// Open the process holding `pid`; `None` if there is none.
     fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>>;
 
@@ -226,7 +232,7 @@ pub(crate) fn hold_once<T: KillTarget>(
     target: &mut T,
     deadline: Deadline,
 ) -> std::result::Result<Hold<T::Process>, HoldError> {
-    let Some(pid) = target.service_pid().map_err(HoldError::Unread)? else {
+    let Some(pid) = target.service_pid().map_err(|e| HoldError::Unread(target.unread(e)))? else {
         return Ok(Hold::NoProcess);
     };
     let process = match target.open(pid) {
@@ -295,8 +301,8 @@ fn of_process(pid: u32, step: Step, e: io::Error) -> io::Error {
 /// that search sees through.
 #[derive(Debug)]
 pub(crate) enum HoldError {
-    /// The manager could not be read for the process at all, so none is known: a caller that already
-    /// knows which it is says so.
+    /// The manager could not be read for the process at all, so none is known: the target words the
+    /// error ([`KillTarget::unread`]), so that it says which service it was for.
     Unread(io::Error),
     /// The manager vouches for the pid, and the process cannot be opened. The error says which process.
     Refused(io::Error),

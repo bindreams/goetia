@@ -1,8 +1,7 @@
 use std::io;
-use std::sync::Arc;
 
-use super::report::{Dyn, Seen, seen};
-use super::{Error, SharedError};
+use super::Error;
+use super::report::{Seen, seen};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]
@@ -39,32 +38,12 @@ fn said_within(context: String, delivered: bool, source: io::Error) -> io::Error
     )
 }
 
-/// Whether `e` holds a goetia [`Error`] or a [`within`] context under a shared payload (an `Arc<io::Error>` or
-/// a [`SharedError`]), which [`told`] cannot move out of it.
-fn goetia_under_shared_payload(e: &io::Error) -> bool {
-    let mut at: &Dyn = e;
-    let mut shared = false;
-    loop {
-        at = if let Some(payload) = at.downcast_ref::<io::Error>().and_then(io::Error::get_ref) {
-            payload
-        } else if let Some(inner) = at.downcast_ref::<Arc<io::Error>>() {
-            shared = true;
-            &**inner
-        } else if let Some(inner) = at.downcast_ref::<SharedError>() {
-            shared = true;
-            &**inner
-        } else {
-            return shared && (at.is::<Error>() || at.is::<Box<Error>>() || at.is::<Within>());
-        };
-    }
-}
-
 /// What an [`io::Error`] is, one layer down, as [`seen`] looks through what carries it: the one place that
 /// knows how [`within`] is laid in it.
 ///
 /// Nothing goetia lays in an [`io::Error`], neither an [`Error`] nor a [`within`] context, sits under a
 /// shared payload (an `Arc<io::Error>` or a [`SharedError`]): a shared payload is only ever an OS failure, which
-/// [`seen`] still looks through for the printer. A debug build asserts it.
+/// [`seen`] still looks through for the printer. A debug build asserts it in [`told`].
 enum Layer<'a> {
     Context(&'a Within),
     Carried(&'a Error),
@@ -72,10 +51,6 @@ enum Layer<'a> {
 }
 
 fn layer(e: &io::Error) -> Layer<'_> {
-    debug_assert!(
-        !goetia_under_shared_payload(e),
-        "a goetia error or a context is laid in a shared payload: {e:?}"
-    );
     match seen(e) {
         Seen::Ours(carried) => Layer::Carried(carried),
         Seen::Other(inner) => inner.downcast_ref::<Within>().map_or(Layer::Os, Layer::Context),
@@ -150,7 +125,11 @@ fn told(e: io::Error) -> Error {
     };
     match take_payload::<Box<Error>>(e) {
         Ok(carried) => *carried,
-        Err(e) => Error::RawOs { os: e },
+        // What the error is said to carry is not its payload, so it is under a shared one.
+        Err(e) => {
+            debug_assert!(false, "a goetia error or a context is laid in a shared payload: {e:?}");
+            Error::RawOs { os: e }
+        }
     }
 }
 
