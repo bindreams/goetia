@@ -38,6 +38,19 @@ fn common_and_kind_read_through_the_enum() {
     assert_eq!(spec.kind(), DaemonKind::Service);
 }
 
+/// The `type` of a daemon in `--json` and in the text forms. Not `error::daemon_noun`, which is
+/// message wording.
+#[skuld::test]
+fn a_daemon_kind_serializes_as_service_or_task() {
+    for (kind, spelling) in [(DaemonKind::Service, "service"), (DaemonKind::Task, "task")] {
+        assert_eq!(kind.as_str(), spelling);
+        assert_eq!(
+            serde_json::to_string(&kind).expect("a DaemonKind serializes infallibly"),
+            format!("\"{spelling}\"")
+        );
+    }
+}
+
 #[skuld::test]
 fn new_refuses_a_control_character() {
     let msg = message(ServiceFields {
