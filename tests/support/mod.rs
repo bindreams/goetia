@@ -11,6 +11,9 @@ pub mod cmd;
 pub mod connect_back;
 #[cfg(unix)]
 pub mod cron_oracle;
+// Runs `CARGO_BIN_EXE_goetia`, which only a build with the `cli` feature has.
+#[cfg(feature = "cli")]
+pub mod demonstration;
 pub mod failed_install;
 pub mod kill;
 pub mod list_json;
@@ -26,6 +29,7 @@ pub mod service_ctrl;
 pub mod service_guard;
 #[cfg(unix)]
 pub mod tasks;
+pub mod wait;
 #[cfg(windows)]
 pub mod windows_tasks;
 #[cfg(windows)]
@@ -63,6 +67,8 @@ pub use world_readable_exe::WorldReadableExe;
 // symptom is a straggler left behind rather than an error.
 
 pub const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
+/// Where systemd keeps a `Persistent=yes` timer's stamp, `stamp-<id>.timer`.
+pub const SYSTEMD_STAMP_DIR: &str = "/var/lib/systemd/timers";
 pub const LAUNCHD_DAEMON_DIR: &str = "/Library/LaunchDaemons";
 pub const SCM_SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 

@@ -1357,7 +1357,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout(#[fixture(launc
     // `accept` returns while the run is still exiting, and `start` reads `Running` from a process
     // with a pid, so wait for a whole `launchctl print` showing the exit and no pid. Not `status`: it
     // reads a failed `print` as `Unknown` with no pid, which would end the wait early.
-    support::kill::until(|| {
+    support::wait::until(|| {
         let printed = print_job(&id).stdout;
         // A job that has not exited yet reads `last exit code = (never exited)`.
         print_field(&printed, "last exit code = ").is_some_and(|code| !code.contains("never exited"))
@@ -1511,7 +1511,7 @@ fn a_daemon_runs_in_the_directories_install_made_for_its_account(#[fixture(launc
     let _guard = Guard::install(&mgr, &spec);
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
-    support::kill::until(|| state.join("work/proof").is_file());
+    support::wait::until(|| state.join("work/proof").is_file());
 
     let log = std::fs::metadata(logs_parent.join("out.log")).expect("launchd opened the log");
     assert_eq!(log.uid(), nobody_uid, "launchd opens the log as the job's account");

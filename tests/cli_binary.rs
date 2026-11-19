@@ -153,6 +153,33 @@ fn f_flag_accepts_a_directory() {
     assert!(out.contains("frpc"), "{out}");
 }
 
+/// The demonstrations write their manifests through `support::demonstration::Manifest`, whose strings reach
+/// the parser's interpolation: a script with `$(...)`, `$((...))` and `$n` comes back from the binary as written.
+#[skuld::test]
+fn a_demonstration_manifest_keeps_the_dollars_of_a_script() {
+    let script = "n=$(cat count); n=$((n + 1)); echo $n \"$$\" ${HOME}";
+    let manifest = support::demonstration::Manifest::new(
+        "frpc",
+        vec![
+            std::env::current_exe().unwrap().display().to_string(),
+            "-c".to_string(),
+            script.to_string(),
+        ],
+        "* * * * *",
+    );
+    manifest.write();
+
+    let (code, out, err) = run_cli(
+        &["daemon", "show", "-f", manifest.dir().to_str().unwrap()],
+        manifest.dir(),
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let shown: yaml_serde::Value = yaml_serde::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(shown["command"][2].as_str(), Some(script), "{out}");
+    assert_eq!(shown["schedule"].as_str(), Some("* * * * *"), "{out}");
+}
+
 /// A manifest is one daemon, so `install` takes no id: clap refuses it, and no artifact is printed.
 #[skuld::test]
 fn install_refuses_a_positional_id() {

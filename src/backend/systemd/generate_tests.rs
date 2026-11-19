@@ -1162,6 +1162,38 @@ fn timer_unit_text_is_exact() {
     );
 }
 
+/// The schedule excludes the spec blob, version and `Description=`; a changed schedule is in the timer's
+/// text.
+#[skuld::test]
+fn a_timers_schedule_changes_only_with_its_schedule() {
+    let schedule = |spec: &DaemonSpec| timer_schedule(spec).expect("a schedule");
+    let spec = task_with(|_| {});
+    let renamed = task_with(|c| c.name = "Another name".to_string());
+    let recommanded = task_with(|c| c.command = vec![PROGRAM.to_string(), "--other".to_string()]);
+    assert_ne!(timer_for(&spec), timer_for(&renamed), "the whole text differs");
+    assert_ne!(timer_for(&spec), timer_for(&recommanded), "the whole text differs");
+    assert_eq!(schedule(&spec), schedule(&renamed));
+    assert_eq!(schedule(&spec), schedule(&recommanded));
+    assert_ne!(schedule(&spec), schedule(&full_task(Some("30 4 * * *"))));
+
+    let text = schedule(&spec);
+    assert!(
+        !text.contains("X-Goetia") && !text.contains("Spec=") && !text.contains("Description="),
+        "{text}"
+    );
+    assert!(text.contains("OnCalendar=*-*-* 03:30:00"), "{text}");
+    for spec in [&spec, &renamed, &recommanded] {
+        assert!(timer_for(spec).expect("a timer").contains(&schedule(spec)));
+    }
+}
+
+#[skuld::test]
+fn only_a_scheduled_task_has_a_timer_schedule() {
+    assert!(timer_schedule(&task_with(|_| {})).is_some());
+    assert!(timer_schedule(&full_task(None)).is_none());
+    assert!(timer_schedule(&minimal_spec()).is_none());
+}
+
 #[skuld::test]
 fn the_display_of_units_is_the_service_then_the_timer_under_a_marker_line() {
     let units = units(&full_task(Some("30 3 * * *")), &full_identity()).unwrap();

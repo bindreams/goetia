@@ -18,7 +18,7 @@ On macOS goetia requires **14.4+**: `kill` holds the daemon's process by its
 identity, which the OS offers from 14.4. On Linux it requires **kernel 5.6+**,
 with `pidfd_open` and `openat2` not blocked by a seccomp profile or an LSM: the
 process library goetia runs `systemctl` with, and holds a daemon's process with
-for `kill`, needs both. It also requires **systemd 242+**
+for `kill`, needs both. It also requires **systemd 243+**
 (2019), and refuses to install, uninstall, start, stop, restart, enable or
 disable anything on an older one, before writing or running anything. It checks both the running systemd and the
 `systemctl` client, which is what parses `--show-transaction`. A running
@@ -26,7 +26,10 @@ systemd it cannot ask is refused. Generated units use
 `Type=exec` (240+), which is what lets a start report a missing executable or
 user as a failure. An older systemd does not reject the directive: it logs that it
 cannot parse it and runs the unit as `Type=simple`, silently losing exactly
-that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
+that. Every `start` and `stop` runs `systemctl --show-transaction` (242+), and
+arming a task's timer runs `systemctl clean` on it (243+) to clear its stamp,
+which is how arming a task again makes up no run missed while goetia's
+`disable` had disarmed it.
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
