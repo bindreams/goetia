@@ -8,9 +8,18 @@
 //! `UseUnifiedSchedulingEngine`, and rewrites the principal's account to a SID. So a readback is a
 //! [`TaskXml`] built from the elements goetia owns, with a dropped one read as its default, and the
 //! account is the blob's, never the principal's. [`Display`](fmt::Display) is the definition's
-//! canonical text: the same for what is generated and what is read back, and with no armed state,
-//! which is the triggers' `Enabled` flags ([`TaskXml::armed`], [`TaskXml::with_armed`]), and no
-//! registration [`Token`] ([`TaskXml::token_of`]).
+//! canonical text: the same for what is generated and what is read back, with no registration
+//! [`Token`] ([`TaskXml::token_of`]).
+//!
+//! **A task is armed when it has triggers that are switched on** ([`TaskXml::armed`]; its own
+//! `Settings/Enabled` stays true, since Task Scheduler refuses a `Run` of a task whose own flag is false).
+//! A disarmed task has none: disabling a trigger would leave a repetition in progress firing, and
+//! removing the triggers stops it. So [`TaskXml::to_xml`] writes the triggers only for an armed task, and
+//! what is read back of a task with none is the definition it would arm: the triggers its blob's
+//! schedule compiles to. The edits of the stored XML:
+//! - `disable`: [`TaskXml::without_triggers`];
+//! - `enable`, no trigger on: [`TaskXml::with_triggers`];
+//! - `enable`, a trigger on: [`TaskXml::with_own_flag`].
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -149,7 +158,7 @@ const SETTINGS: [Setting; 16] = [
 // TaskXml =============================================================================================================
 
 /// What goetia registers for a task, or reads back of one: the action, the account, the triggers,
-/// the settings and the blob. It has no armed state: see [`TaskXml::to_xml`].
+/// the settings and the blob. Whether the task is armed is no part of it: see [`TaskXml::to_xml`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskXml {
     id: Id,
@@ -177,16 +186,10 @@ impl TaskXml {
     ///
     /// The account is read from the spec alone, so that a readback can say the same.
     pub(crate) fn new(spec: &DaemonSpec, host: HostCommand) -> Result<TaskXml, Error> {
-        let DaemonSpec::Task(task) = spec else {
-            unreachable!("a service is not a task: `registration` matches the spec once")
-        };
         let common = spec.common();
         let account = account_of(&common.id, &common.user)?;
         refuse_percent(&common.id, &host)?;
-        let triggers = match &task.schedule {
-            Some(schedule) => compile(schedule, &common.id)?,
-            None => Vec::new(),
-        };
+        let triggers = triggers_of(spec)?;
         Ok(TaskXml {
             id: common.id.clone(),
             name: common.name.clone(),
@@ -209,9 +212,9 @@ impl TaskXml {
         self.account.clone()
     }
 
-    /// The XML to register. `armed` is every trigger's `Enabled` flag, written explicitly; it is
-    /// the installation's state and no part of the definition. `token` is the registration's, the
-    /// action's last argument.
+    /// The XML to register. The triggers are written only when `armed`, which is the installation's
+    /// state and no part of the definition: an install over a disarmed task keeps it without any.
+    /// `token` is the registration's, the action's last argument.
     pub(crate) fn to_xml(&self, armed: bool, token: &Token) -> String {
         let mut out = String::new();
         out.push_str("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n");
@@ -231,12 +234,8 @@ impl TaskXml {
         ));
         out.push_str(&self.settings_xml());
         out.push_str(&format!("<Data>{}</Data>", xml_escape(&self.data)));
-        if !self.triggers.is_empty() {
-            out.push_str("<Triggers>");
-            for trigger in &self.triggers {
-                out.push_str(&trigger_xml(trigger, armed));
-            }
-            out.push_str("</Triggers>");
+        if armed {
+            out.push_str(&triggers_xml(&self.triggers));
         }
         out.push_str(&format!(
             "<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>",
@@ -380,11 +379,33 @@ fn refuse_percent(id: &Id, host: &HostCommand) -> Result<(), Error> {
 
 // The triggers --------------------------------------------------------------------------------------------------------
 
-fn trigger_xml(trigger: &Trigger, armed: bool) -> String {
-    let flag = format!("<Enabled>{armed}</Enabled>");
+/// The triggers `spec`'s schedule compiles to: none for a task with no schedule.
+pub(crate) fn triggers_of(spec: &DaemonSpec) -> Result<Vec<Trigger>, Error> {
+    let DaemonSpec::Task(task) = spec else {
+        return Err(Error::blob(format!(
+            "`{}` is a service, not a task, so it has no triggers",
+            spec.common().id
+        )));
+    };
+    match &task.schedule {
+        Some(schedule) => compile(schedule, &spec.common().id),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The `Triggers` element of `triggers`, empty text for none.
+fn triggers_xml(triggers: &[Trigger]) -> String {
+    if triggers.is_empty() {
+        return String::new();
+    }
+    let inner: String = triggers.iter().map(trigger_xml).collect();
+    format!("<Triggers>{inner}</Triggers>")
+}
+
+fn trigger_xml(trigger: &Trigger) -> String {
     let (at, repeat, schedule) = match trigger {
         Trigger::Never => {
-            return format!("<TimeTrigger><StartBoundary>{NEVER_AT}</StartBoundary>{flag}</TimeTrigger>");
+            return format!("<TimeTrigger><StartBoundary>{NEVER_AT}</StartBoundary></TimeTrigger>");
         }
         Trigger::Daily { every_days, at, repeat } => (
             at,
@@ -439,7 +460,7 @@ fn trigger_xml(trigger: &Trigger, armed: bool) -> String {
         None => String::new(),
     };
     format!(
-        "<CalendarTrigger><StartBoundary>{START_DATE}T{:02}:{:02}:00</StartBoundary>{flag}{repetition}{schedule}\
+        "<CalendarTrigger><StartBoundary>{START_DATE}T{:02}:{:02}:00</StartBoundary>{repetition}{schedule}\
          </CalendarTrigger>",
         at.0, at.1
     )

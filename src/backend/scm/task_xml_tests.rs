@@ -586,7 +586,7 @@ fn a_readback_is_a_fixed_point() {
     assert_eq!(first, again);
     assert_eq!(first.to_string(), again.to_string());
     let disarmed = TaskXml::parse(&first.to_xml(false, &token()), &data_of(&spec)).unwrap();
-    assert_eq!(first, disarmed, "the flags are not part of the definition");
+    assert_eq!(first, disarmed, "a disarmed task reads as the definition it would arm");
 }
 
 #[skuld::test]
@@ -621,6 +621,24 @@ fn a_hand_edit_of_a_setting_trigger_or_action_is_a_difference() {
     }
 }
 
+/// A stored trigger whose own flag reads false is not goetia's, so it is a difference (an install writes
+/// the desired one over it); one that reads true is.
+#[skuld::test]
+fn a_trigger_whose_flag_is_false_is_a_difference_and_one_whose_flag_is_true_is_not() {
+    let spec = spec();
+    let desired = built(&spec).to_string();
+    let base = readback(&spec, &host(), DAILY_AT_0330);
+    let boundary = "<StartBoundary>2000-01-01T03:30:00</StartBoundary>";
+    for flag in ["false", "False", "0"] {
+        let edited = base.replace(boundary, &format!("{boundary}<Enabled>{flag}</Enabled>"));
+        let installed = TaskXml::parse(&edited, &data_of(&spec)).unwrap();
+        assert_ne!(installed.to_string(), desired, "{flag}");
+    }
+    let edited = base.replace(boundary, &format!("{boundary}<Enabled>true</Enabled>"));
+    let installed = TaskXml::parse(&edited, &data_of(&spec)).unwrap();
+    assert_eq!(installed.to_string(), desired);
+}
+
 #[skuld::test]
 fn parse_refuses_data_that_is_not_a_tasks_blob() {
     let service = crate::testing::base_fields("frpc", vec![program("frpc")]);
@@ -633,72 +651,196 @@ fn parse_refuses_data_that_is_not_a_tasks_blob() {
 
 // Arming ==============================================================================================================
 
-/// `DAILY_AT_0330` and a second trigger with its flag stated.
-const TWO_TRIGGERS: &str = r#"<Triggers>
-    <CalendarTrigger>
-      <StartBoundary>2000-01-01T03:30:00</StartBoundary>
-      <Enabled>false</Enabled>
-      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
-    </CalendarTrigger>
-    <TimeTrigger>
-      <StartBoundary>2000-01-01T00:00:00</StartBoundary>
-    </TimeTrigger>
-  </Triggers>"#;
-
-/// `xml` with every `Enabled` element removed: in a readback, only triggers state one.
-fn without_flags(xml: &str) -> String {
-    let mut out = String::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<Enabled>") {
-        let (before, after) = rest.split_at(start);
-        out.push_str(before);
-        rest = &after[after.find("</Enabled>").unwrap() + "</Enabled>".len()..];
-    }
-    out.push_str(rest);
-    out
+/// `xml` with its `Triggers` element, empty or not, taken out: what a disarmed task stores. XML with
+/// none is as it was.
+fn without_triggers_element(xml: &str) -> String {
+    let Some(start) = xml.find("<Triggers") else {
+        return xml.to_owned();
+    };
+    let end = match xml[start..].find("</Triggers>") {
+        Some(close) => start + close + "</Triggers>".len(),
+        None => start + xml[start..].find("/>").expect("an empty element closes itself") + 2,
+    };
+    format!("{}{}", &xml[..start], &xml[end..])
 }
 
+fn has_triggers_element(xml: &str) -> bool {
+    node_at(&Document::parse(xml).unwrap(), "Task/Triggers").is_some()
+}
+
+/// Disarming takes out the whole `Triggers` element, whatever it holds (a hand-added trigger included),
+/// and changes nothing else.
 #[skuld::test]
-fn arming_flips_only_the_trigger_flags() {
+fn disarming_removes_the_triggers_and_nothing_else() {
     let spec = spec();
-    let xml = readback(&spec, &host(), TWO_TRIGGERS);
-    assert!(!TaskXml::armed(&xml), "one trigger is disabled");
+    for triggers in [DAILY_AT_0330, HAND_ADDED, "<Triggers />"] {
+        let xml = readback(&spec, &host(), triggers);
+        let disarmed = TaskXml::without_triggers(&xml).unwrap();
+        assert_eq!(disarmed, without_triggers_element(&xml), "{triggers}");
+        assert!(!has_triggers_element(&disarmed), "{triggers}");
+        assert!(!TaskXml::armed(&disarmed), "{triggers}");
+    }
 
-    let armed = TaskXml::with_armed(&xml, true).unwrap();
-    assert!(TaskXml::armed(&armed));
-    assert_eq!(
-        without_flags(&armed),
-        without_flags(&xml),
-        "nothing but the flags changed"
-    );
-
-    let disarmed = TaskXml::with_armed(&armed, false).unwrap();
-    assert!(!TaskXml::armed(&disarmed));
-    assert_eq!(without_flags(&disarmed), without_flags(&xml));
-    let document = Document::parse(&disarmed).unwrap();
-    let flags: Vec<_> = node_at(&document, "Task/Triggers")
-        .unwrap()
-        .children()
-        .filter(Node::is_element)
-        .map(|trigger| {
-            trigger
-                .children()
-                .find(|child| child.tag_name().name() == "Enabled")
-                .map(|flag| flag.text().unwrap().to_owned())
-        })
-        .collect();
-    assert_eq!(
-        flags,
-        [Some("false".to_owned()), Some("false".to_owned())],
-        "a dropped flag is stated"
-    );
-
-    // A hand edit made elsewhere survives the flip.
-    let edited = xml.replace("<Priority>5</Priority>", "<Priority>3</Priority>");
+    // A hand edit made elsewhere survives.
+    let edited = readback(&spec, &host(), DAILY_AT_0330).replace("<Priority>5</Priority>", "<Priority>3</Priority>");
     assert!(
-        TaskXml::with_armed(&edited, true)
+        TaskXml::without_triggers(&edited)
             .unwrap()
             .contains("<Priority>3</Priority>")
+    );
+
+    // A task with none is as it was.
+    let none = readback(&spec, &host(), "");
+    assert_eq!(TaskXml::without_triggers(&none).unwrap(), none);
+}
+
+/// Arming writes the triggers the blob's schedule compiles to, in place of whatever the stored XML holds,
+/// and changes nothing else.
+#[skuld::test]
+fn arming_writes_the_blobs_triggers_into_the_stored_xml() {
+    let spec = spec();
+    let desired = built(&spec).to_string();
+    for stored in ["", "<Triggers />", HAND_ADDED, DAILY_AT_0330] {
+        let xml = readback(&spec, &host(), stored);
+        let armed = TaskXml::with_triggers(&xml, &spec).unwrap();
+
+        assert!(TaskXml::armed(&armed), "{stored}: {armed}");
+        let installed = TaskXml::parse(&armed, &data_of(&spec)).unwrap();
+        assert_eq!(
+            installed.to_string(),
+            desired,
+            "{stored}: the spec's triggers, and no other"
+        );
+        let document = Document::parse(&armed).unwrap();
+        let children = names_under(&document, "Task");
+        let at = |name: &str| children.iter().position(|child| child == name).unwrap();
+        assert_eq!(
+            children.iter().filter(|child| *child == "Triggers").count(),
+            1,
+            "{stored}"
+        );
+        assert!(at("Triggers") < at("Actions"), "{stored}: {children:?}");
+        let squashed = |xml: &str| without_triggers_element(xml).split_whitespace().collect::<String>();
+        assert_eq!(
+            squashed(&armed),
+            squashed(&xml),
+            "{stored}: nothing but the triggers differs"
+        );
+    }
+
+    // A hand edit made elsewhere survives.
+    let edited = readback(&spec, &host(), "").replace("<Priority>5</Priority>", "<Priority>3</Priority>");
+    assert!(
+        TaskXml::with_triggers(&edited, &spec)
+            .unwrap()
+            .contains("<Priority>3</Priority>")
+    );
+}
+
+/// A task whose triggers are there is armed by its own flag alone: they are kept as they are, a hand-added
+/// one included, and nothing else changes.
+#[skuld::test]
+fn keeping_the_triggers_sets_the_own_flag_and_changes_nothing_else() {
+    let spec = spec();
+    for stored in [DAILY_AT_0330, HAND_ADDED] {
+        let xml = readback(&spec, &host(), stored);
+        assert_eq!(
+            TaskXml::with_own_flag(&xml, true).unwrap(),
+            xml,
+            "{stored}: already true"
+        );
+
+        let off = with_own_flag(&xml, false);
+        let on = TaskXml::with_own_flag(&off, true).unwrap();
+        assert_eq!(on, with_own_flag(&xml, true), "{stored}");
+        assert!(TaskXml::armed(&on), "{stored}");
+    }
+}
+
+/// A false own flag is stated once whether the XML states a flag or not, and nothing else changes: setting it
+/// true again gives back what a flag stated true would be.
+#[skuld::test]
+fn setting_the_own_flag_false_states_it_once_and_changes_nothing_else() {
+    let spec = spec();
+    let xml = readback(&spec, &host(), DAILY_AT_0330);
+    let off = TaskXml::with_own_flag(&xml, false).unwrap();
+    assert_eq!(off.matches("<Enabled>false</Enabled>").count(), 1, "{off}");
+    assert!(!TaskXml::armed(&off));
+    assert_eq!(
+        TaskXml::with_own_flag(&off, true)
+            .unwrap()
+            .replace("<Enabled>true</Enabled>", ""),
+        xml
+    );
+
+    let stated = with_own_flag(&xml, true);
+    let off = TaskXml::with_own_flag(&stated, false).unwrap();
+    assert_eq!(off.matches("<Enabled>").count(), 1, "{off}");
+    assert_eq!(off, with_own_flag(&xml, false));
+}
+
+/// A false own flag is written whether the `Settings` is empty or missing, and the XML is no less goetia's for it.
+#[skuld::test]
+fn setting_the_own_flag_false_writes_the_settings_it_needs() {
+    let xml = readback(&spec(), &host(), DAILY_AT_0330);
+    let start = xml.find("<Settings>").unwrap();
+    let end = xml.find("</Settings>").unwrap() + "</Settings>".len();
+    for (what, settings) in [("empty", "<Settings />"), ("none", "")] {
+        let xml = format!("{}{settings}{}", &xml[..start], &xml[end..]);
+        let off = TaskXml::with_own_flag(&xml, false).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(off.matches("<Enabled>false</Enabled>").count(), 1, "{what}: {off}");
+        assert!(!TaskXml::armed(&off), "{what}: {off}");
+        assert!(
+            off.find("<Settings>").unwrap() < off.find("<Actions").unwrap(),
+            "{what}: {off}"
+        );
+        assert!(TaskXml::armed(&TaskXml::with_own_flag(&off, true).unwrap()), "{what}");
+    }
+}
+
+/// A trigger that is switched off starts nothing, so a task whose only triggers are off is not armed, and
+/// arming it writes the blob's schedule in place of them.
+#[skuld::test]
+fn a_task_whose_only_triggers_are_off_is_not_armed_and_is_armed_with_fresh_ones() {
+    let spec = spec();
+    let off = DAILY_AT_0330.replace("<CalendarTrigger>", "<CalendarTrigger>\n      <Enabled>false</Enabled>");
+    assert_ne!(off, DAILY_AT_0330);
+    let xml = readback(&spec, &host(), &off);
+    assert!(!TaskXml::has_triggers(&xml), "{xml}");
+    assert!(!TaskXml::armed(&xml), "{xml}");
+
+    let armed = TaskXml::with_triggers(&xml, &spec).unwrap();
+    assert!(TaskXml::armed(&armed), "{armed}");
+    assert!(!armed.contains("<Enabled>false</Enabled>"), "{armed}");
+
+    // One that is on among them is enough.
+    let mixed = readback(
+        &spec,
+        &host(),
+        &off.replace("</Triggers>", "<BootTrigger /></Triggers>"),
+    );
+    assert!(TaskXml::armed(&mixed), "{mixed}");
+}
+
+/// A blob that holds a service names no schedule, so arming from it is an error, not a panic.
+#[skuld::test]
+fn arming_from_a_services_blob_is_an_error_that_names_it() {
+    let service = crate::testing::base_fields("frpc", vec![program("frpc")]);
+    let service = DaemonSpec::from(crate::spec::ServiceSpec::new(service).unwrap());
+    let xml = readback(&spec(), &host(), "");
+    let refused = TaskXml::with_triggers(&xml, &service).unwrap_err();
+    assert!(refused.to_string().contains("service"), "{refused}");
+}
+
+/// A task with no schedule has nothing to arm: the triggers of its blob are none.
+#[skuld::test]
+fn arming_a_task_with_no_schedule_is_refused() {
+    let spec = spec_of(User::Root, None);
+    let xml = readback(&spec, &host(), "");
+    let refused = TaskXml::with_triggers(&xml, &spec).unwrap_err();
+    assert!(
+        refused.to_string().contains(crate::manager::flow::NOTHING_TO_ARM),
+        "{refused}"
     );
 }
 
@@ -708,16 +850,22 @@ fn with_own_flag(xml: &str, flag: bool) -> String {
     xml.replace("<Settings>", &format!("<Settings>\n    <Enabled>{flag}</Enabled>"))
 }
 
-/// A task whose own flag is false is started by nothing, whatever its triggers say: it is not armed. An
-/// `uninstall` that did not finish leaves one.
+/// A task is armed when its own flag is true and it has a trigger. A task whose own flag is false is
+/// started by nothing, whatever its triggers say (an `uninstall` that did not finish leaves one), and one with
+/// no trigger has nothing to start it.
 #[skuld::test]
-fn a_task_whose_own_flag_is_false_is_not_armed() {
+fn armed_is_the_own_flag_true_and_a_trigger_present() {
     let spec = spec();
-    let enabled_trigger = TaskXml::with_armed(&readback(&spec, &host(), DAILY_AT_0330), true).unwrap();
-    assert!(TaskXml::armed(&enabled_trigger));
+    let with_trigger = readback(&spec, &host(), DAILY_AT_0330);
+    assert!(TaskXml::armed(&with_trigger));
+    assert!(!TaskXml::armed(&with_own_flag(&with_trigger, false)));
+    assert!(TaskXml::armed(&with_own_flag(&with_trigger, true)));
 
-    assert!(!TaskXml::armed(&with_own_flag(&enabled_trigger, false)));
-    assert!(TaskXml::armed(&with_own_flag(&enabled_trigger, true)));
+    for none in ["", "<Triggers />"] {
+        let xml = readback(&spec, &host(), none);
+        assert!(!TaskXml::armed(&xml), "{none:?}");
+        assert!(!TaskXml::armed(&with_own_flag(&xml, true)), "{none:?}");
+    }
 }
 
 /// Arming and disarming both leave the task's own flag true: `enable` makes a task whose flag an
@@ -725,48 +873,106 @@ fn a_task_whose_own_flag_is_false_is_not_armed() {
 #[skuld::test]
 fn arming_and_disarming_both_set_the_tasks_own_flag() {
     let spec = spec();
-    let xml = TaskXml::with_armed(&readback(&spec, &host(), DAILY_AT_0330), true).unwrap();
-    let off = with_own_flag(&xml, false);
+    let off = with_own_flag(&readback(&spec, &host(), DAILY_AT_0330), false);
 
-    let armed = TaskXml::with_armed(&off, true).unwrap();
+    let armed = TaskXml::with_triggers(&off, &spec).unwrap();
     assert!(TaskXml::armed(&armed), "{armed}");
     assert!(
-        armed.contains("<Enabled>true</Enabled>\n    <MultipleInstancesPolicy>"),
-        "{armed}"
+        armed.contains("<Settings>\n    <Enabled>true</Enabled>"),
+        "the task's own flag is true: {armed}"
     );
-    let disarmed = TaskXml::with_armed(&off, false).unwrap();
+    let disarmed = TaskXml::without_triggers(&off).unwrap();
     assert!(!TaskXml::armed(&disarmed));
     assert!(
         disarmed.contains("<Settings>\n    <Enabled>true</Enabled>"),
-        "the task's own flag is true, the triggers' false: {disarmed}"
+        "the task's own flag is true, and it has no trigger: {disarmed}"
     );
-    // Nothing else changed: with the flags taken out the three are one text.
-    assert_eq!(without_flags(&armed), without_flags(&off));
-    assert_eq!(without_flags(&disarmed), without_flags(&off));
 
     // A task with no trigger has only its own flag to set.
     let no_triggers = readback(&spec, &host(), "");
     assert_eq!(
-        TaskXml::with_armed(&with_own_flag(&no_triggers, false), false).unwrap(),
+        TaskXml::without_triggers(&with_own_flag(&no_triggers, false)).unwrap(),
         with_own_flag(&no_triggers, true)
     );
-    // A task that states no flag has the default, true: nothing is added.
-    assert_eq!(TaskXml::with_armed(&no_triggers, true).unwrap(), no_triggers);
 }
 
+/// The three edits that disarm and arm the stored XML change the triggers and the own flag, never the
+/// action: its arguments, the registration's token included, are the stored ones.
 #[skuld::test]
-fn armed_flags_are_not_in_display() {
+fn disabling_and_enabling_leave_the_token_unchanged() {
     let spec = spec();
-    let xml = readback(&spec, &host(), DAILY_AT_0330);
-    let armed = TaskXml::parse(&TaskXml::with_armed(&xml, true).unwrap(), &data_of(&spec)).unwrap();
-    let disarmed = TaskXml::parse(&TaskXml::with_armed(&xml, false).unwrap(), &data_of(&spec)).unwrap();
-    assert_eq!(armed.to_string(), disarmed.to_string());
+    let stored = readback(&spec, &host(), DAILY_AT_0330);
+    let token_of = |xml: &str| TaskXml::token_of(xml, ID).unwrap();
+    assert_eq!(token_of(&stored), Some(token()));
+
+    let disabled = TaskXml::without_triggers(&stored).unwrap();
+    assert_eq!(token_of(&disabled), Some(token()));
+    let enabled = TaskXml::with_triggers(&disabled, &spec).unwrap();
+    assert_eq!(token_of(&enabled), Some(token()));
+    let flagged = TaskXml::with_own_flag(&with_own_flag(&enabled, false), true).unwrap();
+    assert_eq!(token_of(&flagged), Some(token()));
+
+    // The action is the same text: nothing but the triggers and the own flag moved.
+    let arguments = |xml: &str| {
+        let from = xml.find("<Arguments>").unwrap();
+        xml[from..xml.find("</Arguments>").unwrap()].to_owned()
+    };
+    for xml in [&disabled, &enabled, &flagged] {
+        assert_eq!(arguments(xml), arguments(&stored));
+    }
+}
+
+/// What a disarmed task stores has no triggers, and still reads as the definition an install of its spec
+/// writes: an install finds it up to date, and writes no trigger over it. A disarmed task whose blob names
+/// another schedule differs.
+#[skuld::test]
+fn a_disarmed_task_reads_as_the_definition_it_would_arm() {
+    let spec = spec();
     let desired = built(&spec);
-    assert_eq!(desired.to_string(), armed.to_string());
-    assert!(desired.to_xml(true, &token()).contains("<Enabled>true</Enabled>"));
-    assert!(desired.to_xml(false, &token()).contains("<Enabled>false</Enabled>"));
-    assert!(TaskXml::armed(&desired.to_xml(true, &token())));
-    assert!(!TaskXml::armed(&desired.to_xml(false, &token())));
+    let disarmed_xml = TaskXml::without_triggers(&readback(&spec, &host(), DAILY_AT_0330)).unwrap();
+
+    let installed = TaskXml::parse(&disarmed_xml, &data_of(&spec)).unwrap();
+    assert_eq!(installed.to_string(), desired.to_string());
+    let from_to_xml = TaskXml::parse(&desired.to_xml(false, &token()), &data_of(&spec)).unwrap();
+    assert_eq!(from_to_xml.to_string(), desired.to_string());
+
+    let moved = spec_of(User::Root, Some("0 4 * * *"));
+    assert_ne!(
+        TaskXml::parse(&disarmed_xml, &data_of(&moved)).unwrap().to_string(),
+        desired.to_string()
+    );
+    assert_ne!(
+        built(&moved).to_string(),
+        desired.to_string(),
+        "an install of the new schedule is a difference"
+    );
+}
+
+/// `to_xml` writes the triggers only for an armed task: an install over a disarmed task keeps it so.
+#[skuld::test]
+fn to_xml_writes_triggers_only_when_armed() {
+    let desired = built(&spec());
+    let armed = desired.to_xml(true, &token());
+    let disarmed = desired.to_xml(false, &token());
+    assert!(has_triggers_element(&armed));
+    assert!(TaskXml::armed(&armed));
+    assert!(!has_triggers_element(&disarmed), "{disarmed}");
+    assert!(!TaskXml::armed(&disarmed));
+    assert!(
+        !disarmed.contains("<Enabled>false</Enabled>"),
+        "no trigger flag is written: {disarmed}"
+    );
+    assert_eq!(
+        armed.split_whitespace().collect::<String>(),
+        {
+            let triggers = &armed[armed.find("<Triggers>").unwrap()..armed.find("</Triggers>").unwrap() + 11];
+            disarmed
+                .replace("<Actions", &format!("{triggers}<Actions"))
+                .split_whitespace()
+                .collect::<String>()
+        },
+        "the two differ by the triggers alone"
+    );
 }
 
 #[skuld::test]
@@ -781,7 +987,7 @@ fn a_task_with_no_schedule_has_no_triggers_and_is_never_armed() {
             "{xml}"
         );
         assert!(!TaskXml::armed(&xml), "no trigger is not armed");
-        assert_eq!(TaskXml::with_armed(&xml, true).unwrap(), xml, "nothing to flip");
+        assert_eq!(TaskXml::without_triggers(&xml).unwrap(), xml, "nothing to take out");
     }
     // `Triggers` may read back as an empty element.
     let empty = readback(&spec, &host(), "<Triggers />");
@@ -802,45 +1008,22 @@ const HAND_ADDED: &str = r#"<Triggers>
     <BootTrigger />
   </Triggers>"#;
 
+/// Triggers goetia does not write are armed triggers and drift; `disable` takes them out with the rest.
 #[skuld::test]
-fn a_trigger_with_no_start_boundary_is_armed_and_disarmed_like_any_other() {
+fn a_hand_added_trigger_is_armed_and_drift_until_a_disable() {
     let spec = spec();
     let xml = readback(&spec, &host(), HAND_ADDED);
-    assert!(TaskXml::armed(&xml), "no flag is enabled");
-
-    let disarmed = TaskXml::with_armed(&xml, false).expect("a hand-added trigger does not stop `disable`");
-    assert!(!TaskXml::armed(&disarmed));
-    let document = Document::parse(&disarmed).unwrap();
-    let flags: Vec<_> = node_at(&document, "Task/Triggers")
-        .unwrap()
-        .children()
-        .filter(Node::is_element)
-        .map(|trigger| {
-            let flag = trigger.children().find(|child| child.tag_name().name() == "Enabled");
-            (
-                trigger.tag_name().name().to_owned(),
-                flag.map(|flag| flag.text().unwrap().to_owned()),
-            )
-        })
-        .collect();
-    assert_eq!(
-        flags,
-        [
-            ("CalendarTrigger".to_owned(), Some("false".to_owned())),
-            ("LogonTrigger".to_owned(), Some("false".to_owned())),
-            ("BootTrigger".to_owned(), Some("false".to_owned())),
-        ]
-    );
-    assert!(
-        disarmed.contains("<UserId>S-1-5-21-1-2-3-1001</UserId>"),
-        "the hand edit is kept"
-    );
-
-    let armed = TaskXml::with_armed(&disarmed, true).unwrap();
-    assert!(TaskXml::armed(&armed));
-    // The hand-added triggers are drift, whatever their flags.
-    let installed = TaskXml::parse(&armed, &data_of(&spec)).unwrap();
+    assert!(TaskXml::armed(&xml));
+    let installed = TaskXml::parse(&xml, &data_of(&spec)).unwrap();
     assert!(installed.to_string().contains("Unrecognised:"), "{installed}");
+
+    let disarmed = TaskXml::without_triggers(&xml).unwrap();
+    assert!(
+        !disarmed.contains("S-1-5-21-1-2-3-1001"),
+        "the hand edit goes at `disable`"
+    );
+    let installed = TaskXml::parse(&disarmed, &data_of(&spec)).unwrap();
+    assert!(!installed.to_string().contains("Unrecognised:"), "{installed}");
 }
 
 #[skuld::test]
@@ -908,7 +1091,7 @@ fn a_schedule_that_never_fires_has_a_trigger_and_can_be_armed() {
     let task = built(&spec);
     assert!(!TaskXml::armed(&task.to_xml(false, &token())));
     assert!(TaskXml::armed(&task.to_xml(true, &token())));
-    let armed = TaskXml::with_armed(&task.to_xml(false, &token()), true).unwrap();
+    let armed = TaskXml::with_triggers(&task.to_xml(false, &token()), &spec).unwrap();
     assert!(TaskXml::armed(&armed));
 }
 

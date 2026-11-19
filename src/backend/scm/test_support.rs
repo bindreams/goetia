@@ -80,7 +80,7 @@ pub(crate) fn task_token() -> crate::backend::scm::task_xml::Token {
 }
 
 /// What Task Scheduler holds for `spec` run through [`task_host`]: the XML goetia registers with the
-/// token [`TASK_TOKEN`], its triggers enabled or not, and the blob as its `Data`.
+/// token [`TASK_TOKEN`], its triggers or none, and the blob as its `Data`.
 #[cfg(windows)]
 pub(crate) fn registered_task(
     spec: &crate::spec::DaemonSpec,
