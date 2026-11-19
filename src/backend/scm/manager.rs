@@ -1923,9 +1923,8 @@ impl Scm {
     /// recorded `STOPPED` before it exits, and a `stop` that waited has left none to hold), and for
     /// no other: a process it did not hold cannot be tied to the service it is uninstalling, and
     /// waiting for another service's stuck process would hold the install lock. With no process held
-    /// ([`HoldOutcome::NoProcess`]: the service stopped on its own around the uninstall), nothing is ended or
-    /// waited for: the shim exits by itself once it has reported `STOPPED`, an incomplete stop is still
-    /// reported from the stop record, and a shim file it still runs is left for the next sweep. Then sweeps the
+    /// ([`HoldOutcome::NoProcess`]: the service was stopped before the uninstall could take hold of it), nothing
+    /// is ended or waited for, and a shim file a still-exiting shim runs is skipped, for a later sweep. Then sweeps the
     /// provider's folder and, when `host` was in the default folder and that is another, that one
     /// too (see [`second_folder`]): the service may have been installed by another goetia version or
     /// provider. A host in any other folder is not swept, since that folder is not goetia's.
