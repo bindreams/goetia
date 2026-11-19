@@ -859,8 +859,8 @@ service before the stop request is sent, the request reaches the new process,
 which goetia does not hold, so `stop` can return while it is still exiting, and
 an `uninstall` right after may leave the shim file for the next sweep.
 
-`uninstall` of a `protocol: plain` daemon ends the shim process once the service
-is stopped, waits, with no time limit, for it to exit, deletes the service, and deletes every `goetia-shim-*.exe`
+`uninstall` of a `protocol: plain` daemon ends the shim process it took hold of
+before the service stopped, waits, with no time limit, for it to exit, deletes the service, and deletes every `goetia-shim-*.exe`
 that no remaining service references, and the default folder when it is then
 empty. If a file cannot be deleted, `uninstall` exits non-zero naming each file that
 remains: the service is already deleted, and re-running
@@ -870,6 +870,9 @@ do" (exit `0`) when the sweep succeeded. Besides the provider's folder,
 `uninstall` sweeps only `%ProgramFiles%\Goetia`, where a service installed by
 another provider may have its shim. A file in any other folder is never swept:
 a program's installer may place a file with a shim's name in its own folder.
+A service that stops on its own around the `uninstall` (a daemon that fails at
+start, or one that has just exited) gives it no process to hold, so its shim
+file may be left for the next install or uninstall to sweep.
 
 ### Shipping the shim from a library
 
