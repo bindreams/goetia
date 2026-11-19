@@ -178,7 +178,9 @@ fn arguments_end_with_the_flag_the_id_and_the_token() {
         "ünï",
     ];
     let exe = abs("Program Files/Goetia/goetia-shim.exe");
-    let xml = definition(&spec(), host_at(&exe, &args)).unwrap().to_xml(true, &token());
+    let xml = definition(&spec(), host_at(&exe, &args))
+        .unwrap()
+        .to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
 
     assert_eq!(names_under(&document, "Task/Actions"), ["Exec"], "one action");
@@ -209,7 +211,10 @@ fn the_token_is_32_lower_case_hex_and_two_fresh_ones_differ() {
     for token in [&first, &second] {
         let text = token.as_str();
         assert_eq!(text.len(), 32, "{text}");
-        assert!(text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')), "{text}");
+        assert!(
+            text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "{text}"
+        );
         assert_eq!(Token::parse(text).as_ref(), Some(token));
     }
     for refused in [

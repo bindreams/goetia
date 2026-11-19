@@ -206,9 +206,7 @@ impl Scm {
             None => {
                 task_records(id, runs, &prepared.principal, &Kept::default())?;
                 // An update is the registration it was: it keeps the token, or gets one if it has none.
-                let token = snapshot
-                    .and_then(TaskSnapshot::token)
-                    .unwrap_or_else(Token::fresh);
+                let token = snapshot.and_then(TaskSnapshot::token).unwrap_or_else(Token::fresh);
                 self.task_register(
                     id,
                     definition,

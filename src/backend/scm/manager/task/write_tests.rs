@@ -210,7 +210,9 @@ fn reinstall_of_an_identical_task_writes_nothing() {
         // Another registration's token is no difference.
         let stored = registered_task(&spec, armed);
         let stored = Registered {
-            xml: stored.xml.replace(task_token().as_str(), "00112233445566778899aabbccddeeff"),
+            xml: stored
+                .xml
+                .replace(task_token().as_str(), "00112233445566778899aabbccddeeff"),
             ..stored
         };
         let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), stored);
@@ -359,7 +361,11 @@ fn an_account_change_makes_a_new_token() {
         )
         .unwrap();
 
-    assert_ne!(registered_token(&fake), task_token(), "the old registration's is not carried over");
+    assert_ne!(
+        registered_token(&fake),
+        task_token(),
+        "the old registration's is not carried over"
+    );
 }
 
 #[skuld::test]
@@ -394,7 +400,11 @@ fn a_registration_without_a_token_gets_one_on_update() {
         xml: stored.xml.replace(&format!(" {}", task_token().as_str()), ""),
         ..stored.clone()
     };
-    assert_eq!(TaskXml::token_of(&without.xml).unwrap(), None, "the fixture has no token");
+    assert_eq!(
+        TaskXml::token_of(&without.xml).unwrap(),
+        None,
+        "the fixture has no token"
+    );
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
 
