@@ -168,7 +168,8 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
         Err(HoldError::Expired { pid }) => {
             wait_unbounded_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, None, d)
-            })?;
+            })
+            .map_err(|e| of_process(pid, Step::Recording, e))?;
             Ok(KillOutcome::Ended)
         }
         Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
@@ -178,7 +179,8 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
         Ok(Hold::Ended { pid, held }) => {
             wait_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, held.as_ref(), d)
-            })?;
+            })
+            .map_err(|e| of_process(pid, Step::Recording, e))?;
             Ok(KillOutcome::Ended)
         }
         Ok(Hold::Held { pid, process }) => {
@@ -225,12 +227,9 @@ pub(crate) fn hold_once<T: KillTarget>(
         Ok(Some(process)) => process,
         // The process is gone and the manager has not yet recorded it.
         Ok(None) => {
-            let waited = target.await_recorded(pid, None, deadline).map_err(|e| {
-                HoldError::Read(within(
-                    format!("waiting for the manager to record that process {pid} is gone"),
-                    e,
-                ))
-            })?;
+            let waited = target
+                .await_recorded(pid, None, deadline)
+                .map_err(|e| HoldError::Read(of_process(pid, Step::Recording, e)))?;
             return match waited {
                 Waited::Confirmed => Ok(Hold::Ended { pid, held: None }),
                 Waited::Expired => Err(HoldError::Expired { pid }),
@@ -239,7 +238,7 @@ pub(crate) fn hold_once<T: KillTarget>(
         // A pid that cannot be opened is a refusal only while the manager still says it is the service's.
         Err(e) => {
             return match target.service_pid() {
-                Ok(Some(now)) if now == pid => Err(HoldError::Refused(e)),
+                Ok(Some(now)) if now == pid => Err(HoldError::Refused(of_process(pid, Step::Opening, e))),
                 // The manager has moved on: the pid was a process that exited, or somebody else's,
                 // and `e` is superseded by that.
                 Ok(_) => Ok(Hold::Ended { pid, held: None }),
@@ -250,7 +249,7 @@ pub(crate) fn hold_once<T: KillTarget>(
     };
     let confirmed = target
         .confirm(pid, &process)
-        .map_err(|e| HoldError::Read(within(format!("confirming that process {pid} is the service's"), e)))?;
+        .map_err(|e| HoldError::Read(of_process(pid, Step::Confirming, e)))?;
     if confirmed {
         Ok(Hold::Held { pid, process })
     } else {
@@ -261,14 +260,36 @@ pub(crate) fn hold_once<T: KillTarget>(
     }
 }
 
+/// A step of holding the daemon's process, as a failure of it says so.
+#[derive(Clone, Copy)]
+enum Step {
+    Opening,
+    Confirming,
+    Recording,
+}
+
+/// `e`, a failure of `step` on the process `pid` the manager named, said within a context that names the
+/// process: the report of every failure of a hold after the pid is known says which process it was. What
+/// the backend's own text says of the pid is its own.
+fn of_process(pid: u32, step: Step, e: io::Error) -> io::Error {
+    within(
+        match step {
+            Step::Opening => format!("opening process {pid}"),
+            Step::Confirming => format!("confirming that process {pid} is the daemon's"),
+            Step::Recording => format!("waiting for the manager to record that process {pid} is gone"),
+        },
+        e,
+    )
+}
+
 /// Why [`hold_once`] could not hold the service's process.
 #[derive(Debug)]
 pub(crate) enum HoldError {
-    /// The manager vouches for the pid, and the process cannot be opened.
+    /// The manager vouches for the pid, and the process cannot be opened. The error says which process.
     Refused(io::Error),
     /// The manager could not be read, so what the service runs is not known. A read made after the manager
-    /// named a pid says which process it was about, as `within` does; the failure of the read that follows a
-    /// refused open says it itself.
+    /// named a pid says which process it was about; the failure of the read that follows a refused open says
+    /// it itself.
     Read(io::Error),
     /// The manager still reported `pid`, whose process is gone, when the deadline ran out.
     Expired { pid: u32 },

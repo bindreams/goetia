@@ -158,18 +158,17 @@ pub(super) fn hold_run<P: Processes>(
     instance: &Instance,
     processes: &mut P,
 ) -> Result<Option<P::Held>> {
-    let pid = instance.pid;
     let mut target = RunTarget::new(tasks, path, instance.id, processes);
     match hold_once(&mut target, Budget::Unbounded.start()) {
         Ok(Hold::Held { process, .. }) => Ok(Some(process)),
         Ok(Hold::NoProcess | Hold::Ended { .. }) => Ok(None),
         Err(HoldError::Refused(e)) => Err(open_refused(
             operation,
-            &format!("the process of `{id}`'s run (pid {pid})"),
-            &format!("open the process of `{id}`'s run (pid {pid}) to wait for its exit"),
+            &format!("the process of `{id}`'s run"),
+            &format!("open the process of `{id}`'s run to wait for its exit"),
             e,
         )),
-        // No pid here: the errors of a hold that has one name it.
+        // The errors of a hold that has a pid name it.
         Err(e) => Err(target_failed(
             format!("hold the process of `{id}`'s run"),
             io::Error::from(e),

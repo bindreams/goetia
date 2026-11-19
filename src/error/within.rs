@@ -68,6 +68,15 @@ pub(super) fn carries_error(e: &io::Error) -> bool {
     }
 }
 
+/// Whether `e` says, directly or under other [`within`] contexts, that the signal of its operation was
+/// delivered: see [`within_delivered`].
+fn delivered(e: &io::Error) -> bool {
+    match layer(e) {
+        Layer::Context(within) => within.delivered || delivered(&within.source),
+        Layer::Carried | Layer::Os => false,
+    }
+}
+
 /// `e` as an [`Error`]: the goetia error it carries, else its failure alone as [`Error::RawOs`]. A
 /// context it is said within is a [`Error::Step`] over what is under it.
 fn told(e: io::Error) -> Error {
@@ -91,22 +100,25 @@ fn told(e: io::Error) -> Error {
 /// The failure `e` of a target (a manager, a process), which reports through [`io::Error`], as an
 /// [`Error`], told under `what`, the operation:
 ///
-/// - an error said within a context by [`within_delivered`] says that the operation's signal was
-///   delivered and what failed after it, so `what` names the operation with no verdict on it;
+/// - an error said within a context by [`within_delivered`], at any depth of contexts, says that the
+///   operation's signal was delivered and what failed after it, so `what` names the operation with no
+///   verdict on it;
 /// - any other failure is one of `what`: `failed to <what>`, over the goetia error it carries, else an OS
 ///   failure.
 pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
     let what = what.into();
-    match layer(&e) {
-        Layer::Context(within) if within.delivered => Error::Step {
+    if delivered(&e) {
+        Error::Step {
             what,
             source: Box::new(told(e)),
-        },
-        _ if carries_error(&e) => Error::Step {
+        }
+    } else if carries_error(&e) {
+        Error::Step {
             what: format!("failed to {what}"),
             source: Box::new(told(e)),
-        },
-        _ => Error::os(what, e),
+        }
+    } else {
+        Error::os(what, e)
     }
 }
 
