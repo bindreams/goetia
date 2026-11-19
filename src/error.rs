@@ -902,10 +902,6 @@ impl Error {
     /// The failures of `errors` in one error: `None` for none, the error itself for one, and for
     /// more nested [`Both`](Error::Both)s in the order given. How every caller that tries each of
     /// several things and reports what failed folds them.
-    #[cfg_attr(
-        not(any(windows, target_os = "macos")),
-        allow(dead_code, reason = "the SCM and launchd backends fold their failures with it")
-    )]
     pub(crate) fn both_all(errors: impl IntoIterator<Item = Error>) -> Option<Error> {
         errors.into_iter().reduce(|first, then| Error::Both {
             first: Box::new(first),

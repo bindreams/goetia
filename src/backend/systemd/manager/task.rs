@@ -170,22 +170,21 @@ pub(super) struct Before {
 }
 
 /// What `update_units` has to do before it replaces the job. `timer_dropins` is whether the id's timer
-/// has a drop-in in the directory the update deletes. `armed` is asked only when the timer changes.
+/// has a drop-in in the directory the update deletes, and `armed` whether the timer is armed: each is
+/// asked only when the update replaces a timer by a timer, and `armed` only when that changes it.
 ///
-/// The timers are compared as the reload acts on them ([`generate::timer_without_metadata`]), as
-/// launchd's `changes_loaded_job` compares plists: a changed command or a goetia upgrade rewrites the
-/// timer's metadata and not its schedule.
+/// The timers are compared as the reload acts on them ([`generate::timer_schedule`]), as launchd's
+/// `changes_loaded_job` compares plists: a changed command or a goetia upgrade rewrites the timer's
+/// metadata and not its schedule.
 pub(super) fn before_replacing(
     old: &Fragment,
     new: &Units,
     spec: &DaemonSpec,
-    timer_dropins: bool,
+    timer_dropins: impl FnOnce() -> Result<bool>,
     armed: impl FnOnce() -> Result<bool>,
 ) -> Result<Before> {
-    let timer_changes = match (old.timer(), &new.timer) {
-        (Some(old), Some(new)) => {
-            generate::timer_without_metadata(&old.text) != generate::timer_without_metadata(new) || timer_dropins
-        }
+    let timer_changes = match (old.timer(), &new.timer, generate::timer_schedule(spec)) {
+        (Some(old), Some(_), Some(schedule)) => !old.text.contains(&schedule) || timer_dropins()?,
         _ => false,
     };
     Ok(Before {
@@ -222,13 +221,20 @@ impl Systemd {
         let old_job = old
             .service_text()
             .expect("an id `decide` chose to update has a job: one without is unusable");
-        // Only where the timer's slot is this id's, as `installed` reads it: a service never reads
-        // `<id>.timer.d`.
-        let timer_dropins = old.owns_timer_slot() && discover::clearable_timer_dropin(id)?;
-        let before = before_replacing(old, units, spec, timer_dropins, || {
-            self.systemctl.require_supported(held)?;
-            self.systemctl.timer_enabled(id)
-        })?;
+        let before = before_replacing(
+            old,
+            units,
+            spec,
+            || {
+                // The directory the update deletes; one under another root stays, and is no change.
+                let found = discover::dropin_marker_in(&dropin_dir(id, UnitKind::Timer));
+                Ok(!found.map_err(|failure| failure.into_os_error())?.is_empty())
+            },
+            || {
+                self.systemctl.require_supported(held)?;
+                self.systemctl.timer_enabled(id)
+            },
+        )?;
 
         // A timer the id has none of yet is created first, with nothing else changed: it is not
         // reloaded or enabled, so it cannot start the old job, and a name something else holds stops
@@ -260,10 +266,13 @@ impl Systemd {
         if !before.rearm_timer {
             return self.replace_and_reload(id, units, old, old_job, held);
         }
-        self.systemctl.disable_timer(id, held)?;
-        // Whatever the write came to, the timer is armed again once before this returns: a task
-        // left disarmed would not be re-armed by a retried install, which finds the files up to date.
-        let written = self.replace_and_reload(id, units, old, old_job, held);
+        // Whatever the disarming or the write came to, the timer is armed again once before this
+        // returns: `disable --now` may have removed the link before it failed, and a task left disarmed
+        // would not be re-armed by a retried install, which finds the files up to date.
+        let written = match self.systemctl.disable_timer(id, held) {
+            Ok(()) => self.replace_and_reload(id, units, old, old_job, held),
+            Err(disarming) => Err(disarming),
+        };
         let armed = self.systemctl.arm_timer(id, held);
         match (written, armed) {
             (written, Ok(())) => written,
@@ -303,21 +312,15 @@ impl Systemd {
     }
 }
 
-/// The error for an update that disarmed `id`'s timer and could not arm it again: the task is
-/// disabled, a retried install finds its files up to date and arms nothing, and `enable` does. `cause`
-/// is what ended the update, where something did (a lost race is none).
+/// The error for an update that disarmed `id`'s timer and could not arm it again: the task may not be
+/// armed, a retried install finds its files up to date and arms nothing, `status` shows which it is and
+/// `enable` arms it. `cause` is what ended the update, where something did (a lost race is none).
 fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
-    let source = match cause {
-        None => arming,
-        Some(cause) => Error::Both {
-            first: Box::new(cause),
-            then: Box::new(arming),
-        },
-    };
+    let source = Error::both_all(cause.into_iter().chain([arming])).expect("the arming failure is one");
     Error::Step {
         what: format!(
-            "`{id}`'s timer was disarmed for this update and could not be armed again, so the task is now \
-             disabled: run `goetia daemon enable {id}` to arm it"
+            "`{id}`'s timer was disarmed for this update and could not be armed again, so the task may not be \
+             armed: run `goetia daemon status {id}` to see, and `goetia daemon enable {id}` to arm it"
         ),
         source: Box::new(source),
     }

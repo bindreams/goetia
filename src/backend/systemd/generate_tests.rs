@@ -1163,25 +1163,35 @@ fn timer_unit_text_is_exact() {
 }
 
 /// What a reload acts on is the schedule: the spec blob, the goetia version and `Description=` are not
-/// in it, and a changed schedule is.
+/// in it, and a changed schedule is. The timer's text carries it as it is.
 #[skuld::test]
-fn a_timer_without_metadata_changes_only_with_its_schedule() {
-    let timer = |spec: &DaemonSpec| timer_without_metadata(&timer_for(spec).expect("a timer"));
+fn a_timers_schedule_changes_only_with_its_schedule() {
+    let schedule = |spec: &DaemonSpec| timer_schedule(spec).expect("a schedule");
     let spec = task_with(|_| {});
     let renamed = task_with(|c| c.name = "Another name".to_string());
     let recommanded = task_with(|c| c.command = vec![PROGRAM.to_string(), "--other".to_string()]);
     assert_ne!(timer_for(&spec), timer_for(&renamed), "the whole text differs");
     assert_ne!(timer_for(&spec), timer_for(&recommanded), "the whole text differs");
-    assert_eq!(timer(&spec), timer(&renamed));
-    assert_eq!(timer(&spec), timer(&recommanded));
-    assert_ne!(timer(&spec), timer(&full_task(Some("30 4 * * *"))));
+    assert_eq!(schedule(&spec), schedule(&renamed));
+    assert_eq!(schedule(&spec), schedule(&recommanded));
+    assert_ne!(schedule(&spec), schedule(&full_task(Some("30 4 * * *"))));
 
-    let text = timer(&spec);
+    let text = schedule(&spec);
     assert!(
         !text.contains("X-Goetia") && !text.contains("Spec=") && !text.contains("Description="),
         "{text}"
     );
     assert!(text.contains("OnCalendar=*-*-* 03:30:00"), "{text}");
+    for spec in [&spec, &renamed, &recommanded] {
+        assert!(timer_for(spec).expect("a timer").contains(&schedule(spec)));
+    }
+}
+
+#[skuld::test]
+fn only_a_scheduled_task_has_a_timer_schedule() {
+    assert!(timer_schedule(&task_with(|_| {})).is_some());
+    assert!(timer_schedule(&full_task(None)).is_none());
+    assert!(timer_schedule(&minimal_spec()).is_none());
 }
 
 #[skuld::test]

@@ -264,7 +264,7 @@ fn what_an_update_does_before_it_replaces_the_job() {
             },
         ),
     ] {
-        let before = before_replacing(&old, &units_of(new), new, false, || Ok(true)).expect(what);
+        let before = before_replacing(&old, &units_of(new), new, || Ok(false), || Ok(true)).expect(what);
         assert_eq!(before, expected, "{what}");
     }
 }
@@ -301,7 +301,7 @@ fn an_armed_timer_that_changes_is_to_be_armed_again() {
         ("a disabled task's text changes", &moved, false, false, false),
         ("a disabled task's drop-in directory goes", &old, true, false, false),
     ] {
-        let before = before_replacing(&fragment(&old), &units_of(new), new, dropins, || Ok(armed)).expect(what);
+        let before = before_replacing(&fragment(&old), &units_of(new), new, || Ok(dropins), || Ok(armed)).expect(what);
         assert_eq!(before.rearm_timer, rearm, "{what}");
         assert!(!before.drop_timer && !before.disable_job, "{what}");
     }
@@ -318,10 +318,51 @@ fn the_timer_is_asked_whether_it_is_armed_only_when_it_changes() {
         Ok(true)
     };
 
-    before_replacing(&fragment(&old), &units_of(&old), &old, false, ask).expect("unchanged");
+    before_replacing(&fragment(&old), &units_of(&old), &old, || Ok(false), ask).expect("unchanged");
     assert_eq!(asked.get(), 0);
-    before_replacing(&fragment(&old), &units_of(&moved), &moved, false, ask).expect("changed");
+    before_replacing(&fragment(&old), &units_of(&moved), &moved, || Ok(false), ask).expect("changed");
     assert_eq!(asked.get(), 1);
+}
+
+/// The timer's drop-in directory is read only where the update replaces a timer by a timer: a task
+/// that gets or loses its timer, and a service, never ask.
+#[skuld::test]
+fn the_timer_drop_in_directory_is_read_only_where_a_timer_replaces_a_timer() {
+    let scheduled = task_spec("x", "/bin/a", Some("30 3 * * *"));
+    let unscheduled = task_spec("x", "/bin/a", None);
+    let service = service_spec("x");
+    let read = std::cell::Cell::new(0);
+    let dropins = || {
+        read.set(read.get() + 1);
+        Ok(false)
+    };
+
+    for (what, old, new, reads) in [
+        ("a timer replaces a timer", &scheduled, &scheduled, 1),
+        ("a task gets a timer", &unscheduled, &scheduled, 0),
+        ("a task loses its timer", &scheduled, &unscheduled, 0),
+        ("a service stays one", &service, &service, 0),
+    ] {
+        read.set(0);
+        before_replacing(&fragment(old), &units_of(new), new, dropins, || Ok(false)).expect(what);
+        assert_eq!(read.get(), reads, "{what}");
+    }
+}
+
+/// A drop-in directory that cannot be read is the update's failure, before anything is disarmed.
+#[skuld::test]
+fn an_unreadable_timer_drop_in_directory_fails_the_update() {
+    let old = task_spec("x", "/bin/a", Some("30 3 * * *"));
+
+    let failed = before_replacing(
+        &fragment(&old),
+        &units_of(&old),
+        &old,
+        || Err(Error::os_at("read", "x.timer.d", std::io::Error::other("unreadable"))),
+        || Ok(true),
+    );
+
+    assert!(failed.is_err());
 }
 
 /// A failed answer is the update's failure, before anything is disarmed.
@@ -330,9 +371,13 @@ fn an_unanswered_question_whether_the_timer_is_armed_fails_the_update() {
     let old = task_spec("x", "/bin/a", Some("30 3 * * *"));
     let moved = task_spec("x", "/bin/a", Some("30 5 * * *"));
 
-    let failed = before_replacing(&fragment(&old), &units_of(&moved), &moved, false, || {
-        Err(Error::os_at("read", "x.timer", std::io::Error::other("unanswered")))
-    });
+    let failed = before_replacing(
+        &fragment(&old),
+        &units_of(&moved),
+        &moved,
+        || Ok(false),
+        || Err(Error::os_at("read", "x.timer", std::io::Error::other("unanswered"))),
+    );
 
     assert!(failed.is_err());
 }
@@ -1453,8 +1498,8 @@ fn a_drop_in_directory_that_cannot_be_removed_arms_the_timer_again_and_is_the_fa
     let snapshot = marked(&mgr, &id);
     // `remove_dir_all` of a regular file fails.
     let blocked = dropin_dir(&id, UnitKind::Service);
-    std::fs::write(&blocked, "not a directory").expect("seed");
     let _blocked = FileGuard::new(blocked.clone());
+    std::fs::write(&blocked, "not a directory").expect("seed");
 
     let failed = mgr
         .update_units(&new, &units_of(&new), &snapshot, &mut held(&mgr))
@@ -1462,7 +1507,7 @@ fn a_drop_in_directory_that_cannot_be_removed_arms_the_timer_again_and_is_the_fa
 
     let report = failed.report().to_string();
     assert!(report.contains(&blocked.display().to_string()), "{report}");
-    assert!(!report.contains("now disabled"), "{report}");
+    assert!(!report.contains("may not be armed"), "{report}");
     let calls = without_gate(&fake);
     armed_again(&id, &calls);
     assert!(!calls.contains(&call(&["daemon-reload"])), "{calls:?}");
@@ -1490,7 +1535,7 @@ fn a_reload_that_fails_arms_the_timer_again_and_is_the_failure(#[fixture(systemd
 
     let report = failed.report().to_string();
     assert!(report.contains("reload refused"), "{report}");
-    assert!(!report.contains("now disabled"), "{report}");
+    assert!(!report.contains("may not be armed"), "{report}");
     armed_again(&id, &without_gate(&fake));
 }
 
@@ -1519,7 +1564,8 @@ fn a_failure_after_the_disarming_whose_arming_fails_too_names_the_recovery_and_t
         .expect_err("both failed");
 
     let report = failed.report().to_string();
-    assert!(report.contains("now disabled"), "{report}");
+    assert!(report.contains("may not be armed"), "{report}");
+    assert!(report.contains(&format!("goetia daemon status {id}")), "{report}");
     assert!(report.contains(&format!("goetia daemon enable {id}")), "{report}");
     assert!(report.contains("reload refused"), "{report}");
     assert!(report.contains("enable refused"), "{report}");
@@ -1547,8 +1593,96 @@ fn a_race_whose_arming_fails_names_the_recovery(#[fixture(systemd_group)] _group
         .expect_err("the arming failed");
 
     let report = failed.report().to_string();
-    assert!(report.contains("now disabled"), "{report}");
+    assert!(report.contains("may not be armed"), "{report}");
+    assert!(report.contains(&format!("goetia daemon status {id}")), "{report}");
     assert!(report.contains(&format!("goetia daemon enable {id}")), "{report}");
+    assert!(report.contains("enable refused"), "{report}");
+}
+
+/// A disarming that fails is a step like any other: it may have removed the link before it failed, so
+/// the timer is armed again once, and the failure is the disarming's own. Nothing is written.
+#[skuld::test]
+fn a_disarming_that_fails_arms_the_timer_again_and_is_the_failure(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let new = armed_task_whose_schedule_moves(&id);
+    let fake = gate_then([
+        timer_show("enabled"),
+        reply(
+            &["disable"],
+            exited(
+                1,
+                "",
+                "disable refused
+",
+            ),
+        ),
+        stopped_with_stamp(),
+        cleaned(),
+        reply(&["enable"], exited(0, "", "")),
+    ]);
+    let mgr = over(&fake);
+    let snapshot = marked(&mgr, &id);
+
+    let failed = mgr
+        .update_units(&new, &units_of(&new), &snapshot, &mut held(&mgr))
+        .expect_err("the disarming failed");
+
+    let report = failed.report().to_string();
+    assert!(report.contains("disable refused"), "{report}");
+    assert!(!report.contains("may not be armed"), "{report}");
+    let calls = without_gate(&fake);
+    armed_again(&id, &calls);
+    assert!(!calls.contains(&call(&["daemon-reload"])), "{calls:?}");
+    assert_eq!(
+        text_of(&id, UnitKind::Timer),
+        units_of(&task_spec(&id, "/bin/a", Some("30 3 * * *"))).timer,
+        "nothing was written"
+    );
+}
+
+/// The disarming and the arming both failing leaves the task possibly unarmed: the error says so, how
+/// to look and how to arm it, and why each failed.
+#[skuld::test]
+fn a_disarming_whose_arming_fails_too_names_the_recovery_and_both_causes(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let new = armed_task_whose_schedule_moves(&id);
+    let fake = gate_then([
+        timer_show("enabled"),
+        reply(
+            &["disable"],
+            exited(
+                1,
+                "",
+                "disable refused
+",
+            ),
+        ),
+        stopped_with_stamp(),
+        cleaned(),
+        reply(
+            &["enable"],
+            exited(
+                1,
+                "",
+                "enable refused
+",
+            ),
+        ),
+    ]);
+    let mgr = over(&fake);
+    let snapshot = marked(&mgr, &id);
+
+    let failed = mgr
+        .update_units(&new, &units_of(&new), &snapshot, &mut held(&mgr))
+        .expect_err("both failed");
+
+    let report = failed.report().to_string();
+    assert!(report.contains("may not be armed"), "{report}");
+    assert!(report.contains(&format!("goetia daemon status {id}")), "{report}");
+    assert!(report.contains(&format!("goetia daemon enable {id}")), "{report}");
+    assert!(report.contains("disable refused"), "{report}");
     assert!(report.contains("enable refused"), "{report}");
 }
 

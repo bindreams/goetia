@@ -490,16 +490,6 @@ fn unreadable_dropins(failure: ReadFailure) -> Error {
     }
 }
 
-/// Whether `id`'s timer has a drop-in in the directory an update clears, `UNIT_DIR/<id>.timer.d`: found
-/// by the scan [`installed`] makes, so a directory with no `*.conf` in it is none. A drop-in under
-/// another root stays after an update, and is no change the update makes. Asked only where
-/// [`Fragment::owns_timer_slot`].
-pub(super) fn clearable_timer_dropin(id: &str) -> Result<bool> {
-    let ours = Path::new(UNIT_DIR).join(dropin_name(id, UnitKind::Timer));
-    let dirs = dropin_dirs(id, UnitKind::Timer).map_err(unreadable_dropins)?;
-    Ok(dirs.iter().any(|(dir, _)| *dir == ours))
-}
-
 /// The drop-in text a set of drop-in directories adds to a unit's.
 fn marker(dirs: &[(PathBuf, String)]) -> String {
     dirs.iter().map(|(_, text)| text.as_str()).collect()
@@ -631,7 +621,9 @@ fn dropin_dirs(id: &str, kind: UnitKind) -> ReadResult<Vec<(PathBuf, String)>> {
     Ok(found)
 }
 
-fn dropin_marker_in(dir: &Path) -> ReadResult<String> {
+/// The text of the `*.conf` files in the drop-in directory `dir`, empty where there are none or no
+/// directory.
+pub(super) fn dropin_marker_in(dir: &Path) -> ReadResult<String> {
     let mut entries = match fs::read_dir(dir) {
         Ok(rd) => rd
             .collect::<io::Result<Vec<_>>>()

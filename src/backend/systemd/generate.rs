@@ -100,19 +100,19 @@ pub fn timer_for(spec: &DaemonSpec) -> Option<String> {
     Some(with_goetia_section(timer_unit(task, schedule), spec))
 }
 
-/// A timer's `text` as a reload acts on it: without its `[X-Goetia]` section, which holds the spec and
-/// the goetia version and changes without the schedule changing, and without `Description=`, which
-/// names the timer and schedules nothing. What is left changes only when the schedule does.
+/// The part of `spec`'s timer text that a reload acts on, `None` where [`timer_for`] is: its `[Timer]`
+/// and `[Install]` sections, carried verbatim in the text. `Description=` and the `[X-Goetia]` section,
+/// which hold the name, the spec and the goetia version, change without the schedule changing and are
+/// not in it. A timer's text applies this schedule when it contains it.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only the systemd manager, which is Linux-only, compares timers")
 )]
-pub(crate) fn timer_without_metadata(text: &str) -> String {
-    text.lines()
-        .take_while(|line| line.trim() != "[X-Goetia]")
-        .filter(|line| !line.starts_with("Description="))
-        .collect::<Vec<_>>()
-        .join("\n")
+pub(crate) fn timer_schedule(spec: &DaemonSpec) -> Option<String> {
+    let DaemonSpec::Task(task) = spec else {
+        return None;
+    };
+    Some(schedule_part(task.schedule.as_ref()?))
 }
 
 /// `body`, a blank line, and the `[X-Goetia]` section of `spec`.
@@ -204,6 +204,14 @@ fn timer_unit(task: &TaskSpec, schedule: &Schedule) -> String {
     out.push_str("[Unit]\n");
     out.push_str(&format!("Description={}\n", raw_value(&task.common.name)));
     out.push('\n');
+    out.push_str(&schedule_part(schedule));
+
+    out
+}
+
+/// A timer's `[Timer]` and `[Install]` sections: everything in [`timer_unit`] that schedules.
+fn schedule_part(schedule: &Schedule) -> String {
+    let mut out = String::new();
 
     out.push_str("[Timer]\n");
     for line in on_calendar_lines(schedule) {
