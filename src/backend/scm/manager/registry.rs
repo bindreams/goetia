@@ -601,6 +601,12 @@ fn image_text(raw: &RegValue) -> Option<String> {
 #[path = "registry_tests.rs"]
 mod registry_tests;
 
+/// The key of the `Goetia` Event Log source under `HKEY_LOCAL_MACHINE` ([`register_event_source`]).
+pub const EVENT_SOURCE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\EventLog\Application\Goetia";
+
+/// What [`register_event_source`] writes as the source's `TypesSupported`: errors, warnings and information.
+pub const EVENT_TYPES_SUPPORTED: u32 = 7;
+
 /// Register the `Goetia` Event Log source so Event Viewer can render what the
 /// shim writes.
 ///
@@ -619,18 +625,16 @@ mod registry_tests;
 /// Idempotent. `apply` runs it before it writes the service, and a failure there fails the install
 /// with nothing written, so the next install retries it.
 pub fn register_event_source() -> Result<()> {
-    const KEY: &str = r"SYSTEM\CurrentControlSet\Services\EventLog\Application\Goetia";
-    const TYPES_SUPPORTED: u32 = 7; // ERROR | WARNING | INFORMATION
-
     let message_file = event_message_file(std::env::var("SystemRoot"))?;
-    refuse_nul([message_file.as_str()]).map_err(|e| registry_error("write EventMessageFile under", KEY, e))?;
+    refuse_nul([message_file.as_str()])
+        .map_err(|e| registry_error("write EventMessageFile under", EVENT_SOURCE_KEY, e))?;
     let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .create_subkey(KEY)
-        .map_err(|e| registry_error("create", KEY, e))?;
+        .create_subkey(EVENT_SOURCE_KEY)
+        .map_err(|e| registry_error("create", EVENT_SOURCE_KEY, e))?;
     key.set_value("EventMessageFile", &message_file)
-        .map_err(|e| registry_error("write EventMessageFile under", KEY, e))?;
-    key.set_value("TypesSupported", &TYPES_SUPPORTED)
-        .map_err(|e| registry_error("write TypesSupported under", KEY, e))
+        .map_err(|e| registry_error("write EventMessageFile under", EVENT_SOURCE_KEY, e))?;
+    key.set_value("TypesSupported", &EVENT_TYPES_SUPPORTED)
+        .map_err(|e| registry_error("write TypesSupported under", EVENT_SOURCE_KEY, e))
 }
 
 /// The message file path, expanded here rather than stored as `%SystemRoot%\...`: that form needs

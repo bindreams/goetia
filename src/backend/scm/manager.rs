@@ -95,7 +95,7 @@
 //! Windows rejects a password outright for those accounts.
 
 pub(in crate::backend::scm) mod identity;
-pub(in crate::backend::scm) mod registry;
+pub(crate) mod registry;
 pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;
@@ -741,8 +741,9 @@ impl Backend for Scm {
     /// the `Goetia` event source, a real user's logon right, and the default log of one that runs the shim
     /// host, which the shim only opens: where it is gone (deleted, or its folder was), this makes it again,
     /// which is what the shim's own message for a link or a missing log says to do. The account is the
-    /// one the definition registers, which is the one installed. A task likewise ([`task_beside`]), and
-    /// also the folders and the record directory (with a marker a dead uninstall left cleared).
+    /// one the definition registers, which is the one installed. A task likewise ([`task_beside`]), for the
+    /// account it is registered as, and also the folders and the record directory (with a marker a dead
+    /// uninstall left cleared).
     fn ensure_beside(
         &self,
         spec: &DaemonSpec,
@@ -751,12 +752,11 @@ impl Backend for Scm {
     ) -> Result<()> {
         match (definition, snapshot) {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
-                let gated = service_gate(definition, written_user(&spec.common().user), Password::Unneeded)?;
-                make_default_log(spec, definition, gated.checked.as_ref(), &[], default_log::Step::Narrow).map(drop)
+                service_beside(spec, definition, |reads| {
+                    service_gate(definition, written_user(&spec.common().user), reads)
+                })
             }
-            (WindowsDefinition::Task(definition), WindowsSnapshot::Task(installed)) => {
-                task_beside(spec, definition, installed)
-            }
+            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_beside(installed),
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
             | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
         }
@@ -1227,6 +1227,18 @@ fn apply(
     }
     apply_gated(reg, gated.password, installed.is_none())?;
     make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
+}
+
+/// What an install that finds the service of `reg` up to date makes again: what the service needs (`gate`, which
+/// is [`service_gate`], asked once for [`Password::Unneeded`]: the service is not registered again) and its
+/// default log ([`make_default_log`]).
+fn service_beside(
+    spec: &DaemonSpec,
+    reg: &ScmRegistration,
+    gate: impl FnOnce(Password) -> Result<Gated>,
+) -> Result<()> {
+    let gated = gate(Password::Unneeded)?;
+    make_default_log(spec, reg, gated.checked.as_ref(), &[], default_log::Step::Narrow).map(drop)
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of

@@ -11,7 +11,7 @@ use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
-use goetia::testing::service_fields;
+use goetia::testing::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED, service_fields};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
@@ -839,19 +839,14 @@ fn an_up_to_date_install_makes_a_deleted_default_log_again(#[fixture(scm_group)]
     assert!(log.is_file(), "the install made {} again", log.display());
 }
 
-/// The `Goetia` event source, which an install registers for its daemons and no daemon's removal takes back.
-const EVENT_SOURCE: &str = r"SYSTEM\CurrentControlSet\Services\EventLog\Application\Goetia";
-
-/// What an install writes as `TypesSupported` of the event source: errors, warnings and information.
-const EVENT_TYPES_REGISTERED: u32 = 7;
-
-/// Changes `TypesSupported` of the event source, and puts back what an install writes when it is dropped, so that
-/// the key is as the test found it (a machine that runs it has the source registered) whatever the test does.
+/// Changes `TypesSupported` of the `Goetia` event source, which an install registers for its daemons and no
+/// daemon's removal takes back, and puts back what an install writes when it is dropped, so that the key is as the
+/// test found it (a machine that runs it has the source registered) whatever the test does.
 struct EventTypesChanged;
 
 impl EventTypesChanged {
     fn open() -> std::io::Result<winreg::RegKey> {
-        winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(EVENT_SOURCE, KEY_READ | KEY_WRITE)
+        winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(EVENT_SOURCE_KEY, KEY_READ | KEY_WRITE)
     }
 
     fn set(value: u32) -> std::io::Result<()> {
@@ -867,16 +862,17 @@ impl Drop for EventTypesChanged {
     /// Never panics, so a drop that runs while the test unwinds still goes on.
     fn drop(&mut self) {
         support::cleanup::warn_left_behind(support::cleanup::retrying(|| {
-            Self::set(EVENT_TYPES_REGISTERED)
+            Self::set(EVENT_TYPES_SUPPORTED)
                 .err()
-                .map(|e| format!("put back TypesSupported of {EVENT_SOURCE}: {e}"))
+                .map(|e| format!("put back TypesSupported of {EVENT_SOURCE_KEY}: {e}"))
         }));
     }
 }
 
 /// An install that finds a service up to date still registers the `Goetia` event source, as a write does: a
-/// source that was changed (or whose key was lost) is as an install makes it again.
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+/// source that was changed (or whose key was lost) is as an install makes it again. Every install, of any kind of
+/// daemon, writes the key, so the test is serial with every other test.
+#[skuld::test(serial)]
 fn an_up_to_date_install_registers_the_event_source_again(#[fixture(scm_group)] _group: &Group) {
     let mgr = support::stock_shim_manager();
     let id = support::random_test_id();
@@ -897,7 +893,7 @@ fn an_up_to_date_install_registers_the_event_source_again(#[fixture(scm_group)] 
     assert!(matches!(again, Outcome::UpToDate), "{again:?}");
     assert_eq!(
         EventTypesChanged::get().expect("read the event source"),
-        EVENT_TYPES_REGISTERED
+        EVENT_TYPES_SUPPORTED
     );
 }
 

@@ -275,10 +275,7 @@ impl Scm {
         // The task is registered as the old account until the create lands, so its records and its log name it
         // too ([`landed`] narrows them).
         let registered = stored_principal(old.registered());
-        let kept = Kept {
-            runs: registered.as_slice(),
-            log: registered.as_slice(),
-        };
+        let kept = Kept::both(registered.as_slice());
         task_records(id, runs, &prepared.principal, &kept)?;
         match self.tasks.delete(&TaskPath::of(id)) {
             // The task is gone; a folder that stays is still there for the create.
@@ -286,7 +283,7 @@ impl Scm {
             Err(e) => return Err(e),
         }
         let wrote = self.task_register(id, definition, old.armed(), false, prepared)?;
-        landed(id, runs, prepared, wrote)
+        landed(id, runs, prepared, &kept, wrote)
     }
 
     /// Refuses installing `old`, a task, as another account while it runs:
@@ -343,9 +340,12 @@ fn principal_sid(registered: &Registered) -> Result<Sid> {
 
 /// The record directory of `id` with permissions that name `accounts`. Nothing is read back.
 fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
-    let whose = whose(accounts);
-    runs.ensure(accounts)
-        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by {whose}"), e))
+    runs.ensure(accounts).map_err(|e| {
+        Error::os(
+            format!("make the run records of `{id}` writable by {}", whose(accounts)),
+            e,
+        )
+    })
 }
 
 /// How the error of [`run_records`] speaks of `accounts`, an account named twice counted once.
@@ -369,6 +369,16 @@ struct Kept<'a> {
     log: &'a [Sid],
 }
 
+impl<'a> Kept<'a> {
+    /// `accounts` named in the record directory and the default log alike.
+    fn both(accounts: &'a [Sid]) -> Self {
+        Kept {
+            runs: accounts,
+            log: accounts,
+        }
+    }
+}
+
 /// What a write of a task makes besides its registration, and what an install that finds the task up to date
 /// makes again if it is gone ([`task_beside_with`]): [`run_records`] for `principal`, the account the task runs
 /// as, and what `kept` names; and the default log of `id`, which `principal` and `kept` may append to. Nothing is
@@ -380,15 +390,17 @@ fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept: &Kept<'_>) -> Resul
 }
 
 /// Once a registration that changed the account, or a service into a task, has landed (`wrote` is
-/// [`WriteOutcome::Done`]), the record directory and the default log name the new account alone, each always
-/// set: the removal of a service leaves its account in the directory, though no [`Kept`] named it there, and
-/// the task's shim, another account, could not write its records. Any other end leaves them naming both, which the
-/// next install corrects: it is the one that finds the task as it is ([`task_beside_with`] for an up-to-date
-/// one).
-fn landed(id: &Id, runs: &Runs, prepared: &Prepared, wrote: WriteOutcome) -> Result<WriteOutcome> {
+/// [`WriteOutcome::Done`]), the record directory and the default log name the new account alone. The directory is
+/// set only if `kept` named an account in it: a change of account did, and a service changed into a task did not
+/// (the service never wrote there), so its directory already names the task's account alone. The log is always
+/// set: it named the service's account too. Any other end leaves what was widened naming both, which the next
+/// install corrects: it is the one that finds the task as it is ([`task_beside_with`] for an up-to-date one).
+fn landed(id: &Id, runs: &Runs, prepared: &Prepared, kept: &Kept<'_>, wrote: WriteOutcome) -> Result<WriteOutcome> {
     if matches!(wrote, WriteOutcome::Done) {
         let alone = std::slice::from_ref(&prepared.principal);
-        run_records(id, runs, alone)?;
+        if !kept.runs.is_empty() {
+            run_records(id, runs, alone)?;
+        }
         default_log::ensure(runs.program_data(), id, &Naming::alike(alone))?;
     }
     Ok(wrote)
@@ -421,45 +433,41 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
 
 /// What an install that finds the task `installed` up to date makes again if it is gone ([`task_beside_with`]),
 /// under the machine's `%ProgramData%`: the folders above the record directory are always judged, as a write
-/// does ([`runs_for_write`]). `spec` and `definition` are what the install writes, which names the account.
-pub(in crate::backend::scm) fn task_beside(
-    spec: &DaemonSpec,
-    definition: &TaskXml,
-    installed: &TaskSnapshot,
-) -> Result<()> {
+/// does ([`runs_for_write`]). The machine is seen to for the account the task is registered as, as a real user's
+/// SID spells it (what Task Scheduler stores), without reading a password: the task is not registered again.
+pub(in crate::backend::scm) fn task_beside(installed: &TaskSnapshot) -> Result<()> {
     task_beside_with(
         &program_data()?,
         &FolderCheck::new(CheckPermissions::Enable),
         installed,
-        &definition.account(),
-        |account, reads| prepare(account, written_user(&spec.common().user), reads),
+        |account| {
+            let written = match account {
+                TaskAccount::User(text) if text.starts_with("S-1-") => Some(Written::Sid(text)),
+                TaskAccount::User(_) | TaskAccount::Service(_) => None,
+            };
+            prepare(account, written, Password::Unneeded)
+        },
     )
 }
 
-/// What a write of the task `installed` makes besides its registration, made again: the folders above the record
-/// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for `account`
-/// (`prepare`, as a write's, asked once and with [`Password::Unneeded`]: the event source and a real user's
-/// logon right, but no password, for the task is not registered again), the record directory with the marker a
-/// dead uninstall left cleared ([`Runs::ensure`]), and the default log, which the shim only opens
-/// ([`task_records`]). They name the account `prepare` found alone: an install that was cut short between its
-/// steps left both accounts named, and this is the install that corrects it. Where the task is registered as
-/// another account that can be told, as a write finds it ([`Scm::task_write_with`]), that one is named too, since
-/// it is the account the task still runs as.
+/// What a write of the task `installed` makes besides its registration, made again, for the account it is
+/// registered as, which it runs as (moving it to another is a write's job): the folders above the record
+/// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for that account
+/// (`prepare`, as a write's, asked once: the event source and a real user's logon right), the record directory
+/// with the marker a dead uninstall left cleared ([`Runs::ensure`]), and the default log, which the shim only
+/// opens ([`task_records`]). They name that account alone: an install that was cut short between its steps left
+/// both accounts named, and this is the install that corrects it. A task registered as an account that cannot be
+/// told fails, with nothing made.
 fn task_beside_with(
     program_data: &Path,
     folders: &FolderCheck,
     installed: &TaskSnapshot,
-    account: &TaskAccount,
-    prepare: impl FnOnce(&TaskAccount, Password) -> Result<Prepared>,
+    prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
 ) -> Result<()> {
+    let account = TaskXml::principal(&installed.registered().xml)?;
     let runs = runs_in(program_data, installed.id(), folders)?;
-    let prepared = prepare(account, Password::Unneeded)?;
-    let registered = stored_principal(installed.registered()).filter(|sid| sid != &prepared.principal);
-    let kept = Kept {
-        runs: registered.as_slice(),
-        log: registered.as_slice(),
-    };
-    task_records(installed.id(), &runs, &prepared.principal, &kept)
+    let prepared = prepare(&account)?;
+    task_records(installed.id(), &runs, &prepared.principal, &Kept::default())
 }
 
 // Enable and disable ==================================================================================================
@@ -624,7 +632,7 @@ impl Scm {
         task_records(id, runs, &prepared.principal, &kept)?;
         retire()?;
         let wrote = self.task_register(id, definition, false, false, &prepared)?;
-        landed(id, runs, &prepared, wrote)
+        landed(id, runs, &prepared, &kept, wrote)
     }
 
     /// The sweep of what the removal left: the file a removed service's or task's host named, which

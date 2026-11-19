@@ -115,6 +115,8 @@ pub fn sid_of(authority: u8, subauthorities: &[u32]) -> Vec<u8> {
     crate::backend::scm::sid::sid_from_parts(authority, subauthorities)
 }
 #[cfg(windows)]
+pub use crate::backend::scm::manager::registry::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED};
+#[cfg(windows)]
 pub use crate::backend::scm::wide::{units_until_nul, wide_null};
 
 pub mod cleanup;
