@@ -889,6 +889,49 @@ fn hold_with_the_marker_is_refused_busy_and_hold_ignoring_it_is_not() {
     drop(own);
 }
 
+/// A held pin is named at once, whoever holds it (a shim's, a `run`'s, a stop's): the one pass never waits.
+#[skuld::test]
+fn held_pin_reports_the_path_of_a_held_pin_at_once() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let pin = runs.hold().unwrap();
+    let before = names(&runs);
+
+    let held = runs.held_pin().unwrap().expect("the pin is held");
+
+    assert_eq!(held.parent(), Some(runs.dir.as_path()));
+    assert!(held.extension().is_some_and(|e| e == "pin"), "{}", held.display());
+    assert_eq!(names(&runs), before, "nothing was deleted");
+    drop(pin);
+}
+
+/// A pin nothing holds (a power cut's) is no hold, and a directory that is gone holds none.
+#[skuld::test]
+fn held_pin_with_no_pin_is_none() {
+    let (dir, runs) = fixture();
+    assert_eq!(runs.held_pin().unwrap(), None);
+    fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
+    assert_eq!(runs.held_pin().unwrap(), None);
+
+    let gone = Runs::of(dir.path(), &Id::try_from("absent").unwrap());
+    assert_eq!(gone.held_pin().unwrap(), None);
+}
+
+/// A pin that cannot be judged may be held: the change's check fails and names it, and nothing is deleted.
+#[skuld::test]
+fn an_unjudgeable_pin_is_an_error() {
+    let (_dir, runs) = fixture();
+    fs::write(runs.dir.join("pin-odd.pin"), "").unwrap();
+    let before = names(&runs);
+    let refused = Undeletable::new(&runs, &["pin-odd.pin"]);
+
+    let failed = runs.held_pin().unwrap_err();
+
+    assert!(failed.report().to_string().contains("pin-odd.pin"), "{failed}");
+    assert_eq!(names(&runs), before);
+    drop(refused);
+}
+
 /// The writer's own pin is held until its record is in place and gone before its prune, which a held pin
 /// would stop: so it never blocks its own prune, and a write with no pin of its own is as before.
 #[skuld::test]

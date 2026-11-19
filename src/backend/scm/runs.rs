@@ -435,6 +435,29 @@ impl Runs {
         })
     }
 
+    /// The first pin a handle holds, if one does: the directory listed once, every pin asked
+    /// ([`pins_of`]), and never waited for. A pin whose state cannot be told may be held, and is an error that
+    /// names it. A directory that is gone, or is a link, holds none.
+    pub(crate) fn held_pin(&self) -> Result<Option<PathBuf>> {
+        let dir = match Dir::open_even_if_link(&self.dir) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::os_at("open", &self.dir, e)),
+        };
+        if dir.is_link() {
+            return Ok(None);
+        }
+        let entries = match entries(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::os_at("list", &self.dir, e)),
+        };
+        Ok(match pins_of(&dir, &entries)? {
+            Pins::Held(path) => Some(path),
+            Pins::Free | Pins::Linked => None,
+        })
+    }
+
     /// Whether the task has records, or a removal's marker, to remove. A link where the directory was
     /// is a directory to remove, a dangling one too. A path that cannot be looked at is taken to be there
     /// (the removal then says why not). The marker is looked for as well, since a removal that died after
@@ -572,20 +595,10 @@ impl Runs {
     /// A `dir` that became a link since `entries` was listed has none of them: the pass stops at the first
     /// delete that says so, with nothing held and nothing failed, and the caller deletes the link.
     fn delete_entries(&self, dir: &Dir, entries: &[Entry]) -> Result<Option<PathBuf>> {
-        // A directory is no pin, whatever its name: it is removed below, with the rest.
-        let scan = scan_pins(dir, entries.iter().filter(|entry| !entry.directory()));
-        if scan.linked {
-            return Ok(None);
-        }
-        let unclassified = scan
-            .unclassified
-            .into_iter()
-            .map(|(pin, e)| Error::os_at("remove", pin, e));
-        if let Some(failed) = Error::both_all(unclassified) {
-            return Err(failed);
-        }
-        if scan.held.is_some() {
-            return Ok(scan.held);
+        match pins_of(dir, entries)? {
+            Pins::Linked => return Ok(None),
+            Pins::Held(path) => return Ok(Some(path)),
+            Pins::Free => {}
         }
         let mut held = None;
         for entry in entries {
@@ -806,6 +819,37 @@ fn scan_pins<'a>(dir: &Dir, entries: impl IntoIterator<Item = &'a Entry>) -> Pin
         }
     }
     scan
+}
+
+/// What the pins of a listing say, for a delete that must not run under one.
+enum Pins {
+    /// None is held.
+    Free,
+    /// This one is, the first found.
+    Held(PathBuf),
+    /// The directory became a link since it was listed ([`PinScan::linked`]).
+    Linked,
+}
+
+/// [`scan_pins`] over the entries of `entries` that are no directory (a directory is no pin, whatever its
+/// name: a removal takes it with the rest), with a pin whose state could not be told an error naming every
+/// such pin: no delete may run while a pin may be held.
+fn pins_of(dir: &Dir, entries: &[Entry]) -> Result<Pins> {
+    let scan = scan_pins(dir, entries.iter().filter(|entry| !entry.directory()));
+    if scan.linked {
+        return Ok(Pins::Linked);
+    }
+    let unclassified = scan
+        .unclassified
+        .into_iter()
+        .map(|(pin, e)| Error::os_at("remove", pin, e));
+    if let Some(failed) = Error::both_all(unclassified) {
+        return Err(failed);
+    }
+    Ok(match scan.held {
+        Some(path) => Pins::Held(path),
+        None => Pins::Free,
+    })
 }
 
 fn decode(instance: InstanceId, bytes: &[u8]) -> io::Result<RunRecord> {

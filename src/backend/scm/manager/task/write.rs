@@ -306,6 +306,7 @@ impl Scm {
         match self.task_state_with(old, alive)? {
             State::Running => Err(Error::AccountChangeRunning {
                 id: old.id().to_string(),
+                held: None,
             }),
             State::Idle | State::Stopped | State::Failed | State::Unknown => Ok(()),
         }
