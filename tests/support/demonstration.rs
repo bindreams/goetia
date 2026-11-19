@@ -160,6 +160,15 @@ impl Cli {
         line.to_string()
     }
 
+    /// `id` is not installed: `daemon status <id> --json` exits 1 with a `not-installed` error.
+    #[track_caller]
+    pub fn assert_not_installed(&self, id: &str) {
+        let gone = self.run(&["daemon", "status", id, "--json"]);
+        assert_eq!(gone.code, Some(1), "{gone}");
+        let doc: Value = serde_json::from_str(&gone.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {gone}"));
+        assert_eq!(doc["errors"][0]["kind"], "not-installed", "{gone}");
+    }
+
     /// `id`'s entry in `daemon list --json`.
     #[track_caller]
     pub fn listed(&self, id: &str) -> Value {
@@ -202,6 +211,16 @@ pub struct Expect {
     pub next_run: Time,
 }
 
+/// A task that is installed and disarmed and has never run: idle, no pid, no result, no time.
+pub const DISARMED: Expect = Expect {
+    state: "idle",
+    enabled: false,
+    pid: Time::Null,
+    last_result: LastResult::Null,
+    last_run: Time::Null,
+    next_run: Time::Null,
+};
+
 /// `entry` of the task `id` is as `expect` says. A time that is present is RFC 3339 here; its value is not judged.
 #[track_caller]
 pub fn assert_task_fields(entry: &Value, id: &str, expect: Expect) {
@@ -242,6 +261,143 @@ pub fn instant(text: &str) -> SystemTime {
     text.parse::<jiff::Timestamp>()
         .unwrap_or_else(|e| panic!("`{text}` is not RFC 3339: {e}"))
         .into()
+}
+
+// The zone ============================================================================================================
+
+/// A daily schedule whose time is about 12 hours from now, in the machine's local zone: the zone the
+/// manager reads a schedule in (the test's process sets no `TZ`). The armed task has a next fire that far
+/// away and nothing fires while it is read. A clock step of 12 hours is outside what the lanes do.
+pub fn daily_in_half_a_day() -> String {
+    assert!(
+        std::env::var_os("TZ").is_none(),
+        "the test process has a `TZ`, and the manager reads a schedule in /etc/localtime, not in `TZ`"
+    );
+    let at = jiff::Zoned::now()
+        .checked_add(jiff::Span::new().hours(12))
+        .expect("12 hours from now");
+    format!("{} {} * * *", at.minute(), at.hour())
+}
+
+/// What one form of the task's status reported, read with the child's `TZ` set to [`ZONE`]. A time is
+/// `None` where the form shows none (the text form writes `-`). `window` is the clock before and after
+/// this form's read: the reads are separate, and a minute boundary may fall between any two.
+#[derive(Debug)]
+pub struct Read {
+    pub form: &'static str,
+    pub state: String,
+    pub last_run: Option<String>,
+    pub next_run: Option<String>,
+    pub window: (SystemTime, SystemTime),
+}
+
+impl Read {
+    /// Every time shown is at the offset of `TZ`. CI hosts run in UTC, so this is where a caller of the
+    /// system zone is seen not to pass UTC.
+    fn at_the_zone(self) -> Read {
+        for time in [&self.last_run, &self.next_run].into_iter().flatten() {
+            assert!(
+                time.ends_with(ZONE_OFFSET),
+                "`{time}` is not at {ZONE_OFFSET}: {self:?}"
+            );
+        }
+        self
+    }
+
+    fn of_entry(form: &'static str, entry: &Value, window: (SystemTime, SystemTime)) -> Read {
+        let field = |key: &str| entry[key].as_str().map(str::to_string);
+        Read {
+            form,
+            state: entry["state"].as_str().expect("a state").to_string(),
+            last_run: field("last-run"),
+            next_run: field("next-run"),
+            window,
+        }
+        .at_the_zone()
+    }
+
+    fn of_text(line: &str, window: (SystemTime, SystemTime)) -> Read {
+        // The text form writes `-` for a time it has none of.
+        let word = |key: &str| Some(text_field(line, key).to_string()).filter(|word| word != "-");
+        Read {
+            form: "status",
+            state: text_state(line).to_string(),
+            last_run: word("last-run"),
+            next_run: word("next-run"),
+            window,
+        }
+        .at_the_zone()
+    }
+}
+
+/// `read`, and the clock before and after it.
+fn windowed<T>(read: impl FnOnce() -> T) -> (T, (SystemTime, SystemTime)) {
+    let before = SystemTime::now();
+    let value = read();
+    (value, (before, SystemTime::now()))
+}
+
+/// The three forms that print a task's times, each read once, at the offset of the child's `TZ`.
+#[derive(Debug)]
+pub struct Zoned {
+    /// The `status --json` entry, read by `json_read`.
+    pub json: Value,
+    pub json_read: Read,
+    pub text_read: Read,
+    pub list_read: Read,
+}
+
+/// `id` read once in each form through `in_zone`, a [`Cli::in_zone`] of [`ZONE`].
+pub fn read_in_the_zone(in_zone: &Cli, id: &str) -> Zoned {
+    let (json, json_window) = windowed(|| in_zone.status_json(id));
+    let (text, text_window) = windowed(|| in_zone.status_text(id));
+    let (listed, list_window) = windowed(|| in_zone.listed(id));
+    Zoned {
+        json_read: Read::of_entry("status --json", &json, json_window),
+        text_read: Read::of_text(&text, text_window),
+        list_read: Read::of_entry("list --json", &listed, list_window),
+        json,
+    }
+}
+
+impl Zoned {
+    pub fn reads(&self) -> [&Read; 3] {
+        [&self.json_read, &self.text_read, &self.list_read]
+    }
+
+    /// Every form is in `state` with no `next-run`.
+    #[track_caller]
+    pub fn assert_state(&self, state: &str) {
+        for read in self.reads() {
+            assert_eq!(read.state, state, "{}: {self:?}", read.form);
+            assert_eq!(read.next_run, None, "{}: {self:?}", read.form);
+        }
+    }
+
+    /// Every form is in `state`, and its `next-run` is one of `candidates(before, after)`, the clock
+    /// before and after that form's own read.
+    #[track_caller]
+    pub fn assert_next_run(&self, state: &str, candidates: impl Fn(SystemTime, SystemTime) -> Vec<SystemTime>) {
+        for read in self.reads() {
+            assert_eq!(read.state, state, "{}: {self:?}", read.form);
+            let next = read.next_run.as_deref().map(instant);
+            let (before, after) = read.window;
+            let expected = candidates(before, after);
+            assert!(
+                next.is_some_and(|next| expected.contains(&next)),
+                "{}: next-run {next:?} is none of {expected:?}, read in [{before:?}, {after:?}]: {self:?}",
+                read.form
+            );
+        }
+    }
+
+    /// No form shows a `last-run`.
+    #[track_caller]
+    pub fn assert_no_last_run(&self) {
+        for read in self.reads() {
+            assert!(read.last_run.is_none(), "{}: a last-run: {self:?}", read.form);
+        }
+    }
 }
 
 /// The state of a status text line (`id: state (task, ...)`).
