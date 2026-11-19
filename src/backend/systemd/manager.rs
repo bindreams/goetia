@@ -57,7 +57,8 @@
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
 //!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's order puts
-//!    its timer first, so that nothing starts the job again: see the `task` module.
+//!    its timer first, so that nothing starts the job again, and clears the timer's stamp so that
+//!    the id's next timer makes up nothing: see the `task` module.
 //! 7. **Absence is about the id, not about the fragment file.** `cli::uninstall` maps
 //!    [`Error::NotInstalled`] — and only that variant — to exit `0` and "nothing to do", so a
 //!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an

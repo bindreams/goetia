@@ -24,6 +24,9 @@
 //!   there to read, and the link it leaves would run the task at every boot.
 //! - `uninstall` disarms the timer, stops the job, and removes the timer before the job: a crash
 //!   leaves a job without a timer, still ours.
+//! - Every disarming (`disable`, `uninstall`, and an update that drops the timer) clears the timer's
+//!   stamp, after `disable --now` and before the timer's file goes: `systemctl clean` of a unit
+//!   systemd cannot find fails, and an active timer is refused. See `disarm_timer`.
 //!
 //! A timer without its job (a crash of an older goetia, or a hand removal) is ours and unusable: its
 //! blob is the error `read` gives it, and `uninstall` removes it.
@@ -202,7 +205,7 @@ impl Systemd {
 
         if before.drop_timer {
             let old_timer = old.timer().expect("a timer to drop is installed");
-            self.systemctl.disable_timer(id, held)?;
+            self.disarm_timer(id, held)?;
             match quarantine_if_still_ours(id, UnitKind::Timer, &old_timer.text)? {
                 Some(backup) => remove_file_if_present(&backup)?,
                 None => return Ok(WriteOutcome::Raced),
@@ -243,7 +246,7 @@ impl Systemd {
         let owns_timer = snapshot.owns_timer_slot();
 
         if snapshot.timer().is_some() {
-            self.systemctl.disable_timer(id, held)?;
+            self.disarm_timer(id, held)?;
         }
         // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
         // means rather than an end, and bounding it would turn a slow-stopping service into a failed
@@ -371,9 +374,23 @@ impl Systemd {
 
     fn disarm(&self, snapshot: &Fragment, held: &mut Held) -> Result<()> {
         match snapshot.timer() {
-            Some(_) => self.systemctl.disable_timer(snapshot.id.as_str(), held),
+            Some(_) => self.disarm_timer(snapshot.id.as_str(), held),
             None => Ok(()),
         }
+    }
+
+    /// The timer disarmed now and at boot, and its stamp cleared once it is inactive. The stamp is
+    /// when the timer last elapsed; a timer armed again reads it, and starts the job at once for a
+    /// time its schedule named while it was disarmed. With the stamp gone, `Persistent=yes` makes up
+    /// only a time missed while the machine was off. Clearing it again is harmless, so a repeated
+    /// `disable` is as good as the first. Not done by an `install` that re-arms: that timer never
+    /// stops.
+    fn disarm_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.systemctl.disable_timer(id, held)?;
+        if self.systemctl.timer_keeps_stamp(id)? {
+            self.systemctl.clean_timer(id, held)?;
+        }
+        Ok(())
     }
 }
 

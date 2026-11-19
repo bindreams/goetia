@@ -798,6 +798,12 @@ fn every_path() -> Vec<Way> {
         Way::request("disable timer", |s: &Systemctl| {
             s.disable_timer("x", &mut Held::default())
         }),
+        Way::request("clean timer", |s: &Systemctl| s.clean_timer("x", &mut Held::default())),
+        Way {
+            name: "show can-clean".to_string(),
+            gated: false,
+            run: Box::new(|s: &Systemctl| s.timer_keeps_stamp("x").map(drop)),
+        },
         Way::request("start job", |s: &Systemctl| {
             s.start_job("x", &mut Held::default()).map(drop)
         }),
@@ -1155,6 +1161,66 @@ fn a_timer_verb_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
     assert!(msg.contains("Access denied"), "{msg}");
 }
 
+#[skuld::test]
+fn a_timer_s_stamp_is_cleaned_by_state_and_the_timer_named_after_the_terminator() {
+    let fake = Fake::new([reply(&["clean"], exited(0, "", ""))]);
+
+    on_booted(fake.clone())
+        .clean_timer("-h", &mut gate_held())
+        .expect("clean");
+
+    assert_eq!(fake.calls(), [["clean", "--what=state", "--", "-h.timer"]]);
+}
+
+#[skuld::test]
+fn a_clean_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
+    let fake = gate_then([reply(
+        &["clean"],
+        exited(
+            1,
+            "",
+            "Failed to clean unit x.timer: Unit is not inactive or has pending job.\n",
+        ),
+    )]);
+
+    let msg = on_booted(fake)
+        .clean_timer("x", &mut Held::default())
+        .expect_err("clean")
+        .report()
+        .to_string();
+
+    assert!(msg.contains("`systemctl clean --what=state x.timer` failed"), "{msg}");
+    assert!(msg.contains("not inactive"), "{msg}");
+}
+
+/// What `systemctl show --property CanClean` says of a timer: `state` when it is `Persistent=`, and
+/// nothing when it is not.
+#[skuld::test]
+fn a_timer_keeps_a_stamp_when_it_can_be_cleaned_of_state() {
+    for (can_clean, keeps) in [("state", true), ("", false), ("cache state", true), ("cache", false)] {
+        let answer = format!("CanClean={can_clean}\nLoadState=loaded\n");
+        assert_eq!(
+            showing(&answer).timer_keeps_stamp("x").expect(can_clean),
+            keeps,
+            "{can_clean:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn the_timer_is_asked_whether_it_keeps_a_stamp_by_its_own_name() {
+    let fake = Fake::new([reply(&["show"], exited(0, "CanClean=state\nLoadState=loaded\n", ""))]);
+
+    on_booted(fake.clone())
+        .timer_keeps_stamp("x")
+        .expect("timer_keeps_stamp");
+
+    assert_eq!(
+        fake.calls(),
+        [["show", "--property", "CanClean,LoadState", "--", "x.timer"]]
+    );
+}
+
 /// Decision 15: a run in flight is `Running` in any of its three states, and a job between runs is
 /// `Idle` whether its last run succeeded (`inactive`) or failed (`failed`): a failed run is a
 /// result, not a state. Anything else systemd says is `Unknown`, and never a state it made up.
@@ -1242,9 +1308,9 @@ fn verdicted(source: Source, reported: &str) -> Result<()> {
 /// The `Version` property as distributions set it, measured with `systemctl --version`, whose
 /// parenthesised part is the same `GIT_VERSION` string (identical on this host's systemd 257).
 #[skuld::test]
-fn a_running_systemd_242_or_newer_is_supported() {
+fn a_running_systemd_243_or_newer_is_supported() {
     for version in [
-        "242",
+        "243",
         "257.13-1~deb13u1",   // Debian 13
         "252.39-1~deb12u2",   // Debian 12
         "255.4-1ubuntu8.17",  // Ubuntu 24.04
@@ -1261,9 +1327,9 @@ fn a_running_systemd_242_or_newer_is_supported() {
 }
 
 #[skuld::test]
-fn a_client_242_or_newer_is_supported() {
+fn a_client_243_or_newer_is_supported() {
     for version in [
-        "systemd 242 (242)",
+        "systemd 243 (243)",
         "systemd 257 (257.13-1~deb13u1)",
         "systemd 258~rc1 (258~rc1-1)",
     ] {
@@ -1281,9 +1347,26 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
         (Source::Client, "systemd 241 (241)", "241"),
     ] {
         let msg = verdicted(source, version).expect_err(version).to_string();
-        assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
+        assert!(msg.contains("requires systemd 243 or newer"), "{msg}");
         assert!(msg.contains(&format!(" {reported}")), "{msg}");
         assert!(msg.contains("--show-transaction"), "{msg}");
+        assert!(!msg.contains("Type=exec"), "{version} parses Type=exec: {msg}");
+    }
+}
+
+/// systemd 242 has `--show-transaction` and parses `Type=exec`; it has no `clean` of a timer's
+/// stamp, and the refusal says that and nothing more.
+#[skuld::test]
+fn systemd_242_is_refused_for_clean_alone() {
+    for (source, version, reported) in [
+        (Source::Manager, "242.1-1", "242"),
+        (Source::Client, "systemd 242 (242)", "242"),
+    ] {
+        let msg = verdicted(source, version).expect_err(version).to_string();
+        assert!(msg.contains("requires systemd 243 or newer"), "{msg}");
+        assert!(msg.contains(&format!(" {reported}")), "{msg}");
+        assert!(msg.contains("clean"), "{msg}");
+        assert!(!msg.contains("--show-transaction"), "{version} has it: {msg}");
         assert!(!msg.contains("Type=exec"), "{version} parses Type=exec: {msg}");
     }
 }
@@ -1293,7 +1376,7 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
 #[skuld::test]
 fn systemd_older_than_240_is_refused_for_both_reasons() {
     let msg = verdicted(Source::Manager, "239-41.el8").unwrap_err().to_string();
-    assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
+    assert!(msg.contains("requires systemd 243 or newer"), "{msg}");
     assert!(msg.contains("--show-transaction"), "{msg}");
     assert!(msg.contains("Type=simple"), "{msg}");
     let msg = verdicted(Source::Client, "systemd 237").unwrap_err().to_string();
@@ -1417,11 +1500,11 @@ fn refused(manager: &str, client: &str) -> String {
         .to_string()
 }
 
-/// Both must be 242 or newer: the running systemd parses `Type=exec` and answers the job, and the
-/// client parses `--show-transaction`, so neither rescues the other. The refusal names whichever
-/// failed, with its version, and both when both did.
+/// Both must be 243 or newer: the running systemd parses `Type=exec`, answers the job and cleans a
+/// timer, and the client parses `--show-transaction` and has `clean`, so neither rescues the other.
+/// The refusal names whichever failed, with its version, and both when both did.
 #[skuld::test]
-fn both_the_running_systemd_and_the_client_must_be_242_or_newer() {
+fn both_the_running_systemd_and_the_client_must_be_243_or_newer() {
     assert!(supported_by(two_versions("257", "257")).is_ok());
 
     let old_client = refused("257", "241");
@@ -1737,7 +1820,7 @@ fn any_other_failure_to_ask_the_manager_is_a_refusal() {
         "{msg}"
     );
     assert!(msg.contains("Connection timed out"), "{msg}");
-    assert!(msg.contains("cannot tell whether the running systemd is 242+"), "{msg}");
+    assert!(msg.contains("cannot tell whether the running systemd is 243+"), "{msg}");
 
     let silent = reply(&["show"], exited(0, "", ""));
     let msg = supported_by([version(), silent]).unwrap_err().to_string();

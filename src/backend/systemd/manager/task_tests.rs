@@ -277,6 +277,28 @@ fn reload() -> Entry {
     reply(&["daemon-reload"], exited(0, "", ""))
 }
 
+/// `systemctl show` of a timer that keeps a stamp to clean: `Persistent=yes`.
+fn keeps_stamp() -> Entry {
+    reply(&["show"], exited(0, "CanClean=state\nLoadState=loaded\n", ""))
+}
+
+/// `systemctl show` of a timer with nothing to clean: `Persistent=` is off.
+fn keeps_no_stamp() -> Entry {
+    reply(&["show"], exited(0, "CanClean=\nLoadState=loaded\n", ""))
+}
+
+fn cleaned() -> Entry {
+    reply(&["clean"], exited(0, "", ""))
+}
+
+/// The two calls that follow a timer's `disable --now`: is there a stamp, and the cleaning of it.
+fn stamp_calls(id: &str) -> [Vec<String>; 2] {
+    [
+        call(&["show", "--property", "CanClean,LoadState", "--", &format!("{id}.timer")]),
+        call(&["clean", "--what=state", "--", &format!("{id}.timer")]),
+    ]
+}
+
 /// `systemctl --no-block`'s announcement of job `n` for `verb`.
 pub(in crate::backend::systemd::manager) fn enqueued(verb: &str, n: u32) -> Entry {
     reply(
@@ -462,20 +484,70 @@ fn enable_and_disable_of_an_undecodable_snapshot_act_on_the_units_present() {
         ]
     );
 
-    let fake = gate_then([reply(&["disable"], exited(0, "", ""))]);
+    let fake = gate_then([reply(&["disable"], exited(0, "", "")), keeps_stamp(), cleaned()]);
     over(&fake).disable_units(&undecodable(false)).expect("disable");
-    assert_eq!(without_gate(&fake), [call(&["disable", "--now", "--", "x.timer"])]);
+    let [show, clean] = stamp_calls("x");
+    assert_eq!(
+        without_gate(&fake),
+        [call(&["disable", "--now", "--", "x.timer"]), show, clean]
+    );
 }
 
-/// A run in flight is the job's and goes on: nothing here stops, kills or even names the job.
+/// A run in flight is the job's and goes on: nothing here stops, kills or even names the job. The
+/// timer's stamp is cleared once it is inactive, so that a time its schedule names while it is
+/// disarmed is not made up when it is armed again.
 #[skuld::test]
 fn disable_leaves_the_run_in_flight() {
     let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
-    let fake = gate_then([reply(&["disable"], exited(0, "", ""))]);
+    let fake = gate_then([reply(&["disable"], exited(0, "", "")), keeps_stamp(), cleaned()]);
 
     over(&fake).disable_units(&fragment(&spec)).expect("disable");
 
-    assert_eq!(without_gate(&fake), [call(&["disable", "--now", "--", "x.timer"])]);
+    let [show, clean] = stamp_calls("x");
+    assert_eq!(
+        without_gate(&fake),
+        [call(&["disable", "--now", "--", "x.timer"]), show, clean]
+    );
+}
+
+/// A timer whose `Persistent=` is off (a drop-in) keeps no stamp the manager reads, and `clean` of it
+/// fails: it is not asked to, and the disable stands.
+#[skuld::test]
+fn disable_of_a_timer_that_keeps_no_stamp_cleans_nothing() {
+    let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
+    let fake = gate_then([reply(&["disable"], exited(0, "", "")), keeps_no_stamp()]);
+
+    over(&fake).disable_units(&fragment(&spec)).expect("disable");
+
+    let [show, _] = stamp_calls("x");
+    assert_eq!(
+        without_gate(&fake),
+        [call(&["disable", "--now", "--", "x.timer"]), show]
+    );
+}
+
+/// A clean that fails is the disable's failure, in systemd's words: the schedule is disarmed, and the
+/// stamp that could still start the job once it is armed again is not cleared.
+#[skuld::test]
+fn a_clean_that_fails_fails_the_disable() {
+    let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
+    let fake = gate_then([
+        reply(&["disable"], exited(0, "", "")),
+        keeps_stamp(),
+        reply(
+            &["clean"],
+            exited(1, "", "Failed to clean unit x.timer: Input/output error\n"),
+        ),
+    ]);
+
+    let msg = over(&fake)
+        .disable_units(&fragment(&spec))
+        .expect_err("the clean failed")
+        .report()
+        .to_string();
+
+    assert!(msg.contains("`systemctl clean --what=state x.timer` failed"), "{msg}");
+    assert!(msg.contains("Input/output error"), "{msg}");
 }
 
 #[skuld::test]
@@ -722,7 +794,12 @@ fn a_timer_without_its_job_is_ours_unusable_and_uninstall_removes_it(#[fixture(s
     let _left = Leftovers::new(&id);
     let spec = task_spec(&id, "/bin/a", Some("30 3 * * *"));
     seed(&id, UnitKind::Timer, units_of(&spec).timer.as_deref().expect("a timer"));
-    let fake = gate_then([reply(&["disable"], exited(0, "", "")), reload()]);
+    let fake = gate_then([
+        reply(&["disable"], exited(0, "", "")),
+        keeps_stamp(),
+        cleaned(),
+        reload(),
+    ]);
     let mgr = over(&fake);
 
     let snapshot = marked(&mgr, &id);
@@ -733,10 +810,13 @@ fn a_timer_without_its_job_is_ours_unusable_and_uninstall_removes_it(#[fixture(s
     mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
 
     assert_eq!(text_of(&id, UnitKind::Timer), None);
+    let [show, clean] = stamp_calls(&id);
     assert_eq!(
         without_gate(&fake),
         [
             call(&["disable", "--now", "--", &format!("{id}.timer")]),
+            show,
+            clean,
             call(&["daemon-reload"])
         ]
     );
@@ -830,6 +910,8 @@ fn a_service_beside_a_marked_timer_updates_without_force(#[fixture(systemd_group
     let timer = owned(&id, UnitKind::Timer);
     let fake = gate_then([
         reply(&["disable"], exited(0, "", "")).then(move || assert!(timer.exists(), "disarmed before removal")),
+        keeps_stamp(),
+        cleaned(),
         reload(),
     ]);
     let mgr = over(&fake);
@@ -839,10 +921,13 @@ fn a_service_beside_a_marked_timer_updates_without_force(#[fixture(systemd_group
     assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
     assert_eq!(text_of(&id, UnitKind::Timer), None);
     assert_eq!(text_of(&id, UnitKind::Service), Some(units_of(&service).service));
+    let [show, clean] = stamp_calls(&id);
     assert_eq!(
         without_gate(&fake),
         [
             call(&["disable", "--now", "--", &format!("{id}.timer")]),
+            show,
+            clean,
             call(&["daemon-reload"])
         ]
     );
@@ -866,9 +951,14 @@ fn retype_raced_at_the_first_request(
         seed(id, UnitKind::Timer, timer);
     }
     let path = owned(id, kind);
-    let fake = gate_then([reply(&[verb], exited(0, "", "")).then(move || {
-        std::fs::write(&path, "[Unit]\nDescription=changed by someone else\n").expect("change the file");
-    })]);
+    let fake = gate_then([
+        reply(&[verb], exited(0, "", "")).then(move || {
+            std::fs::write(&path, "[Unit]\nDescription=changed by someone else\n").expect("change the file");
+        }),
+        // What a timer's disarming asks next; a retype of a service asks neither.
+        keeps_stamp(),
+        cleaned(),
+    ]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, id);
 
@@ -968,6 +1058,8 @@ fn retyping_a_task_to_a_service_disarms_the_timer_and_replaces_the_job(#[fixture
             assert!(timer.exists(), "the timer is disarmed while it is still there to read");
             assert_eq!(std::fs::read_to_string(&job).expect("the job"), was);
         }),
+        keeps_stamp(),
+        cleaned(),
         reload(),
     ]);
     let mgr = over(&fake);
@@ -978,10 +1070,13 @@ fn retyping_a_task_to_a_service_disarms_the_timer_and_replaces_the_job(#[fixture
         .expect("update_units");
 
     assert!(matches!(wrote, WriteOutcome::Done));
+    let [show, clean] = stamp_calls(&id);
     assert_eq!(
         without_gate(&fake),
         [
             call(&["disable", "--now", "--", &format!("{id}.timer")]),
+            show,
+            clean,
             call(&["daemon-reload"])
         ]
     );
@@ -1013,17 +1108,25 @@ fn a_scheduled_task_made_scheduleless_disarms_and_removes_the_timer_first(#[fixt
     let old_units = units_of(&old);
     seed(&id, UnitKind::Service, &old_units.service);
     seed(&id, UnitKind::Timer, old_units.timer.as_deref().expect("a timer"));
-    let fake = gate_then([reply(&["disable"], exited(0, "", "")), reload()]);
+    let fake = gate_then([
+        reply(&["disable"], exited(0, "", "")),
+        keeps_stamp(),
+        cleaned(),
+        reload(),
+    ]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
     mgr.update_units(&new, &units_of(&new), &snapshot, &mut held(&mgr))
         .expect("update_units");
 
+    let [show, clean] = stamp_calls(&id);
     assert_eq!(
         without_gate(&fake),
         [
             call(&["disable", "--now", "--", &format!("{id}.timer")]),
+            show,
+            clean,
             call(&["daemon-reload"])
         ]
     );
@@ -1244,8 +1347,9 @@ fn a_task_timer_beside_the_old_service_is_ours_and_a_rerun_finishes_the_retype(
 
 // uninstall ===========================================================================================================
 
-/// The timer is disarmed first, so nothing starts the job between its stop and its removal; the stop
-/// is unbounded; the files go timer first.
+/// The timer is disarmed first, so nothing starts the job between its stop and its removal, and its
+/// stamp is cleared while the timer is still there to name; the stop is unbounded; the files go timer
+/// first.
 #[skuld::test]
 fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
@@ -1267,6 +1371,8 @@ fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixtur
                 "nothing is removed before the timer is disarmed"
             )
         }),
+        keeps_stamp(),
+        cleaned(),
         enqueued("stop", 3),
         reload(),
     ]);
@@ -1275,10 +1381,13 @@ fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixtur
 
     mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
 
+    let [show, clean] = stamp_calls(&id);
     assert_eq!(
         without_gate(&fake),
         [
             call(&["disable", "--now", "--", &format!("{id}.timer")]),
+            show,
+            clean,
             call(&["stop", "--show-transaction", "--", &format!("{id}.service")]),
             call(&["daemon-reload"]),
         ]
@@ -1348,6 +1457,8 @@ fn uninstall_reports_a_timer_that_changed_as_a_concurrent_change(#[fixture(syste
     let changed = "[Timer]\nOnCalendar=hourly\n";
     let fake = gate_then([
         reply(&["disable"], exited(0, "", "")).then(move || std::fs::write(&timer, changed).expect("change")),
+        keeps_stamp(),
+        cleaned(),
         enqueued("stop", 3),
     ]);
     let mgr = over(&fake);

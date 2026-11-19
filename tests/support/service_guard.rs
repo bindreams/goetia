@@ -16,7 +16,7 @@
 //! `systemctl` / `launchctl` / `services.msc`, long after the run that left it.
 
 use super::cleanup::remove_path_retrying;
-use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
+use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_STAMP_DIR, SYSTEMD_UNIT_DIR, cmd};
 
 pub struct ServiceGuard {
     id: String,
@@ -56,6 +56,11 @@ fn cleanup(id: &str) -> Vec<String> {
         problems.extend(remove_path_retrying(&dir.join(format!("{unit}.d")), true));
         problems.extend(remove_path_retrying(&dir.join(wants_dir).join(&unit), false));
     }
+    // Made by systemd when the timer starts, and left when a test did not uninstall.
+    problems.extend(remove_path_retrying(
+        &std::path::PathBuf::from(SYSTEMD_STAMP_DIR).join(format!("stamp-{id}.timer")),
+        false,
+    ));
     problems.extend(cmd::run_cleanup("systemctl", &[&["daemon-reload"]], &[]));
     problems
 }

@@ -1212,11 +1212,15 @@ pub enum VersionReading {
 /// [`Error::UnsupportedManager`]'s message: one sentence for each of the manager and its client
 /// that is below the floor or unreadable.
 fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> String {
-    use crate::backend::systemd::{SYSTEMD_FLOOR, TYPE_EXEC};
+    use crate::backend::systemd::{SHOW_TRANSACTION, SYSTEMD_FLOOR, TYPE_EXEC};
     const ANSWER: &str = "cannot answer the `systemctl --show-transaction` every start and stop runs";
+    const CLEAN: &str = "cannot clean a timer's stamp, which a task's `disable` and `uninstall` do";
     const TYPE_SIMPLE: &str = "runs goetia's `Type=exec` units as `Type=simple`, which cannot report a failed exec";
     let manager = match manager {
         VersionReading::Major(n) if *n >= SYSTEMD_FLOOR => None,
+        VersionReading::Major(n) if *n >= SHOW_TRANSACTION => {
+            Some(format!("The running systemd is {n}, which {CLEAN}."))
+        }
         VersionReading::Major(n) if *n >= TYPE_EXEC => Some(format!("The running systemd is {n}, which {ANSWER}.")),
         VersionReading::Major(n) => Some(format!(
             "The running systemd is {n}, which {ANSWER}, and {TYPE_SIMPLE}."
@@ -1227,6 +1231,10 @@ fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> Str
     };
     let client = match client {
         VersionReading::Major(n) if *n >= SYSTEMD_FLOOR => None,
+        VersionReading::Major(n) if *n >= SHOW_TRANSACTION => Some(format!(
+            "The `systemctl` client is {n}, which has no `clean` for a timer's stamp, which a task's `disable` and \
+             `uninstall` run."
+        )),
         VersionReading::Major(n) => Some(format!(
             "The `systemctl` client is {n}, which does not accept the `--show-transaction` option every start and \
              stop passes it."

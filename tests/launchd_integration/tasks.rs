@@ -29,7 +29,8 @@ use crate::launchd::{
 };
 use crate::support::cron_oracle::assert_next_run_strict;
 use crate::support::tasks::{
-    Held, Lines, assert_same_text, id_of, run_task, sh, status_with_result, task_status, with_logs,
+    Held, Lines, assert_rearm_makes_up_no_missed_run, assert_same_text, id_of, run_task, sh, status_with_result,
+    task_status, with_logs,
 };
 use crate::support::{self, Group, cmd, kill, launchd_group, may_account_for};
 
@@ -365,6 +366,18 @@ fn the_timer_fires_by_itself(#[fixture(launchd_group)] _group: &Group) {
     let finished = status_with_result(&mgr, &task_id);
     assert_eq!(finished.last_result, Some(Exit::Code(0)), "{finished:?}");
     assert!(finished.common.enabled, "the schedule stays armed: {finished:?}");
+}
+
+/// A timer loaded again does not start the job for a minute that passed while it was unloaded.
+#[skuld::test]
+fn rearming_a_task_makes_up_no_missed_run(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let task_id = id_of(&id);
+    let mut held = Held::new();
+    let mgr = Launchd::new();
+    let _guard = Guard::install(&mgr, &task(&id, held.command.clone(), Some("* * * * *")));
+
+    assert_rearm_makes_up_no_missed_run(&mgr, &task_id, &mut held);
 }
 
 /// A fire while a run is in flight starts nothing: the timer's `kickstart` finds the job running. The

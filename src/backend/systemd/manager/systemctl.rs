@@ -481,9 +481,9 @@ impl Systemctl {
 /// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked before goetia writes a unit, and by
 /// [`Systemctl::door`] before every request: an older systemd does not reject `Type=exec` but logs that it
 /// cannot parse it and runs the unit as `Type=simple`, silently losing the failed-exec detection
-/// the directive is there for. Asked once per [`Held`]: one pass is remembered there, so the steps of
-/// one sequence share one pair of probes, and a manager that changes between two invocations is asked
-/// again.
+/// the directive is there for. The floor itself is where `systemctl clean` works on a timer. Asked
+/// once per [`Held`]: one pass is remembered there, so the steps of one sequence share one pair of
+/// probes, and a manager that changes between two invocations is asked again.
 impl Systemctl {
     pub(super) fn require_supported(&self, held: &mut Held) -> Result<()> {
         if held.gate_passed {
@@ -801,6 +801,22 @@ impl Systemctl {
     /// flight is the task's unit's, not the timer's, and goes on.
     pub(super) fn disable_timer(&self, id: &str, held: &mut Held) -> Result<()> {
         self.unit_file_verb(&["disable", "--now"], id, UnitKind::Timer, held)
+    }
+
+    /// `systemctl clean --what=state` for `id`'s timer: its stamp (`/var/lib/systemd/timers/stamp-*`),
+    /// which is what makes a timer with `Persistent=yes` start at once for a time it missed. Systemd
+    /// refuses a timer that is not inactive, so this follows `disable --now`.
+    pub(super) fn clean_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.unit_file_verb(&["clean", "--what=state"], id, UnitKind::Timer, held)
+    }
+
+    /// Whether `id`'s timer keeps a stamp to clean: its `CanClean` says `state`. A timer whose
+    /// `Persistent=` is off (a drop-in can do it) lists nothing, and `clean` of it fails.
+    pub(super) fn timer_keeps_stamp(&self, id: &str) -> Result<bool> {
+        let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["CanClean"])?;
+        Ok(props
+            .get("CanClean")
+            .is_some_and(|what| what.split_whitespace().any(|word| word == "state")))
     }
 
     fn unit_file_verb(&self, head: &[&str], id: &str, kind: UnitKind, held: &mut Held) -> Result<()> {
