@@ -554,8 +554,8 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
         "a shim launched as the old account may still be about to open the log"
     );
 
-    let pid = status.process_id.expect("a pending start has a process");
-    support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
+    mgr.kill(id)
+        .unwrap_or_else(|e| panic!("kill the process of the pending start: {}", e.report()));
     start
         .join()
         .expect("the start thread")
