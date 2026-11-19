@@ -44,6 +44,12 @@ pub const CONTAINED_CHILD: &str = "--goetia-contained-child";
 #[cfg(windows)]
 pub const PRINT_AND_EXIT: &str = "--goetia-print-and-exit";
 
+/// `<exe> --goetia-run-until-released <port>`: connect to the test's listener and wait until the test
+/// drops its end of the connection, then exit 0. A run the test holds, and then lets end by itself:
+/// `RUN_UNTIL_KILLED` ends only by a stop or a kill, which records another result.
+#[cfg(windows)]
+pub const RUN_UNTIL_RELEASED: &str = "--goetia-run-until-released";
+
 /// `<exe> --goetia-print-when-released <port> <text>`: print `<text> first <pid>` on a line, connect to the
 /// test's listener, and block reading the connection until the test shuts its writing half down; then print
 /// `<text> released <pid>`, answer with one byte (so the test knows the line was written) and block forever.
@@ -84,6 +90,11 @@ pub fn run_if_requested() -> bool {
         #[cfg(windows)]
         Some(SERVICE_HOST) => {
             windows::run(&args[2]);
+            true
+        }
+        #[cfg(windows)]
+        Some(RUN_UNTIL_RELEASED) => {
+            run_until_released(args[2].parse().expect("port argument"));
             true
         }
         #[cfg(windows)]
@@ -137,6 +148,17 @@ fn contained_child() -> ! {
     std::io::stdout().flush().expect("flush stdout");
     loop {
         std::thread::park();
+    }
+}
+
+/// [`RUN_UNTIL_RELEASED`]. A connection that cannot be made ends the run at once, as it does for
+/// [`connect`]: the test, which holds the listener, is the one that sees no connection.
+#[cfg(windows)]
+fn run_until_released(port: u16) {
+    use std::io::Read as _;
+
+    if let Some(mut stream) = open(port) {
+        log_failure(port, "read", stream.read_to_end(&mut Vec::new()).map(drop));
     }
 }
 

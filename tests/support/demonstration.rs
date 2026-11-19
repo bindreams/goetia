@@ -266,3 +266,106 @@ pub fn text_field<'a>(line: &'a str, key: &str) -> &'a str {
     let end = rest.find([',', ')']).unwrap_or(rest.len());
     &rest[..end]
 }
+
+// The zoned reads =====================================================================================================
+
+/// A daily schedule whose time is about 12 hours from now, in the machine's local zone: the zone the
+/// manager reads a schedule in (systemd's `/etc/localtime`, Task Scheduler's system zone), which is
+/// not `TZ`. The armed task has a next fire that far away and nothing fires while it is read. A clock
+/// step of 12 hours is outside what the lanes do.
+pub fn daily_in_half_a_day() -> String {
+    assert!(
+        std::env::var_os("TZ").is_none(),
+        "the test process has a `TZ`, and the manager reads a schedule in the machine's zone, not in `TZ`"
+    );
+    let at = jiff::Zoned::now()
+        .checked_add(jiff::Span::new().hours(12))
+        .expect("12 hours from now");
+    format!("{} {} * * *", at.minute(), at.hour())
+}
+
+/// What one form of the task's status reported, read with the child's `TZ` set to [`ZONE`]. A time is
+/// `None` where the form shows none (the text form writes `-`).
+#[derive(Debug)]
+pub struct Read {
+    pub form: &'static str,
+    pub state: String,
+    pub last_run: Option<String>,
+    pub next_run: Option<String>,
+}
+
+impl Read {
+    /// Every time shown is at the offset of `TZ`. CI hosts run in UTC, so this is where a caller of the
+    /// system zone is seen not to pass UTC.
+    fn at_the_zone(self) -> Read {
+        for time in [&self.last_run, &self.next_run].into_iter().flatten() {
+            assert!(
+                time.ends_with(ZONE_OFFSET),
+                "`{time}` is not at {ZONE_OFFSET}: {self:?}"
+            );
+        }
+        self
+    }
+
+    fn of_entry(form: &'static str, entry: &Value) -> Read {
+        let field = |key: &str| entry[key].as_str().map(str::to_string);
+        Read {
+            form,
+            state: entry["state"].as_str().expect("a state").to_string(),
+            last_run: field("last-run"),
+            next_run: field("next-run"),
+        }
+        .at_the_zone()
+    }
+
+    fn of_text(line: &str) -> Read {
+        // The text form writes `-` for a time it has none of.
+        let word = |key: &str| Some(text_field(line, key).to_string()).filter(|word| word != "-");
+        Read {
+            form: "status",
+            state: text_state(line).to_string(),
+            last_run: word("last-run"),
+            next_run: word("next-run"),
+        }
+        .at_the_zone()
+    }
+}
+
+/// The three forms that print a task's times, each read once, at the offset of the child's `TZ`.
+#[derive(Debug)]
+pub struct Zoned {
+    /// The `status --json` entry, read by `json_read`.
+    pub json: Value,
+    pub json_read: Read,
+    pub text_read: Read,
+    pub list_read: Read,
+}
+
+/// `id`'s status in the three forms, through `in_zone` (a [`Cli::in_zone`]).
+#[track_caller]
+pub fn read_in_the_zone(in_zone: &Cli, id: &str) -> Zoned {
+    let json = in_zone.status_json(id);
+    let text = in_zone.status_text(id);
+    let listed = in_zone.listed(id);
+    Zoned {
+        json_read: Read::of_entry("status --json", &json),
+        text_read: Read::of_text(&text),
+        list_read: Read::of_entry("list --json", &listed),
+        json,
+    }
+}
+
+impl Zoned {
+    pub fn reads(&self) -> [&Read; 3] {
+        [&self.json_read, &self.text_read, &self.list_read]
+    }
+
+    /// Every form is in `state` with no `next-run`, or with the one `next_run`.
+    #[track_caller]
+    pub fn assert_state(&self, state: &str, next_run: Option<SystemTime>) {
+        for read in self.reads() {
+            assert_eq!(read.state, state, "{self:?}");
+            assert_eq!(read.next_run.as_deref().map(instant), next_run, "{self:?}");
+        }
+    }
+}
