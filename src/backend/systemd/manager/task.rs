@@ -24,13 +24,27 @@
 //!   there to read, and the link it leaves would run the task at every boot.
 //! - `uninstall` disarms the timer, stops the job, and removes the timer before the job: a crash
 //!   leaves a job without a timer, still ours.
-//! - Every disarming (`disable`, `uninstall`, and an update that drops the timer) clears the timer's
-//!   stamp, after `disable --now` and before the timer's file goes: `systemctl clean` of a unit
-//!   systemd cannot find fails, and an active timer is refused. See `disarm_timer`.
+//! - An update that changes an armed task's timer (its text, or a drop-in directory the update
+//!   deletes) disarms it with `disable --now` before the write, reloads, and arms it again. A reload
+//!   alone would let systemd read a time between the timer's last elapse and now as missed, and start
+//!   the job at once. A crash between the disarm and the re-arm leaves the task disabled: `status`
+//!   shows it, and `enable` arms it. A write that loses a race arms it again before the retry. A
+//!   disabled task's changed timer is only written.
+//! - Every arm goes through `Systemctl::arm_timer`, which clears the timer's stamp first while the
+//!   timer is inactive (`systemctl clean` refuses an active one). A task being armed was disarmed,
+//!   so no run its schedule named since was missed in downtime; the stamp, which `Persistent=yes`
+//!   reads, would start it at once. Disarming clears nothing: a stamp a disarming left, or one
+//!   `uninstall` leaves behind when the timer's file goes (systemd keeps it), is cleared by the next
+//!   arm of that id. This holds for a timer disarmed by goetia's `disable`. A timer stopped by hand
+//!   with `systemctl stop` stays loaded and keeps systemd's own memory of its last elapse, so arming
+//!   it can start the job at once.
 //!
 //! A timer without its job (a crash of an older goetia, or a hand removal) is ours and unusable: its
 //! blob is the error `read` gives it, and `uninstall` removes it.
 
+use std::fs;
+use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::systemd::generate::{self, Units};
@@ -149,13 +163,29 @@ pub(super) struct Before {
     pub(super) disable_job: bool,
     /// A timer is installed and the new definition has none: disarm and remove it.
     pub(super) drop_timer: bool,
+    /// An armed timer is to change, in its text or by losing its drop-in directory: disarm it before
+    /// the write, and arm it after the reload (see [`Systemd::update_units`]).
+    pub(super) rearm_timer: bool,
 }
 
-pub(super) fn before_replacing(old: &Fragment, new: &Units, spec: &DaemonSpec) -> Before {
-    Before {
+/// What `update_units` has to do before it replaces the job. `timer_dropins` is whether the id's timer
+/// drop-in directory exists, which the update deletes. `armed` is asked only when the timer changes.
+pub(super) fn before_replacing(
+    old: &Fragment,
+    new: &Units,
+    spec: &DaemonSpec,
+    timer_dropins: bool,
+    armed: impl FnOnce() -> Result<bool>,
+) -> Result<Before> {
+    let timer_changes = match (old.timer(), &new.timer) {
+        (Some(old), Some(new)) => old.text != *new || timer_dropins,
+        _ => false,
+    };
+    Ok(Before {
         disable_job: old.kind() == Some(DaemonKind::Service) && spec.kind() == DaemonKind::Task,
         drop_timer: old.timer().is_some() && new.timer.is_none(),
-    }
+        rearm_timer: timer_changes && armed()?,
+    })
 }
 
 impl Systemd {
@@ -185,7 +215,10 @@ impl Systemd {
         let old_job = old
             .service_text()
             .expect("an id `decide` chose to update has a job: one without is unusable");
-        let before = before_replacing(old, units, spec);
+        let before = before_replacing(old, units, spec, dir_exists(&dropin_dir(id, UnitKind::Timer))?, || {
+            self.systemctl.require_supported(held)?;
+            self.systemctl.timer_enabled(id)
+        })?;
 
         // A timer the id has none of yet is created first, with nothing else changed: it is not
         // reloaded or enabled, so it cannot start the old job, and a name something else holds stops
@@ -205,7 +238,7 @@ impl Systemd {
 
         if before.drop_timer {
             let old_timer = old.timer().expect("a timer to drop is installed");
-            self.disarm_timer(id, held)?;
+            self.systemctl.disable_timer(id, held)?;
             match quarantine_if_still_ours(id, UnitKind::Timer, &old_timer.text)? {
                 Some(backup) => remove_file_if_present(&backup)?,
                 None => return Ok(WriteOutcome::Raced),
@@ -214,15 +247,18 @@ impl Systemd {
         if before.disable_job {
             self.systemctl.disable_impl(id, held)?;
         }
+        if before.rearm_timer {
+            self.systemctl.disable_timer(id, held)?;
+        }
 
         if let ReplaceOutcome::Raced = replace_unit_verified(id, UnitKind::Service, &units.service, old_job)? {
-            return Ok(WriteOutcome::Raced);
+            return self.raced(id, &before, held);
         }
         if let Some(timer) = &units.timer
             && let Some(old_timer) = old.timer()
             && let ReplaceOutcome::Raced = replace_unit_verified(id, UnitKind::Timer, timer, &old_timer.text)?
         {
-            return Ok(WriteOutcome::Raced);
+            return self.raced(id, &before, held);
         }
 
         // Only after the last write has committed: clearing a drop-in first would delete an admin's
@@ -232,7 +268,28 @@ impl Systemd {
             remove_dir_if_present(&dropin_dir(id, UnitKind::Timer))?;
         }
         self.systemctl.daemon_reload_or_report(id, held)?;
+        if before.rearm_timer {
+            self.systemctl.arm_timer(id, held)?;
+        }
         Ok(WriteOutcome::Done)
+    }
+
+    /// A write that lost a race: a timer this update disarmed is armed again first, so that the retry
+    /// finds the task as the user left it.
+    fn raced(&self, id: &str, before: &Before, held: &mut Held) -> Result<WriteOutcome> {
+        if before.rearm_timer {
+            self.systemctl.arm_timer(id, held)?;
+        }
+        Ok(WriteOutcome::Raced)
+    }
+}
+
+/// Whether `path` is a directory that exists.
+fn dir_exists(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::os_at("read", path, e)),
     }
 }
 
@@ -246,7 +303,7 @@ impl Systemd {
         let owns_timer = snapshot.owns_timer_slot();
 
         if snapshot.timer().is_some() {
-            self.disarm_timer(id, held)?;
+            self.systemctl.disable_timer(id, held)?;
         }
         // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
         // means rather than an end, and bounding it would turn a slow-stopping service into a failed
@@ -323,7 +380,7 @@ impl Systemd {
                     self.systemctl.enable_impl(id, held)?;
                 }
                 if snapshot.timer().is_some() {
-                    self.systemctl.enable_timer(id, held)?;
+                    self.systemctl.arm_timer(id, held)?;
                 }
                 Ok(())
             }
@@ -352,7 +409,7 @@ impl Systemd {
                 }
             }
         }
-        self.systemctl.enable_timer(id, held)
+        self.systemctl.arm_timer(id, held)
     }
 
     /// A service as it always was. A task's is its timer's, and a run in flight goes on: a task
@@ -374,23 +431,9 @@ impl Systemd {
 
     fn disarm(&self, snapshot: &Fragment, held: &mut Held) -> Result<()> {
         match snapshot.timer() {
-            Some(_) => self.disarm_timer(snapshot.id.as_str(), held),
+            Some(_) => self.systemctl.disable_timer(snapshot.id.as_str(), held),
             None => Ok(()),
         }
-    }
-
-    /// The timer disarmed now and at boot, and its stamp cleared once it is inactive. The stamp is
-    /// when the timer last elapsed; a timer armed again reads it, and starts the job at once for a
-    /// time its schedule named while it was disarmed. With the stamp gone, `Persistent=yes` makes up
-    /// only a time missed while the machine was off. Clearing it again is harmless, so a repeated
-    /// `disable` is as good as the first. Not done by an `install` that re-arms: that timer never
-    /// stops.
-    fn disarm_timer(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.systemctl.disable_timer(id, held)?;
-        if self.systemctl.timer_keeps_stamp(id)? {
-            self.systemctl.clean_timer(id, held)?;
-        }
-        Ok(())
     }
 }
 

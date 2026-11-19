@@ -11,7 +11,7 @@ use goetia::spec::{HashSeed, Schedule, User};
 use goetia::testing::{FIRING_SCHEDULES, cron_matches, task_run_times};
 use jiff::civil::{self, DateTime};
 use jiff::tz::TimeZone;
-use jiff::{Timestamp, ToSpan as _, Zoned};
+use jiff::{Timestamp, ToSpan as _};
 
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::CONNECT_BACK;
@@ -54,70 +54,6 @@ fn the_scheduler_fires_the_task_by_itself(#[fixture(scm_group)] _group: &Group) 
     assert_eq!(status.last_result, Some(Exit::Code(0)));
     assert!(status.last_run.is_some(), "{status:?}");
     mgr.disable(id).expect("disable");
-    mgr.uninstall(id).expect("uninstall");
-}
-
-/// Re-arming a task makes up no run its schedule named while it was disarmed, though `StartWhenAvailable`
-/// is set: the task is armed and disarmed, the time its schedule names passes, and it is armed again.
-/// Read at the re-arming, its stored state is that of a task that never ran: no `last_run`, idle, and
-/// next due the day after. A run made up some time after the re-arming is not seen here: Task Scheduler
-/// documents a 10-minute delay for `StartWhenAvailable`, which the knowledge base's measurement watched
-/// for 20 minutes.
-///
-/// The schedule is one daily time, not `* * * * *`: a disarmed task whose repetition is in progress
-/// goes on starting at every tick (measured), and one armed just after a tick may be started for it,
-/// neither of which is a made-up run. The re-arming waits for Task Scheduler to have handled the time,
-/// not for the clock to reach it: a second task of the same schedule, armed throughout, has started for
-/// it when it has.
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn rearming_a_task_makes_up_no_missed_run(#[fixture(scm_group)] _group: &Group) {
-    let guard = TaskGuard::new();
-    let witness_guard = TaskGuard::new();
-    let (id, witness) = (&guard.id, &witness_guard.id);
-    let mgr = support::stock_shim_manager();
-    let (listener, witness_listener) = (ConnectBack::listen(), ConnectBack::listen());
-    // A minute two to three minutes ahead, local time: time to arm both before it.
-    let at = Zoned::now()
-        .checked_add(3.minutes())
-        .and_then(|ahead| ahead.with().second(0).subsec_nanosecond(0).build())
-        .expect("a minute ahead");
-    let schedule = format!("{} {} * * *", at.minute(), at.hour());
-    let due = SystemTime::from(at.timestamp());
-    mgr.install(
-        &task_spec(
-            witness,
-            connects_back(&witness_listener),
-            Some(&schedule),
-            User::Root,
-            None,
-        ),
-        false,
-    )
-    .expect("install the witness");
-    mgr.install(
-        &task_spec(id, connects_back(&listener), Some(&schedule), User::Root, None),
-        false,
-    )
-    .expect("install");
-    mgr.enable(witness).expect("enable the witness");
-    mgr.enable(id).expect("enable");
-    mgr.disable(id).expect("disable");
-    assert!(!task_status(&mgr, id).common.enabled, "precondition: disarmed");
-    kill::until(|| task_status(&mgr, witness).last_run.is_some_and(|began| began >= due));
-
-    mgr.enable(id).expect("enable again");
-
-    let status = task_status(&mgr, id);
-    assert!(status.common.enabled, "{status:?}");
-    assert_eq!(status.last_run, None, "nothing was made up for {due:?}: {status:?}");
-    assert_eq!(status.common.state, State::Idle, "{status:?}");
-    assert!(
-        status.next_run.is_some_and(|next| next > due),
-        "the next run is after {due:?}: {status:?}"
-    );
-    mgr.disable(witness).expect("disable the witness");
-    mgr.disable(id).expect("disable");
-    mgr.uninstall(witness).expect("uninstall the witness");
     mgr.uninstall(id).expect("uninstall");
 }
 

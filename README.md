@@ -26,7 +26,10 @@ systemd it cannot ask is refused. Generated units use
 `Type=exec` (240+), which is what lets a start report a missing executable or
 user as a failure. An older systemd does not reject the directive: it logs that it
 cannot parse it and runs the unit as `Type=simple`, silently losing exactly
-that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
+that. Every `start` and `stop` runs `systemctl --show-transaction` (242+), and
+arming a task's timer runs `systemctl clean` on it (243+) to clear its stamp,
+which is how arming a task again makes up no run missed while goetia's
+`disable` had disarmed it.
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds

@@ -800,9 +800,9 @@ fn every_path() -> Vec<Way> {
         }),
         Way::request("clean timer", |s: &Systemctl| s.clean_timer("x", &mut Held::default())),
         Way {
-            name: "show can-clean".to_string(),
+            name: "show stamp".to_string(),
             gated: false,
-            run: Box::new(|s: &Systemctl| s.timer_keeps_stamp("x").map(drop)),
+            run: Box::new(|s: &Systemctl| s.timer_stamp_clearable("x").map(drop)),
         },
         Way::request("start job", |s: &Systemctl| {
             s.start_job("x", &mut Held::default()).map(drop)
@@ -1193,32 +1193,89 @@ fn a_clean_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
     assert!(msg.contains("not inactive"), "{msg}");
 }
 
-/// What `systemctl show --property CanClean` says of a timer: `state` when it is `Persistent=`, and
-/// nothing when it is not.
+/// A timer's stamp is cleared only by an arm that finds the timer inactive and `CanClean` naming
+/// `state`: `Persistent=` on, and no run of the timer in flight to refuse the clean.
 #[skuld::test]
-fn a_timer_keeps_a_stamp_when_it_can_be_cleaned_of_state() {
-    for (can_clean, keeps) in [("state", true), ("", false), ("cache state", true), ("cache", false)] {
-        let answer = format!("CanClean={can_clean}\nLoadState=loaded\n");
+fn a_timer_s_stamp_is_clearable_when_it_is_inactive_and_can_be_cleaned_of_state() {
+    for (can_clean, active, clearable) in [
+        ("state", "inactive", true),
+        ("cache state", "inactive", true),
+        ("state", "active", false),
+        ("state", "failed", false),
+        ("", "inactive", false),
+        ("cache", "inactive", false),
+    ] {
+        let answer = format!("CanClean={can_clean}\nActiveState={active}\nLoadState=loaded\n");
         assert_eq!(
-            showing(&answer).timer_keeps_stamp("x").expect(can_clean),
-            keeps,
-            "{can_clean:?}"
+            showing(&answer).timer_stamp_clearable("x").expect(&answer),
+            clearable,
+            "{can_clean:?} {active:?}"
         );
     }
 }
 
 #[skuld::test]
-fn the_timer_is_asked_whether_it_keeps_a_stamp_by_its_own_name() {
-    let fake = Fake::new([reply(&["show"], exited(0, "CanClean=state\nLoadState=loaded\n", ""))]);
+fn the_timer_is_asked_about_its_stamp_by_its_own_name_in_one_show() {
+    let fake = Fake::new([timer_shows("state", "inactive")]);
 
     on_booted(fake.clone())
-        .timer_keeps_stamp("x")
-        .expect("timer_keeps_stamp");
+        .timer_stamp_clearable("x")
+        .expect("timer_stamp_clearable");
 
     assert_eq!(
         fake.calls(),
-        [["show", "--property", "CanClean,LoadState", "--", "x.timer"]]
+        [["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"]]
     );
+}
+
+fn timer_shows(can_clean: &str, active: &str) -> Entry {
+    reply(
+        &["show"],
+        exited(
+            0,
+            &format!("CanClean={can_clean}\nActiveState={active}\nLoadState=loaded\n"),
+            "",
+        ),
+    )
+}
+
+/// Arming asks the gate, then one `show`; an inactive timer that keeps a stamp is cleaned before it is
+/// enabled now, and nothing else is.
+#[skuld::test]
+fn arming_a_stopped_timer_cleans_its_stamp_before_enabling_it_now() {
+    let fake = gate_then([
+        timer_shows("state", "inactive"),
+        reply(&["clean"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+    ]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    assert_eq!(
+        fake.calls().into_iter().skip(2).collect::<Vec<_>>(),
+        [
+            vec!["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"],
+            vec!["clean", "--what=state", "--", "x.timer"],
+            vec!["enable", "--now", "--", "x.timer"],
+        ]
+    );
+}
+
+/// A timer whose `Persistent=` is off (a drop-in) keeps no stamp the manager reads, and `clean` of it
+/// fails: it is not asked to.
+#[skuld::test]
+fn arming_a_timer_that_keeps_no_stamp_does_not_clean() {
+    let fake = gate_then([timer_shows("", "inactive"), reply(&["enable"], exited(0, "", ""))]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    let calls: Vec<_> = fake.calls().into_iter().skip(2).collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[1], ["enable", "--now", "--", "x.timer"]);
 }
 
 /// Decision 15: a run in flight is `Running` in any of its three states, and a job between runs is
@@ -1338,9 +1395,9 @@ fn a_client_243_or_newer_is_supported() {
 }
 
 /// systemd 240 and 241 parse `Type=exec`; only `--show-transaction` is missing, and the refusal
-/// must say that and nothing more.
+/// must say that and that they lack `clean` of a timer, and not `Type=exec`.
 #[skuld::test]
-fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
+fn systemd_240_and_241_are_refused_for_show_transaction_and_clean() {
     for (source, version, reported) in [
         (Source::Manager, "241.7-1", "241"),
         (Source::Manager, "240", "240"),
@@ -1350,6 +1407,7 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
         assert!(msg.contains("requires systemd 243 or newer"), "{msg}");
         assert!(msg.contains(&format!(" {reported}")), "{msg}");
         assert!(msg.contains("--show-transaction"), "{msg}");
+        assert!(msg.contains("clean"), "{msg}");
         assert!(!msg.contains("Type=exec"), "{version} parses Type=exec: {msg}");
     }
 }

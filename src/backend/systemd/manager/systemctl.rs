@@ -793,7 +793,7 @@ impl Systemctl {
 
     /// `systemctl enable --now` for `id`'s timer: the schedule is armed at boot and now. The task's
     /// own unit is never enabled: it has no `[Install]`, and boot does not start it.
-    pub(super) fn enable_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+    fn enable_timer(&self, id: &str, held: &mut Held) -> Result<()> {
         self.unit_file_verb(&["enable", "--now"], id, UnitKind::Timer, held)
     }
 
@@ -803,20 +803,38 @@ impl Systemctl {
         self.unit_file_verb(&["disable", "--now"], id, UnitKind::Timer, held)
     }
 
-    /// `systemctl clean --what=state` for `id`'s timer: its stamp (`/var/lib/systemd/timers/stamp-*`),
-    /// which is what makes a timer with `Persistent=yes` start at once for a time it missed. Systemd
-    /// refuses a timer that is not inactive, so this follows `disable --now`.
-    pub(super) fn clean_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+    /// `id`'s timer armed, and the one way goetia arms one. Its stamp (the time it last elapsed, which
+    /// `Persistent=yes` reads) is cleared first when the timer is inactive and has one: a timer being
+    /// armed was disarmed, so a time its schedule named since was missed while disarmed, not while the
+    /// machine was off, and the stamp would start the job at once for it. An active timer is armed
+    /// already, `clean` refuses it, and its stamp is the catch-up of a downtime. That holds for a timer
+    /// disarmed by `disable --now`; a timer stopped by hand with `systemctl stop` stays loaded with
+    /// systemd's own memory of its last elapse, which the clean does not reach.
+    /// Asks the gate before the `show`, which reads a property older systemd lacks.
+    pub(super) fn arm_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.require_supported(held)?;
+        if self.timer_stamp_clearable(id)? {
+            self.clean_timer(id, held)?;
+        }
+        self.enable_timer(id, held)
+    }
+
+    /// `systemctl clean --what=state` for `id`'s timer: its stamp (`/var/lib/systemd/timers/stamp-*`).
+    /// Systemd refuses a timer that is not inactive. Only [`Systemctl::arm_timer`] runs it.
+    fn clean_timer(&self, id: &str, held: &mut Held) -> Result<()> {
         self.unit_file_verb(&["clean", "--what=state"], id, UnitKind::Timer, held)
     }
 
-    /// Whether `id`'s timer keeps a stamp to clean: its `CanClean` says `state`. A timer whose
-    /// `Persistent=` is off (a drop-in can do it) lists nothing, and `clean` of it fails.
-    pub(super) fn timer_keeps_stamp(&self, id: &str) -> Result<bool> {
-        let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["CanClean"])?;
-        Ok(props
+    /// Whether `id`'s timer is inactive and keeps a stamp to clean, in one `show`: its `CanClean` says
+    /// `state`. A timer whose `Persistent=` is off (a drop-in can do it) lists nothing, and `clean` of
+    /// it fails.
+    fn timer_stamp_clearable(&self, id: &str) -> Result<bool> {
+        let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["CanClean", "ActiveState"])?;
+        let inactive = props.get("ActiveState").is_some_and(|state| state == "inactive");
+        let keeps_stamp = props
             .get("CanClean")
-            .is_some_and(|what| what.split_whitespace().any(|word| word == "state")))
+            .is_some_and(|what| what.split_whitespace().any(|word| word == "state"));
+        Ok(inactive && keeps_stamp)
     }
 
     fn unit_file_verb(&self, head: &[&str], id: &str, kind: UnitKind, held: &mut Held) -> Result<()> {

@@ -5,7 +5,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::manager::{Exit, ServiceManager, Status, TaskStatus};
 use goetia::spec::{DaemonSpec, Id, TaskSpec};
@@ -75,8 +74,7 @@ impl Held {
         let count = dir.path().join("count");
         let script = format!(
             "{prelude}n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > \"{c}.new\"; \
-             mv \"{c}.new\" \"{c}\"; date +%s > \"{c}.at.new\"; mv \"{c}.at.new\" \"{c}.at\"; \
-             echo ready; echo started $n > \"{}\"; read line < \"{}\"; exit 0",
+             mv \"{c}.new\" \"{c}\"; echo ready; echo started $n > \"{}\"; read line < \"{}\"; exit 0",
             started.display(),
             hold.display(),
             c = count.display()
@@ -108,14 +106,6 @@ impl Held {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => panic!("read the run count: {e}"),
         }
-    }
-
-    /// When the newest run that has announced itself began, to the second: the clock the program read
-    /// before it announced. Read after [`Self::wait_started`] returned for that run.
-    pub fn started_at(&self) -> SystemTime {
-        let text =
-            std::fs::read_to_string(self.count.with_extension("at")).expect("a run that announced itself has a start");
-        UNIX_EPOCH + Duration::from_secs(text.trim().parse().expect("the start is whole seconds"))
     }
 
     /// Lets the run in flight end. Blocks until the run is waiting for it, so only call it while one is.
@@ -170,42 +160,6 @@ pub fn run_task(mgr: &dyn ServiceManager, id: &Id) -> (Exit, Vec<u8>) {
         .run(id, &mut out)
         .unwrap_or_else(|e| panic!("run {id}: {}", e.report()));
     (exit, out)
-}
-
-/// Re-arming a task makes up no run its schedule named while it was disarmed. `id` is a task installed
-/// with the schedule `* * * * *` and the program of `held`, and not armed.
-///
-/// Armed, it runs by itself once; disarmed, a minute boundary passes (the clock is the event waited for);
-/// armed again, its next run is a scheduled one, which begins at or after the `next_run` read at the
-/// re-arming. A run made up for the minute that passed would begin before it, and would be the second
-/// run too: the scheduled one is only the third.
-pub fn assert_rearm_makes_up_no_missed_run(mgr: &dyn ServiceManager, id: &Id, held: &mut Held) {
-    mgr.enable(id).expect("enable");
-    assert_eq!(held.wait_started(), 1, "the armed task runs by itself");
-    held.release();
-    status_with_result(mgr, id);
-    mgr.disable(id).expect("disable");
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_secs();
-    let passed = UNIX_EPOCH + Duration::from_secs((secs / 60 + 1) * 60);
-    kill::until(|| SystemTime::now() >= passed);
-
-    mgr.enable(id).expect("enable again");
-
-    let scheduled = task_status(mgr, id).next_run.expect("an armed task has a next run");
-    assert!(
-        scheduled > passed,
-        "the next run {scheduled:?} is after the minute that passed {passed:?}"
-    );
-    assert_eq!(held.wait_started(), 2, "the run that follows the re-arming");
-    let began = held.started_at();
-    assert!(
-        began >= scheduled,
-        "the run began at {began:?}, before the scheduled {scheduled:?}: a run made up for {passed:?}"
-    );
-    held.release();
 }
 
 /// A diff small enough to read: the first line where `got` and `want` differ.

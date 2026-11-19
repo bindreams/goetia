@@ -5,7 +5,7 @@ pub mod generate;
 pub mod manager;
 
 /// The oldest systemd goetia runs against: `systemctl clean` works on a timer from 243. A task's
-/// `disable` and `uninstall` use it to clear the timer's stamp (see `manager::task`).
+/// `enable` uses it to clear the timer's stamp (see `manager::task`).
 pub(crate) const SYSTEMD_FLOOR: u32 = 243;
 
 /// The oldest systemd whose `systemctl` has `--show-transaction`, which every start and stop runs.
