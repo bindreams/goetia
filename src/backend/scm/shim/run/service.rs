@@ -29,7 +29,7 @@ use windows_sys::Win32::System::Services::{
 
 use super::exit;
 use super::logging::Log;
-use super::os::{Os, Real, Spawned, spawn_error_code};
+use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
@@ -45,7 +45,7 @@ pub(super) const TABLE_NAME: &str = "goetia-shim";
 /// (`super::run` did, to choose this mode): the service name comes from SCM.
 pub(crate) fn run() -> ! {
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
-        Log::real().failure(TABLE_NAME, &dispatcher_failure(e));
+        Log::real(Arc::default()).failure(TABLE_NAME, &dispatcher_failure(e));
         exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
     exit::end_when_dispatched()
@@ -55,9 +55,12 @@ define_windows_service!(ffi_service_main, service_main);
 
 /// SCM's arguments to `ServiceMain`: the first is the service's name.
 fn service_main(scm_args: Vec<OsString>) {
-    let log = Arc::new(Log::real());
+    // One `Real` for the run: the supervisor's `Os` and the log's channels share the handle held on the default log.
+    let real = Arc::new(Real::default());
+    let log = Arc::new(Log::real(Arc::clone(&real)));
+    exit::keep_log(Arc::clone(&log));
     match service_name(&log, &scm_args) {
-        Ok(id) => run_service(id, log),
+        Ok(id) => run_service(id, log, real),
         Err(code) => exit::end_process(code),
     }
 }
@@ -76,8 +79,13 @@ fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32>
         })
 }
 
-fn run_service(id: &str, log: Arc<Log>) {
-    let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
+fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
+    // Before the control handler, and so before the first status this service reports: an install that changes
+    // the account leaves the log's permissions as they are while SCM reads this service `START_PENDING`, and
+    // narrows them once it reads any other state, since a handle opened now keeps working.
+    log.hold_default(id);
+    exit::name_run(id);
+    let supervisor = Supervisor::new(real, Arc::clone(&log));
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
@@ -106,10 +114,10 @@ fn run_service(id: &str, log: Arc<Log>) {
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
 
-/// From now on the shim's failures go to the daemon's own log (the default one when `spec` sets no
-/// `logs`), interleaved with its output. Call right after the spec decodes.
+/// From now on the shim's failures go to the daemon's own log, interleaved with its output: the spec's
+/// `logs`, tried before the default. Call right after the spec decodes.
 pub(super) fn set_daemon_log(log: &Log, id: &str, spec: &DaemonSpec) {
-    if let Some(path) = log.daemon_log_path(id, spec.common().logs.as_deref()) {
+    if let Some((path, LogKind::Own)) = log.daemon_log(id, spec.common().logs.as_deref()) {
         log.set_daemon_log(path);
     }
 }
@@ -582,14 +590,6 @@ fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running
 const NO_LOG_FILE: &str =
     "no log file for this daemon's output (no `logs:`, and no default log directory); it is still being run";
 
-fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
-    format!(
-        "open log file {}: {} (this daemon's output will not be captured; it is still being run)",
-        path.display(),
-        Chain(e)
-    )
-}
-
 /// A stdio assignment `build_command` expects never to fail: asserted in debug builds, logged in
 /// release, where the daemon then runs with that stream unredirected.
 fn stdio_set<T, E: std::error::Error + 'static>(log: &Log, id: &str, assigned: Result<T, E>) {
@@ -618,13 +618,14 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
     cmd.contain();
 
     let logs = spec.common().logs.as_deref();
-    // `Err(None)`: no file, by design.
+    // `Err(None)`: no file, by design, or a failed open that `Log::open_failed` has told.
     let opened = match (spec, logs) {
         (DaemonSpec::Task(_), None) => Err(None),
-        (_, logs) => match log.daemon_log_path(id, logs) {
-            Some(path) => os
-                .open_log(&path, log.parents_of(id, &path))
-                .map_err(|e| Some(log_open_failed(&path, &e))),
+        (_, logs) => match log.daemon_log(id, logs) {
+            Some((path, kind)) => os.open_log(&path, kind).map_err(|e| {
+                log.open_failed(id, &path, &e);
+                None
+            }),
             None => Err(Some(NO_LOG_FILE.to_string())),
         },
     };

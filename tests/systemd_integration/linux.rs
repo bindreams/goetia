@@ -1040,7 +1040,7 @@ fn this_hosts_systemd_is_supported(#[fixture(systemd_group)] _group: &Group) {
 
     let outcome = Systemd::new()
         .install(&mk(guard.id()), false)
-        .expect("the host running the tests runs systemd 242+");
+        .expect("the host running the tests runs systemd 243+");
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
 }
 
@@ -1082,10 +1082,10 @@ fn goetia_on_systemd(manager: u32, client: u32, args: &[&str]) -> std::process::
         .expect("spawn goetia")
 }
 
-/// Below systemd 242 goetia refuses before it writes a unit or runs a start or stop — rather than
-/// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, or fail every start
-/// and stop on an unrecognized option. The running systemd and the client each count: an old one
-/// is refused next to a new other, and named.
+/// Below systemd 243 goetia refuses before it writes a unit or runs a start or stop — rather than
+/// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, fail every start
+/// and stop on an unrecognized option, or fail a task's `disable` for want of `clean` on a timer. The
+/// running systemd and the client each count: an old one is refused next to a new other, and named.
 #[skuld::test]
 fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1095,13 +1095,15 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(syste
     let versions = [
         (241, 257, "The running systemd is 241"),
         (257, 241, "The `systemctl` client is 241"),
+        (242, 257, "The running systemd is 242"),
+        (257, 242, "The `systemctl` client is 242"),
     ];
     let refused = |args: &[&str]| {
         for (manager, client, named) in versions {
             let output = goetia_on_systemd(manager, client, args);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
-            assert!(stderr.contains("requires systemd 242 or newer"), "{args:?}: {stderr}");
+            assert!(stderr.contains("requires systemd 243 or newer"), "{args:?}: {stderr}");
             assert!(stderr.contains(named), "{args:?}: {stderr}");
         }
     };
@@ -1154,7 +1156,7 @@ fn a_running_systemd_that_cannot_be_asked_is_refused(#[fixture(systemd_group)] _
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("cannot tell whether the running systemd is 242+"),
+        stderr.contains("cannot tell whether the running systemd is 243+"),
         "{stderr}"
     );
     // systemctl's own words, up to where versions and hosts differ: 257 says "Failed to connect to

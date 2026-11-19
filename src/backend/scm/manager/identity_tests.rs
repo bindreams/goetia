@@ -393,3 +393,34 @@ fn an_input_code_is_an_account_lookup_and_any_other_code_is_an_os_failure() {
     );
     assert!(matches!(err, Error::Os { .. }), "{err:?}");
 }
+
+// service_account_sid =================================================================================================
+
+/// A service with no account, and every spelling of a built-in that goetia registers or Windows reads back,
+/// runs as that built-in's well-known SID, with no lookup.
+#[skuld::test]
+fn a_services_built_in_account_is_its_well_known_sid() {
+    for (account, sid) in [
+        (None, system()),
+        (Some("LocalSystem"), system()),
+        (Some(r"NT AUTHORITY\LocalService"), sid_from_parts(5, &[19])),
+        (Some(r"nt authority\local service"), sid_from_parts(5, &[19])),
+        (Some(r"NT AUTHORITY\NetworkService"), sid_from_parts(5, &[20])),
+        (Some("NetworkService"), sid_from_parts(5, &[20])),
+    ] {
+        assert_eq!(service_account_sid(account, None).unwrap(), sid, "{account:?}");
+    }
+}
+
+/// A spec that gave a SID names that SID, as the logon gate does: the account name it registers is not
+/// looked up again, which could name another account.
+#[skuld::test]
+fn a_service_whose_spec_gave_a_sid_is_that_sid_with_no_lookup() {
+    let users = sid_from_parts(5, &[32, 545]);
+
+    let sid = service_account_sid(Some("no-such-account-goetia"), Some(Written::Sid("S-1-5-32-545")));
+
+    assert_eq!(sid.unwrap(), users);
+    let built_in = service_account_sid(Some("NetworkService"), Some(Written::Name("NetworkService")));
+    assert_eq!(built_in.unwrap(), sid_from_parts(5, &[20]));
+}

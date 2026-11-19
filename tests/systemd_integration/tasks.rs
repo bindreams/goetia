@@ -322,9 +322,185 @@ fn the_rendered_on_calendar_fires_at_the_resolved_fields(#[fixture(systemd_group
     }
 }
 
-/// An install that changes the schedule of an armed task is enough to move its next run.
+/// Where systemd keeps the stamp of `id`'s timer.
+fn stamp_path(id: &str) -> PathBuf {
+    PathBuf::from(support::SYSTEMD_STAMP_DIR).join(format!("stamp-{id}.timer"))
+}
+
+/// A daily schedule (cron text) at the local time `when` names, in `date -d` words.
+fn daily_at(when: &str) -> String {
+    let at = cmd::run("date", &["-d", when, "+%-M %-H"]).expect_ok().stdout;
+    format!("{} * * *", at.trim())
+}
+
+/// Gives `id`'s timer a stamp from two hours ago, so a schedule time since then is a missed one.
+fn plant_stale_stamp(id: &str) {
+    cmd::run("touch", &["-d", "-2 hours", &stamp_path(id).to_string_lossy()]).expect_ok();
+}
+
+/// When systemd last elapsed `id`'s timer, as it holds it now: empty for a timer that remembers no
+/// elapse. Starting a timer loads it from the stamp, and a run made up for a missed time sets it, so an
+/// empty answer after an arm is the proof that neither happened, with no wait for a run that did not come.
+fn last_trigger(id: &str) -> String {
+    let shown = cmd::run(
+        "systemctl",
+        &["show", "--property=LastTriggerUSec", "--value", &format!("{id}.timer")],
+    );
+    shown.expect_ok().stdout.trim().to_string()
+}
+
+/// Arming a task again makes up no run its schedule named while goetia's `disable` had it disarmed: the
+/// arm clears the timer's stamp first, and the timer then remembers no elapse and waits for the next
+/// time its schedule names. The stamp is planted two hours old, and the schedule's time was a minute ago.
 #[skuld::test]
-fn install_over_a_task_with_a_changed_schedule_rearms_it(#[fixture(systemd_group)] _group: &Group) {
+fn arming_a_disabled_task_makes_up_no_run_for_the_time_it_was_disarmed(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let task_id = id_of(&id);
+    let mgr = Systemd::new();
+    let schedule = daily_at("-1 min");
+    mgr.install(&task(&id, vec!["/bin/true".to_string()], Some(&schedule)), false)
+        .expect("install");
+    mgr.enable(&task_id).expect("enable");
+    mgr.disable(&task_id).expect("disable");
+    plant_stale_stamp(&id);
+
+    let before = SystemTime::now();
+    mgr.enable(&task_id).expect("enable again");
+    let status = task_status(&mgr, &task_id);
+    let after = SystemTime::now();
+
+    assert_eq!(
+        last_trigger(&id),
+        "",
+        "the timer remembers no elapse: nothing was made up"
+    );
+    assert!(status.common.enabled, "{status:?}");
+    assert_next_run(&status, &schedule, &task_id, before, after);
+}
+
+/// A stamp that `uninstall` leaves behind (systemd keeps it when the timer's file goes) is cleared by
+/// the next arm of that id, which is the arm of a new install.
+#[skuld::test]
+fn a_stamp_left_by_uninstall_is_cleared_by_the_next_arm_of_the_id(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let task_id = id_of(&id);
+    let mgr = Systemd::new();
+    let schedule = daily_at("-1 min");
+    let spec = task(&id, vec!["/bin/true".to_string()], Some(&schedule));
+    mgr.install(&spec, false).expect("install");
+    mgr.enable(&task_id).expect("enable");
+    mgr.uninstall(&task_id).expect("uninstall");
+    assert!(stamp_path(&id).exists(), "systemd keeps the stamp: the precondition");
+    plant_stale_stamp(&id);
+
+    mgr.install(&spec, false).expect("install again");
+    let before = SystemTime::now();
+    mgr.enable(&task_id).expect("enable");
+    let status = task_status(&mgr, &task_id);
+    let after = SystemTime::now();
+
+    // A catch-up is dispatched after `enable` returns, so read the next run, which is absent while one
+    // is being made up.
+    assert_next_run(&status, &schedule, &task_id, before, after);
+    assert_eq!(
+        last_trigger(&id),
+        "",
+        "the timer remembers no elapse: nothing was made up"
+    );
+}
+
+/// An active timer is armed already: `enable` leaves its stamp, and with it the catch-up of a downtime.
+/// The schedule names a time twelve hours away, which the test cannot reach: a time elapsing in it would
+/// rewrite the stamp.
+#[skuld::test]
+fn enable_of_an_armed_task_leaves_its_stamp(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let task_id = id_of(&id);
+    let mgr = Systemd::new();
+    let far = daily_at("+12 hours");
+    mgr.install(&task(&id, vec!["/bin/true".to_string()], Some(&far)), false)
+        .expect("install");
+    mgr.enable(&task_id).expect("enable");
+    let before = fs::metadata(stamp_path(&id))
+        .and_then(|m| m.modified())
+        .expect("an armed timer has a stamp");
+
+    mgr.enable(&task_id).expect("enable of an armed task");
+
+    let after = fs::metadata(stamp_path(&id))
+        .and_then(|m| m.modified())
+        .expect("the stamp");
+    assert_eq!(before, after, "the stamp is the one it was");
+}
+
+/// A timer whose `Persistent=` an administrator turned off keeps no stamp, and systemd refuses to clean
+/// it: arming it asks nothing of `clean`, and `disable` and `uninstall` still work.
+#[skuld::test]
+fn a_timer_with_persistence_turned_off_still_arms_disarms_and_uninstalls(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let task_id = id_of(&id);
+    let mgr = Systemd::new();
+    mgr.install(&exiting(&id, 0), false).expect("install");
+    let dropin = PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.timer.d"));
+    fs::create_dir(&dropin).expect("a drop-in directory");
+    fs::write(dropin.join("override.conf"), "[Timer]\nPersistent=no\n").expect("a drop-in");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+
+    mgr.enable(&task_id).expect("enable");
+    assert!(task_status(&mgr, &task_id).common.enabled);
+    mgr.disable(&task_id).expect("disable");
+    assert!(!task_status(&mgr, &task_id).common.enabled);
+    mgr.enable(&task_id).expect("enable again");
+    mgr.uninstall(&task_id).expect("uninstall");
+    assert!(!timer_path(&id).exists());
+}
+
+/// An install that moves an armed task's schedule to a time between the timer's last elapse and now makes
+/// up no run: the timer is disarmed, written, reloaded and armed again (a reload alone would start the
+/// job at once), and it waits for the new schedule's next time. The armed timer is given a last elapse
+/// two hours old by arming it by hand over a stale stamp; goetia's own arm would clear that.
+#[skuld::test]
+fn install_over_an_armed_task_with_a_schedule_already_past_makes_up_no_run(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let task_id = id_of(&id);
+    let mgr = Systemd::new();
+    let command = vec!["/bin/true".to_string()];
+    mgr.install(&task(&id, command.clone(), Some(&daily_at("+1 hour"))), false)
+        .expect("install");
+    plant_stale_stamp(&id);
+    cmd::run("systemctl", &["enable", "--now", &format!("{id}.timer")]).expect_ok();
+    assert_ne!(
+        last_trigger(&id),
+        "",
+        "the precondition: an armed timer that remembers an elapse"
+    );
+
+    let schedule = daily_at("-1 min");
+    let before = SystemTime::now();
+    let outcome = mgr
+        .install(&task(&id, command, Some(&schedule)), false)
+        .expect("install a new schedule");
+    let status = task_status(&mgr, &task_id);
+    let after = SystemTime::now();
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert_eq!(
+        last_trigger(&id),
+        "",
+        "the timer remembers no elapse: nothing was made up"
+    );
+    assert!(status.common.enabled, "{status:?}");
+    assert_next_run(&status, &schedule, &task_id, before, after);
+}
+
+/// A disabled task's changed schedule is only written: the timer is not armed, so it never starts.
+#[skuld::test]
+fn install_over_a_disabled_task_with_a_changed_schedule_only_writes_it(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let task_id = id_of(&id);
@@ -332,18 +508,16 @@ fn install_over_a_task_with_a_changed_schedule_rearms_it(#[fixture(systemd_group
     let command = vec!["/bin/true".to_string()];
     mgr.install(&task(&id, command.clone(), Some("0 3 * * *")), false)
         .expect("install");
-    mgr.enable(&task_id).expect("enable");
 
-    let before = SystemTime::now();
     let outcome = mgr
         .install(&task(&id, command, Some("0 5 * * *")), false)
         .expect("install a new schedule");
-    let status = task_status(&mgr, &task_id);
-    let after = SystemTime::now();
 
     assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
-    assert!(status.common.enabled, "{status:?}");
-    assert_next_run(&status, "0 5 * * *", &task_id, before, after);
+    let status = task_status(&mgr, &task_id);
+    assert!(!status.common.enabled, "{status:?}");
+    assert_eq!(status.next_run, None, "{status:?}");
+    assert!(!stamp_path(&id).exists(), "the timer never started");
 }
 
 /// A task with its schedule dropped has no timer to fire, and the timer it had is gone and not running.

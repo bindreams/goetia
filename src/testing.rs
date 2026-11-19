@@ -58,6 +58,13 @@ pub fn program_data() -> PathBuf {
         .unwrap_or_else(|e| panic!("cannot locate %ProgramData%: {}", e.report()))
 }
 
+/// The version marker every service host carries and an install checks for, which a program that is no host
+/// (a test binary a test installs as one) is given by appending it.
+#[cfg(windows)]
+pub fn host_marker() -> Vec<u8> {
+    crate::backend::scm::shim::marker::MARKER.to_vec()
+}
+
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
 /// a test never takes a placeholder for a SID.
 #[cfg(windows)]
@@ -90,6 +97,23 @@ pub fn remove_task(id: &Id) {
 
 #[cfg(windows)]
 pub use crate::backend::scm::shim::acl::{Ace, Dacl, kernel_object_dacl};
+
+/// The DACL of the file or folder `path`, as an install reads one, not following a link at it.
+#[cfg(windows)]
+pub fn file_dacl(path: &std::path::Path) -> Result<Dacl> {
+    let security = crate::backend::scm::shim::acl::read_path(path)?;
+    Ok(Dacl {
+        protected: security.protected,
+        aces: security.dacl,
+    })
+}
+
+/// The binary SID with `authority` as its identifier authority and `subauthorities` after it, as an
+/// [`Ace`] names its trustee.
+#[cfg(windows)]
+pub fn sid_of(authority: u8, subauthorities: &[u32]) -> Vec<u8> {
+    crate::backend::scm::sid::sid_from_parts(authority, subauthorities)
+}
 #[cfg(windows)]
 pub use crate::backend::scm::wide::{units_until_nul, wide_null};
 

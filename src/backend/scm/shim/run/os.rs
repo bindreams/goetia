@@ -2,15 +2,18 @@
 //! [`Os`], [`Spawned`] and [`Channels`] instead of `cosca`, `std::thread` and the file system.
 //! [`Real`] implements them; tests use `fake::Fake`.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use cosca::Containment;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
+use crate::backend::scm::default_log;
 use crate::backend::unreaped::release_unreaped;
 use crate::error::os_error_in;
 
@@ -25,19 +28,21 @@ pub(crate) trait Os: Send + Sync {
     /// Run `f` on a new thread named `name`; the OS may refuse.
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>;
 
-    /// Open the file at `path` for appending, making its missing parent directories as `parents`
-    /// says. It is the daemon's log: the daemon's output is redirected into it.
-    fn open_log(&self, path: &Path, parents: Parents) -> io::Result<File>;
+    /// Open the file at `path` for appending, as `kind` says. It is the daemon's log: the daemon's output is
+    /// redirected into it. The default log is the handle the shim holds on it, so the daemon's output
+    /// and the shim's own lines share one file until that file is deleted.
+    fn open_log(&self, path: &Path, kind: LogKind) -> io::Result<File>;
 }
 
-/// Whether opening a log file makes the folders above it that are missing. The shim makes none under
-/// `%ProgramData%\Goetia`, which an elevated install made (and judged) for it: its default log is opened
-/// with [`Parents::Never`]. A `logs:` path of the daemon's own is the user's to name, so its folders are
-/// made ([`Parents::Create`]).
+/// Which log a file is, which decides how the shim opens it. The default log,
+/// `%ProgramData%\Goetia\logs\<id>.log`, is an elevated install's: it made the folder and the file, and
+/// judged them, so the shim makes nothing there and opens the file for appending alone
+/// ([`LogKind::Default`]). A `logs:` path of the daemon's own is the user's to name, so its folders and the
+/// file are made ([`LogKind::Own`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Parents {
-    Create,
-    Never,
+pub(crate) enum LogKind {
+    Own,
+    Default,
 }
 
 /// A spawned daemon. Dropping it kills its tree, as `cosca::Child` does; a kill the OS refuses is
@@ -67,18 +72,51 @@ pub(crate) enum Severity {
 
 /// Where the shim's failure and warning lines go.
 pub(crate) trait Channels: Send + Sync {
-    /// Append `line` and a newline to the file at `path`, making its missing parent directories as
-    /// `parents` says. The line is written in one `write`, so output another handle appends to the same
+    /// Opens the default log at `path` as [`LogKind::Default`] and holds it for the run, so later appends and
+    /// `open_log` of that path share one handle that survives an install taking the account out of the file's
+    /// permissions. Held again by path if the file was deleted. Nothing is held if it cannot be opened.
+    fn hold_default(&self, path: &Path) -> io::Result<()>;
+
+    /// Append `line` and a newline to the file at `path`, opening it as `kind` says (the held default log is
+    /// not opened again). The line is written in one `write`, so output another handle appends to the same
     /// file cannot split it.
-    fn append(&self, path: &Path, line: &str, parents: Parents) -> io::Result<()>;
+    fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()>;
 
     /// Report `line` to the Windows Event Log as `severity`. Best-effort: this is itself a
     /// failure-reporting path.
     fn event_log(&self, severity: Severity, line: &str);
 }
 
-/// The production implementation of all three traits.
-pub(crate) struct Real;
+/// The production implementation of all three traits. One `Real` serves one shim: the [`Os`] and the
+/// [`Channels`] of a run are the same value, so they share the one handle held on the default log.
+#[derive(Default)]
+pub(crate) struct Real {
+    /// The default logs [`Channels::hold_default`] opened (or a use did), by path: one handle for each, kept for the
+    /// run, so a use of another path never gives up this one.
+    held: Mutex<HashMap<PathBuf, Arc<File>>>,
+}
+
+impl Real {
+    /// The default log at `path` through the handle held on it: the one [`Channels::hold_default`] opened,
+    /// unless its file has been deleted (the handle is then released) or none is held; then the path is opened
+    /// ([`default_log::open_for_append`], which makes nothing) and that handle is held. The new handle is held by
+    /// the same call that made it, so two uses at once cannot each open one.
+    fn default_log(&self, path: &Path) -> io::Result<Arc<File>> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(file) = held.get(path) {
+            if !default_log::is_deleted(file)? {
+                return Ok(Arc::clone(file));
+            }
+            // Released first: where the delete is not a POSIX one, a handle on the deleted file keeps its name
+            // and blocks the install's remake. A daemon's output handle is a clone of this one, and a new file made
+            // meanwhile is not what it writes.
+            held.remove(path);
+        }
+        let file = Arc::new(default_log::open_for_append(path)?);
+        held.insert(path.to_path_buf(), Arc::clone(&file));
+        Ok(file)
+    }
+}
 
 impl Os for Real {
     fn spawn(&self, mut cmd: cosca::Command) -> Result<Box<dyn Spawned>, cosca::error::Error> {
@@ -89,8 +127,11 @@ impl Os for Real {
         std::thread::Builder::new().name(name.to_string()).spawn(f)
     }
 
-    fn open_log(&self, path: &Path, parents: Parents) -> io::Result<File> {
-        open_append(path, parents)
+    fn open_log(&self, path: &Path, kind: LogKind) -> io::Result<File> {
+        match kind {
+            LogKind::Default => self.default_log(path)?.try_clone(),
+            LogKind::Own => open_own(path),
+        }
     }
 }
 
@@ -113,8 +154,15 @@ impl Spawned for cosca::Child {
 }
 
 impl Channels for Real {
-    fn append(&self, path: &Path, line: &str, parents: Parents) -> io::Result<()> {
-        append_line(&mut open_append(path, parents)?, line)
+    fn hold_default(&self, path: &Path) -> io::Result<()> {
+        self.default_log(path).map(drop)
+    }
+
+    fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
+        match kind {
+            LogKind::Default => append_line(&mut &*self.default_log(path)?, line),
+            LogKind::Own => append_line(&mut open_own(path)?, line),
+        }
     }
 
     fn event_log(&self, severity: Severity, line: &str) {
@@ -135,9 +183,8 @@ pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
     })
 }
 
-/// Open `path` for append, making its parent directories first when `parents` says.
-fn open_append(path: &Path, parents: Parents) -> io::Result<File> {
-    if let (Parents::Create, Some(parent)) = (parents, path.parent()) {
+fn open_own(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     OpenOptions::new().create(true).append(true).open(path)

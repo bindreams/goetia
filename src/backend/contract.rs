@@ -130,6 +130,18 @@ pub(crate) trait Backend {
         reservation: &mut Self::Reservation,
     ) -> Result<WriteOutcome>;
 
+    /// What an install that found the definition up to date still sees to: what a [`Self::write`] makes
+    /// besides the definition, and nothing else would make again if it were gone (SCM's default log, which
+    /// the shim only opens). `snapshot` is what `read` found. A failure fails the install. Nothing by default.
+    fn ensure_beside(
+        &self,
+        _spec: &DaemonSpec,
+        _definition: &Self::Definition,
+        _snapshot: &Self::Snapshot,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether the definition a [`Self::write`] was to leave is in place, read the way
     /// this backend reads one. Asked after every write that did not return [`WriteOutcome::Done`] (which
     /// is known to have landed), failed or not, and only if the write made something to keep or take back. Every backend states it: one whose scope makes nothing says

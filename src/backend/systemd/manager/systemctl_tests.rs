@@ -564,7 +564,7 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
     assert!(matches!(e, Error::RequestInDoubt { reached: false, .. }), "{e:?}");
 }
 
-/// A `daemon-reload` in doubt after `install` wrote the unit stays in doubt — exit `4` — and says
+/// A `daemon-reload` in doubt after `install` wrote the unit stays in doubt, exit `4`, and says
 /// the unit was written; any other failure there is exit `1`, and says so too.
 #[skuld::test]
 fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
@@ -576,7 +576,7 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
         "{e:?}"
     );
     let msg = e.report().to_string();
-    assert!(msg.contains("wrote the unit for `x`"), "{msg}");
+    assert!(msg.contains("the unit file for `x` is on disk"), "{msg}");
     assert!(msg.contains("the wait failed"), "{msg}");
 
     let refused = gate_then([reply(&["daemon-reload"], exited(1, "", "Access denied\n"))]);
@@ -586,7 +586,7 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
     assert!(matches!(e, Error::Step { .. }), "{e:?}");
     assert!(!e.is_indeterminate(), "{e:?}");
     let msg = e.report().to_string();
-    assert!(msg.contains("wrote the unit for `x`"), "{msg}");
+    assert!(msg.contains("the unit file for `x` is on disk"), "{msg}");
     assert!(msg.contains("Access denied"), "{msg}");
 }
 
@@ -798,6 +798,15 @@ fn every_path() -> Vec<Way> {
         Way::request("disable timer", |s: &Systemctl| {
             s.disable_timer("x", &mut Held::default())
         }),
+        Way::request("clean timer", |s: &Systemctl| s.clean_timer("x", &mut Held::default())),
+        Way::request("reset-failed timer", |s: &Systemctl| {
+            s.reset_timer("x", &mut Held::default())
+        }),
+        Way {
+            name: "show stamp".to_string(),
+            gated: false,
+            run: Box::new(|s: &Systemctl| s.timer_stamp("x").map(drop)),
+        },
         Way::request("start job", |s: &Systemctl| {
             s.start_job("x", &mut Held::default()).map(drop)
         }),
@@ -807,9 +816,9 @@ fn every_path() -> Vec<Way> {
             run: Box::new(|s: &Systemctl| s.task_state("x.service").map(drop)),
         },
         Way {
-            name: "show timer".to_string(),
+            name: "show timer arming".to_string(),
             gated: false,
-            run: Box::new(|s: &Systemctl| s.timer_enabled("x").map(drop)),
+            run: Box::new(|s: &Systemctl| s.timer_arming("x").map(drop)),
         },
     ];
     for budget in [
@@ -1155,6 +1164,238 @@ fn a_timer_verb_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
     assert!(msg.contains("Access denied"), "{msg}");
 }
 
+#[skuld::test]
+fn a_timer_s_stamp_is_cleaned_by_state_and_the_timer_named_after_the_terminator() {
+    let fake = Fake::new([reply(&["clean"], exited(0, "", ""))]);
+
+    on_booted(fake.clone())
+        .clean_timer("-h", &mut gate_held())
+        .expect("clean");
+
+    assert_eq!(fake.calls(), [["clean", "--what=state", "--", "-h.timer"]]);
+}
+
+#[skuld::test]
+fn a_clean_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
+    let fake = gate_then([reply(
+        &["clean"],
+        exited(
+            1,
+            "",
+            "Failed to clean unit x.timer: Unit is not inactive or has pending job.\n",
+        ),
+    )]);
+
+    let msg = on_booted(fake)
+        .clean_timer("x", &mut Held::default())
+        .expect_err("clean")
+        .report()
+        .to_string();
+
+    assert!(msg.contains("`systemctl clean --what=state x.timer` failed"), "{msg}");
+    assert!(msg.contains("not inactive"), "{msg}");
+}
+
+/// A timer's stamp is cleared only by an arm that finds the timer inactive or failed and `CanClean`
+/// naming `state`. A failed timer is reset before its stamp is cleaned: `clean` refuses it.
+#[skuld::test]
+fn a_timer_s_stamp_is_cleared_when_it_is_settled_and_can_be_cleaned_of_state() {
+    for (can_clean, active, expected) in [
+        ("state", "inactive", Stamp::Clean),
+        ("cache state", "inactive", Stamp::Clean),
+        ("state", "failed", Stamp::ResetThenClean),
+        ("state", "active", Stamp::Left),
+        ("", "inactive", Stamp::Left),
+        ("", "failed", Stamp::Left),
+        ("cache", "inactive", Stamp::Left),
+    ] {
+        let answer = format!("CanClean={can_clean}\nActiveState={active}\nLoadState=loaded\n");
+        assert_eq!(
+            showing(&answer).timer_stamp("x").expect(&answer),
+            expected,
+            "{can_clean:?} {active:?}"
+        );
+    }
+}
+
+/// A state arming has no rule for is no "nothing to clean": the arm fails naming it.
+#[skuld::test]
+fn a_timer_in_a_state_arming_does_not_know_is_an_error_naming_it() {
+    for active in ["activating", "deactivating", "maintenance", "reloading"] {
+        let answer = format!("CanClean=state\nActiveState={active}\nLoadState=loaded\n");
+        let msg = showing(&answer)
+            .timer_stamp("x")
+            .expect_err(&answer)
+            .report()
+            .to_string();
+        assert_eq!(
+            msg,
+            format!("failed to arm `x.timer`: found it in state `{active}`, which goetia has no rule for")
+        );
+    }
+}
+
+#[skuld::test]
+fn the_timer_is_asked_about_its_stamp_by_its_own_name_in_one_show() {
+    let fake = Fake::new([timer_shows("state", "inactive")]);
+
+    on_booted(fake.clone()).timer_stamp("x").expect("timer_stamp");
+
+    assert_eq!(
+        fake.calls(),
+        [["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"]]
+    );
+}
+
+fn timer_shows(can_clean: &str, active: &str) -> Entry {
+    reply(
+        &["show"],
+        exited(
+            0,
+            &format!("CanClean={can_clean}\nActiveState={active}\nLoadState=loaded\n"),
+            "",
+        ),
+    )
+}
+
+/// Arming asks the gate, then one `show`; an inactive timer that keeps a stamp is cleaned before it is
+/// enabled now, and nothing else is.
+#[skuld::test]
+fn arming_a_stopped_timer_cleans_its_stamp_before_enabling_it_now() {
+    let fake = gate_then([
+        timer_shows("state", "inactive"),
+        reply(&["clean"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+    ]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    assert_eq!(
+        fake.calls().into_iter().skip(2).collect::<Vec<_>>(),
+        [
+            vec!["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"],
+            vec!["clean", "--what=state", "--", "x.timer"],
+            vec!["enable", "--now", "--", "x.timer"],
+        ]
+    );
+}
+
+/// A failed timer is reset before its stamp is cleaned: `clean` refuses it.
+#[skuld::test]
+fn arming_a_failed_timer_resets_it_then_cleans_its_stamp_before_enabling_it_now() {
+    let fake = gate_then([
+        timer_shows("state", "failed"),
+        reply(&["reset-failed"], exited(0, "", "")),
+        reply(&["clean"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+    ]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    assert_eq!(
+        fake.calls().into_iter().skip(2).collect::<Vec<_>>(),
+        [
+            vec!["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"],
+            vec!["reset-failed", "--", "x.timer"],
+            vec!["clean", "--what=state", "--", "x.timer"],
+            vec!["enable", "--now", "--", "x.timer"],
+        ]
+    );
+}
+
+/// A reset that fails fails the arm in systemd's words, with nothing cleaned or enabled.
+#[skuld::test]
+fn a_failing_reset_fails_the_arm() {
+    let fake = gate_then([
+        timer_shows("state", "failed"),
+        reply(
+            &["reset-failed"],
+            exited(1, "", "Failed to reset failed state of unit x.timer: busy\n"),
+        ),
+    ]);
+
+    let msg = on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect_err("the reset failed")
+        .report()
+        .to_string();
+
+    assert!(msg.contains("`systemctl reset-failed x.timer` failed"), "{msg}");
+    assert_eq!(fake.calls().len(), 4, "the gate's two probes, the show and the reset");
+}
+
+fn timer_not_found() -> Entry {
+    reply(
+        &["show"],
+        exited(0, "CanClean=\nActiveState=inactive\nLoadState=not-found\n", ""),
+    )
+}
+
+/// A timer file written and not reloaded reads `not-found`: the arm reloads and asks again, and still
+/// cleans the stamp.
+#[skuld::test]
+fn arming_a_timer_systemd_has_not_loaded_reloads_asks_again_and_cleans() {
+    let fake = gate_then([
+        timer_not_found(),
+        reply(&["daemon-reload"], exited(0, "", "")),
+        timer_shows("state", "inactive"),
+        reply(&["clean"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+    ]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    let show = vec!["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"];
+    assert_eq!(
+        fake.calls().into_iter().skip(2).collect::<Vec<_>>(),
+        [
+            show.clone(),
+            vec!["daemon-reload"],
+            show,
+            vec!["clean", "--what=state", "--", "x.timer"],
+            vec!["enable", "--now", "--", "x.timer"],
+        ]
+    );
+}
+
+/// A timer systemd cannot see after a reload is still not a state: the arm fails with nothing enabled.
+#[skuld::test]
+fn a_timer_still_not_loaded_after_the_reload_fails_the_arm() {
+    let fake = gate_then([
+        timer_not_found(),
+        reply(&["daemon-reload"], exited(0, "", "")),
+        timer_not_found(),
+    ]);
+
+    let e = on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect_err("not loaded");
+
+    assert!(matches!(e, Error::UnitNotLoaded { .. }), "{e:?}");
+    assert_eq!(fake.calls().len(), 5, "the gate's two probes, show, reload, show");
+}
+
+/// A timer whose `Persistent=` is off (a drop-in) keeps no stamp the manager reads, and `clean` of it
+/// fails: it is not asked to.
+#[skuld::test]
+fn arming_a_timer_that_keeps_no_stamp_does_not_clean() {
+    let fake = gate_then([timer_shows("", "inactive"), reply(&["enable"], exited(0, "", ""))]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    let calls: Vec<_> = fake.calls().into_iter().skip(2).collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[1], ["enable", "--now", "--", "x.timer"]);
+}
+
 /// Decision 15: a run in flight is `Running` in any of its three states, and a job between runs is
 /// `Idle` whether its last run succeeded (`inactive`) or failed (`failed`): a failed run is a
 /// result, not a state. Anything else systemd says is `Unknown`, and never a state it made up.
@@ -1199,17 +1440,72 @@ fn a_task_job_systemd_has_not_loaded_is_not_a_state() {
     assert!(matches!(e, Error::UnitNotLoaded { .. }), "{e:?}");
 }
 
+/// A read is no request: of a unit systemd has not loaded it sends the one `show` and reloads nothing,
+/// so it needs no privilege and no gate.
 #[skuld::test]
-fn a_timer_is_enabled_when_its_unit_file_state_says_so() {
-    for (state, enabled) in [
-        ("enabled", true),
-        ("disabled", false),
-        ("static", false),
-        ("masked", false),
-        ("", false),
+fn a_read_of_a_unit_systemd_has_not_loaded_sends_nothing_else() {
+    let answer = "ActiveState=inactive\nMainPID=0\nUnitFileState=\nInvocationID=\nLoadState=not-found\n";
+    type Read = fn(&Systemctl) -> Result<()>;
+    let reads: [(&str, Read); 4] = [
+        ("status", |s| s.status_from_unit("x.service").map(drop)),
+        ("task", |s| s.task_state("x.service").map(drop)),
+        ("pid", |s| s.main_pid_of("x.service").map(drop)),
+        ("arming", |s| s.timer_arming("x").map(drop)),
+    ];
+    for (name, read) in reads {
+        let fake = Fake::new([reply(&["show"], exited(0, answer, ""))]);
+        let e = read(&on_booted(fake.clone())).expect_err(name);
+        assert!(matches!(e, Error::UnitNotLoaded { .. }), "{name}: {e:?}");
+        assert_eq!(fake.calls().len(), 1, "{name}");
+    }
+}
+
+/// A reload that fails keeps its context: the unit file is on disk and not picked up, and a reload in
+/// doubt stays in doubt.
+#[skuld::test]
+fn a_reload_that_fails_after_a_not_found_keeps_its_context() {
+    let not_found = || {
+        reply(
+            &["show"],
+            exited(0, "CanClean=\nActiveState=inactive\nLoadState=not-found\n", ""),
+        )
+    };
+
+    let e = on_booted(gate_then([not_found(), fail(&["daemon-reload"], lost(false))]))
+        .arm_timer("x", &mut Held::default())
+        .expect_err("injected");
+    assert!(matches!(&e, Error::RequestInDoubt { .. }), "{e:?}");
+    let msg = e.report().to_string();
+    assert!(msg.contains("the unit file for `x` is on disk"), "{msg}");
+    assert!(!msg.contains("wrote"), "{msg}");
+
+    let e = on_booted(gate_then([
+        not_found(),
+        reply(&["daemon-reload"], exited(1, "", "Access denied\n")),
+    ]))
+    .arm_timer("x", &mut Held::default())
+    .expect_err("refused");
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(e.report().to_string().contains("Access denied"));
+}
+
+/// A timer is enabled when its unit file state says so, and active when its `ActiveState` does; the
+/// two are read apart: goetia's own `disable --now` can leave it active and not enabled.
+#[skuld::test]
+fn a_timer_s_activity_and_its_link_are_read_apart() {
+    for (active, state, expected) in [
+        ("active", "enabled", (true, true)),
+        ("active", "disabled", (true, false)),
+        ("inactive", "enabled", (false, true)),
+        ("inactive", "disabled", (false, false)),
+        ("failed", "disabled", (false, false)),
+        ("inactive", "static", (false, false)),
+        ("inactive", "masked", (false, false)),
+        ("inactive", "", (false, false)),
     ] {
-        let answer = format!("UnitFileState={state}\nLoadState=loaded\n");
-        assert_eq!(showing(&answer).timer_enabled("x").expect(state), enabled, "{state:?}");
+        let answer = format!("ActiveState={active}\nUnitFileState={state}\nLoadState=loaded\n");
+        let arming = showing(&answer).timer_arming("x").expect(&answer);
+        assert_eq!((arming.active, arming.enabled), expected, "{active:?} {state:?}");
     }
 }
 
@@ -1217,14 +1513,20 @@ fn a_timer_is_enabled_when_its_unit_file_state_says_so() {
 fn the_timer_is_asked_about_by_its_own_name() {
     let fake = Fake::new([reply(
         &["show"],
-        exited(0, "UnitFileState=enabled\nLoadState=loaded\n", ""),
+        exited(0, "ActiveState=active\nUnitFileState=enabled\nLoadState=loaded\n", ""),
     )]);
 
-    on_booted(fake.clone()).timer_enabled("x").expect("timer_enabled");
+    on_booted(fake.clone()).timer_arming("x").expect("timer_arming");
 
     assert_eq!(
         fake.calls(),
-        [["show", "--property", "UnitFileState,LoadState", "--", "x.timer"]]
+        [[
+            "show",
+            "--property",
+            "ActiveState,UnitFileState,LoadState",
+            "--",
+            "x.timer"
+        ]]
     );
 }
 
@@ -1242,9 +1544,9 @@ fn verdicted(source: Source, reported: &str) -> Result<()> {
 /// The `Version` property as distributions set it, measured with `systemctl --version`, whose
 /// parenthesised part is the same `GIT_VERSION` string (identical on this host's systemd 257).
 #[skuld::test]
-fn a_running_systemd_242_or_newer_is_supported() {
+fn a_running_systemd_243_or_newer_is_supported() {
     for version in [
-        "242",
+        "243",
         "257.13-1~deb13u1",   // Debian 13
         "252.39-1~deb12u2",   // Debian 12
         "255.4-1ubuntu8.17",  // Ubuntu 24.04
@@ -1261,9 +1563,9 @@ fn a_running_systemd_242_or_newer_is_supported() {
 }
 
 #[skuld::test]
-fn a_client_242_or_newer_is_supported() {
+fn a_client_243_or_newer_is_supported() {
     for version in [
-        "systemd 242 (242)",
+        "systemd 243 (243)",
         "systemd 257 (257.13-1~deb13u1)",
         "systemd 258~rc1 (258~rc1-1)",
     ] {
@@ -1272,18 +1574,36 @@ fn a_client_242_or_newer_is_supported() {
 }
 
 /// systemd 240 and 241 parse `Type=exec`; only `--show-transaction` is missing, and the refusal
-/// must say that and nothing more.
+/// must say that and that they lack `clean` of a timer, and not `Type=exec`.
 #[skuld::test]
-fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
+fn systemd_240_and_241_are_refused_for_show_transaction_and_clean() {
     for (source, version, reported) in [
         (Source::Manager, "241.7-1", "241"),
         (Source::Manager, "240", "240"),
         (Source::Client, "systemd 241 (241)", "241"),
     ] {
         let msg = verdicted(source, version).expect_err(version).to_string();
-        assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
+        assert!(msg.contains("requires systemd 243 or newer"), "{msg}");
         assert!(msg.contains(&format!(" {reported}")), "{msg}");
         assert!(msg.contains("--show-transaction"), "{msg}");
+        assert!(msg.contains("clean"), "{msg}");
+        assert!(!msg.contains("Type=exec"), "{version} parses Type=exec: {msg}");
+    }
+}
+
+/// systemd 242 has `--show-transaction` and parses `Type=exec`; it has no `clean` of a timer's
+/// stamp, and the refusal says that and nothing more.
+#[skuld::test]
+fn systemd_242_is_refused_for_clean_alone() {
+    for (source, version, reported) in [
+        (Source::Manager, "242.1-1", "242"),
+        (Source::Client, "systemd 242 (242)", "242"),
+    ] {
+        let msg = verdicted(source, version).expect_err(version).to_string();
+        assert!(msg.contains("requires systemd 243 or newer"), "{msg}");
+        assert!(msg.contains(&format!(" {reported}")), "{msg}");
+        assert!(msg.contains("clean"), "{msg}");
+        assert!(!msg.contains("--show-transaction"), "{version} has it: {msg}");
         assert!(!msg.contains("Type=exec"), "{version} parses Type=exec: {msg}");
     }
 }
@@ -1293,7 +1613,7 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
 #[skuld::test]
 fn systemd_older_than_240_is_refused_for_both_reasons() {
     let msg = verdicted(Source::Manager, "239-41.el8").unwrap_err().to_string();
-    assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
+    assert!(msg.contains("requires systemd 243 or newer"), "{msg}");
     assert!(msg.contains("--show-transaction"), "{msg}");
     assert!(msg.contains("Type=simple"), "{msg}");
     let msg = verdicted(Source::Client, "systemd 237").unwrap_err().to_string();
@@ -1417,11 +1737,11 @@ fn refused(manager: &str, client: &str) -> String {
         .to_string()
 }
 
-/// Both must be 242 or newer: the running systemd parses `Type=exec` and answers the job, and the
-/// client parses `--show-transaction`, so neither rescues the other. The refusal names whichever
-/// failed, with its version, and both when both did.
+/// Both must be 243 or newer: the running systemd parses `Type=exec`, answers the job and cleans a
+/// timer, and the client parses `--show-transaction` and has `clean`, so neither rescues the other.
+/// The refusal names whichever failed, with its version, and both when both did.
 #[skuld::test]
-fn both_the_running_systemd_and_the_client_must_be_242_or_newer() {
+fn both_the_running_systemd_and_the_client_must_be_243_or_newer() {
     assert!(supported_by(two_versions("257", "257")).is_ok());
 
     let old_client = refused("257", "241");
@@ -1737,7 +2057,7 @@ fn any_other_failure_to_ask_the_manager_is_a_refusal() {
         "{msg}"
     );
     assert!(msg.contains("Connection timed out"), "{msg}");
-    assert!(msg.contains("cannot tell whether the running systemd is 242+"), "{msg}");
+    assert!(msg.contains("cannot tell whether the running systemd is 243+"), "{msg}");
 
     let silent = reply(&["show"], exited(0, "", ""));
     let msg = supported_by([version(), silent]).unwrap_err().to_string();

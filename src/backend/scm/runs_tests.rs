@@ -15,7 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::*;
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
-use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, read_object};
+use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, is_as_wanted, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
 use crate::backend::scm::test_support::{delete_pending, directory_held_open, directory_with_a_file, make_mount_point};
 use crate::elevation::test_support::process_user_sid;
@@ -1563,16 +1563,15 @@ fn a_goetia_folder_that_is_there_and_is_not_safe_is_refused_and_left_alone() {
 }
 
 /// `Goetia\runs` is goetia's alone to make, so one that is there and is not as goetia makes it (its
-/// owner, protection and entries) is refused, naming it, and left as it is.
+/// owner, protection and entries) is refused, naming it, and left as it is. `Goetia` and `logs` are made
+/// as an elevated install makes them, which names Administrators as their owner.
 #[skuld::test]
-fn a_runs_folder_that_is_there_and_is_not_as_wanted_is_refused_and_left_alone() {
+fn a_runs_folder_that_is_there_and_is_not_as_wanted_is_refused_and_left_alone(#[fixture(scm_group)] _group: &Group) {
     let dir = tempfile::tempdir().unwrap();
     let runs = Runs::of(dir.path(), &id());
     let root = dir.path().join("Goetia").join("runs");
-    fs::create_dir_all(&root).unwrap();
-    // `Goetia\logs` is there too: making it names Administrators as its owner, which a test that needs no
-    // elevation leaves to the `scm` group's.
-    fs::create_dir_all(crate::backend::scm::folder::logs_folder(dir.path())).unwrap();
+    crate::backend::scm::folder::make_goetia_folders(dir.path(), |_| Ok(())).unwrap();
+    fs::create_dir(&root).unwrap();
 
     let refused = runs.ensure_roots(&disabled()).unwrap_err();
 
