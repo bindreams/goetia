@@ -655,15 +655,19 @@ What holds on every platform:
 
 - **One run at a time, by design.** A schedule that fires while a run is in
   flight starts nothing, and so does a `start` over one (it succeeds). Parallel
-  runs are not offered. On Windows that holds only to the millisecond: for a
-  task whose account logs on with a password, a start can be accepted up to
-  20 ms before the previous run's process has exited, so two runs can be alive
-  at once. `status` shows one pid, and `stop`, `kill` and `uninstall` act on
+  runs are not offered. On Windows two runs can still be alive at once, by two
+  routes: for a task whose account logs on with a password, a start can be
+  accepted before the previous run's process has exited (measured up to about
+  20 ms; slower exits can widen it); and a run started outside goetia, from Task
+  Scheduler or with `RunEx` ignoring constraints, can overlap a goetia run for
+  any account. `status` shows one pid, and `stop`, `kill` and `uninstall` act on
   every run alive.
 - **Catch-up is always on**, with no field to turn it off: a run missed while
   the machine was off or asleep is made up when it is back, except where
-  [launchd](#launchd-calendar-entries) cannot. Only that: a run that came due
-  while the task was disarmed is never made up, on all three platforms.
+  [launchd](#launchd-calendar-entries) cannot. Only that: on systemd and
+  launchd, a run that came due while the task was disarmed is never made up.
+  TODO(owner): on Windows, replace with the result of the systemd-fix PR's
+  measurement (goetia sets `StartWhenAvailable=true`).
 - **No retry.** A run that fails is not run again; a program that wants one
   retries itself. How it failed is its `last-result`.
 - **Times are local.** See [the schedule](#the-schedule-per-platform).
@@ -700,8 +704,9 @@ All under `goetia daemon`, as for a service:
   schedule has nothing to arm: `enable` is refused, naming the missing
   schedule, and its `enabled` is always `false`. On Windows, `enable` and
   `disable` of a task that runs as a real user need `GOETIA_SERVICE_PASSWORD`
-  (see [Task accounts on Windows](#task-accounts-on-windows)). Arming never
-  makes up a run that came due while the task was disarmed.
+  (see [Task accounts on Windows](#task-accounts-on-windows)). On systemd and
+  launchd, arming never makes up a run that came due while the task was
+  disarmed. TODO(owner): Windows, as stated under catch-up above.
 - **`disable`** disarms it. A run in flight carries on.
 - **`start`** requests a run now, armed or not, and returns once the manager
   has accepted the request. It says nothing of how the run went: `last-result`
@@ -806,15 +811,19 @@ shell, not systemd's `203/EXEC`.
 `status` and `list` report a task with the fields of
 [the `--json` document](#the-document).
 `state` is `running` while a run is in flight and `idle` between runs; `pid` is
-the run's process (on Windows, the shim host's: `goetia-shim.exe`, or the
-embedding program's own executable where it uses `StandaloneShim` or calls
-`goetia::shim::main()` itself). `enabled` is whether the schedule is armed.
+the run's process (on Windows, the task's shim host: `goetia-shim.exe` where an
+installer places it, `goetia-shim-<hex>.exe` with `EmbeddedStockShim`, the
+program itself where it calls `goetia::shim::main()`, or whatever a custom
+`ShimProvider` supplies). `enabled` is whether the schedule is armed.
 `last-result` is how the most recent finished
 run ended, `last-run` when it started and `next-run` when the schedule starts
 the next one. A task that has never run is `idle` with `last-result` and
-`last-run` `null`, and `status` still exits `0`. Its `next-run` is `null` only
-where nothing is armed: the task is disabled or has no `schedule`. An enabled
-task with a schedule has its next run before it has had a first.
+`last-run` `null`, and `status` still exits `0`. Its `next-run` is `null`
+exactly where nothing will start a run: the task is disabled or has no
+`schedule`; its schedule never fires (`0 0 30 2 *`); or it is enabled but its
+timer is not loaded or not active (launchd after an interrupted `enable` or
+`install`, systemd with the timer stopped by hand). Otherwise an enabled task
+has its next run before it has had a first.
 
 The three differ by platform where a run is in flight, or the manager failed
 a run before it exited:
@@ -872,8 +881,8 @@ with the request standing.
 - **launchd:** `stop` sends `SIGTERM` only, and waits (bounded by `--timeout`).
   A task that ignores it keeps running; `kill` ends it: it reads the run's pid
   from launchd, holds that process, confirms with `launchctl procinfo` that
-  it is the job's, and sends `SIGKILL` to the held process. Only `stop` signals
-  by label. goetia never boots the job out for either. A `stop` under any budget,
+  it is the job's, and sends `SIGKILL` to the held process. Only `stop` and
+  `run` signal by label (`run` resumes its held launch with `SIGCONT`). goetia never boots the job out for either. A `stop` under any budget,
   `--timeout 0` included, first waits for a start launchd has accepted to
   begin, so that it can end it, and it also ends a run that begins while it
   stops.
@@ -1254,12 +1263,15 @@ as it was.
 - systemd and SCM: a changed task takes effect at its next run, and the one in
   flight is not touched.
 - launchd updates an idle task, which launchd holds loaded without a process:
-  it boots the timer out, writes the plists, and, if the task was enabled,
-  loads the job and then the timer again, so the schedule stays armed. It
-  refuses only a change to the job's plist while a run is in flight (exit `1`,
-  naming the task and saying to `stop` it, which leaves it idle), with nothing
-  written. A change that touches only the timer, such as a schedule edit, is
-  applied while a run is in flight and does not touch the run. A run due while
+  it boots the timer out where the timer renders differently, the job is
+  booted out, or the timer is stray, writes the plists, and, if the task was
+  enabled, loads the job and then the timer again, so the schedule stays armed.
+  It refuses only when the job's rendering, apart from goetia's metadata
+  comment, changes, the job is loaded and a run is in flight (exit `1`, naming
+  the task and saying to `stop` it, which leaves it idle), with nothing
+  written. A schedule edit changes the job plist's metadata comment but not its
+  rendering, so it is applied while a run is in flight and does not touch the
+  run. A run due while
   the plists are replaced is missed (see [launchd](#launchd-calendar-entries)).
 - Windows: an install that changes the account a task runs as registers the
   task again, so its last run and last result start over, and it is refused
