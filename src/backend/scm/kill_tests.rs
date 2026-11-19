@@ -10,12 +10,16 @@ use super::*;
 use crate::backend::kill::{KillOutcome, kill_service};
 use crate::backend::scm::test_support::{spent, unbounded};
 use crate::backend::scm::wait::Waited;
+use crate::error::Error;
 use crate::manager::budget::Deadline;
 
 type Log = Rc<RefCell<Vec<String>>>;
 
 /// The kind of a failed `service_pid`: not `Other`, so a test sees whether a kind is kept.
 const READ_FAILED_KIND: io::ErrorKind = io::ErrorKind::TimedOut;
+
+/// The OS code of an open that fails: `ERROR_ACCESS_DENIED`.
+const OPEN_DENIED: i32 = 5;
 
 /// What opening a pid finds.
 enum Open {
@@ -140,7 +144,7 @@ impl KillTarget for Scripted {
                 log: self.log.clone(),
             })),
             Open::Gone => Ok(None),
-            Open::Fails => Err(io::Error::other("access denied")),
+            Open::Fails => Err(io::Error::from_raw_os_error(OPEN_DENIED)),
         }
     }
 
@@ -272,7 +276,12 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
     let error = hold_service_process(&mut target, unbounded()).expect_err("a refused open");
 
     assert!(matches!(error, HoldError::Refused(_)), "{error:?}");
-    assert_eq!(io::Error::from(error).to_string(), "access denied");
+    let refused = Error::os("hold", io::Error::from(error));
+    assert_eq!(refused.raw_os_error(), Some(OPEN_DENIED));
+    assert!(
+        refused.report().to_string().contains("opening process 100"),
+        "{refused:?}"
+    );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -335,7 +344,12 @@ fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
     let HoldOutcome::Refused(reason) = outcome else {
         panic!("expected the refusal, got {outcome:?}");
     };
-    assert_eq!(reason.to_string(), "access denied");
+    let refused = Error::os("hold", reason);
+    assert_eq!(refused.raw_os_error(), Some(OPEN_DENIED));
+    assert!(
+        refused.report().to_string().contains("opening process 100"),
+        "{refused:?}"
+    );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -567,7 +581,11 @@ fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() 
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
-    assert_eq!(e.to_string(), "notifier could not be opened");
+    assert_eq!(
+        crate::backend::kill::kill_failed("frpc", e).report().to_string(),
+        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: notifier could not be \
+         opened"
+    );
 }
 
 // The raw status ------------------------------------------------------------------------------------------------------

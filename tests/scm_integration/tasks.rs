@@ -17,7 +17,7 @@ use crate::common::conformance_mk;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{PRINT_AND_EXIT, RUN_UNTIL_KILLED};
 use crate::support::windows_tasks::{EndsTheRunOnPanic, ProcessHandle, task_spec};
-use crate::support::{self, ConnectBack, Group, ServiceGuard, kill, scm_group};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
 
 pub(crate) const SCHEDULE: &str = "30 3 * * *";
 
@@ -73,7 +73,7 @@ pub(crate) fn task_status(mgr: &Scm, id: &Id) -> TaskStatus {
 /// result. Read again with no cap, since the run's end is a state of the machine and not a time.
 pub(crate) fn status_once_ended(mgr: &Scm, id: &Id) -> TaskStatus {
     let mut found = None;
-    kill::until(|| {
+    wait::until(|| {
         let status = task_status(mgr, id);
         let ended = status.common.state == State::Idle && status.last_result.is_some();
         found = Some(status);

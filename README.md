@@ -18,7 +18,7 @@ On macOS goetia requires **14.4+**: `kill` holds the daemon's process by its
 identity, which the OS offers from 14.4. On Linux it requires **kernel 5.6+**,
 with `pidfd_open` and `openat2` not blocked by a seccomp profile or an LSM: the
 process library goetia runs `systemctl` with, and holds a daemon's process with
-for `kill`, needs both. It also requires **systemd 242+**
+for `kill`, needs both. It also requires **systemd 243+**
 (2019), and refuses to install, uninstall, start, stop, restart, enable or
 disable anything on an older one, before writing or running anything. It checks both the running systemd and the
 `systemctl` client, which is what parses `--show-transaction`. A running
@@ -26,7 +26,10 @@ systemd it cannot ask is refused. Generated units use
 `Type=exec` (240+), which is what lets a start report a missing executable or
 user as a failure. An older systemd does not reject the directive: it logs that it
 cannot parse it and runs the unit as `Type=simple`, silently losing exactly
-that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
+that. Every `start` and `stop` runs `systemctl --show-transaction` (242+), and
+arming a task's timer runs `systemctl clean` on it (243+) to clear its stamp,
+which is how arming a task again makes up no run missed while goetia's
+`disable` had disarmed it.
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
@@ -856,8 +859,9 @@ service before the stop request is sent, the request reaches the new process,
 which goetia does not hold, so `stop` can return while it is still exiting, and
 an `uninstall` right after may leave the shim file for the next sweep.
 
-`uninstall` of a `protocol: plain` daemon ends the shim process once the service
-is stopped, waits, with no time limit, for it to exit, deletes the service, and deletes every `goetia-shim-*.exe`
+`uninstall` of a `protocol: plain` daemon stops and deletes the service, ends the
+shim process it took hold of before the service stopped, waits, with no time limit,
+for it to exit, and deletes every `goetia-shim-*.exe`
 that no remaining service references, and the default folder when it is then
 empty. If a file cannot be deleted, `uninstall` exits non-zero naming each file that
 remains: the service is already deleted, and re-running
@@ -867,6 +871,10 @@ do" (exit `0`) when the sweep succeeded. Besides the provider's folder,
 `uninstall` sweeps only `%ProgramFiles%\Goetia`, where a service installed by
 another provider may have its shim. A file in any other folder is never swept:
 a program's installer may place a file with a shim's name in its own folder.
+`uninstall` waits only for a shim process it took hold of. When the service was
+already stopped, or stopped before `uninstall` could take hold of its process (a
+daemon that fails at start), a shim still exiting keeps its file in use; that file
+is skipped without an error, and a later sweep removes it.
 
 ### Shipping the shim from a library
 
