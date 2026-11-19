@@ -13,6 +13,11 @@ pub(crate) fn not_found() -> cosca::error::Error {
     cosca::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
+/// A cause that has a cause: `Chain` prints `context: cause`.
+pub(crate) fn chained() -> std::io::Error {
+    crate::error::within("the context", std::io::Error::other("the cause"))
+}
+
 /// A supervisor over `fake`'s `Os` and `Log`: the one under test.
 pub(crate) fn supervisor(fake: &Fake) -> Arc<Supervisor> {
     Arc::new(Supervisor::new(fake.os(), fake.log()))

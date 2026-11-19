@@ -44,6 +44,28 @@ impl ServiceAccountHost {
     }
 }
 
+/// A copy of this test binary that an install accepts as a service host: it carries the version marker, which a
+/// test binary built from the library alone does not. What it does when SCM starts it is the test's.
+pub fn this_binary_as_a_service_host(name: &str) -> WorldReadableExe {
+    use std::io::Write as _;
+
+    let host = WorldReadableExe::new(name);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(host.path_str())
+        .and_then(|mut file| file.write_all(&goetia::testing::host_marker()))
+        .unwrap_or_else(|e| panic!("append the host marker to {}: {e}", host.path_str()));
+    host
+}
+
+/// A manager whose `protocol: plain` services run `host` with `args`.
+pub fn manager_hosted_by(host: &WorldReadableExe, args: Vec<String>) -> Scm {
+    Scm::with_shim(
+        goetia::shim::StandaloneShim::new(host.path_str().into(), args),
+        goetia::shim::CheckPermissions::Disable,
+    )
+}
+
 /// The task `id`, run by `user`, that starts `command` on `schedule` (`None`: only a test starts it)
 /// and sends its output to `logs` where it has one.
 pub fn task_spec(id: &Id, command: Vec<String>, schedule: Option<&str>, user: User, logs: Option<&Path>) -> DaemonSpec {

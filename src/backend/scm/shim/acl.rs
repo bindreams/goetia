@@ -30,13 +30,14 @@ use crate::backend::scm::sid::sid_display;
 use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_installer};
 
 #[cfg(windows)]
-pub(crate) use protected::{Descriptor, is_as_wanted, missing_components};
+pub(crate) use protected::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, missing_components};
 #[cfg(all(windows, any(test, feature = "testing")))]
 #[doc(hidden)]
 pub use system::{Dacl, kernel_object_dacl};
 #[cfg(windows)]
 pub(crate) use system::{
-    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, read_path, require_acls_under,
+    ObjectId, display_path, index_at, is_unreadable, kernel_object_owner, normalise as lexical, read_object, read_path,
+    require_acls_under,
 };
 
 #[cfg(windows)]
@@ -363,7 +364,7 @@ mod system {
     /// the older file index where the volume has no file ID. The forms never compare equal, since a
     /// file index and a file ID can hold the same numbers and name two objects.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum ObjectId {
+    pub(crate) enum ObjectId {
         /// The volume's 64-bit serial number and the file's 128-bit ID.
         Id { volume: u64, id: [u8; 16] },
         /// The volume's 32-bit serial number and the file's 64-bit index.
@@ -451,10 +452,22 @@ mod system {
         })
     }
 
+    /// The object at `path` by the volume's serial number and the file's index, which no spelling of the path
+    /// changes (a share's, an 8.3 name's, a link's). A link is read as itself, not followed. The path is opened for
+    /// no access, with backup semantics (so a folder opens), as `std::fs::canonicalize` opens it: an object whose
+    /// permissions or attributes the caller may not read still has an identity.
+    pub(crate) fn index_at(path: &Path) -> io::Result<ObjectId> {
+        let file = OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        file_index(&file)
+    }
+
     fn file_index(file: &File) -> io::Result<ObjectId> {
         // SAFETY: an all-zero `BY_HANDLE_FILE_INFORMATION` is a valid value of plain integers.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: `file` is open with `FILE_READ_ATTRIBUTES`; `info` is a valid out-pointer.
+        // SAFETY: `file` is an open handle (any access); `info` is a valid out-pointer.
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
             return Err(io::Error::last_os_error());
         }
