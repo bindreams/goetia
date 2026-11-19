@@ -11,6 +11,9 @@ pub mod cmd;
 pub mod connect_back;
 #[cfg(unix)]
 pub mod cron_oracle;
+// Runs `CARGO_BIN_EXE_goetia`, which only a build with the `cli` feature has.
+#[cfg(feature = "cli")]
+pub mod demonstration;
 pub mod failed_install;
 pub mod kill;
 pub mod list_json;
@@ -26,6 +29,7 @@ pub mod service_ctrl;
 pub mod service_guard;
 #[cfg(unix)]
 pub mod tasks;
+pub mod wait;
 #[cfg(windows)]
 pub mod windows_tasks;
 #[cfg(windows)]

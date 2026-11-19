@@ -16,7 +16,7 @@ use jiff::{Timestamp, ToSpan as _};
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::CONNECT_BACK;
 use crate::support::windows_tasks::task_spec;
-use crate::support::{self, ConnectBack, Group, kill, scm_group};
+use crate::support::{self, ConnectBack, Group, scm_group, wait};
 use crate::tasks::{
     SCHEDULE, TaskGuard, records_of, runs_until_ended, status_once_ended, task_as, task_exists, task_status,
 };
@@ -81,7 +81,7 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
         status.next_run.expect("an armed task has a next run"),
     );
 
-    kill::until(|| task_status(&mgr, id).next_run.is_some_and(|next| next > fire));
+    wait::until(|| task_status(&mgr, id).next_run.is_some_and(|next| next > fire));
 
     let after = task_status(&mgr, id);
     assert_eq!(after.common.state, State::Running);
