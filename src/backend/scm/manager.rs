@@ -739,8 +739,9 @@ impl Backend for Scm {
     /// The default log of a daemon that runs the shim host, which the shim only opens: where an install
     /// finds the daemon up to date and its log gone (deleted, or its folder was), this makes it again,
     /// which is what the shim's own message for a link or a missing log says to do. The account is the
-    /// one the definition registers, which is the one installed. A task's run records are made again the same
-    /// way, with a marker a dead uninstall left cleared ([`task_beside`]).
+    /// one the definition registers, which is the one installed. A task is seen to as a write of it is,
+    /// except for its registration ([`task_beside`]): the `Goetia` event source, a real user's logon right,
+    /// the folders and the record directory (with a marker a dead uninstall left cleared), and the log.
     fn ensure_beside(
         &self,
         spec: &DaemonSpec,
@@ -751,7 +752,9 @@ impl Backend for Scm {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
                 make_default_log(spec, definition, None, &[], default_log::Step::Narrow).map(drop)
             }
-            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_beside(installed),
+            (WindowsDefinition::Task(definition), WindowsSnapshot::Task(installed)) => {
+                task_beside(spec, definition, installed)
+            }
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
             | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
         }

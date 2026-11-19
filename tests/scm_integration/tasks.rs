@@ -113,6 +113,8 @@ fn an_up_to_date_install_of_a_task_makes_its_run_records_again(#[fixture(scm_gro
     let marker = records.with_file_name(format!("{id}~removing"));
     mgr.install(&spec, false).expect("install");
     std::fs::remove_dir(&records).unwrap_or_else(|e| panic!("delete {}: {e}", records.display()));
+    // Removed on every end of the test, and declared before the marker is written.
+    let _marker = support::cleanup::FileGuard::new(marker.clone());
     std::fs::write(&marker, "").unwrap_or_else(|e| panic!("make {}: {e}", marker.display()));
 
     let again = mgr.install(&spec, false).expect("install again");

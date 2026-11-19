@@ -911,21 +911,37 @@ fn an_unchanged_install_names_the_account_alone_in_the_log() {
 
 // An install that finds the task up to date ---------------------------------------------------------------------------
 
-/// A task of `Users`, whose record directory and default log an install made (the folders as `disabled` judges
-/// them: the temporary `%ProgramData%` is no place goetia's own check could pass), and what `task_beside_with`
-/// sees of it.
+/// [`task_beside_with`] under the temporary `%ProgramData%` `dir` (the folders as `Disable` judges them: it is no
+/// place goetia's own check could pass), with `prepare` for the machine.
+fn beside_with(
+    dir: &TempDir,
+    snapshot: &TaskSnapshot,
+    prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
+) -> Result<()> {
+    task_beside_with(
+        dir.path(),
+        &FolderCheck::new(CheckPermissions::Disable),
+        snapshot,
+        &root(),
+        prepare,
+    )
+}
+
+/// A task of `Users`, whose record directory and default log an install made, and what `task_beside_with` sees
+/// of it.
 fn made_by_an_install() -> (TempDir, Runs, TaskSnapshot) {
     let (dir, runs) = records();
     let spec = task_spec_as(User::Id(AccountId::Sid("S-1-5-32-545".to_owned())), Some("30 3 * * *"));
     let snapshot = snapshot_of(&spec, false);
-    task_beside_with(&snapshot, &runs, &FolderCheck::new(CheckPermissions::Disable)).unwrap();
+    beside_with(&dir, &snapshot, prepared(users(), None)).unwrap();
     assert!(records_dir(&dir).is_dir());
     (dir, runs, snapshot)
 }
 
 #[track_caller]
 fn assert_beside_remakes(dir: &TempDir, runs: &Runs, snapshot: &TaskSnapshot) {
-    task_beside_with(snapshot, runs, &FolderCheck::new(CheckPermissions::Disable)).unwrap();
+    beside_with(dir, snapshot, prepared(users(), None)).unwrap();
+    assert!(runs.hold().is_ok(), "a run of the task does not back off");
 
     assert!(records_dir(dir).is_dir(), "the record directory is there");
     assert!(trustees_of(&records_dir(dir)).contains(&users()), "naming the account");
@@ -978,6 +994,30 @@ fn an_up_to_date_install_names_the_registered_account_alone_in_the_record_direct
     assert_beside_remakes(&dir, &runs, &snapshot);
 
     assert!(!trustees_of(&records_dir(&dir)).contains(&local_service()));
+}
+
+/// ... and sees to what a write sees to for the account (the event source, a real user's logon right), and a
+/// failure of it fails the install.
+#[skuld::test]
+fn an_up_to_date_install_sees_to_what_the_machine_must_hold_for_the_account(#[fixture(scm_group)] _group: &Group) {
+    let (dir, _runs, snapshot) = made_by_an_install();
+    let seen = std::cell::Cell::new(false);
+
+    beside_with(&dir, &snapshot, |account| {
+        assert_eq!(account, &root());
+        seen.set(true);
+        Ok(Prepared {
+            principal: users(),
+            password: None,
+        })
+    })
+    .unwrap();
+    assert!(seen.get());
+
+    let refused = beside_with(&dir, &snapshot, |_| {
+        Err(Error::InvalidPassword { variable: "V".into() })
+    });
+    assert!(matches!(refused, Err(Error::InvalidPassword { .. })), "{refused:?}");
 }
 
 // Before any write ====================================================================================================
@@ -1603,6 +1643,35 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
 
 fn prepared_alice() -> impl FnOnce(&TaskAccount) -> Result<Prepared> {
     prepared(process_user_sid(), Some("secret"))
+}
+
+/// A service changed into a task keeps no account in the record directory (the service never wrote there), so
+/// the landing does not set the directory again: what the service's removal left in its permissions stays.
+/// Setting the permissions of a directory that names an account other than the test's needs an elevated token.
+#[skuld::test]
+fn a_service_changed_into_a_task_does_not_set_the_record_directory_when_the_task_lands(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let (dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            prepared(process_user_sid(), None),
+            || Ok(None),
+            || {
+                runs.ensure(&[local_service()])
+                    .map_err(|e| Error::os("name another account", e))
+            },
+        )
+        .unwrap();
+
+    assert!(trustees_of(&records_dir(&dir)).contains(&local_service()));
 }
 
 #[skuld::test]

@@ -1529,6 +1529,17 @@ fn ensure_is_repeatable() {
     assert!(runs.read(&instance(1)).unwrap().is_some());
 }
 
+/// An account named twice (a task changed to the account it already ran as) is one trustee, as in the default log.
+#[skuld::test]
+fn ensure_names_an_account_given_twice_once() {
+    let (_dir, runs) = fixture();
+    let users = sid_from_parts(5, &[32, 545]);
+
+    runs.ensure(&[users.clone(), users.clone()]).unwrap();
+
+    assert_eq!(entries_of(&runs.dir), dacl_for(users));
+}
+
 // the folders above the directory =====================================================================================
 
 fn enabled() -> FolderCheck {

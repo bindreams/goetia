@@ -52,7 +52,7 @@ use self::dir::Dir;
 use self::files::DeleteOutcome;
 use super::folder::{ensure_as_made, goetia_folder, make_goetia_folders};
 use super::shim::acl::{Descriptor, FolderCheck};
-use super::sid::Sid;
+use super::sid::{Sid, distinct};
 use crate::error::{Error, Result};
 use crate::spec::Id;
 
@@ -260,7 +260,7 @@ impl Runs {
     /// It also takes away a removal's marker that an uninstall left when it died ([`Runs::remove_all`]):
     /// the task is installed again, and its `run` must not back off.
     pub(crate) fn ensure(&self, principals: &[Sid]) -> io::Result<()> {
-        let permissions = Descriptor::for_runs(principals).map_err(io::Error::other)?;
+        let permissions = Descriptor::for_runs(&distinct(principals)).map_err(io::Error::other)?;
         match permissions.create_dir(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 permissions.set_dacl_of(Dir::open_for_dacl(&self.dir)?.file())
