@@ -1244,6 +1244,22 @@ fn a_failed_hold_reports_the_read_and_the_refused_open_it_followed() {
     );
 }
 
+/// A hold whose read of SCM failed with a goetia error that left the outcome open is that error: the
+/// CLI exits `4`, not `1`.
+#[skuld::test]
+fn a_failed_hold_keeps_the_class_of_the_goetia_error_the_read_carried() {
+    let read = Error::Undetermined {
+        id: "frpc".to_string(),
+        reason: Box::new(Error::os("read", std::io::Error::other("SCM did not answer"))),
+        recovery: "re-run".to_string(),
+    };
+
+    let error = hold_failed(&Id::try_from("frpc").unwrap(), std::io::Error::other(read));
+
+    assert!(error.is_indeterminate(), "{error:?}");
+    assert!(matches!(error.cause(), Error::Undetermined { .. }), "{error:?}");
+}
+
 /// A stop whose hold expired and whose STOP was sent is the wait that ran out, led by the process SCM
 /// still named.
 #[skuld::test]

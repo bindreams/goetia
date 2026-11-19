@@ -636,6 +636,28 @@ fn a_failed_read_after_a_refused_open_keeps_what_the_read_carries() {
     assert!(matches!(failed.cause(), Error::Undetermined { .. }), "{failed:?}");
 }
 
+/// The class of the read is the failure's, and the refused open is told with it: neither is dropped.
+#[skuld::test]
+fn a_failed_read_after_a_refused_open_is_the_reads_class_and_tells_the_open() {
+    let read = Error::Undetermined {
+        id: ID.to_string(),
+        reason: Box::new(Error::os("read", io::Error::other("manager read failed"))),
+        recovery: "re-run".to_string(),
+    };
+    let mut target = Scripted::new([Some(100)], [Open::Fails])
+        .failing_read(2)
+        .reading_fails_carrying(read);
+
+    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
+
+    assert!(failed.is_indeterminate(), "{failed:?}");
+    assert_eq!(
+        failed.report().to_string(),
+        "reading the manager failed after the service's process could not be opened (access denied): cannot \
+         determine whether daemon `frpc` is installed: failed to read: manager read failed. re-run"
+    );
+}
+
 /// An error of goetia's that the refused open carries is written in full, as the report writes any:
 /// its child's stderr and its remedy are not lost to the parenthesis it sits in.
 #[skuld::test]
