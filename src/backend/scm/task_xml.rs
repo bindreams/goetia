@@ -99,7 +99,8 @@ const fn setting(scope: Scope, name: &'static str, value: &'static str, absent: 
 }
 
 /// The settings of a task: no run is bounded in time, a run that is alive makes a new start a no-op,
-/// a missed start runs when the machine is back, and the battery, idle, network and wake flags are
+/// a start missed while the machine was off runs when it is back (one that came due while the task was
+/// disarmed is not made up), and the battery, idle, network and wake flags are
 /// off. `Priority` 5 gives the normal class a service runs at; the default 7 is below normal.
 const SETTINGS: [Setting; 16] = [
     setting(Scope::Principal, "RunLevel", "HighestAvailable", "LeastPrivilege"),
