@@ -653,9 +653,13 @@ and no timer.
 
 What holds on every platform:
 
-- **One run at a time.** A schedule that fires while a run is in flight starts
-  nothing, and so does a `start` over one (it succeeds). Parallel runs are not
-  offered.
+- **One run at a time, by design.** A schedule that fires while a run is in
+  flight starts nothing, and so does a `start` over one (it succeeds). Parallel
+  runs are not offered. On Windows that holds only to the millisecond: for a
+  task whose account logs on with a password, a start can be accepted up to
+  20 ms before the previous run's process has exited, so two runs can be alive
+  at once. `status` shows one pid, and `stop`, `kill` and `uninstall` act on
+  every run alive.
 - **Catch-up is always on**, with no field to turn it off: a run missed while
   the machine was off or asleep is made up when it is back, except where
   [launchd](#launchd-calendar-entries) cannot.
@@ -800,11 +804,15 @@ shell, not systemd's `203/EXEC`.
 `status` and `list` report a task with the fields of
 [the `--json` document](#the-document).
 `state` is `running` while a run is in flight and `idle` between runs; `pid` is
-the run's process (on Windows, the host's, `goetia-shim.exe`). `enabled` is
-whether the schedule is armed. `last-result` is how the most recent finished
+the run's process (on Windows, the shim host's: `goetia-shim.exe`, or the
+embedding program's own executable where it uses `StandaloneShim` or calls
+`goetia::shim::main()` itself). `enabled` is whether the schedule is armed.
+`last-result` is how the most recent finished
 run ended, `last-run` when it started and `next-run` when the schedule starts
-the next one. A task that has never run is `idle` with all three `null`, and
-`status` still exits `0`.
+the next one. A task that has never run is `idle` with `last-result` and
+`last-run` `null`, and `status` still exits `0`. Its `next-run` is `null` only
+where nothing is armed: the task is disabled or has no `schedule`. An enabled
+task with a schedule has its next run before it has had a first.
 
 The three differ by platform where a run is in flight, or the manager failed
 a run before it exited:
@@ -846,7 +854,8 @@ same.
   An unelevated `status` or `list` of a task that runs as another account (SYSTEM,
   LocalService, or an administrator's own elevated task) cannot open the run's
   process, so it cannot tell running from idle. It reports the id as `unusable`,
-  naming the denial, exit `4`, and `run` of it refuses with the same denial.
+  naming the denial, exit `4`. An unelevated `run` never gets that far: it
+  checks for elevation first and fails with the elevation error, exit `1`.
   Re-running as Administrator clears it.
 
 ### Stopping and killing a task
@@ -859,8 +868,10 @@ with the request standing.
 - **systemd:** as for a service: `stop` stops the unit, and `kill` sends
   `SIGKILL` to its main process through a pidfd.
 - **launchd:** `stop` sends `SIGTERM` only, and waits (bounded by `--timeout`).
-  A task that ignores it keeps running; `kill`, which sends `SIGKILL` by label,
-  ends it. goetia never boots the job out for either. A `stop` under any budget,
+  A task that ignores it keeps running; `kill` ends it: it reads the run's pid
+  from launchd, holds that process, confirms with `launchctl procinfo` that
+  it is the job's, and sends `SIGKILL` to the held process. Only `stop` signals
+  by label. goetia never boots the job out for either. A `stop` under any budget,
   `--timeout 0` included, first waits for a start launchd has accepted to
   begin, so that it can end it, and it also ends a run that begins while it
   stops.
@@ -966,7 +977,10 @@ in 48 can be refused. The way out is to split the schedule across two tasks.
   (cron's either-or, where a date both name would start the task from two
   triggers at one instant, which `IgnoreNew` does not reliably make one run) is
   refused, as is one where both must match, which Task Scheduler's day forms
-  cannot hold. Use `*` for one of the two.
+  cannot hold. Use `*` for one of the two. The exception is an either-or
+  schedule whose days of the month fall in no month of its month set: it is
+  accepted, and only its weekdays count. `0 0 30 2 1` runs on Mondays in
+  February, never on the 30th.
 - **Clock changes.** A skipped hour runs nothing that day, and a repeated hour
   runs in both passes. A trigger due at the instant of the change does not run
   (the first minute after a skipped hour, and the start of the second pass of a
@@ -1238,11 +1252,13 @@ as it was.
 - systemd and SCM: a changed task takes effect at its next run, and the one in
   flight is not touched.
 - launchd updates an idle task, which launchd holds loaded without a process:
-  it boots the timer out, writes the plists, and loads the job again if the
-  task was enabled. It refuses a changed task only while a run is in flight
-  (exit `1`, naming the task and saying to `stop` it, which leaves it idle),
-  with nothing written. A run due while the plists are replaced is missed (see
-  [launchd](#launchd-calendar-entries)).
+  it boots the timer out, writes the plists, and, if the task was enabled,
+  loads the job and then the timer again, so the schedule stays armed. It
+  refuses only a change to the job's plist while a run is in flight (exit `1`,
+  naming the task and saying to `stop` it, which leaves it idle), with nothing
+  written. A change that touches only the timer, such as a schedule edit, is
+  applied while a run is in flight and does not touch the run. A run due while
+  the plists are replaced is missed (see [launchd](#launchd-calendar-entries)).
 - Windows: an install that changes the account a task runs as registers the
   task again, so its last run and last result start over, and it is refused
   while the task runs. A failure between the removal and the new registration
