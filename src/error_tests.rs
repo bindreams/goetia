@@ -279,7 +279,10 @@ fn an_unreadable_stop_action_is_as_indeterminate_as_the_kept_failure_and_is_its_
     assert!(over(in_doubt()).is_indeterminate());
 
     let refusal = over(not_installed());
-    assert!(matches!(refusal.cause(), Error::StopActionUnreadable { .. }), "{refusal:?}");
+    assert!(
+        matches!(refusal.cause(), Error::StopActionUnreadable { .. }),
+        "{refusal:?}"
+    );
     assert!(!refusal.wraps_unreadable_host());
     let mapped = refusal.map_cause(|leaf| {
         assert!(matches!(leaf, Error::StopActionUnreadable { .. }), "{leaf:?}");
