@@ -135,7 +135,7 @@ fn field<'a>(entry: &'a Value, name: &str) -> Option<&'a str> {
 }
 
 /// The invocation of every run of `id`'s unit the manager started, oldest first.
-fn started_invocations(id: &str) -> Vec<String> {
+pub(crate) fn started_invocations(id: &str) -> Vec<String> {
     let unit = format!("UNIT={}", unit_of(id));
     journal(&[&unit, &format!("MESSAGE_ID={STARTING}")])
         .iter()
