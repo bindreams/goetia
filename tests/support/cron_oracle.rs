@@ -55,11 +55,18 @@ pub fn assert_next_run_time(next_run: Option<SystemTime>, text: &str, id: &Id, b
 /// `next_run` is the next minute after `before` or the next after `after`, and never the minute at or
 /// before `before`: for launchd, whose `next_run` goetia computes from the clock it reads.
 pub fn assert_next_run_strict(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
-    assert_in(
-        status.next_run,
-        text,
-        &strict_next_runs(&parse(text, id), before, after),
-    );
+    assert_next_run_strict_time(status.next_run, text, id, before, after);
+}
+
+/// [`assert_next_run_strict`] for a time read from somewhere other than a [`TaskStatus`] (the CLI's document).
+pub fn assert_next_run_strict_time(
+    next_run: Option<SystemTime>,
+    text: &str,
+    id: &Id,
+    before: SystemTime,
+    after: SystemTime,
+) {
+    assert_in(next_run, text, &strict_next_runs(&parse(text, id), before, after));
 }
 
 fn assert_in(next_run: Option<SystemTime>, text: &str, expected: &[SystemTime]) {
