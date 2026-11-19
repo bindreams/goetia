@@ -902,10 +902,6 @@ impl Error {
     /// The failures of `errors` in one error: `None` for none, the error itself for one, and for
     /// more nested [`Both`](Error::Both)s in the order given. How every caller that tries each of
     /// several things and reports what failed folds them.
-    #[cfg_attr(
-        not(any(windows, target_os = "macos")),
-        allow(dead_code, reason = "the SCM and launchd backends fold their failures with it")
-    )]
     pub(crate) fn both_all(errors: impl IntoIterator<Item = Error>) -> Option<Error> {
         errors.into_iter().reduce(|first, then| Error::Both {
             first: Box::new(first),
@@ -1212,14 +1208,20 @@ pub enum VersionReading {
 /// [`Error::UnsupportedManager`]'s message: one sentence for each of the manager and its client
 /// that is below the floor or unreadable.
 fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> String {
-    use crate::backend::systemd::{SYSTEMD_FLOOR, TYPE_EXEC};
+    use crate::backend::systemd::{SHOW_TRANSACTION, SYSTEMD_FLOOR, TYPE_EXEC};
     const ANSWER: &str = "cannot answer the `systemctl --show-transaction` every start and stop runs";
+    const CLEAN: &str = "cannot clean a timer's stamp, which arming a task's timer does";
     const TYPE_SIMPLE: &str = "runs goetia's `Type=exec` units as `Type=simple`, which cannot report a failed exec";
     let manager = match manager {
         VersionReading::Major(n) if *n >= SYSTEMD_FLOOR => None,
-        VersionReading::Major(n) if *n >= TYPE_EXEC => Some(format!("The running systemd is {n}, which {ANSWER}.")),
+        VersionReading::Major(n) if *n >= SHOW_TRANSACTION => {
+            Some(format!("The running systemd is {n}, which {CLEAN}."))
+        }
+        VersionReading::Major(n) if *n >= TYPE_EXEC => {
+            Some(format!("The running systemd is {n}, which {ANSWER}, and {CLEAN}."))
+        }
         VersionReading::Major(n) => Some(format!(
-            "The running systemd is {n}, which {ANSWER}, and {TYPE_SIMPLE}."
+            "The running systemd is {n}, which {ANSWER}, {CLEAN}, and {TYPE_SIMPLE}."
         )),
         VersionReading::Unreadable(text) => Some(format!(
             "goetia cannot read the version the running systemd reports ({text:?}), so cannot tell whether it is."
@@ -1227,9 +1229,12 @@ fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> Str
     };
     let client = match client {
         VersionReading::Major(n) if *n >= SYSTEMD_FLOOR => None,
+        VersionReading::Major(n) if *n >= SHOW_TRANSACTION => Some(format!(
+            "The `systemctl` client is {n}, which has no `clean` for a timer's stamp, which arming a task's timer runs."
+        )),
         VersionReading::Major(n) => Some(format!(
             "The `systemctl` client is {n}, which does not accept the `--show-transaction` option every start and \
-             stop passes it."
+             stop passes it, and has no `clean` for a timer's stamp, which arming a task's timer runs."
         )),
         VersionReading::Unreadable(text) => Some(format!(
             "goetia cannot read the version `systemctl --version` reports ({text:?}), so cannot tell whether it is."

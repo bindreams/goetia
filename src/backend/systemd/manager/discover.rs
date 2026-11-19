@@ -93,9 +93,10 @@ impl ReadFailure {
         undetermined(id, self.op, &self.path, self.source)
     }
 
-    /// The reading for a caller that already knows goetia owns the id, so "unusable" is a true
-    /// statement about it: `super::write::quarantine_if_still_ours`, which reaches this only after
-    /// `read` found the fragment marked.
+    /// The failure as the operating system's own, with no claim about the id: for a caller that
+    /// already knows goetia owns the id (`super::write::quarantine_if_still_ours`, `unreadable_dropins`,
+    /// which reach this only after `read` found the fragment marked), or that reports the read itself
+    /// (the manager's scan, and its comparison of a unit with a text).
     pub(super) fn into_os_error(self) -> Error {
         Error::os_at(self.op, self.path, self.source)
     }
@@ -460,13 +461,9 @@ pub(super) fn installed(snapshot: &Fragment) -> Result<InstalledDefinition<Units
             "the job is missing, so there is no installed definition to compare",
         ));
     };
-    let unreadable = |failure: ReadFailure| Error::Step {
-        what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
-        source: Box::new(failure.into_os_error()),
-    };
-    let service_dirs = dropin_dirs(id, UnitKind::Service).map_err(unreadable)?;
+    let service_dirs = dropin_dirs(id, UnitKind::Service).map_err(unreadable_dropins)?;
     let timer_dirs = if snapshot.owns_timer_slot() {
-        dropin_dirs(id, UnitKind::Timer).map_err(unreadable)?
+        dropin_dirs(id, UnitKind::Timer).map_err(unreadable_dropins)?
     } else {
         Vec::new()
     };
@@ -484,6 +481,14 @@ pub(super) fn installed(snapshot: &Fragment) -> Result<InstalledDefinition<Units
         definition: units,
         external: dropin_external_config(id, &dirs),
     })
+}
+
+/// The error for a drop-in directory that could not be read.
+pub(super) fn unreadable_dropins(failure: ReadFailure) -> Error {
+    Error::Step {
+        what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
+        source: Box::new(failure.into_os_error()),
+    }
 }
 
 /// The drop-in text a set of drop-in directories adds to a unit's.
@@ -617,7 +622,9 @@ fn dropin_dirs(id: &str, kind: UnitKind) -> ReadResult<Vec<(PathBuf, String)>> {
     Ok(found)
 }
 
-fn dropin_marker_in(dir: &Path) -> ReadResult<String> {
+/// The text of the `*.conf` files in the drop-in directory `dir`, empty where there are none or no
+/// directory.
+pub(super) fn dropin_marker_in(dir: &Path) -> ReadResult<String> {
     let mut entries = match fs::read_dir(dir) {
         Ok(rd) => rd
             .collect::<io::Result<Vec<_>>>()
