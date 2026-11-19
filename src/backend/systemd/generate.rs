@@ -100,10 +100,9 @@ pub fn timer_for(spec: &DaemonSpec) -> Option<String> {
     Some(with_goetia_section(timer_unit(task, schedule), spec))
 }
 
-/// The part of `spec`'s timer text that a reload acts on, `None` where [`timer_for`] is: its `[Timer]`
-/// and `[Install]` sections, carried verbatim in the text. `Description=` and the `[X-Goetia]` section,
-/// which hold the name, the spec and the goetia version, change without the schedule changing and are
-/// not in it. A timer's text applies this schedule when it contains it.
+/// The part of `spec`'s timer text a reload acts on (`None` where [`timer_for`] is): the `[Timer]` and
+/// `[Install]` sections. `Description=` and `[X-Goetia]` change without the schedule changing and are
+/// excluded.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only the systemd manager, which is Linux-only, compares timers")
@@ -194,10 +193,8 @@ fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
 /// service of the same name.
 ///
 /// `AccuracySec=1s` makes the run start within the cron second; the default of one minute fired
-/// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up. It
-/// reads the timer's stamp, the time it last elapsed, so each arm of the timer clears the stamp of a
-/// timer that is not active (`enable`, and an install that re-arms a changed timer): a time passed
-/// while the timer was disarmed is then not a missed one.
+/// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up;
+/// arming clears its stamp (see `Systemctl::arm_timer`).
 fn timer_unit(task: &TaskSpec, schedule: &Schedule) -> String {
     let mut out = String::new();
 

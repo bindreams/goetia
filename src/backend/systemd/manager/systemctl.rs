@@ -79,6 +79,17 @@ enum Stamp {
     ResetThenClean,
 }
 
+/// How `id`'s timer stands, as [`Systemctl::timer_arming`] reads it. The two differ where goetia's own
+/// `disable --now` removed the link, reloaded, and then failed to stop the timer: active, and not
+/// enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TimerArming {
+    /// `ActiveState` is `active`: the timer is running, so the catch-up of a reload applies.
+    pub active: bool,
+    /// `UnitFileState` is `enabled`: goetia reports the task enabled.
+    pub enabled: bool,
+}
+
 /// What one `systemctl` run is for: what [`Systemctl::door`] establishes before it runs, and what a
 /// failure to run it says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,9 +503,7 @@ impl Systemctl {
 /// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked before goetia writes a unit, and by
 /// [`Systemctl::door`] before every request: an older systemd does not reject `Type=exec` but logs that it
 /// cannot parse it and runs the unit as `Type=simple`, silently losing the failed-exec detection
-/// the directive is there for. The floor itself is where `systemctl clean` works on a timer. Asked
-/// once per [`Held`]: one pass is remembered there, so the steps of one sequence share one pair of
-/// probes, and a manager that changes between two invocations is asked again.
+/// the directive is there for.
 impl Systemctl {
     pub(super) fn require_supported(&self, held: &mut Held) -> Result<()> {
         if held.gate_passed {
@@ -814,19 +823,25 @@ impl Systemctl {
         self.unit_file_verb(&["disable", "--now"], id, UnitKind::Timer, held)
     }
 
-    /// `id`'s timer armed, and the one way goetia arms one. Its stamp (the time it last elapsed, which
-    /// `Persistent=yes` reads) is cleared first when the timer is inactive or failed and has one: a
-    /// timer being armed was disarmed, so a time its schedule named since was missed while disarmed,
-    /// not while the machine was off, and the stamp would start the job at once for it. A failed timer
-    /// (one whose trigger was refused stays loaded, `failed`, with its memory of the last elapse) is
-    /// reset first, which `clean` needs and nothing else clears. An active timer is armed already,
-    /// `clean` refuses it, and its stamp is the catch-up of a downtime. That holds for a timer
-    /// disarmed by `disable --now`; a timer stopped by hand with `systemctl stop` stays loaded with
-    /// systemd's own memory of its last elapse, which the clean does not reach.
-    /// Asks the gate before the `show`, which reads a property older systemd lacks.
+    /// `id`'s timer armed: the only way goetia arms one. First clears the stamp `Persistent=yes` reads (a
+    /// time its schedule named while disarmed was not missed in downtime) when the timer is inactive or
+    /// failed and `CanClean` names `state`; a failed timer is reset first, since `clean` refuses it. An
+    /// active timer is left alone: its stamp is the downtime catch-up. A timer stopped by hand keeps
+    /// systemd's own memory, which clean does not reach.
+    ///
+    /// Asks the gate before the `show`, which reads a property older systemd lacks. A timer file that
+    /// systemd reports not found is reloaded and asked about again: the callers hold a file on disk,
+    /// and goetia can leave one written and not reloaded.
     pub(super) fn arm_timer(&self, id: &str, held: &mut Held) -> Result<()> {
         self.require_supported(held)?;
-        match self.timer_stamp(id)? {
+        let stamp = match self.timer_stamp(id) {
+            Err(Error::UnitNotLoaded { .. }) => {
+                self.daemon_reload(held)?;
+                self.timer_stamp(id)?
+            }
+            other => other?,
+        };
+        match stamp {
             Stamp::Left => {}
             Stamp::Clean => self.clean_timer(id, held)?,
             Stamp::ResetThenClean => {
@@ -837,30 +852,47 @@ impl Systemctl {
         self.enable_timer(id, held)
     }
 
-    /// `systemctl reset-failed` for `id`'s timer: a failed timer is inactive again. Only
-    /// [`Systemctl::arm_timer`] runs it.
+    /// `systemctl reset-failed` for `id`'s timer: a failed timer is inactive again.
     fn reset_timer(&self, id: &str, held: &mut Held) -> Result<()> {
         self.unit_file_verb(&["reset-failed"], id, UnitKind::Timer, held)
     }
 
     /// `systemctl clean --what=state` for `id`'s timer: its stamp (`/var/lib/systemd/timers/stamp-*`).
-    /// Systemd refuses a timer that is not inactive. Only [`Systemctl::arm_timer`] runs it.
+    /// Systemd refuses a timer that is not inactive.
     fn clean_timer(&self, id: &str, held: &mut Held) -> Result<()> {
         self.unit_file_verb(&["clean", "--what=state"], id, UnitKind::Timer, held)
     }
 
-    /// What arming has to do about `id`'s timer's stamp, in one `show`: the timer keeps a stamp to
-    /// clean when its `CanClean` says `state`. A timer whose `Persistent=` is off (a drop-in can do it)
-    /// lists nothing, and `clean` of it fails.
+    /// A timer whose `Persistent=` is off (a drop-in can do it) lists nothing in `CanClean`, and `clean`
+    /// of it fails. A state other than `active`, `inactive` and `failed` is an error naming it: arming
+    /// does not go on blind.
     fn timer_stamp(&self, id: &str) -> Result<Stamp> {
-        let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["CanClean", "ActiveState"])?;
+        let unit = unit_name(id, UnitKind::Timer);
+        let props = self.show_installed(&unit, &["CanClean", "ActiveState"])?;
         let keeps_stamp = props
             .get("CanClean")
             .is_some_and(|what| what.split_whitespace().any(|word| word == "state"));
-        Ok(match props.get("ActiveState").map(String::as_str) {
-            Some("inactive") if keeps_stamp => Stamp::Clean,
-            Some("failed") if keeps_stamp => Stamp::ResetThenClean,
-            _ => Stamp::Left,
+        match props.get("ActiveState").map(String::as_str) {
+            Some("active") => Ok(Stamp::Left),
+            Some("inactive") if keeps_stamp => Ok(Stamp::Clean),
+            Some("failed") if keeps_stamp => Ok(Stamp::ResetThenClean),
+            Some("inactive" | "failed") => Ok(Stamp::Left),
+            other => Err(Error::os(
+                format!("arm `{unit}`"),
+                std::io::Error::other(format!(
+                    "systemd reports `ActiveState={}`, which arming does not know what to do with",
+                    other.unwrap_or_default()
+                )),
+            )),
+        }
+    }
+
+    /// Whether `id`'s timer is active and whether it is enabled, in one `show`: see [`TimerArming`].
+    pub(super) fn timer_arming(&self, id: &str) -> Result<TimerArming> {
+        let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["ActiveState", "UnitFileState"])?;
+        Ok(TimerArming {
+            active: props.get("ActiveState").is_some_and(|s| s == "active"),
+            enabled: props.get("UnitFileState").is_some_and(|s| s == "enabled"),
         })
     }
 
@@ -933,8 +965,8 @@ impl Systemctl {
     ///
     /// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
     /// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
-    /// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand.
-    /// What systemd reports for such a name is not that unit's state, and never read as one.
+    /// say. A file written and not yet reloaded can read so too: [`Systemctl::arm_timer`] reloads and
+    /// asks again before it takes it for the first. What systemd reports for such a name is not that unit's state, and never read as one.
     fn show_installed(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
         let mut asked = props.to_vec();
         asked.push("LoadState");

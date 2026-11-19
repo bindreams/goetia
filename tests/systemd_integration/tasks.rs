@@ -357,8 +357,7 @@ fn the_rendered_on_calendar_fires_at_the_resolved_fields(#[fixture(systemd_group
     }
 }
 
-/// Where systemd keeps the stamp of `id`'s timer: when the timer last elapsed, which a timer with
-/// `Persistent=yes` reads when it starts, and starts the job at once if its schedule named a time since.
+/// Where systemd keeps the stamp of `id`'s timer.
 fn stamp_path(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_STAMP_DIR).join(format!("stamp-{id}.timer"))
 }
@@ -369,9 +368,7 @@ fn daily_at(when: &str) -> String {
     format!("{} * * *", at.trim())
 }
 
-/// Gives `id`'s timer a stamp from two hours ago: what it remembers of a last elapse, which a timer
-/// with `Persistent=yes` reads when it starts, and starts the job at once if its schedule named a time
-/// since.
+/// Gives `id`'s timer a stamp from two hours ago, so a schedule time since then is a missed one.
 fn plant_stale_stamp(id: &str) {
     cmd::run("touch", &["-d", "-2 hours", &stamp_path(id).to_string_lossy()]).expect_ok();
 }
@@ -439,9 +436,8 @@ fn a_stamp_left_by_uninstall_is_cleared_by_the_next_arm_of_the_id(#[fixture(syst
     let status = task_status(&mgr, &task_id);
     let after = SystemTime::now();
 
-    // A catch-up fires from an event source dispatched after `enable` returns, so `last_trigger` can
-    // still be empty then. The next run is read at once: a timer that has started to make up a run has
-    // none until the run is over, and one that made up none waits for the schedule's next time.
+    // A catch-up is dispatched after `enable` returns, so read the next run, which is absent while one
+    // is being made up.
     assert_next_run(&status, &schedule, &task_id, before, after);
     assert_eq!(
         last_trigger(&id),
@@ -451,13 +447,17 @@ fn a_stamp_left_by_uninstall_is_cleared_by_the_next_arm_of_the_id(#[fixture(syst
 }
 
 /// An active timer is armed already: `enable` leaves its stamp, and with it the catch-up of a downtime.
+/// The schedule names a time twelve hours away, which the test cannot reach: a time elapsing in it would
+/// rewrite the stamp.
 #[skuld::test]
 fn enable_of_an_armed_task_leaves_its_stamp(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let task_id = id_of(&id);
     let mgr = Systemd::new();
-    mgr.install(&exiting(&id, 0), false).expect("install");
+    let far = daily_at("+12 hours");
+    mgr.install(&task(&id, vec!["/bin/true".to_string()], Some(&far)), false)
+        .expect("install");
     mgr.enable(&task_id).expect("enable");
     let before = fs::metadata(stamp_path(&id))
         .and_then(|m| m.modified())

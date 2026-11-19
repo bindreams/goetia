@@ -820,6 +820,11 @@ fn every_path() -> Vec<Way> {
             gated: false,
             run: Box::new(|s: &Systemctl| s.timer_enabled("x").map(drop)),
         },
+        Way {
+            name: "show timer arming".to_string(),
+            gated: false,
+            run: Box::new(|s: &Systemctl| s.timer_arming("x").map(drop)),
+        },
     ];
     for budget in [
         Budget::Immediate,
@@ -1196,11 +1201,8 @@ fn a_clean_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
     assert!(msg.contains("not inactive"), "{msg}");
 }
 
-/// A timer's stamp is cleared only by an arm that finds the timer settled and `CanClean` naming
-/// `state`: `Persistent=` on, and no run of the timer in flight to refuse the clean. A failed timer
-/// (`ActiveState=failed`, which a refused trigger leaves, and which stays loaded with its memory of
-/// the last elapse) is reset first: systemd refuses `clean` of it, and measured, a failed timer armed
-/// without the reset made up the run.
+/// A timer's stamp is cleared only by an arm that finds the timer inactive or failed and `CanClean`
+/// naming `state`. A failed timer is reset before its stamp is cleaned: `clean` refuses it.
 #[skuld::test]
 fn a_timer_s_stamp_is_cleared_when_it_is_settled_and_can_be_cleaned_of_state() {
     for (can_clean, active, expected) in [
@@ -1218,6 +1220,21 @@ fn a_timer_s_stamp_is_cleared_when_it_is_settled_and_can_be_cleaned_of_state() {
             expected,
             "{can_clean:?} {active:?}"
         );
+    }
+}
+
+/// A state arming has no rule for is no "nothing to clean": the arm fails naming it.
+#[skuld::test]
+fn a_timer_in_a_state_arming_does_not_know_is_an_error_naming_it() {
+    for active in ["activating", "deactivating", "maintenance", "reloading"] {
+        let answer = format!("CanClean=state\nActiveState={active}\nLoadState=loaded\n");
+        let msg = showing(&answer)
+            .timer_stamp("x")
+            .expect_err(&answer)
+            .report()
+            .to_string();
+        assert!(msg.contains(&format!("ActiveState={active}")), "{msg}");
+        assert!(msg.contains("x.timer"), "{msg}");
     }
 }
 
@@ -1268,7 +1285,7 @@ fn arming_a_stopped_timer_cleans_its_stamp_before_enabling_it_now() {
     );
 }
 
-/// A failed timer is reset before its stamp is cleaned: `clean` refuses a timer that is not inactive.
+/// A failed timer is reset before its stamp is cleaned: `clean` refuses it.
 #[skuld::test]
 fn arming_a_failed_timer_resets_it_then_cleans_its_stamp_before_enabling_it_now() {
     let fake = gate_then([
@@ -1312,6 +1329,59 @@ fn a_failing_reset_fails_the_arm() {
 
     assert!(msg.contains("`systemctl reset-failed x.timer` failed"), "{msg}");
     assert_eq!(fake.calls().len(), 4, "the gate's two probes, the show and the reset");
+}
+
+fn timer_not_found() -> Entry {
+    reply(
+        &["show"],
+        exited(0, "CanClean=\nActiveState=inactive\nLoadState=not-found\n", ""),
+    )
+}
+
+/// A timer file written and not reloaded reads `not-found`: the arm reloads and asks again, and still
+/// cleans the stamp.
+#[skuld::test]
+fn arming_a_timer_systemd_has_not_loaded_reloads_asks_again_and_cleans() {
+    let fake = gate_then([
+        timer_not_found(),
+        reply(&["daemon-reload"], exited(0, "", "")),
+        timer_shows("state", "inactive"),
+        reply(&["clean"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+    ]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    let show = vec!["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"];
+    assert_eq!(
+        fake.calls().into_iter().skip(2).collect::<Vec<_>>(),
+        [
+            show.clone(),
+            vec!["daemon-reload"],
+            show,
+            vec!["clean", "--what=state", "--", "x.timer"],
+            vec!["enable", "--now", "--", "x.timer"],
+        ]
+    );
+}
+
+/// A timer systemd cannot see after a reload is still not a state: the arm fails with nothing enabled.
+#[skuld::test]
+fn a_timer_still_not_loaded_after_the_reload_fails_the_arm() {
+    let fake = gate_then([
+        timer_not_found(),
+        reply(&["daemon-reload"], exited(0, "", "")),
+        timer_not_found(),
+    ]);
+
+    let e = on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect_err("not loaded");
+
+    assert!(matches!(e, Error::UnitNotLoaded { .. }), "{e:?}");
+    assert_eq!(fake.calls().len(), 5, "the gate's two probes, show, reload, show");
 }
 
 /// A timer whose `Persistent=` is off (a drop-in) keeps no stamp the manager reads, and `clean` of it
@@ -1384,6 +1454,23 @@ fn a_timer_is_enabled_when_its_unit_file_state_says_so() {
     ] {
         let answer = format!("UnitFileState={state}\nLoadState=loaded\n");
         assert_eq!(showing(&answer).timer_enabled("x").expect(state), enabled, "{state:?}");
+    }
+}
+
+/// A timer's activity and its link are read apart: goetia's own `disable --now` can leave it active and
+/// not enabled.
+#[skuld::test]
+fn a_timer_s_activity_and_its_link_are_read_apart() {
+    for (active, state, expected) in [
+        ("active", "enabled", (true, true)),
+        ("active", "disabled", (true, false)),
+        ("inactive", "enabled", (false, true)),
+        ("inactive", "disabled", (false, false)),
+        ("failed", "disabled", (false, false)),
+    ] {
+        let answer = format!("ActiveState={active}\nUnitFileState={state}\nLoadState=loaded\n");
+        let arming = showing(&answer).timer_arming("x").expect(&answer);
+        assert_eq!((arming.active, arming.enabled), expected, "{active:?} {state:?}");
     }
 }
 

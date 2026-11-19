@@ -1162,8 +1162,8 @@ fn timer_unit_text_is_exact() {
     );
 }
 
-/// What a reload acts on is the schedule: the spec blob, the goetia version and `Description=` are not
-/// in it, and a changed schedule is. The timer's text carries it as it is.
+/// The schedule excludes the spec blob, version and `Description=`; a changed schedule is in the timer's
+/// text.
 #[skuld::test]
 fn a_timers_schedule_changes_only_with_its_schedule() {
     let schedule = |spec: &DaemonSpec| timer_schedule(spec).expect("a schedule");

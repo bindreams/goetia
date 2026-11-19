@@ -222,6 +222,7 @@ fn what_an_update_does_before_it_replaces_the_job() {
             Before {
                 disable_job: true,
                 drop_timer: false,
+                disarm_timer: false,
                 rearm_timer: false,
             },
         ),
@@ -232,6 +233,7 @@ fn what_an_update_does_before_it_replaces_the_job() {
             Before {
                 disable_job: false,
                 drop_timer: true,
+                disarm_timer: false,
                 rearm_timer: false,
             },
         ),
@@ -242,6 +244,7 @@ fn what_an_update_does_before_it_replaces_the_job() {
             Before {
                 disable_job: false,
                 drop_timer: true,
+                disarm_timer: false,
                 rearm_timer: false,
             },
         ),
@@ -260,11 +263,12 @@ fn what_an_update_does_before_it_replaces_the_job() {
             Before {
                 disable_job: false,
                 drop_timer: true,
+                disarm_timer: false,
                 rearm_timer: false,
             },
         ),
     ] {
-        let before = before_replacing(&old, &units_of(new), new, || Ok(false), || Ok(true)).expect(what);
+        let before = before_replacing(&old, &units_of(new), new, || Ok(false), || Ok(enabled())).expect(what);
         assert_eq!(before, expected, "{what}");
     }
 }
@@ -273,49 +277,103 @@ fn nothing() -> Before {
     Before {
         disable_job: false,
         drop_timer: false,
+        disarm_timer: false,
         rearm_timer: false,
     }
 }
 
-/// An armed task whose timer changes is disarmed before the write and armed after the reload: its
-/// schedule differs (the timer's text without its `[X-Goetia]` section and `Description=`), or the
-/// update deletes a drop-in directory of the timer. A timer that does not change, and a task that is
-/// not armed, are only written.
+fn enabled() -> TimerArming {
+    TimerArming {
+        active: true,
+        enabled: true,
+    }
+}
+
+/// A timer whose changed schedule is to be disarmed before the write: its schedule differs (the timer's
+/// text without its `[X-Goetia]` section and `Description=`), or the update deletes a drop-in directory
+/// of it, and it is active or enabled. It is armed again only if it was enabled. A timer that does not
+/// change, and one that is neither active nor enabled, are only written.
 #[skuld::test]
-fn an_armed_timer_that_changes_is_to_be_armed_again() {
+fn a_timer_that_changes_is_disarmed_by_its_activity_and_armed_again_by_its_link() {
     let old = task_spec("x", "/bin/a", Some("30 3 * * *"));
     let moved = task_spec("x", "/bin/a", Some("30 5 * * *"));
     let recommanded = task_spec("x", "/bin/b", Some("30 3 * * *"));
-    for (what, new, dropins, armed, rearm) in [
-        ("its text changes", &moved, false, true, true),
-        ("the update deletes a drop-in directory of it", &old, true, true, true),
-        ("both", &moved, true, true, true),
-        ("nothing about it changes", &old, false, true, false),
+    let (on, active_only, enabled_only, off) = (
+        enabled(),
+        TimerArming {
+            active: true,
+            enabled: false,
+        },
+        TimerArming {
+            active: false,
+            enabled: true,
+        },
+        TimerArming {
+            active: false,
+            enabled: false,
+        },
+    );
+    for (what, new, dropins, arming, disarm, rearm) in [
+        ("its text changes", &moved, false, on, true, true),
+        (
+            "the update deletes a drop-in directory of it",
+            &old,
+            true,
+            on,
+            true,
+            true,
+        ),
+        ("both", &moved, true, on, true, true),
+        ("nothing about it changes", &old, false, on, false, false),
         (
             "its task's command changes, which only the timer's metadata carries",
             &recommanded,
             false,
+            on,
+            false,
+            false,
+        ),
+        (
+            "it is active and not enabled: goetia's own disable left it so",
+            &moved,
+            false,
+            active_only,
             true,
             false,
         ),
-        ("a disabled task's text changes", &moved, false, false, false),
-        ("a disabled task's drop-in directory goes", &old, true, false, false),
+        ("it is enabled and not active", &moved, false, enabled_only, true, true),
+        (
+            "a stopped, disabled timer's text changes",
+            &moved,
+            false,
+            off,
+            false,
+            false,
+        ),
+        (
+            "a stopped, disabled timer's drop-in directory goes",
+            &old,
+            true,
+            off,
+            false,
+            false,
+        ),
     ] {
-        let before = before_replacing(&fragment(&old), &units_of(new), new, || Ok(dropins), || Ok(armed)).expect(what);
-        assert_eq!(before.rearm_timer, rearm, "{what}");
+        let before = before_replacing(&fragment(&old), &units_of(new), new, || Ok(dropins), || Ok(arming)).expect(what);
+        assert_eq!((before.disarm_timer, before.rearm_timer), (disarm, rearm), "{what}");
         assert!(!before.drop_timer && !before.disable_job, "{what}");
     }
 }
 
-/// Whether a timer is armed is asked of systemd only when the timer changes.
+/// How a timer stands is asked of systemd only when the timer changes.
 #[skuld::test]
-fn the_timer_is_asked_whether_it_is_armed_only_when_it_changes() {
+fn the_timer_is_asked_how_it_stands_only_when_it_changes() {
     let old = task_spec("x", "/bin/a", Some("30 3 * * *"));
     let moved = task_spec("x", "/bin/a", Some("30 5 * * *"));
     let asked = std::cell::Cell::new(0);
     let ask = || {
         asked.set(asked.get() + 1);
-        Ok(true)
+        Ok(enabled())
     };
 
     before_replacing(&fragment(&old), &units_of(&old), &old, || Ok(false), ask).expect("unchanged");
@@ -346,7 +404,7 @@ fn the_timer_drop_in_directory_is_read_only_where_a_timer_replaces_a_timer() {
         ("a service stays one", &service, &service, 0),
     ] {
         read.set(0);
-        before_replacing(&fragment(old), &units_of(new), new, dropins, || Ok(false)).expect(what);
+        before_replacing(&fragment(old), &units_of(new), new, dropins, || Ok(enabled())).expect(what);
         assert_eq!(read.get(), reads, "{what}");
     }
 }
@@ -361,7 +419,7 @@ fn an_unreadable_timer_drop_in_directory_fails_the_update() {
         &units_of(&old),
         &old,
         || Err(Error::os_at("read", "x.timer.d", std::io::Error::other("unreadable"))),
-        || Ok(true),
+        || Ok(enabled()),
     );
 
     assert!(failed.is_err());
@@ -565,9 +623,7 @@ fn enable_of_a_task_cleans_the_stamp_then_enables_the_timer_now_and_never_the_se
     );
 }
 
-/// A failed timer stays loaded with its memory of the last elapse and `clean` refuses it: it is reset
-/// first (measured: reset, clean, enable made up no run; clean alone was refused, and the arm that
-/// went on made up the run).
+/// A failed timer is reset before its stamp is cleaned: `clean` refuses it.
 #[skuld::test]
 fn enable_of_a_failed_task_resets_the_timer_then_cleans_the_stamp_then_enables_it() {
     let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
@@ -1288,10 +1344,50 @@ fn a_changed_schedule_of_a_disabled_task_is_only_written(#[fixture(systemd_group
             call(&[
                 "show",
                 "--property",
-                "UnitFileState,LoadState",
+                "ActiveState,UnitFileState,LoadState",
                 "--",
                 &format!("{id}.timer")
             ]),
+            call(&["daemon-reload"]),
+        ]
+    );
+    assert_eq!(text_of(&id, UnitKind::Timer), units_of(&new).timer);
+}
+
+/// A timer that is active and not enabled (goetia's own `disable --now` removed the link, reloaded and
+/// failed to stop it) still makes up a time a reload finds missed: it is disarmed around the change, and
+/// not armed after, so an install never enables a timer goetia reports as disabled.
+#[skuld::test]
+fn a_changed_schedule_of_an_active_but_disabled_timer_is_disarmed_and_not_armed(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let old = task_spec(&id, "/bin/a", Some("30 3 * * *"));
+    let new = task_spec(&id, "/bin/a", Some("30 5 * * *"));
+    let old_units = units_of(&old);
+    seed(&id, UnitKind::Service, &old_units.service);
+    seed(&id, UnitKind::Timer, old_units.timer.as_deref().expect("a timer"));
+    let fake = gate_then([
+        timer_stands("disabled", "active"),
+        reply(&["disable"], exited(0, "", "")),
+        reload(),
+    ]);
+
+    let outcome = install(&over(&fake), &new, false);
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert_eq!(
+        without_gate(&fake),
+        [
+            call(&[
+                "show",
+                "--property",
+                "ActiveState,UnitFileState,LoadState",
+                "--",
+                &format!("{id}.timer")
+            ]),
+            call(&["disable", "--now", "--", &format!("{id}.timer")]),
             call(&["daemon-reload"]),
         ]
     );
@@ -1349,7 +1445,7 @@ fn a_changed_schedule_of_an_armed_task_is_disarmed_written_reloaded_and_armed(
             call(&[
                 "show",
                 "--property",
-                "UnitFileState,LoadState",
+                "ActiveState,UnitFileState,LoadState",
                 "--",
                 &format!("{id}.timer")
             ]),
@@ -2055,10 +2151,20 @@ fn show_in(active: &str, pid: u32, invocation: &str) -> Entry {
     )
 }
 
+/// `systemctl show` of a timer with this `UnitFileState`, inactive.
 fn timer_show(state: &str) -> Entry {
+    timer_stands(state, "inactive")
+}
+
+/// `systemctl show` of a timer with this `UnitFileState` and `ActiveState`.
+fn timer_stands(state: &str, active: &str) -> Entry {
     reply(
         &["show"],
-        exited(0, &format!("UnitFileState={state}\nLoadState=loaded\n"), ""),
+        exited(
+            0,
+            &format!("ActiveState={active}\nUnitFileState={state}\nLoadState=loaded\n"),
+            "",
+        ),
     )
 }
 

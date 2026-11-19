@@ -74,10 +74,7 @@ pub trait ServiceManager {
     /// `id` is not managed by Goetia. A task's `enable` arms its schedule; a task with no schedule
     /// has nothing to arm, and its `enable` is [`Error::Invalid`] before the manager is asked. Arming
     /// again starts no run for a time the schedule named while goetia's `disable` had the task
-    /// disarmed: a missed start is made up only for time the machine was off or asleep. On systemd
-    /// that is the timer's stamp, cleared as it is armed when the timer is not active. A timer stopped
-    /// by hand with `systemctl stop` keeps systemd's own memory of its last elapse, and arming it can
-    /// start the job at once.
+    /// disarmed: a missed start is made up only for time the machine was off or asleep.
     fn enable(&self, id: &Id) -> Result<()>;
 
     /// Disable the service at boot. Does not stop it if running. A task's `disable` disarms its
