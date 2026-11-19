@@ -191,7 +191,7 @@ fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
 fn a_denied_open_that_a_failed_privilege_step_is_told_after_is_named_a_denial() {
     let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
     let step = std::io::Error::from_raw_os_error(1300);
-    let e = crate::error::paired(denied, step);
+    let e = crate::error::debug_privilege_also_failed(denied, step);
 
     let err = open_refused("kill", "service `x`", "open service `x` to kill it", e);
 

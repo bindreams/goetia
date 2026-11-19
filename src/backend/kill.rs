@@ -49,11 +49,12 @@ pub enum KillOutcome {
     NotRunning,
 }
 
-/// The failure of a kill of `id`, as the verb reports it. A target that talks to a manager through
-/// calls that fail with goetia's own [`Error`] wraps it in an [`io::Error`] to pass it through
-/// [`KillTarget`]; it comes back as itself, with its kind, and one carried under the context of a
-/// signal that was delivered ([`signalled_but`]) is the source of a step that says so. Any other error
-/// is an OS failure of the kill.
+/// The failure of a kill of `id`, as the verb reports it: a [`Step`](Error::Step) around the error the
+/// failure carries, or an OS failure of the kill. A target that talks to a manager through calls that fail
+/// with goetia's own [`Error`] wraps it in an [`io::Error`] to pass it through [`KillTarget`]; it is the
+/// step's source, with its class, so a caller matching on `NoManager` or `Command` finds it with
+/// [`Error::cause`]. A failure after the signal was delivered ([`signalled_but`]) is told under the kill
+/// with no claim that the kill failed. Any other error is an OS failure of the kill.
 pub(crate) fn kill_failed(id: &str, e: io::Error) -> Error {
     target_failed(format!("kill `{id}`"), e)
 }

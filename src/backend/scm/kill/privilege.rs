@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
-use crate::error::{Chain, paired, within};
+use crate::error::{Chain, debug_privilege_also_failed, within};
 
 /// While alive, the calling thread runs with the caller's `SeDebugPrivilege` enabled, if the caller
 /// holds it. Dropping restores the thread's earlier token.
@@ -51,7 +51,7 @@ impl DebugPrivilege {
             return open;
         }
         match self.failure.take() {
-            Some(step) => paired(open, step),
+            Some(step) => debug_privilege_also_failed(open, step),
             None => open,
         }
     }

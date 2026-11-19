@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::*;
 use crate::error::Reason;
 use crate::error::error_tests::{exit_status, id, os, undetermined};
-use crate::error::{Composite, carried_composite, carry, paired};
+use crate::error::{Composite, carried_composite, carry};
 
 /// A remedy is its own sentence: it follows a period the words before it already ended with, and
 /// supplies one when they did not.
@@ -392,10 +392,6 @@ fn a_standard_printer_shows_each_failure_of_a_composite_once() {
         }),
         then: Box::new(os("stat", "/r", "last failure")),
     };
-    let pair = paired(
-        std::io::Error::other("primary failure"),
-        std::io::Error::other("second failure"),
-    );
     let blob = Error::StartJudgedWithoutBlob {
         id: "x".to_string(),
         judged_as: crate::spec::Protocol::Native,
@@ -407,10 +403,9 @@ fn a_standard_printer_shows_each_failure_of_a_composite_once() {
         read_failed: Box::new(os("read", "/t", "read failure")),
         restore_failed: Some(Box::new(os("write", "/u", "restore failure"))),
     };
-    let shown: [(&(dyn std::error::Error + 'static), &[&str]); 5] = [
+    let shown: [(&(dyn std::error::Error + 'static), &[&str]); 4] = [
         (&both, &["first failure", "then failure"]),
         (&nested, &["first failure", "then failure", "last failure"]),
-        (&pair, &["primary failure", "second failure"]),
         (&blob, &["blob failure", "start failure"]),
         (&loaded, &["read failure", "restore failure"]),
     ];

@@ -169,8 +169,9 @@ pub(super) fn hold_run<P: Processes>(
             &format!("open the process of `{id}`'s run (pid {pid}) to wait for its exit"),
             e,
         )),
+        // No pid here: the errors of a hold that has one name it.
         Err(e) => Err(target_failed(
-            format!("hold the process of `{id}`'s run (pid {pid})"),
+            format!("hold the process of `{id}`'s run"),
             io::Error::from(e),
         )),
     }

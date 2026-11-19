@@ -1676,8 +1676,8 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
     hold_if_possible(&mut target, deadline).map_err(|e| not_done(hold_failed(id, e)))
 }
 
-/// The failure `e` to read SCM while holding `id`'s process, as `hold_process` reports it: a goetia error
-/// that `e` carries is the error, with its class.
+/// The failure `e` to hold `id`'s process, as `hold_process` reports it: a [`Step`](Error::Step) around
+/// the goetia error that `e` carries, with its class, or else an OS failure of the hold.
 fn hold_failed(id: &Id, e: std::io::Error) -> Error {
     target_failed(format!("hold `{id}`'s process to wait for its exit"), e)
 }

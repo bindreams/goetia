@@ -6,20 +6,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod composite;
+#[cfg(windows)]
+mod debug_privilege;
 mod escape;
-#[cfg(any(windows, test))]
-mod paired;
 mod reason;
 mod report;
 mod within;
 
 pub(crate) use composite::{Composite, carried_composite, carry};
+#[cfg(windows)]
+pub(crate) use debug_privilege::debug_privilege_also_failed;
 #[cfg(feature = "cli")]
 pub(crate) use escape::EscapedStream;
 #[cfg(any(feature = "cli", unix))]
 pub(crate) use escape::escape;
-#[cfg(any(windows, test))]
-pub(crate) use paired::paired;
 pub use reason::Reason;
 #[cfg(feature = "cli")]
 pub(crate) use report::Sink;
@@ -55,6 +55,12 @@ pub enum Error {
         #[source]
         source: BoxError,
     },
+
+    /// An OS failure that says nothing of its own: the words of the error around it say what failed, as
+    /// those of [`ManagerUnreadAfterOpenRefused`](Error::ManagerUnreadAfterOpenRefused) do. `os` is
+    /// rendered as any error is, and is not the [`source`](std::error::Error::source).
+    #[error("{}", raw_os_message(os))]
+    RawOs { os: std::io::Error },
 
     /// A tool goetia runs (`systemctl`, `launchctl`, `plutil`, `sc.exe`) ran and exited
     /// unsuccessfully. `stderr` is its own diagnostic, trimmed: [`report`](Error::report) writes it,
@@ -774,7 +780,8 @@ pub enum Error {
     /// A hold of the process `pid` of a daemon whose open was refused, `open_refused`, which the message only
     /// mentions, and whose re-read of what runs the daemon (the service manager, or the Task Scheduler's
     /// listing of a run) failed after that, `source`, so that it is not known whether the refusal was the
-    /// daemon's. The re-read's class is the error's.
+    /// daemon's. The re-read's class is the error's: `source` is the goetia error it carried, else its OS
+    /// failure alone ([`RawOs`](Error::RawOs)).
     #[error("{}", manager_unread_after_open_refused_message(*pid, open_refused))]
     ManagerUnreadAfterOpenRefused {
         pid: u32,
@@ -841,6 +848,7 @@ impl Error {
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
+            | Error::RawOs { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
             | Error::ConcurrentChange { .. }
@@ -1026,6 +1034,7 @@ impl Error {
                 Some(manager_unread_after_open_refused_message(*pid, open_refused))
             }
             Error::OutputAlsoFailed { id, shown, .. } => Some(output_also_failed_message(id, shown)),
+            Error::RawOs { os } => Some(raw_os_message(os)),
             Error::ProcessWaitTimeout {
                 id,
                 pid,
@@ -1467,6 +1476,11 @@ fn manager_unread_after_open_refused_message(pid: u32, open_refused: &std::io::E
         .text(format!("the process (pid {pid}) could not be opened ("))
         .mentioned(open_refused)
         .text("), and the re-read of what runs the daemon failed")
+}
+
+/// The message of [`Error::RawOs`]: `os` is the whole of it, and the cause of the failure it states.
+fn raw_os_message(os: &std::io::Error) -> Pieces<'_> {
+    Pieces::new().cause(os)
 }
 
 /// The message of [`Error::OutputAlsoFailed`]: `shown` is why the output could not be shown.

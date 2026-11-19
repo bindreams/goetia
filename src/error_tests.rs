@@ -1536,11 +1536,13 @@ fn the_os_error_of_an_error_a_sentence_only_mentions_is_not_found() {
     assert_eq!(timeout(Some(failed)).raw_os_error(), None);
 }
 
-/// The primary failure of a pair is the pair's cause, and the second only told after it.
+/// The denied open of a failed privilege step is the failure's cause, and the step only told after it.
+#[cfg(windows)]
 #[skuld::test]
-fn the_os_error_of_a_pair_is_its_primarys_and_never_its_seconds() {
-    let pair =
-        |primary: std::io::Error, second: std::io::Error| Error::os("kill", crate::error::paired(primary, second));
+fn the_os_error_of_a_denied_open_is_the_opens_and_never_the_steps() {
+    let pair = |primary: std::io::Error, second: std::io::Error| {
+        Error::os("kill", crate::error::debug_privilege_also_failed(primary, second))
+    };
     let coded = |code| std::io::Error::from_raw_os_error(code);
     assert_eq!(pair(coded(5), coded(8)).raw_os_error(), Some(5));
     assert_eq!(pair(std::io::Error::other("no code"), coded(8)).raw_os_error(), None);
