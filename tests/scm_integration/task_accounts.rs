@@ -487,6 +487,62 @@ fn a_running_service_whose_account_changes_keeps_its_log_and_the_new_account_wri
     assert_eq!(accounts_of_default_log(id), [sid_of(5, &NETWORK_SERVICE)]);
 }
 
+/// A log deleted under a running service, whose account an install then changes, is made again naming both
+/// accounts: the running shim reopens the path as the account it runs as, which a log naming the new one alone
+/// would refuse. The next install, which finds the service as it is, names the new account alone.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_log_made_under_a_running_service_whose_account_changes_names_both_accounts_until_the_next_install(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    use std::net::Shutdown;
+
+    let id = &test_id();
+    let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = host.manager();
+    let listener = ConnectBack::listen();
+    let as_account = |account: &str| {
+        service_running(
+            id,
+            account,
+            vec![
+                host.exe.path_str(),
+                PRINT_WHEN_RELEASED.to_owned(),
+                listener.port().to_string(),
+                "run".to_owned(),
+            ],
+        )
+    };
+    let (local_service, network_service) = (sid_of(5, &LOCAL_SERVICE), sid_of(5, &NETWORK_SERVICE));
+    mgr.install(&as_account("LocalService"), false)
+        .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
+    mgr.start(id, Budget::Unbounded)
+        .unwrap_or_else(|e| panic!("start as LocalService: {}", e.report()));
+    let run = listener.accept_stream("the program of the service, as LocalService");
+
+    let log = support::shim_default_log(&support::program_data(), id.as_str());
+    std::fs::remove_file(&log).unwrap_or_else(|e| panic!("delete {} under the running shim: {e}", log.display()));
+    mgr.install(&as_account("NetworkService"), false)
+        .unwrap_or_else(|e| panic!("install as NetworkService, while it runs: {}", e.report()));
+    let mut both = vec![local_service, network_service.clone()];
+    both.sort();
+    assert_eq!(
+        accounts_of_default_log(id),
+        both,
+        "the running shim may reopen the log as LocalService"
+    );
+
+    let again = mgr
+        .install(&as_account("NetworkService"), false)
+        .unwrap_or_else(|e| panic!("install as NetworkService again: {}", e.report()));
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert_eq!(accounts_of_default_log(id), [network_service]);
+
+    run.shutdown(Shutdown::Write).expect("release the program");
+    mgr.stop(id, Budget::DEFAULT)
+        .unwrap_or_else(|e| panic!("stop: {}", e.report()));
+}
+
 /// Ends the process of a parked service host if the test fails before it releases it, so that the service guard,
 /// which stops and deletes the service, finds nothing parked in `ServiceMain`.
 struct ParkedProcess(std::cell::Cell<Option<u32>>);
@@ -500,7 +556,8 @@ impl ParkedProcess {
 impl Drop for ParkedProcess {
     fn drop(&mut self) {
         if let Some(pid) = self.0.get()
-            && let Some(problem) = support::cmd::run_cleanup("taskkill.exe", &[&["/F", "/PID", &pid.to_string()]], &[128])
+            && let Some(problem) =
+                support::cmd::run_cleanup("taskkill.exe", &[&["/F", "/PID", &pid.to_string()]], &[128])
         {
             eprintln!("ParkedProcess[{pid}]: cleanup failed: {problem}");
         }

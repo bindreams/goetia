@@ -14,7 +14,8 @@ use crate::backend::scm::folder::logs_folder;
 use crate::backend::scm::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, read_path};
 use crate::backend::scm::sid::{sid_display, sid_from_parts};
 use crate::backend::scm::test_support::{
-    delete_pending, effective_rights, make_mount_point, permit_only, set_dacl, set_owner, set_reparse_point, short, withdraw_append,
+    delete_pending, effective_rights, make_mount_point, permit_only, set_dacl, set_owner, set_reparse_point, short,
+    withdraw_append,
 };
 use crate::elevation::test_support::{ThreadTokenReset, process_user_sid, restricted_token_copy};
 use crate::testing::groups::{Group, scm_group};
