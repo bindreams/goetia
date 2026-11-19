@@ -131,10 +131,10 @@ pub(crate) trait Backend {
     ) -> Result<WriteOutcome>;
 
     /// What an install that found the definition up to date still sees to: what a [`Self::write`] makes
-    /// besides the definition, and nothing else would make again if it were gone. SCM's: a daemon's default log,
-    /// which the shim only opens; and a task's record folders and directory (with the marker a dead uninstall
-    /// left cleared), the `Goetia` event source, and a real user's logon right. `snapshot` is what `read`
-    /// found. A failure fails the install. Nothing by default.
+    /// besides the definition, and nothing else would make again if it were gone. SCM's, for a service and a
+    /// task alike: the `Goetia` event source, a real user's logon right, and the default log, which the shim
+    /// only opens; and for a task, its record folders and directory (with the marker a dead uninstall left
+    /// cleared). `snapshot` is what `read` found. A failure fails the install. Nothing by default.
     fn ensure_beside(
         &self,
         _spec: &DaemonSpec,

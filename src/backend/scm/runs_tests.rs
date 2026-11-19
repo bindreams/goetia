@@ -1529,7 +1529,7 @@ fn ensure_is_repeatable() {
     assert!(runs.read(&instance(1)).unwrap().is_some());
 }
 
-/// An account named twice (a task changed to the account it already ran as) is one trustee, as in the default log.
+/// An account named twice is one trustee, as in the default log.
 #[skuld::test]
 fn ensure_names_an_account_given_twice_once() {
     let (_dir, runs) = fixture();
