@@ -16,9 +16,9 @@
 //! removing the triggers stops it. So [`TaskXml::to_xml`] writes the triggers only for an armed task, and
 //! what is read back of a task with none is the definition it would arm: the triggers its blob's
 //! schedule compiles to. Three edits of the stored XML change the state:
-//! - [`TaskXml::without_triggers`] for `disable`;
-//! - [`TaskXml::with_triggers`] for `enable` of a task with no trigger switched on;
-//! - [`TaskXml::with_own_flag`] for `enable` of a task whose stored triggers are on, which are kept.
+//! - `disable` uses [`TaskXml::without_triggers`];
+//! - `enable` of a task with no trigger switched on uses [`TaskXml::with_triggers`];
+//! - `enable` of a task whose stored triggers are on uses [`TaskXml::with_own_flag`], which keeps them.
 
 use std::collections::BTreeSet;
 use std::fmt;

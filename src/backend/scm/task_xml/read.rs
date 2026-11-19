@@ -1,9 +1,9 @@
 //! Reading a task's XML as Task Scheduler stores it: the definition ([`TaskXml::parse`]), the armed
 //! state, which is whether it has a trigger that is switched on ([`TaskXml::armed`]), and the three
 //! edits of the stored XML that arm and disarm it:
-//! - [`TaskXml::without_triggers`]: `disable`;
-//! - [`TaskXml::with_triggers`]: `enable` of a task with no trigger switched on (the blob's schedule);
-//! - [`TaskXml::with_own_flag`]: `enable` of a task whose stored triggers are on, kept as they are.
+//! - `disable` registers [`TaskXml::without_triggers`];
+//! - `enable` of a task with no trigger switched on registers [`TaskXml::with_triggers`] (the blob's schedule);
+//! - `enable` of a task whose stored triggers are on registers [`TaskXml::with_own_flag`], keeping them.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
