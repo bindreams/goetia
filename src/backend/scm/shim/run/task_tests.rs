@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, FALSE, TRUE};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, FALSE, TRUE};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
@@ -19,15 +19,19 @@ use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::{Instance, Registered, TaskApi};
 use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::backend::scm::shim::run::os::LogKind;
+use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::shim::run::os::fake::{
-    FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
+    ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
 };
+use crate::backend::scm::shim::run::os::{LogKind, Severity};
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 use crate::backend::scm::task_xml::Token;
-use crate::backend::scm::test_support::{TASK_TOKEN, registered_task, registered_task_with, task_token};
+use crate::backend::scm::test_support::{
+    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, delete_pending, directory_with_a_file, make_mount_point,
+    registered_task, registered_task_with, set_dacl, task_token,
+};
 use crate::elevation::test_support::process_user_sid;
 use crate::error::Error;
 use crate::spec::{DaemonFields, DaemonSpec, ServiceSpec, TaskFields, TaskSpec};
@@ -98,9 +102,9 @@ struct Run {
 }
 
 impl Run {
-    /// A task whose own read answers `reply`, and whose directory of records is made for this
-    /// process's own account.
-    fn reading(reply: crate::error::Result<Option<Registered>>) -> Run {
+    /// A task that states no reply, so that any call on it fails the test, and whose directory of
+    /// records is made for this process's own account.
+    fn unread() -> Run {
         let dir = tempfile::tempdir().unwrap();
         let id = Id::try_from(ID).unwrap();
         let runs = Runs::of(dir.path(), &id);
@@ -108,16 +112,61 @@ impl Run {
         std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join(ID)).unwrap();
         runs.ensure(&[process_user_sid()]).unwrap();
         let fake = FakeGuard::new();
-        let supervisor = supervisor(&fake);
-        let api = TaskFake::new();
-        api.on_get(reply);
+        let supervisor = Arc::new(Supervisor::new(fake.os(), fake.task_log()));
         Run {
             fake,
             supervisor,
-            api,
+            api: TaskFake::new(),
             runs,
             _dir: dir,
         }
+    }
+
+    /// A task whose own read answers `reply`.
+    fn reading(reply: crate::error::Result<Option<Registered>>) -> Run {
+        let run = Run::unread();
+        run.api.on_get(reply);
+        run
+    }
+
+    /// Another handle on the task's records.
+    fn hand(&self) -> Runs {
+        Runs::of(self._dir.path(), &Id::try_from(ID).unwrap())
+    }
+
+    /// The `%ProgramData%` the records are under.
+    fn program_data(&self) -> &Path {
+        self._dir.path()
+    }
+
+    /// The task's directory of records.
+    fn records_dir(&self) -> PathBuf {
+        self._dir.path().join("Goetia").join("runs").join(ID)
+    }
+
+    /// Nothing started: no program, no log opened for it, no default log held, no record, and every pin
+    /// this run took is gone (a removal that waits for a pin would call its note, which panics).
+    fn started_nothing(&self) {
+        assert_eq!(self.fake.calls(Op::Spawn), 0, "a program was started");
+        assert_eq!(self.fake.calls(Op::OpenLog), 0, "a log was opened");
+        assert_eq!(self.record(), None);
+        self.no_pin_is_left();
+    }
+
+    /// No pin is held: the records are removed, which waits for a held pin and so would panic here. Ends
+    /// the test's use of the records.
+    fn no_pin_is_left(&self) {
+        self.runs
+            .remove_all(|path, _| panic!("the shim still holds {}", path.display()))
+            .unwrap();
+    }
+
+    /// The task's default log was held, by the shim, so many times.
+    fn default_log_holds(calls: &[ChannelCall]) -> usize {
+        calls
+            .iter()
+            .filter(|call| matches!(call, ChannelCall::HoldDefault { .. }))
+            .count()
     }
 
     /// A task whose own read returns `spec`.
@@ -152,7 +201,7 @@ impl Run {
             Some(task_token()),
             &self.supervisor,
             &self.api,
-            Some(&self.runs),
+            Ok(self.program_data()),
             OWN_PID,
         )
     }
@@ -263,32 +312,58 @@ fn a_service_blob_is_refused_by_task_mode() {
     run.api.finish();
 }
 
+/// A blob that is not a task's, or cannot be read as one, is refused: it is the task's content that is
+/// wrong, which no run of the shim changes.
 #[skuld::test]
-fn a_task_that_is_gone_or_not_goetias_is_refused_and_nothing_runs() {
+fn a_foreign_or_undecodable_blob_is_refused_and_nothing_runs() {
     let cases = [
         (
-            Ok(None),
-            format!(r"the task \Goetia\{ID} is gone: no program was started"),
-        ),
-        (
-            Ok(Some(Registered {
-                xml: String::new(),
-                data: "an administrator's note".to_string(),
-                enabled: Some(true),
-            })),
+            "an administrator's note".to_string(),
             "the task's Data holds no Goetia marker: this task was not created by `goetia daemon install`".to_string(),
         ),
+        ("Marker: goetia\nSchema: not-a-schema".to_string(), String::new()),
     ];
-    for (reply, message) in cases {
-        let run = Run::reading(reply);
+    for (data, message) in cases {
+        let run = Run::reading(Ok(Some(Registered {
+            xml: String::new(),
+            data,
+            enabled: Some(true),
+        })));
 
         let code = run.run();
 
         assert_eq!(code, Reported::Refused.process_exit_code() as u32);
-        assert_one_failure(&run.fake.take_failures(), ID, &message);
-        assert_eq!(run.fake.calls(Op::Spawn), 0);
+        let failures = run.fake.take_failures();
+        let expected = if message.is_empty() {
+            "decode the task's Data: "
+        } else {
+            message.as_str()
+        };
+        assert!(
+            failures.len() == 1 && failures[0].starts_with(&format!("goetia-shim[{ID}]: {expected}")),
+            "{failures:?}"
+        );
+        run.started_nothing();
         run.api.finish();
     }
+}
+
+/// A task that is gone is a failure of the shim's, not a refusal: a deleted task is the one case an
+/// uninstall or an account change makes of a shim that was late.
+#[skuld::test]
+fn a_deleted_task_ends_the_shim_with_the_shim_failure_code() {
+    let run = Run::reading(Ok(None));
+
+    let code = run.run();
+
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
+    assert_one_failure(
+        &run.fake.take_failures(),
+        ID,
+        &format!(r"the task \Goetia\{ID} is gone: no program was started"),
+    );
+    run.started_nothing();
+    run.api.finish();
 }
 
 fn not_the_registration_started_under() -> String {
@@ -311,7 +386,14 @@ fn a_registration_with_another_token_starts_no_program() {
     let run = Run::of(&spec_logging_to(None));
 
     let other = Token::parse(OTHER_TOKEN).unwrap();
-    let code = run_in(ID, Some(other), &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+    let code = run_in(
+        ID,
+        Some(other),
+        &run.supervisor,
+        &run.api,
+        Ok(run.program_data()),
+        OWN_PID,
+    );
 
     assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
     assert_one_failure(&run.fake.take_failures(), ID, &not_the_registration_started_under());
@@ -351,7 +433,7 @@ fn a_registration_with_no_ending_for_this_task_starts_no_program() {
         })));
         let (id, token) = requested_of(argv).expect("an ending with the task flag is task mode");
 
-        let code = run_in(&id, token, &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+        let code = run_in(&id, token, &run.supervisor, &run.api, Ok(run.program_data()), OWN_PID);
 
         assert_eq!(
             code,
@@ -369,7 +451,7 @@ fn a_registration_with_no_ending_for_this_task_starts_no_program() {
 fn a_shim_started_with_no_token_under_a_registration_with_one_starts_no_program() {
     let run = Run::of(&spec_logging_to(None));
 
-    let code = run_in(ID, None, &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+    let code = run_in(ID, None, &run.supervisor, &run.api, Ok(run.program_data()), OWN_PID);
 
     assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
     assert_one_failure(&run.fake.take_failures(), ID, &not_the_registration_started_under());
@@ -414,21 +496,22 @@ fn a_registration_replaced_while_waiting_for_the_listing_ends_the_wait() {
     }
 }
 
-/// A task deleted while the shim waits for its listing is gone, as when it is read first.
+/// A task deleted while the shim, which holds a pin, waits for its listing is gone, as when it is read
+/// first: the wait ends, the pin is released, and the uninstall's removal of the records is not held up.
 #[skuld::test]
-fn a_task_deleted_while_waiting_for_the_listing_ends_the_wait() {
+fn a_pinned_shim_ends_when_the_task_is_deleted() {
     let run = Run::of(&spec_logging_to(None));
     run.api.on_instances(Ok(vec![])).on_get(Ok(None));
 
     let code = run.run();
 
-    assert_eq!(code, Reported::Refused.process_exit_code() as u32);
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
     assert_one_failure(
         &run.fake.take_failures(),
         ID,
         &format!(r"the task \Goetia\{ID} is gone: no program was started"),
     );
-    assert_eq!(run.fake.calls(Op::Spawn), 0);
+    run.started_nothing();
     run.api.finish();
 }
 
@@ -477,6 +560,260 @@ fn a_task_that_cannot_be_read_is_a_logged_shim_failure_with_the_os_error_and_not
     );
     assert_eq!(run.fake.calls(Op::Spawn), 0);
     run.api.finish();
+}
+
+/// The removal's marker stands, as an uninstall or an account change leaves it: the shim's pin is refused.
+#[skuld::test]
+fn refused_pin_ends_the_shim_before_it_reads_the_task() {
+    let run = Run::unread();
+    run.runs.close().unwrap();
+
+    let code = run.run();
+
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
+    assert_eq!(run.api.calls(), vec![], "Task Scheduler was asked");
+    assert_eq!(run.fake.take_failures().len(), 1, "the refusal is told once");
+    run.started_nothing();
+    run.api.finish();
+}
+
+#[skuld::test]
+fn refused_shim_opens_no_log() {
+    let run = Run::unread();
+    run.runs.close().unwrap();
+
+    run.run();
+
+    assert_eq!(run.fake.calls(Op::OpenLog), 0);
+    assert_eq!(
+        run.fake.default_log_opens(),
+        0,
+        "the refusal's line opened the default log"
+    );
+    let calls = run.fake.take_channel_calls();
+    assert_eq!(Run::default_log_holds(&calls), 0);
+    assert!(
+        matches!(calls.as_slice(), [ChannelCall::EventLog { severity: Severity::Error, line }]
+            if line.contains("being removed or handed to another account")),
+        "the refusal is told to the Event Log alone: {calls:?}"
+    );
+}
+
+/// The pin is taken before the default log is held: a shim whose pin fails never holds it, and one whose
+/// pin is made does.
+#[skuld::test]
+fn shim_pins_before_it_holds_the_default_log() {
+    let refused = Run::unread();
+    std::fs::remove_dir(refused.records_dir()).unwrap();
+    refused.run();
+    assert_eq!(Run::default_log_holds(&refused.fake.take_channel_calls()), 0);
+
+    let run = Run::of(&spec_logging_to(None)).listed().program(exits(0));
+    run.run();
+    assert_eq!(Run::default_log_holds(&run.fake.take_channel_calls()), 1);
+    run.finish();
+}
+
+/// A refused run is a missed one, and the log says so, naming the records and why they are not held.
+#[skuld::test]
+fn shim_refused_by_the_marker_of_a_refused_change_logs_it() {
+    let run = Run::unread();
+    run.runs.close().unwrap();
+
+    run.run();
+
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!(
+                "goetia-shim[{ID}]: hold the run records {}: ",
+                run.records_dir().display()
+            ))
+            && failures[0].contains("being removed or handed to another account")
+            && failures[0].ends_with(": no program was started"),
+        "{failures:?}"
+    );
+}
+
+/// The pin's refusal at the first step, whatever its cause, ends the shim with the OS error it met or none,
+/// and the line names the records.
+fn pin_failure_starts_no_program(run: &Run) -> u32 {
+    let code = run.run();
+
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!(
+                "goetia-shim[{ID}]: hold the run records {}: ",
+                run.records_dir().display()
+            ))
+            && failures[0].ends_with(": no program was started"),
+        "{failures:?}"
+    );
+    assert_eq!(run.api.calls(), vec![], "Task Scheduler was asked");
+    assert_eq!(run.fake.calls(Op::Spawn), 0);
+    assert_eq!(run.fake.calls(Op::OpenLog), 0);
+    assert_eq!(Run::default_log_holds(&run.fake.take_channel_calls()), 0);
+    run.api.finish();
+    code
+}
+
+struct Restore(PathBuf);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        if let Ok(everyone) = Descriptor::from_sddl("D:P(A;;FA;;;WD)") {
+            let _ = set_dacl(&everyone, &self.0);
+        }
+    }
+}
+
+#[skuld::test]
+fn a_pin_that_is_denied_starts_no_program() {
+    let run = Run::unread();
+    let _restore = Restore(run.records_dir());
+    let stranger_only = Descriptor::from_sddl(&format!("D:P(A;;FA;;;{A_STRANGER})")).unwrap();
+    set_dacl(&stranger_only, &run.records_dir()).unwrap();
+
+    let code = pin_failure_starts_no_program(&run);
+
+    assert_eq!(code, ERROR_ACCESS_DENIED);
+}
+
+#[skuld::test]
+fn a_pin_in_a_directory_that_is_gone_starts_no_program() {
+    let run = Run::unread();
+    std::fs::remove_dir(run.records_dir()).unwrap();
+
+    let code = pin_failure_starts_no_program(&run);
+
+    assert_eq!(code, ERROR_FILE_NOT_FOUND);
+}
+
+#[skuld::test]
+fn a_pin_in_a_directory_that_is_a_link_starts_no_program() {
+    let run = Run::unread();
+    let target = tempfile::tempdir().unwrap();
+    make_mount_point(&run.records_dir(), target.path());
+
+    let code = pin_failure_starts_no_program(&run);
+
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
+    assert_eq!(
+        std::fs::read_dir(target.path()).unwrap().count(),
+        0,
+        "nothing was made in the target"
+    );
+}
+
+/// A marker placed while the shim waits for its listing refuses the program: it was listed, and its pin
+/// was made before the marker, so the removal waits for it; the shim looks again after the listing, before
+/// it opens a log or spawns, and a marker that stands is a start it must not make. Its pin is released.
+#[skuld::test]
+fn shim_rechecks_the_marker_after_its_listing() {
+    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    let removal = run.hand();
+    run.api.on_instances_during(Ok(listed()), move || {
+        removal.close().unwrap();
+    });
+
+    let code = run.run();
+
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!(
+                "goetia-shim[{ID}]: the run records {} are being removed or handed to another account: ",
+                run.records_dir().display()
+            ))
+            && failures[0].ends_with("no program was started"),
+        "{failures:?}"
+    );
+    run.started_nothing();
+    run.api.finish();
+}
+
+/// A look for the marker that cannot be made after the listing ends the shim with the error it met, with no
+/// program started and no log opened. Here the listing leaves a marker whose delete is pending, which Windows
+/// answers with access denied.
+#[skuld::test]
+fn a_marker_look_that_fails_starts_no_program() {
+    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    let marker = run.records_dir().with_file_name(format!("{ID}~removing"));
+    let held = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&held);
+    run.api.on_instances_during(Ok(listed()), move || {
+        *slot.lock().unwrap() = Some(delete_pending(&marker));
+    });
+
+    let code = run.run();
+    drop(held.lock().unwrap().take());
+
+    assert_eq!(code, ERROR_ACCESS_DENIED);
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!(
+                "goetia-shim[{ID}]: look for the removal's marker of the run records {}: ",
+                run.records_dir().display()
+            ))
+            && failures[0].ends_with(": no program was started"),
+        "{failures:?}"
+    );
+    run.started_nothing();
+    run.api.finish();
+}
+
+/// The run's pin is held through the listing and the run, and released as its record is renamed in place,
+/// before its own prune: the records of other runs are kept while it is held and gone after, and the
+/// directory reports the record's rename before the pin's removal, so no other run's prune could have
+/// found the record's temp file with no pin held.
+#[skuld::test]
+fn a_run_records_under_its_own_pin_and_drops_it_after_the_rename() {
+    let run = Run::of(&spec_logging_to(None));
+    let mut watch = DirWatch::new(&run.records_dir());
+    let other = run.hand();
+    let earlier = |n: u8| RunRecord {
+        instance: InstanceId::parse(&format!("{n:032x}")).unwrap(),
+        started: u64::from(n),
+        outcome: RunOutcome::Exited(0),
+    };
+    let (first, second) = (earlier(5), earlier(6));
+    let seen = (first.clone(), second.clone());
+    run.api.on_instances_during(Ok(listed()), move || {
+        other.write(&seen.0, None).unwrap();
+        other.write(&seen.1, None).unwrap();
+        assert!(
+            other.read(&seen.0.instance).unwrap().is_some(),
+            "the shim's pin did not keep an earlier record from the next write's prune"
+        );
+    });
+    let run = run.program(exits(0));
+
+    assert_eq!(run.run(), 0);
+
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(0)));
+    assert_eq!(
+        run.runs.read(&first.instance).unwrap(),
+        None,
+        "pruned once the pin is gone"
+    );
+    assert_eq!(run.runs.read(&second.instance).unwrap(), None);
+    // The directory's own account of the order: the last name is the test's, made once the run is over.
+    std::fs::write(run.records_dir().join("done"), "").unwrap();
+    let changes = watch.until_added("done");
+    let position = |wanted: &dyn Fn(&NameChange) -> bool| changes.iter().position(wanted);
+    let own = format!("{}.json", instance().hex());
+    let renamed_in = position(&|change| *change == NameChange::RenamedTo(own.clone()));
+    let pin_removed = position(&|change| matches!(change, NameChange::Removed(name) if name.ends_with(".pin")));
+    assert!(
+        renamed_in.is_some() && pin_removed.is_some() && renamed_in < pin_removed,
+        "the record was renamed in at {renamed_in:?}, the pin removed at {pin_removed:?}: {changes:?}"
+    );
+    drop(watch);
+    run.finish();
+    run.no_pin_is_left();
 }
 
 // How the run ends ====================================================================================================
@@ -661,7 +998,14 @@ fn a_stop_during_the_com_reads_is_not_lost() {
             at,
         };
 
-        let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+        let code = run_in(
+            ID,
+            Some(task_token()),
+            &run.supervisor,
+            &api,
+            Ok(run.program_data()),
+            OWN_PID,
+        );
 
         assert_eq!(code, STOPPED, "a stop during {at:?}");
         assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped), "{at:?}");
@@ -825,21 +1169,6 @@ fn a_marker_whose_log_cannot_be_opened_is_reported() {
     assert!(!failures[0].contains("will not be captured"), "{failures:?}");
 }
 
-/// With no instance there is no marker to write, since no run can be named, and the program still
-/// runs. A listing that cannot be read is the one way a run has none.
-#[skuld::test]
-fn a_run_with_no_instance_writes_no_marker() {
-    let run = Run::of(&spec_logging_to(Some(LOGS)));
-    run.api
-        .on_instances(Err(Error::os("list the task's instances", io::Error::other("refused"))));
-    let run = run.program(exits(0));
-
-    assert_eq!(run.run(), 0);
-
-    assert_eq!(run.fake.calls(Op::OpenLog), 1, "only the program's own output");
-    run.finish();
-}
-
 /// The marker's open and the program's own open are of one file, and each fails and is told for what it costs:
 /// the marker's line first, then the output's. A failed marker does not silence the output's failure.
 #[skuld::test]
@@ -876,28 +1205,84 @@ fn a_record_carries_the_time_the_run_began() {
     run.finish();
 }
 
-// What cannot be recorded =============================================================================================
+// A listing that cannot be read =======================================================================================
 
+/// The OS error a failed listing carries, which the shim ends with.
+const LISTING_FAILED: u32 = ERROR_FILE_NOT_FOUND;
+
+fn listing_fails() -> crate::error::Error {
+    Error::os(
+        "list the task's instances",
+        io::Error::from_raw_os_error(LISTING_FAILED as i32),
+    )
+}
+
+/// A listing that cannot be read, with the task gone, starts no program: the shim cannot tell its own
+/// instance from another's, and nothing it could record would name its run.
 #[skuld::test]
-fn an_unreadable_listing_runs_the_program_and_writes_no_record() {
-    let run = Run::of(&spec_logging_to(None));
-    run.api
-        .on_instances(Err(Error::os("list the task's instances", io::Error::other("refused"))));
-    let run = run.program(exits(5));
-    let pin = run.runs.pin().unwrap();
+fn failed_listing_with_the_task_gone_starts_no_program() {
+    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    run.api.on_instances(Err(listing_fails())).on_get(Ok(None));
 
     let code = run.run();
 
-    assert_eq!(code, 5, "the program's code is returned all the same");
-    assert_eq!(pin.appeared().unwrap(), vec![], "a record was written for no run");
-    let failures = run.finish();
-    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(code, LISTING_FAILED);
+    let failures = run.fake.take_failures();
     assert!(
-        failures[0].starts_with(&format!("goetia-shim[{ID}]: "))
-            && failures[0].contains("list the task's instances: refused")
-            && failures[0].contains("the run is not recorded; the program is run anyway"),
+        failures.len() == 1
+            && failures[0].starts_with(&format!("goetia-shim[{ID}]: list the task's instances: "))
+            && failures[0].ends_with(&format!(r"the task \Goetia\{ID} is gone: no program was started")),
         "{failures:?}"
     );
+    run.started_nothing();
+    run.api.finish();
+}
+
+/// The `get` after the failed listing only words the line: with the task present the code is the same.
+#[skuld::test]
+fn failed_listing_with_the_task_present_starts_no_program() {
+    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    run.api
+        .on_instances(Err(listing_fails()))
+        .on_get(Ok(Some(data_of(&spec_logging_to(Some(LOGS))))));
+
+    let code = run.run();
+
+    assert_eq!(code, LISTING_FAILED);
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!("goetia-shim[{ID}]: list the task's instances: "))
+            && failures[0].ends_with(": no program was started")
+            && !failures[0].contains("is gone"),
+        "{failures:?}"
+    );
+    run.started_nothing();
+    run.api.finish();
+}
+
+/// With another registration in the task's place the line says so, and the code is the listing's still.
+#[skuld::test]
+fn failed_listing_with_another_registration_starts_no_program() {
+    let spec = spec_logging_to(Some(LOGS));
+    let run = Run::of(&spec);
+    let other = Token::parse(OTHER_TOKEN).unwrap();
+    run.api
+        .on_instances(Err(listing_fails()))
+        .on_get(Ok(Some(registered_task_with(&spec, false, &other))));
+
+    let code = run.run();
+
+    assert_eq!(code, LISTING_FAILED);
+    let failures = run.fake.take_failures();
+    assert!(
+        failures.len() == 1
+            && failures[0].starts_with(&format!("goetia-shim[{ID}]: list the task's instances: "))
+            && failures[0].ends_with(&not_the_registration_started_under()),
+        "{failures:?}"
+    );
+    run.started_nothing();
+    run.api.finish();
 }
 
 // The wait for the run's own instance =================================================================================
@@ -950,7 +1335,14 @@ fn a_stop_while_the_instance_is_not_listed_starts_nothing_and_records_the_run_st
         at: Read::Instances,
     };
 
-    let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+    let code = run_in(
+        ID,
+        Some(task_token()),
+        &run.supervisor,
+        &api,
+        Ok(run.program_data()),
+        OWN_PID,
+    );
 
     assert_eq!(code, STOPPED);
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
@@ -977,7 +1369,14 @@ fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded(
     };
     let pin = run.runs.pin().unwrap();
 
-    let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+    let code = run_in(
+        ID,
+        Some(task_token()),
+        &run.supervisor,
+        &api,
+        Ok(run.program_data()),
+        OWN_PID,
+    );
 
     assert_eq!(code, STOPPED);
     assert_eq!(pin.appeared().unwrap(), vec![]);
@@ -995,22 +1394,14 @@ fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded(
 
 #[skuld::test]
 fn a_failed_record_write_still_returns_the_programs_code() {
-    let dir = tempfile::tempdir().unwrap();
-    // No `ensure`: the directory is not there, so the write fails.
-    let unmade = Runs::of(dir.path(), &Id::try_from(ID).unwrap());
     let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(5));
+    // A directory where the record's temp file is to be made: the pin is made, and the write fails.
+    directory_with_a_file(&run.records_dir().join(format!("{}.json.tmp", instance().hex())));
 
-    let code = run_in(
-        ID,
-        Some(task_token()),
-        &run.supervisor,
-        &run.api,
-        Some(&unmade),
-        OWN_PID,
-    );
+    let code = run.run();
 
     assert_eq!(code, 5);
-    assert_eq!(unmade.read(&instance()).unwrap(), None);
+    assert_eq!(run.record(), None);
     // The log is the program's own now that the task is read, and the failure is said there.
     let calls = run.fake.take_channel_calls();
     let said: Vec<_> = calls
@@ -1032,6 +1423,7 @@ fn a_failed_record_write_still_returns_the_programs_code() {
     );
     assert_eq!(run.fake.waiter_end(0), WaiterEnd::Returned);
     run.api.finish();
+    run.no_pin_is_left();
 }
 
 /// A prune that cannot remove a record (here a directory where the record should be) is a warning in
@@ -1065,16 +1457,26 @@ fn a_prune_problem_is_logged_and_does_not_change_the_runs_end() {
     );
 }
 
-/// A run with no `%ProgramData%` to keep records in is run, and not recorded.
+/// A shim with no `%ProgramData%` holds no pin and so starts no program, and reads nothing.
 #[skuld::test]
-fn a_run_with_nowhere_to_record_still_runs() {
-    let run = Run::of(&spec_logging_to(None)).listed().program(exits(3));
+fn no_program_data_starts_no_program() {
+    let run = Run::unread();
+    let cause = Error::os("locate %ProgramData%", io::Error::other("no such known folder"));
 
-    let code = run_in(ID, Some(task_token()), &run.supervisor, &run.api, None, OWN_PID);
+    let code = run_in(ID, Some(task_token()), &run.supervisor, &run.api, Err(&cause), OWN_PID);
 
-    assert_eq!(code, 3);
-    assert_eq!(run.record(), None);
-    assert_eq!(run.finish(), Vec::<String>::new());
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
+    assert_one_failure(
+        &run.fake.take_failures(),
+        ID,
+        &format!(
+            "no program was started: the run records cannot be held, since the machine's %ProgramData% could not be located: {}",
+            cause.report()
+        ),
+    );
+    assert_eq!(run.fake.calls(Op::Spawn), 0);
+    assert_eq!(run.api.calls(), vec![], "the task was read");
+    run.api.finish();
 }
 
 // What it never does ==================================================================================================
@@ -1091,7 +1493,7 @@ fn an_id_that_is_not_an_id_reads_nothing_and_runs_nothing() {
         Some(task_token()),
         &supervisor(&fake),
         &api,
-        None,
+        Ok(Path::new("unused")),
         OWN_PID,
     );
 

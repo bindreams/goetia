@@ -22,10 +22,9 @@ use crate::support::demonstration::{
     read_in_the_zone,
 };
 use crate::support::sentinel::RUN_UNTIL_RELEASED;
+use crate::support::windows_tasks::{status_once_ended, task_status};
 use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
-use crate::tasks::{
-    prints_and_exits, records_of, runs_until_ended, status_once_ended, task_exists, task_status, test_id,
-};
+use crate::tasks::{prints_and_exits, records_of, runs_until_ended, task_exists, test_id};
 
 const EVERY_MINUTE: &str = "* * * * *";
 

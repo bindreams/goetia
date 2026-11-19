@@ -330,7 +330,7 @@ fn a_log_with_no_default_file_holds_nothing() {
     let fake = FakeGuard::new();
     let log = Log::from_program_data(
         fake.channels(),
-        Err(Error::os("locate %ProgramData%", std::io::Error::other("x"))),
+        &Err(Error::os("locate %ProgramData%", std::io::Error::other("x"))),
     );
     fake.take_channel_calls();
 
@@ -345,7 +345,7 @@ fn a_machine_that_cannot_name_program_data_has_no_default_file_and_the_event_log
     let cause = Error::os("locate %ProgramData%", std::io::Error::other("no such known folder"));
     let why = cause.report().to_string();
 
-    let log = Log::from_program_data(fake.channels(), Err(cause));
+    let log = Log::from_program_data(fake.channels(), &Err(cause));
 
     let first = fake.take_channel_calls();
     let [ChannelCall::EventLog { severity, line }] = first.as_slice() else {
@@ -376,7 +376,7 @@ fn a_log_with_no_default_file_still_writes_the_daemons_own() {
     let fake = FakeGuard::new();
     let log = Log::from_program_data(
         fake.channels(),
-        Err(Error::os("locate %ProgramData%", std::io::Error::other("x"))),
+        &Err(Error::os("locate %ProgramData%", std::io::Error::other("x"))),
     );
     fake.take_channel_calls();
     let daemon = Path::new("daemon").join("svc.log");
@@ -457,4 +457,65 @@ fn program_data_is_the_known_folder_and_logging_uses_it() {
         Log::real(Arc::default()).default_log_path("svc"),
         Some(program_data.join("Goetia").join("logs").join("svc.log"))
     );
+}
+
+/// Task mode appends nothing to the default log before it is held.
+#[skuld::test]
+fn a_log_closed_until_held_tells_the_event_log_alone_until_the_default_log_is_held() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake).closed_until_held();
+    let default = Path::new("logs").join("svc.log");
+
+    log.failure("svc", "the line");
+    log.warning("svc", "the line");
+
+    assert_eq!(fake.default_log_opens(), 0, "a line opened the default log");
+    let calls = fake.take_channel_calls();
+    assert!(
+        calls.iter().all(|call| matches!(call, ChannelCall::EventLog { .. })) && calls.len() == 2,
+        "the Event Log alone, both lines: {calls:?}"
+    );
+
+    log.hold_default("svc");
+    log.failure("svc", "the line");
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![
+            ChannelCall::HoldDefault { path: default.clone() },
+            appended_default(&default, true),
+            reported()
+        ],
+        "once held, a line goes to the file as in service mode"
+    );
+}
+
+/// A log that could not be held is still open to the path afterwards: the hold ran, and the shim goes on.
+#[skuld::test]
+fn a_default_log_that_could_not_be_held_opens_the_closed_log_all_the_same() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake).closed_until_held();
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+    fake.take_channel_calls();
+    log.failure("svc", "the line");
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![appended_default(&default, true), reported()]
+    );
+}
+
+/// A closed log still writes the daemon's own log once there is one: only the default is closed.
+#[skuld::test]
+fn a_log_closed_until_held_still_writes_the_daemons_own_log() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake).closed_until_held();
+    let own = Path::new("own.log");
+    log.set_daemon_log(own.to_path_buf());
+
+    log.failure("svc", "the line");
+
+    assert_eq!(fake.take_channel_calls(), vec![appended_own(own, true), reported()]);
 }

@@ -8,10 +8,11 @@ use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use goetia::backend::scm::manager::Scm;
+use goetia::manager::{ServiceManager as _, State, Status, TaskStatus};
 use goetia::spec::{DaemonSpec, Id, TaskSpec, User};
 use goetia::testing::{remove_task, task};
 
-use super::{WorldReadableExe, shim_manager_at};
+use super::{WorldReadableExe, shim_manager_at, wait};
 
 /// What a task of an account that cannot run the build tree needs (`LocalService`, a local user): a copy
 /// of this binary and a copy of the shim, each executable by every account. Declare it before the guard
@@ -76,6 +77,28 @@ pub fn task_spec(id: &Id, command: Vec<String>, schedule: Option<&str>, user: Us
     fields.common.user = user;
     fields.common.logs = logs.map(Path::to_path_buf);
     TaskSpec::new(fields).map(DaemonSpec::from).expect("a valid task")
+}
+
+/// The status of the task `id`; a service of that id is a failed test.
+pub fn task_status(mgr: &Scm, id: &Id) -> TaskStatus {
+    match mgr.status(id).expect("status of a task") {
+        Status::Task(status) => status,
+        Status::Service(status) => panic!("`{id}` reads as a service: {status:?}"),
+    }
+}
+
+/// The status of `id` once its run has ended and Task Scheduler has recorded how: idle, with a last
+/// result. Read again with no cap, since the run's end is a state of the machine and not a time. For a
+/// task that has not run before the one waited for.
+pub fn status_once_ended(mgr: &Scm, id: &Id) -> TaskStatus {
+    let mut found = None;
+    wait::until(|| {
+        let status = task_status(mgr, id);
+        let ended = status.common.state == State::Idle && status.last_result.is_some();
+        found = Some(status);
+        ended
+    });
+    found.expect("a status was read")
 }
 
 /// An open handle to a process, which keeps its pid from being given to another, to ask whether it has
