@@ -503,8 +503,8 @@ fn a_hold_whose_first_read_failed_names_which_run_it_was_for() {
 
     assert_eq!(
         failed.report().to_string(),
-        "failed to hold the process of `nightly`'s run (pid 200): failed to list the runs of `nightly`: listing \
-         failed"
+        "failed to hold the process of `nightly`'s run: failed to list the instances of `nightly` for its run \
+         (pid 200): failed to list the runs of `nightly`: listing failed"
     );
 }
 
@@ -669,7 +669,10 @@ fn a_kill_whose_first_read_of_each_run_failed_names_each_run() {
     let failed = scm(&fake).task_kill_with(&id(), &mut machine).unwrap_err();
 
     let report = failed.report().to_string();
-    assert!(report.contains("(pid 100)") && report.contains("(pid 200)"), "{report}");
+    for pid in [100, 200] {
+        let said = format!("failed to list the instances of `nightly` for its run (pid {pid}): ");
+        assert_eq!(report.matches(&said).count(), 1, "{report}");
+    }
     assert!(machine.terminated.is_empty(), "{report}");
     fake.finish();
 }
