@@ -1536,18 +1536,9 @@ fn a_stop_that_names_a_budget_keeps_it_whatever_the_daemons_stop_action_says() {
     assert_eq!(reserved_under(&fake), Budget::Immediate);
 }
 
-/// What a stop of `odd`'s undecodable definition reports: the decode failure `cause` under the words that say
-/// what the stop needed and which flags run it anyway.
-fn undecodable_stop(cause: impl std::fmt::Display) -> String {
-    format!(
-        "a stop with no `--timeout` or `--no-timeout` needs the daemon's stop action for how long to wait, and the \
-         definition of `odd` could not be read; `--timeout <d>` or `--no-timeout` runs the stop anyway: {cause}"
-    )
-}
-
-/// A definition that will not decode has no stop action to take the daemon's own wait from: the stop says
-/// so, with the decode failure under it and the flags that run the stop anyway, and reserves and sends
-/// nothing. A caller that names the wait does not need the definition, and the stop still works.
+/// A definition that will not decode has no stop action to take the daemon's own wait from: the stop is
+/// [`Error::StopActionUnreadable`] over the decode failure, and reserves and sends nothing. A caller that
+/// names the wait does not need the definition, and the stop still works.
 #[skuld::test]
 fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_is_refused_with_the_flags_that_run_it() {
     let fake = Fake::new();
@@ -1556,10 +1547,11 @@ fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_is_refused_with_t
 
     let e = ServiceManager::stop(&fake, &id, None).expect_err("no stop action to wait by");
 
-    assert_eq!(
-        e.report().to_string(),
-        undecodable_stop(ServiceManager::kind(&fake, &id).expect_err("the same blob").report())
+    assert!(
+        matches!(&e, Error::StopActionUnreadable { source } if matches!(**source, Error::Kept(_))),
+        "{e:?}"
     );
+    assert!(e.report().to_string().contains("could not be read"), "{}", e.report());
     assert!(fake.prepared().is_empty(), "nothing was reserved");
 
     ServiceManager::stop(&fake, &id, Some(Budget::DEFAULT)).expect("a stop that names its wait");
@@ -1576,9 +1568,8 @@ fn a_sequences_stop_of_a_definition_that_will_not_decode_names_no_budget_is_refu
     let e = sequence.stop(&id, None).expect_err("no stop action to wait by");
 
     assert!(
-        e.report().to_string().starts_with(&undecodable_stop("")),
-        "{}",
-        e.report()
+        matches!(&e, Error::StopActionUnreadable { source } if matches!(**source, Error::Kept(_))),
+        "{e:?}"
     );
     sequence
         .stop(&id, Some(Budget::DEFAULT))

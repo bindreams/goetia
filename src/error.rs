@@ -367,6 +367,19 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// A `stop` named no wait, so it takes the daemon's stop action for one, and the definition that
+    /// holds it will not decode; `source` is the decode failure. Nothing was sent. A stop that names its
+    /// wait does not read the definition, so the remedy, which [`report`](Error::report) prints last,
+    /// is the flags that name one.
+    #[error(
+        "with no `--timeout` or `--no-timeout`, the wait comes from the daemon's stop action, and its definition \
+         could not be read"
+    )]
+    StopActionUnreadable {
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -801,6 +814,7 @@ impl Error {
             | Error::SiblingShimMissing { .. }
             | Error::ShimLockForeign { .. }
             | Error::ShimLockDenied { .. }
+            | Error::StopActionUnreadable { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -925,6 +939,7 @@ impl Error {
                 "An administrator must make each named service's registry key readable, or let SCM query it \
                  (`SERVICE_QUERY_CONFIG`)",
             ),
+            Error::StopActionUnreadable { .. } => Some("Pass `--timeout <duration>` or `--no-timeout`"),
             Error::Kept(kept) => kept.remedy(),
             _ => None,
         }
@@ -963,6 +978,7 @@ impl Error {
             | Error::Step { .. }
             | Error::InstalledUnreadable { .. }
             | Error::ServiceImageUnreadable { .. }
+            | Error::StopActionUnreadable { .. }
             | Error::Both { .. }
             | Error::ConcurrentChange { .. }
             | Error::QuarantineStranded { .. }

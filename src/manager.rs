@@ -194,7 +194,7 @@ pub trait ServiceManager {
     /// [`StopAction::TEARDOWN_MARGIN`](crate::spec::StopAction::TEARDOWN_MARGIN), without bound where it has
     /// no `timeout`, and [`Budget::DEFAULT`] for `send-signal: kill`. `None` is read from the definition this
     /// call reads and acts on, so the wait and the stop cannot disagree; a definition that does not decode
-    /// has none to read, and `None` is then the decode failure ([`Error::Kept`]).
+    /// has none to read, and `None` is then [`Error::StopActionUnreadable`], over the decode failure.
     /// Does not change its boot-enablement.
     ///
     /// `Ok(())` means the service manager reports the service as stopped, on
@@ -355,7 +355,8 @@ pub trait Sequence {
     /// See [`ServiceManager::enable`], including the refusal of a task with no schedule.
     fn enable(&mut self, id: &Id) -> Result<()>;
 
-    /// See [`ServiceManager::stop`].
+    /// See [`ServiceManager::stop`], including [`Error::StopActionUnreadable`] for a `None` budget, which
+    /// spends no step.
     fn stop(&mut self, id: &Id, budget: Option<Budget>) -> Result<()>;
 
     /// See [`ServiceManager::start`].

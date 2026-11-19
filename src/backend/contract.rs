@@ -33,10 +33,10 @@ pub(crate) trait InstalledService {
     fn id(&self) -> &Id;
 
     /// The metadata as `read` decoded it, or why it will not decode. Kept as the failure: the
-    /// marker alone is proof of ownership, so `uninstall` and the other verbs must still work on a
-    /// service whose blob will not decode. The one exception is a `stop` that names no wait: it needs
-    /// the stop action for its wait ([`flow::stop_budget`]), so it is refused on a blob that will not
-    /// decode, and `--timeout` or `--no-timeout` runs it.
+    /// marker alone is proof of ownership. `status`, `kind` and `run` need the decoded blob, and so does
+    /// a `stop` that names no wait ([`flow::stop_budget`]); each returns the kept failure, a `stop` as
+    /// [`Error::StopActionUnreadable`]. `uninstall`, `start`, `enable`, `disable`, `kill` and a `stop` that
+    /// names its wait work on the marker alone.
     fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>>;
 
     /// The `stop-action` the metadata carries, or the failure to decode it: the one reader of it, for the

@@ -266,6 +266,21 @@ fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_
     );
 }
 
+/// The one pin of the variant's words: the failure first, the remedy last, and never indeterminate.
+#[skuld::test]
+fn an_unreadable_stop_action_says_what_ran_the_stop_and_ends_in_the_flags_that_run_it() {
+    let e = Error::StopActionUnreadable {
+        source: Box::new(Error::blob("bad base64")),
+    };
+
+    assert_eq!(
+        e.report().to_string(),
+        "with no `--timeout` or `--no-timeout`, the wait comes from the daemon's stop action, and its definition \
+         could not be read: blob: bad base64. Pass `--timeout <duration>` or `--no-timeout`"
+    );
+    assert!(!e.is_indeterminate());
+}
+
 #[cfg(unix)]
 pub(crate) fn exit_status(code: i32) -> std::process::ExitStatus {
     std::os::unix::process::ExitStatusExt::from_raw(code << 8)
