@@ -67,7 +67,7 @@ default = ["cli"]
 # CLI-only deps (clap and output formatting) are optional behind this feature, so
 # `goetia = { version = "0.1", default-features = false }` stays a clean
 # library dependency (see the design spec's crate table, §1).
-cli = ["dep:clap"]
+cli = ["dep:clap", "dep:jiff"]
 # Set only by a build that embeds the stock shim (`goetia::embed_shim!()` is `Some` under it). The
 # release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
 # than reading `goetia-shim.exe` beside it; the library never reads it.
@@ -96,6 +96,9 @@ crossbeam-channel = "0.5.17"
 # The host name that seeds `H` in a task's `schedule` (`spec::schedule`).
 gethostname = "1.1.0"
 humantime = "2"
+# The times `daemon status` and `daemon list` print, RFC 3339 in the system time zone (`cli::report`), behind
+# `cli`. The default features bundle a zone database where the host has none (Windows).
+jiff = { version = "0.2.43", optional = true }
 # The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
 # costs one fast pass.
 memchr = "2"
@@ -134,9 +137,9 @@ nix = { version = "0.31", features = ["fs", "dir", "user"] }
 # CLI's own optional deps are pulled in.
 libc = "0.2"
 nix = { version = "0.31", features = ["user", "fs", "dir", "event"] }
-# `backend::launchd::next`: the next fire of a task's calendar entries in the system time zone, which
-# `launchd` (calendar intervals only, no next-fire query) cannot tell. Zones are read from
-# `/etc/localtime`'s bytes.
+# `backend::launchd::next`, the next fire of a task's calendar entries in the system time zone, which
+# `launchd` (calendar intervals only, no next-fire query) cannot tell, with zones read from
+# `/etc/localtime`'s bytes. Unconditional: the launchd backend needs it without the `cli` feature.
 jiff = "0.2.43"
 
 [target.'cfg(windows)'.dependencies]
@@ -210,8 +213,8 @@ libsearch-guard.workspace = true
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
-# `backend::launchd::next`'s tests, on every host: the default features bundle a zone database where the
-# host has none (Windows).
+# The tests' `jiff`: `backend::launchd::next`'s unit tests off macOS, and the integration tests, which cannot see
+# the library's optional `jiff`. Default features bundle a zone database where the host has none (Windows).
 jiff = "0.2.43"
 libsearch-guard.workspace = true
 

@@ -12,6 +12,7 @@ use super::report::{self, DaemonReport, Report};
 use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unusable_warnings};
 use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
+use crate::spec::DaemonKind;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -45,11 +46,12 @@ pub fn run(
         // classify is that id's own entry in `errors`.
         undetermined: Vec::new(),
     };
+    let zone = report::display_zone();
     for id_str in &args.ids {
         match parse_id(id_str) {
             Err(e) => report.errors.push(report::invalid_id(id_str, e)),
             Ok(id) => match mgr.status(&id) {
-                Ok(status) => report.daemons.push(report::daemon(id_str, &status)),
+                Ok(status) => report.daemons.push(report::daemon(id_str, &status, &zone)),
                 Err(e) => report.errors.push(report::status_error(id_str, e)),
             },
         }
@@ -77,7 +79,7 @@ fn unavailable(e: Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -
 fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let (index, report) = match mgr.list().map(partition_installed) {
         Ok(index) => {
-            let report = report::from_index(&index);
+            let report = report::from_index(&index, &report::display_zone());
             (Some(index), report)
         }
         Err(e) => (None, report::unavailable(e)),
@@ -113,14 +115,27 @@ fn print_daemons(report: &Report, out: &mut dyn Write) {
 
 /// The one human-readable shape `status` renders in, shared by both
 /// invocation forms.
+///
+/// A task's line names its type and what its manager knows of its runs, `-` where it knows nothing.
 fn format_status_line(daemon: &DaemonReport) -> String {
-    format!(
-        "{}: {} (enabled={}, pid={})",
-        daemon.id,
-        daemon.state,
-        daemon.enabled,
-        daemon.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
-    )
+    let or_dash = |value: Option<String>| value.unwrap_or_else(|| "-".to_string());
+    let pid = or_dash(daemon.pid.map(|p| p.to_string()));
+    match daemon.kind {
+        DaemonKind::Service => format!(
+            "{}: {} (enabled={}, pid={pid})",
+            daemon.id, daemon.state, daemon.enabled
+        ),
+        DaemonKind::Task => format!(
+            "{}: {} ({}, enabled={}, pid={pid}, last-result={}, last-run={}, next-run={})",
+            daemon.id,
+            daemon.state,
+            daemon.kind.as_str(),
+            daemon.enabled,
+            or_dash(daemon.last_result.map(|exit| exit.to_string())),
+            or_dash(daemon.last_run.clone()),
+            or_dash(daemon.next_run.clone()),
+        ),
+    }
 }
 
 #[cfg(test)]
