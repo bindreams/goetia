@@ -18,28 +18,23 @@ use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
-use serde_json::Value;
 
-use crate::linux::{CreatedRoot, UNIT_DIR_EXCLUSIVE, create_root, exiting, main_pid, timer_path, timer_wants_symlink};
+use crate::linux::{
+    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, main_pid, manager_entries,
+    output_entries, started_invocations, starting_matches, timer_path, timer_wants_symlink, unit_of,
+};
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
 use crate::support::cron_oracle::assert_next_run;
 use crate::support::tasks::{
     Held, Lines, assert_same_text, id_of, run_task, sh, status_with_result, task_status, with_logs,
 };
-use crate::support::{self, Group, ServiceGuard, cmd, cron_oracle, kill, systemd_group};
+use crate::support::{self, Group, ServiceGuard, cmd, cron_oracle, systemd_group, wait};
 
 /// Held by the tests that rewrite journald's configuration (and restart it) while they run.
 #[skuld::label]
 pub(crate) const JOURNALD_CONFIG: skuld::Label;
 
-/// "Starting `<unit>`...": the manager began a run.
-const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
-
 // Fixtures ============================================================================================================
-
-fn unit_of(id: &str) -> String {
-    format!("{id}.service")
-}
 
 fn task(id: &str, command: Vec<String>, schedule: Option<&str>) -> DaemonSpec {
     goetia::testing::task(id, command, schedule)
@@ -117,40 +112,10 @@ impl Drop for JournaldConf {
     }
 }
 
-/// The entries `journalctl` holds for `matches`, oldest first, as JSON objects.
-fn journal(matches: &[&str]) -> Vec<Value> {
-    cmd::run("journalctl", &["--sync"]).expect_ok();
-    let mut args = vec!["-a", "-o", "json", "--no-pager"];
-    args.extend_from_slice(matches);
-    cmd::run("journalctl", &args)
-        .expect_ok()
-        .stdout
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("journalctl JSON `{line}`: {e}")))
-        .collect()
-}
-
-fn field<'a>(entry: &'a Value, name: &str) -> Option<&'a str> {
-    entry.get(name)?.as_str()
-}
-
-/// The invocation of every run of `id`'s unit the manager started, oldest first.
-fn started_invocations(id: &str) -> Vec<String> {
-    let unit = format!("UNIT={}", unit_of(id));
-    journal(&[&unit, &format!("MESSAGE_ID={STARTING}")])
-        .iter()
-        .map(|entry| {
-            field(entry, "INVOCATION_ID")
-                .expect("a Starting entry has an invocation")
-                .to_string()
-        })
-        .collect()
-}
-
 /// `(invocation, EXIT_CODE, EXIT_STATUS)` of every "Main process exited" entry of `id`'s unit.
 fn exited(id: &str) -> Vec<(String, String, String)> {
     let unit = format!("UNIT={}", unit_of(id));
-    journal(&[&unit, "MESSAGE_ID=98e322203f7a4ed290d09fe03c09fe15"])
+    manager_entries(&[unit.as_str(), "MESSAGE_ID=98e322203f7a4ed290d09fe03c09fe15"])
         .iter()
         .map(|entry| {
             let get = |name| field(entry, name).unwrap_or_default().to_string();
@@ -168,7 +133,7 @@ fn counted(count: u32) -> Vec<u8> {
 /// that has not started yet writes is after it.
 fn stdout_end(id: &str) -> Option<String> {
     let unit = format!("_SYSTEMD_UNIT={}", unit_of(id));
-    journal(&[&unit, "_TRANSPORT=stdout", "-r", "-n", "1"])
+    output_entries(&[unit.as_str(), "_TRANSPORT=stdout", "-r", "-n", "1"])
         .first()
         .map(|entry| field(entry, "__CURSOR").expect("an entry has a cursor").to_string())
 }
@@ -190,7 +155,7 @@ fn run_stream_text(id: &str, after: Option<&str>) -> Vec<u8> {
     let from = after.map(|cursor| format!("--after-cursor={cursor}"));
     let mut query = vec![unit.as_str(), "_TRANSPORT=stdout"];
     query.extend(from.as_deref());
-    let entries = journal(&query);
+    let entries = output_entries(&query);
     let first = entries.first().expect("a run wrote a stdout line");
     assert_eq!(
         field(first, "MESSAGE"),
@@ -652,8 +617,7 @@ fn status_after_a_successful_run_reads_exit_0_from_the_journal(#[fixture(systemd
 
     let status = status_with_result(&mgr, &task_id);
     assert_eq!(status.last_result, Some(Exit::Code(0)), "{status:?}");
-    let unit = format!("UNIT={}", unit_of(&id));
-    let starting = journal(&[&unit, &format!("MESSAGE_ID={STARTING}")]);
+    let starting = manager_entries(&starting_matches(&id));
     let [entry] = starting.as_slice() else {
         panic!("a task run once has one Starting entry: {starting:?}");
     };
@@ -981,7 +945,7 @@ fn run_of_a_start_job_canceled_before_it_ran_ends_with_an_unknown_outcome(#[fixt
     let result = std::thread::scope(|scope| {
         let running = scope.spawn(|| mgr.run(&task_id, &mut Vec::new()));
         // The job is queued once the manager lists it; then it is canceled.
-        kill::until(|| {
+        wait::until(|| {
             cmd::run("systemctl", &["list-jobs", "--no-legend"])
                 .stdout
                 .lines()
@@ -1306,7 +1270,16 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
 
     let unit = unit_of(&id);
     let (by_manager, by_unit) = (format!("UNIT={unit}"), format!("_SYSTEMD_UNIT={unit}"));
-    let entries = journal(&[&by_manager, "+", &by_unit, "_TRANSPORT=stdout"]);
+    // Both scopes in one query, so the output's, with the manager's `_PID=1` in its own half:
+    // `manager_entries` refuses a `+`, so this query cannot use it.
+    let entries = output_entries(&[
+        "--system",
+        by_manager.as_str(),
+        FROM_PID_1,
+        "+",
+        by_unit.as_str(),
+        "_TRANSPORT=stdout",
+    ]);
     let starting = entries
         .iter()
         .position(|entry| field(entry, "MESSAGE_ID") == Some(STARTING))
@@ -1330,7 +1303,7 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
     );
 
     let after = format!("--after-cursor={}", field(&entries[at], "__CURSOR").expect("a cursor"));
-    let later = journal(&[&after, &by_unit, "_TRANSPORT=stdout"]);
+    let later = output_entries(&[after.as_str(), by_unit.as_str(), "_TRANSPORT=stdout"]);
     let lines: Vec<_> = later.iter().filter_map(|entry| field(entry, "MESSAGE")).collect();
     assert_eq!(lines, ["one", "two"]);
 }

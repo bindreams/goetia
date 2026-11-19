@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use goetia::manager::{Exit, ServiceManager, Status, TaskStatus};
 use goetia::spec::{DaemonSpec, Id, TaskSpec};
 
-use super::kill;
+use super::wait;
 
 pub fn id_of(id: &str) -> Id {
     Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not an id: {e}"))
@@ -144,7 +144,7 @@ pub fn task_status(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
 /// The status of `id` once its newest run has a result.
 pub fn status_with_result(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
     let mut found = None;
-    kill::until(|| {
+    wait::until(|| {
         let status = task_status(mgr, id);
         let done = status.last_result.is_some();
         found = Some(status);
