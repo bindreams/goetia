@@ -408,15 +408,15 @@ fn a_standard_printer_shows_each_failure_of_a_composite_once() {
         read_failed: Box::new(os("read", "/t", "read failure")),
         restore_failed: Some(Box::new(os("write", "/u", "restore failure"))),
     };
-    let mut shown: Vec<(&(dyn std::error::Error + 'static), &[&str])> = vec![
+    let shown: &[(&(dyn std::error::Error + 'static), &[&str])] = &[
         (&both, &["first failure", "then failure"]),
         (&nested, &["first failure", "then failure", "last failure"]),
+        #[cfg(windows)]
+        (&pair, &["primary failure", "second failure"]),
         (&blob, &["blob failure", "start failure"]),
         (&loaded, &["read failure", "restore failure"]),
     ];
-    #[cfg(windows)]
-    shown.push((&pair, &["primary failure", "second failure"]));
-    for (e, failures) in shown {
+    for &(e, failures) in shown {
         let text = standard_print(e);
         for failure in failures {
             assert_eq!(text.matches(failure).count(), 1, "`{failure}` in {text}");

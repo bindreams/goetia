@@ -59,7 +59,7 @@ fn layer(e: &io::Error) -> Layer<'_> {
 }
 
 /// Whether `e` carries a goetia [`Error`], directly or under [`within`] contexts: the question
-/// [`target_failed`] and [`debug_privilege_also_failed`](super::debug_privilege_also_failed) ask.
+/// [`target_failed`] and `debug_privilege_also_failed` (Windows) ask.
 pub(super) fn carries_error(e: &io::Error) -> bool {
     match layer(e) {
         Layer::Context(within) => carries_error(&within.source),
