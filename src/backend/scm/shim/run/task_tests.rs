@@ -19,10 +19,10 @@ use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::{Instance, Registered, TaskApi};
 use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::backend::scm::shim::run::os::{Channels, LogKind, Severity};
 use crate::backend::scm::shim::run::os::fake::{
     FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
 };
+use crate::backend::scm::shim::run::os::{Channels, LogKind, Severity};
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };

@@ -818,7 +818,10 @@ fn a_change_of_account_names_the_new_account_alone_in_the_records_directory_once
         );
 
         let trustees = trustees_of(&records_dir(&dir));
-        assert!(trustees.contains(&users()), "{ending}: the new account can write its own");
+        assert!(
+            trustees.contains(&users()),
+            "{ending}: the new account can write its own"
+        );
         assert_eq!(
             trustees.contains(&local_service()),
             ending == "delete fails",
@@ -880,9 +883,18 @@ fn an_account_change_places_the_marker_and_narrows_between_the_delete_and_the_cr
         panic!("the delete and the create: {seen:?}");
     };
     assert!(!marker_at_delete, "the marker was placed before the delete");
-    assert!(at_delete.contains(&local_service()) && at_delete.contains(&users()), "{at_delete:?}");
-    assert!(!marker_at_create, "the narrowing takes the marker away before the create");
-    assert!(at_create.contains(&users()) && !at_create.contains(&local_service()), "{at_create:?}");
+    assert!(
+        at_delete.contains(&local_service()) && at_delete.contains(&users()),
+        "{at_delete:?}"
+    );
+    assert!(
+        !marker_at_create,
+        "the narrowing takes the marker away before the create"
+    );
+    assert!(
+        at_create.contains(&users()) && !at_create.contains(&local_service()),
+        "{at_create:?}"
+    );
     fake.finish();
 }
 
@@ -946,7 +958,11 @@ fn a_held_pin_delays_the_narrowing_of_an_account_change() {
         trustees.contains(&local_service()),
         "narrowed while a pin was held: {trustees:?}"
     );
-    assert_eq!(new_pin, Err(std::io::ErrorKind::ResourceBusy), "a pin was accepted during the wait");
+    assert_eq!(
+        new_pin,
+        Err(std::io::ErrorKind::ResourceBusy),
+        "a pin was accepted during the wait"
+    );
     assert!(!marker.exists(), "the narrowing takes the marker away");
     let trustees = trustees_of(&records);
     assert!(trustees.contains(&users()) && !trustees.contains(&local_service()));
