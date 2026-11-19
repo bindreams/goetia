@@ -487,33 +487,60 @@ fn a_running_service_whose_account_changes_keeps_its_log_and_the_new_account_wri
     assert_eq!(accounts_of_default_log(id), [sid_of(5, &NETWORK_SERVICE)]);
 }
 
+/// Ends the process of a parked service host if the test fails before it releases it, so that the service guard,
+/// which stops and deletes the service, finds nothing parked in `ServiceMain`.
+struct ParkedProcess(std::cell::Cell<Option<u32>>);
+
+impl ParkedProcess {
+    fn disarm(&self) {
+        self.0.set(None);
+    }
+}
+
+impl Drop for ParkedProcess {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.get()
+            && let Some(problem) = support::cmd::run_cleanup("taskkill.exe", &[&["/F", "/PID", &pid.to_string()]], &[128])
+        {
+            eprintln!("ParkedProcess[{pid}]: cleanup failed: {problem}");
+        }
+    }
+}
+
 /// SCM reads `START_PENDING` from its launch of a service's process until the process's first status report, which
 /// the shim makes only after it holds its log (before it registers its control handler). An install that changes the
 /// account of a service in that state therefore leaves both accounts in the log's permissions: a shim launched as the
 /// old account may not have opened it yet, and the narrowing would deny it, so the whole run would have no default
-/// log. The first install that finds the service in no such state names the new account alone.
+/// log. The first install that finds the service up names the new account alone.
 ///
-/// The host here is this binary, which connects back and then waits, never reaching SCM's dispatcher: the state it
-/// is in is the measurement the narrowing rests on, and the test fails if it is not `START_PENDING`.
+/// The host is a copy of this binary (`fixture`'s `before-handler`): it connects to SCM's dispatcher, and in
+/// `ServiceMain`, before it registers a control handler, tells the test its pid and blocks until the test shuts down
+/// its end of the connection. The window the narrowing rests on is measured: the test fails unless SCM reads
+/// `START_PENDING` there.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_until_the_next_install(
     #[fixture(scm_group)] _group: &Group,
 ) {
+    use std::io::Read as _;
+    use std::net::Shutdown;
     use windows_service::service::{ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     let id = &test_id();
     let host = this_binary_as_a_service_host(&format!("{id}-host"));
     let _guard = ServiceGuard::new(id.as_str());
+    // After the service guard, so a failing test ends the parked process first.
+    let parked = ParkedProcess(std::cell::Cell::new(None));
     let reached = ConnectBack::listen();
+    let stopped = ConnectBack::listen();
     let mgr = manager_hosted_by(
         &host,
         vec![
             FIXTURE.to_owned(),
             id.to_string(),
             reached.port().to_string(),
-            "1".to_owned(),
-            "before-dispatcher".to_owned(),
+            stopped.port().to_string(),
+            "before-handler".to_owned(),
         ],
     );
     let as_account = |account: &str| service_running(id, account, vec![host.path_str()]);
@@ -523,7 +550,8 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
         .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
     assert_eq!(accounts_of_default_log(id), std::slice::from_ref(&local_service));
 
-    // The start returns when the process dies: it never reaches the dispatcher.
+    // `StartService` returns once the service reports `RUNNING`, which the parked process does not do until it
+    // is released.
     let name = id.to_string();
     let start = std::thread::spawn(move || {
         let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
@@ -532,7 +560,10 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
             .expect("open the service to start it");
         service.start::<&str>(&[])
     });
-    let pid = reached.accept_value("the service's process, which has not reached the dispatcher");
+    let mut connection = reached.accept_stream("the service's process, parked in ServiceMain");
+    let mut pid = String::new();
+    connection.read_to_string(&mut pid).expect("the process's pid");
+    parked.0.set(Some(pid.parse().expect("a pid")));
     let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
     let service = scm
         .open_service(id.as_str(), ServiceAccess::QUERY_STATUS)
@@ -541,7 +572,7 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
     assert_eq!(
         status.current_state,
         ServiceState::StartPending,
-        "SCM reports START_PENDING from the launch of the process until its first status report"
+        "SCM reports START_PENDING from the launch of the process until its first status report, with the          dispatcher connected and no control handler registered"
     );
 
     mgr.install(&as_account("NetworkService"), false)
@@ -554,12 +585,18 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
         "a shim launched as the old account may still be about to open the log"
     );
 
-    // SCM knows no pid for a service whose process has not reached the dispatcher, so `kill` has none.
-    support::cmd::run("taskkill.exe", &["/F", "/PID", &pid]).expect_ok();
+    // Releasing the process lets it register its handler and report `RUNNING`, which ends the start.
+    connection.shutdown(Shutdown::Write).expect("release the process");
+    parked.disarm();
     start
         .join()
         .expect("the start thread")
-        .expect_err("a process that is killed does not start the service");
+        .unwrap_or_else(|e| panic!("the released service starts: {e}"));
+    assert_eq!(
+        mgr.status(id).expect("status").common().state,
+        State::Running,
+        "the start has ended"
+    );
 
     let again = mgr
         .install(&as_account("NetworkService"), false)
@@ -568,6 +605,9 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
     assert_eq!(
         accounts_of_default_log(id),
         [network_service],
-        "an install that finds no start in progress names the new account alone"
+        "an install that finds the service up names the new account alone"
     );
+
+    mgr.stop(id, Budget::DEFAULT)
+        .unwrap_or_else(|e| panic!("stop: {}", e.report()));
 }
