@@ -747,8 +747,8 @@ impl Backend for Scm {
         snapshot: &WindowsSnapshot,
     ) -> Result<()> {
         match (definition, snapshot) {
-            (WindowsDefinition::Service(definition), WindowsSnapshot::Service(installed)) => {
-                make_default_log(spec, definition, None, &[], default_log::Step::Narrow, Some(installed)).map(drop)
+            (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
+                make_default_log(spec, definition, None, &[], default_log::Step::Narrow).map(drop)
             }
             (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_default_log(installed),
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
@@ -1185,8 +1185,8 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
 /// service exists, since a virtual account's SID resolves only then, before any start. An update that
 /// changes the account names the registered account and the new one before the configuration changes, and the
-/// new one alone once it has landed, unless a start is in progress or this install made the log under a run that
-/// is up ([`default_log::naming`]), so that a change that fails leaves the account the service still runs as its
+/// new one alone once it has landed, unless a start is in progress or this install made the log under a live run
+/// ([`default_log::naming`]), so that a change that fails leaves the account the service still runs as its
 /// log, and the next install corrects what a failure left. The names come from what install knows (the snapshot's account, the new account), never from the file.
 /// A failure of the log after a create leaves the new service, and the next `install` finds it up to date and
 /// makes the log ([`Backend::ensure_beside`]).
@@ -1216,18 +1216,11 @@ fn apply(
         } else {
             default_log::Step::Narrow
         };
-        let change = make_default_log(
-            spec,
-            reg,
-            gated.checked.as_ref(),
-            before.as_slice(),
-            step,
-            Some(installed),
-        )?;
+        let change = make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
         after = change.map_or(default_log::Step::Narrow, |change| change.step_after());
     }
     apply_gated(reg, gated.password, installed.is_none())?;
-    make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after, installed).map(drop)
+    make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of
@@ -1313,8 +1306,7 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// far the service's run is ([`default_log::Run`]), which SCM is asked once: a shim holds its log from before its
 /// first status report, and reopens by path one that was deleted. Call it once the service exists (a virtual
 /// account's SID resolves only then) and before it starts, or for the account an update is about to give a
-/// service that exists. A log made under a live run is told, by where `installed`, the definition the run was
-/// started from, sends its output ([`installed_writes_default_log`]). The change it returns says what the install's
+/// service that exists. The change it returns says what the install's
 /// next step does with the file ([`default_log::LogChange::step_after`]); `None` for a service with no default log.
 fn make_default_log(
     spec: &DaemonSpec,
@@ -1322,7 +1314,6 @@ fn make_default_log(
     checked: Option<&Sid>,
     kept: &[Sid],
     step: default_log::Step,
-    installed: Option<&ScmSnapshot>,
 ) -> Result<Option<default_log::LogChange>> {
     if !generate::hosted(spec) {
         return Ok(None);
@@ -1333,19 +1324,7 @@ fn make_default_log(
         None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
     };
     let program_data = program_data()?;
-    let change = default_log::make(&program_data, id, step, service_run(id)?, kept, &account)?;
-    default_log::tell_if_made_while_running(&program_data, id, &change, !installed_writes_default_log(installed));
-    Ok(Some(change))
-}
-
-/// Whether the definition a service is installed with sends its daemon's output to the default log: it names no
-/// `logs:`. A live run was started from this definition, not from the one being installed, so an install that adds
-/// or removes `logs:` is told by what the run does. A definition that cannot be read is not known to log elsewhere,
-/// and a create has no run.
-fn installed_writes_default_log(installed: Option<&ScmSnapshot>) -> bool {
-    installed
-        .and_then(|installed| installed.blob().ok())
-        .is_none_or(|blob| blob.spec.common().logs.is_none())
+    default_log::make(&program_data, id, step, service_run(id)?, kept, &account).map(Some)
 }
 
 /// How far the run of the service `id` is, from the state SCM reports for it.

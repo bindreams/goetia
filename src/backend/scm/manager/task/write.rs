@@ -448,7 +448,7 @@ impl Scm {
             || service_gate(definition, written),
             |gated| {
                 apply_gated(definition, gated.password, true)?;
-                make_default_log(spec, definition, gated.checked.as_ref(), &[], Step::Narrow, None)?;
+                make_default_log(spec, definition, gated.checked.as_ref(), &[], Step::Narrow)?;
                 Ok(WriteOutcome::Done)
             },
         )?;

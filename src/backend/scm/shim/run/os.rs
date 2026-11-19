@@ -109,7 +109,7 @@ impl Real {
             }
             // Released first: where the delete is not a POSIX one, a handle on the deleted file keeps its name
             // and blocks the install's remake. A daemon's output handle is a clone of this one, and a new file made
-            // meanwhile is not what it writes ([`default_log::made_while_running`]).
+            // meanwhile is not what it writes.
             held.remove(path);
         }
         let file = Arc::new(default_log::open_for_append(path)?);

@@ -71,8 +71,8 @@ pub(crate) struct LogChange {
 }
 
 impl LogChange {
-    /// Whether the file was made while a run of the service was live: the one fact that the warning of
-    /// [`made_while_running`] and the [`Step::Leave`] of the install's next step both follow.
+    /// Whether the file was made while a run of the service was live: the one fact that the [`Step::Leave`] of the
+    /// install's next step follows.
     pub(crate) fn under_live_run(&self) -> bool {
         self.outcome == EnsureOutcome::Made && self.run.is_live()
     }
@@ -106,7 +106,7 @@ pub(crate) enum Step {
     Widen,
     /// Once it has, or where there is none: the log names the account the service now runs as.
     Narrow,
-    /// Once it has, after a step of the same install that made the log under a run that is up: that log stays as
+    /// Once it has, after a step of the same install that made the log under a live run (starting or up): that log stays as
     /// it is, naming the kept accounts too, until the next install narrows it.
     Leave,
 }
@@ -217,43 +217,6 @@ fn distinct(accounts: &[Sid]) -> Vec<Sid> {
         }
     }
     named
-}
-
-/// What an install says of a default log it made while a run of the daemon was live and its output goes to the
-/// default log (`logs_elsewhere` is whether the definition the run started from names a `logs:`): the log it made is
-/// not the file the run writes. The delete of a file frees its name at once on current NTFS (POSIX semantics) even
-/// while a handle is open on it, so the install made a new file, and the daemon's output goes on into the deleted one
-/// until the daemon is started again. A start in progress may not hold the log yet, so that is told as a
-/// possibility. `None` for any other case.
-pub(crate) fn made_while_running(
-    program_data: &Path,
-    id: &Id,
-    change: &LogChange,
-    logs_elsewhere: bool,
-) -> Option<String> {
-    if !change.under_live_run() || logs_elsewhere {
-        return None;
-    }
-    let path = path_in(&logs_folder(program_data), id.as_str());
-    Some(match change.run {
-        Run::Starting => format!(
-            "`{id}` was starting when its default log {} was made again: its output may go to the deleted log until \
-             it is restarted; if it does, restart it",
-            path.display()
-        ),
-        Run::Up | Run::Stopped => format!(
-            "`{id}` was running when its default log {} was made again: its output goes to the deleted log until it \
-             is restarted; restart it",
-            path.display()
-        ),
-    })
-}
-
-/// Prints [`made_while_running`] as a warning.
-pub(crate) fn tell_if_made_while_running(program_data: &Path, id: &Id, change: &LogChange, logs_elsewhere: bool) {
-    if let Some(said) = made_while_running(program_data, id, change, logs_elsewhere) {
-        eprintln!("warning: {said}");
-    }
 }
 
 /// A deleted log whose handle a daemon still holds keeps its name where the delete is not POSIX (the daemon's

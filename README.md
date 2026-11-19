@@ -1097,9 +1097,9 @@ The shim opens `<id>.log` once, when it starts, and writes through that handle, 
 changes the account (SCM does not restart the service) leaves the running shim its log. An install that
 changes the account while the service is starting, or has to make the file for a running service, leaves the old
 account named beside the new one in the file's permissions until the next install. If you delete
-`<id>.log` while the daemon runs, Windows frees the name at once on current NTFS: `goetia daemon install`
-makes a new `<id>.log` and says that the running daemon's output goes to the deleted one (may go, while it is
-still starting) until you restart it, so restart it; until that restart, a run started before an earlier install
+`<id>.log` while the daemon runs, its output goes on into the deleted file until you restart the daemon, as with
+any file a running program holds; Windows frees the name at once on current NTFS, and `goetia daemon install`
+makes a new `<id>.log`. Until that restart, a run started before an earlier install
 changed the account writes its own lines to the Event Log only, not to the new `<id>.log`. Where the delete is
 deferred until the daemon's handle closes, the name stays and `goetia daemon install` fails saying so: stop the
 daemon, then install again.

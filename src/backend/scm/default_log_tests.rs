@@ -311,55 +311,6 @@ fn a_system_account_keeps_its_full_control_of_the_log() {
     );
 }
 
-/// What the install says when it made the log while a run of the daemon was live: only then, only where the run's
-/// output goes to the default log (its definition names no `logs:`), and the words say what to do. A run that is
-/// starting may not hold the log yet, so it is told as a possibility.
-#[skuld::test]
-fn a_log_made_under_a_live_run_is_told_and_no_other_is() {
-    let program_data = Path::new(r"C:\ProgramData");
-    let told = |outcome, run, logs_elsewhere| {
-        made_while_running(program_data, &id(), &LogChange { outcome, run }, logs_elsewhere)
-    };
-
-    let up = told(EnsureOutcome::Made, Run::Up, false).expect("made while it runs");
-    assert!(up.contains("nightly"), "{up}");
-    assert!(up.contains(r"C:\ProgramData\Goetia\logs\nightly.log"), "{up}");
-    assert!(
-        up.contains("its output goes to the deleted log until it is restarted"),
-        "{up}"
-    );
-    assert!(up.contains("restart it"), "{up}");
-
-    let starting = told(EnsureOutcome::Made, Run::Starting, false).expect("made while it starts");
-    assert!(
-        starting.contains(r"C:\ProgramData\Goetia\logs\nightly.log"),
-        "{starting}"
-    );
-    assert!(
-        starting.contains("its output may go to the deleted log until it is restarted"),
-        "{starting}"
-    );
-    assert!(starting.contains("restart it"), "{starting}");
-
-    for (outcome, run) in [
-        (EnsureOutcome::Made, Run::Stopped),
-        (EnsureOutcome::Set, Run::Up),
-        (EnsureOutcome::Kept, Run::Up),
-        (EnsureOutcome::Set, Run::Starting),
-        (EnsureOutcome::Kept, Run::Starting),
-    ] {
-        assert_eq!(told(outcome, run, false), None, "{outcome:?}, {run:?}");
-    }
-    // The run's output goes to its own `logs:`, not to the file the install made.
-    for run in [Run::Starting, Run::Up] {
-        assert_eq!(
-            told(EnsureOutcome::Made, run, true),
-            None,
-            "a run with `logs:` writes elsewhere, {run:?}"
-        );
-    }
-}
-
 /// A run is live from the launch of its shim: a start in progress is, since the shim opens the log and spawns the
 /// daemon before it reports `RUNNING`, and so is any run past it. A stopped service has none.
 #[skuld::test]
