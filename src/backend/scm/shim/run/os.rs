@@ -29,7 +29,7 @@ pub(crate) trait Os: Send + Sync {
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>;
 
     /// Open the file at `path` for appending, as `kind` says. It is the daemon's log: the daemon's output is
-    /// redirected into it. The default log is the one [`Channels::hold_default`] holds, so the daemon's output
+    /// redirected into it. The default log is the handle the shim holds on it, so the daemon's output
     /// and the shim's own lines share one file until that file is deleted.
     fn open_log(&self, path: &Path, kind: LogKind) -> io::Result<File>;
 }
