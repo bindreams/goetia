@@ -210,6 +210,21 @@ fn a_denied_open_with_the_failed_step_keeps_the_kills_context() {
     );
 }
 
+/// The denial is read as the search reads any error's OS code, so a denial said within a context is
+/// explained as a bare one is.
+#[skuld::test]
+fn a_denial_said_within_a_context_is_explained_as_a_bare_one_is() {
+    let e = failed_to_enable().explain_denial(within("opening process 7", denied()));
+
+    assert_eq!(os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
+    assert!(
+        Error::os("kill", e)
+            .report()
+            .to_string()
+            .contains("enabling SeDebugPrivilege for the open also failed"),
+    );
+}
+
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.
 #[skuld::test]
 fn a_denied_open_with_no_failed_step_is_unchanged() {

@@ -484,7 +484,7 @@ fn an_exit_entry_that_cannot_be_read_is_an_unrecorded_exit_with_that_failure_as_
     assert!(lacking(&unreadable), "{unreadable:?}");
     assert_eq!(
         unreadable.report().to_string(),
-        "the run of `x` ended without recording its exit status: `journalctl` answered without an exit status, so goetia cannot tell its live state"
+        "the run of `x` ended without recording its exit status: its exit entry in the journal does not say how it ended: `journalctl` answered without an exit status, so goetia cannot tell its live state"
     );
 
     let failed = read(vec![failed_with("inv", "resources")]);

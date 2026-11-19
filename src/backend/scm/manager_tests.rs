@@ -1124,7 +1124,7 @@ fn a_stop_that_could_not_open_its_process_says_so_and_the_open_failure_is_search
     assert_eq!(
         said,
         format!(
-            "goetia could not open `frpc`'s process (access denied), so it could not wait for the process to exit: {}",
+            "goetia could not hold `frpc`'s process (access denied), so it could not wait for the process to exit: {}",
             timeout().report()
         )
     );

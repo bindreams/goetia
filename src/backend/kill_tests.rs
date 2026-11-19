@@ -436,8 +436,9 @@ fn a_held_process_the_manager_does_not_name_is_not_signalled_and_the_record_is_w
     );
 }
 
-/// The wait for the record of an ended process fails: that is the kill's error, plain, for nothing
-/// was signalled.
+/// The wait for the record of a process the manager moved off, which is not known to be gone, fails:
+/// that is the kill's error, plain, for nothing was signalled, and it says no more than the notice of
+/// the same wait does.
 #[skuld::test]
 fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found])
@@ -449,7 +450,7 @@ fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
     assert_eq!(e.kind(), READ_FAILED_KIND);
     assert_eq!(
         kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to record that process 100 is gone: manager read failed"
+        "failed to kill `frpc`: waiting for the manager to record that process 100 has exited: manager read failed"
     );
     assert!(!target.log().iter().any(|call| call.starts_with("terminate")));
 }
@@ -735,8 +736,7 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
     assert!(!target.log().contains(&"await_recorded 100".to_string()));
 }
 
-/// A process that was never signalled keeps the plain error: it is not a signalled one. The hold names
-/// the process the read was about, once.
+/// A process that was never signalled keeps the plain error: it is not a signalled one.
 #[skuld::test]
 fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
     let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
@@ -746,7 +746,7 @@ fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
     assert_eq!(e.kind(), READ_FAILED_KIND);
     assert_eq!(
         kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to record that process 100 is gone: manager read failed"
+        "failed to kill `frpc`: waiting for the manager to record that process 100 has exited: manager read failed"
     );
 }
 
@@ -804,7 +804,7 @@ fn a_failed_signal_is_an_error_and_waits_for_nothing() {
 
     let text = crate::error::Chain(&e).to_string();
     assert!(
-        text.contains("process 100 was held and confirmed as the service's, but signalling it failed"),
+        text.contains("process 100 was held and confirmed as the daemon's, but signalling it failed"),
         "{text}"
     );
     assert!(text.ends_with("terminate failed"), "{text}");

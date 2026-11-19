@@ -442,6 +442,7 @@ fn an_instance_that_cannot_be_opened_fails_the_stop_before_any_stop_is_sent() {
     let report = failed.report().to_string();
     assert!(report.contains("denied access"), "{failed}");
     assert!(report.contains("process 200"), "{failed}");
+    assert_eq!(report.matches("open").count(), 1, "{failed}");
     assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
     assert!(machine.waited.is_empty());
 }
@@ -475,6 +476,35 @@ fn a_hold_whose_re_read_failed_after_a_refused_open_names_the_pid_once() {
             "failed to hold the process of `nightly`'s run: the process (pid 100) could not be opened ({denied}), \
              and the re-read of what runs the daemon failed: failed to list the runs of `nightly`: listing failed"
         )
+    );
+}
+
+/// The first read of a hold is made before the listing has named the process, and the caller knows which
+/// run it is for: a failed first read says so, for the run it failed for.
+#[skuld::test]
+fn a_hold_whose_first_read_failed_names_which_run_it_was_for() {
+    let fake = Fake::new();
+    // The first run's hold and its second read, then the second run's first read, which fails.
+    fake.on_instances(two()).on_instances(two()).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100, 200]);
+
+    let failed = hold_all(
+        &fake,
+        "kill",
+        &id(),
+        &TaskPath::of(&id()),
+        vec![instance(1, 100), instance(2, 200)],
+        &mut machine,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        failed.report().to_string(),
+        "failed to hold the process of `nightly`'s run (pid 200): failed to list the runs of `nightly`: listing \
+         failed"
     );
 }
 
