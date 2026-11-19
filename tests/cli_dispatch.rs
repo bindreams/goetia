@@ -2667,9 +2667,9 @@ fn status_json_with_no_ids_equals_list_json_with_a_task_installed() {
     );
 }
 
-/// `list`'s text row names the type, between the name and the state.
+/// `list`'s text row names the type in a last column, so the columns that were there keep their positions.
 #[skuld::test]
-fn list_text_of_a_task_has_its_type_column() {
+fn list_text_of_a_task_has_its_type_column_last() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
     fake.install(&a_task("nightly"), false).unwrap();
@@ -2679,7 +2679,7 @@ fn list_text_of_a_task_has_its_type_column() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(
         out,
-        "frpc\tfrpc\tservice\tstopped\tenabled=false\nnightly\tnightly\ttask\tidle\tenabled=false\n"
+        "frpc\tfrpc\tstopped\tenabled=false\tservice\nnightly\tnightly\tidle\tenabled=false\ttask\n"
     );
 }
 

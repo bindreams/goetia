@@ -334,7 +334,7 @@ fn every_rendering_of_an_unusable_entry_has_the_same_prefix_and_reason() {
             name: "x".to_string(),
             reason: reason.clone(),
         }]);
-        let report = from_index(&index);
+        let report = from_index(&index, &TimeZone::UTC);
         let message = format!("installed but unusable: {}", reason.unescaped());
         assert_eq!(report.errors[0].message, message);
 
@@ -381,7 +381,7 @@ fn task_status(
 
 /// The document of one daemon, as `status` and `list` write it.
 fn document(status: &Status) -> serde_json::Value {
-    serde_json::to_value(daemon_in("job", status, &TimeZone::UTC)).expect("a DaemonReport serializes infallibly")
+    serde_json::to_value(daemon("job", status, &TimeZone::UTC)).expect("a DaemonReport serializes infallibly")
 }
 
 /// One shape for every daemon: a consumer reads the same keys of a service and of a task.
@@ -389,7 +389,7 @@ fn document(status: &Status) -> serde_json::Value {
 fn a_service_entry_carries_type_service_and_null_task_fields() {
     let status = Status::Service(common(State::Running, Some(1234), true));
 
-    let json = serde_json::to_string(&daemon_in("frpc", &status, &TimeZone::UTC)).unwrap();
+    let json = serde_json::to_string(&daemon("frpc", &status, &TimeZone::UTC)).unwrap();
 
     assert_eq!(
         json,
@@ -404,7 +404,7 @@ fn a_service_entry_carries_type_service_and_null_task_fields() {
 fn a_task_that_never_ran_is_idle_with_null_results() {
     let status = task_status(common(State::Idle, None, false), None, None, None);
 
-    let json = serde_json::to_string(&daemon_in("job", &status, &TimeZone::UTC)).unwrap();
+    let json = serde_json::to_string(&daemon("job", &status, &TimeZone::UTC)).unwrap();
 
     assert_eq!(
         json,
@@ -440,30 +440,81 @@ fn a_finished_task_run_shows_code_signal_and_times() {
         (19_800, "2026-01-15T17:30:00+05:30", "2026-01-15T18:30:00+05:30"),
         (0, "2026-01-15T12:00:00+00:00", "2026-01-15T13:00:00+00:00"),
     ] {
-        let json = serde_json::to_value(daemon_in("job", &status, &zone(offset))).unwrap();
+        let json = serde_json::to_value(daemon("job", &status, &zone(offset))).unwrap();
         assert_eq!(json["last-run"], last_run);
         assert_eq!(json["next-run"], next_run);
     }
 }
 
-/// The production path formats in the host's zone, not UTC: `daemon` is `daemon_in` with the system zone.
+/// One zone for a whole document: every entry `from_index` writes carries the zone it was given.
 #[skuld::test]
-fn a_timestamp_is_formatted_in_the_system_zone() {
-    let status = task_status(common(State::Idle, None, true), None, Some(at(NOON)), None);
+fn every_entry_of_a_listing_is_written_in_the_one_zone_given() {
+    use crate::cli::support::partition_installed;
+    use crate::manager::Installed;
+    use crate::spec::test_support::program;
+    use crate::testing::task;
 
-    let production = daemon("job", &status);
+    let entry = |id: &str| Installed::Ours {
+        spec: task(id, vec![program("job")], None),
+        status: task_status(
+            common(State::Idle, None, true),
+            None,
+            Some(at(NOON)),
+            Some(at(NOON + 3600)),
+        ),
+    };
+    let index = partition_installed(vec![entry("a"), entry("b")]);
 
-    let system = TimeZone::system();
-    let instant = jiff::Timestamp::from_second(NOON as i64).unwrap();
-    assert_eq!(
-        production.last_run.as_deref(),
-        Some(
-            instant
-                .display_with_offset(system.to_offset(instant))
-                .to_string()
-                .as_str()
-        )
+    let report = from_index(&index, &zone(19_800));
+
+    let runs: Vec<_> = report.daemons.iter().map(|d| d.last_run.as_deref()).collect();
+    assert_eq!(runs, [Some("2026-01-15T17:30:00+05:30"); 2]);
+    let runs: Vec<_> = report.daemons.iter().map(|d| d.next_run.as_deref()).collect();
+    assert_eq!(runs, [Some("2026-01-15T18:30:00+05:30"); 2]);
+}
+
+/// A time `jiff` cannot represent (years beyond -9999 to 9999) is unknown, not a clamped bound that reads as a
+/// real time.
+#[skuld::test]
+fn a_time_outside_jiffs_range_is_null() {
+    // About 11,500 CE, and about 10,700 BCE; Windows' `SystemTime` starts in 1601 and cannot hold the second.
+    let far_future = at(300_000_000_000);
+    let far_past = UNIX_EPOCH.checked_sub(Duration::from_secs(400_000_000_000));
+    assert!(
+        far_past.is_some() || cfg!(windows),
+        "only Windows' SystemTime lacks the year -10,700"
     );
+
+    for far in std::iter::once(far_future).chain(far_past) {
+        let status = task_status(common(State::Idle, None, true), None, Some(far), Some(far));
+        let json = document(&status);
+        assert_eq!(json["last-run"], serde_json::Value::Null);
+        assert_eq!(json["next-run"], serde_json::Value::Null);
+    }
+
+    // The neighbours in range are still written.
+    let status = task_status(common(State::Idle, None, true), None, Some(at(NOON)), Some(far_future));
+    let json = document(&status);
+    assert_eq!(json["last-run"], "2026-01-15T12:00:00+00:00");
+    assert_eq!(json["next-run"], serde_json::Value::Null);
+}
+
+/// The fraction of a second is dropped toward the earlier second, before the epoch as after it.
+#[skuld::test]
+fn a_time_before_the_epoch_drops_its_fraction_toward_the_earlier_second() {
+    for (before_epoch, expected) in [
+        (Duration::from_millis(1500), "1969-12-31T23:59:58+00:00"),
+        (Duration::from_millis(1), "1969-12-31T23:59:59+00:00"),
+        (Duration::from_secs(2), "1969-12-31T23:59:58+00:00"),
+    ] {
+        let time = UNIX_EPOCH.checked_sub(before_epoch).expect("a time before the epoch");
+        let status = task_status(common(State::Idle, None, true), None, Some(time), None);
+        assert_eq!(
+            document(&status)["last-run"],
+            expected,
+            "{before_epoch:?} before the epoch"
+        );
+    }
 }
 
 /// systemd: the journal's newest run has no terminal entry while the run is in flight, so `last-result` is

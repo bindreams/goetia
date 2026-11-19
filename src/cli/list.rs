@@ -4,6 +4,8 @@
 
 use std::io::Write;
 
+use jiff::tz::TimeZone;
+
 use super::ExitCode;
 use super::report;
 use super::support::{
@@ -22,7 +24,7 @@ pub fn run(
     // from it — see [`report`]'s module doc comment.
     let (index, report) = match get_manager().and_then(|mgr| mgr.list()).map(partition_installed) {
         Ok(index) => {
-            let report = report::from_index(&index);
+            let report = report::from_index(&index, &TimeZone::system());
             (Some(index), report)
         }
         Err(e) => (None, report::unavailable(e)),
@@ -48,11 +50,11 @@ fn print_text(index: &InstalledIndex, out: &mut dyn Write, err: &mut dyn Write) 
     for (id, (spec, status)) in &index.ours {
         let _ = writeln!(
             out,
-            "{id}\t{}\t{}\t{}\tenabled={}",
+            "{id}\t{}\t{}\tenabled={}\t{}",
             spec.common().name,
-            status.kind().as_str(),
             state_str(status.common().state),
-            status.common().enabled
+            status.common().enabled,
+            status.kind().as_str()
         );
     }
 }

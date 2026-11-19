@@ -18,7 +18,7 @@ fn rendered(id: Option<&str>, message: &str) -> (String, String) {
 }
 
 fn line_of(status: &Status) -> String {
-    format_status_line(&report::daemon_in("job", status, &jiff::tz::TimeZone::UTC))
+    format_status_line(&report::daemon("job", status, &jiff::tz::TimeZone::UTC))
 }
 
 /// A service's line is as it was before tasks.

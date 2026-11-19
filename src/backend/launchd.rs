@@ -2,9 +2,8 @@
 
 pub(crate) mod calendar;
 pub mod generate;
-// `not(doc)`: `rustdoc-tests.sh` documents the library with `--cfg test` but without dev-dependencies, and
-// `jiff` is one of them off macOS.
-#[cfg(any(all(test, not(doc)), target_os = "macos"))]
+// Off macOS, `jiff` is there only with the `cli` feature; the module's tests run wherever it is.
+#[cfg(any(all(test, feature = "cli"), target_os = "macos"))]
 pub(crate) mod next;
 pub(crate) mod refuse;
 pub(crate) mod state;

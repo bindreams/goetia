@@ -34,7 +34,7 @@
 
 use std::fmt::{self, Write as _};
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -249,9 +249,13 @@ impl serde::Serialize for Kind {
 /// so the ordering is by id.
 ///
 /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
-pub(crate) fn from_index(index: &InstalledIndex) -> Report {
+pub(crate) fn from_index(index: &InstalledIndex, zone: &TimeZone) -> Report {
     Report {
-        daemons: index.ours.iter().map(|(id, (_, status))| daemon(id, status)).collect(),
+        daemons: index
+            .ours
+            .iter()
+            .map(|(id, (_, status))| daemon(id, status, zone))
+            .collect(),
         errors: index
             .unusable
             .iter()
@@ -279,13 +283,9 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
     }
 }
 
-/// One daemon, from a successful `ServiceManager::status(&id)`, with its times in the system time zone.
-pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
-    daemon_in(id, status, &TimeZone::system())
-}
-
-/// [`daemon`] with its times in `zone`.
-pub(crate) fn daemon_in(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport {
+/// One daemon, from a successful `ServiceManager::status(&id)`, with its times in `zone`. A caller resolves
+/// the system zone once per document, so every entry of it carries the same offset rule.
+pub(crate) fn daemon(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport {
     let common = status.common();
     let (last_result, last_run, next_run) = match status {
         Status::Service(_) => (None, None, None),
@@ -298,21 +298,20 @@ pub(crate) fn daemon_in(id: &str, status: &Status, zone: &TimeZone) -> DaemonRep
         enabled: common.enabled,
         pid: common.pid,
         last_result,
-        last_run: last_run.map(|time| format_time(time, zone)),
-        next_run: next_run.map(|time| format_time(time, zone)),
+        last_run: last_run.and_then(|time| format_time(time, zone)),
+        next_run: next_run.and_then(|time| format_time(time, zone)),
     }
 }
 
 /// `time` as RFC 3339 with `zone`'s offset at that instant, to the second (`2026-11-18T03:30:00+02:00`).
-/// A time beyond `jiff`'s range (years -9999 to 9999), which no manager reports, is written as the nearest bound.
-fn format_time(time: SystemTime, zone: &TimeZone) -> String {
-    let instant = Timestamp::try_from(time).unwrap_or(if time < UNIX_EPOCH {
-        Timestamp::MIN
-    } else {
-        Timestamp::MAX
-    });
-    let whole = Timestamp::from_second(instant.as_second()).expect("a whole second of a Timestamp is in range");
-    whole.display_with_offset(zone.to_offset(whole)).to_string()
+/// A fraction is dropped toward the earlier second, before the epoch as after it. A time `jiff` cannot represent
+/// (years beyond -9999 to 9999), which no manager reports, is `None`: unknown, never a bound that reads as a time.
+fn format_time(time: SystemTime, zone: &TimeZone) -> Option<String> {
+    let instant = Timestamp::try_from(time).ok()?;
+    // `as_second` truncates toward zero, and a negative timestamp carries a negative fraction.
+    let floor = instant.as_second() - i64::from(instant.subsec_nanosecond() < 0);
+    let whole = Timestamp::from_second(floor).ok()?;
+    Some(whole.display_with_offset(zone.to_offset(whole)).to_string())
 }
 
 /// Classify a failure of `ServiceManager::status(&id)` — and of nothing
