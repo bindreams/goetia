@@ -3,6 +3,10 @@
 //! program is this binary in a shim fixture mode (`fixture.rs`). The tasks of a service account run a
 //! copy of the shim and of this binary that the account can execute (`WorldReadableExe`).
 
+use std::path::PathBuf;
+
+use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
+
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{Id, User};
 
@@ -178,5 +182,52 @@ fn a_task_runs_at_normal_priority(#[fixture(scm_group)] _group: &Group) {
         "0x20",
         "NORMAL_PRIORITY_CLASS"
     );
+    mgr.uninstall(&id).expect("uninstall");
+}
+
+/// The removal's marker of the task `id`, placed by hand as an uninstall or an account change that began
+/// leaves it, and taken away when it drops.
+struct RemovalMarker(PathBuf);
+
+impl RemovalMarker {
+    fn place(id: &Id) -> Self {
+        let path = goetia::testing::program_data()
+            .join("Goetia")
+            .join("runs")
+            .join(format!("{id}~removing"));
+        std::fs::File::create(&path).unwrap_or_else(|e| panic!("place {}: {e}", path.display()));
+        Self(path)
+    }
+}
+
+impl Drop for RemovalMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The shim Task Scheduler starts obeys the removal's marker: its pin is refused, so it starts no program
+/// and ends as a shim failure, which is the task's last result. The run is started through Task Scheduler's
+/// own `Run`, since a verb of goetia would be refused by the marker before it asked for anything.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
+    let id = task_id();
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = manager();
+    let reported = ConnectBack::listen();
+    let command = fixture_command("exit", &[&reported.port().to_string(), "7"]);
+    mgr.install(&task_spec(&id, command, None, User::Root, None), false)
+        .expect("install");
+    let marker = RemovalMarker::place(&id);
+
+    let result = goetia::testing::run_task_until_it_ends(&id).unwrap_or_else(|e| panic!("run: {}", e.report()));
+
+    assert_eq!(
+        result, ERROR_GEN_FAILURE as i32,
+        "the shim's failure, not the program's 7"
+    );
+    // The run has ended, so no later connection is possible: this is an observation, not a race.
+    assert!(!reported.connected_yet(), "the program ran under a marker");
+    drop(marker);
     mgr.uninstall(&id).expect("uninstall");
 }

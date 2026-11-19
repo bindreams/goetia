@@ -207,6 +207,14 @@ pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<S
     }
 }
 
+/// Starts the task `\Goetia\<id>` through Task Scheduler's own `Run`, and returns its last result once a
+/// run has ended: the exit code of the shim that Task Scheduler started as the task's action. A verb of
+/// goetia cannot be used for this, since it pins the run records before it asks for the run.
+#[cfg(windows)]
+pub fn run_task_until_it_ends(id: &Id) -> Result<i32> {
+    crate::backend::scm::manager::task::run_until_it_ends(id)
+}
+
 /// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for
 /// about five seconds and then warning. A task that is not there is done. Never panics: it is what a
 /// guard's `Drop` calls.
