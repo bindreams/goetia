@@ -3,40 +3,35 @@
 //! next run through `status`, and is removed by `uninstall`.
 //!
 //! "Armed" and "fired" are two installs of the one id, so no read can straddle a fire: the first has a
-//! daily schedule whose time has just passed (its next fire is a day away), the second is `* * * * *`.
+//! daily schedule whose time is 12 hours away, the second is `* * * * *`.
 //!
 //! The platform-neutral half (the manifest, the binary, the document) is `support::demonstration`.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use goetia::backend::systemd::manager::Systemd;
 use serde_json::Value;
 
-use crate::linux::{UNIT_DIR_EXCLUSIVE, started_invocations, timer_path, timer_wants_symlink, unit_path};
+use crate::linux::{UNIT_DIR_EXCLUSIVE, timer_path, timer_wants_symlink, unit_path, wait_for_started};
 use crate::support::cron_oracle::expected_next_runs;
 use crate::support::demonstration::{
     Cli, Expect, LastResult, Manifest, Time, ZONE, ZONE_OFFSET, assert_task_fields, instant, text_field, text_state,
 };
 use crate::support::tasks::{Held, id_of, sh, status_with_result};
-use crate::support::{self, Group, ServiceGuard, kill, systemd_group};
+use crate::support::{self, Group, ServiceGuard, systemd_group};
 
 const EVERY_MINUTE: &str = "* * * * *";
 
-/// A daily schedule whose time was two minutes ago, local time: its next fire is a day away.
-fn daily_just_passed() -> String {
-    let past = SystemTime::now() - Duration::from_secs(120);
-    let secs = past
-        .duration_since(UNIX_EPOCH)
-        .expect("a time after the epoch")
-        .as_secs();
-    let time = libc::time_t::try_from(secs).expect("a time_t");
-    // SAFETY: an all-zero `tm` is a valid value, and `localtime_r` fills the one it is given.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are valid for the call.
-    let filled = unsafe { libc::localtime_r(&time, &mut tm) };
-    assert!(!filled.is_null(), "localtime_r failed for {secs}");
-    format!("{} {} * * *", tm.tm_min, tm.tm_hour)
+/// A daily schedule whose time is about 12 hours from now, in the container's local zone: the zone
+/// systemd reads `OnCalendar` in (the test's process sets no `TZ`). The armed task has a next fire
+/// that far away and nothing fires while it is read. A clock step of 12 hours is outside what the
+/// lanes do.
+fn daily_in_half_a_day() -> String {
+    let at = jiff::Zoned::now()
+        .checked_add(jiff::Span::new().hours(12))
+        .expect("12 hours from now");
+    format!("{} {} * * *", at.minute(), at.hour())
 }
 
 /// What one form of the task's status reported, read with the child's `TZ` set to [`ZONE`]. A time is
@@ -130,7 +125,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
     let cli = Cli::new();
     let in_zone = Cli::in_zone(ZONE);
     let mut held = Held::new();
-    let daily = daily_just_passed();
+    let daily = daily_in_half_a_day();
     let mut manifest = Manifest::new(&id, held.command.clone(), &daily);
 
     // 1. Installed, the task is idle and disarmed.
@@ -148,9 +143,8 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
         },
     );
 
-    // 2. Armed. Enabled with a schedule whose time has passed, it is idle with the next run the cron names
-    // (a day away), never run, in every form and at the offset of `TZ`. Nothing fires, so one read is the
-    // read.
+    // 2. Armed. Enabled with a schedule 12 hours away, it is idle with the next run the cron names, never
+    // run, in every form and at the offset of `TZ`. Nothing fires, so one read is the read.
     let enabled_at = SystemTime::now();
     cli.daemon(&["enable", &id]);
     let [_, next, _] = expected_next_runs(&daily, &id_of(&id), enabled_at, SystemTime::now());
@@ -194,23 +188,11 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
     cli.install(&manifest);
     let enabling_at = SystemTime::now();
     cli.daemon(&["enable", &id]);
-    let [_, first, last] = expected_next_runs(EVERY_MINUTE, &id_of(&id), enabling_at, SystemTime::now());
+    let candidates = expected_next_runs(EVERY_MINUTE, &id_of(&id), enabling_at, SystemTime::now());
     held.wait_started();
-    assert_task_fields(
-        &in_zone.status_json(&id),
-        &id,
-        Expect {
-            state: "running",
-            enabled: true,
-            pid: Time::Present,
-            last_result: LastResult::Null,
-            last_run: Time::Any,
-            next_run: Time::Null,
-        },
-    );
     // `last-run` is read from the journal, which need not hold the run's `Starting` entry yet: wait for it
     // (the entry `goetia` matches), and then one read must show the `last-run`.
-    kill::until(|| !started_invocations(&id).is_empty());
+    wait_for_started(&id);
     let running = read_in_the_zone(&in_zone, &id);
     assert_task_fields(
         &running.json,
@@ -231,8 +213,10 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
         });
         let fired = instant(time);
         assert!(
-            fired >= first && fired < last + Duration::from_secs(60),
-            "{}: last-run {fired:?} is not in [{first:?}, {last:?} + 60s)",
+            candidates
+                .iter()
+                .any(|&at| fired >= at && fired < at + Duration::from_secs(60)),
+            "{}: last-run {fired:?} is not in a minute from any of {candidates:?}",
             read.form
         );
     }

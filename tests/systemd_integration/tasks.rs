@@ -20,8 +20,8 @@ use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 
 use crate::linux::{
-    CreatedRoot, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, journal, main_pid, started_invocations,
-    timer_path, timer_wants_symlink, unit_of,
+    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, journal, main_pid,
+    started_invocations, timer_path, timer_wants_symlink, unit_of,
 };
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
 use crate::support::cron_oracle::assert_next_run;
@@ -444,7 +444,7 @@ fn status_after_a_successful_run_reads_exit_0_from_the_journal(#[fixture(systemd
     let status = status_with_result(&mgr, &task_id);
     assert_eq!(status.last_result, Some(Exit::Code(0)), "{status:?}");
     let unit = format!("UNIT={}", unit_of(&id));
-    let starting = journal(&[&unit, &format!("MESSAGE_ID={STARTING}")]);
+    let starting = journal(&[&unit, &format!("MESSAGE_ID={STARTING}"), FROM_PID_1]);
     let [entry] = starting.as_slice() else {
         panic!("a task run once has one Starting entry: {starting:?}");
     };
@@ -1097,7 +1097,7 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
 
     let unit = unit_of(&id);
     let (by_manager, by_unit) = (format!("UNIT={unit}"), format!("_SYSTEMD_UNIT={unit}"));
-    let entries = journal(&[&by_manager, "+", &by_unit, "_TRANSPORT=stdout"]);
+    let entries = journal(&[&by_manager, FROM_PID_1, "+", &by_unit, "_TRANSPORT=stdout"]);
     let starting = entries
         .iter()
         .position(|entry| field(entry, "MESSAGE_ID") == Some(STARTING))

@@ -2820,16 +2820,17 @@ pub(crate) const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
 
 /// What the manager's entries are all written by, as `goetia` asks for them: a unit's own process can
 /// write an entry with any `MESSAGE_ID` and `UNIT`.
-const FROM_PID_1: &str = "_PID=1";
+pub(crate) const FROM_PID_1: &str = "_PID=1";
 
 pub(crate) fn unit_of(id: &str) -> String {
     format!("{id}.service")
 }
 
-/// The entries `journalctl` holds for `matches`, oldest first, as JSON objects.
+/// The entries `journalctl` holds for `matches`, oldest first, as JSON objects. The system journal, as
+/// `goetia` reads it.
 pub(crate) fn journal(matches: &[&str]) -> Vec<Value> {
     cmd::run("journalctl", &["--sync"]).expect_ok();
-    let mut args = vec!["-a", "-o", "json", "--no-pager"];
+    let mut args = vec!["--system", "-a", "-o", "json", "--no-pager"];
     args.extend_from_slice(matches);
     cmd::run("journalctl", &args)
         .expect_ok()
@@ -2855,6 +2856,37 @@ pub(crate) fn started_invocations(id: &str) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// Kills and reaps the `journalctl` follower it holds, when it goes.
+struct Follower(std::process::Child);
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        drop(self.0.kill());
+        drop(self.0.wait());
+    }
+}
+
+/// Blocks until the journal holds a `Starting` entry for a run of `id`'s unit: a `journalctl --follow` on
+/// the matches [`started_invocations`] reads, stopped at its first line. It prints the entries already
+/// there and then each new one, so the wait ends on the entry itself and has no cap.
+pub(crate) fn wait_for_started(id: &str) {
+    let unit = format!("UNIT={}", unit_of(id));
+    let message = format!("MESSAGE_ID={STARTING}");
+    let mut follower = Follower(
+        Command::new("journalctl")
+            .args(["--system", "-f", "-a", "-o", "json", "--no-pager"])
+            .args([unit.as_str(), message.as_str(), FROM_PID_1])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn journalctl --follow"),
+    );
+    let stdout = follower.0.stdout.take().expect("a piped stdout");
+    let mut line = String::new();
+    let read = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+        .expect("read the follower's first line");
+    assert_ne!(read, 0, "journalctl --follow ended without an entry for `{unit}`");
 }
 
 /// A task that exits with `code` the moment it starts, and runs daily at 03:30.
