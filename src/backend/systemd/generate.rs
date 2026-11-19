@@ -179,7 +179,9 @@ fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
 /// service of the same name.
 ///
 /// `AccuracySec=1s` makes the run start within the cron second; the default of one minute fired
-/// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up.
+/// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up. It
+/// reads the timer's stamp, the time it last elapsed, so `disable` and `uninstall` clear the stamp:
+/// a time passed while the timer was disarmed is then not a missed one.
 fn timer_unit(task: &TaskSpec, schedule: &Schedule) -> String {
     let mut out = String::new();
 
