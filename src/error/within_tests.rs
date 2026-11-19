@@ -116,7 +116,10 @@ fn a_failure_said_within_a_context_by_a_target_is_still_a_failure_of_the_operati
 #[skuld::test]
 fn a_context_around_a_delivered_signal_still_says_it_was_delivered() {
     for source in [denied(), io::Error::other(Error::blob("carried"))] {
-        let wrapped = within("outer", within_delivered("process 7 was signalled, but waiting failed", source));
+        let wrapped = within(
+            "outer",
+            within_delivered("process 7 was signalled, but waiting failed", source),
+        );
 
         let report = target_failed("kill `x`", wrapped).report().to_string();
 

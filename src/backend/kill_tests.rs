@@ -757,7 +757,9 @@ fn every_failure_of_a_kill_after_the_pid_is_read_says_which_process() {
     let refused = Scripted::new([Some(100)], [Open::Fails]);
     let confirming = Scripted::new([Some(100)], [Open::Found]).failing_read(2);
     let recording = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
-    let recording_after_expiry = Scripted::new([Some(100)], [Open::Gone]).lagging_record().failing_recorded();
+    let recording_after_expiry = Scripted::new([Some(100)], [Open::Gone])
+        .lagging_record()
+        .failing_recorded();
     let recording_after_ended = Scripted::new([Some(100)], [Open::Found]).disowning().failing_recorded();
     for (what, mut target) in [
         ("refused open", refused),
