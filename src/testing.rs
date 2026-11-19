@@ -79,6 +79,90 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     crate::backend::scm::manager::sid_for_account_name(account_name, None).map(|(sid, _kind)| sid)
 }
 
+/// Whether the account `sid` holds the logon right `right` (`"SeBatchLogonRight"`), as the local security
+/// policy says (`LsaEnumerateAccountRights`). A failure to ask fails the calling test.
+#[cfg(windows)]
+pub fn account_holds_right(sid: &[u8], right: &str) -> bool {
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        LSA_UNICODE_STRING, LsaClose, LsaEnumerateAccountRights, LsaFreeMemory, LsaNtStatusToWinError,
+        POLICY_LOOKUP_NAMES,
+    };
+    use windows_sys::Win32::Security::PSID;
+
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+    let policy = open_policy(POLICY_LOOKUP_NAMES as u32);
+
+    let mut rights: *mut LSA_UNICODE_STRING = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: `policy` was opened above; `sid` is a SID buffer live for the call; the out-params are valid.
+    let status = unsafe { LsaEnumerateAccountRights(policy, sid.as_ptr() as PSID, &mut rights, &mut count) };
+    let mut held = false;
+    if status == 0 {
+        // SAFETY: on success `rights` points at `count` strings, each `Length` bytes of UTF-16 at `Buffer`.
+        held = unsafe { std::slice::from_raw_parts(rights, count as usize) }
+            .iter()
+            .any(|name| {
+                let units = unsafe { std::slice::from_raw_parts(name.Buffer, name.Length as usize / 2) };
+                String::from_utf16_lossy(units) == right
+            });
+        // SAFETY: `rights` was allocated by `LsaEnumerateAccountRights` and is freed once.
+        unsafe { LsaFreeMemory(rights.cast()) };
+    } else {
+        // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS`.
+        let win32 = unsafe { LsaNtStatusToWinError(status) };
+        // An account with no rights at all is not found by the policy: it holds none.
+        assert_eq!(win32, ERROR_FILE_NOT_FOUND, "enumerate the rights of the account: NTSTATUS {status:#x}");
+    }
+    // SAFETY: `policy` was opened above and is closed once, after its last use.
+    unsafe { LsaClose(policy) };
+    held
+}
+
+/// Takes the logon right `right` away from the account `sid`, so that a test can show an install grants it again.
+/// A right the account does not hold is done. A failure fails the calling test.
+#[cfg(windows)]
+pub fn revoke_right(sid: &[u8], right: &str) {
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        LSA_UNICODE_STRING, LsaClose, LsaNtStatusToWinError, LsaRemoveAccountRights, POLICY_CREATE_ACCOUNT,
+        POLICY_LOOKUP_NAMES,
+    };
+    use windows_sys::Win32::Security::PSID;
+
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+    let policy = open_policy((POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES) as u32);
+    let mut text: Vec<u16> = right.encode_utf16().collect();
+    let bytes = (text.len() * 2) as u16;
+    let name = LSA_UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: text.as_mut_ptr(),
+    };
+    // SAFETY: `policy` was opened above; `sid` is a SID buffer and `name` points into `text`, both live for the call.
+    let status = unsafe { LsaRemoveAccountRights(policy, sid.as_ptr() as PSID, false, &name, 1) };
+    // SAFETY: `policy` was opened above and is closed once, after its last use.
+    unsafe { LsaClose(policy) };
+    if status != 0 {
+        // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS`.
+        let win32 = unsafe { LsaNtStatusToWinError(status) };
+        assert_eq!(win32, ERROR_FILE_NOT_FOUND, "remove {right}: NTSTATUS {status:#x}");
+    }
+}
+
+/// The local security policy opened for `access`. A failure fails the calling test.
+#[cfg(windows)]
+fn open_policy(access: u32) -> isize {
+    use windows_sys::Win32::Security::Authentication::Identity::{LSA_OBJECT_ATTRIBUTES, LsaOpenPolicy};
+
+    let mut policy: isize = 0;
+    let attributes = LSA_OBJECT_ATTRIBUTES::default();
+    // SAFETY: `attributes` is a valid, zeroed `LSA_OBJECT_ATTRIBUTES`; a null system name is the local one.
+    let status = unsafe { LsaOpenPolicy(std::ptr::null(), &attributes, access, &mut policy) };
+    assert_eq!(status, 0, "open the local security policy: NTSTATUS {status:#x}");
+    policy
+}
+
 /// When Task Scheduler itself says the task `id` runs between `from` and `to`: its `GetRunTimes`, the
 /// oracle the schedule tests compare the cron they translated with.
 #[cfg(windows)]

@@ -79,8 +79,7 @@ pub(super) fn password_of(
 }
 
 /// The record directory of task `id` under `program_data`, with the folders above it seen to
-/// ([`Runs::ensure_roots`], which `folders` judges). The only place the folders are seen to, for a write
-/// and for an install that finds the task up to date alike.
+/// ([`Runs::ensure_roots`], which `folders` judges).
 fn runs_in(program_data: &Path, id: &Id, folders: &FolderCheck) -> Result<Runs> {
     let runs = Runs::of(program_data, id);
     runs.ensure_roots(folders)?;
@@ -96,7 +95,7 @@ fn runs_for_write(id: &Id) -> Result<Runs> {
 
 /// What an install of a task needs of the machine before it writes anything. For a real user: the
 /// account is refused unless it is a user (the right would reach every account in a group), the
-/// password is read (as `reads` says), and `SeBatchLogonRight` is granted to the SID that check found (without
+/// password is read, and `SeBatchLogonRight` is granted to the SID that check found (without
 /// it a first start starts nothing and raises nothing). For every account, the `Goetia` event source, which
 /// the shim logs to and which only an elevated process can register.
 pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>, reads: Password) -> Result<Prepared> {
@@ -188,9 +187,8 @@ impl Scm {
     /// registered again ([`Self::task_register_again`]): disabled, refused while the old one runs (its
     /// shim still writes its record), then, with the record directory made to name the old account and the
     /// new one, the registration alone is deleted (its records stay) and created with the armed state it
-    /// had, and the directory then names the new account alone ([`landed`]). A failure between the delete and the
-    /// create leaves nothing at the id, which an install that runs again creates (disarmed: `enable`
-    /// arms it).
+    /// had. A failure between the delete and the create leaves nothing at the id, which an install that runs
+    /// again creates (disarmed: `enable` arms it).
     pub(super) fn task_write_with<P: Processes>(
         &self,
         spec: &DaemonSpec,
@@ -273,7 +271,7 @@ impl Scm {
         let id = old.id();
         self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
         // The task is registered as the old account until the create lands, so its records and its log name it
-        // too ([`landed`] narrows them).
+        // too.
         let registered = stored_principal(old.registered());
         let kept = Kept::both(registered.as_slice());
         task_records(id, runs, &prepared.principal, &kept)?;
@@ -348,7 +346,7 @@ fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
     })
 }
 
-/// How the error of [`run_records`] speaks of `accounts`, an account named twice counted once.
+/// "its account" or "its accounts", counting duplicates once.
 fn whose(accounts: &[Sid]) -> &'static str {
     if distinct(accounts).len() == 1 {
         "its account"
@@ -358,9 +356,7 @@ fn whose(accounts: &[Sid]) -> &'static str {
 }
 
 /// The accounts besides the task's own that the record directory and the default log name until a write that
-/// changes the account lands ([`landed`] follows it): the old task writes its records and its log until the
-/// create replaces it. The default log is the one the shim opens and never makes, so a kept account may append
-/// to it.
+/// changes the account lands ([`landed`]): the old task keeps writing both until the create replaces it.
 #[derive(Default)]
 struct Kept<'a> {
     /// Those the record directory names.
@@ -379,9 +375,8 @@ impl<'a> Kept<'a> {
     }
 }
 
-/// What a write of a task makes besides its registration, and what an install that finds the task up to date
-/// makes again if it is gone ([`task_beside_with`]): [`run_records`] for `principal`, the account the task runs
-/// as, and what `kept` names; and the default log of `id`, which `principal` and `kept` may append to. Nothing is
+/// What a write of a task makes besides its registration, and what an up-to-date install makes again
+/// ([`task_beside_with`]): the record directory and the default log, naming `principal` and `kept`. Nothing is
 /// read back.
 fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept: &Kept<'_>) -> Result<()> {
     run_records(id, runs, &[kept.runs, std::slice::from_ref(principal)].concat())?;
@@ -389,13 +384,9 @@ fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept: &Kept<'_>) -> Resul
     default_log::ensure(runs.program_data(), id, &Naming::alike(&accounts)).map(drop)
 }
 
-/// Once a registration that changed the account, or a service into a task, has landed (`wrote` is
-/// [`WriteOutcome::Done`]), the record directory and the default log name the new account alone. The directory is
-/// set only if `kept` named an account in it: a change of account did, and a service changed into a task did not
-/// (the service never wrote there), nor did a change from a stored principal that cannot be told
-/// (`Kept::both(&[])`): [`task_records`] already named the task's account alone in the directory. The log is always
-/// set: it named the service's account too. Any other end leaves what was widened naming both, which the next
-/// install corrects: it is the one that finds the task as it is ([`task_beside_with`] for an up-to-date one).
+/// Once a registration that changed the account, or a service into a task, has landed ([`WriteOutcome::Done`]),
+/// the record directory (if `kept` widened it) and the default log name the new account alone. Any other end leaves
+/// both named; the next install corrects it ([`task_beside_with`]).
 fn landed(id: &Id, runs: &Runs, prepared: &Prepared, kept: &Kept<'_>, wrote: WriteOutcome) -> Result<WriteOutcome> {
     if matches!(wrote, WriteOutcome::Done) {
         let alone = std::slice::from_ref(&prepared.principal);
@@ -434,7 +425,7 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
 
 /// What an install that finds the task `installed` up to date makes again if it is gone ([`task_beside_with`]),
 /// under the machine's `%ProgramData%`: the folders above the record directory are always judged, as a write
-/// does ([`runs_for_write`]). `spec` and `definition` are what the install writes, which names the account.
+/// does ([`runs_for_write`]).
 pub(in crate::backend::scm) fn task_beside(
     spec: &DaemonSpec,
     definition: &TaskXml,
@@ -452,12 +443,12 @@ pub(in crate::backend::scm) fn task_beside(
 
 /// What a write of the task `installed` makes besides its registration, made again: the folders above the record
 /// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for the account
-/// `definition` registers, written as `spec` writes it (`prepare`, as a write's, asked once and with
-/// [`Password::Unneeded`]: the event source and a real user's logon right, but no password, for the task is not
-/// registered again), the record directory with the marker a dead uninstall left cleared ([`Runs::ensure`]), and
-/// the default log, which the shim only opens ([`task_records`]). They name the account `prepare` found alone: an
-/// install that was cut short between its steps left both accounts named, and this is the install that corrects
-/// it. Moving the task to another account is a write's job, which finds the task registered as another.
+/// `definition` registers (`prepare`, with [`Password::Unneeded`]: the event source and a real user's logon right,
+/// but no password, for the task is not registered again), the record directory with the marker a dead uninstall
+/// left cleared ([`Runs::ensure`]), and the default log ([`task_records`]). They name the account `prepare` found
+/// alone. The record directory is not made by `runs_in`, but the folders above it may be; a refusal there comes
+/// before anything the account needs (the logon right, the event source, the records, the log). Moving the task to
+/// another account is a write's job, which finds the task registered as another.
 fn task_beside_with(
     program_data: &Path,
     folders: &FolderCheck,

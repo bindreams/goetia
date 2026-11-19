@@ -250,8 +250,7 @@ impl Runs {
     /// `principals`, the accounts the task runs as (more than one only while it changes from one account
     /// to another); or, when it is there, sets its permissions to name them
     /// ([`Descriptor::set_dacl_of`]: the directory alone, never what is in it). Call it on every write of
-    /// the task, so that a reinstall that changes the account can still write, and on an install that
-    /// finds the task up to date, so that a directory that is gone is made again.
+    /// the task, so that a reinstall that changes the account can still write.
     ///
     /// A directory that is there and is a link (the account can make one: see the module's note) is
     /// refused ([`io::ErrorKind::NotADirectory`]) and nothing is written to what it points to; the

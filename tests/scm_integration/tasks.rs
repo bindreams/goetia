@@ -14,7 +14,7 @@ use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 use goetia::testing::{remove_task, service_fields};
 
 use crate::common::conformance_mk;
-use crate::managed::UNIT_DIR_EXCLUSIVE;
+use crate::managed::{EventSourceChanged, UNIT_DIR_EXCLUSIVE};
 use crate::support::sentinel::{PRINT_AND_EXIT, RUN_UNTIL_KILLED};
 use crate::support::windows_tasks::{EndsTheRunOnPanic, ProcessHandle, task_spec};
 use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
@@ -122,6 +122,21 @@ fn an_up_to_date_install_of_a_task_makes_its_run_records_again(#[fixture(scm_gro
     assert!(matches!(again, Outcome::UpToDate), "{again:?}");
     assert!(records.is_dir(), "the install made {} again", records.display());
     assert!(!marker.exists(), "and took away {}", marker.display());
+}
+
+/// An install that finds a task up to date still registers the `Goetia` event source, restoring a changed or
+/// missing key. Serial: every install writes that key.
+#[skuld::test(serial)]
+fn an_up_to_date_install_of_a_task_registers_the_event_source_again(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let mgr = support::stock_shim_manager();
+    let spec = task_as(&guard.id, User::Root, Some(SCHEDULE));
+    mgr.install(&spec, false).expect("install");
+
+    EventSourceChanged::capture().assert_made_again_by(|| {
+        let again = mgr.install(&spec, false).expect("install again");
+        assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    });
 }
 
 /// A `logs:` in goetia's log folder is refused at a task's install, as at a service's

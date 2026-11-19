@@ -738,13 +738,8 @@ impl Backend for Scm {
         }
     }
 
-    /// What a write makes besides the definition, made again where an install finds the daemon up to date.
-    /// A service is seen to as a write of it is, except for its registration and password ([`service_gate`]):
-    /// the `Goetia` event source, a real user's logon right, and the default log of one that runs the shim
-    /// host, which the shim only opens: where it is gone (deleted, or its folder was), this makes it again,
-    /// which is what the shim's own message for a link or a missing log says to do. The account is the
-    /// one the definition registers, which is the one installed. A task likewise ([`task_beside`]), and also
-    /// the folders and the record directory (with a marker a dead uninstall left cleared).
+    /// A service: the event source, a real user's logon right ([`service_gate`], no password) and, if it runs
+    /// the shim host, its default log. A task: [`task_beside`]. The account is the one the definition registers.
     fn ensure_beside(
         &self,
         spec: &DaemonSpec,
@@ -1250,18 +1245,17 @@ struct Gated {
     checked: Option<Sid>,
 }
 
-/// Whether what an install sees to for an account reads the password of a real user.
+/// Whether `prepare`/`service_gate` read a real user's password: `Read` before a registration, `Unneeded` when
+/// the daemon is already registered.
 #[derive(Clone, Copy)]
 enum Password {
-    /// The daemon is about to be registered, which a real user's needs the password for.
     Read,
-    /// The daemon is registered already and is not registered again.
     Unneeded,
 }
 
 /// What a service of `reg` needs before it is written, which a change of a task into a service sees to
-/// before it removes the task: the account is a user and its right is granted, the password is read
-/// (as `reads` says), and the event source is registered. See [`apply`].
+/// before it removes the task: the account is a user and its right is granted, the password is read,
+/// and the event source is registered. See [`apply`].
 fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads: Password) -> Result<Gated> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in

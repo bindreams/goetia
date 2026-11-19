@@ -119,8 +119,7 @@ mod system {
 
         /// The permissions of a task's run-record directory: Administrators own it; SYSTEM and
         /// Administrators have full control of it and of what is made in it; each of `principals`, the accounts the
-        /// task runs as (more than one only while it changes from one to another), may read, write, run and delete
-        /// the files made in it (`0x1300af`: not change
+        /// task runs as, may read, write, run and delete the files made in it (`0x1300af`: not change
         /// permissions or take ownership, and not set attributes or extended attributes, `0x110`; an
         /// entry only files inherit) and has, on the directory itself, the same without adding a
         /// subdirectory (`0x4`) and without deleting the directory (`DELETE`, `0x10000`), and with
@@ -133,8 +132,10 @@ mod system {
         /// directory and the files the account did not create.** A file the account creates is granted
         /// what its creating open asks for, whatever the masks say (there is no entry to check yet), so
         /// the handle of that open is as capable as the open asked it to be; goetia's own creating opens
-        /// ask for what they use. A SID that is not whole is an error.
+        /// ask for what they use. A SID that is not whole is an error. `principals` is not empty: no account could
+        /// write the records.
         pub(crate) fn for_runs(principals: &[Sid]) -> Result<Self> {
+            debug_assert!(!principals.is_empty(), "a record directory names the account that writes to it");
             let mut sddl = String::from("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
             for principal in principals {
                 let principal = sid_text(principal, "a run-record directory")?;
