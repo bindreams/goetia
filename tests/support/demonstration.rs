@@ -6,7 +6,6 @@
 //! its last result and next run through `status`, and is removed by `uninstall`. A platform's test owns
 //! the order of those steps and how `next-run` is judged there; this module owns writing and reading.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
@@ -14,7 +13,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::cmd::Run;
+use super::cmd::{Run, try_run_command};
 use super::list_json;
 
 /// A POSIX `TZ` that `jiff` reads on every platform: five and a half hours ahead of UTC, in no zone database.
@@ -26,17 +25,16 @@ pub const ZONE_OFFSET: &str = "+05:30";
 
 /// The `goetia.yaml` of one task, in a temporary directory that is removed when this is dropped.
 ///
-/// Written through `yaml_serde`, so the YAML quoting of `* * * * *` is the library's. Every string it writes
-/// has `$` doubled to `$$`: `command` is interpolated and every `$` that is not `${...}` or `$$` is an error
-/// (the README's "Syntax"), and the scripts the tests run use `$(...)`, `$((...))` and `$n`. The library
-/// knows nothing of interpolation, and interpolation nothing of YAML.
+/// Written through `yaml_serde`, so the YAML quoting of `* * * * *` is the library's. Every field that is
+/// interpolated has `$` doubled to `$$`: every `$` that is not `${...}` or `$$` is an error (the README's
+/// "Interpolation"), and the scripts the tests run use `$(...)`, `$((...))` and `$n`. `id` is not
+/// interpolated, so it is written as it is. The library knows nothing of interpolation, and interpolation
+/// nothing of YAML.
 pub struct Manifest {
     pub id: String,
     pub command: Vec<String>,
     pub schedule: String,
     pub logs: Option<PathBuf>,
-    pub user: Option<String>,
-    pub env: BTreeMap<String, String>,
     dir: tempfile::TempDir,
 }
 
@@ -49,10 +47,6 @@ struct Document {
     schedule: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     logs: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    env: BTreeMap<String, String>,
 }
 
 /// `text` as a manifest string: a literal `$` is written `$$`.
@@ -67,8 +61,6 @@ impl Manifest {
             command,
             schedule: schedule.to_string(),
             logs: None,
-            user: None,
-            env: BTreeMap::new(),
             dir: tempfile::tempdir().expect("a manifest directory"),
         }
     }
@@ -81,17 +73,11 @@ impl Manifest {
     /// `goetia.yaml`, as the fields stand now. Call again after changing a field: the file is replaced.
     pub fn write(&self) -> &Path {
         let document = Document {
-            id: literal(&self.id),
+            id: self.id.clone(),
             kind: "task",
             command: self.command.iter().map(|arg| literal(arg)).collect(),
             schedule: literal(&self.schedule),
             logs: self.logs.as_ref().map(|path| literal(&path.display().to_string())),
-            user: self.user.as_deref().map(literal),
-            env: self
-                .env
-                .iter()
-                .map(|(name, value)| (literal(name), literal(value)))
-                .collect(),
         };
         let yaml = yaml_serde::to_string(&document).expect("a manifest serializes");
         std::fs::write(self.dir.path().join("goetia.yaml"), yaml).expect("write goetia.yaml");
@@ -116,27 +102,24 @@ impl Cli {
         Cli { zone: Some(zone) }
     }
 
-    /// The child's whole output.
-    pub fn output(&self, args: &[&str]) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_goetia"));
         command.args(args);
         if let Some(zone) = self.zone {
             command.env("TZ", zone);
         }
         command
+    }
+
+    /// The child's whole output.
+    pub fn output(&self, args: &[&str]) -> Output {
+        self.command(args)
             .output()
             .unwrap_or_else(|e| panic!("spawn goetia {args:?}: {e}"))
     }
 
     pub fn run(&self, args: &[&str]) -> Run {
-        let output = self.output(args);
-        Run {
-            program: "goetia".to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }
+        try_run_command(&mut self.command(args)).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// `goetia daemon <args>`, which must exit 0.
@@ -192,11 +175,12 @@ impl Cli {
 
 // The document ========================================================================================================
 
-/// Whether a field of a task's entry holds a value.
+/// Whether a field of a task's entry holds a value. `Any` is for a field the step cannot know: it is not judged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Time {
     Present,
     Null,
+    Any,
 }
 
 /// What `last-result` holds.
@@ -230,9 +214,17 @@ pub fn assert_task_fields(entry: &Value, id: &str, expect: Expect) {
         Some(_) => Time::Present,
         None => panic!("`{key}` is never absent: {entry}"),
     };
-    assert_eq!(presence("pid"), expect.pid, "pid: {entry}");
-    assert_eq!(presence("last-run"), expect.last_run, "last-run: {entry}");
-    assert_eq!(presence("next-run"), expect.next_run, "next-run: {entry}");
+    for (key, want) in [
+        ("pid", expect.pid),
+        ("last-run", expect.last_run),
+        ("next-run", expect.next_run),
+    ] {
+        let got = presence(key);
+        assert!(
+            want == Time::Any || got == want,
+            "{key} is {got:?}, not {want:?}: {entry}"
+        );
+    }
     match expect.last_result {
         LastResult::Null => assert_eq!(entry["last-result"], Value::Null, "{entry}"),
         LastResult::Code(code) => assert_eq!(entry["last-result"], serde_json::json!({ "code": code }), "{entry}"),
@@ -247,13 +239,18 @@ pub fn assert_task_fields(entry: &Value, id: &str, expect: Expect) {
 /// The instant an RFC 3339 `text` names. Panics on text that is not RFC 3339 with an offset.
 #[track_caller]
 pub fn instant(text: &str) -> SystemTime {
-    assert!(
-        text.ends_with('Z') || text[text.len().saturating_sub(6)..].starts_with(['+', '-']),
-        "`{text}` carries no offset"
-    );
     text.parse::<jiff::Timestamp>()
         .unwrap_or_else(|e| panic!("`{text}` is not RFC 3339: {e}"))
         .into()
+}
+
+/// The state of a status text line (`id: state (task, ...)`).
+#[track_caller]
+pub fn text_state(line: &str) -> &str {
+    line.split_once(": ")
+        .and_then(|(_, rest)| rest.split_once(" ("))
+        .map(|(state, _)| state)
+        .unwrap_or_else(|| panic!("`{line}` is not a status line"))
 }
 
 /// The value of the key `key` of a status text line (`id: state (task, enabled=true, ..., key=value, ...)`),

@@ -7,36 +7,40 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use goetia::backend::systemd::manager::Systemd;
 use serde_json::Value;
 
-use crate::linux::{timer_path, timer_wants_symlink, unit_path};
+use crate::linux::{UNIT_DIR_EXCLUSIVE, timer_path, timer_wants_symlink, unit_path};
 use crate::support::cron_oracle::assert_next_run_time;
 use crate::support::demonstration::{
-    Cli, Expect, LastResult, Manifest, Time, ZONE, ZONE_OFFSET, assert_task_fields, instant, text_field,
+    Cli, Expect, LastResult, Manifest, Time, ZONE, ZONE_OFFSET, assert_task_fields, instant, text_field, text_state,
 };
-use crate::support::tasks::{Held, id_of, sh};
-use crate::support::{self, Group, ServiceGuard, kill, systemd_group};
+use crate::support::tasks::{Held, id_of, sh, status_with_result};
+use crate::support::{self, Group, ServiceGuard, systemd_group};
 
 const SCHEDULE: &str = "* * * * *";
 
-/// The task's entry, once its newest run has a result.
-fn status_once_it_has_a_result(cli: &Cli, id: &str) -> Value {
-    let mut found = Value::Null;
-    kill::until(|| {
-        found = cli.status_json(id);
-        !found["last-result"].is_null()
-    });
-    found
+/// What one form of the task's status reported, read with the child's `TZ` set to [`ZONE`]. A time is
+/// `None` where the form shows none (the text form writes `-`).
+struct Read {
+    form: &'static str,
+    state: String,
+    last_run: Option<String>,
+    next_run: Option<String>,
 }
 
-/// Every form that prints a task's times prints them at the offset of the child's `TZ`, and the instants
-/// are the ones the backend knows: `next-run` is a minute the cron names, and `last-run` is in the minute
-/// `scheduled` names (given where the task has a `last_run`). `last_run` and `next_run` say which of the two the
-/// task has at this step. Returns the `status --json` entry. CI hosts run in UTC, so this is the one place a
-/// caller of the system zone is seen not to pass UTC.
-fn read_times_in_the_zone(id: &str, scheduled: Option<SystemTime>, last_run: Time, next_run: Time) -> Value {
+/// The three forms that print a task's times, read one after another, and the clock around them.
+struct Zoned {
+    json: Value,
+    reads: Vec<Read>,
+    before: SystemTime,
+    after: SystemTime,
+}
+
+/// Reads the task through `status --json`, `status` and `list --json`, each at the offset of the child's
+/// `TZ`. CI hosts run in UTC, so this is the one place a caller of the system zone is seen not to pass UTC.
+fn read_in_the_zone(id: &str) -> Zoned {
     let zoned = Cli::in_zone(ZONE);
-    let task_id = id_of(id);
 
     let before = SystemTime::now();
     let json = zoned.status_json(id);
@@ -47,41 +51,123 @@ fn read_times_in_the_zone(id: &str, scheduled: Option<SystemTime>, last_run: Tim
     // The text form writes `-` for a time it has none of.
     let field = |entry: &Value, key: &str| entry[key].as_str().map(str::to_string);
     let word = |key: &str| Some(text_field(&text, key).to_string()).filter(|word| word != "-");
-    let forms = [
-        ("status --json", field(&json, "last-run"), field(&json, "next-run")),
-        ("status", word("last-run"), word("next-run")),
-        ("list --json", field(&listed, "last-run"), field(&listed, "next-run")),
+    let reads = vec![
+        Read {
+            form: "status --json",
+            state: json["state"].as_str().expect("a state").to_string(),
+            last_run: field(&json, "last-run"),
+            next_run: field(&json, "next-run"),
+        },
+        Read {
+            form: "status",
+            state: text_state(&text).to_string(),
+            last_run: word("last-run"),
+            next_run: word("next-run"),
+        },
+        Read {
+            form: "list --json",
+            state: listed["state"].as_str().expect("a state").to_string(),
+            last_run: field(&listed, "last-run"),
+            next_run: field(&listed, "next-run"),
+        },
     ];
-    for (form, shown_last_run, shown_next_run) in forms {
-        assert_eq!(
-            shown_last_run.is_some(),
-            last_run == Time::Present,
-            "{form}: {json} / {text} / {listed}"
-        );
-        assert_eq!(
-            shown_next_run.is_some(),
-            next_run == Time::Present,
-            "{form}: {json} / {text} / {listed}"
-        );
-        for time in shown_last_run.iter().chain(&shown_next_run) {
-            assert!(time.ends_with(ZONE_OFFSET), "{form}: `{time}` is not at {ZONE_OFFSET}");
-        }
-        if let Some(time) = shown_last_run {
-            let fired = instant(&time);
-            let scheduled = scheduled.expect("a task with a last run has a scheduled minute");
-            assert!(
-                fired >= scheduled && fired < scheduled + Duration::from_secs(60),
-                "{form}: last-run {fired:?} is not in the minute of {scheduled:?}"
-            );
-        }
-        if let Some(time) = shown_next_run {
-            assert_next_run_time(Some(instant(&time)), SCHEDULE, &task_id, before, after);
-        }
+    Zoned {
+        json,
+        reads,
+        before,
+        after,
     }
-    json
 }
 
-#[skuld::test]
+impl Zoned {
+    /// Every `next-run` shown is at the offset of `TZ` and is a minute the cron names. Returns the
+    /// first one shown.
+    fn judge_next_runs(&self, id: &str) -> Option<SystemTime> {
+        let task_id = id_of(id);
+        let mut first = None;
+        for read in &self.reads {
+            if let Some(time) = &read.next_run {
+                assert!(
+                    time.ends_with(ZONE_OFFSET),
+                    "{}: `{time}` is not at {ZONE_OFFSET}",
+                    read.form
+                );
+                let next = instant(time);
+                assert_next_run_time(Some(next), SCHEDULE, &task_id, self.before, self.after);
+                first.get_or_insert(next);
+            }
+        }
+        first
+    }
+
+    /// Every form shows a `last-run`, at the offset of `TZ`, in `[from, to)`.
+    fn judge_last_runs(&self, from: SystemTime, to: SystemTime) {
+        for read in &self.reads {
+            let time = read
+                .last_run
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: a finished run has a last-run: {}", read.form, self.json));
+            assert!(
+                time.ends_with(ZONE_OFFSET),
+                "{}: `{time}` is not at {ZONE_OFFSET}",
+                read.form
+            );
+            let fired = instant(time);
+            assert!(
+                fired >= from && fired < to,
+                "{}: last-run {fired:?} is not in [{from:?}, {to:?})",
+                read.form
+            );
+        }
+    }
+}
+
+/// `* * * * *` fires at the next minute, which may land before or after the reads that follow `enable`.
+/// Each read is judged by the state it reports: `idle` is armed (a next run, no last run); `running` is
+/// the held first run in flight, where systemd has no next run and `last-run` is not yet known to be
+/// readable. The reads need not agree on the state.
+fn judge_armed_or_running(zoned: &Zoned) {
+    for read in &zoned.reads {
+        match read.state.as_str() {
+            "idle" => {
+                assert!(
+                    read.next_run.is_some(),
+                    "{}: idle and armed has a next-run: {}",
+                    read.form,
+                    zoned.json
+                );
+                assert!(
+                    read.last_run.is_none(),
+                    "{}: no run has begun: {}",
+                    read.form,
+                    zoned.json
+                );
+            }
+            "running" => assert!(
+                read.next_run.is_none(),
+                "{}: a task in flight has no next-run: {}",
+                read.form,
+                zoned.json
+            ),
+            other => panic!("{}: `{other}` is neither idle nor running: {}", read.form, zoned.json),
+        }
+    }
+    let in_flight = zoned.json["state"] == "running";
+    assert_task_fields(
+        &zoned.json,
+        zoned.json["id"].as_str().expect("an id"),
+        Expect {
+            state: if in_flight { "running" } else { "idle" },
+            enabled: true,
+            pid: if in_flight { Time::Present } else { Time::Null },
+            last_result: LastResult::Null,
+            last_run: if in_flight { Time::Any } else { Time::Null },
+            next_run: if in_flight { Time::Null } else { Time::Present },
+        },
+    );
+}
+
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -104,26 +190,18 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
         },
     );
 
-    // 2. Enabled, it has a next run, the minute the cron names, in every form and at the offset of `TZ`.
+    // 2. Enabled, it is armed with a next run, the minute the cron names, in every form and at the offset
+    // of `TZ`; or, where the first minute came first, its held first run is in flight.
+    let enabled_at = SystemTime::now();
     cli.daemon(&["enable", &id]);
-    let armed = read_times_in_the_zone(&id, None, Time::Null, Time::Present);
-    assert_task_fields(
-        &armed,
-        &id,
-        Expect {
-            state: "idle",
-            enabled: true,
-            pid: Time::Null,
-            last_result: LastResult::Null,
-            last_run: Time::Null,
-            next_run: Time::Present,
-        },
-    );
-    let scheduled = instant(armed["next-run"].as_str().expect("a next run"));
+    let armed = read_in_the_zone(&id);
+    judge_armed_or_running(&armed);
+    let scheduled = armed.judge_next_runs(&id);
 
     // 3. The schedule fires with nothing started by the test: the program announces itself. systemd has no
-    // next run for a timer whose service is running. The run is held, so any later fire is dropped by the
-    // manager, and the schedule is disarmed while it is.
+    // next run for a timer whose service is running, and the run is held, so any later fire is dropped by
+    // the manager. `last-run` is not asserted while the run is in flight: journald need not have the
+    // `Starting` entry it comes from yet.
     held.wait_started();
     assert_task_fields(
         &cli.status_json(&id),
@@ -133,16 +211,16 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
             enabled: true,
             pid: Time::Present,
             last_result: LastResult::Null,
-            last_run: Time::Present,
+            last_run: Time::Any,
             next_run: Time::Null,
         },
     );
-    read_times_in_the_zone(&id, Some(scheduled), Time::Present, Time::Null);
     cli.daemon(&["disable", &id]);
     held.release();
-    let finished = status_once_it_has_a_result(&cli, &id);
+    status_with_result(&Systemd::new(), &id_of(&id));
+    let finished = read_in_the_zone(&id);
     assert_task_fields(
-        &finished,
+        &finished.json,
         &id,
         Expect {
             state: "idle",
@@ -153,11 +231,16 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
             next_run: Time::Null,
         },
     );
-    let fired = instant(finished["last-run"].as_str().expect("a last run"));
-    assert!(
-        fired >= scheduled && fired < scheduled + Duration::from_secs(60),
-        "last-run {fired:?} is not in the minute of {scheduled:?}"
-    );
+    for read in &finished.reads {
+        assert_eq!(read.state, "idle", "{}: {}", read.form, finished.json);
+        assert!(read.next_run.is_none(), "{}: {}", read.form, finished.json);
+    }
+    // The run began in the minute `scheduled` names; where the reads after `enable` met it in flight, in
+    // some minute after `enable`.
+    match scheduled {
+        Some(minute) => finished.judge_last_runs(minute, minute + Duration::from_secs(60)),
+        None => finished.judge_last_runs(enabled_at, finished.after),
+    }
 
     // 4. `run` shows the output and exits with the run's result. The same id, installed again with another
     // command: a disarmed task is replaced.
