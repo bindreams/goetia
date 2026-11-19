@@ -2697,7 +2697,9 @@ fn status_json_with_no_ids_equals_list_json_with_a_task_installed() {
     let task = &daemons(&doc)[1];
     assert_eq!(task["last-result"], serde_json::json!({"code": 3}));
     for (key, seconds) in [("last-run", 1_768_478_400), ("next-run", 1_768_478_460)] {
-        let text = task[key].as_str().unwrap_or_else(|| panic!("`{key}` is a string: {task}"));
+        let text = task[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{key}` is a string: {task}"));
         let parsed: jiff::Timestamp = text.parse().unwrap_or_else(|e| panic!("`{key}` = {text}: {e}"));
         assert_eq!(parsed.as_second(), seconds, "{key}");
     }

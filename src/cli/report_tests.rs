@@ -551,7 +551,11 @@ fn a_time_is_null_outside_rfc_3339s_years_and_jiffs_range() {
     ];
     for (instant, zone, expected) in cases {
         match system_time(instant) {
-            Some(time) => assert_eq!(last_run(time, zone), expected.map_or(null.clone(), serde_json::Value::from), "{instant}"),
+            Some(time) => assert_eq!(
+                last_run(time, zone),
+                expected.map_or(null.clone(), serde_json::Value::from),
+                "{instant}"
+            ),
             None => assert!(cfg!(windows), "only Windows' SystemTime lacks {instant}"),
         }
     }
