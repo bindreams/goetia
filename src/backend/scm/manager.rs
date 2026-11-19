@@ -752,9 +752,13 @@ impl Backend for Scm {
             }
             (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => {
                 let made = task_default_log(installed)?;
-                default_log::tell_if_made_while_running(&program_data()?, installed.id(), made, || {
-                    Ok(self.task_run_state(installed)? == State::Running)
-                });
+                default_log::tell_if_made_while_running(
+                    &program_data()?,
+                    installed.id(),
+                    spec.common().logs.as_deref(),
+                    made,
+                    || Ok(self.task_run_state(installed)? == State::Running),
+                );
                 Ok(())
             }
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
@@ -1312,8 +1316,9 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
 /// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
 /// account up again), else the one the spec gave as a SID, else the registered name's. `kept` are the accounts
-/// it names beside it, those the service may still run as, at `step` ([`default_log::naming`]): a narrowing asks
-/// SCM whether a start is in progress, which a shim holds its log from before its first status report. Call it once
+/// it names beside it, those the service may still run as, at `step` ([`default_log::naming`]), by how far the
+/// service's run is ([`default_log::Run`]), which SCM is asked once: a shim holds its log from before its first status
+/// report, and reopens by path one that was deleted. Call it once
 /// the service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
 /// update is about to give a service that exists.
 fn make_default_log(
@@ -1330,27 +1335,24 @@ fn make_default_log(
         Some(sid) => sid.clone(),
         None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
     };
-    let starting = step == default_log::Step::Narrow && service_state(&reg.name)? == WinState::StartPending;
-    let (accounts, existing) = default_log::naming(step, starting, kept, &account);
-    let program_data = program_data()?;
     let id = &spec.common().id;
-    let made = default_log::ensure(&program_data, id, &accounts, existing)?;
-    default_log::tell_if_made_while_running(&program_data, id, made, || {
-        Ok(service_state(&reg.name)? != WinState::Stopped)
+    let run = service_run(id)?;
+    let naming = default_log::naming(step, run, kept, &account);
+    let program_data = program_data()?;
+    let made = default_log::ensure(&program_data, id, &naming)?;
+    default_log::tell_if_made_while_running(&program_data, id, spec.common().logs.as_deref(), made, || {
+        Ok(run == default_log::Run::Up)
     });
     Ok(())
 }
 
-/// The state SCM reports for the service `name`.
-fn service_state(name: &str) -> Result<WinState> {
-    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
-    let service = scm
-        .open_service(name, ServiceAccess::QUERY_STATUS)
-        .map_err(|e| to_error(&format!("open service `{name}` to read its state"), e))?;
+/// How far the run of the service `id` is, from the state SCM reports for it.
+fn service_run(id: &Id) -> Result<default_log::Run> {
+    let (_scm, service) = open_existing(id, "query", ServiceAccess::QUERY_STATUS)?;
     service
         .query_status()
-        .map(|status| status.current_state)
-        .map_err(|e| to_error(&format!("query status for `{name}`"), e))
+        .map(|status| default_log::Run::of(status.current_state))
+        .map_err(|e| to_error(&format!("query status for `{id}`"), e))
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it

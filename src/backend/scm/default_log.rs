@@ -14,6 +14,7 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 
+use windows_service::service::ServiceState;
 use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, STATUS_DELETE_PENDING};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -34,12 +35,32 @@ pub(crate) fn path_in(logs: &Path, id: &str) -> PathBuf {
 }
 
 /// What an install does with a log that is already there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Existing {
-    /// Sets its owner and permissions to the ones computed.
-    Set,
-    /// Leaves it as it is. A file that is missing is made all the same.
+    /// Sets its owner and permissions to the ones computed for these accounts.
+    Set(Vec<Sid>),
+    /// Leaves it as it is.
     Keep,
+}
+
+/// The accounts a log names, and what is done with a log that is already there, which a missing one is not: that
+/// is made, for [`Naming::made`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Naming {
+    /// The accounts a file this install makes names.
+    pub made: Vec<Sid>,
+    /// What is done with a file that is there.
+    pub existing: Existing,
+}
+
+impl Naming {
+    /// A file that is made, and one that is there, names `accounts`.
+    pub(crate) fn alike(accounts: &[Sid]) -> Self {
+        Self {
+            made: accounts.to_vec(),
+            existing: Existing::Set(accounts.to_vec()),
+        }
+    }
 }
 
 /// What [`ensure`] did to the file.
@@ -62,42 +83,69 @@ pub(crate) enum Step {
     Narrow,
 }
 
-/// The accounts a log names, and what is done with the file there, at `step` for the new account `new` and the
-/// accounts `kept` (those the service ran as before the change). `starting` is whether SCM reports the service
-/// `START_PENDING`: its shim may have been launched as a kept account and has not yet opened the log, which it
-/// does before it registers the control handler, so the first status it reports says it has. Any other state means
-/// that run's shim holds the log, or that there is none, and a start after the change runs as `new`. The file is
-/// therefore not rewritten while a start is in progress, and one that has to be made names the kept accounts too.
-pub(crate) fn naming(step: Step, starting: bool, kept: &[Sid], new: &Sid) -> (Vec<Sid>, Existing) {
-    let with_kept = || [kept, std::slice::from_ref(new)].concat();
-    match (step, starting) {
-        (Step::Widen, _) => (with_kept(), Existing::Set),
-        (Step::Narrow, false) => (vec![new.clone()], Existing::Set),
-        (Step::Narrow, true) => (with_kept(), Existing::Keep),
+/// How far a service's run is, from the state SCM reports for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Run {
+    /// None. A start after the install runs as the account it names.
+    Stopped,
+    /// `START_PENDING`: a shim launched as a kept account may not yet hold its log, which it does before it
+    /// registers the control handler, so the first status it reports says it has.
+    Starting,
+    /// Past its start: the shim holds the log it opened, and reopens by path, as its own account, one that was
+    /// made in its place.
+    Up,
+}
+
+impl Run {
+    pub(crate) fn of(state: ServiceState) -> Self {
+        match state {
+            ServiceState::Stopped => Self::Stopped,
+            ServiceState::StartPending => Self::Starting,
+            ServiceState::Running
+            | ServiceState::StopPending
+            | ServiceState::ContinuePending
+            | ServiceState::PausePending
+            | ServiceState::Paused => Self::Up,
+        }
     }
 }
 
-/// Makes the default log of `id` under `program_data` empty, or, as `existing` says, sets the owner and the
-/// permissions of the one there, to those of [`Descriptor::for_default_log`] for `accounts`: the accounts the
-/// daemon's shim runs as, or may run as until a change lands. The permissions are computed from `accounts` and
+/// What a log names, and what is done with the one there, at `step` for the new account `new` and the accounts
+/// `kept` (those the service ran as before the change), while the service's run is `run`. A file is not rewritten
+/// while a start is in progress, and one that has to be made names the kept accounts too. A file made under an up
+/// run names them as well, since that run's shim, which holds the file that was there, reopens the path as its own
+/// account if it was deleted; the one there is narrowed, as that shim holds it.
+pub(crate) fn naming(step: Step, run: Run, kept: &[Sid], new: &Sid) -> Naming {
+    let with_kept = || [kept, std::slice::from_ref(new)].concat();
+    match (step, run) {
+        (Step::Widen, _) => Naming::alike(&with_kept()),
+        (Step::Narrow, Run::Stopped) => Naming::alike(std::slice::from_ref(new)),
+        (Step::Narrow, Run::Starting) => Naming {
+            made: with_kept(),
+            existing: Existing::Keep,
+        },
+        (Step::Narrow, Run::Up) => Naming {
+            made: with_kept(),
+            existing: Existing::Set(vec![new.clone()]),
+        },
+    }
+}
+
+/// Makes the default log of `id` under `program_data` empty, or, as `naming` says, sets the owner and the
+/// permissions of the one there, to those of [`Descriptor::for_default_log`]: for the accounts the daemon's shim
+/// runs as, or may run as until a change lands. The permissions are computed from the accounts and
 /// never read back from the file. The file is opened once, without following a link, and its owner and
 /// permissions are set on that handle (a file this open made has them already); a link is refused and nothing is
 /// set on it. What is in the file is kept. The folder is
 /// [`make_goetia_folders`](super::folder::make_goetia_folders)'s, made before: where it is not there this
 /// is an error.
-pub(crate) fn ensure(program_data: &Path, id: &Id, accounts: &[Sid], existing: Existing) -> Result<EnsureOutcome> {
+pub(crate) fn ensure(program_data: &Path, id: &Id, naming: &Naming) -> Result<EnsureOutcome> {
     let path = path_in(&logs_folder(program_data), id.as_str());
-    let mut named: Vec<Sid> = Vec::new();
-    for account in accounts {
-        if !named.contains(account) {
-            named.push(account.clone());
-        }
-    }
-    let permissions = Descriptor::for_default_log(&named)?;
+    let made_for = Descriptor::for_default_log(&distinct(&naming.made))?;
     // Only an elevated token may assign Administrators as the owner, as the open that makes the file does;
     // an unelevated one, which no install is, sets the permissions alone.
     let owner = cosca::elevation::is_elevated();
-    let (file, made) = permissions
+    let (file, made) = made_for
         .open_always_for_dacl(&path, owner)
         .map_err(|e| make_error(&path, e))?;
     if is_link(&file).map_err(|e| Error::os_at("read the type of", &path, e))? {
@@ -106,9 +154,10 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, accounts: &[Sid], existing: E
     if made {
         return Ok(EnsureOutcome::Made);
     }
-    if existing == Existing::Keep {
+    let Existing::Set(accounts) = &naming.existing else {
         return Ok(EnsureOutcome::Kept);
-    }
+    };
+    let permissions = Descriptor::for_default_log(&distinct(accounts))?;
     let set = if owner {
         permissions.set_owner_and_dacl_of(&file)
     } else {
@@ -118,18 +167,31 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, accounts: &[Sid], existing: E
     Ok(EnsureOutcome::Set)
 }
 
-/// What an install says of a default log it made, if a run of the daemon was up: the log it made is not the file
+/// `accounts`, each once.
+fn distinct(accounts: &[Sid]) -> Vec<Sid> {
+    let mut named: Vec<Sid> = Vec::new();
+    for account in accounts {
+        if !named.contains(account) {
+            named.push(account.clone());
+        }
+    }
+    named
+}
+
+/// What an install says of a default log it made, if a run of the daemon was up and its output goes to the default
+/// log (`logs` is the daemon's `logs:`, which names another file where it is set): the log it made is not the file
 /// the run writes. The delete of a file frees its name at once on current NTFS (POSIX semantics) even while a
 /// handle is open on it, so the install made a new file, and the daemon's output goes on into the deleted one until
 /// the daemon is started again. `None` for any other case.
 pub(crate) fn made_while_running(
     program_data: &Path,
     id: &Id,
+    logs: Option<&Path>,
     outcome: EnsureOutcome,
     running: bool,
 ) -> Option<String> {
     let path = path_in(&logs_folder(program_data), id.as_str());
-    (outcome == EnsureOutcome::Made && running).then(|| {
+    (outcome == EnsureOutcome::Made && running && logs.is_none()).then(|| {
         format!(
             "`{id}` was running when its default log {} was made again: its output goes to the deleted log until it \
              is restarted; restart it",
@@ -139,10 +201,11 @@ pub(crate) fn made_while_running(
 }
 
 /// Prints [`made_while_running`] when `outcome` is [`EnsureOutcome::Made`] and `running` (asked only then) says
-/// the daemon is up. A `running` that cannot say is told as running, with why.
+/// the daemon is up past its start. A `running` that cannot say is told as running, with why.
 pub(crate) fn tell_if_made_while_running(
     program_data: &Path,
     id: &Id,
+    logs: Option<&Path>,
     outcome: EnsureOutcome,
     running: impl FnOnce() -> Result<bool>,
 ) {
@@ -156,14 +219,14 @@ pub(crate) fn tell_if_made_while_running(
             format!("could not tell whether it runs ({}); if it does, ", e.report()),
         ),
     };
-    if let Some(said) = made_while_running(program_data, id, outcome, running) {
+    if let Some(said) = made_while_running(program_data, id, logs, outcome, running) {
         eprintln!("warning: {unread}{said}");
     }
 }
 
 /// A deleted log whose handle a daemon still holds keeps its name where the delete is not POSIX (the daemon's
 /// output handle is on the file), and an open answers access denied; the error says to stop the daemon and install
-/// again. A directory at the name is told as one. The status of an open of the name tells either from a permission
+/// again. A directory at the name, and a link, are told as what they are. The status of an open of the name tells either from a permission
 /// that refuses the install: the Win32 error is access denied for all three.
 fn make_error(path: &Path, e: io::Error) -> Error {
     if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
@@ -177,6 +240,7 @@ fn make_error(path: &Path, e: io::Error) -> Error {
                     )),
                 );
             }
+            AtName::Link => return Error::os("use the default log", link_error(path)),
             AtName::DeletePending => {
                 return Error::os(
                     "use the default log",
@@ -194,14 +258,16 @@ fn make_error(path: &Path, e: io::Error) -> Error {
 
 /// What a name that refused an open with access denied is.
 enum AtName {
+    Link,
     Directory,
     DeletePending,
     Other,
 }
 
-/// What is at `path`, from an open of its attributes relative to its folder: the status says `DELETE_PENDING`
-/// where the Win32 error is access denied as for a permission that refuses the open. A folder that cannot be
-/// opened, or any other status, is no answer.
+/// What is at `path`, from an open of its attributes relative to its folder, which does not follow a link
+/// ([`Dir::open_in`]): the status says `DELETE_PENDING` where the Win32 error is access denied as for a permission
+/// that refuses the open. A link to a directory is refused by the install's open as a directory is. A folder that
+/// cannot be opened, or any other status, is no answer.
 fn what_is_at(path: &Path) -> AtName {
     let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
         return AtName::Other;
@@ -211,6 +277,7 @@ fn what_is_at(path: &Path) -> AtName {
     };
     match folder.open_in(name, FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, 0) {
         Err(STATUS_DELETE_PENDING) => AtName::DeletePending,
+        Ok(file) if is_link(&file).unwrap_or(false) => AtName::Link,
         Ok(file) if file.metadata().is_ok_and(|metadata| metadata.is_dir()) => AtName::Directory,
         Ok(_) | Err(_) => AtName::Other,
     }

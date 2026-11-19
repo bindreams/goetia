@@ -14,7 +14,7 @@ use super::api::{Registered, Registration};
 use super::live::Liveness;
 use super::verbs::{Processes, System, gone};
 use super::{TaskApi, TaskPath, TaskSnapshot};
-use crate::backend::scm::default_log::{self, EnsureOutcome, Existing, Step};
+use crate::backend::scm::default_log::{self, EnsureOutcome, Naming, Step};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
@@ -195,10 +195,16 @@ impl Scm {
         match changed {
             None => {
                 let made = task_records(id, runs, &prepared, &[])?;
-                default_log::tell_if_made_while_running(runs.program_data(), id, made, || match snapshot {
-                    Some(old) => Ok(self.task_state_with(old, |pid| processes.alive(pid))? == State::Running),
-                    None => Ok(false),
-                });
+                default_log::tell_if_made_while_running(
+                    runs.program_data(),
+                    id,
+                    spec.common().logs.as_deref(),
+                    made,
+                    || match snapshot {
+                        Some(old) => Ok(self.task_state_with(old, |pid| processes.alive(pid))? == State::Running),
+                        None => Ok(false),
+                    },
+                );
                 self.task_register(
                     id,
                     definition,
@@ -341,7 +347,7 @@ fn run_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
 fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, kept: &[Sid]) -> Result<EnsureOutcome> {
     run_records(id, runs, prepared)?;
     let accounts = [kept, std::slice::from_ref(&prepared.principal)].concat();
-    default_log::ensure(runs.program_data(), id, &accounts, Existing::Set)
+    default_log::ensure(runs.program_data(), id, &Naming::alike(&accounts))
 }
 
 /// Once a registration that changed the account, or a service into a task, has landed (`wrote` is
@@ -352,8 +358,7 @@ fn landed(id: &Id, runs: &Runs, prepared: &Prepared, wrote: WriteOutcome) -> Res
         default_log::ensure(
             runs.program_data(),
             id,
-            std::slice::from_ref(&prepared.principal),
-            Existing::Set,
+            &Naming::alike(std::slice::from_ref(&prepared.principal)),
         )?;
     }
     Ok(wrote)
@@ -388,7 +393,7 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
 /// the task up to date makes again if it is gone, since the shim makes none.
 pub(in crate::backend::scm) fn task_default_log(installed: &TaskSnapshot) -> Result<EnsureOutcome> {
     let principal = principal_sid(installed.registered())?;
-    default_log::ensure(&program_data()?, installed.id(), &[principal], Existing::Set)
+    default_log::ensure(&program_data()?, installed.id(), &Naming::alike(&[principal]))
 }
 
 // Enable and disable ==================================================================================================
