@@ -370,7 +370,7 @@ pub enum Error {
     /// The `stop` of `id` named no wait, so it takes the daemon's stop action for one, and the installed
     /// definition that holds it will not decode; `source` is the decode failure. Nothing was sent. A stop
     /// that names its wait does not read the definition, so the remedy, which [`report`](Error::report)
-    /// prints last, is the flags that name one. A wrapper, as [`wrapper!`] lists.
+    /// prints last, is the flags that name one. A wrapper, as `wrapper!` lists.
     #[error(
         "the stop of `{id}` was refused and nothing was sent, because with no `--timeout` or `--no-timeout` the \
          wait comes from the daemon's stop action, which could not be taken from its installed definition"
