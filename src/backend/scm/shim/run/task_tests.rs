@@ -1130,7 +1130,7 @@ fn a_record_carries_the_time_the_run_began() {
     run.finish();
 }
 
-// A listing that cannot be read ======================================================================================
+// A listing that cannot be read =======================================================================================
 
 /// The OS error a failed listing carries, which the shim ends with.
 const LISTING_FAILED: u32 = ERROR_FILE_NOT_FOUND;
