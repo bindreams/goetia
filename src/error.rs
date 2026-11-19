@@ -69,7 +69,7 @@ pub enum Error {
     },
 
     /// A goetia operation failed because a step under it did. `what` is words only: it holds no error.
-    /// Words that set an error inside them are a variant of their own, whose shape [`Error::pieces`]
+    /// Words that set an error inside them are a variant of their own, whose shape `Error::pieces`
     /// states, so that the printer and the search reach the error.
     #[error("{what}")]
     Step {

@@ -241,7 +241,8 @@ fn a_start_judged_without_its_blob_is_indeterminate_when_the_failed_start_is() {
 /// `cause` read through them as through a `Step`, and `map_cause` keeps them around the result.
 #[skuld::test]
 fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is() {
-    let wrappers: [(&str, fn(Error) -> Error); 4] = [
+    type Wrap = fn(Error) -> Error;
+    let wrappers: [(&str, Wrap); 4] = [
         ("StartJudgedWithoutBlob", |source| Error::StartJudgedWithoutBlob {
             id: "x".to_string(),
             judged_as: crate::spec::Protocol::Plain,
@@ -278,6 +279,45 @@ fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is()
         );
         assert!(mapped.source().is_some(), "{name}");
     }
+}
+
+/// What a wrapper says inside its words and what it wraps are both found by the one search; a mentioned
+/// error is not.
+#[skuld::test]
+fn the_search_finds_what_a_wrapper_says_in_its_words_and_what_it_wraps_but_not_what_it_mentions() {
+    let named = |name: &'static str| move |e: &Error| matches!(e, Error::Blob { message, .. } if message == name);
+    let blob = |message: &str| Error::blob(message.to_string());
+    let judged = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Plain,
+        blob: Arc::new(blob("said")),
+        source: Box::new(blob("wrapped")),
+    };
+    let output = Error::OutputAlsoFailed {
+        id: "x".to_string(),
+        shown: Box::new(blob("said")),
+        source: Box::new(blob("wrapped")),
+    };
+    for e in [&judged, &output] {
+        assert!(finds_error(e, named("said")), "{e:?}");
+        assert!(finds_error(e, named("wrapped")), "{e:?}");
+    }
+    let unconfirmed = Error::ProcessExitUnconfirmed {
+        id: "x".to_string(),
+        terminate_failed: Arc::new(std::io::Error::from_raw_os_error(6)),
+        source: Box::new(os_code(5)),
+    };
+    assert!(finds_os_code(&unconfirmed, 5), "{unconfirmed:?}");
+    assert!(!finds_os_code(&unconfirmed, 6), "{unconfirmed:?}");
+    let unopened = Error::ProcessNotOpened {
+        id: "x".to_string(),
+        open_failed: std::io::Error::from_raw_os_error(6),
+        source: Box::new(os_code(5)),
+    };
+    assert!(
+        finds_os_code(&unopened, 5) && finds_os_code(&unopened, 6),
+        "{unopened:?}"
+    );
 }
 
 /// A run that ended without a recorded exit says why in `reason`, and a failed read of the record is its
