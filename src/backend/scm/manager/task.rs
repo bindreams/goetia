@@ -27,6 +27,7 @@ pub(crate) use com::Com;
 pub(crate) use read::TaskSnapshot;
 pub(in crate::backend::scm) use read::combined;
 pub(crate) use run::TaskRun;
+pub(crate) use write::registration_password;
 pub(in crate::backend::scm) use write::task_default_log;
 
 use crate::backend::scm::instance::TaskPath;

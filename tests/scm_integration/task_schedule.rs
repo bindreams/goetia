@@ -94,7 +94,9 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
 /// `disable` stops a repetition that is in progress: a disabled `* * * * *` starts nothing at the boundaries
 /// that follow. Read in the stored state, with no window in which no run came: a second task, armed alike,
 /// starts at every boundary, so its last run moving past two boundaries is Task Scheduler's own sign that
-/// they have passed, and the disabled task's last run is what it was. `enable` then starts it again.
+/// they have passed. The disabled task's last run is earlier than the first boundary after `disable`
+/// returned: a start dispatched at the boundary before it may still show up after it, and is no fault.
+/// `enable` then starts it again.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixture(scm_group)] _group: &Group) {
     let (subject, control) = (TaskGuard::new(), TaskGuard::new());
@@ -113,9 +115,7 @@ fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixtu
     control_listener.accept_unbounded();
 
     mgr.disable(&subject.id).expect("disable");
-    // A run the disable found alive is over before the last start is read.
-    let before = status_once_ended(&mgr, &subject.id).last_run;
-    assert!(before.is_some(), "the task ran before it was disabled");
+    let disabled_at = SystemTime::now();
 
     let next_control_run = |after: SystemTime| {
         let mut found = after;
@@ -128,15 +128,15 @@ fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixtu
         });
         found
     };
-    let first = next_control_run(SystemTime::now());
+    let first = next_control_run(disabled_at);
     let second = next_control_run(first);
 
-    let after = task_status(&mgr, &subject.id);
-    assert_eq!(
-        after.last_run, before,
-        "the disabled task started at a boundary the control started at"
+    // A run dispatched before the disable is over before the last start is read.
+    let after = status_once_ended(&mgr, &subject.id);
+    assert!(
+        after.last_run.is_some_and(|run| run < first),
+        "the disabled task started at a boundary the control started at ({first:?}): {after:?}"
     );
-    assert_eq!(after.common.state, State::Idle, "{after:?}");
 
     mgr.enable(&subject.id).expect("enable again");
     wait::until(|| task_status(&mgr, &subject.id).last_run.is_some_and(|run| run > second));

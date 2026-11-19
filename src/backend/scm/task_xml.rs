@@ -353,7 +353,10 @@ fn refuse_percent(id: &Id, host: &HostCommand) -> Result<(), Error> {
 /// The triggers `spec`'s schedule compiles to: none for a task with no schedule.
 pub(super) fn triggers_of(spec: &DaemonSpec) -> Result<Vec<Trigger>, Error> {
     let DaemonSpec::Task(task) = spec else {
-        unreachable!("a service is not a task: `registration` matches the spec once")
+        return Err(Error::blob(format!(
+            "`{}` is a service, not a task, so it has no triggers",
+            spec.common().id
+        )));
     };
     match &task.schedule {
         Some(schedule) => compile(schedule, &spec.common().id),

@@ -1104,6 +1104,47 @@ fn disable_writes_no_triggers_and_enable_writes_the_compiled_ones_and_both_keep_
     fake.finish();
 }
 
+/// `enable` of a task that has triggers keeps them as they are, a hand-added one included, and does not need the
+/// blob: one that will not decode is no obstacle.
+#[skuld::test]
+fn enable_keeps_the_triggers_that_are_there_and_needs_no_blob_for_them() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let armed = registered_task(&spec, true);
+    let hand_added = Registered {
+        xml: armed.xml.replace(
+            "</Triggers>",
+            "<LogonTrigger><UserId>S-1-5-18</UserId></LogonTrigger></Triggers>",
+        ),
+        data: armed.data.clone(),
+        enabled: armed.enabled,
+    };
+    assert!(hand_added.xml.contains("LogonTrigger"), "the edit is made");
+    // Off by its own flag, as an uninstall that did not finish leaves it.
+    let off = Registered {
+        xml: hand_added
+            .xml
+            .replace("<Enabled>true</Enabled>", "<Enabled>false</Enabled>"),
+        data: armed.data.clone(),
+        enabled: Some(false),
+    };
+    for blob in [
+        Ok(blob(&spec)),
+        Err(std::sync::Arc::new(Error::blob("the blob will not decode"))),
+    ] {
+        let fake = Fake::new();
+        fake.on_register(Ok(Registration::Created));
+        let scm = scm(&fake);
+        scm.task_set_armed_with(&TaskSnapshot::new(id(), blob, off.clone()), true, || Ok(None))
+            .unwrap();
+        let calls = fake.calls();
+        let Call::Register { xml, .. } = &calls[0] else {
+            panic!("enable registers: {calls:?}");
+        };
+        assert_eq!(xml, &hand_added.xml, "the triggers are kept, and the own flag is true");
+        fake.finish();
+    }
+}
+
 /// A blob that will not decode names no schedule, so `enable` has no triggers to write and says why; `disable`
 /// needs none, and works.
 #[skuld::test]

@@ -129,8 +129,12 @@ impl TaskXml {
         let Ok(document) = document(xml) else {
             return false;
         };
-        own_flag_is_true(document.root_element())
-            && child(document.root_element(), "Triggers").is_some_and(|triggers| elements(triggers).next().is_some())
+        own_flag_is_true(document.root_element()) && has_triggers(&document)
+    }
+
+    /// Whether `xml` holds a trigger. XML that cannot be read holds none.
+    pub(crate) fn has_triggers(xml: &str) -> bool {
+        document(xml).is_ok_and(|document| has_triggers(&document))
     }
 
     /// `xml` with its triggers taken out (the `Triggers` element, empty or not, a hand-added trigger
@@ -142,18 +146,27 @@ impl TaskXml {
     /// be started again. One that states none is enabled already.
     pub(crate) fn without_triggers(xml: &str) -> Result<String, Error> {
         let document = document(xml)?;
-        let mut edits = own_flag_edit(&document);
+        let mut edits = own_flag_edit(&document, true)?;
         if let Some(triggers) = child(document.root_element(), "Triggers") {
             edits.push((triggers.range(), String::new()));
         }
         Ok(edited(xml, edits))
     }
 
-    /// `xml` with the triggers `spec`'s schedule compiles to in place of any it holds (a hand-added
-    /// trigger is replaced with the rest), before `Actions` when it holds none, and nothing else
+    /// `xml` with the task's own flag set to `flag` and nothing else changed: the triggers it holds are
+    /// kept. A true flag is set where it is stated (one that states none is enabled already), a false
+    /// one is stated. `enable` registers a task that has triggers so, with `true`.
+    pub(crate) fn with_own_flag(xml: &str, flag: bool) -> Result<String, Error> {
+        let document = document(xml)?;
+        Ok(edited(xml, own_flag_edit(&document, flag)?))
+    }
+
+    /// `xml` with the triggers `spec`'s schedule compiles to in place of any it holds (an empty
+    /// `Triggers` element is replaced), before `Actions` when it holds none, and nothing else
     /// changed but the task's own flag, which is set true as [`TaskXml::without_triggers`] sets it.
-    /// This is what `enable` registers: the blob names the schedule, so the triggers need not be in
-    /// the stored XML. A spec with no schedule has nothing to arm: [`Error::Invalid`].
+    /// This is what `enable` registers for a task that has none: the blob names the schedule. A spec
+    /// with no schedule has nothing to arm ([`Error::Invalid`]), and a service's is no task's
+    /// ([`Error::Blob`]).
     pub(crate) fn with_triggers(xml: &str, spec: &DaemonSpec) -> Result<String, Error> {
         let triggers = triggers_of(spec)?;
         if triggers.is_empty() {
@@ -161,7 +174,7 @@ impl TaskXml {
         }
         let text = triggers_xml(&triggers);
         let document = document(xml)?;
-        let mut edits = own_flag_edit(&document);
+        let mut edits = own_flag_edit(&document, true)?;
         edits.push(match child(document.root_element(), "Triggers") {
             Some(stored) => (stored.range(), text),
             None => {
@@ -175,16 +188,25 @@ impl TaskXml {
     }
 }
 
-/// The edit that sets the task's own flag true, where the XML states it.
-fn own_flag_edit(document: &Document<'_>) -> Vec<(Range<usize>, String)> {
-    child(document.root_element(), "Settings")
-        .and_then(|settings| child(settings, "Enabled"))
-        .map(|flag| match flag.first_child().filter(Node::is_text) {
-            Some(value) => (value.range(), "true".to_owned()),
-            None => (flag.range(), "<Enabled>true</Enabled>".to_owned()),
-        })
-        .into_iter()
-        .collect()
+/// The edit that sets the task's own flag to `value` where the XML states it, and for `false` where it
+/// does not (a flag that is not stated is true): first among the `Settings`, whose order is free. None
+/// for a true flag that is not stated.
+fn own_flag_edit(document: &Document<'_>, value: bool) -> Result<Vec<(Range<usize>, String)>, Error> {
+    let settings = child(document.root_element(), "Settings");
+    if let Some(flag) = settings.and_then(|settings| child(settings, "Enabled")) {
+        return Ok(vec![match flag.first_child().filter(Node::is_text) {
+            Some(text) => (text.range(), value.to_string()),
+            None => (flag.range(), format!("<Enabled>{value}</Enabled>")),
+        }]);
+    }
+    if value {
+        return Ok(Vec::new());
+    }
+    let first = settings
+        .and_then(|settings| settings.first_child())
+        .ok_or_else(|| Error::blob("the task has no settings"))?;
+    let at = first.range().start;
+    Ok(vec![(at..at, "<Enabled>false</Enabled>".to_owned())])
 }
 
 /// `xml` with `edits` made, each a range of `xml` and its replacement.
@@ -231,6 +253,10 @@ fn only(node: Node<'_, '_>, allowed: &[&str]) -> Option<()> {
     elements(node)
         .all(|child| allowed.contains(&child.tag_name().name()))
         .then_some(())
+}
+
+fn has_triggers(document: &Document<'_>) -> bool {
+    child(document.root_element(), "Triggers").is_some_and(|triggers| elements(triggers).next().is_some())
 }
 
 /// Whether the task's own flag, `Settings/Enabled`, is true: it is when Task Scheduler states none.
@@ -290,6 +316,8 @@ fn split_arguments(arguments: &str) -> Vec<String> {
 
 /// The [`Trigger`] goetia writes that `node` is, or `None` for any other trigger.
 fn trigger_of(node: Node<'_, '_>) -> Option<Trigger> {
+    // A trigger that is switched off is not what goetia writes: an install writes the desired one over it.
+    flag_is_true(child(node, "Enabled")).then_some(())?;
     match node.tag_name().name() {
         "TimeTrigger" => {
             only(node, &["StartBoundary", "Enabled"])?;

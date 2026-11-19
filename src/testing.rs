@@ -84,11 +84,13 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
 ///
 /// A disarmed task has no triggers, so there is nothing to ask. Its schedule's triggers are written for
 /// the question with the task's own flag false, which no start can come of (`GetRunTimes` lists a
-/// disabled task's times, M2), and taken out again after; an armed task is asked as it is.
+/// disabled task's times, M2), and the task is registered again as it was after; an armed task is asked as
+/// it is. A task that logs on with a password is registered again with `GOETIA_SERVICE_PASSWORD`, as the
+/// verbs do, and is [`Error::PasswordRequired`] without it, before anything is written.
 #[cfg(windows)]
 pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
     use crate::backend::scm::instance::TaskPath;
-    use crate::backend::scm::manager::task::{Com, TaskApi as _};
+    use crate::backend::scm::manager::task::{Com, TaskApi as _, registration_password};
     use crate::backend::scm::task_xml::{TaskXml, extract_from_data};
     use crate::error::Error;
 
@@ -101,11 +103,11 @@ pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<S
     }
     let blob = extract_from_data(&registered.data)?.ok_or_else(|| Error::blob("the task's `Data` is not goetia's"))?;
     let account = TaskXml::principal(&registered.xml)?;
-    let triggered = TaskXml::with_triggers(&registered.xml, &blob.spec)?;
-    let held = triggered.replacen("<Settings>", "<Settings><Enabled>false</Enabled>", 1);
-    Com.register(&path, &held, &account, None, true)?;
+    let password = registration_password(&account)?;
+    let held = TaskXml::with_own_flag(&TaskXml::with_triggers(&registered.xml, &blob.spec)?, false)?;
+    Com.register(&path, &held, &account, password.as_deref(), true)?;
     let times = Com.run_times(&path, from, to);
-    let back = Com.register(&path, &TaskXml::without_triggers(&held)?, &account, None, true);
+    let back = Com.register(&path, &registered.xml, &account, password.as_deref(), true);
     let times = times?;
     back?;
     Ok(times)

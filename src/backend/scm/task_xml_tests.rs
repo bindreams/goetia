@@ -523,6 +523,24 @@ fn a_hand_edit_of_a_setting_trigger_or_action_is_a_difference() {
     }
 }
 
+/// A stored trigger whose own flag reads false is not goetia's, so it is a difference (an install writes
+/// the desired one over it); one that reads true is.
+#[skuld::test]
+fn a_trigger_whose_flag_is_false_is_a_difference_and_one_whose_flag_is_true_is_not() {
+    let spec = spec();
+    let desired = built(&spec).to_string();
+    let base = readback(&spec, &host(), DAILY_AT_0330);
+    let boundary = "<StartBoundary>2000-01-01T03:30:00</StartBoundary>";
+    for flag in ["false", "False", "0"] {
+        let edited = base.replace(boundary, &format!("{boundary}<Enabled>{flag}</Enabled>"));
+        let installed = TaskXml::parse(&edited, &data_of(&spec)).unwrap();
+        assert_ne!(installed.to_string(), desired, "{flag}");
+    }
+    let edited = base.replace(boundary, &format!("{boundary}<Enabled>true</Enabled>"));
+    let installed = TaskXml::parse(&edited, &data_of(&spec)).unwrap();
+    assert_eq!(installed.to_string(), desired);
+}
+
 #[skuld::test]
 fn parse_refuses_data_that_is_not_a_tasks_blob() {
     let service = crate::testing::base_fields("frpc", vec![program("frpc")]);
@@ -619,6 +637,58 @@ fn arming_writes_the_blobs_triggers_into_the_stored_xml() {
             .unwrap()
             .contains("<Priority>3</Priority>")
     );
+}
+
+/// A task whose triggers are there is armed by its own flag alone: they are kept as they are, a hand-added
+/// one included, and nothing else changes.
+#[skuld::test]
+fn keeping_the_triggers_sets_the_own_flag_and_changes_nothing_else() {
+    let spec = spec();
+    for stored in [DAILY_AT_0330, HAND_ADDED] {
+        let xml = readback(&spec, &host(), stored);
+        assert_eq!(
+            TaskXml::with_own_flag(&xml, true).unwrap(),
+            xml,
+            "{stored}: already true"
+        );
+
+        let off = with_own_flag(&xml, false);
+        let on = TaskXml::with_own_flag(&off, true).unwrap();
+        assert_eq!(on, with_own_flag(&xml, true), "{stored}");
+        assert!(TaskXml::armed(&on), "{stored}");
+    }
+}
+
+/// A false own flag is stated once whether the XML states a flag or not, and nothing else changes: setting it
+/// true again gives back what a flag stated true would be.
+#[skuld::test]
+fn setting_the_own_flag_false_states_it_once_and_changes_nothing_else() {
+    let spec = spec();
+    let xml = readback(&spec, &host(), DAILY_AT_0330);
+    let off = TaskXml::with_own_flag(&xml, false).unwrap();
+    assert_eq!(off.matches("<Enabled>false</Enabled>").count(), 1, "{off}");
+    assert!(!TaskXml::armed(&off));
+    assert_eq!(
+        TaskXml::with_own_flag(&off, true)
+            .unwrap()
+            .replace("<Enabled>true</Enabled>", ""),
+        xml
+    );
+
+    let stated = with_own_flag(&xml, true);
+    let off = TaskXml::with_own_flag(&stated, false).unwrap();
+    assert_eq!(off.matches("<Enabled>").count(), 1, "{off}");
+    assert_eq!(off, with_own_flag(&xml, false));
+}
+
+/// A blob that holds a service names no schedule, so arming from it is an error, not a panic.
+#[skuld::test]
+fn arming_from_a_services_blob_is_an_error_that_names_it() {
+    let service = crate::testing::base_fields("frpc", vec![program("frpc")]);
+    let service = DaemonSpec::from(crate::spec::ServiceSpec::new(service).unwrap());
+    let xml = readback(&spec(), &host(), "");
+    let refused = TaskXml::with_triggers(&xml, &service).unwrap_err();
+    assert!(refused.to_string().contains("service"), "{refused}");
 }
 
 /// A task with no schedule has nothing to arm: the triggers of its blob are none.

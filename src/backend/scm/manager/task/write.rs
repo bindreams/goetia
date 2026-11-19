@@ -6,9 +6,10 @@
 //! permissions. A failure of any is a failure with nothing sent.
 //!
 //! A task is armed when it has triggers; an install makes it disarmed and keeps what is installed. `disable`
-//! registers the stored XML with no `Triggers`, and `enable` with the ones the blob's schedule compiles to;
-//! everything outside `<Triggers>` is the stored XML's, so a hand edit of it survives, and a hand-added
-//! trigger goes at `disable`, as it does at the next install. Re-registering a task that logs on with a
+//! registers the stored XML with no `Triggers`, and `enable` the stored XML as it is when it has triggers,
+//! and with the ones the blob's schedule compiles to when it has none; everything outside `<Triggers>` is
+//! the stored XML's, so a hand edit of it survives, and a hand-added trigger goes at `disable`, as it
+//! does at the next install. Re-registering a task that logs on with a
 //! password takes the password (M3): `enable` and `disable` of a real user's task read
 //! `GOETIA_SERVICE_PASSWORD` as an install does.
 
@@ -78,6 +79,11 @@ pub(super) fn password_of(
             }),
         },
     }
+}
+
+/// The password a registration of a task that runs as `account` needs, read as `enable` and `disable` read it.
+pub(crate) fn registration_password(account: &TaskAccount) -> Result<Option<String>> {
+    password_of(account, identity::service_password)
 }
 
 /// The record directory of task `id` under the machine's `%ProgramData%`, with the folders above it
@@ -388,8 +394,9 @@ impl Scm {
     }
 
     /// Registers `snapshot`'s task again armed or not, and nothing else changed: armed, with the
-    /// triggers its blob's schedule compiles to (a blob that will not decode names none, so it is
-    /// the error); not armed, with none. The task's own flag stays true.
+    /// triggers it holds, or when it holds none the ones its blob's schedule compiles to (a blob that
+    /// will not decode names none, so it is the error); not armed, with none. Either way the task's
+    /// own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
     pub(super) fn task_set_armed_with(
         &self,
@@ -398,11 +405,13 @@ impl Scm {
         password: impl FnOnce() -> Result<Option<String>>,
     ) -> Result<()> {
         let registered = snapshot.registered();
-        let xml = if armed {
+        let xml = if !armed {
+            TaskXml::without_triggers(&registered.xml)?
+        } else if TaskXml::has_triggers(&registered.xml) {
+            TaskXml::with_own_flag(&registered.xml, true)?
+        } else {
             let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
             TaskXml::with_triggers(&registered.xml, &blob.spec)?
-        } else {
-            TaskXml::without_triggers(&registered.xml)?
         };
         let account = stored_account(registered)?;
         let password = password_of(&account, password)?;
