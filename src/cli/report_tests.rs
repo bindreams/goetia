@@ -472,31 +472,6 @@ fn every_entry_of_a_listing_is_written_in_the_one_zone_given() {
     assert_eq!(runs, [Some("2026-01-15T18:30:00+05:30"); 2]);
 }
 
-/// A time `jiff` cannot represent is unknown, not a clamped bound that reads as a real time.
-#[skuld::test]
-fn a_time_outside_jiffs_range_is_null() {
-    // About 11,500 CE, and about 10,700 BCE; Windows' `SystemTime` starts in 1601 and cannot hold the second.
-    let far_future = at(300_000_000_000);
-    let far_past = UNIX_EPOCH.checked_sub(Duration::from_secs(400_000_000_000));
-    assert!(
-        far_past.is_some() || cfg!(windows),
-        "only Windows' SystemTime lacks the year -10,700"
-    );
-
-    for far in std::iter::once(far_future).chain(far_past) {
-        let status = task_status(common(State::Idle, None, true), None, Some(far), Some(far));
-        let json = document(&status);
-        assert_eq!(json["last-run"], serde_json::Value::Null);
-        assert_eq!(json["next-run"], serde_json::Value::Null);
-    }
-
-    // The neighbours in range are still written.
-    let status = task_status(common(State::Idle, None, true), None, Some(at(NOON)), Some(far_future));
-    let json = document(&status);
-    assert_eq!(json["last-run"], "2026-01-15T12:00:00+00:00");
-    assert_eq!(json["next-run"], serde_json::Value::Null);
-}
-
 /// `time` as `SystemTime`, or `None` where the platform's `SystemTime` cannot hold it (Windows before 1601).
 fn system_time(time: Timestamp) -> Option<SystemTime> {
     let since_epoch = time.as_duration();
@@ -556,7 +531,8 @@ fn a_time_is_null_outside_rfc_3339s_years_and_jiffs_range() {
                 expected.map_or(null.clone(), serde_json::Value::from),
                 "{instant}"
             ),
-            None => assert!(cfg!(windows), "only Windows' SystemTime lacks {instant}"),
+            None if cfg!(windows) => {} // Windows' `SystemTime` starts in 1601.
+            None => panic!("only Windows' SystemTime lacks {instant}"),
         }
     }
     if let Some(min) = system_time(Timestamp::MIN) {
@@ -571,8 +547,8 @@ fn an_offset_with_seconds_is_written_to_the_minute_and_names_the_same_instant() 
     // Africa/Monrovia until 1972: -00:44:30.
     let time = at(0);
     for (offset, expected) in [
-        (-2670, "1969-12-31T23:15:00-00:45"),
-        (2670, "1970-01-01T00:45:00+00:45"),
+        (-2670, "1969-12-31T23:16:00-00:44"),
+        (2670, "1970-01-01T00:44:00+00:44"),
         (-2669, "1969-12-31T23:16:00-00:44"),
     ] {
         let shown = last_run(time, &zone(offset));
@@ -582,10 +558,17 @@ fn an_offset_with_seconds_is_written_to_the_minute_and_names_the_same_instant() 
     }
 }
 
+/// The unknown zone, which `jiff` gives where it cannot determine the system zone, writes RFC 3339's unknown
+/// offset.
+#[skuld::test]
+fn the_unknown_zone_writes_the_unknown_offset() {
+    assert_eq!(last_run(at(NOON), &TimeZone::unknown()), "2026-01-15T12:00:00-00:00");
+}
+
 /// A zone with daylight saving writes each time with the offset in force at that time.
 #[skuld::test]
 fn each_time_carries_the_offset_in_force_at_that_instant() {
-    let new_york = TimeZone::get("America/New_York").expect("a bundled zone");
+    let new_york = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").expect("a valid POSIX zone");
     let summer: Timestamp = "2026-07-15T12:00:00Z".parse().unwrap();
     let status = task_status(
         common(State::Idle, None, true),

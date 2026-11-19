@@ -2617,7 +2617,19 @@ fn every_form_writes_a_tasks_times_in_the_system_zone() {
     fake.install(&a_task("nightly"), false).unwrap();
     let seconds = 1_768_478_400;
     let instant = jiff::Timestamp::from_second(seconds).unwrap();
-    let expected = instant.display_with_offset(zone.to_offset(instant)).to_string();
+    // The offset truncated to the minute, as `status` prints it; the unknown zone prints `-00:00`.
+    let offset = zone
+        .to_offset(instant)
+        .round(
+            jiff::tz::OffsetRound::new()
+                .smallest(jiff::Unit::Minute)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap();
+    let expected = match zone.is_unknown() {
+        true => format!("{}-00:00", offset.to_datetime(instant)),
+        false => instant.display_with_offset(offset).to_string(),
+    };
     let at = std::time::UNIX_EPOCH + Duration::from_secs(seconds as u64);
     fake.seed_task_status("nightly", Some(Exit::Code(0)), Some(at), Some(at));
 
