@@ -9,7 +9,7 @@ use goetia::spec::{Id, User};
 use crate::common::{UNIT_DIR_EXCLUSIVE, fixture_command, fixture_command_with_exe, manager};
 use crate::supervisor_integration::pid_is_alive;
 use crate::support::windows_tasks::{EndsTheRunOnPanic, ServiceAccountHost, task_spec};
-use crate::support::{self, ConnectBack, Group, ServiceGuard, kill, scm_group};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
 
 /// What a run that `Stop` ended exits as: Windows' code for a console process ended by its close event.
 const STOPPED: Exit = Exit::Code(0xC000_013A_u32 as i32);
@@ -97,7 +97,7 @@ fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_
         assert_eq!(exit, STOPPED, "one record, `Stopped`");
         // Gone is a state the kernel reaches as the shim's job closes, so it is waited for.
         for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
-            kill::until(|| !pid_is_alive(&pid));
+            wait::until(|| !pid_is_alive(&pid));
             assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
         }
     });

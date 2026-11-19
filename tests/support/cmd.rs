@@ -46,13 +46,20 @@ impl fmt::Display for Run {
 
 /// Runs `program`; a failure to spawn it is the error, for a caller that must not panic.
 pub fn try_run(program: &str, args: &[&str]) -> Result<Run, String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("spawn `{program}`: {e}"))?;
+    try_run_command(Command::new(program).args(args))
+}
+
+/// [`try_run`] for a `command` the caller has set up (an environment, a working directory).
+pub fn try_run_command(command: &mut Command) -> Result<Run, String> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let output = command.output().map_err(|e| format!("spawn `{program}`: {e}"))?;
     Ok(Run {
-        program: program.to_string(),
-        args: args.iter().map(|a| (*a).to_string()).collect(),
+        program,
+        args,
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
