@@ -253,6 +253,9 @@ struct Shape {
     arm_first: bool,
     /// The service is marked for deletion.
     delete: bool,
+    /// After the mark, this thread waits `BOUND` with nothing registered, so that the time since the mark
+    /// matches an iteration that waited for a delivery.
+    idle: bool,
 }
 
 /// A registration pending on `h` (if `shape.arm_first`), `DeleteService` through `h` (if `shape.delete`), then
@@ -284,6 +287,10 @@ fn one_iteration(running: bool, extra: u32, shape: Shape, follow: Follow) -> Str
         if shape.arm_first {
             let d = await_delivery(sink, 0, BOUND);
             let _ = write!(line, "delivery after the mark: {}; ", show_delivery(d, BOUND));
+        } else if shape.idle {
+            // SAFETY: an alertable wait; nothing is registered, so nothing runs in it.
+            unsafe { SleepEx(BOUND.as_millis() as u32, 1) };
+            line.push_str("idle after the mark; ");
         }
     }
     if running && sink.len() == 0 {
@@ -360,6 +367,7 @@ fn run_cell(name: &str, running: bool, extra: u32, shape: Shape, iterations: usi
 const BOTH: Shape = Shape {
     arm_first: true,
     delete: true,
+    idle: false,
 };
 
 #[skuld::test]
@@ -403,6 +411,7 @@ fn delivery_probe_controls(#[fixture(scm_group)] _group: &Group) {
             Shape {
                 arm_first: true,
                 delete: false,
+                idle: false,
             },
         ),
         (
@@ -410,6 +419,15 @@ fn delivery_probe_controls(#[fixture(scm_group)] _group: &Group) {
             Shape {
                 arm_first: false,
                 delete: true,
+                idle: false,
+            },
+        ),
+        (
+            "marked-then-idle",
+            Shape {
+                arm_first: false,
+                delete: true,
+                idle: true,
             },
         ),
         (
@@ -417,6 +435,7 @@ fn delivery_probe_controls(#[fixture(scm_group)] _group: &Group) {
             Shape {
                 arm_first: false,
                 delete: false,
+                idle: false,
             },
         ),
     ];
