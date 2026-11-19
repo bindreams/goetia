@@ -2390,10 +2390,7 @@ fn an_update_over_a_timer_systemd_has_not_loaded_writes_and_reloads(#[fixture(sy
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     let new = armed_task_whose_schedule_moves(&id);
-    let fake = gate_then([
-        reply(&["show"], exited(0, "LoadState=not-found\n", "")),
-        reload(),
-    ]);
+    let fake = gate_then([reply(&["show"], exited(0, "LoadState=not-found\n", "")), reload()]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
@@ -2404,7 +2401,10 @@ fn an_update_over_a_timer_systemd_has_not_loaded_writes_and_reloads(#[fixture(sy
     assert!(matches!(written, WriteOutcome::Done), "{written:?}");
     let calls = without_gate(&fake);
     assert_eq!(calls.last(), Some(&call(&["daemon-reload"])), "{calls:?}");
-    assert!(!calls.iter().any(|c| c[0] == "disable" || c[0] == "enable"), "{calls:?}");
+    assert!(
+        !calls.iter().any(|c| c[0] == "disable" || c[0] == "enable"),
+        "{calls:?}"
+    );
     assert_eq!(
         text_of(&id, UnitKind::Timer),
         units_of(&new).timer,
