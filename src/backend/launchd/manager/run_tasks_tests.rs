@@ -385,7 +385,7 @@ fn assert_vanished(e: &Error, pid: u32) {
 /// found it gone, never the stranded hold, and exit 4.
 fn assert_ended_unfollowed(e: &Error) {
     assert!(
-        matches!(e, Error::RunUnrecorded { id, reason, .. }
+        matches!(e, Error::RunUnrecorded { id, reason: Some(reason), .. }
             if id == ID && reason.starts_with("its launch ended before goetia could follow it")),
         "expected the launch that ended before goetia could follow it, got {e:?}"
     );
@@ -398,7 +398,7 @@ fn assert_ended_unfollowed(e: &Error) {
 
 fn assert_unfollowed(e: &Error, pid: u32) {
     assert!(
-        matches!(e, Error::RunUnrecorded { id, reason, .. }
+        matches!(e, Error::RunUnrecorded { id, reason: Some(reason), .. }
         if id == ID
             && *reason == format!(
                 "the `launchctl kickstart` goetia made for it launched process {pid} with no hold on it, \
@@ -452,7 +452,7 @@ fn a_run_whose_exit_came_without_a_status_is_unrecorded() {
     let e = run.wait().expect_err("an exit with no status");
 
     assert!(
-        matches!(&e, Error::RunUnrecorded { id, reason, .. } if id == ID && !reason.contains("may")),
+        matches!(&e, Error::RunUnrecorded { id, reason: Some(reason), .. } if id == ID && !reason.contains("may")),
         "{e:?}"
     );
     assert!(e.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
@@ -883,7 +883,7 @@ fn a_launch_that_ends_during_the_procinfo_is_gone_at_the_read() {
 
     assert_ended_unfollowed(&e);
     assert!(
-        matches!(&e, Error::RunUnrecorded { reason, .. } if reason.contains("(the process's status: exit code 0)")),
+        matches!(&e, Error::RunUnrecorded { reason: Some(reason), .. } if reason.contains("(the process's status: exit code 0)")),
         // `finish` reaps the child inside the procinfo, so its exit event is queued before the check reads
         // the watch: the status is certain here, as it is not for an exit that comes after the check.
         "the exit the watch kept is shown, though the read that raced it was discarded: {e:?}"
@@ -1108,7 +1108,7 @@ fn a_sigcont_that_reports_no_process_is_run_unrecorded_with_the_reason() {
     let e = failed(&fake, snapshot(&tree, None));
 
     assert!(
-        matches!(&e, Error::RunUnrecorded { reason, .. } if reason == "it was ended before goetia could resume it"),
+        matches!(&e, Error::RunUnrecorded { reason: Some(reason), .. } if reason == "it was ended before goetia could resume it"),
         "{e:?}"
     );
 }

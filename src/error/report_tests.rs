@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::*;
 use crate::error::Reason;
 use crate::error::error_tests::{exit_status, id, os, undetermined};
-use crate::error::paired;
+use crate::error::{Composite, carried_composite, carry, paired};
 
 /// A remedy is its own sentence: it follows a period the words before it already ended with, and
 /// supplies one when they did not.
@@ -555,4 +555,54 @@ fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
     );
     // A chain with no code anywhere has none.
     assert_eq!(os_error_in(&unassessable(containment(code_less()))), None);
+}
+
+/// A composite the walks do not name is told, searched and looked up through its carrier like the two there
+/// are: a new payload needs nothing but its [`Composite`] impl.
+#[skuld::test]
+fn a_composite_no_walk_names_is_told_and_searched_through_its_carrier() {
+    #[derive(Debug)]
+    struct Probe {
+        cause: std::io::Error,
+        aside: std::io::Error,
+    }
+    impl Composite for Probe {
+        fn pieces(&self) -> Pieces<'_> {
+            Pieces::new()
+                .text("probe: ")
+                .cause(&self.cause)
+                .text(" next to ")
+                .mentioned(&self.aside)
+        }
+
+        fn into_carried(self: Box<Self>) -> Result<Error, Box<dyn Composite>> {
+            Err(self)
+        }
+    }
+    impl std::fmt::Display for Probe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.pieces().fmt(f)
+        }
+    }
+    impl std::error::Error for Probe {}
+
+    let carried = carry(
+        std::io::ErrorKind::Other,
+        Probe {
+            cause: std::io::Error::from_raw_os_error(5),
+            aside: std::io::Error::from_raw_os_error(8),
+        },
+    );
+    let (cause, aside) = (
+        std::io::Error::from_raw_os_error(5).to_string(),
+        std::io::Error::from_raw_os_error(8).to_string(),
+    );
+    assert!(carried_composite::<Probe>(&carried).is_some());
+    let e = Error::os("probe it", carried);
+
+    assert_eq!(
+        e.report().to_string(),
+        format!("failed to probe it: probe: {cause} next to {aside}")
+    );
+    assert_eq!(e.raw_os_error(), Some(5), "the cause's code, never the mentioned one's");
 }

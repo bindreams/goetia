@@ -95,7 +95,7 @@ fn a_run_that_ended_before_it_could_be_resumed_says_so() {
     let resumed = run_unresumed(&frpc());
 
     assert!(
-        matches!(&resumed, Error::RunUnrecorded { id, reason, .. }
+        matches!(&resumed, Error::RunUnrecorded { id, reason: Some(reason), .. }
             if id == "frpc" && reason == "it was ended before goetia could resume it"),
         "{resumed:?}"
     );
@@ -108,7 +108,7 @@ fn a_launch_goetia_started_unheld_is_unrecorded_and_names_its_pid() {
     let unfollowed = run_unfollowed(&frpc(), 4242);
 
     assert!(
-        matches!(&unfollowed, Error::RunUnrecorded { id, reason, .. }
+        matches!(&unfollowed, Error::RunUnrecorded { id, reason: Some(reason), .. }
             if id == "frpc"
                 && reason == "the `launchctl kickstart` goetia made for it launched process 4242 with no hold \
                               on it, so goetia does not follow it"),
@@ -139,7 +139,7 @@ fn a_launch_that_ended_before_it_could_be_followed_is_unrecorded_with_the_proces
         (run_ended_unfollowed(&frpc(), None), ""),
     ] {
         assert!(
-            matches!(&gone, Error::RunUnrecorded { id, reason: said, .. } if id == "frpc" && *said == reason(status)),
+            matches!(&gone, Error::RunUnrecorded { id, reason: Some(said), .. } if id == "frpc" && *said == reason(status)),
             "{gone:?}"
         );
         assert!(gone.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
@@ -210,7 +210,7 @@ fn a_run_whose_exit_came_without_a_status_ended_unrecorded() {
     let ended = run_ended_without_status(&frpc());
 
     assert!(
-        matches!(&ended, Error::RunUnrecorded { id, reason, .. }
+        matches!(&ended, Error::RunUnrecorded { id, reason: Some(reason), .. }
             if id == "frpc" && reason == "the kernel did not report it"),
         "{ended:?}"
     );

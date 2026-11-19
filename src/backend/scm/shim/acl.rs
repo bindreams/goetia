@@ -760,11 +760,10 @@ mod system {
         Error::os_at(verb, path, Unreadable(what))
     }
 
-    /// Whether `error` is, or has anywhere in its chain, a read of an object's owner or permissions that
-    /// failed because the object holds something goetia cannot read, which says something about the
-    /// object; any other failure says nothing.
+    /// Whether `error` is a read of an object's owner or permissions that failed because the object
+    /// holds something goetia cannot read, which says something about the object; any other failure says nothing.
     pub(crate) fn is_unreadable(error: &Error) -> bool {
-        crate::error::find(error, &|e| e.downcast_ref::<Unreadable>()).is_some()
+        matches!(error, Error::Os { source, .. } if source.is::<Unreadable>())
     }
 
     /// Refuses with [`Unsafe`]'s error when the volume of `dir`, or of its first existing ancestor,

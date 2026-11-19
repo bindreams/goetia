@@ -3181,7 +3181,7 @@ fn is_judged(ended: io::Result<Waited>) -> bool {
             false
         }
         Err(e) => {
-            assert!(carried::<IncompleteStop>(&e).is_some(), "{e}");
+            assert!(carried_composite::<IncompleteStop>(&e).is_some(), "{e}");
             true
         }
     }
@@ -3266,7 +3266,7 @@ fn stop_and_await_exit_fails_over_a_shims_incomplete_stop_record() {
     let err =
         stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::<u32>::NoProcess, true, no_end).unwrap_err();
 
-    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
+    assert!(carried_composite::<IncompleteStop>(&err).is_some(), "{err}");
 }
 
 /// The shim process goetia holds is ended before the incomplete stop is returned: its KILL_ON_JOB_CLOSE
@@ -3294,7 +3294,7 @@ fn stop_and_await_exit_ends_the_held_process_of_an_incomplete_stop_before_failin
     )
     .unwrap_err();
 
-    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
+    assert!(carried_composite::<IncompleteStop>(&err).is_some(), "{err}");
     assert_eq!(*calls.borrow(), vec![("terminate", 7), ("wait", 7)]);
 }
 
@@ -3321,7 +3321,7 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
             ending(|_| terminate, |_, _, _| exit),
         )
         .unwrap_err();
-        assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
+        assert!(carried_composite::<IncompleteStop>(&err).is_some(), "{err}");
         err.to_string()
     };
 
@@ -3478,7 +3478,7 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
 
         let (waited, ended) = ended_by_incomplete_stop(waited, &mut held);
 
-        assert!(carried::<IncompleteStop>(&waited.unwrap_err()).is_some());
+        assert!(carried_composite::<IncompleteStop>(&waited.unwrap_err()).is_some());
         assert!(ended.is_empty());
         assert!(
             matches!(held, HoldOutcome::NoProcess | HoldOutcome::Refused(_)),

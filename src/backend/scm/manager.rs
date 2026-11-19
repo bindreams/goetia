@@ -118,7 +118,7 @@ use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
-    carried, end_on_incomplete_stop, end_process,
+    end_on_incomplete_stop, end_process,
 };
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::scm::folder::{make_goetia_folders, program_data};
@@ -142,7 +142,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Reason, Result};
+use crate::error::{Error, Reason, Result, carried_composite, os_error_in};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
@@ -1483,7 +1483,7 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
         Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
-            let state = match (carried::<IncompleteStop>(&e).is_some(), marked) {
+            let state = match (carried_composite::<IncompleteStop>(&e).is_some(), marked) {
                 (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
@@ -2231,7 +2231,7 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
 /// `context` is the open, as [`to_error`] takes it, and `e` its failure: a process's, for a task's run
 /// that a caller who is not an Administrator may not open (see `task::read`).
 fn open_refused(operation: &str, target: &str, context: &str, e: std::io::Error) -> Error {
-    let access_denied = e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    let access_denied = os_error_in(&e) == Some(ERROR_ACCESS_DENIED as i32);
     let failed = Error::os(context, e);
     if !access_denied {
         return failed;

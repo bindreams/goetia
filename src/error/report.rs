@@ -4,10 +4,9 @@ use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
-use super::Error;
+use super::composite::Carrier;
 use super::escape::{write_escaped, write_escaped_keeping_layout};
-use super::within::PairedFailure;
-use crate::backend::scm::wait::IncompleteStop;
+use super::{Error, SharedError};
 
 /// What [`Error::report`] and `Error::report_unescaped` return: the chain, formatted on `Display`.
 pub(super) struct Report<'a> {
@@ -214,14 +213,30 @@ pub(super) struct Node<'a> {
 ///
 /// What only carries another error is looked through, so that the node is the carried error: an
 /// [`io::Error`](std::io::Error) with a custom payload (its `source()` is the payload's, which skips the
-/// payload), an `Arc<io::Error>`, a `Box<Error>` and an [`Error::Kept`]. A `cosca` error is
-/// [`Shape::Cosca`]. A goetia error that sets another inside its message, a `PairedFailure` and an
-/// `IncompleteStop` are [`Shape::Pieces`]. Any other is its own `Display` and `source()`.
+/// payload), an `Arc<io::Error>` or [`SharedError`], a `Box<Error>` and an [`Error::Kept`]. A `cosca` error is
+/// [`Shape::Cosca`]. A goetia error that sets another inside its message, and any
+/// [`Composite`](super::Composite) in its [`Carrier`], are [`Shape::Pieces`]. Any other is its own
+/// `Display` and `source()`.
 pub(super) fn parts<'a>(e: &'a Dyn) -> Node<'a> {
     if let Some(payload) = e.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref) {
         return parts(payload);
     }
+    if let Some(carrier) = e.downcast_ref::<Carrier>() {
+        let composite = carrier.composite();
+        return Node {
+            error: composite,
+            ours: None,
+            shape: Shape::Pieces(composite.pieces()),
+            source: composite.source(),
+        };
+    }
+    // An `Arc`'s `source()` is its content's, which skips the content: a shared error is looked through
+    // for the error it holds. `Arc<io::Error>` is how `cosca` shares one; `SharedError` is what `Blob` and
+    // `Invalid` keep.
     if let Some(shared) = e.downcast_ref::<Arc<std::io::Error>>() {
+        return parts(&**shared);
+    }
+    if let Some(shared) = e.downcast_ref::<SharedError>() {
         return parts(&**shared);
     }
     // A `#[source]` of type `Box<Error>` reaches here as the box.
@@ -235,11 +250,7 @@ pub(super) fn parts<'a>(e: &'a Dyn) -> Node<'a> {
     };
     let shape = if error.is::<cosca::error::Error>() {
         Shape::Cosca
-    } else if let Some(pieces) = ours
-        .and_then(Error::pieces)
-        .or_else(|| error.downcast_ref::<PairedFailure>().map(PairedFailure::pieces))
-        .or_else(|| error.downcast_ref::<IncompleteStop>().map(IncompleteStop::pieces))
-    {
+    } else if let Some(pieces) = ours.and_then(Error::pieces) {
         Shape::Pieces(pieces)
     } else {
         Shape::Own

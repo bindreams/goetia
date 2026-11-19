@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
 use crate::backend::scm::kill::HoldOutcome;
-use crate::error::{Pieces, terminating_failed};
+use crate::error::{Composite, Error, Pieces, carried_composite, carry, terminating_failed};
 use crate::manager::budget::Deadline;
 use crate::spec::Protocol;
 
@@ -309,7 +309,7 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
     let Err(e) = waited else {
         return waited;
     };
-    let Some(incomplete) = carried::<IncompleteStop>(&e) else {
+    let Some(incomplete) = carried_composite::<IncompleteStop>(&e) else {
         return Err(e);
     };
     let Some(process) = take_held(held) else {
@@ -320,10 +320,13 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
         Ok(EndProcessOutcome::Lingers { terminate_failed, .. }) => Unexited::Lingers { terminate_failed },
         Err(failure) => Unexited::WaitFailed(failure),
     };
-    Err(io::Error::other(IncompleteStop {
-        failed_start: incomplete.failed_start,
-        process: Some(process),
-    }))
+    Err(carry(
+        io::ErrorKind::Other,
+        IncompleteStop {
+            failed_start: incomplete.failed_start,
+            process: Some(process),
+        },
+    ))
 }
 
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
@@ -668,11 +671,6 @@ impl<E> From<io::Error> for SettleError<E> {
     }
 }
 
-/// The `T` that `e` carries as its source, if it does.
-pub(crate) fn carried<T: std::error::Error + 'static>(e: &io::Error) -> Option<&T> {
-    e.get_ref().and_then(|source| source.downcast_ref::<T>())
-}
-
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
 enum Seen {
     /// With the status that showed it, whose record is the stop's.
@@ -776,10 +774,13 @@ enum Unexited {
     WaitFailed(ProcessWaitFailure),
 }
 
-impl IncompleteStop {
-    /// What `Display` renders: the failed wait is a cause of the failure, the failed terminate is only
-    /// mentioned.
-    pub(crate) fn pieces(&self) -> Pieces<'_> {
+impl Composite for IncompleteStop {
+    fn into_carried(self: Box<Self>) -> Result<Error, Box<dyn Composite>> {
+        Err(self)
+    }
+
+    /// The failed wait is a cause of the failure, the failed terminate is only mentioned.
+    fn pieces(&self) -> Pieces<'_> {
         let start = if self.failed_start { " (failed start)" } else { "" };
         let record = Pieces::new().text(format!(
             "service stopped{start}: SCM recorded `(0, 1003)`, the code goetia-shim records when it could not end the daemon's process tree, so the daemon may still be running"
@@ -820,10 +821,13 @@ fn judged(end: WaitEnd, shim: bool) -> io::Result<Waited> {
         WaitEnd {
             waited: Waited::Confirmed,
             exit: Some(exit),
-        } if shim && exit.is_incomplete_stop() => Err(io::Error::other(IncompleteStop {
-            failed_start: false,
-            process: None,
-        })),
+        } if shim && exit.is_incomplete_stop() => Err(carry(
+            io::ErrorKind::Other,
+            IncompleteStop {
+                failed_start: false,
+                process: None,
+            },
+        )),
         end => Ok(end.waited),
     }
 }
@@ -1091,10 +1095,13 @@ fn stopped_before_running(
             // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
             // to confirm. The notification may follow a `RUNNING` the wait never saw.
             if exit.is_incomplete_stop() {
-                return Err(io::Error::other(IncompleteStop {
-                    failed_start: true,
-                    process: None,
-                }));
+                return Err(carry(
+                    io::ErrorKind::Other,
+                    IncompleteStop {
+                        failed_start: true,
+                        process: None,
+                    },
+                ));
             }
             // `daemon_ran` is safe here: a host that exits before it connects also records `(0, 0)`
             // with a wait hint (P25 c/d); that is either our own start failing with `StartServiceW`

@@ -62,7 +62,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::RunStateUnknown { id: id() },
         Error::RunUnrecorded {
             id: id(),
-            reason: String::new(),
+            reason: Some("because".to_string()),
             source: None,
         },
     ];
@@ -326,7 +326,7 @@ fn the_search_finds_what_a_wrapper_says_in_its_words_and_what_it_wraps_but_not_w
 fn an_unrecorded_run_says_its_reason_and_returns_the_failed_read_as_its_source() {
     let said = Error::RunUnrecorded {
         id: "x".to_string(),
-        reason: "why".to_string(),
+        reason: Some("why".to_string()),
         source: None,
     };
     assert_eq!(
@@ -337,7 +337,7 @@ fn an_unrecorded_run_says_its_reason_and_returns_the_failed_read_as_its_source()
 
     let read = Error::RunUnrecorded {
         id: "x".to_string(),
-        reason: String::new(),
+        reason: None,
         source: Some(Box::new(Error::blob("unreadable"))),
     };
     assert_eq!(
@@ -660,10 +660,11 @@ fn pieces_name_the_errors_a_variant_writes_into_its_own_text() {
         embedded(&start_as_managed(not_installed())),
         Some(Error::Blob { .. })
     ));
-    assert!(matches!(
-        embedded(&Error::Kept(Arc::new(loaded))),
-        Some(Error::Undetermined { .. })
-    ));
+    // A kept error states no shape of its own: the walks read the error it holds.
+    let kept = Error::Kept(Arc::new(loaded));
+    assert!(kept.pieces().is_none());
+    assert_eq!(kept.report().to_string(), kept.unkept().report().to_string());
+    assert!(kept.report().to_string().ends_with(". re-run as root"));
     assert!(not_installed().pieces().is_none());
     assert!(step("a", inner()).pieces().is_none());
 }
@@ -1604,7 +1605,7 @@ fn error_messages_and_exit_class() {
         (
             Error::RunUnrecorded {
                 id: id(),
-                reason: "the journal has no exit".to_string(),
+                reason: Some("the journal has no exit".to_string()),
                 source: None,
             },
             "the run of `nightly` ended without recording its exit status: the journal has no exit",

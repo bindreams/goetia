@@ -5,11 +5,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod composite;
 mod escape;
 mod reason;
 mod report;
 mod within;
 
+pub(crate) use composite::{Composite, carried_composite, carry};
 #[cfg(feature = "cli")]
 pub(crate) use escape::EscapedStream;
 #[cfg(any(feature = "cli", unix))]
@@ -579,15 +581,16 @@ pub enum Error {
     /// could follow it (launchd). Exit `4` (indeterminate): the run may have happened, so repeating `run`
     /// may repeat it.
     ///
-    /// `reason` says why, and is empty when `source`, the failed read of what the manager recorded,
-    /// is all there is to say.
+    /// `reason` says why. `source` is the failure that left the exit unrecorded, when there was one:
+    /// the failed read of what the manager recorded. One of them is always there, and `reason` is
+    /// `None` only when `source` says it all.
     #[error(
         "the run of `{id}` ended without recording its exit status{}",
-        unrecorded_reason(reason)
+        unrecorded_reason(reason.as_deref(), source.is_some())
     )]
     RunUnrecorded {
         id: String,
-        reason: String,
+        reason: Option<String>,
         #[source]
         source: Option<Box<Error>>,
     },
@@ -980,8 +983,8 @@ impl Error {
 
     /// The message `Display` writes with errors set inside it, which `report` writes as it writes any
     /// error, so as to collect their remedies; `None` for an error whose `Display` is its own text. Where
-    /// it is `Some`, none of the errors in it is the `source`. A [`Kept`](Error::Kept) error answers as
-    /// the error it holds.
+    /// it is `Some`, none of the errors in it is the `source`. A [`Kept`](Error::Kept) error has none of
+    /// its own: [`parts`](report::parts) reads the error it holds.
     ///
     /// The one place the shape of such a variant is stated, with [`parts`](report::parts), which reads
     /// it. Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
@@ -1076,8 +1079,8 @@ impl Error {
             | Error::ElevationRequired { .. }
             | Error::UnsupportedPlatform { .. }
             | Error::AccountLookup { .. }
-            | Error::AlreadyExists { .. } => None,
-            Error::Kept(kept) => kept.pieces(),
+            | Error::AlreadyExists { .. }
+            | Error::Kept(_) => None,
         }
     }
 
@@ -1446,12 +1449,12 @@ fn output_also_failed_message<'a>(id: &str, shown: &'a Error) -> Pieces<'a> {
 }
 
 /// [`Error::RunUnrecorded`]'s tail: `: reason`, or nothing when `source` says it all.
-fn unrecorded_reason(reason: &str) -> String {
-    if reason.is_empty() {
-        String::new()
-    } else {
-        format!(": {reason}")
-    }
+fn unrecorded_reason(reason: Option<&str>, has_source: bool) -> String {
+    debug_assert!(
+        reason.is_some() || has_source,
+        "an unrecorded run says why, in a reason or a source"
+    );
+    reason.map(|reason| format!(": {reason}")).unwrap_or_default()
 }
 
 /// The message of [`Error::ProcessWaitTimeout`]: `terminate_failed` is why goetia's attempt to end
