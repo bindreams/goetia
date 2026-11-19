@@ -662,7 +662,8 @@ What holds on every platform:
   every run alive.
 - **Catch-up is always on**, with no field to turn it off: a run missed while
   the machine was off or asleep is made up when it is back, except where
-  [launchd](#launchd-calendar-entries) cannot.
+  [launchd](#launchd-calendar-entries) cannot. Only that: a run that came due
+  while the task was disarmed is never made up, on all three platforms.
 - **No retry.** A run that fails is not run again; a program that wants one
   retries itself. How it failed is its `last-result`.
 - **Times are local.** See [the schedule](#the-schedule-per-platform).
@@ -699,7 +700,8 @@ All under `goetia daemon`, as for a service:
   schedule has nothing to arm: `enable` is refused, naming the missing
   schedule, and its `enabled` is always `false`. On Windows, `enable` and
   `disable` of a task that runs as a real user need `GOETIA_SERVICE_PASSWORD`
-  (see [Task accounts on Windows](#task-accounts-on-windows)).
+  (see [Task accounts on Windows](#task-accounts-on-windows)). Arming never
+  makes up a run that came due while the task was disarmed.
 - **`disable`** disarms it. A run in flight carries on.
 - **`start`** requests a run now, armed or not, and returns once the manager
   has accepted the request. It says nothing of how the run went: `last-result`
