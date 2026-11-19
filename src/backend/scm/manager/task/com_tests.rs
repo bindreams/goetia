@@ -14,6 +14,9 @@ use crate::testing::groups::{Group, scm_group};
 
 const FOREIGN_FOLDER: &str = r"\GoetiaForeignFolder";
 
+/// An absolute program for a spec, which a task spec requires.
+const PING: &str = r"C:\Windows\System32\ping.exe";
+
 /// The task XML of an action that runs `ping.exe` for `count` echoes, as SYSTEM.
 fn xml(count: u32, description: &str, data: &str) -> String {
     format!(
@@ -420,7 +423,7 @@ fn a_hand_added_trigger_taken_out_by_without_triggers_updates_and_reads_back_dis
         );
 
         // The empty `<Triggers />` a removal leaves is filled in place.
-        let spec = crate::testing::task("goetia-com-logon", vec!["ping.exe".to_owned()], Some("*/5 * * * *"));
+        let spec = crate::testing::task("goetia-com-logon", vec![PING.to_owned()], Some("*/5 * * * *"));
         let rearmed = TaskXml::with_triggers(&read.xml, &spec).unwrap();
         Com.register(&path, &rearmed, &system(), None, true)
             .unwrap_or_else(|e| panic!("{trigger}: re-armed as {rearmed}: {}", e.report()));
@@ -502,7 +505,7 @@ fn the_run_times_of_a_disarmed_task_restore_its_stored_xml(#[fixture(scm_group)]
     let (from, to) = (SystemTime::now(), SystemTime::now() + Duration::from_secs(3 * 3600));
 
     for (schedule, listed) in [(Some("*/5 * * * *"), true), (None, false)] {
-        let spec: DaemonSpec = crate::testing::task("goetia-com-run-times", vec!["x".to_owned()], schedule);
+        let spec: DaemonSpec = crate::testing::task("goetia-com-run-times", vec![PING.to_owned()], schedule);
         let text = TaskXml::new(&spec, host.clone()).unwrap().to_xml(false);
         Com.register(&path, &text, &system(), None, false)
             .unwrap_or_else(|e| panic!("{schedule:?}: {}", e.report()));
