@@ -30,7 +30,7 @@ use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::manager::{Scm, open_refused};
-use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
+use crate::backend::scm::runs::{MarkerCheck, Pin, RunOutcome, RunRecord, Runs};
 use crate::error::{Error, Result, target_failed, within};
 use crate::manager::Budget;
 use crate::manager::budget::{self, Deadline};
@@ -320,6 +320,23 @@ fn no_records(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
+/// A pin on the run records of `id`, held until the caller lets it go: `None` when there are no records to
+/// keep (the directory is gone or is a link, [`no_records`]). Any other refusal is an error worded as any
+/// verb's is, a denial for access denied: that includes a pin refused because the records are being removed
+/// (as `check` looks for the marker), which is not "no records".
+pub(super) fn pin_records(operation: &str, id: &Id, runs: &Runs, check: MarkerCheck) -> Result<Option<Pin>> {
+    match runs.hold_with(check) {
+        Ok(pin) => Ok(Some(pin)),
+        Err(e) if no_records(&e) => Ok(None),
+        Err(e) => Err(open_refused(
+            operation,
+            &format!("the run records of `{id}`"),
+            &format!("pin the run records of `{id}`"),
+            e,
+        )),
+    }
+}
+
 /// The runs `stopped` ended, as their shims recorded them: one that could not end the program's process
 /// tree is a failed stop, and a record that cannot be read does not say the stop was complete. A task
 /// with no records, or whose directory is a link, has no stop to read ([`Runs::read`]).
@@ -374,41 +391,37 @@ impl Scm {
     /// `stop` of a task: [`Self::task_stop_with`] over the machine's processes and the task's records.
     pub(in crate::backend::scm) fn task_stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let runs = Runs::of(&program_data()?, id);
-        self.task_stop_with("stop", id, budget, &runs, &mut System)
+        self.task_stop_with("stop", id, budget, &runs, None, &mut System)
     }
 
     /// Every run of the task ended ([`stop_runs`]), and then read in its record: a stop whose shim could
     /// not end the program's tree is a failed stop. `operation` is the verb, which a denial names.
     ///
-    /// When there is a run to stop and the budget waits, a [`Pin`](crate::backend::scm::runs::Pin) is
+    /// When there is a run to stop and the budget waits, a [`Pin`] is
     /// held from before the first `Stop` is sent until every record is read: the shims write as their
     /// runs end, and without it the write of a later run prunes the record of an earlier one before it
     /// is read. A task with no run to stop has no records to keep, so it takes none (a caller who is not
     /// an Administrator cannot); one whose record directory is gone has none either (`NotFound`), nor has
-    /// one where the directory is a link ([`no_records`]), and the stop goes on. Any
+    /// one where the directory is a link ([`pin_records`]), and the stop goes on. Any
     /// other refusal is an error, worded as any verb's refusal is (a denial for access denied): that
     /// includes the pin refused because the records are being removed, which is not "no records".
+    ///
+    /// `pin` is the caller's own, taken before the call (an uninstall that placed the marker itself takes
+    /// its pin past it, [`pin_records`]): the stop takes none of its own, and lets go of the caller's when
+    /// it returns. `None` is a stop that takes its own, as a `stop` does.
     pub(super) fn task_stop_with<P: Processes>(
         &self,
         operation: &'static str,
         id: &Id,
         budget: Budget,
         runs: &Runs,
+        pin: Option<Pin>,
         processes: &mut P,
     ) -> Result<()> {
-        let mut pin = None;
+        let mut pin = pin;
         let stopped = stop_runs(&*self.tasks, operation, id, budget, processes, || {
-            match runs.hold() {
-                Ok(held) => pin = Some(held),
-                Err(e) if no_records(&e) => {}
-                Err(e) => {
-                    return Err(open_refused(
-                        operation,
-                        &format!("the run records of `{id}`"),
-                        &format!("pin the run records of `{id}`"),
-                        e,
-                    ));
-                }
+            if pin.is_none() {
+                pin = pin_records(operation, id, runs, MarkerCheck::Refuse)?;
             }
             Ok(())
         })?;

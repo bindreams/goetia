@@ -221,7 +221,6 @@ pub(crate) enum MarkerCheck {
     /// A marker that stands refuses the pin: the shim's, a `run`'s, a stop's.
     Refuse,
     /// The pin is made whatever stands: the holder placed the marker itself.
-    #[cfg_attr(not(test), allow(dead_code))] // the uninstall's own pin is its one caller, in a later change
     Ignore,
 }
 
@@ -402,7 +401,13 @@ impl Runs {
     /// error that says the records are being removed. It is not [`io::ErrorKind::NotFound`], which a
     /// directory already removed gives and which a caller may take as "no records".
     pub(crate) fn hold(&self) -> io::Result<Pin> {
-        self.hold_in(Dir::open(&self.dir)?, MarkerCheck::Refuse)
+        self.hold_with(MarkerCheck::Refuse)
+    }
+
+    /// [`Runs::hold`] with the marker looked for as `check` says: the removal's own pin, taken after the
+    /// removal placed the marker, is [`MarkerCheck::Ignore`].
+    pub(crate) fn hold_with(&self, check: MarkerCheck) -> io::Result<Pin> {
+        self.hold_in(Dir::open(&self.dir)?, check)
     }
 
     /// [`Runs::hold`] in `dir`, which was opened for the pin's life; the marker is looked for as `check`

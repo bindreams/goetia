@@ -76,6 +76,14 @@ pub(super) fn records() -> (TempDir, PathBuf, Runs) {
     (dir, path, runs)
 }
 
+/// How many pins the directory `path` holds.
+pub(super) fn pins_in(path: &std::path::Path) -> usize {
+    std::fs::read_dir(path)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
+        .count()
+}
+
 /// [`records`] where the task's directory is a junction, as its account can make it (adding a file is all
 /// that takes). The target holds an incomplete stop of the run `1`, which a read through the link would
 /// find: nothing may. The last is the target, which outlasts the link.

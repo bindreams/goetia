@@ -7,9 +7,11 @@ use std::time::Duration;
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
 use super::super::support::{
-    Machine, PATH, id, instance, instance_id, linked_records, record, records, scm, shim_writes, snapshot_of,
+    Machine, PATH, id, instance, instance_id, linked_records, pins_in, record, records, scm, shim_writes,
+    snapshot_of,
 };
 use super::*;
+use crate::backend::scm::runs::MarkerCheck;
 use crate::backend::Backend;
 use crate::backend::scm::manager::WindowsSnapshot;
 use crate::backend::scm::manager::task::api::Started;
@@ -43,7 +45,7 @@ fn two() -> Result<Vec<Instance>> {
 }
 
 fn stopped(fake: &Fake, machine: &mut Machine, runs: &Runs, budget: Budget) -> Result<()> {
-    scm(fake).task_stop_with("stop", &id(), budget, runs, machine)
+    scm(fake).task_stop_with("stop", &id(), budget, runs, None, machine)
 }
 
 // Stop ================================================================================================================
@@ -414,13 +416,66 @@ fn the_stops_pin_is_released_when_it_returns() {
 
     stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
 
-    let pins = std::fs::read_dir(&path)
-        .unwrap()
-        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
-        .count();
-    assert_eq!(pins, 0);
+    assert_eq!(pins_in(&path), 0);
     fake.finish();
     drop(dir);
+}
+
+/// A stop under the caller's pin takes none of its own: the marker the caller placed would refuse it, and
+/// the one pin there is, is the caller's.
+#[skuld::test]
+fn stop_with_the_callers_pin_takes_none_of_its_own() {
+    let (dir, path, runs) = records();
+    runs.close().unwrap();
+    let pin = runs.hold_with(MarkerCheck::Ignore).unwrap();
+    let fake = Fake::new();
+    fake.on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_stop(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+    let shim = Runs::of(dir.path(), &id());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let watcher = seen.clone();
+    let watched = path.clone();
+    machine.on_exit = Box::new(move |_| {
+        watcher.lock().unwrap().push(pins_in(&watched));
+        shim_writes(&shim, &record(1, RunOutcome::Stopped));
+    });
+
+    scm(&fake)
+        .task_stop_with("uninstall", &id(), Budget::Unbounded, &runs, Some(pin), &mut machine)
+        .unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), [1], "the caller's pin, and no other, while the run ended");
+    assert_eq!(pins_in(&path), 0, "the caller's pin is released when the stop returns");
+    fake.finish();
+}
+
+/// A stop with no pin of the caller's takes its own while a run ends, as it always has.
+#[skuld::test]
+fn stop_with_no_pin_takes_its_own_as_before() {
+    let (dir, path, runs) = records();
+    let fake = Fake::new();
+    fake.on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_stop(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+    let shim = Runs::of(dir.path(), &id());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let watcher = seen.clone();
+    let watched = path.clone();
+    machine.on_exit = Box::new(move |_| {
+        watcher.lock().unwrap().push(pins_in(&watched));
+        shim_writes(&shim, &record(1, RunOutcome::Stopped));
+    });
+
+    stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), [1], "its own pin while the run ended");
+    assert_eq!(pins_in(&path), 0);
+    fake.finish();
 }
 
 #[skuld::test]

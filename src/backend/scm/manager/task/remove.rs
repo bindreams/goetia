@@ -147,13 +147,21 @@ impl Scm {
     /// 1. The task is disabled (its own flag, `TaskApi::set_enabled`), whether or not it is armed, so
     ///    that nothing starts another run. That is no registration, so it needs no password and works
     ///    for an account whose password changed or that is gone: an uninstall never needs the password.
-    /// 2. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
+    /// 2. The removal's marker is placed ([`Runs::close`]): no shim of the task pins the records from
+    ///    now on, and a shim that is listed has passed its own check of the marker before this, or is
+    ///    stopped by the next step.
+    /// 3. The uninstall's own pin is taken past that marker, which would refuse any other
+    ///    ([`MarkerCheck::Ignore`]): it keeps the shims' prune from deleting a record before it is read.
+    /// 4. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
     ///    event. A run whose shim recorded an incomplete stop, or whose record cannot be read, keeps the
-    ///    task, disabled.
-    /// 3. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder,
-    ///    with no bound, and says on stderr what it waits for. The install lock is held throughout.
+    ///    task, disabled, and the marker: the re-run takes its own pin past it and finishes. The pin is
+    ///    let go once the records are read.
+    /// 5. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder
+    ///    (a shim that pinned before the marker leaves once it reads the task gone), with no bound, and
+    ///    says on stderr what it waits for. The install lock is held throughout.
     ///
-    /// A task that is gone has nothing to disable or stop; the rest finds nothing.
+    /// A task that is gone has nothing to disable or stop; the rest finds nothing. A task with no
+    /// directory of records has no marker to place and no pin to take.
     pub(super) fn task_remove_with<P: Processes>(
         &self,
         snapshot: &TaskSnapshot,
@@ -169,7 +177,7 @@ impl Scm {
             Err(e) => return Err(uninstall_failed(id, Left::Unknown, e)),
         }
 
-        self.task_stop_with("uninstall", id, Budget::Unbounded, runs, processes)
+        self.task_stop_with("uninstall", id, Budget::Unbounded, runs, None, processes)
             .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
 
         match self.tasks.delete(&path) {
