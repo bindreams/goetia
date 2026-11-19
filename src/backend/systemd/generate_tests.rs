@@ -1162,6 +1162,28 @@ fn timer_unit_text_is_exact() {
     );
 }
 
+/// What a reload acts on is the schedule: the spec blob, the goetia version and `Description=` are not
+/// in it, and a changed schedule is.
+#[skuld::test]
+fn a_timer_without_metadata_changes_only_with_its_schedule() {
+    let timer = |spec: &DaemonSpec| timer_without_metadata(&timer_for(spec).expect("a timer"));
+    let spec = task_with(|_| {});
+    let renamed = task_with(|c| c.name = "Another name".to_string());
+    let recommanded = task_with(|c| c.command = vec![PROGRAM.to_string(), "--other".to_string()]);
+    assert_ne!(timer_for(&spec), timer_for(&renamed), "the whole text differs");
+    assert_ne!(timer_for(&spec), timer_for(&recommanded), "the whole text differs");
+    assert_eq!(timer(&spec), timer(&renamed));
+    assert_eq!(timer(&spec), timer(&recommanded));
+    assert_ne!(timer(&spec), timer(&full_task(Some("30 4 * * *"))));
+
+    let text = timer(&spec);
+    assert!(
+        !text.contains("X-Goetia") && !text.contains("Spec=") && !text.contains("Description="),
+        "{text}"
+    );
+    assert!(text.contains("OnCalendar=*-*-* 03:30:00"), "{text}");
+}
+
 #[skuld::test]
 fn the_display_of_units_is_the_service_then_the_timer_under_a_marker_line() {
     let units = units(&full_task(Some("30 3 * * *")), &full_identity()).unwrap();

@@ -799,10 +799,13 @@ fn every_path() -> Vec<Way> {
             s.disable_timer("x", &mut Held::default())
         }),
         Way::request("clean timer", |s: &Systemctl| s.clean_timer("x", &mut Held::default())),
+        Way::request("reset-failed timer", |s: &Systemctl| {
+            s.reset_timer("x", &mut Held::default())
+        }),
         Way {
             name: "show stamp".to_string(),
             gated: false,
-            run: Box::new(|s: &Systemctl| s.timer_stamp_clearable("x").map(drop)),
+            run: Box::new(|s: &Systemctl| s.timer_stamp("x").map(drop)),
         },
         Way::request("start job", |s: &Systemctl| {
             s.start_job("x", &mut Held::default()).map(drop)
@@ -1193,22 +1196,26 @@ fn a_clean_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
     assert!(msg.contains("not inactive"), "{msg}");
 }
 
-/// A timer's stamp is cleared only by an arm that finds the timer inactive and `CanClean` naming
-/// `state`: `Persistent=` on, and no run of the timer in flight to refuse the clean.
+/// A timer's stamp is cleared only by an arm that finds the timer settled and `CanClean` naming
+/// `state`: `Persistent=` on, and no run of the timer in flight to refuse the clean. A failed timer
+/// (`ActiveState=failed`, which a refused trigger leaves, and which stays loaded with its memory of
+/// the last elapse) is reset first: systemd refuses `clean` of it, and measured, a failed timer armed
+/// without the reset made up the run.
 #[skuld::test]
-fn a_timer_s_stamp_is_clearable_when_it_is_inactive_and_can_be_cleaned_of_state() {
-    for (can_clean, active, clearable) in [
-        ("state", "inactive", true),
-        ("cache state", "inactive", true),
-        ("state", "active", false),
-        ("state", "failed", false),
-        ("", "inactive", false),
-        ("cache", "inactive", false),
+fn a_timer_s_stamp_is_cleared_when_it_is_settled_and_can_be_cleaned_of_state() {
+    for (can_clean, active, expected) in [
+        ("state", "inactive", Stamp::Clean),
+        ("cache state", "inactive", Stamp::Clean),
+        ("state", "failed", Stamp::ResetThenClean),
+        ("state", "active", Stamp::Left),
+        ("", "inactive", Stamp::Left),
+        ("", "failed", Stamp::Left),
+        ("cache", "inactive", Stamp::Left),
     ] {
         let answer = format!("CanClean={can_clean}\nActiveState={active}\nLoadState=loaded\n");
         assert_eq!(
-            showing(&answer).timer_stamp_clearable("x").expect(&answer),
-            clearable,
+            showing(&answer).timer_stamp("x").expect(&answer),
+            expected,
             "{can_clean:?} {active:?}"
         );
     }
@@ -1218,9 +1225,7 @@ fn a_timer_s_stamp_is_clearable_when_it_is_inactive_and_can_be_cleaned_of_state(
 fn the_timer_is_asked_about_its_stamp_by_its_own_name_in_one_show() {
     let fake = Fake::new([timer_shows("state", "inactive")]);
 
-    on_booted(fake.clone())
-        .timer_stamp_clearable("x")
-        .expect("timer_stamp_clearable");
+    on_booted(fake.clone()).timer_stamp("x").expect("timer_stamp");
 
     assert_eq!(
         fake.calls(),
@@ -1261,6 +1266,52 @@ fn arming_a_stopped_timer_cleans_its_stamp_before_enabling_it_now() {
             vec!["enable", "--now", "--", "x.timer"],
         ]
     );
+}
+
+/// A failed timer is reset before its stamp is cleaned: `clean` refuses a timer that is not inactive.
+#[skuld::test]
+fn arming_a_failed_timer_resets_it_then_cleans_its_stamp_before_enabling_it_now() {
+    let fake = gate_then([
+        timer_shows("state", "failed"),
+        reply(&["reset-failed"], exited(0, "", "")),
+        reply(&["clean"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+    ]);
+
+    on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect("arm");
+
+    assert_eq!(
+        fake.calls().into_iter().skip(2).collect::<Vec<_>>(),
+        [
+            vec!["show", "--property", "CanClean,ActiveState,LoadState", "--", "x.timer"],
+            vec!["reset-failed", "--", "x.timer"],
+            vec!["clean", "--what=state", "--", "x.timer"],
+            vec!["enable", "--now", "--", "x.timer"],
+        ]
+    );
+}
+
+/// A reset that fails fails the arm in systemd's words, with nothing cleaned or enabled.
+#[skuld::test]
+fn a_failing_reset_fails_the_arm() {
+    let fake = gate_then([
+        timer_shows("state", "failed"),
+        reply(
+            &["reset-failed"],
+            exited(1, "", "Failed to reset failed state of unit x.timer: busy\n"),
+        ),
+    ]);
+
+    let msg = on_booted(fake.clone())
+        .arm_timer("x", &mut Held::default())
+        .expect_err("the reset failed")
+        .report()
+        .to_string();
+
+    assert!(msg.contains("`systemctl reset-failed x.timer` failed"), "{msg}");
+    assert_eq!(fake.calls().len(), 4, "the gate's two probes, the show and the reset");
 }
 
 /// A timer whose `Persistent=` is off (a drop-in) keeps no stamp the manager reads, and `clean` of it

@@ -434,8 +434,15 @@ fn a_stamp_left_by_uninstall_is_cleared_by_the_next_arm_of_the_id(#[fixture(syst
     plant_stale_stamp(&id);
 
     mgr.install(&spec, false).expect("install again");
+    let before = SystemTime::now();
     mgr.enable(&task_id).expect("enable");
+    let status = task_status(&mgr, &task_id);
+    let after = SystemTime::now();
 
+    // A catch-up fires from an event source dispatched after `enable` returns, so `last_trigger` can
+    // still be empty then. The next run is read at once: a timer that has started to make up a run has
+    // none until the run is over, and one that made up none waits for the schedule's next time.
+    assert_next_run(&status, &schedule, &task_id, before, after);
     assert_eq!(
         last_trigger(&id),
         "",

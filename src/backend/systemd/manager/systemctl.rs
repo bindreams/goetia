@@ -68,6 +68,17 @@ fn listeners(step: Step, budget: Budget) -> usize {
 
 // The manager boundary ================================================================================================
 
+/// What arming a timer has to do about its stamp: see [`Systemctl::arm_timer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stamp {
+    /// The timer is active, or keeps no stamp: nothing to clean.
+    Left,
+    /// The timer is inactive and keeps a stamp.
+    Clean,
+    /// The timer is failed and keeps a stamp.
+    ResetThenClean,
+}
+
 /// What one `systemctl` run is for: what [`Systemctl::door`] establishes before it runs, and what a
 /// failure to run it says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,19 +815,32 @@ impl Systemctl {
     }
 
     /// `id`'s timer armed, and the one way goetia arms one. Its stamp (the time it last elapsed, which
-    /// `Persistent=yes` reads) is cleared first when the timer is inactive and has one: a timer being
-    /// armed was disarmed, so a time its schedule named since was missed while disarmed, not while the
-    /// machine was off, and the stamp would start the job at once for it. An active timer is armed
-    /// already, `clean` refuses it, and its stamp is the catch-up of a downtime. That holds for a timer
+    /// `Persistent=yes` reads) is cleared first when the timer is inactive or failed and has one: a
+    /// timer being armed was disarmed, so a time its schedule named since was missed while disarmed,
+    /// not while the machine was off, and the stamp would start the job at once for it. A failed timer
+    /// (one whose trigger was refused stays loaded, `failed`, with its memory of the last elapse) is
+    /// reset first, which `clean` needs and nothing else clears. An active timer is armed already,
+    /// `clean` refuses it, and its stamp is the catch-up of a downtime. That holds for a timer
     /// disarmed by `disable --now`; a timer stopped by hand with `systemctl stop` stays loaded with
     /// systemd's own memory of its last elapse, which the clean does not reach.
     /// Asks the gate before the `show`, which reads a property older systemd lacks.
     pub(super) fn arm_timer(&self, id: &str, held: &mut Held) -> Result<()> {
         self.require_supported(held)?;
-        if self.timer_stamp_clearable(id)? {
-            self.clean_timer(id, held)?;
+        match self.timer_stamp(id)? {
+            Stamp::Left => {}
+            Stamp::Clean => self.clean_timer(id, held)?,
+            Stamp::ResetThenClean => {
+                self.reset_timer(id, held)?;
+                self.clean_timer(id, held)?;
+            }
         }
         self.enable_timer(id, held)
+    }
+
+    /// `systemctl reset-failed` for `id`'s timer: a failed timer is inactive again. Only
+    /// [`Systemctl::arm_timer`] runs it.
+    fn reset_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.unit_file_verb(&["reset-failed"], id, UnitKind::Timer, held)
     }
 
     /// `systemctl clean --what=state` for `id`'s timer: its stamp (`/var/lib/systemd/timers/stamp-*`).
@@ -825,16 +849,19 @@ impl Systemctl {
         self.unit_file_verb(&["clean", "--what=state"], id, UnitKind::Timer, held)
     }
 
-    /// Whether `id`'s timer is inactive and keeps a stamp to clean, in one `show`: its `CanClean` says
-    /// `state`. A timer whose `Persistent=` is off (a drop-in can do it) lists nothing, and `clean` of
-    /// it fails.
-    fn timer_stamp_clearable(&self, id: &str) -> Result<bool> {
+    /// What arming has to do about `id`'s timer's stamp, in one `show`: the timer keeps a stamp to
+    /// clean when its `CanClean` says `state`. A timer whose `Persistent=` is off (a drop-in can do it)
+    /// lists nothing, and `clean` of it fails.
+    fn timer_stamp(&self, id: &str) -> Result<Stamp> {
         let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["CanClean", "ActiveState"])?;
-        let inactive = props.get("ActiveState").is_some_and(|state| state == "inactive");
         let keeps_stamp = props
             .get("CanClean")
             .is_some_and(|what| what.split_whitespace().any(|word| word == "state"));
-        Ok(inactive && keeps_stamp)
+        Ok(match props.get("ActiveState").map(String::as_str) {
+            Some("inactive") if keeps_stamp => Stamp::Clean,
+            Some("failed") if keeps_stamp => Stamp::ResetThenClean,
+            _ => Stamp::Left,
+        })
     }
 
     fn unit_file_verb(&self, head: &[&str], id: &str, kind: UnitKind, held: &mut Held) -> Result<()> {

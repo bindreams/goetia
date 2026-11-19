@@ -100,6 +100,21 @@ pub fn timer_for(spec: &DaemonSpec) -> Option<String> {
     Some(with_goetia_section(timer_unit(task, schedule), spec))
 }
 
+/// A timer's `text` as a reload acts on it: without its `[X-Goetia]` section, which holds the spec and
+/// the goetia version and changes without the schedule changing, and without `Description=`, which
+/// names the timer and schedules nothing. What is left changes only when the schedule does.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the systemd manager, which is Linux-only, compares timers")
+)]
+pub(crate) fn timer_without_metadata(text: &str) -> String {
+    text.lines()
+        .take_while(|line| line.trim() != "[X-Goetia]")
+        .filter(|line| !line.starts_with("Description="))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `body`, a blank line, and the `[X-Goetia]` section of `spec`.
 fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
     body.push('\n');
@@ -180,8 +195,9 @@ fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
 ///
 /// `AccuracySec=1s` makes the run start within the cron second; the default of one minute fired
 /// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up. It
-/// reads the timer's stamp, the time it last elapsed, so `enable` clears the stamp of
-/// a timer that is not active: a time passed while the timer was disarmed is then not a missed one.
+/// reads the timer's stamp, the time it last elapsed, so each arm of the timer clears the stamp of a
+/// timer that is not active (`enable`, and an install that re-arms a changed timer): a time passed
+/// while the timer was disarmed is then not a missed one.
 fn timer_unit(task: &TaskSpec, schedule: &Schedule) -> String {
     let mut out = String::new();
 

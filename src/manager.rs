@@ -47,6 +47,10 @@ pub trait ServiceManager {
     /// [`Error::LoadedJobInDoubt`] or
     /// [`Error::LoadedStateInDoubt`]
     /// (exit `4`).
+    ///
+    /// A run due while `install` changes an enabled task's schedule is missed on systemd and
+    /// launchd: the task is disarmed and armed again around the change, and arming makes up no run
+    /// the schedule named meanwhile. `goetia daemon start <id>` runs it.
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
     /// What [`Self::install`] would do for `spec`, without doing it, always

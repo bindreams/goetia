@@ -24,14 +24,18 @@
 //!   there to read, and the link it leaves would run the task at every boot.
 //! - `uninstall` disarms the timer, stops the job, and removes the timer before the job: a crash
 //!   leaves a job without a timer, still ours.
-//! - An update that changes an armed task's timer (its text, or a drop-in directory the update
-//!   deletes) disarms it with `disable --now` before the write, reloads, and arms it again. A reload
-//!   alone would let systemd read a time between the timer's last elapse and now as missed, and start
-//!   the job at once. A crash between the disarm and the re-arm leaves the task disabled: `status`
-//!   shows it, and `enable` arms it. A write that loses a race arms it again before the retry. A
-//!   disabled task's changed timer is only written.
+//! - An update that changes an armed task's schedule (the timer's text without its `[X-Goetia]`
+//!   section and `Description=`, or a drop-in directory the update deletes) disarms it with
+//!   `disable --now` before the write, reloads, and arms it again. A reload alone would let systemd
+//!   read a time between the timer's last elapse and now as missed, and start the job at once. A
+//!   crash between the disarm and the re-arm leaves the task disabled: `status` shows it, and
+//!   `enable` arms it. Any failure or lost race after the disarm tries to arm it again once before it
+//!   returns; if that fails too, the error says the task is disabled and that `goetia daemon enable
+//!   <id>` arms it. A disabled task's changed timer is only written, and so is a changed command or
+//!   name, which the schedule does not carry.
 //! - Every arm goes through `Systemctl::arm_timer`, which clears the timer's stamp first while the
-//!   timer is inactive (`systemctl clean` refuses an active one). A task being armed was disarmed,
+//!   timer is inactive or failed (a failed one is reset first; `systemctl clean` refuses an active
+//!   one). A task being armed was disarmed,
 //!   so no run its schedule named since was missed in downtime; the stamp, which `Persistent=yes`
 //!   reads, would start it at once. Disarming clears nothing: a stamp a disarming left, or one
 //!   `uninstall` leaves behind when the timer's file goes (systemd keeps it), is cleared by the next
@@ -42,9 +46,6 @@
 //! A timer without its job (a crash of an older goetia, or a hand removal) is ours and unusable: its
 //! blob is the error `read` gives it, and `uninstall` removes it.
 
-use std::fs;
-use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::systemd::generate::{self, Units};
@@ -56,7 +57,7 @@ use crate::manager::flow::NOTHING_TO_ARM;
 use crate::manager::{Budget, DaemonStatus, State, Status, TaskStatus};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
-use super::discover::{foreign_timer_recovery, timer_is_foreign};
+use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
 use super::systemctl::Held;
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::{
@@ -163,13 +164,17 @@ pub(super) struct Before {
     pub(super) disable_job: bool,
     /// A timer is installed and the new definition has none: disarm and remove it.
     pub(super) drop_timer: bool,
-    /// An armed timer is to change, in its text or by losing its drop-in directory: disarm it before
-    /// the write, and arm it after the reload (see [`Systemd::update_units`]).
+    /// An armed timer's schedule is to change, in its rendering or by losing its drop-in directory:
+    /// disarm it before the write, and arm it after the reload (see [`Systemd::update_units`]).
     pub(super) rearm_timer: bool,
 }
 
 /// What `update_units` has to do before it replaces the job. `timer_dropins` is whether the id's timer
-/// drop-in directory exists, which the update deletes. `armed` is asked only when the timer changes.
+/// has a drop-in in the directory the update deletes. `armed` is asked only when the timer changes.
+///
+/// The timers are compared as the reload acts on them ([`generate::timer_without_metadata`]), as
+/// launchd's `changes_loaded_job` compares plists: a changed command or a goetia upgrade rewrites the
+/// timer's metadata and not its schedule.
 pub(super) fn before_replacing(
     old: &Fragment,
     new: &Units,
@@ -178,7 +183,9 @@ pub(super) fn before_replacing(
     armed: impl FnOnce() -> Result<bool>,
 ) -> Result<Before> {
     let timer_changes = match (old.timer(), &new.timer) {
-        (Some(old), Some(new)) => old.text != *new || timer_dropins,
+        (Some(old), Some(new)) => {
+            generate::timer_without_metadata(&old.text) != generate::timer_without_metadata(new) || timer_dropins
+        }
         _ => false,
     };
     Ok(Before {
@@ -215,7 +222,10 @@ impl Systemd {
         let old_job = old
             .service_text()
             .expect("an id `decide` chose to update has a job: one without is unusable");
-        let before = before_replacing(old, units, spec, dir_exists(&dropin_dir(id, UnitKind::Timer))?, || {
+        // Only where the timer's slot is this id's, as `installed` reads it: a service never reads
+        // `<id>.timer.d`.
+        let timer_dropins = old.owns_timer_slot() && discover::clearable_timer_dropin(id)?;
+        let before = before_replacing(old, units, spec, timer_dropins, || {
             self.systemctl.require_supported(held)?;
             self.systemctl.timer_enabled(id)
         })?;
@@ -247,18 +257,39 @@ impl Systemd {
         if before.disable_job {
             self.systemctl.disable_impl(id, held)?;
         }
-        if before.rearm_timer {
-            self.systemctl.disable_timer(id, held)?;
+        if !before.rearm_timer {
+            return self.replace_and_reload(id, units, old, old_job, held);
         }
+        self.systemctl.disable_timer(id, held)?;
+        // Whatever the write came to, the timer is armed again once before this returns: a task
+        // left disarmed would not be re-armed by a retried install, which finds the files up to date.
+        let written = self.replace_and_reload(id, units, old, old_job, held);
+        let armed = self.systemctl.arm_timer(id, held);
+        match (written, armed) {
+            (written, Ok(())) => written,
+            (Ok(_), Err(arming)) => Err(left_disabled(id, None, arming)),
+            (Err(cause), Err(arming)) => Err(left_disabled(id, Some(cause), arming)),
+        }
+    }
 
+    /// The job and the timer replaced, each verified against what `read` saw, the drop-in directories
+    /// cleared, and one reload. `Raced` where either file was not what `read` saw.
+    fn replace_and_reload(
+        &self,
+        id: &str,
+        units: &Units,
+        old: &Fragment,
+        old_job: &str,
+        held: &mut Held,
+    ) -> Result<WriteOutcome> {
         if let ReplaceOutcome::Raced = replace_unit_verified(id, UnitKind::Service, &units.service, old_job)? {
-            return self.raced(id, &before, held);
+            return Ok(WriteOutcome::Raced);
         }
         if let Some(timer) = &units.timer
             && let Some(old_timer) = old.timer()
             && let ReplaceOutcome::Raced = replace_unit_verified(id, UnitKind::Timer, timer, &old_timer.text)?
         {
-            return self.raced(id, &before, held);
+            return Ok(WriteOutcome::Raced);
         }
 
         // Only after the last write has committed: clearing a drop-in first would delete an admin's
@@ -268,28 +299,27 @@ impl Systemd {
             remove_dir_if_present(&dropin_dir(id, UnitKind::Timer))?;
         }
         self.systemctl.daemon_reload_or_report(id, held)?;
-        if before.rearm_timer {
-            self.systemctl.arm_timer(id, held)?;
-        }
         Ok(WriteOutcome::Done)
-    }
-
-    /// A write that lost a race: a timer this update disarmed is armed again first, so that the retry
-    /// finds the task as the user left it.
-    fn raced(&self, id: &str, before: &Before, held: &mut Held) -> Result<WriteOutcome> {
-        if before.rearm_timer {
-            self.systemctl.arm_timer(id, held)?;
-        }
-        Ok(WriteOutcome::Raced)
     }
 }
 
-/// Whether `path` is a directory that exists.
-fn dir_exists(path: &Path) -> Result<bool> {
-    match fs::metadata(path) {
-        Ok(meta) => Ok(meta.is_dir()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(Error::os_at("read", path, e)),
+/// The error for an update that disarmed `id`'s timer and could not arm it again: the task is
+/// disabled, a retried install finds its files up to date and arms nothing, and `enable` does. `cause`
+/// is what ended the update, where something did (a lost race is none).
+fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
+    let source = match cause {
+        None => arming,
+        Some(cause) => Error::Both {
+            first: Box::new(cause),
+            then: Box::new(arming),
+        },
+    };
+    Error::Step {
+        what: format!(
+            "`{id}`'s timer was disarmed for this update and could not be armed again, so the task is now \
+             disabled: run `goetia daemon enable {id}` to arm it"
+        ),
+        source: Box::new(source),
     }
 }
 

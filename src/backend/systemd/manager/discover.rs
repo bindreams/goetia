@@ -460,13 +460,9 @@ pub(super) fn installed(snapshot: &Fragment) -> Result<InstalledDefinition<Units
             "the job is missing, so there is no installed definition to compare",
         ));
     };
-    let unreadable = |failure: ReadFailure| Error::Step {
-        what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
-        source: Box::new(failure.into_os_error()),
-    };
-    let service_dirs = dropin_dirs(id, UnitKind::Service).map_err(unreadable)?;
+    let service_dirs = dropin_dirs(id, UnitKind::Service).map_err(unreadable_dropins)?;
     let timer_dirs = if snapshot.owns_timer_slot() {
-        dropin_dirs(id, UnitKind::Timer).map_err(unreadable)?
+        dropin_dirs(id, UnitKind::Timer).map_err(unreadable_dropins)?
     } else {
         Vec::new()
     };
@@ -484,6 +480,24 @@ pub(super) fn installed(snapshot: &Fragment) -> Result<InstalledDefinition<Units
         definition: units,
         external: dropin_external_config(id, &dirs),
     })
+}
+
+/// The error for a drop-in directory that could not be read.
+fn unreadable_dropins(failure: ReadFailure) -> Error {
+    Error::Step {
+        what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
+        source: Box::new(failure.into_os_error()),
+    }
+}
+
+/// Whether `id`'s timer has a drop-in in the directory an update clears, `UNIT_DIR/<id>.timer.d`: found
+/// by the scan [`installed`] makes, so a directory with no `*.conf` in it is none. A drop-in under
+/// another root stays after an update, and is no change the update makes. Asked only where
+/// [`Fragment::owns_timer_slot`].
+pub(super) fn clearable_timer_dropin(id: &str) -> Result<bool> {
+    let ours = Path::new(UNIT_DIR).join(dropin_name(id, UnitKind::Timer));
+    let dirs = dropin_dirs(id, UnitKind::Timer).map_err(unreadable_dropins)?;
+    Ok(dirs.iter().any(|(dir, _)| *dir == ours))
 }
 
 /// The drop-in text a set of drop-in directories adds to a unit's.
