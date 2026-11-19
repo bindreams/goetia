@@ -504,8 +504,15 @@ fn a_time_is_null_outside_rfc_3339s_years_and_jiffs_range() {
     let max = system_time(Timestamp::MAX).expect("year 9999 fits");
     let shown = last_run(max, utc);
     assert!(shown.as_str().unwrap().starts_with("9999-12-30T"), "{shown}");
-    // One second past `Timestamp::MAX` is outside its range.
+    // One second past `Timestamp::MAX` is outside its range, for `next-run` as for `last-run`.
     assert_eq!(last_run(max + Duration::from_secs(1), utc), null);
+    let status = task_status(
+        common(State::Idle, None, true),
+        None,
+        None,
+        Some(max + Duration::from_secs(1)),
+    );
+    assert_eq!(document(&status)["next-run"], null);
 
     // Negative years and `Timestamp::MIN` cannot be held by Windows' `SystemTime`.
     let year = |year: i16, month, day, hour| {
@@ -558,11 +565,10 @@ fn an_offset_with_seconds_is_written_to_the_minute_and_names_the_same_instant() 
     }
 }
 
-/// The unknown zone, which `jiff` gives where it cannot determine the system zone, writes RFC 3339's unknown
-/// offset.
+/// The unknown zone, which `jiff` gives where it cannot determine the system zone, writes UTC with `Z`.
 #[skuld::test]
-fn the_unknown_zone_writes_the_unknown_offset() {
-    assert_eq!(last_run(at(NOON), &TimeZone::unknown()), "2026-01-15T12:00:00-00:00");
+fn the_unknown_zone_writes_utc_with_z() {
+    assert_eq!(last_run(at(NOON), &TimeZone::unknown()), "2026-01-15T12:00:00Z");
 }
 
 /// A zone with daylight saving writes each time with the offset in force at that time.

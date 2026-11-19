@@ -14,9 +14,8 @@
 //! schedule). `last-result` is `{"code": n}` or `{"signal": n}`. A time is RFC 3339 to the second, with the
 //! system time zone's offset at that instant, to the minute. It is `null` when the instant is outside `jiff`'s
 //! `Timestamp` range or its civil year in that offset is outside 0 to 9999. Where `jiff` cannot determine the
-//! system zone, it behaves as UTC: the instant stays exact and the offset reads `-00:00`, RFC 3339's
-//! "unknown". A `daemons` entry
-//! carries no `name`:
+//! system zone, a time is written in UTC with `Z`, which RFC 9557 uses for an unknown local offset. A `daemons`
+//! entry carries no `name`:
 //! [`crate::manager::ServiceManager::status`] returns a [`Status`] with no
 //! spec, so only `list` could supply it, and the two subcommands must not
 //! differ in fields. `pid` is an integer or `null`; `null` means the manager
@@ -287,7 +286,7 @@ pub(crate) fn from_index(index: &InstalledIndex, zone: &TimeZone) -> Report {
 /// The zone a document's times are written in, which a caller resolves once per document so every entry carries
 /// the same offset rule. It is `jiff`'s system zone on every platform, which honours `TZ`; a printed time is an
 /// exact instant whatever offset it carries. Where `jiff` cannot determine the system zone it returns the unknown
-/// zone, which behaves as UTC: the instant stays exact and the offset reads `-00:00`, RFC 3339's "unknown".
+/// zone, and a time is written in UTC with `Z` (RFC 9557's unknown local offset).
 pub(crate) fn display_zone() -> TimeZone {
     TimeZone::system()
 }
@@ -312,10 +311,10 @@ pub(crate) fn daemon(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport
 }
 
 /// `time` as RFC 3339 with `zone`'s offset at that instant, to the second (`2026-11-18T03:30:00+02:00`).
-/// A fraction is dropped toward the earlier second, before the epoch as after it. The offset is truncated to the
-/// minute, which is all RFC 3339 prints, and the civil time is computed from that truncated offset, so it names
-/// the instant it was given (an offset with seconds, as Africa/Monrovia had until 1972, would otherwise print
-/// 30 s late). `None`, unknown and never a bound that reads as a time, when `time` is outside `jiff`'s
+/// A fraction is dropped toward the earlier second, before the epoch as after it. The offset is cut to the
+/// minute, which is all RFC 3339 prints, and the civil time is computed from that offset, so it names the instant
+/// it was given (an offset with seconds, as Africa/Monrovia had until 1972, would otherwise print 30 s late). It
+/// is truncated, not rounded: rounding can leave `Offset`'s range at its edge, truncating cannot. `None`, unknown and never a bound that reads as a time, when `time` is outside `jiff`'s
 /// `Timestamp` range or its civil year there is outside 0 to 9999, which RFC 3339 can write.
 fn format_time(time: SystemTime, zone: &TimeZone) -> Option<String> {
     let whole = Timestamp::try_from(time)
@@ -329,9 +328,8 @@ fn format_time(time: SystemTime, zone: &TimeZone) -> Option<String> {
     if !(0..=9999).contains(&offset.to_datetime(whole).year()) {
         return None;
     }
-    // RFC 3339 writes an unknown local offset as `-00:00`; the unknown zone's offset is zero.
     Some(match zone.is_unknown() {
-        true => format!("{}-00:00", offset.to_datetime(whole)),
+        true => whole.to_string(),
         false => whole.display_with_offset(offset).to_string(),
     })
 }
