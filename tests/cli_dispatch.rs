@@ -2574,7 +2574,7 @@ fn status_json_reports_a_null_pid_for_a_stopped_daemon() {
 }
 
 /// A task's entry carries its type and what the manager knows of its runs; the times are RFC 3339 with
-/// an offset, whatever zone the host is in, and name the instants seeded.
+/// an offset, whatever zone the host is in.
 #[skuld::test]
 fn status_json_of_a_task_carries_type_results_and_times() {
     let fake = Fake::new();
@@ -2653,7 +2653,7 @@ fn status_json_of_a_task_that_never_ran_is_idle_with_null_results() {
     }
 }
 
-/// A service's entry has the three task keys, null, so one schema reads both.
+/// A service's entry has the three task keys, null.
 #[skuld::test]
 fn status_json_of_a_service_has_type_service_and_null_task_keys() {
     let fake = Fake::new();
@@ -2694,6 +2694,13 @@ fn status_json_with_no_ids_equals_list_json_with_a_task_installed() {
         ["service", "task"],
         "both kinds are in the document that was compared"
     );
+    let task = &daemons(&doc)[1];
+    assert_eq!(task["last-result"], serde_json::json!({"code": 3}));
+    for (key, seconds) in [("last-run", 1_768_478_400), ("next-run", 1_768_478_460)] {
+        let text = task[key].as_str().unwrap_or_else(|| panic!("`{key}` is a string: {task}"));
+        let parsed: jiff::Timestamp = text.parse().unwrap_or_else(|e| panic!("`{key}` = {text}: {e}"));
+        assert_eq!(parsed.as_second(), seconds, "{key}");
+    }
 }
 
 /// `list`'s text row names the type in a last column, so the columns that were there keep their positions.

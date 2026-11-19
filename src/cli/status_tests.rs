@@ -21,7 +21,7 @@ fn line_of(status: &Status) -> String {
     format_status_line(&report::daemon("job", status, &jiff::tz::TimeZone::UTC))
 }
 
-/// A service's line is as it was before tasks.
+/// A service's line is `id: state (enabled=, pid=)`.
 #[skuld::test]
 fn status_text_of_a_service_has_no_task_suffix() {
     let status = Status::Service(DaemonStatus {
@@ -69,6 +69,26 @@ fn status_text_of_a_task_names_its_type_results_and_times() {
     assert_eq!(
         line_of(&task(None, None, None)),
         "job: idle (task, enabled=true, pid=-, last-result=-, last-run=-, next-run=-)"
+    );
+
+    // A running task has a pid; a Windows `stop` exit code is the signed value; a time outside RFC 3339's years
+    // is `-`.
+    let running = Status::Task(TaskStatus {
+        common: DaemonStatus {
+            state: State::Running,
+            pid: Some(4321),
+            enabled: true,
+        },
+        last_result: Some(Exit::Code(-1_073_741_510)),
+        last_run: Some(at(1_768_478_400)),
+        next_run: Some(at(300_000_000_000)),
+    });
+    assert_eq!(
+        line_of(&running),
+        concat!(
+            "job: running (task, enabled=true, pid=4321, last-result=exit code -1073741510, ",
+            "last-run=2026-01-15T12:00:00+00:00, next-run=-)"
+        )
     );
 }
 

@@ -213,9 +213,8 @@ libsearch-guard.workspace = true
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
-# `backend::launchd::next`'s tests off macOS, and the integration tests that name `jiff` (`cli_dispatch.rs`,
-# `scm_integration/task_schedule.rs`), which cannot see the library's optional `jiff`. The default features bundle
-# a zone database where the host has none (Windows).
+# The tests' `jiff` (the library's optional `jiff` is invisible to integration tests). Default features bundle a
+# zone database where the host has none (Windows).
 jiff = "0.2.43"
 libsearch-guard.workspace = true
 

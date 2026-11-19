@@ -384,7 +384,6 @@ fn document(status: &Status) -> serde_json::Value {
     serde_json::to_value(daemon("job", status, &TimeZone::UTC)).expect("a DaemonReport serializes infallibly")
 }
 
-/// One shape for every daemon: a consumer reads the same keys of a service and of a task.
 #[skuld::test]
 fn a_service_entry_carries_type_service_and_null_task_fields() {
     let status = Status::Service(common(State::Running, Some(1234), true));
@@ -473,8 +472,7 @@ fn every_entry_of_a_listing_is_written_in_the_one_zone_given() {
     assert_eq!(runs, [Some("2026-01-15T18:30:00+05:30"); 2]);
 }
 
-/// A time `jiff` cannot represent (years beyond -9999 to 9999) is unknown, not a clamped bound that reads as a
-/// real time.
+/// A time `jiff` cannot represent is unknown, not a clamped bound that reads as a real time.
 #[skuld::test]
 fn a_time_outside_jiffs_range_is_null() {
     // About 11,500 CE, and about 10,700 BCE; Windows' `SystemTime` starts in 1601 and cannot hold the second.
@@ -497,6 +495,105 @@ fn a_time_outside_jiffs_range_is_null() {
     let json = document(&status);
     assert_eq!(json["last-run"], "2026-01-15T12:00:00+00:00");
     assert_eq!(json["next-run"], serde_json::Value::Null);
+}
+
+/// `time` as `SystemTime`, or `None` where the platform's `SystemTime` cannot hold it (Windows before 1601).
+fn system_time(time: Timestamp) -> Option<SystemTime> {
+    let since_epoch = time.as_duration();
+    if since_epoch.is_negative() {
+        UNIX_EPOCH.checked_sub(since_epoch.unsigned_abs())
+    } else {
+        UNIX_EPOCH.checked_add(since_epoch.unsigned_abs())
+    }
+}
+
+/// The `last-run` document of an instant seen in `zone`.
+fn last_run(time: SystemTime, zone: &TimeZone) -> serde_json::Value {
+    let status = task_status(common(State::Idle, None, true), None, Some(time), None);
+    serde_json::to_value(daemon("job", &status, zone)).unwrap()["last-run"].clone()
+}
+
+/// RFC 3339 has years 0000 to 9999: an instant whose civil year in the display offset is outside them is `null`,
+/// as is one outside `Timestamp`'s own range, where `jiff` would print a negative year in an expanded form.
+#[skuld::test]
+fn a_time_is_null_outside_rfc_3339s_years_and_jiffs_range() {
+    let utc = &TimeZone::UTC;
+    let null = serde_json::Value::Null;
+
+    // The last day: 9999-12-30, and `Timestamp::MAX`, both in range.
+    let last_day: Timestamp = "9999-12-30T00:00:00Z".parse().unwrap();
+    assert_eq!(
+        last_run(system_time(last_day).expect("year 9999 fits"), utc),
+        "9999-12-30T00:00:00+00:00"
+    );
+    let max = system_time(Timestamp::MAX).expect("year 9999 fits");
+    let shown = last_run(max, utc);
+    assert!(shown.as_str().unwrap().starts_with("9999-12-30T"), "{shown}");
+    // One second past `Timestamp::MAX` is outside its range.
+    assert_eq!(last_run(max + Duration::from_secs(1), utc), null);
+
+    // Negative years and `Timestamp::MIN` cannot be held by Windows' `SystemTime`.
+    let year = |year: i16, month, day, hour| {
+        jiff::civil::date(year, month, day)
+            .at(hour, 0, 0, 0)
+            .to_zoned(TimeZone::UTC)
+            .unwrap()
+            .timestamp()
+    };
+    let cases = [
+        // The first instant of year 0 is written; the second before it is year -1.
+        (year(0, 1, 1, 0), utc, Some("0000-01-01T00:00:00+00:00")),
+        (year(0, 1, 1, 0) - jiff::SignedDuration::from_secs(1), utc, None),
+        // The year is the display offset's: year 0 in UTC is year -1 at -01:00, and year -1 in UTC is year 0 at +01:00.
+        (year(0, 1, 1, 0), &zone(-3600), None),
+        (year(-1, 12, 31, 23), &zone(3600), Some("0000-01-01T00:00:00+01:00")),
+        (Timestamp::MIN, utc, None),
+    ];
+    for (instant, zone, expected) in cases {
+        match system_time(instant) {
+            Some(time) => assert_eq!(last_run(time, zone), expected.map_or(null.clone(), serde_json::Value::from), "{instant}"),
+            None => assert!(cfg!(windows), "only Windows' SystemTime lacks {instant}"),
+        }
+    }
+    if let Some(min) = system_time(Timestamp::MIN) {
+        assert_eq!(last_run(min - Duration::from_secs(1), utc), null);
+    }
+}
+
+/// jiff prints the offset to the minute but would compute the civil time from the exact offset: the printed
+/// time must name the instant it was given.
+#[skuld::test]
+fn an_offset_with_seconds_is_written_to_the_minute_and_names_the_same_instant() {
+    // Africa/Monrovia until 1972: -00:44:30.
+    let time = at(0);
+    for (offset, expected) in [
+        (-2670, "1969-12-31T23:15:00-00:45"),
+        (2670, "1970-01-01T00:45:00+00:45"),
+        (-2669, "1969-12-31T23:16:00-00:44"),
+    ] {
+        let shown = last_run(time, &zone(offset));
+        assert_eq!(shown, expected, "offset {offset} s");
+        let parsed: Timestamp = shown.as_str().unwrap().parse().unwrap();
+        assert_eq!(parsed.as_second(), 0, "{shown} names the instant given");
+    }
+}
+
+/// A zone with daylight saving writes each time with the offset in force at that time.
+#[skuld::test]
+fn each_time_carries_the_offset_in_force_at_that_instant() {
+    let new_york = TimeZone::get("America/New_York").expect("a bundled zone");
+    let summer: Timestamp = "2026-07-15T12:00:00Z".parse().unwrap();
+    let status = task_status(
+        common(State::Idle, None, true),
+        None,
+        Some(at(NOON)),
+        Some(system_time(summer).expect("2026 fits")),
+    );
+
+    let json = serde_json::to_value(daemon("job", &status, &new_york)).unwrap();
+
+    assert_eq!(json["last-run"], "2026-01-15T07:00:00-05:00");
+    assert_eq!(json["next-run"], "2026-07-15T08:00:00-04:00");
 }
 
 /// The fraction of a second is dropped toward the earlier second, before the epoch as after it.

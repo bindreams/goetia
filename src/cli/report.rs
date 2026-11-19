@@ -9,12 +9,12 @@
 //! "errors":[],"undetermined":[]}
 //! ```
 //!
-//! (One line in the real document.) `daemons`, `errors` and `undetermined` are always present, as arrays,
-//! possibly empty. A `daemons` entry is a service or a task, told by `type`, in one shape: `last-result`,
-//! `last-run` and `next-run` are `null` on a service, and `null` on a task for what its manager does not
-//! know (no run yet, a run in flight, no armed schedule). `last-result` is `{"code": n}` or
-//! `{"signal": n}`. A time is RFC 3339 with the offset of the system time zone at that instant, to the
-//! second; a time `jiff` cannot represent (years beyond -9999 to 9999) is `null`. A `daemons` entry
+//! `daemons`, `errors` and `undetermined` are always arrays. `last-result`, `last-run` and `next-run` are
+//! `null` on a service, and on a task where its manager does not know them (no run yet, run in flight, no armed
+//! schedule). `last-result` is `{"code": n}` or `{"signal": n}`. A time is RFC 3339 to the second, with the
+//! system time zone's offset at that instant, to the minute. It is `null` when the instant is outside `jiff`'s
+//! `Timestamp` range or its civil year in that offset is outside 0 to 9999. Where `jiff` cannot determine the
+//! system zone, it behaves as UTC: the instant stays exact and the offset reads `+00:00`. A `daemons` entry
 //! carries no `name`:
 //! [`crate::manager::ServiceManager::status`] returns a [`Status`] with no
 //! spec, so only `list` could supply it, and the two subcommands must not
@@ -37,7 +37,7 @@ use std::fmt::{self, Write as _};
 use std::io::Write;
 use std::time::SystemTime;
 
-use jiff::tz::TimeZone;
+use jiff::tz::{Offset, TimeZone};
 use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 
 use super::ExitCode;
@@ -67,8 +67,7 @@ pub(crate) struct UndeterminedReport {
     pub reason: String,
 }
 
-/// One daemon, a service or a task, in one shape: the three task keys are `null` on a service, never
-/// absent.
+/// The three task keys are `null` on a service, never absent.
 #[derive(serde::Serialize)]
 pub(crate) struct DaemonReport {
     pub id: String,
@@ -80,10 +79,10 @@ pub(crate) struct DaemonReport {
     /// How the most recent finished run ended: `{"code": n}` or `{"signal": n}`.
     #[serde(rename = "last-result")]
     pub last_result: Option<Exit>,
-    /// When the most recent run started, as [`format_time`] writes it.
+    /// When the most recent run started.
     #[serde(rename = "last-run")]
     pub last_run: Option<String>,
-    /// When the manager will start the task next, as [`format_time`] writes it.
+    /// When the manager will start the task next.
     #[serde(rename = "next-run")]
     pub next_run: Option<String>,
 }
@@ -286,13 +285,13 @@ pub(crate) fn from_index(index: &InstalledIndex, zone: &TimeZone) -> Report {
 
 /// The zone a document's times are written in, which a caller resolves once per document so every entry carries
 /// the same offset rule. It is `jiff`'s system zone on every platform, which honours `TZ`; a printed time is an
-/// exact instant whatever offset it carries.
+/// exact instant whatever offset it carries. Where `jiff` cannot determine the system zone it returns the unknown
+/// zone, which behaves as UTC: the instant stays exact and the offset reads `+00:00`. No warning is given.
 pub(crate) fn display_zone() -> TimeZone {
     TimeZone::system()
 }
 
-/// One daemon, from a successful `ServiceManager::status(&id)`, with its times in `zone`. A caller resolves
-/// the system zone once per document, so every entry of it carries the same offset rule.
+/// One daemon, from a successful `ServiceManager::status(&id)`, with its times in `zone`.
 pub(crate) fn daemon(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport {
     let common = status.common();
     let (last_result, last_run, next_run) = match status {
@@ -312,14 +311,21 @@ pub(crate) fn daemon(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport
 }
 
 /// `time` as RFC 3339 with `zone`'s offset at that instant, to the second (`2026-11-18T03:30:00+02:00`).
-/// A fraction is dropped toward the earlier second, before the epoch as after it. A time `jiff` cannot represent
-/// (years beyond -9999 to 9999), which no manager reports, is `None`: unknown, never a bound that reads as a time.
+/// A fraction is dropped toward the earlier second, before the epoch as after it. The offset is rounded to the
+/// minute, which is all RFC 3339 prints, and the civil time is computed from that rounded offset, so it names
+/// the instant it was given (an offset with seconds, as Africa/Monrovia had until 1972, would otherwise print
+/// 30 s late). `None`, unknown and never a bound that reads as a time, when `time` is outside `jiff`'s
+/// `Timestamp` range or its civil year there is outside 0 to 9999, which RFC 3339 can write.
 fn format_time(time: SystemTime, zone: &TimeZone) -> Option<String> {
     let whole = Timestamp::try_from(time)
         .ok()?
         .round(TimestampRound::new().smallest(Unit::Second).mode(RoundMode::Floor))
         .ok()?;
-    Some(whole.display_with_offset(zone.to_offset(whole)).to_string())
+    // Rounding fails only at the extreme of `Offset`'s range, which no zone has; UTC is exact there too.
+    let offset = zone.to_offset(whole).round(Unit::Minute).unwrap_or(Offset::UTC);
+    (0..=9999)
+        .contains(&offset.to_datetime(whole).year())
+        .then(|| whole.display_with_offset(offset).to_string())
 }
 
 /// Classify a failure of `ServiceManager::status(&id)` — and of nothing

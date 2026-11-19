@@ -116,8 +116,7 @@ fn print_daemons(report: &Report, out: &mut dyn Write) {
 /// The one human-readable shape `status` renders in, shared by both
 /// invocation forms.
 ///
-/// A task's line names its type and what its manager knows of its runs, `-` where it knows nothing; a
-/// service's is `id: state (enabled=, pid=)`.
+/// A task's line names its type and what its manager knows of its runs, `-` where it knows nothing.
 fn format_status_line(daemon: &DaemonReport) -> String {
     let or_dash = |value: Option<String>| value.unwrap_or_else(|| "-".to_string());
     let pid = or_dash(daemon.pid.map(|p| p.to_string()));
