@@ -362,13 +362,10 @@ fn resolve_shape(
         },
         Phase::Authored,
     );
-    // `type` is shaped before the paths: `command[0]`'s systemd rules depend on it, and its own error
-    // outranks theirs. A `type` still deferred or absent is read as a service, the stricter reading.
+    // `command[0]`'s systemd rules depend on `type`, and its error outranks theirs. An absent `type` is a
+    // service; `native` is set only once substitution is done, so `type` is never deferred when it is read.
     let daemon_type = shape(id, Field::Type, raw.daemon_type, substitution, parse_type)?;
-    let kind = match daemon_type {
-        Shaped::Parsed(kind) => kind,
-        Shaped::Absent | Shaped::Deferred => DaemonKind::Service,
-    };
+    let kind = daemon_type.parsed().unwrap_or(DaemonKind::Service);
     let native = native.map(|backend| (backend, kind));
     let mut command = raw.command;
     let mut cwd = raw.cwd;

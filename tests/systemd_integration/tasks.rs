@@ -695,9 +695,7 @@ fn a_task_whose_env_sh_resets_is_refused_before_anything_is_written(#[fixture(sy
     assert!(!crate::linux::unit_path(&id).exists() && !timer_path(&id).exists());
 }
 
-/// A task's `command[0]` may hold a backslash, `"`, `'` or a trailing space: the task starts through `sh`,
-/// which execs the path as written, and the program's own output arrives. (A service's path may not: its
-/// `ExecStart=` is the path itself.)
+/// `sh` execs a task's `command[0]` as written, so the program runs and its output arrives.
 #[skuld::test]
 fn a_task_whose_command_has_a_backslash_quote_or_trailing_space_installs_and_runs(
     #[fixture(systemd_group)] _group: &Group,

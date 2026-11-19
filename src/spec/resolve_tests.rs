@@ -3419,7 +3419,6 @@ command: [bin/frpc]
         assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
     }
 
-    /// The path rules of `command[0]` are a service's: the same four forms resolve for a task.
     #[cfg(unix)]
     #[skuld::test]
     fn a_systemd_host_refuses_a_special_command_zero_for_a_service_and_not_for_a_task() {

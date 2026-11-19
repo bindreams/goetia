@@ -250,7 +250,7 @@ impl BackendKind {
 
 /// The first value of `common` that systemd cannot carry, the generator's check.
 ///
-/// - `command[0]`, `cwd` and `logs`: see [`systemd_path_field_defect`]; `kind` is the daemon's.
+/// - `command[0]`, `cwd` and `logs`: see [`systemd_path_field_defect`].
 /// - Then the others: see [`systemd_value_defect`].
 pub(crate) fn systemd_defect(common: &DaemonFields, kind: DaemonKind) -> Option<String> {
     let values = FieldValues::from(common);

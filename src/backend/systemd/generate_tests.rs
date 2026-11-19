@@ -1293,8 +1293,7 @@ fn a_value_no_encoding_carries_is_refused_for_a_task_too() {
     assert!(message.contains("`cwd`"), "{message}");
 }
 
-/// The path rules of `command[0]` are a service's: a task's path is an ordinary word after the wrapper, which
-/// `sh` execs as written (a backslash, a quote or a trailing space is no more than another character in it).
+/// A task's `command[0]` is an ordinary word after the wrapper, which `sh` execs as written.
 #[skuld::test]
 fn a_tasks_executable_path_may_hold_a_backslash_quote_or_trailing_space() {
     for (suffix, written) in [

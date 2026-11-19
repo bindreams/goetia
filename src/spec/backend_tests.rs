@@ -381,7 +381,6 @@ fn shaped_with_env_key(key: &str) -> ShapedSpec {
     spec
 }
 
-/// `command[0]`'s path rules are a service's: a task's path is an ordinary word after `sh`.
 #[skuld::test]
 fn command_zero_path_rules_apply_to_a_service_and_not_to_a_task() {
     for path in [r"/bin/a\b", "/bin/a\"b", "/bin/a'b", "/bin/a "] {
