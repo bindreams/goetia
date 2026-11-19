@@ -21,6 +21,7 @@ use crate::decide::{self, ExternalConfig, Ownership};
 use crate::elevation::test_support::process_user_sid;
 use crate::manager::State;
 use crate::spec::{AccountId, DaemonKind, User};
+use crate::testing::groups::{Group, scm_group};
 
 fn id() -> Id {
     Id::try_from("nightly").unwrap()
@@ -777,6 +778,121 @@ fn a_change_of_account_that_does_not_land_leaves_both_accounts_their_log() {
     }
 }
 
+/// A delete or registration that fails leaves the old account able to write the record directory, beside the new one.
+#[skuld::test]
+fn a_change_of_account_that_does_not_land_leaves_both_accounts_their_records_directory() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    for ending in ["raced", "register fails", "delete fails"] {
+        let (dir, runs) = made_records();
+        let fake = Fake::new();
+        fake.on_set_enabled(Ok(())).on_instances(Ok(Vec::new()));
+        match ending {
+            "raced" => {
+                fake.on_delete(Ok(true)).on_register(Ok(Registration::Raced));
+            }
+            "register fails" => {
+                fake.on_delete(Ok(true))
+                    .on_register(Err(Error::os("register", std::io::Error::other("denied"))))
+                    .on_set_enabled(Err(Error::NotInstalled { id: "nightly".into() }));
+            }
+            _ => {
+                fake.on_delete(Err(Error::os("delete", std::io::Error::other("denied"))))
+                    .on_set_enabled(Ok(()));
+            }
+        }
+
+        let _ = scm(&fake).task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        );
+
+        let trustees = trustees_of(&records_dir(&dir));
+        assert!(
+            trustees.contains(&local_service()),
+            "{ending}: the registered account can still write its records"
+        );
+        assert!(
+            trustees.contains(&users()),
+            "{ending}: the new account can write its own"
+        );
+    }
+}
+
+/// A change that lands narrows the record directory to the new account alone.
+#[skuld::test]
+fn a_change_of_account_that_lands_leaves_the_new_account_alone_in_the_records_directory() {
+    let (dir, runs) = made_records();
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap();
+
+    let trustees = trustees_of(&records_dir(&dir));
+    assert!(trustees.contains(&users()));
+    assert!(!trustees.contains(&local_service()));
+}
+
+/// An account change from a snapshot whose stored principal cannot be told widens nothing in the record directory
+/// (`Kept::both(&[])`), so the landing leaves it naming the new account alone, as the log.
+#[skuld::test]
+fn an_account_change_from_an_untold_principal_names_the_new_account_alone() {
+    let (dir, runs) = made_records();
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let installed = registered_task(&old, false);
+    let no_principal = Registered {
+        xml: installed.xml.replace("<UserId>S-1-5-19</UserId>", ""),
+        data: installed.data.clone(),
+        enabled: Some(true),
+    };
+    assert_ne!(no_principal.xml, installed.xml, "the principal is gone");
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+
+    let wrote = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&TaskSnapshot::new(id(), Ok(blob(&old)), no_principal)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap();
+
+    assert!(matches!(wrote, WriteOutcome::Done), "{wrote:?}");
+    for (what, trustees) in [
+        ("the records", trustees_of(&records_dir(&dir))),
+        ("the log", trustees_of(&default_log(&dir))),
+    ] {
+        assert!(trustees.contains(&users()), "{what} name the new account");
+        assert!(!trustees.contains(&local_service()), "{what} do not name the old");
+    }
+    fake.finish();
+}
+
 /// A change that lands leaves the new account alone: the registered account's entry and anything else on the
 /// file are gone.
 #[skuld::test]
@@ -832,6 +948,167 @@ fn an_unchanged_install_names_the_account_alone_in_the_log() {
     let trustees = trustees_of(&default_log(&dir));
     assert!(trustees.contains(&users()));
     assert!(!trustees.contains(&process_user_sid()));
+}
+
+// An install that finds the task up to date ---------------------------------------------------------------------------
+
+/// [`task_beside_with`] under the temporary `%ProgramData%` `dir`, whose folders are judged as `Disable` (goetia's
+/// own check could not pass there).
+fn beside_of(
+    dir: &TempDir,
+    spec: &DaemonSpec,
+    snapshot: &TaskSnapshot,
+    prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
+) -> Result<()> {
+    task_beside_with(
+        dir.path(),
+        &FolderCheck::new(CheckPermissions::Disable),
+        spec,
+        &definition(spec),
+        snapshot,
+        prepare,
+    )
+}
+
+/// [`beside_of`] for [`users_spec`], with a `prepare` that looks at the account alone.
+fn beside_with(
+    dir: &TempDir,
+    snapshot: &TaskSnapshot,
+    prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
+) -> Result<()> {
+    beside_of(dir, &users_spec(), snapshot, |account, _, _| prepare(account))
+}
+
+/// The task of `Users` (an account the test is in, so that it may read what the install sets).
+fn users_spec() -> DaemonSpec {
+    task_spec_as(User::Id(AccountId::Sid("S-1-5-32-545".to_owned())), Some("30 3 * * *"))
+}
+
+/// The account the definition of [`users_spec`] registers, which is the account its snapshot is registered as.
+fn users_account() -> TaskAccount {
+    definition(&users_spec()).account()
+}
+
+/// A task of `Users` as an install made it.
+fn made_by_an_install() -> (TempDir, Runs, TaskSnapshot) {
+    let (dir, runs) = records();
+    let snapshot = snapshot_of(&users_spec(), false);
+    beside_with(&dir, &snapshot, prepared(users(), None)).unwrap();
+    assert!(records_dir(&dir).is_dir());
+    (dir, runs, snapshot)
+}
+
+#[track_caller]
+fn assert_beside_remakes(dir: &TempDir, runs: &Runs, snapshot: &TaskSnapshot) {
+    beside_with(dir, snapshot, prepared(users(), None)).unwrap();
+    assert!(runs.hold().is_ok(), "a run of the task does not back off");
+
+    assert!(records_dir(dir).is_dir(), "the record directory is there");
+    assert!(trustees_of(&records_dir(dir)).contains(&users()), "naming the account");
+    assert!(default_log(dir).is_file(), "and the default log");
+}
+
+/// An install that finds the task up to date makes its record directory again, which the shim only opens.
+/// Making the folders names Administrators as their owner, which only an elevated token may.
+#[skuld::test]
+fn an_up_to_date_install_makes_a_deleted_record_directory_again(#[fixture(scm_group)] _group: &Group) {
+    let (dir, runs, snapshot) = made_by_an_install();
+    std::fs::remove_dir(records_dir(&dir)).unwrap();
+
+    assert_beside_remakes(&dir, &runs, &snapshot);
+}
+
+/// ... and `runs` itself, which every task's directory is in.
+#[skuld::test]
+fn an_up_to_date_install_makes_a_deleted_runs_folder_again(#[fixture(scm_group)] _group: &Group) {
+    let (dir, runs, snapshot) = made_by_an_install();
+    std::fs::remove_dir_all(dir.path().join("Goetia").join("runs")).unwrap();
+
+    assert_beside_remakes(&dir, &runs, &snapshot);
+}
+
+/// ... and takes away the marker an uninstall that died left, which makes a `run` of the id back off.
+#[skuld::test]
+fn an_up_to_date_install_clears_a_marker_a_dead_uninstall_left(#[fixture(scm_group)] _group: &Group) {
+    let (dir, runs, snapshot) = made_by_an_install();
+    let marker = dir.path().join("Goetia").join("runs").join("nightly~removing");
+    std::fs::write(&marker, "").unwrap();
+    assert!(runs.hold().is_err(), "a run backs off while the marker is there");
+
+    assert_beside_remakes(&dir, &runs, &snapshot);
+
+    assert!(!marker.exists());
+    assert!(runs.hold().is_ok());
+}
+
+/// An install cut short after the directory named both accounts leaves it so until the next install, which
+/// finds the task up to date and names the registered account alone.
+#[skuld::test]
+fn an_up_to_date_install_names_the_registered_account_alone_in_the_record_directory(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let (dir, runs, snapshot) = made_by_an_install();
+    runs.ensure(&[users(), local_service()]).unwrap();
+    assert!(trustees_of(&records_dir(&dir)).contains(&local_service()));
+
+    assert_beside_remakes(&dir, &runs, &snapshot);
+
+    assert!(!trustees_of(&records_dir(&dir)).contains(&local_service()));
+}
+
+/// ... and sees to what a write sees to for the spec's account (the event source, a real user's logon right),
+/// written as the spec writes it, which a refusal quotes. It reads no password: the task is not registered
+/// again. A failure of it fails the install.
+#[skuld::test]
+fn an_up_to_date_install_sees_to_what_the_machine_must_hold_for_the_specs_account(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let (dir, _runs, snapshot) = made_by_an_install();
+    let seen = std::cell::Cell::new(false);
+
+    beside_of(&dir, &users_spec(), &snapshot, |account, written, reads| {
+        assert_eq!(account, &users_account());
+        assert!(matches!(written, Some(Written::Sid("S-1-5-32-545"))), "{written:?}");
+        assert!(matches!(reads, Password::Unneeded), "no password is read");
+        seen.set(true);
+        Ok(Prepared {
+            principal: users(),
+            password: None,
+        })
+    })
+    .unwrap();
+    assert!(seen.get());
+
+    let refused = beside_with(&dir, &snapshot, |_| {
+        Err(Error::InvalidPassword { variable: "V".into() })
+    });
+    assert!(matches!(refused, Err(Error::InvalidPassword { .. })), "{refused:?}");
+}
+
+/// The error for a spec account that does not resolve quotes the spec's own field. The record directory is not
+/// made, though the folders above it may be, and nothing the account needs is set: the lookup comes before the
+/// logon right, the event source, the records and the log.
+#[skuld::test]
+fn an_up_to_date_install_of_an_unresolvable_spec_account_quotes_the_spec_field(#[fixture(scm_group)] _group: &Group) {
+    let (dir, _runs) = records();
+    let name = "goetia-no-such-account";
+    let spec = task_spec_as(User::Name(name.to_owned()), Some("30 3 * * *"));
+    let snapshot = snapshot_of(&spec, false);
+
+    let failed = beside_of(&dir, &spec, &snapshot, prepare).unwrap_err();
+
+    let text = failed.to_string();
+    assert!(text.contains("user.name") && text.contains(name), "{text}");
+    assert!(!records_dir(&dir).exists(), "`runs\\<id>` is absent");
+    assert!(!default_log(&dir).exists(), "the log is not made");
+}
+
+/// The error of the record directory counts the accounts it names, an account named twice once.
+#[skuld::test]
+fn the_error_of_the_record_directory_counts_the_accounts_once_each() {
+    assert_eq!(whose(&[users()]), "its account");
+    assert_eq!(whose(&[users(), users()]), "its account");
+    assert_eq!(whose(&[users(), local_service()]), "its accounts");
 }
 
 // Before any write ====================================================================================================
@@ -1305,7 +1582,7 @@ fn a_task_that_runs_is_not_changed_into_a_service() {
 #[skuld::test]
 fn a_gate_that_fails_leaves_the_task_untouched() {
     let (dir, runs) = made_records();
-    runs.ensure(&process_user_sid()).unwrap();
+    runs.ensure(&[process_user_sid()]).unwrap();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_instances(Ok(Vec::new()));
@@ -1337,7 +1614,7 @@ fn a_gate_that_fails_leaves_the_task_untouched() {
 #[skuld::test]
 fn a_task_is_removed_after_the_gate_and_before_the_service_is_created() {
     let (dir, runs) = made_records();
-    runs.ensure(&process_user_sid()).unwrap();
+    runs.ensure(&[process_user_sid()]).unwrap();
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_instances(Ok(Vec::new()))
@@ -1457,6 +1734,34 @@ fn a_gate_that_fails_leaves_the_service_untouched() {
 
 fn prepared_alice() -> impl FnOnce(&TaskAccount) -> Result<Prepared> {
     prepared(process_user_sid(), Some("secret"))
+}
+
+/// A service changed into a task names no account beside the task's in the record directory (the service never
+/// wrote there), so the landing leaves the directory as the write made it: the task's account alone.
+/// Setting the permissions of a directory that names an account other than the test's needs an elevated token.
+#[skuld::test]
+fn a_service_changed_into_a_task_names_the_task_account_alone_in_the_record_directory(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let (dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+
+    scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            prepared(process_user_sid(), None),
+            || Ok(Some(local_service())),
+            || Ok(()),
+        )
+        .unwrap();
+
+    let trustees = trustees_of(&records_dir(&dir));
+    assert!(trustees.contains(&process_user_sid()), "the task's account");
+    assert!(!trustees.contains(&local_service()), "and not the service's");
 }
 
 #[skuld::test]

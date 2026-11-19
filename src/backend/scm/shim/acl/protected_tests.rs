@@ -163,7 +163,10 @@ mod windows {
     #[skuld::test]
     fn the_runs_descriptor_names_the_owner_and_the_principal() {
         let me = users();
-        let wanted = Descriptor::for_runs(&me).unwrap().wanted().unwrap();
+        let wanted = Descriptor::for_runs(std::slice::from_ref(&me))
+            .unwrap()
+            .wanted()
+            .unwrap();
         let inherit = OBJECT_INHERIT | CONTAINER_INHERIT;
         let mut expected = vec![
             allow(system(), FULL, inherit),
@@ -177,6 +180,30 @@ mod windows {
 
         assert_eq!(wanted.owner, administrators());
         assert!(wanted.protected);
+        let mut actual = wanted.dacl.unwrap();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    /// An account change names both accounts alike, each with the entries of the one-account descriptor.
+    #[skuld::test]
+    fn the_runs_descriptor_gives_each_of_its_principals_the_same_entries() {
+        let (first, second) = (users(), crate::backend::scm::sid::sid_from_parts(5, &[19]));
+        let wanted = Descriptor::for_runs(&[first.clone(), second.clone()])
+            .unwrap()
+            .wanted()
+            .unwrap();
+        let inherit = OBJECT_INHERIT | CONTAINER_INHERIT;
+        let mut expected = vec![
+            allow(system(), FULL, inherit),
+            allow(administrators(), FULL, inherit),
+            allow(first.clone(), 0x13_00AF, OBJECT_INHERIT | INHERIT_ONLY),
+            allow(first, 0x12_00EB, 0),
+            allow(second.clone(), 0x13_00AF, OBJECT_INHERIT | INHERIT_ONLY),
+            allow(second, 0x12_00EB, 0),
+        ];
+
         let mut actual = wanted.dacl.unwrap();
         actual.sort();
         expected.sort();
@@ -249,7 +276,7 @@ mod windows {
     // What the runs descriptor grants is read back from a real directory by `runs_tests`.
     #[skuld::test]
     fn the_runs_descriptor_refuses_bytes_that_are_not_a_sid() {
-        assert!(Descriptor::for_runs(&vec![1, 2, 3]).is_err());
+        assert!(Descriptor::for_runs(&[vec![1, 2, 3]]).is_err());
     }
 
     #[skuld::test]
