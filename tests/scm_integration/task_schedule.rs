@@ -3,7 +3,7 @@
 //! second: it computes the run times of a disarmed task too (M2), so those tests arm nothing.
 
 use std::collections::BTreeSet;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
@@ -89,6 +89,57 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
     assert!(!listener.connected_yet(), "no second program was started");
     mgr.stop(id, Budget::DEFAULT).expect("stop");
     mgr.uninstall(id).expect("uninstall");
+}
+
+/// `disable` stops a repetition in progress: a disabled `* * * * *` task starts nothing at later boundaries.
+/// A control task armed alike marks when boundary B1 (the first after `disable` returned) has passed; the
+/// disabled task's last run must predate B1 - 1 s (tolerating a start dispatched before `disable` returned,
+/// which the task was still armed for, and millisecond skew). `enable` then starts it again.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixture(scm_group)] _group: &Group) {
+    let (subject, control) = (TaskGuard::new(), TaskGuard::new());
+    let mgr = support::stock_shim_manager();
+    let (subject_listener, control_listener) = (ConnectBack::listen(), ConnectBack::listen());
+    for (guard, listener) in [(&subject, &subject_listener), (&control, &control_listener)] {
+        mgr.install(
+            &task_spec(&guard.id, connects_back(listener), Some("* * * * *"), User::Root, None),
+            false,
+        )
+        .expect("install");
+        mgr.enable(&guard.id).expect("enable");
+    }
+    // Both have started, so the repetition of the hour is in progress.
+    subject_listener.accept_unbounded();
+    control_listener.accept_unbounded();
+
+    mgr.disable(&subject.id).expect("disable");
+    let disabled_at = SystemTime::now();
+
+    let minute = Duration::from_secs(60);
+    let epoch_secs = disabled_at
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    let b1 = UNIX_EPOCH + minute * (epoch_secs / 60 + 1).try_into().expect("a minute count fits");
+    let slack = Duration::from_secs(1);
+    let mut seen = b1;
+    wait::until(|| match task_status(&mgr, &control.id).last_run {
+        Some(run) if run + slack >= b1 + minute => {
+            seen = run;
+            true
+        }
+        _ => false,
+    });
+
+    // A run dispatched before the disable is over before the last start is read.
+    let after = status_once_ended(&mgr, &subject.id);
+    assert!(
+        after.last_run.is_none_or(|run| run + slack < b1),
+        "the disabled task started at or after the boundary {b1:?}, which the control passed: {after:?}"
+    );
+
+    mgr.enable(&subject.id).expect("enable again");
+    wait::until(|| task_status(&mgr, &subject.id).last_run.is_some_and(|run| run > seen));
 }
 
 /// A task that is not armed still starts when asked, and stays not armed.

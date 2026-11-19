@@ -168,10 +168,43 @@ fn open_policy(access: u32) -> isize {
 
 /// When Task Scheduler itself says the task `id` runs between `from` and `to`: its `GetRunTimes`, the
 /// oracle the schedule tests compare the cron they translated with.
+///
+/// A disarmed task has no triggers, so there is nothing to ask. Its schedule's triggers are written for
+/// the question with the task's own flag false, which no start can come of (`GetRunTimes` lists a
+/// disabled task's times, M2), and the task is registered again as it was after; an armed task is asked as
+/// it is. A task that logs on with a password is registered again with `GOETIA_SERVICE_PASSWORD`, as the
+/// verbs do, and is [`PasswordRequired`](crate::error::Error::PasswordRequired) without it, before anything is written.
+/// A task whose schedule compiles to no triggers has no run times: the list is empty, and nothing is written.
 #[cfg(windows)]
 pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
     use crate::backend::scm::instance::TaskPath;
-    crate::backend::scm::manager::task::Com.run_times(&TaskPath::of(id), from, to)
+    use crate::backend::scm::manager::task::{Com, TaskApi as _, registration_password, stored_account};
+    use crate::backend::scm::task_xml::{TaskXml, extract_from_data, triggers_of};
+    use crate::error::Error;
+
+    let path = TaskPath::of(id);
+    let registered = Com
+        .get(&path)?
+        .ok_or_else(|| Error::NotInstalled { id: id.to_string() })?;
+    if TaskXml::armed(&registered.xml) {
+        return Com.run_times(&path, from, to);
+    }
+    let blob = extract_from_data(&registered.data)?.ok_or_else(|| Error::blob("the task's `Data` is not goetia's"))?;
+    if triggers_of(&blob.spec)?.is_empty() {
+        return Ok(Vec::new());
+    }
+    let account = stored_account(&registered)?;
+    let password = registration_password(&account)?;
+    let held = TaskXml::with_own_flag(&TaskXml::with_triggers(&registered.xml, &blob.spec)?, false)?;
+    Com.register(&path, &held, &account, password.as_deref(), true)?;
+    let times = Com.run_times(&path, from, to);
+    let back = Com.register(&path, &registered.xml, &account, password.as_deref(), true);
+    match (times, back) {
+        (Ok(times), Ok(_)) => Ok(times),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        // The restore failed too: report the held task, not this.
+        (Err(times), Err(back)) => Err(Error::both_all([back, times]).expect("two errors")),
+    }
 }
 
 /// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for
