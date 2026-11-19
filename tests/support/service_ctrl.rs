@@ -53,7 +53,8 @@ pub fn report_stopped(handle: StatusHandle, stop_port: u16) {
     report(handle, SERVICE_STOPPED, 0);
 }
 
-fn report(handle: StatusHandle, state: u32, controls_accepted: u32) {
+/// Report `state` as it is, accepting `controls_accepted`.
+pub fn report(handle: StatusHandle, state: u32, controls_accepted: u32) {
     let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,

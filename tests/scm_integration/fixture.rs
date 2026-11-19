@@ -24,11 +24,15 @@
 //!   `RegisterServiceCtrlHandlerExW`, send its pid to `start-port` and block until the test closes its end
 //!   of that connection; then go on as `plain`. Until then the service has made no status report. Run as the
 //!   service host of a `protocol: plain` daemon, it is a shim that holds no log yet.
+//! - `flap:<n>` - report `RUNNING`, send its pid to `start-port` and wait for the test to shut down its end of that
+//!   connection (as `before-handler` does, but after `RUNNING`); then report `PAUSED` and `RUNNING` again `n` times in
+//!   a row, connect to `stop-port` (done), and go on as `plain`.
 
 use std::ffi::OsString;
 use std::sync::mpsc;
 
 use windows_service::{define_windows_service, service_dispatcher};
+use windows_sys::Win32::System::Services::{SERVICE_ACCEPT_STOP, SERVICE_PAUSED, SERVICE_RUNNING};
 
 use crate::support::sentinel::{connect, open, send_line};
 use crate::support::service_ctrl;
@@ -81,7 +85,14 @@ fn service_main(_scm_arguments: Vec<OsString>) {
     let status_handle = service_ctrl::register(&name, (!refuse_stop).then_some(stop_tx));
     service_ctrl::report_running(status_handle, !refuse_stop);
 
-    if let Some(var) = mode.strip_prefix("env:") {
+    if let Some(cycles) = mode.strip_prefix("flap:") {
+        wait_for_release(start_port);
+        for _ in 0..cycles.parse::<u32>().expect("flap cycles") {
+            service_ctrl::report(status_handle, SERVICE_PAUSED, SERVICE_ACCEPT_STOP);
+            service_ctrl::report(status_handle, SERVICE_RUNNING, SERVICE_ACCEPT_STOP);
+        }
+        connect(stop_port);
+    } else if let Some(var) = mode.strip_prefix("env:") {
         let value = std::env::var(var).unwrap_or_else(|_| "\u{0}MISSING".to_string());
         send_line(start_port, &value);
     } else {
