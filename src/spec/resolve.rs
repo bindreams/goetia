@@ -362,13 +362,14 @@ fn resolve_shape(
         },
         Phase::Authored,
     );
-    // The paths are judged before `type` is parsed below, and `command[0]`'s systemd rules depend on
-    // it. A `type` that is deferred or does not parse is read as a service here, the stricter reading:
-    // the pass that parses it reports it.
-    let kind = match shape(id, Field::Type, raw.daemon_type.clone(), substitution, parse_type) {
-        Ok(Shaped::Parsed(kind)) => kind,
-        _ => DaemonKind::Service,
+    // `type` is shaped before the paths: `command[0]`'s systemd rules depend on it, and its own error
+    // outranks theirs. A `type` still deferred or absent is read as a service, the stricter reading.
+    let daemon_type = shape(id, Field::Type, raw.daemon_type, substitution, parse_type)?;
+    let kind = match daemon_type {
+        Shaped::Parsed(kind) => kind,
+        Shaped::Absent | Shaped::Deferred => DaemonKind::Service,
     };
+    let native = native.map(|backend| (backend, kind));
     let mut command = raw.command;
     let mut cwd = raw.cwd;
     let mut logs = raw.logs;
@@ -383,7 +384,6 @@ fn resolve_shape(
             PathField::Logs => logs.as_mut(),
         };
         if let Some(text) = slot {
-            let native = native.map(|backend| (backend, kind));
             *text = resolve_path_string(id, path_field, text, base_dir, substitution, native, &mut warnings)?;
         }
     }
@@ -391,7 +391,6 @@ fn resolve_shape(
     let logs = logs.map(PathBuf::from);
     let env = raw.env;
 
-    let daemon_type = shape(id, Field::Type, raw.daemon_type, substitution, parse_type)?;
     refuse_fields_of_the_other_type(
         id,
         &daemon_type,
