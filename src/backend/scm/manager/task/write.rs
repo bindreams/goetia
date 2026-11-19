@@ -392,7 +392,8 @@ fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept: &Kept<'_>) -> Resul
 /// Once a registration that changed the account, or a service into a task, has landed (`wrote` is
 /// [`WriteOutcome::Done`]), the record directory and the default log name the new account alone. The directory is
 /// set only if `kept` named an account in it: a change of account did, and a service changed into a task did not
-/// (the service never wrote there), so its directory already names the task's account alone. The log is always
+/// (the service never wrote there), nor did a change from a stored principal that cannot be told
+/// (`Kept::both(&[])`): [`task_records`] already named the task's account alone in the directory. The log is always
 /// set: it named the service's account too. Any other end leaves what was widened naming both, which the next
 /// install corrects: it is the one that finds the task as it is ([`task_beside_with`] for an up-to-date one).
 fn landed(id: &Id, runs: &Runs, prepared: &Prepared, kept: &Kept<'_>, wrote: WriteOutcome) -> Result<WriteOutcome> {
@@ -433,40 +434,44 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
 
 /// What an install that finds the task `installed` up to date makes again if it is gone ([`task_beside_with`]),
 /// under the machine's `%ProgramData%`: the folders above the record directory are always judged, as a write
-/// does ([`runs_for_write`]). The machine is seen to for the account the task is registered as, as a real user's
-/// SID spells it (what Task Scheduler stores), without reading a password: the task is not registered again.
-pub(in crate::backend::scm) fn task_beside(installed: &TaskSnapshot) -> Result<()> {
+/// does ([`runs_for_write`]). `spec` and `definition` are what the install writes, which names the account.
+pub(in crate::backend::scm) fn task_beside(
+    spec: &DaemonSpec,
+    definition: &TaskXml,
+    installed: &TaskSnapshot,
+) -> Result<()> {
     task_beside_with(
         &program_data()?,
         &FolderCheck::new(CheckPermissions::Enable),
+        spec,
+        definition,
         installed,
-        |account| {
-            let written = match account {
-                TaskAccount::User(text) if text.starts_with("S-1-") => Some(Written::Sid(text)),
-                TaskAccount::User(_) | TaskAccount::Service(_) => None,
-            };
-            prepare(account, written, Password::Unneeded)
-        },
+        prepare,
     )
 }
 
-/// What a write of the task `installed` makes besides its registration, made again, for the account it is
-/// registered as, which it runs as (moving it to another is a write's job): the folders above the record
-/// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for that account
-/// (`prepare`, as a write's, asked once: the event source and a real user's logon right), the record directory
-/// with the marker a dead uninstall left cleared ([`Runs::ensure`]), and the default log, which the shim only
-/// opens ([`task_records`]). They name that account alone: an install that was cut short between its steps left
-/// both accounts named, and this is the install that corrects it. A task registered as an account that cannot be
-/// told fails, with nothing made.
+/// What a write of the task `installed` makes besides its registration, made again: the folders above the record
+/// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for the account
+/// `definition` registers, written as `spec` writes it (`prepare`, as a write's, asked once and with
+/// [`Password::Unneeded`]: the event source and a real user's logon right, but no password, for the task is not
+/// registered again), the record directory with the marker a dead uninstall left cleared ([`Runs::ensure`]), and
+/// the default log, which the shim only opens ([`task_records`]). They name the account `prepare` found alone: an
+/// install that was cut short between its steps left both accounts named, and this is the install that corrects
+/// it. Moving the task to another account is a write's job, which finds the task registered as another.
 fn task_beside_with(
     program_data: &Path,
     folders: &FolderCheck,
+    spec: &DaemonSpec,
+    definition: &TaskXml,
     installed: &TaskSnapshot,
-    prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
+    prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
 ) -> Result<()> {
-    let account = TaskXml::principal(&installed.registered().xml)?;
     let runs = runs_in(program_data, installed.id(), folders)?;
-    let prepared = prepare(&account)?;
+    let prepared = prepare(
+        &definition.account(),
+        written_user(&spec.common().user),
+        Password::Unneeded,
+    )?;
     task_records(installed.id(), &runs, &prepared.principal, &Kept::default())
 }
 

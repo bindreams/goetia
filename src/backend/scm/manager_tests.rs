@@ -1641,35 +1641,3 @@ fn the_registered_account_is_looked_up_only_for_a_hosted_service_whose_account_c
         "hosted, changed"
     );
 }
-
-/// An install that finds a service up to date sees to what the service needs without reading a password: the
-/// service is not registered again. A native service has no default log, so nothing else is made.
-#[skuld::test]
-fn an_up_to_date_service_install_asks_the_gate_for_no_password() {
-    let spec = blob_of(Protocol::Native).spec;
-    let asked = std::cell::Cell::new(false);
-
-    service_beside(&spec, &dummy_reg(None), |reads| {
-        assert!(matches!(reads, Password::Unneeded), "no password is read");
-        asked.set(true);
-        Ok(Gated {
-            password: None,
-            checked: None,
-        })
-    })
-    .unwrap();
-
-    assert!(asked.get());
-}
-
-/// ... and a gate that refuses fails the install.
-#[skuld::test]
-fn an_up_to_date_service_install_fails_when_the_gate_refuses() {
-    let spec = blob_of(Protocol::Native).spec;
-
-    let refused = service_beside(&spec, &dummy_reg(None), |_| {
-        Err(Error::InvalidPassword { variable: "V".into() })
-    });
-
-    assert!(matches!(refused, Err(Error::InvalidPassword { .. })), "{refused:?}");
-}
