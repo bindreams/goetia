@@ -16,6 +16,9 @@ mod support;
 #[path = "scm_integration/common.rs"]
 mod common;
 #[cfg(windows)]
+#[path = "scm_integration/delivery.rs"]
+mod delivery;
+#[cfg(windows)]
 #[path = "scm_integration/deny.rs"]
 mod deny;
 #[cfg(windows)]
