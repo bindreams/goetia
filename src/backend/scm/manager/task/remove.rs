@@ -61,11 +61,12 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
     }
 }
 
-/// What an uninstall says on stderr when its removal of the run records has to wait, each time the path it
-/// waits for changes: the manager has no channel for a notice, so it is said as its warnings are. A
+/// What an uninstall, or an install that changes the task's account, says on stderr when its wait for the
+/// run records' holders has to wait, each time the path it waits for changes: the manager has no channel
+/// for a notice, so it is said as its warnings are. A
 /// directory that is not empty with nothing known to hold what is in it is said as that, and claims no
 /// holder.
-fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
+pub(super) fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
     match kind {
         PauseKind::Held => eprintln!(
             "waiting for {} to be released by a `run` or another program that has it open",

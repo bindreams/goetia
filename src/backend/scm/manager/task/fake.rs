@@ -39,10 +39,10 @@ struct Script {
     unstated: Vec<Call>,
     get: VecDeque<Result<Option<Registered>>>,
     names: VecDeque<Result<Vec<String>>>,
-    register: VecDeque<Result<Registration>>,
+    register: VecDeque<Result<(Registration, Option<Effect>)>>,
     set_enabled: VecDeque<Result<()>>,
-    delete: VecDeque<Result<bool>>,
-    instances: VecDeque<Result<Vec<Instance>>>,
+    delete: VecDeque<Result<(bool, Option<Effect>)>>,
+    instances: VecDeque<Result<(Vec<Instance>, Option<Effect>)>>,
     info: VecDeque<Result<TaskInfo>>,
     run: VecDeque<Result<(Started, Option<Effect>)>>,
     stop: VecDeque<Result<()>>,
@@ -105,7 +105,22 @@ impl Fake {
     }
 
     pub(crate) fn on_register(&self, reply: Result<Registration>) -> &Self {
-        lock(&self.0).register.push_back(reply);
+        lock(&self.0)
+            .register
+            .push_back(reply.map(|registration| (registration, None)));
+        self
+    }
+
+    /// [`Self::on_register`], where `during` happens before the reply is given: what the world looks like
+    /// when the scheduler is asked to register.
+    pub(crate) fn on_register_during(
+        &self,
+        reply: Result<Registration>,
+        during: impl FnOnce() + Send + 'static,
+    ) -> &Self {
+        lock(&self.0)
+            .register
+            .push_back(reply.map(|registration| (registration, Some(Box::new(during) as Effect))));
         self
     }
 
@@ -115,12 +130,34 @@ impl Fake {
     }
 
     pub(crate) fn on_delete(&self, reply: Result<bool>) -> &Self {
-        lock(&self.0).delete.push_back(reply);
+        lock(&self.0).delete.push_back(reply.map(|deleted| (deleted, None)));
+        self
+    }
+
+    /// [`Self::on_delete`], where `during` happens before the reply is given: what the world looks like
+    /// when the scheduler is asked to delete.
+    pub(crate) fn on_delete_during(&self, reply: Result<bool>, during: impl FnOnce() + Send + 'static) -> &Self {
+        lock(&self.0)
+            .delete
+            .push_back(reply.map(|deleted| (deleted, Some(Box::new(during) as Effect))));
         self
     }
 
     pub(crate) fn on_instances(&self, reply: Result<Vec<Instance>>) -> &Self {
-        lock(&self.0).instances.push_back(reply);
+        lock(&self.0).instances.push_back(reply.map(|listed| (listed, None)));
+        self
+    }
+
+    /// [`Self::on_instances`], where `during` happens before the reply is given: what the world looks like
+    /// when the listing is read.
+    pub(crate) fn on_instances_during(
+        &self,
+        reply: Result<Vec<Instance>>,
+        during: impl FnOnce() + Send + 'static,
+    ) -> &Self {
+        lock(&self.0)
+            .instances
+            .push_back(reply.map(|listed| (listed, Some(Box::new(during) as Effect))));
         self
     }
 
@@ -187,7 +224,11 @@ impl TaskApi for Fake {
             password: password.map(str::to_owned),
             update,
         };
-        self.answer(call, |s| &mut s.register)
+        let (registration, during) = self.answer(call, |s| &mut s.register)?;
+        if let Some(during) = during {
+            during();
+        }
+        Ok(registration)
     }
 
     fn set_enabled(&self, path: &TaskPath, enabled: bool) -> Result<()> {
@@ -197,11 +238,19 @@ impl TaskApi for Fake {
     }
 
     fn delete(&self, path: &TaskPath) -> Result<bool> {
-        self.answer(Call::Delete(path.as_str().to_owned()), |s| &mut s.delete)
+        let (deleted, during) = self.answer(Call::Delete(path.as_str().to_owned()), |s| &mut s.delete)?;
+        if let Some(during) = during {
+            during();
+        }
+        Ok(deleted)
     }
 
     fn instances(&self, path: &TaskPath) -> Result<Vec<Instance>> {
-        self.answer(Call::Instances(path.as_str().to_owned()), |s| &mut s.instances)
+        let (listed, during) = self.answer(Call::Instances(path.as_str().to_owned()), |s| &mut s.instances)?;
+        if let Some(during) = during {
+            during();
+        }
+        Ok(listed)
     }
 
     fn info(&self, path: &TaskPath) -> Result<TaskInfo> {

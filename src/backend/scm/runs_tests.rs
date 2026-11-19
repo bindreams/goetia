@@ -120,7 +120,7 @@ fn a_record_is_whole_whatever_the_length_of_its_path() {
         made_for(&runs, &process_user_sid());
         let written = record(1, 5);
 
-        runs.write(&written).unwrap();
+        runs.write(&written, None).unwrap();
 
         assert_eq!(
             runs.read(&written.instance).unwrap(),
@@ -145,7 +145,7 @@ fn a_record_round_trips_by_its_instance() {
             outcome,
             ..record(n, 0x01DB_0000_0000_0000 + u64::from(n))
         };
-        runs.write(&written).unwrap();
+        runs.write(&written, None).unwrap();
         assert_eq!(runs.read(&written.instance).unwrap(), Some(written));
     }
     assert_eq!(
@@ -167,8 +167,8 @@ fn a_second_write_for_an_instance_replaces_its_record() {
         ..first.clone()
     };
 
-    runs.write(&first).unwrap();
-    runs.write(&second).unwrap();
+    runs.write(&first, None).unwrap();
+    runs.write(&second, None).unwrap();
 
     assert_eq!(runs.read(&first.instance).unwrap(), Some(second));
     assert_eq!(names(&runs), [file_of(&first.instance)]);
@@ -182,7 +182,7 @@ fn a_write_leaves_no_partial_record_and_removes_a_leftover_temp() {
     fs::write(runs.dir.join(format!("{}.json.tmp", own.instance.hex())), "{\"sta").unwrap();
     fs::write(runs.dir.join(format!("{}.json.tmp", instance(2).hex())), "{\"sta").unwrap();
 
-    runs.write(&own).unwrap();
+    runs.write(&own, None).unwrap();
 
     assert_eq!(names(&runs), [file_of(&own.instance)]);
     assert_eq!(runs.read(&own.instance).unwrap(), Some(own));
@@ -197,7 +197,7 @@ fn a_write_leaves_no_partial_record_and_removes_a_leftover_temp() {
 #[skuld::test]
 fn a_prune_reads_the_records_before_the_pins() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let calls = std::cell::Cell::new(0);
     let pin = std::cell::RefCell::new(None);
 
@@ -207,7 +207,7 @@ fn a_prune_reads_the_records_before_the_pins() {
         calls.set(calls.get() + 1);
         if calls.get() == 1 {
             *pin.borrow_mut() = Some(runs.pin().unwrap());
-            runs.write(&record(2, 2)).unwrap();
+            runs.write(&record(2, 2), None).unwrap();
         }
         listing
     });
@@ -223,7 +223,7 @@ fn a_write_in_flight_keeps_its_temp_file_from_a_prune_and_is_no_problem() {
     let in_flight = runs.dir.join(format!("{}.json.tmp", instance(2).hex()));
     let held = temp_held(&runs, &in_flight);
 
-    let problems = runs.write(&record(1, 1)).unwrap();
+    let problems = runs.write(&record(1, 1), None).unwrap();
 
     assert!(in_flight.exists(), "a prune cannot delete what a write holds");
     assert_eq!(
@@ -238,7 +238,7 @@ fn a_write_in_flight_keeps_its_temp_file_from_a_prune_and_is_no_problem() {
 #[skuld::test]
 fn a_listing_that_fails_is_a_problem_of_the_prune() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
 
     let dir = Dir::open(&runs.dir).unwrap();
     let problems = runs.prune_listing(&dir, &instance(1), || Err(io::Error::other("listing denied")));
@@ -251,13 +251,13 @@ fn a_listing_that_fails_is_a_problem_of_the_prune() {
 #[skuld::test]
 fn a_removal_that_fails_is_a_problem_and_the_rest_are_removed() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let stuck = runs.dir.join(file_of(&instance(2)));
     directory_with_a_file(&stuck);
     let doomed = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
     fs::write(&doomed, "").unwrap();
 
-    let problems = runs.write(&record(4, 4)).unwrap();
+    let problems = runs.write(&record(4, 4), None).unwrap();
 
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains(&file_of(&instance(2))), "{problems:?}");
@@ -268,9 +268,9 @@ fn a_removal_that_fails_is_a_problem_and_the_rest_are_removed() {
 fn without_a_pin_a_write_keeps_only_its_own_record() {
     let (_dir, runs) = fixture();
 
-    runs.write(&record(1, 1)).unwrap();
-    runs.write(&record(2, 2)).unwrap();
-    runs.write(&record(3, 3)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
+    runs.write(&record(3, 3), None).unwrap();
 
     assert_eq!(
         instances_kept(&runs, &[instance(1), instance(2), instance(3)]),
@@ -281,12 +281,12 @@ fn without_a_pin_a_write_keeps_only_its_own_record() {
 #[skuld::test]
 fn a_live_pin_stops_all_pruning() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let pin = runs.pin().unwrap();
     let before = names(&runs).len();
 
-    runs.write(&record(2, 2)).unwrap();
-    runs.write(&record(3, 3)).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
+    runs.write(&record(3, 3), None).unwrap();
 
     assert_eq!(
         instances_kept(&runs, &[instance(1), instance(2), instance(3)]),
@@ -296,15 +296,42 @@ fn a_live_pin_stops_all_pruning() {
     drop(pin);
 }
 
+/// A run holds a pin from its start until its record is in place: the write releases it before it prunes, so
+/// a writer's own pin never stops its own prune, and while it is held no other write prunes.
+#[skuld::test]
+fn a_writers_own_pin_does_not_stop_its_own_prune() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let own = runs.hold().unwrap();
+
+    runs.write(&record(2, 2), Some(own)).unwrap();
+
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
+    assert_eq!(names(&runs), [file_of(&instance(2))], "the pin went with the write");
+}
+
+#[skuld::test]
+fn another_runs_pin_still_stops_a_prune_by_a_writer_that_holds_its_own() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let other = runs.hold().unwrap();
+    let own = runs.hold().unwrap();
+
+    runs.write(&record(2, 2), Some(own)).unwrap();
+
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [true, true]);
+    drop(other);
+}
+
 #[skuld::test]
 fn a_stale_pin_is_deleted_and_does_not_stop_pruning() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     // A pin whose holder died with the machine: no handle holds the file.
     let stale = runs.dir.join("pin-stale.pin");
     fs::write(&stale, "").unwrap();
 
-    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
 
     assert!(!stale.exists(), "the stale pin is deleted");
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
@@ -317,13 +344,13 @@ fn a_stale_pin_is_deleted_and_does_not_stop_pruning() {
 #[skuld::test]
 fn a_stale_pin_the_writing_account_has_no_entry_on_is_deleted_and_does_not_stop_pruning() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let stale = runs.dir.join("pin-old.pin");
     fs::write(&stale, "").unwrap();
     let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
     crate::backend::scm::test_support::set_dacl(&system_only, &stale).unwrap();
 
-    let problems = runs.write(&record(2, 2)).unwrap();
+    let problems = runs.write(&record(2, 2), None).unwrap();
 
     assert!(!stale.exists(), "the stale pin is deleted");
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
@@ -337,7 +364,7 @@ fn a_stale_pin_the_writing_account_has_no_entry_on_is_deleted_and_does_not_stop_
 #[skuld::test]
 fn a_live_pin_the_writing_account_has_no_entry_on_is_kept_and_stops_pruning() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let live = runs.dir.join("pin-other.pin");
     let holder = pin_held_with_write_dac(&runs, &live);
     Descriptor::from_sddl("D:P(A;;FA;;;SY)")
@@ -345,7 +372,7 @@ fn a_live_pin_the_writing_account_has_no_entry_on_is_kept_and_stops_pruning() {
         .set_dacl_of(&holder)
         .unwrap();
 
-    let problems = runs.write(&record(2, 2)).unwrap();
+    let problems = runs.write(&record(2, 2), None).unwrap();
 
     assert!(live.exists(), "a live pin is not deleted");
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [true, true]);
@@ -359,11 +386,11 @@ fn a_live_pin_the_writing_account_has_no_entry_on_is_kept_and_stops_pruning() {
 #[skuld::test]
 fn a_pin_that_cannot_be_deleted_is_a_problem_and_is_taken_as_not_held() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let odd = runs.dir.join("pin-odd.pin");
     directory_with_a_file(&odd);
 
-    let problems = runs.write(&record(2, 2)).unwrap();
+    let problems = runs.write(&record(2, 2), None).unwrap();
 
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("pin-odd.pin"), "{problems:?}");
@@ -375,10 +402,10 @@ fn a_pin_that_cannot_be_deleted_is_a_problem_and_is_taken_as_not_held() {
 #[skuld::test]
 fn a_pin_whose_delete_is_pending_is_no_problem_and_no_hold_to_a_prune() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let reader = delete_pending(&runs.dir.join("pin-odd.pin"));
 
-    let problems = runs.write(&record(2, 2)).unwrap();
+    let problems = runs.write(&record(2, 2), None).unwrap();
 
     assert_eq!(problems, Vec::<String>::new());
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
@@ -389,11 +416,11 @@ fn a_pin_whose_delete_is_pending_is_no_problem_and_no_hold_to_a_prune() {
 #[skuld::test]
 fn a_hold_keeps_the_records_from_every_write_as_a_pin_does() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let hold = runs.hold().unwrap();
 
-    runs.write(&record(2, 2)).unwrap();
-    runs.write(&record(3, 3)).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
+    runs.write(&record(3, 3), None).unwrap();
 
     assert_eq!(
         instances_kept(&runs, &[instance(1), instance(2), instance(3)]),
@@ -407,12 +434,12 @@ fn a_hold_keeps_the_records_from_every_write_as_a_pin_does() {
 #[skuld::test]
 fn a_stale_pin_beside_a_live_one_is_deleted_and_the_live_one_still_keeps_every_record() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let pin = runs.pin().unwrap();
     let stale = runs.dir.join("pin-stale.pin");
     fs::write(&stale, "").unwrap();
 
-    let problems = runs.write(&record(2, 2)).unwrap();
+    let problems = runs.write(&record(2, 2), None).unwrap();
 
     assert!(!stale.exists());
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [true, true]);
@@ -425,14 +452,14 @@ fn the_records_are_kept_until_the_last_of_two_pins_is_dropped() {
     let (_dir, runs) = fixture();
     let first = runs.pin().unwrap();
     let second = runs.hold().unwrap();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
 
     drop(first);
-    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [true, true]);
 
     drop(second);
-    runs.write(&record(3, 3)).unwrap();
+    runs.write(&record(3, 3), None).unwrap();
     assert_eq!(
         instances_kept(&runs, &[instance(1), instance(2), instance(3)]),
         [false, false, true]
@@ -443,8 +470,8 @@ fn the_records_are_kept_until_the_last_of_two_pins_is_dropped() {
 fn dropping_a_pin_releases_its_records_to_the_next_write() {
     let (_dir, runs) = fixture();
     let pin = runs.pin().unwrap();
-    runs.write(&record(1, 1)).unwrap();
-    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
 
     drop(pin);
     assert_eq!(
@@ -452,7 +479,7 @@ fn dropping_a_pin_releases_its_records_to_the_next_write() {
         2,
         "dropping the pin deletes its file and nothing else"
     );
-    runs.write(&record(3, 3)).unwrap();
+    runs.write(&record(3, 3), None).unwrap();
 
     assert_eq!(
         instances_kept(&runs, &[instance(1), instance(2), instance(3)]),
@@ -465,11 +492,11 @@ fn dropping_a_pin_releases_its_records_to_the_next_write() {
 #[skuld::test]
 fn appeared_lists_only_records_not_in_the_pins_listing_ascending() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 100)).unwrap();
+    runs.write(&record(1, 100), None).unwrap();
     let pin = runs.pin().unwrap();
-    runs.write(&record(2, 30)).unwrap();
-    runs.write(&record(3, 10)).unwrap();
-    runs.write(&record(4, 20)).unwrap();
+    runs.write(&record(2, 30), None).unwrap();
+    runs.write(&record(3, 10), None).unwrap();
+    runs.write(&record(4, 20), None).unwrap();
 
     let appeared = pin.appeared().unwrap();
 
@@ -479,7 +506,7 @@ fn appeared_lists_only_records_not_in_the_pins_listing_ascending() {
 #[skuld::test]
 fn appeared_is_empty_when_nothing_was_written_after_the_pin() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
 
     let pin = runs.pin().unwrap();
 
@@ -519,7 +546,7 @@ fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (Result<()>, Option<
 #[skuld::test]
 fn remove_all_clears_the_directory_and_its_pins_that_nothing_holds() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
     fs::write(runs.dir.join(format!("{}.json.tmp", instance(2).hex())), "").unwrap();
 
@@ -534,7 +561,7 @@ fn remove_all_clears_the_directory_and_its_pins_that_nothing_holds() {
 #[skuld::test]
 fn remove_all_does_not_wait_for_a_stale_pin_it_has_no_entry_on() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let stale = runs.dir.join("pin-old.pin");
     fs::write(&stale, "").unwrap();
     let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
@@ -582,7 +609,7 @@ impl Drop for Undeletable<'_> {
 #[skuld::test]
 fn remove_all_with_pins_it_cannot_tell_about_deletes_nothing_and_names_each() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     fs::write(runs.dir.join("other.txt"), "").unwrap();
     fs::write(runs.dir.join("pin-odd.pin"), "").unwrap();
     fs::write(runs.dir.join("pin-odd2.pin"), "").unwrap();
@@ -607,7 +634,7 @@ fn remove_all_with_pins_it_cannot_tell_about_deletes_nothing_and_names_each() {
 #[skuld::test]
 fn remove_all_takes_a_file_whose_delete_is_pending_as_deleted() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let pending_pin = delete_pending(&runs.dir.join("pin-odd.pin"));
     let pending_record = delete_pending(&runs.dir.join(file_of(&instance(2))));
     let temp = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
@@ -632,7 +659,7 @@ fn remove_all_takes_a_file_whose_delete_is_pending_as_deleted() {
 #[skuld::test]
 fn remove_all_waits_for_a_temp_file_the_shim_is_writing_and_names_it() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let temp = runs.dir.join(format!("{}.json.tmp", instance(2).hex()));
     let writing = temp_held(&runs, &temp);
     let mut noted = Vec::new();
@@ -659,7 +686,7 @@ fn remove_all_deletes_a_pin_whose_name_is_not_unicode() {
     use std::os::windows::ffi::OsStringExt as _;
 
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let mut units: Vec<u16> = "pin-".encode_utf16().collect();
     units.push(0xD800);
     units.extend(".pin".encode_utf16());
@@ -683,9 +710,9 @@ fn remove_all_of_a_directory_that_is_gone_is_done_without_waiting() {
 #[skuld::test]
 fn remove_all_deletes_nothing_while_a_run_holds_a_pin_and_removes_everything_when_it_returns() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let pin = runs.pin().unwrap();
-    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
     let before = names(&runs);
 
     let (result, seen) = remove_all_while_held(&runs, pin);
@@ -703,7 +730,7 @@ fn remove_all_deletes_nothing_while_a_run_holds_a_pin_and_removes_everything_whe
 #[skuld::test]
 fn remove_all_waits_for_a_stops_hold_as_for_a_runs_pin() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let hold = runs.hold().unwrap();
     let before = names(&runs);
 
@@ -719,7 +746,7 @@ fn remove_all_waits_for_a_stops_hold_as_for_a_runs_pin() {
 #[skuld::test]
 fn remove_all_waits_for_a_live_pin_the_removing_account_has_no_entry_on() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let live = runs.dir.join("pin-other.pin");
     let holder = pin_held_with_write_dac(&runs, &live);
     Descriptor::from_sddl("D:P(A;;FA;;;SY)")
@@ -738,7 +765,7 @@ fn remove_all_waits_for_a_live_pin_the_removing_account_has_no_entry_on() {
 #[skuld::test]
 fn remove_all_waits_for_two_held_pins_and_is_not_confused_by_a_stale_one_beside_them() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let first = runs.pin().unwrap();
     let second = runs.hold().unwrap();
     fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
@@ -762,7 +789,7 @@ fn leave_marker(runs: &Runs) {
 #[skuld::test]
 fn a_pin_or_hold_taken_after_the_removal_began_backs_off_and_leaves_no_file() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     leave_marker(&runs);
 
     let pin = runs.pin().err().expect("a pin is refused");
@@ -790,7 +817,7 @@ fn a_hold_in_a_directory_that_is_gone_is_not_found() {
 #[skuld::test]
 fn a_pin_taken_before_the_marker_is_waited_for_and_nothing_is_deleted_under_it() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let pin = runs.pin().unwrap();
     leave_marker(&runs);
     let before = names(&runs);
@@ -807,7 +834,7 @@ fn a_pin_taken_before_the_marker_is_waited_for_and_nothing_is_deleted_under_it()
 #[skuld::test]
 fn remove_all_refuses_a_new_pin_while_it_waits_on_one() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let pin = runs.pin().unwrap();
     let mut probes = Vec::new();
     let mut pin = Some(pin);
@@ -831,7 +858,7 @@ fn remove_all_refuses_a_new_pin_while_it_waits_on_one() {
 #[skuld::test]
 fn remove_all_is_not_blocked_by_a_marker_a_cut_short_removal_left() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     leave_marker(&runs);
 
     runs.remove_all(no_note).unwrap();
@@ -843,7 +870,7 @@ fn remove_all_is_not_blocked_by_a_marker_a_cut_short_removal_left() {
 #[skuld::test]
 fn remove_all_removes_files_and_directories_of_names_that_are_not_goetias() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     fs::write(runs.dir.join("notes.txt"), "").unwrap();
     // A directory in it: made as an account that may add one.
     crate::backend::scm::test_support::directory_with_a_file(&runs.dir.join("sub"));
@@ -858,7 +885,7 @@ fn remove_all_removes_files_and_directories_of_names_that_are_not_goetias() {
 #[skuld::test]
 fn remove_all_removes_a_directory_or_a_link_whose_name_is_a_pins_a_records_or_a_temps() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let target = tempfile::tempdir().unwrap();
     fs::write(target.path().join("victim.txt"), "keep").unwrap();
     let temp = format!("{}.json.tmp", instance(2).hex());
@@ -881,7 +908,7 @@ fn a_directory_named_as_a_record_is_not_a_record_to_a_pin() {
     let (_dir, runs) = fixture();
     let pin = runs.pin().unwrap();
     directory_with_a_file(&runs.dir.join(file_of(&instance(1))));
-    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
 
     assert_eq!(pin.appeared().unwrap(), [record(2, 2)]);
 }
@@ -891,8 +918,8 @@ fn a_directory_named_as_a_record_is_not_a_record_to_a_pin() {
 #[skuld::test]
 fn remove_all_waits_for_a_file_another_program_holds_and_names_it() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
-    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
     let held_name = file_of(&instance(2));
     let held = OpenOptions::new()
         .read(true)
@@ -922,7 +949,7 @@ fn remove_all_waits_for_a_file_another_program_holds_and_names_it() {
 #[skuld::test]
 fn remove_all_names_each_thing_it_waits_for_as_it_changes() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let pending = runs.dir.join(file_of(&instance(2)));
     let temp = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
     let mut reader = Some(delete_pending(&pending));
@@ -952,7 +979,7 @@ fn remove_all_names_each_thing_it_waits_for_as_it_changes() {
 #[skuld::test]
 fn remove_all_fails_at_once_naming_a_directory_of_a_foreign_name_it_cannot_remove() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let sub = runs.dir.join("sub");
     directory_with_a_file(&sub);
     let holder = directory_held_open(&sub.join("inner"));
@@ -1099,7 +1126,7 @@ fn a_failed_removal_leaves_its_marker_beside_the_directory() {
 #[skuld::test]
 fn remove_all_makes_no_note_when_nothing_is_held_or_pending() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
     fs::write(runs.dir.join(format!("{}.json.tmp", instance(2).hex())), "").unwrap();
     leave_marker(&runs);
@@ -1119,7 +1146,7 @@ fn a_marker_is_never_the_directory_of_another_task() {
     let other = Runs::of(dir.path(), &Id::try_from("x.removing").unwrap());
     made_for(&removed, &process_user_sid());
     made_for(&other, &process_user_sid());
-    other.write(&record(1, 1)).unwrap();
+    other.write(&record(1, 1), None).unwrap();
 
     removed.remove_all(no_note).unwrap();
 
@@ -1148,7 +1175,7 @@ fn a_directory_with_a_held_pin_cannot_be_renamed_away() {
 /// directory, which outlasts the junction.
 fn linked(runs: &Runs) -> (TempDir, Runs) {
     let (target_dir, target) = fixture();
-    target.write(&record(9, 9)).unwrap();
+    target.write(&record(9, 9), None).unwrap();
     fs::write(target.dir.join("victim.txt"), "keep").unwrap();
     fs::remove_dir(&runs.dir).unwrap();
     junction(&runs.dir, &target.dir);
@@ -1269,7 +1296,7 @@ fn nothing_reads_pins_or_writes_through_a_link() {
     let read = runs.read(&instance(9)).unwrap();
     let pin = runs.pin().err().map(|e| e.kind());
     let hold = runs.hold().err().map(|e| e.kind());
-    let write = runs.write(&record(1, 1)).unwrap_err();
+    let write = runs.write(&record(1, 1), None).unwrap_err();
 
     assert_eq!(read, None, "a link holds no records");
     assert_eq!(pin, Some(io::ErrorKind::NotADirectory));
@@ -1437,7 +1464,7 @@ fn a_directory_that_is_there_gets_a_protected_dacl_naming_the_principal() {
 fn ensure_for_another_principal_rewrites_the_dacl() {
     let (_dir, runs) = fixture();
     let first = record(1, 1);
-    runs.write(&first).unwrap();
+    runs.write(&first, None).unwrap();
     // `Users` has this test's account among its members, so it still reaches what it made.
     let users = sid_from_parts(5, &[32, 545]);
 
@@ -1445,7 +1472,7 @@ fn ensure_for_another_principal_rewrites_the_dacl() {
 
     assert_eq!(entries_of(&runs.dir), dacl_for(users));
     assert_eq!(runs.read(&first.instance).unwrap(), Some(first));
-    runs.write(&record(2, 2)).unwrap();
+    runs.write(&record(2, 2), None).unwrap();
 }
 
 /// The DACL call changes the directory and nothing it holds: the files made in it keep their trustees
@@ -1455,7 +1482,7 @@ fn ensure_for_another_principal_rewrites_the_dacl() {
 #[skuld::test]
 fn a_change_of_principal_leaves_what_is_in_the_directory_and_a_hard_links_target_alone() {
     let (dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
     let kept = runs.dir.join(file_of(&instance(1)));
     let elsewhere = tempfile::tempdir_in(dir.path()).unwrap();
     let target = elsewhere.path().join("target.txt");
@@ -1522,7 +1549,7 @@ fn ensure_clears_a_marker_a_cut_short_removal_left() {
 #[skuld::test]
 fn ensure_is_repeatable() {
     let (_dir, runs) = fixture();
-    runs.write(&record(1, 1)).unwrap();
+    runs.write(&record(1, 1), None).unwrap();
 
     runs.ensure(&[process_user_sid()]).unwrap();
 

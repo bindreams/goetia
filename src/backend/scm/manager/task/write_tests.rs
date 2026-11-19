@@ -5,6 +5,9 @@
 use std::fs::OpenOptions;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL};
@@ -611,11 +614,12 @@ fn an_enabled_flag_that_cannot_be_put_back_is_reported_with_the_failure() {
     fake.finish();
 }
 
-/// A task found disabled, or whose flag Task Scheduler did not say (`None`), is not disabled, and is not
-/// enabled if the write fails: what is put back is what was found, and nothing is known of an unread flag.
-/// The flag is Task Scheduler's own: the XML says nothing of it here, which reads as enabled.
+/// The task is disabled first whatever flag it was found with (a flag Task Scheduler did not say, `None`,
+/// included: it is what is read before the disable that decides nothing), and a write that fails puts back
+/// what was found: a task found disabled stays so, and one whose flag was not said is enabled again. The flag
+/// is Task Scheduler's own: the XML says nothing of it here, which reads as enabled.
 #[skuld::test]
-fn a_task_found_disabled_or_unread_is_left_as_it_was_by_a_write_that_fails() {
+fn a_task_is_disabled_first_whatever_flag_it_was_found_with_and_put_back_unless_found_off() {
     for found_flag in [Some(false), None] {
         let old = as_service("LocalService");
         let new = as_service("NetworkService");
@@ -625,8 +629,12 @@ fn a_task_found_disabled_or_unread_is_left_as_it_was_by_a_write_that_fails() {
         };
         let (_dir, runs) = made_records();
         let fake = Fake::new();
-        fake.on_instances(Ok(Vec::new()))
+        fake.on_set_enabled(Ok(()))
+            .on_instances(Ok(Vec::new()))
             .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))));
+        if found_flag.is_none() {
+            fake.on_set_enabled(Ok(()));
+        }
 
         let failed = scm(&fake)
             .task_write_with(
@@ -640,11 +648,15 @@ fn a_task_found_disabled_or_unread_is_left_as_it_was_by_a_write_that_fails() {
             .unwrap_err();
 
         assert!(failed.to_string().contains("delete"), "{found_flag:?}: {failed}");
-        assert_eq!(
-            fake.calls(),
-            [Call::Instances(PATH.to_owned()), Call::Delete(PATH.to_owned())],
-            "{found_flag:?}"
-        );
+        let mut expected = vec![
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned()),
+        ];
+        if found_flag.is_none() {
+            expected.push(Call::SetEnabled(PATH.to_owned(), true));
+        }
+        assert_eq!(fake.calls(), expected, "{found_flag:?}");
         fake.finish();
     }
 }
@@ -732,56 +744,49 @@ fn local_service() -> Sid {
 }
 
 /// A change of account never leaves the account the task still runs as without its log. The registered
-/// account and the new one are named before anything is deleted, and the new one alone only once the task is
-/// registered: a delete that fails leaves the old task, a raced create leaves what the other install made,
-/// and either way both accounts may append until an install that lands corrects it. What the file held is not
-/// read: an entry no install names is gone.
+/// account and the new one are named before anything is deleted, and the new one alone once the old task is
+/// deleted and its runs' pins are gone: a delete that fails leaves the old task, and both accounts may append
+/// until an install that deletes it corrects it. What the file held is not read: an entry no install names is
+/// gone.
 #[skuld::test]
-fn a_change_of_account_that_does_not_land_leaves_both_accounts_their_log() {
+fn a_change_of_account_whose_delete_fails_leaves_both_accounts_their_log() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
-    for raced in [false, true] {
-        let (dir, runs) = made_records();
-        log_with_an_entry_no_install_names(&dir);
-        let fake = Fake::new();
-        fake.on_set_enabled(Ok(())).on_instances(Ok(Vec::new()));
-        if raced {
-            fake.on_delete(Ok(true)).on_register(Ok(Registration::Raced));
-        } else {
-            // The failure puts the enabled flag back.
-            fake.on_delete(Err(Error::os("delete", std::io::Error::other("denied"))))
-                .on_set_enabled(Ok(()));
-        }
+    let (dir, runs) = made_records();
+    log_with_an_entry_no_install_names(&dir);
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(())).on_instances(Ok(Vec::new()));
+    // The failure puts the enabled flag back.
+    fake.on_delete(Err(Error::os("delete", std::io::Error::other("denied"))))
+        .on_set_enabled(Ok(()));
 
-        let _ = scm(&fake).task_write_with(
-            &new,
-            &definition(&new),
-            Some(&snapshot_of(&old, false)),
-            &runs,
-            &mut Running(vec![]),
-            prepared(users(), None),
-        );
+    let _ = scm(&fake).task_write_with(
+        &new,
+        &definition(&new),
+        Some(&snapshot_of(&old, false)),
+        &runs,
+        &mut Running(vec![]),
+        prepared(users(), None),
+    );
 
-        let trustees = trustees_of(&default_log(&dir));
-        assert!(
-            trustees.contains(&local_service()),
-            "raced={raced}: the registered account keeps its log"
-        );
-        assert!(
-            trustees.contains(&users()),
-            "raced={raced}: the new account has its own"
-        );
-        assert!(
-            !trustees.contains(&process_user_sid()),
-            "raced={raced}: an entry nothing names was carried over"
-        );
-    }
+    let trustees = trustees_of(&default_log(&dir));
+    assert!(
+        trustees.contains(&local_service()),
+        "the registered account keeps its log"
+    );
+    assert!(trustees.contains(&users()), "the new account has its own");
+    assert!(
+        !trustees.contains(&process_user_sid()),
+        "an entry nothing names was carried over"
+    );
 }
 
-/// The record directory is the log's twin: the old task keeps running as its account until the create lands, so a
-/// delete or a registration that fails leaves that account able to write its records, beside the new one.
+/// The record directory is the log's twin: the old task keeps running as its account until it is deleted, so a
+/// delete that fails leaves that account able to write its records, beside the new one. Once it is deleted the
+/// directory names the new account alone, whether or not the create then lands (a raced or failed create leaves
+/// no task of the old account).
 #[skuld::test]
-fn a_change_of_account_that_does_not_land_leaves_both_accounts_their_records_directory() {
+fn a_change_of_account_names_the_new_account_alone_in_the_records_directory_once_the_delete_is_done() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
     for ending in ["raced", "register fails", "delete fails"] {
@@ -813,15 +818,139 @@ fn a_change_of_account_that_does_not_land_leaves_both_accounts_their_records_dir
         );
 
         let trustees = trustees_of(&records_dir(&dir));
-        assert!(
+        assert!(trustees.contains(&users()), "{ending}: the new account can write its own");
+        assert_eq!(
             trustees.contains(&local_service()),
-            "{ending}: the registered account can still write its records"
-        );
-        assert!(
-            trustees.contains(&users()),
-            "{ending}: the new account can write its own"
+            ending == "delete fails",
+            "{ending}: the registered account's entry"
         );
     }
+}
+
+/// What a step of an account change finds: whether the marker is there, and who the records directory names.
+type Found = (&'static str, bool, Vec<Sid>);
+
+/// An account change as a test observes it: `seen` is what the world looked like at the delete and at the
+/// create, and `fake` has those two effects stated, with no pin held.
+fn observing_the_delete_and_the_create(dir: &TempDir, seen: &Arc<Mutex<Vec<Found>>>) -> Fake {
+    let found = |step: &'static str| {
+        let (seen, records, marker) = (Arc::clone(seen), records_dir(dir), marker_of(dir));
+        move || {
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((step, marker.exists(), trustees_of(&records)));
+        }
+    };
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete_during(Ok(true), found("delete"))
+        .on_register_during(Ok(Registration::Created), found("create"));
+    fake
+}
+
+/// The removal's marker, which is beside the task's directory.
+fn marker_of(dir: &TempDir) -> PathBuf {
+    records_dir(dir).with_file_name("nightly~removing")
+}
+
+/// The marker, the wait and the narrowing are all between the delete and the create: at the delete the
+/// directory still names both accounts and there is no marker; by the create it names the new account alone
+/// and the narrowing has taken the marker away.
+#[skuld::test]
+fn an_account_change_places_the_marker_and_narrows_between_the_delete_and_the_create() {
+    let (dir, runs) = made_records();
+    let (old, new) = (as_service("LocalService"), as_service("NetworkService"));
+    let seen = Arc::default();
+    let fake = observing_the_delete_and_the_create(&dir, &seen);
+
+    scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    let [(_, marker_at_delete, at_delete), (_, marker_at_create, at_create)] = &seen[..] else {
+        panic!("the delete and the create: {seen:?}");
+    };
+    assert!(!marker_at_delete, "the marker was placed before the delete");
+    assert!(at_delete.contains(&local_service()) && at_delete.contains(&users()), "{at_delete:?}");
+    assert!(!marker_at_create, "the narrowing takes the marker away before the create");
+    assert!(at_create.contains(&users()) && !at_create.contains(&local_service()), "{at_create:?}");
+    fake.finish();
+}
+
+/// A pin is held by a run of the old account that the delete did not end: the narrowing waits for it, and the
+/// marker is already there, so that no new pin is taken. The write is blocked at the wait while the pin is
+/// held, which the observer (a thread that sees the marker and then lets the pin go) reads from the fake's
+/// calls and the directory's permissions.
+#[skuld::test]
+fn a_held_pin_delays_the_narrowing_of_an_account_change() {
+    let (dir, runs) = made_records();
+    let (old, new) = (as_service("LocalService"), as_service("NetworkService"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+    let pin = runs.hold().unwrap();
+    let (marker, records) = (marker_of(&dir), records_dir(&dir));
+    let finished = AtomicBool::new(false);
+
+    let (outcome, waiting) = std::thread::scope(|scope| {
+        let observer = scope.spawn(|| {
+            // The marker is the first thing the write places after the delete; it is there while the pin is held.
+            while !marker.exists() && !finished.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let at_the_wait = (
+                marker.exists(),
+                fake.calls(),
+                trustees_of(&records),
+                runs.hold().map(drop).map_err(|e| e.kind()),
+            );
+            drop(pin);
+            at_the_wait
+        });
+        let outcome = scm(&fake).task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, false)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        );
+        finished.store(true, Ordering::SeqCst);
+        (outcome, observer.join().unwrap())
+    });
+
+    assert!(matches!(outcome.unwrap(), WriteOutcome::Done));
+    let (marker_there, calls, trustees, new_pin) = waiting;
+    assert!(marker_there, "the write did not place the marker and wait");
+    assert_eq!(
+        calls,
+        [
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned()),
+        ],
+        "the task was created while a pin was held"
+    );
+    assert!(
+        trustees.contains(&local_service()),
+        "narrowed while a pin was held: {trustees:?}"
+    );
+    assert_eq!(new_pin, Err(std::io::ErrorKind::ResourceBusy), "a pin was accepted during the wait");
+    assert!(!marker.exists(), "the narrowing takes the marker away");
+    let trustees = trustees_of(&records);
+    assert!(trustees.contains(&users()) && !trustees.contains(&local_service()));
+    fake.finish();
 }
 
 /// A change that lands narrows the record directory to the new account alone.

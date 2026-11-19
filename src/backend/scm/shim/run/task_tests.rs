@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tempfile::TempDir;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, FALSE, TRUE};
@@ -19,7 +19,7 @@ use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::{Instance, Registered, TaskApi};
 use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::backend::scm::shim::run::os::LogKind;
+use crate::backend::scm::shim::run::os::{Channels, LogKind, Severity};
 use crate::backend::scm::shim::run::os::fake::{
     FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
 };
@@ -130,6 +130,11 @@ impl Run {
 
     fn run(&self) -> u32 {
         run_in(ID, &self.supervisor, &self.api, Some(&self.runs), OWN_PID)
+    }
+
+    /// The task's directory of records.
+    fn records_dir(&self) -> PathBuf {
+        self._dir.path().join("Goetia").join("runs").join(ID)
     }
 
     /// What the run wrote, if anything.
@@ -685,6 +690,137 @@ fn an_unreadable_listing_runs_the_program_and_writes_no_record() {
     );
 }
 
+// The pin =============================================================================================================
+
+/// The pins in the records directory `dir`.
+fn pins_in(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
+        .count()
+}
+
+/// What a run met, in order, and how many pins it held then.
+type Seen = Arc<Mutex<Vec<(&'static str, usize)>>>;
+
+fn note(seen: &Seen, what: &'static str, dir: &Path) {
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((what, pins_in(dir)));
+}
+
+/// Channels that note the pins held when the default log is held, and otherwise are `inner`.
+struct NotesTheHold {
+    inner: Arc<dyn Channels>,
+    dir: PathBuf,
+    seen: Seen,
+}
+
+impl Channels for NotesTheHold {
+    fn hold_default(&self, path: &Path) -> io::Result<()> {
+        note(&self.seen, "the default log is held", &self.dir);
+        self.inner.hold_default(path)
+    }
+
+    fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
+        self.inner.append(path, line, kind)
+    }
+
+    fn event_log(&self, severity: Severity, line: &str) {
+        self.inner.event_log(severity, line);
+    }
+}
+
+/// An install that changes the task's account narrows the records' and the default log's permissions once
+/// every pin is gone, and the run it cannot see otherwise (alive, and not yet listed) is seen by its pin: so
+/// the pin comes before the default log is opened, which a narrowing could deny, and before the first
+/// listing read.
+#[skuld::test]
+fn the_shim_pins_before_it_holds_the_default_log_and_before_its_first_listing_read() {
+    let run = Run::of(&spec_logging_to(None));
+    let dir = run.records_dir();
+    let seen = Seen::default();
+    let (noted, at) = (Arc::clone(&seen), dir.clone());
+    run.api
+        .on_instances_during(Ok(listed()), move || note(&noted, "the listing is read", &at));
+    let run = run.program(exits(0));
+    let channels = NotesTheHold {
+        inner: run.fake.channels(),
+        dir: dir.clone(),
+        seen: Arc::clone(&seen),
+    };
+    let supervisor = Arc::new(Supervisor::new(
+        run.fake.os(),
+        Arc::new(Log::new(Arc::new(channels), PathBuf::from(FAKE_LOGS))),
+    ));
+
+    assert_eq!(run_in(ID, &supervisor, &run.api, Some(&run.runs), OWN_PID), 0);
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [("the default log is held", 1), ("the listing is read", 1)]
+    );
+    assert_eq!(pins_in(&dir), 0, "the pin is released with the record");
+    assert!(run.record().is_some());
+    run.finish();
+}
+
+/// A pin that is refused (the records are being removed or handed over, or the directory is not there) leaves
+/// the run unrecorded: the program runs, nothing is written, and it is said.
+#[skuld::test]
+fn a_hold_that_is_refused_runs_the_program_and_writes_nothing() {
+    for case in ["a marker", "no directory"] {
+        let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(5));
+        let dir = tempfile::tempdir().unwrap();
+        let unmade = Runs::of(dir.path(), &Id::try_from(ID).unwrap());
+        let runs = if case == "a marker" {
+            std::fs::write(run.records_dir().with_file_name(format!("{ID}~removing")), "").unwrap();
+            &run.runs
+        } else {
+            &unmade
+        };
+
+        let code = run_in(ID, &run.supervisor, &run.api, Some(runs), OWN_PID);
+
+        assert_eq!(code, 5, "{case}");
+        assert_eq!(run.record(), None, "{case}");
+        assert_eq!(std::fs::read_dir(run.records_dir()).unwrap().count(), 0, "{case}");
+        assert!(!dir.path().join("Goetia").exists(), "{case}: made what was not there");
+        let failures = run.finish();
+        assert_eq!(failures.len(), 1, "{case}: {failures:?}");
+        assert!(
+            failures[0].starts_with(&format!("goetia-shim[{ID}]: hold the run records: "))
+                && failures[0].ends_with("the run is not recorded; the program is run anyway"),
+            "{case}: {failures:?}"
+        );
+    }
+}
+
+/// A run that will not be recorded has nothing for its pin to protect, and its program may run long: the pin
+/// is gone before the program starts.
+#[skuld::test]
+fn a_run_that_will_not_be_recorded_holds_no_pin_while_its_program_runs() {
+    let run = Run::of(&spec_logging_to(None));
+    run.api
+        .on_instances(Err(Error::os("list the task's instances", io::Error::other("refused"))));
+    let run = run.program(runs_until_stopped());
+
+    let (pins, code) = std::thread::scope(|scope| {
+        let ended = scope.spawn(|| run.run());
+        while run.fake.calls(Op::Spawn) == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pins = pins_in(&run.records_dir());
+        assert!(run.supervisor.bus.request_stop());
+        (pins, ended.join().unwrap())
+    });
+
+    assert_eq!(pins, 0, "the program started with the pin held");
+    assert_eq!(code, STOPPED);
+    assert_eq!(run.record(), None);
+    run.finish();
+}
+
 // The wait for the run's own instance =================================================================================
 
 /// Task Scheduler lists a run once it has started it, which can be after the shim reads the listing:
@@ -780,15 +916,15 @@ fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded(
 
 #[skuld::test]
 fn a_failed_record_write_still_returns_the_programs_code() {
-    let dir = tempfile::tempdir().unwrap();
-    // No `ensure`: the directory is not there, so the write fails.
-    let unmade = Runs::of(dir.path(), &Id::try_from(ID).unwrap());
     let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(5));
+    // A directory with a file in it where the record's temp file goes: the temp file cannot be made.
+    let temp = run.records_dir().join(format!("{}.json.tmp", instance().hex()));
+    crate::backend::scm::test_support::directory_with_a_file(&temp);
 
-    let code = run_in(ID, &run.supervisor, &run.api, Some(&unmade), OWN_PID);
+    let code = run.run();
 
     assert_eq!(code, 5);
-    assert_eq!(unmade.read(&instance()).unwrap(), None);
+    assert_eq!(run.record(), None);
     // The log is the program's own now that the task is read, and the failure is said there.
     let calls = run.fake.take_channel_calls();
     let said: Vec<_> = calls

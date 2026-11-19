@@ -32,7 +32,7 @@ use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::clock::file_time_of;
 use crate::backend::scm::manager::task::{Com, TaskApi};
-use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
+use crate::backend::scm::runs::{Pin, RunOutcome, RunRecord, Runs};
 use crate::backend::scm::task_xml::{TASK_MODE_ARG, extract_from_data};
 use crate::error::Chain;
 use crate::spec::{DaemonSpec, Id};
@@ -59,7 +59,6 @@ pub(super) fn requested(args: &[OsString]) -> Option<&str> {
 pub(super) fn run(id: &str) -> ! {
     let real = Arc::new(Real::default());
     let log = Arc::new(Log::real(Arc::clone(&real)));
-    log.hold_default(id);
     exit::keep_log(Arc::clone(&log));
     exit::name_run(id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
@@ -90,15 +89,40 @@ pub(super) fn run(id: &str) -> ! {
 /// Runs the task `id` as the process `own_pid` and returns the code the process is to end with: the
 /// program's own, or the stop's ([`STOPPED_EXIT`]), or the incomplete stop's, or a shim failure's.
 ///
-/// In order, every failure before the program starts logged: reads the task through `api` (a service's
-/// blob is refused), waits for its own instance by `own_pid` to be listed ([`own_instance`]), sets the
-/// diagnostics log, writes the run's marker as the first line of `logs` when there is one, runs the
+/// In order, every failure before the program starts logged: takes a pin on the run records
+/// ([`Runs::hold`]), then holds the default log ([`Log::hold_default`]), reads the task through `api` (a
+/// service's blob is refused), waits for its own instance by `own_pid` to be listed ([`own_instance`]), sets
+/// the diagnostics log, writes the run's marker as the first line of `logs` when there is one, runs the
 /// program, and writes the one record into `runs`. A listing that cannot be read, and a record that
 /// cannot be written, are logged and do not stop the program or change its code. A stop during the
 /// wait starts no program: the run is recorded stopped, or logged unrecorded, and ends with the stop's
 /// code.
+///
+/// **The pin comes first,** before the log is opened and before anything is read from Task Scheduler: an
+/// install that changes the task's account waits for every pin before it narrows the permissions of the
+/// records and of the default log ([`Runs::drain_pins`]), and a run that is alive but not yet listed (Task
+/// Scheduler does not end it when the task is deleted) is seen by nothing else. The pin is held until the
+/// record is renamed into place ([`Runs::write`]). A pin that is refused or fails (the records are being
+/// removed or handed over, the directory is gone or denied) leaves the run unrecorded, which is logged, and
+/// the program is run. The pin is dropped before the program starts when no record will be written.
 pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs: Option<&Runs>, own_pid: u32) -> u32 {
     let log = &*supervisor.log;
+    let pinned = runs.map(|runs| runs.hold().map(|pin| (runs, pin)));
+    log.hold_default(id);
+    let mut recording = match pinned {
+        Some(Ok(recording)) => Some(recording),
+        Some(Err(e)) => {
+            log.failure(
+                id,
+                &format!(
+                    "hold the run records: {}: the run is not recorded; the program is run anyway",
+                    Chain(&e)
+                ),
+            );
+            None
+        }
+        None => None,
+    };
     let (spec, path) = match own_spec(id, api) {
         Ok(read) => read,
         Err(stop) => {
@@ -110,10 +134,14 @@ pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs:
         OwnInstanceOutcome::Listed(instance) => Some(instance),
         OwnInstanceOutcome::Unread => None,
         OwnInstanceOutcome::Stopped(instance) => {
-            record_run(log, id, runs, instance, file_time_now(), Some(RunOutcome::Stopped));
+            record_run(log, id, recording, instance, file_time_now(), Some(RunOutcome::Stopped));
             return STOPPED_EXIT;
         }
     };
+    if instance.is_none() {
+        // No record will be written: nothing is left to protect, and the program may run long.
+        recording = None;
+    }
     set_daemon_log(log, id, &spec);
     if let (Some(logs), Some(instance)) = (spec.common().logs.as_deref(), &instance) {
         write_marker(supervisor, id, logs, instance);
@@ -121,25 +149,29 @@ pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs:
 
     let started = file_time_now();
     let (record, code) = ended_as(run_pass(&spec, supervisor, id, || {}, || {}));
-    record_run(log, id, runs, instance, started, record);
+    record_run(log, id, recording, instance, started, record);
     code
 }
 
-/// Writes the run's record when it has everything one needs; a write that fails is logged.
+/// Writes the run's record when it has everything one needs, releasing its pin when the record is in
+/// place ([`Runs::write`]); a write that fails is logged. With no record to write the pin is dropped.
 fn record_run(
     log: &Log,
     id: &str,
-    runs: Option<&Runs>,
+    recording: Option<(&Runs, Pin)>,
     instance: Option<InstanceId>,
     started: u64,
     outcome: Option<RunOutcome>,
 ) {
-    if let (Some(runs), Some(instance), Some(outcome)) = (runs, instance, outcome) {
-        match runs.write(&RunRecord {
-            instance,
-            started,
-            outcome,
-        }) {
+    if let (Some((runs, pin)), Some(instance), Some(outcome)) = (recording, instance, outcome) {
+        match runs.write(
+            &RunRecord {
+                instance,
+                started,
+                outcome,
+            },
+            Some(pin),
+        ) {
             Ok(problems) => {
                 for problem in problems {
                     log.warning(id, &format!("prune the run records: {problem}"));
