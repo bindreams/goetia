@@ -116,13 +116,13 @@ pub(crate) fn permit_only(path: &std::path::Path, sid: &str) {
 }
 
 /// [`permit_only`] for an account no test runs as, with the account `sid` left only the rights to read the
-/// attributes and the permissions and to change them: it may not append, which is what a log's account loses
+/// attributes and the permissions and to change them and the owner: it may not append, which is what a log's account loses
 /// when an install takes its entry out, and a test may still put the permissions back.
 #[cfg(windows)]
 pub(crate) fn withdraw_append(path: &std::path::Path, sid: &str) {
-    // Read the attributes and the permissions, change the permissions, and wait on the handle (every open asks
-    // for the last).
-    set_entries(path, &[("FA", A_STRANGER), ("0x160080", sid)]);
+    // Read the attributes and the permissions, change the permissions and the owner (an install opens a log for
+    // both), and wait on the handle (every open asks for the last).
+    set_entries(path, &[("FA", A_STRANGER), ("0x1e0080", sid)]);
 }
 
 /// Makes the permissions of the existing file `path` `entries`, each rights in SDDL and the account's SID,

@@ -1,7 +1,7 @@
 //! The default log's file: what an install makes of it and what the shim may do to it. The files are in
-//! temporary directories; a file that is there is the test account's own, so what an install sets on it
-//! needs no elevation, and only making one (it names Administrators as its owner) is a test of the `scm`
-//! group.
+//! temporary directories. An install names Administrators as the owner of the file it makes and of the one it
+//! sets the permissions of, which only an elevated token may assign: a test of that is in the `scm` group, and
+//! any other sets the permissions alone, as an unelevated token does.
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -16,8 +16,9 @@ use crate::backend::scm::sid::{sid_display, sid_from_parts};
 use crate::backend::scm::test_support::{
     delete_pending, effective_rights, permit_only, set_dacl, set_owner, set_reparse_point, short, withdraw_append,
 };
-use crate::elevation::test_support::{ThreadTokenReset, process_user_sid, token_without_privileges};
+use crate::elevation::test_support::{ThreadTokenReset, process_user_sid, restricted_token_copy};
 use crate::testing::groups::{Group, scm_group};
+use windows_sys::Win32::Security::{DISABLE_MAX_PRIVILEGE, TOKEN_IMPERSONATE, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
 /// `IO_REPARSE_TAG_HSM2`: a tag that names no other file, which an unelevated account can set on its own
@@ -73,7 +74,9 @@ fn the_default_log_is_named_for_its_daemon_in_the_logs_folder() {
 
 /// The permissions are set on a log that is there, and it is not otherwise changed.
 #[skuld::test]
-fn a_log_that_is_there_has_its_permissions_set_to_the_account_s_append_and_nothing_else() {
+fn a_log_that_is_there_has_its_permissions_set_to_the_account_s_append_and_nothing_else(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let (dir, log) = program_data_with_logs();
     fs::write(&log, "kept\n").unwrap();
     let me = process_user_sid();
@@ -701,7 +704,11 @@ fn a_logs_in_a_folder_whose_permissions_cannot_be_read_is_accepted() {
     let descriptor = Descriptor::from_sddl(&format!("D:P(A;;{rights};;;{me})(A;;;;;OW)")).unwrap();
     set_dacl(&descriptor, &closed).unwrap();
     // As an unelevated user, whatever this process is: an elevated token opens any folder with backup semantics.
-    let _unelevated = ThreadTokenReset::impersonate(&token_without_privileges());
+    let _unelevated = ThreadTokenReset::impersonate(&restricted_token_copy(
+        DISABLE_MAX_PRIVILEGE,
+        &mut [],
+        TOKEN_QUERY | TOKEN_IMPERSONATE,
+    ));
     read_path(&closed).expect_err("the premise: the permissions of the folder cannot be read");
 
     assert_eq!(refusal_of(&dir, &closed.join("x.log")), None);

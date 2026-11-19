@@ -518,7 +518,7 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
     let network_service = sid_of(5, &NETWORK_SERVICE);
     mgr.install(&as_account("LocalService"), false)
         .unwrap_or_else(|e| panic!("install as LocalService: {}", e.report()));
-    assert_eq!(accounts_of_default_log(id), [local_service.clone()]);
+    assert_eq!(accounts_of_default_log(id), std::slice::from_ref(&local_service));
 
     // The start returns when the process dies: it never reaches the dispatcher.
     let name = id.to_string();
