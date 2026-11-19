@@ -367,15 +367,16 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// A `stop` named no wait, so it takes the daemon's stop action for one, and the definition that
-    /// holds it will not decode; `source` is the decode failure. Nothing was sent. A stop that names its
-    /// wait does not read the definition, so the remedy, which [`report`](Error::report) prints last,
-    /// is the flags that name one.
+    /// The `stop` of `id` named no wait, so it takes the daemon's stop action for one, and the installed
+    /// definition that holds it will not decode; `source` is the decode failure. Nothing was sent. A stop
+    /// that names its wait does not read the definition, so the remedy, which [`report`](Error::report)
+    /// prints last, is the flags that name one. A wrapper, as [`wrapper!`] lists.
     #[error(
-        "with no `--timeout` or `--no-timeout`, the wait comes from the daemon's stop action, and its definition \
-         could not be read"
+        "the stop of `{id}` was refused and nothing was sent, because with no `--timeout` or `--no-timeout` the \
+         wait comes from the daemon's stop action, which could not be taken from its installed definition"
     )]
     StopActionUnreadable {
+        id: String,
         #[source]
         source: Box<Error>,
     },
@@ -758,6 +759,7 @@ macro_rules! wrapper {
         Error::Step { source: $source, .. }
             | Error::StartAsManaged { source: $source, .. }
             | Error::InstalledUnreadable { source: $source, .. }
+            | Error::StopActionUnreadable { source: $source, .. }
     };
 }
 
@@ -814,7 +816,6 @@ impl Error {
             | Error::SiblingShimMissing { .. }
             | Error::ShimLockForeign { .. }
             | Error::ShimLockDenied { .. }
-            | Error::StopActionUnreadable { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -837,8 +838,9 @@ impl Error {
         }
     }
 
-    /// The error a chain of [`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged) and
-    /// [`InstalledUnreadable`](Error::InstalledUnreadable) ends in, which classification reads: a step
+    /// The error a chain of [`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged),
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable) and
+    /// [`StopActionUnreadable`](Error::StopActionUnreadable) ends in, which classification reads: a step
     /// over [`NotInstalled`](Error::NotInstalled) is still "not installed". An error that carries
     /// another one in any other variant ([`Kept`](Error::Kept), [`Undetermined`](Error::Undetermined),
     /// [`Both`](Error::Both), and the rest) is itself the cause.
@@ -848,7 +850,8 @@ impl Error {
     }
 
     /// Whether this error, or what it wraps in a [`Step`](Error::Step),
-    /// [`StartAsManaged`](Error::StartAsManaged) or [`Kept`](Error::Kept), is an
+    /// [`StartAsManaged`](Error::StartAsManaged), [`StopActionUnreadable`](Error::StopActionUnreadable) or
+    /// [`Kept`](Error::Kept), is an
     /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
     /// walks through that variant. The errors carried by any other variant are not walked.
     pub(crate) fn wraps_unreadable_host(&self) -> bool {
@@ -939,7 +942,9 @@ impl Error {
                 "An administrator must make each named service's registry key readable, or let SCM query it \
                  (`SERVICE_QUERY_CONFIG`)",
             ),
-            Error::StopActionUnreadable { .. } => Some("Pass `--timeout <duration>` or `--no-timeout`"),
+            Error::StopActionUnreadable { .. } => {
+                Some("Pass `--timeout <duration>` or `--no-timeout` to stop it anyway")
+            }
             Error::Kept(kept) => kept.remedy(),
             _ => None,
         }

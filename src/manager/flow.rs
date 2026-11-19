@@ -386,6 +386,7 @@ pub(crate) fn stop_budget<S: InstalledService>(snapshot: &S, given: Option<Budge
             .stop_action()
             .map(|action| Budget::for_stop(&action))
             .map_err(|e| Error::StopActionUnreadable {
+                id: snapshot.id().to_string(),
                 source: Box::new(Error::kept(e)),
             }),
     }

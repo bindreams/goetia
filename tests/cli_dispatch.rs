@@ -5171,6 +5171,14 @@ fn a_wait_flag_overrides_the_stop_actions_wait() {
     }
 }
 
+/// What a refused flagless stop of a definition that will not decode tells the user to pass: both flags that name
+/// the wait, and the decode failure it stands on.
+fn assert_names_the_flags_that_name_the_wait(err: &str) {
+    assert!(err.contains("--timeout <duration>"), "{err}");
+    assert!(err.contains("--no-timeout"), "{err}");
+    assert!(err.contains("blob"), "the decode failure: {err}");
+}
+
 /// The daemon's own wait is read from its stop action, and a definition that will not decode has none: the
 /// stop fails with the decode failure and reserves nothing. A wait the user names needs no definition.
 #[skuld::test]
@@ -5180,8 +5188,7 @@ fn a_daemon_whose_definition_will_not_decode_is_stopped_only_under_a_wait_the_us
 
     let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
     assert_eq!(code, 1, "{err}");
-    assert!(err.contains("its definition could not be read"), "{err}");
-    assert!(err.contains("blob"), "the decode failure: {err}");
+    assert_names_the_flags_that_name_the_wait(&err);
     assert!(fake.prepared().is_empty(), "nothing was reserved");
 
     let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc", "--timeout", "3s"], &fake);
@@ -5196,7 +5203,7 @@ fn a_restart_of_a_definition_that_will_not_decode_fails_with_no_wait_flag_and_st
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(err.contains("its definition could not be read"), "{err}");
+    assert_names_the_flags_that_name_the_wait(&err);
     assert_eq!(fake.calls(), vec![], "nothing was stopped or started");
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc", "--timeout", "3s"], &fake);

@@ -1536,25 +1536,57 @@ fn a_stop_that_names_a_budget_keeps_it_whatever_the_daemons_stop_action_says() {
     assert_eq!(reserved_under(&fake), Budget::Immediate);
 }
 
-/// A definition that will not decode has no stop action to take the daemon's own wait from: the stop is
-/// [`Error::StopActionUnreadable`] over the decode failure, and reserves and sends nothing. A caller that
-/// names the wait does not need the definition, and the stop still works.
+/// The report a stop that names no wait returns for a definition that will not decode, whole: what was
+/// refused and why, the decode failure, and the flags that run the stop. Through the real `stop_budget`.
 #[skuld::test]
-fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_is_refused_with_the_flags_that_run_it() {
+fn a_stop_of_a_definition_that_will_not_decode_names_no_budget_reports_what_was_refused_and_the_flags() {
     let fake = Fake::new();
     fake.seed_unusable("odd");
     let id = Id::try_from("odd").unwrap();
 
     let e = ServiceManager::stop(&fake, &id, None).expect_err("no stop action to wait by");
 
-    assert!(
-        matches!(&e, Error::StopActionUnreadable { source } if matches!(**source, Error::Kept(_))),
-        "{e:?}"
+    assert_eq!(
+        e.report().to_string(),
+        "the stop of `odd` was refused and nothing was sent, because with no `--timeout` or `--no-timeout` the \
+         wait comes from the daemon's stop action, which could not be taken from its installed definition: blob: \
+         invalid base64: Invalid symbol 45, offset 3. Pass `--timeout <duration>` or `--no-timeout` to stop it anyway"
     );
-    assert!(e.report().to_string().contains("could not be read"), "{}", e.report());
+    assert!(!e.is_indeterminate());
     assert!(fake.prepared().is_empty(), "nothing was reserved");
 
     ServiceManager::stop(&fake, &id, Some(Budget::DEFAULT)).expect("a stop that names its wait");
+}
+
+/// The decode failure under the refusal is the one the snapshot kept, the failure `kind` reports for it.
+#[skuld::test]
+fn a_stop_budget_refusal_carries_the_failure_the_snapshot_kept() {
+    let fake = Fake::new();
+    fake.seed_unusable("odd");
+    let id = Id::try_from("odd").unwrap();
+    let Ok(ReadOutcome::Marked(snapshot)) = Backend::read(&fake, &id) else {
+        panic!("a marked entry");
+    };
+
+    let Err(Error::Kept(by_kind)) = kind_of(&snapshot) else {
+        panic!("the kept decode failure");
+    };
+    let e = stop_budget(&snapshot, None).expect_err("no stop action to wait by");
+
+    match &e {
+        Error::StopActionUnreadable { id, source } => {
+            assert_eq!(id, "odd");
+            assert!(
+                matches!(&**source, Error::Kept(by_stop) if Arc::ptr_eq(by_stop, &by_kind)),
+                "{e:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        e.remedy(),
+        Some("Pass `--timeout <duration>` or `--no-timeout` to stop it anyway")
+    );
 }
 
 /// The same through a sequence, which has spent no step when the stop cannot resolve its wait.
@@ -1568,9 +1600,10 @@ fn a_sequences_stop_of_a_definition_that_will_not_decode_names_no_budget_is_refu
     let e = sequence.stop(&id, None).expect_err("no stop action to wait by");
 
     assert!(
-        matches!(&e, Error::StopActionUnreadable { source } if matches!(**source, Error::Kept(_))),
+        matches!(&e, Error::StopActionUnreadable { source, .. } if matches!(**source, Error::Kept(_))),
         "{e:?}"
     );
+    assert!(e.remedy().is_some_and(|r| r.contains("--no-timeout")), "{e:?}");
     sequence
         .stop(&id, Some(Budget::DEFAULT))
         .expect("the step is still unspent");

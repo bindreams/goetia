@@ -266,19 +266,31 @@ fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_
     );
 }
 
-/// The one pin of the variant's words: the failure first, the remedy last, and never indeterminate.
+/// The stop refused for want of a readable stop action is as indeterminate as the decode failure under it,
+/// and is that failure's `cause`, `map_cause` and host-read classification, as a `Step` over it would be.
 #[skuld::test]
-fn an_unreadable_stop_action_says_what_ran_the_stop_and_ends_in_the_flags_that_run_it() {
-    let e = Error::StopActionUnreadable {
-        source: Box::new(Error::blob("bad base64")),
+fn an_unreadable_stop_action_reads_as_the_decode_failure_under_it() {
+    let over = |source: Error| Error::StopActionUnreadable {
+        id: "x".to_string(),
+        source: Box::new(source),
     };
+    assert!(!over(Error::Kept(Arc::new(Error::blob("bad")))).is_indeterminate());
+    assert!(over(Error::Kept(Arc::new(in_doubt()))).is_indeterminate());
+    assert!(matches!(over(not_installed()).cause(), Error::NotInstalled { .. }));
 
-    assert_eq!(
-        e.report().to_string(),
-        "with no `--timeout` or `--no-timeout`, the wait comes from the daemon's stop action, and its definition \
-         could not be read: blob: bad base64. Pass `--timeout <duration>` or `--no-timeout`"
-    );
-    assert!(!e.is_indeterminate());
+    let mapped = over(not_installed()).map_cause(|leaf| {
+        assert!(matches!(leaf, Error::NotInstalled { .. }), "{leaf:?}");
+        in_doubt()
+    });
+    assert!(matches!(mapped, Error::StopActionUnreadable { .. }), "{mapped:?}");
+    assert!(matches!(mapped.cause(), Error::WaitTimeout { .. }), "{mapped:?}");
+
+    let unreadable = || Error::InstalledUnreadable {
+        id: "x".to_string(),
+        source: Box::new(not_installed()),
+    };
+    assert!(over(unreadable()).wraps_unreadable_host());
+    assert!(!over(Error::blob("bad")).wraps_unreadable_host());
 }
 
 #[cfg(unix)]
