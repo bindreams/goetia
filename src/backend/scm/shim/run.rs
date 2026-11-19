@@ -12,7 +12,7 @@
 //! process tree on `SERVICE_STOP`.
 //!
 //! **Task mode** ([`task`]): Task Scheduler runs the shim as a task's action, and its arguments end
-//! in the task-mode argument and the task's id. It reads its own task, runs the program the same way,
+//! in the task-mode argument, the task's id and the registration's token. It reads its own task, runs the program the same way,
 //! and records how the run ended.
 
 use std::ffi::OsString;
@@ -35,7 +35,7 @@ pub(crate) fn run() -> ! {
     std::hint::black_box(&marker::MARKER);
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match task::requested(&args) {
-        Some(id) => task::run(id),
+        Some((id, token)) => task::run(id, token),
         None => service::run(),
     }
 }
