@@ -1752,7 +1752,13 @@ fn apply_refuses_an_account_that_is_no_user_before_the_password(#[fixture(env)] 
             generate::account_needs_password(Some(name)),
             "`{name}` needs a password"
         );
-        let err = apply(&dummy_reg(Some(name)), Some(identity::Written::Name(name)), true).expect_err(name);
+        let err = apply(
+            &simple_daemon(),
+            &dummy_reg(Some(name)),
+            Some(identity::Written::Name(name)),
+            None,
+        )
+        .expect_err(name);
         assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");
     }
 }
@@ -1777,4 +1783,32 @@ fn begin_run_of_a_service_is_not_a_task() {
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("a service began a run"),
     }
+}
+
+/// An update looks the registered account up only for the one thing that needs it: the default log of a
+/// service that has one, when the account changes. A task, which has no such log here, and an account that
+/// stays are not looked up (a lookup is a call to the system, and may fail for a reason that has nothing to do
+/// with the install).
+#[skuld::test]
+fn the_registered_account_is_looked_up_only_for_a_hosted_service_whose_account_changes() {
+    let old = Some(r"NT AUTHORITY\LocalService".to_string());
+    let new = Some(r"NT AUTHORITY\NetworkService".to_string());
+    let never = || -> Result<Option<Sid>> { panic!("the registered account was looked up") };
+    let found = crate::backend::scm::sid::sid_from_parts(5, &[19]);
+
+    assert_eq!(
+        accounts_kept_before_change(false, &old, &new, never).unwrap(),
+        None,
+        "not hosted"
+    );
+    assert_eq!(
+        accounts_kept_before_change(true, &old, &old, never).unwrap(),
+        None,
+        "unchanged"
+    );
+    assert_eq!(
+        accounts_kept_before_change(true, &old, &new, || Ok(Some(found.clone()))).unwrap(),
+        Some(found),
+        "hosted, changed"
+    );
 }

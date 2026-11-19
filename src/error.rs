@@ -276,8 +276,8 @@ pub enum Error {
     /// who made it or what is in it. No OS call failed.
     #[error(
         "refusing {}: its owner or permissions are not those goetia gives the folder, so goetia cannot vouch for \
-         it; delete the folder (it holds only the records of finished runs, which the next run writes again) and \
-         run the command again",
+         it; delete the folder (goetia makes it again; it holds the records of finished runs and the daemons' \
+         default logs, so keep any you want first) and run the command again",
         path.display()
     )]
     FolderNotAsMade { path: PathBuf },

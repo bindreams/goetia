@@ -219,6 +219,12 @@ pub(crate) fn install<B: Backend>(
             // The desired definition stands here, so what an earlier write made for it is kept.
             Outcome::UpToDate => {
                 scope.settle(|| Standing::Yes);
+                // `decide` finds an install up to date only over a marked snapshot.
+                let Some(snapshot) = found.snapshot.as_ref() else {
+                    debug_assert!(false, "an install is up to date only over a snapshot");
+                    return Ok(outcome);
+                };
+                b.ensure_beside(spec, &desired, snapshot)?;
                 return Ok(outcome);
             }
             Outcome::Conflict { .. }

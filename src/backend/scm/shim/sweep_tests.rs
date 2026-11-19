@@ -516,19 +516,17 @@ fn an_unresolvable_default_folder_is_an_error_for_any_other_folder() {
 
 #[cfg(windows)]
 mod windows {
-    use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
-    use std::os::windows::ffi::OsStringExt as _;
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::path::Path;
 
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, GetShortPathNameW};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::system::{expand_environment, remove_if_empty_default, unexpanded};
     use super::*;
     use crate::backend::scm::shim::acl::acl_tests::windows::junction;
     use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
-    use crate::backend::scm::wide::wide_null;
+    use crate::backend::scm::test_support::short;
     use crate::backend::scm::wide::wide_null_cut;
     use crate::error::Error;
 
@@ -574,20 +572,6 @@ mod windows {
 
     fn shim_in(dir: &Path, hex: &str) -> PathBuf {
         dir.join(format!("goetia-shim-{hex}.exe"))
-    }
-
-    /// `path` by its 8.3 names where the volume keeps them, and unchanged where it does not.
-    fn short(path: &Path) -> PathBuf {
-        let wide = wide_null(path).unwrap();
-        let mut buf = vec![0u16; 1024];
-        // SAFETY: `wide` is NUL-terminated and `buf` is `buf.len()` writable units.
-        let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
-        assert!(
-            0 < len && len < buf.len(),
-            "GetShortPathNameW: {}",
-            std::io::Error::last_os_error()
-        );
-        PathBuf::from(OsString::from_wide(&buf[..len]))
     }
 
     #[skuld::test]

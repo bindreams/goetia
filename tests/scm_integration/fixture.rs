@@ -20,13 +20,17 @@
 //!   `managed::uninstall_errors_when_service_will_not_stop`), connects to
 //!   `start-port`, then blocks forever on a channel nobody sends to. Killed
 //!   directly by its PID during that test's own cleanup, never via `stop`.
+//! - `before-handler` - connect to the dispatcher as `plain` does, then, in `ServiceMain` and before
+//!   `RegisterServiceCtrlHandlerExW`, send its pid to `start-port` and block until the test closes its end
+//!   of that connection; then go on as `plain`. Until then the service has made no status report. Run as the
+//!   service host of a `protocol: plain` daemon, it is a shim that holds no log yet.
 
 use std::ffi::OsString;
 use std::sync::mpsc;
 
 use windows_service::{define_windows_service, service_dispatcher};
 
-use crate::support::sentinel::{connect, send_line};
+use crate::support::sentinel::{connect, open, send_line};
 use crate::support::service_ctrl;
 
 pub const FIXTURE: &str = "--goetia-scm-fixture";
@@ -46,6 +50,21 @@ pub fn run_if_requested() -> bool {
 
 define_windows_service!(ffi_service_main, service_main);
 
+/// Tells the test this process's pid and blocks until the test shuts down its end of the connection, which is
+/// how it releases the process: a real primitive of the connection, and a test that fails drops its end as well.
+fn wait_for_release(port: u16) {
+    use std::io::{Read as _, Write as _};
+    use std::net::Shutdown;
+
+    let mut stream = open(port).expect("connect to the test");
+    stream
+        .write_all(std::process::id().to_string().as_bytes())
+        .expect("send the pid");
+    stream.shutdown(Shutdown::Write).expect("end the pid");
+    let mut until_released = Vec::new();
+    stream.read_to_end(&mut until_released).expect("wait to be released");
+}
+
 fn service_main(_scm_arguments: Vec<OsString>) {
     let args: Vec<String> = std::env::args().collect();
     let name = args[2].clone();
@@ -53,6 +72,10 @@ fn service_main(_scm_arguments: Vec<OsString>) {
     let stop_port: u16 = args[4].parse().expect("stop port");
     let mode = args.get(5).cloned().unwrap_or_else(|| "plain".to_string());
     let refuse_stop = mode == "refuse-stop";
+
+    if mode == "before-handler" {
+        wait_for_release(start_port);
+    }
 
     let (stop_tx, stop_rx) = mpsc::channel();
     let status_handle = service_ctrl::register(&name, (!refuse_stop).then_some(stop_tx));

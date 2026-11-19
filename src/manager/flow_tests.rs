@@ -241,6 +241,19 @@ fn an_install_settles_after_every_write_and_asks_for_the_standing_only_of_a_writ
     );
 }
 
+/// An install that finds the definition up to date still sees to what stands beside it; one that writes
+/// does that in its write.
+#[skuld::test]
+fn an_install_sees_to_what_stands_beside_the_definition_only_when_it_is_up_to_date() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    assert_eq!(fake.ensures(), 0, "a write makes it itself");
+
+    assert_eq!(fake.install(&mk("frpc"), false).unwrap(), Outcome::UpToDate);
+
+    assert_eq!(fake.ensures(), 1);
+}
+
 /// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.
 #[skuld::test]
 fn a_write_that_loses_to_an_ours_entry_follows_that_entry() {

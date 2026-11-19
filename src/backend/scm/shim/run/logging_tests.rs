@@ -3,28 +3,29 @@
 //! by the shim integration tests.
 
 use super::*;
-use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard};
+use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard, HOLD_FAILED};
+use crate::backend::scm::shim::run::test_support::chained;
 use crate::error::Error;
 
 const LINE: &str = "goetia-shim[svc]: the line";
 
-fn appended(path: &Path, parents: Parents, ok: bool) -> ChannelCall {
+fn appended(path: &Path, kind: LogKind, ok: bool) -> ChannelCall {
     ChannelCall::Append {
         path: path.to_path_buf(),
         line: LINE.to_string(),
-        parents,
+        kind,
         ok,
     }
 }
 
 /// The default log: the shim makes no folder for it.
 fn appended_default(path: &Path, ok: bool) -> ChannelCall {
-    appended(path, Parents::Never, ok)
+    appended(path, LogKind::Default, ok)
 }
 
 /// The daemon's own `logs` path, whose folders are the user's to name and so are made.
 fn appended_own(path: &Path, ok: bool) -> ChannelCall {
-    appended(path, Parents::Create, ok)
+    appended(path, LogKind::Own, ok)
 }
 
 fn reported() -> ChannelCall {
@@ -107,48 +108,235 @@ fn a_failure_goes_to_the_default_when_the_daemon_log_cannot_be_opened() {
     );
 }
 
-/// A daemon with no `logs` writes its default log, so its path is the default and no folder is made for
-/// it, whatever the call that set it.
+/// The shim compares no paths: a daemon with no `logs` writes its default log, which an install made and the
+/// shim only opens; any `logs:` is the user's own, whose parents are made. An install refuses a `logs:` in the
+/// folder of the default logs, so the two are never the same file.
 #[skuld::test]
-fn a_daemon_log_that_is_the_default_is_written_with_no_folder_made() {
-    let fake = FakeGuard::new();
-    let log = log_over(&fake);
-    let default = Path::new("logs").join("svc.log");
-    log.set_daemon_log(default.clone());
-
-    log.failure("svc", "the line");
-
-    assert_eq!(
-        fake.take_channel_calls(),
-        vec![appended_default(&default, true), reported()]
-    );
-}
-
-#[skuld::test]
-fn parents_are_made_for_every_path_but_the_default() {
-    let fake = FakeGuard::new();
-    let log = log_over(&fake);
-
-    assert_eq!(
-        (
-            log.parents_of("svc", &Path::new("logs").join("svc.log")),
-            log.parents_of("svc", Path::new(r"D:\logs\mine.log")),
-            log.parents_of("other", &Path::new("logs").join("svc.log")),
-        ),
-        (Parents::Never, Parents::Create, Parents::Create)
-    );
-}
-
-#[skuld::test]
-fn daemon_log_path_is_the_spec_s_logs_or_the_default() {
+fn the_default_log_is_the_one_of_an_unset_logs_and_every_set_logs_is_the_users_own() {
     let fake = FakeGuard::new();
     let log = log_over(&fake);
     let set = Path::new(r"D:\logs\mine.log");
 
     assert_eq!(
-        (log.daemon_log_path("svc", Some(set)), log.daemon_log_path("svc", None)),
-        (Some(set.to_path_buf()), Some(Path::new("logs").join("svc.log")))
+        (log.daemon_log("svc", None), log.daemon_log("svc", Some(set))),
+        (
+            Some((Path::new("logs").join("svc.log"), LogKind::Default)),
+            Some((set.to_path_buf(), LogKind::Own))
+        )
     );
+}
+
+/// A `logs:` that an install of an earlier version allowed and that is the default log's path as written is
+/// the default log: opened as the install's file, not as the user's own, which the file's permissions refuse.
+#[skuld::test]
+fn a_logs_equal_to_the_default_path_as_written_is_the_default_log() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+
+    assert_eq!(
+        log.daemon_log("svc", Some(&default)),
+        Some((default.clone(), LogKind::Default))
+    );
+    assert_eq!(
+        log.daemon_log("other", Some(&default)),
+        Some((default, LogKind::Own)),
+        "another daemon's default log is not this one's"
+    );
+}
+
+/// The shim opens its default log once, from its start, and holds it ([`Channels::hold_default`]).
+#[skuld::test]
+fn holding_the_default_log_asks_the_channels_to_hold_the_log_of_the_id() {
+    let fake = FakeGuard::new();
+
+    log_over(&fake).hold_default("svc");
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![ChannelCall::HoldDefault {
+            path: Path::new("logs").join("svc.log")
+        }]
+    );
+}
+
+/// A default log that cannot be held is told to the Event Log, once, with the error and the file: the
+/// daemon's own open of it says the same only for the output, and the shim's lines would otherwise fail
+/// without a word. The shim goes on: each line opens the file by its path.
+#[skuld::test]
+fn a_default_log_that_cannot_be_held_is_reported_to_the_event_log_once_and_lines_still_try_the_path() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+
+    let calls = fake.take_channel_calls();
+    let [
+        ChannelCall::HoldDefault { .. },
+        ChannelCall::EventLog { severity, line },
+    ] = calls.as_slice()
+    else {
+        panic!("a hold, then one line to the Event Log: {calls:?}");
+    };
+    assert_eq!(*severity, Severity::Error);
+    assert!(line.starts_with("goetia-shim[svc]: "), "{line}");
+    assert!(line.contains(&default.display().to_string()), "the file: {line}");
+    assert!(line.contains(HOLD_FAILED), "the error: {line}");
+
+    log.failure("svc", "the line");
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![appended_default(&default, true), reported()],
+        "the shim goes on with the path"
+    );
+}
+
+/// What the shim says of a default log it could not hold is the hold's own, and promises nothing of what the
+/// opens that follow will meet.
+#[skuld::test]
+fn the_hold_of_the_default_log_says_what_it_met_and_nothing_of_what_follows() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+
+    assert_eq!(
+        fake.take_failures(),
+        vec![format!(
+            "goetia-shim[svc]: hold the default log {}: {HOLD_FAILED}",
+            default.display()
+        )]
+    );
+}
+
+/// A fault the shim could not hold the file for does not silence the open that fails for it: that open says
+/// what it costs (the output is not captured), which the hold's line does not.
+#[skuld::test]
+fn a_default_log_that_could_not_be_held_does_not_silence_the_open_that_fails_too() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let default = Path::new("logs").join("svc.log");
+    fake.will_fail_hold(&default);
+
+    log.hold_default("svc");
+    log.open_failed("svc", &default, &std::io::Error::other("denied"));
+
+    let told = fake.take_failures();
+    let [held, opened] = told.as_slice() else {
+        panic!("the hold's line and the open's: {told:?}");
+    };
+    assert!(held.contains("hold the default log"), "{held}");
+    assert!(opened.contains("this daemon's output will not be captured"), "{opened}");
+}
+
+/// A fault is told once, however often it is met: the same open of the same file failing the same way is one line.
+#[skuld::test]
+fn an_open_that_fails_again_the_same_way_is_told_once() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("elsewhere").join("daemon.log");
+    let other = Path::new("elsewhere").join("other.log");
+    let fault = std::io::Error::other("denied");
+
+    log.open_failed("svc", &daemon, &fault);
+    log.open_failed("svc", &daemon, &fault);
+    log.open_failed("svc", &other, &fault);
+    log.marker_open_failed("svc", &daemon, &fault);
+    log.marker_open_failed("svc", &daemon, &fault);
+
+    let told = fake.take_failures();
+    let [first, second, marker] = told.as_slice() else {
+        panic!("one line for each file's output, and the marker's: {told:?}");
+    };
+    assert!(first.contains(&daemon.display().to_string()), "{first}");
+    assert!(second.contains(&other.display().to_string()), "{second}");
+    assert!(marker.contains("the run marker could not be written"), "{marker}");
+}
+
+/// The marker's open and the output's open of one file, failing alike, are two facts with two consequences: a
+/// marker not written, and an output not captured. A failed marker does not silence the output's failure.
+#[skuld::test]
+fn a_failed_marker_and_a_failed_output_of_one_file_are_both_told() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("elsewhere").join("daemon.log");
+    let fault = std::io::Error::other("denied");
+
+    log.marker_open_failed("svc", &daemon, &fault);
+    log.open_failed("svc", &daemon, &fault);
+
+    let told = fake.take_failures();
+    let [marker, output] = told.as_slice() else {
+        panic!("the marker's line and the output's: {told:?}");
+    };
+    assert!(marker.contains("the run marker could not be written"), "{marker}");
+    assert!(output.contains("this daemon's output will not be captured"), "{output}");
+}
+
+/// A different fault in the same file is another fact, told in its own right.
+#[skuld::test]
+fn a_fault_of_another_kind_in_the_same_file_is_told_too() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("elsewhere").join("daemon.log");
+
+    log.open_failed("svc", &daemon, &std::io::Error::from(std::io::ErrorKind::NotFound));
+    log.open_failed(
+        "svc",
+        &daemon,
+        &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    );
+
+    assert_eq!(fake.take_failures().len(), 2);
+}
+
+/// The marker says what its own failure costs: the run cannot be found in the log. It does not say the output
+/// is not captured, which the marker's open does not know.
+#[skuld::test]
+fn the_markers_failed_open_says_the_marker_could_not_be_written() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+
+    log.marker_open_failed("svc", Path::new("daemon.log"), &chained());
+
+    assert_eq!(
+        fake.take_failures(),
+        vec![
+            "goetia-shim[svc]: open log file daemon.log: the context: the cause (the run marker could not be written; the program is still run)"
+                .to_string()
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_log_file_that_cannot_be_opened_prints_the_cause_of_the_failure() {
+    assert_eq!(
+        log_open_failed(
+            Path::new("daemon.log"),
+            &chained(),
+            "this daemon's output will not be captured; it is still being run"
+        ),
+        "open log file daemon.log: the context: the cause (this daemon's output will not be captured; it is still being run)"
+    );
+}
+
+/// A machine with no `%ProgramData%` has no default log to hold.
+#[skuld::test]
+fn a_log_with_no_default_file_holds_nothing() {
+    let fake = FakeGuard::new();
+    let log = Log::from_program_data(
+        fake.channels(),
+        Err(Error::os("locate %ProgramData%", std::io::Error::other("x"))),
+    );
+    fake.take_channel_calls();
+
+    log.hold_default("svc");
+
+    assert_eq!(fake.take_channel_calls(), vec![]);
 }
 
 #[skuld::test]
@@ -170,10 +358,10 @@ fn a_machine_that_cannot_name_program_data_has_no_default_file_and_the_event_log
     assert_eq!(
         (
             log.default_log_path("svc"),
-            log.daemon_log_path("svc", None),
-            log.daemon_log_path("svc", Some(set))
+            log.daemon_log("svc", None),
+            log.daemon_log("svc", Some(set))
         ),
-        (None, None, Some(set.to_path_buf()))
+        (None, None, Some((set.to_path_buf(), LogKind::Own)))
     );
     log.failure("svc", "the line");
     assert_eq!(
@@ -206,7 +394,7 @@ fn log_destinations_try_the_daemon_log_then_the_default() {
 
     assert_eq!(
         log_destinations(Some(&daemon), default.clone()),
-        vec![(daemon, Parents::Create), (default, Parents::Never)]
+        vec![(daemon, LogKind::Own), (default, LogKind::Default)]
     );
 }
 
@@ -214,16 +402,9 @@ fn log_destinations_try_the_daemon_log_then_the_default() {
 fn log_destinations_try_the_default_once_when_there_is_no_daemon_log() {
     let default = PathBuf::from("default.log");
 
-    assert_eq!(log_destinations(None, default.clone()), vec![(default, Parents::Never)]);
-}
-
-#[skuld::test]
-fn log_destinations_do_not_retry_the_default_when_it_is_the_daemon_log() {
-    let default = PathBuf::from("default.log");
-
     assert_eq!(
-        log_destinations(Some(&default), default.clone()),
-        vec![(default, Parents::Never)]
+        log_destinations(None, default.clone()),
+        vec![(default, LogKind::Default)]
     );
 }
 
@@ -273,7 +454,7 @@ fn program_data_is_the_known_folder_and_logging_uses_it() {
         "the known folder is where the environment says it is, unless a process redirects the variable"
     );
     assert_eq!(
-        Log::real().default_log_path("svc"),
+        Log::real(Arc::default()).default_log_path("svc"),
         Some(program_data.join("Goetia").join("logs").join("svc.log"))
     );
 }
