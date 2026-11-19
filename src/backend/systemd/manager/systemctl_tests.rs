@@ -1456,7 +1456,8 @@ fn not_loaded_then_reloaded(not_found: &str, after: &str) -> Fake {
 /// reloaded and asked about again, whichever read it was.
 #[skuld::test]
 fn a_unit_written_and_not_reloaded_is_reloaded_by_every_read_of_it() {
-    let reads: [(&str, &str, fn(&Systemctl) -> Result<()>); 4] = [
+    type Read = fn(&Systemctl) -> Result<()>;
+    let reads: [(&str, &str, Read); 4] = [
         (
             "status",
             "ActiveState=active\nMainPID=42\nUnitFileState=enabled\nLoadState=",
