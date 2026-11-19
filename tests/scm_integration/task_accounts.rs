@@ -532,7 +532,7 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
             .expect("open the service to start it");
         service.start::<&str>(&[])
     });
-    reached.accept("the service's process, which has not reached the dispatcher");
+    let pid = reached.accept_value("the service's process, which has not reached the dispatcher");
     let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
     let service = scm
         .open_service(id.as_str(), ServiceAccess::QUERY_STATUS)
@@ -554,8 +554,8 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
         "a shim launched as the old account may still be about to open the log"
     );
 
-    mgr.kill(id)
-        .unwrap_or_else(|e| panic!("kill the process of the pending start: {}", e.report()));
+    // SCM knows no pid for a service whose process has not reached the dispatcher, so `kill` has none.
+    support::cmd::run("taskkill.exe", &["/F", "/PID", &pid]).expect_ok();
     start
         .join()
         .expect("the start thread")
