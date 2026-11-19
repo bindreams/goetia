@@ -42,8 +42,9 @@ fn said_within(context: String, delivered: bool, source: io::Error) -> io::Error
 /// knows how [`within`] is laid in it.
 ///
 /// Nothing goetia lays in an [`io::Error`], neither an [`Error`] nor a [`within`] context, sits under a
-/// shared payload (an `Arc<io::Error>` or a [`SharedError`](super::SharedError)): a shared payload is only ever an OS failure, which
-/// [`seen`] still looks through for the printer. A debug build asserts it in [`told`].
+/// shared payload (an `Arc<io::Error>` or a [`SharedError`](super::SharedError)): a shared payload is only
+/// ever an OS failure, which [`seen`] still looks through for the printer. A debug build asserts it in
+/// [`told`].
 enum Layer<'a> {
     Context(&'a Within),
     Carried(&'a Error),
