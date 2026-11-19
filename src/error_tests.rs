@@ -1539,9 +1539,8 @@ fn the_os_error_of_an_error_a_sentence_only_mentions_is_not_found() {
 /// The primary failure of a pair is the pair's cause, and the second only told after it.
 #[skuld::test]
 fn the_os_error_of_a_pair_is_its_primarys_and_never_its_seconds() {
-    let pair = |primary: std::io::Error, second: std::io::Error| {
-        Error::os("kill", crate::error::paired(primary, second))
-    };
+    let pair =
+        |primary: std::io::Error, second: std::io::Error| Error::os("kill", crate::error::paired(primary, second));
     let coded = |code| std::io::Error::from_raw_os_error(code);
     assert_eq!(pair(coded(5), coded(8)).raw_os_error(), Some(5));
     assert_eq!(pair(std::io::Error::other("no code"), coded(8)).raw_os_error(), None);

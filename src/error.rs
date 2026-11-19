@@ -18,6 +18,8 @@ pub(crate) use composite::{Composite, carried_composite, carry};
 pub(crate) use escape::EscapedStream;
 #[cfg(any(feature = "cli", unix))]
 pub(crate) use escape::escape;
+#[cfg(any(windows, test))]
+pub(crate) use paired::paired;
 pub use reason::Reason;
 #[cfg(feature = "cli")]
 pub(crate) use report::Sink;
@@ -26,8 +28,6 @@ pub(crate) use report::find;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
 pub(crate) use report::{Chain, Pieces};
-#[cfg(any(windows, test))]
-pub(crate) use paired::paired;
 pub(crate) use within::{target_failed, unread_after_open_refused, within};
 
 use report::Report;

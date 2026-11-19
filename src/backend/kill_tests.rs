@@ -797,7 +797,11 @@ fn a_wrapped_error_comes_back_as_itself() {
     let failed = kill_failed("x", e);
 
     assert!(matches!(failed.cause(), Error::NoManager { .. }), "{failed:?}");
-    assert!(failed.report().to_string().starts_with("failed to kill `x`: "), "{}", failed.report());
+    assert!(
+        failed.report().to_string().starts_with("failed to kill `x`: "),
+        "{}",
+        failed.report()
+    );
 }
 
 /// Any other failure is an OS failure of the kill, naming it.

@@ -44,7 +44,12 @@ fn a_goetia_error_the_read_carries_is_the_source_of_a_hold_that_could_not_tell_a
     let back = carried(unread_after_open_refused(7, denied(), read)).expect("an error is carried");
 
     assert!(back.is_indeterminate(), "{back:?}");
-    let Error::ManagerUnreadAfterOpenRefused { pid, open_refused, source } = &back else {
+    let Error::ManagerUnreadAfterOpenRefused {
+        pid,
+        open_refused,
+        source,
+    } = &back
+    else {
         panic!("{back:?}");
     };
     assert_eq!(*pid, 7);
@@ -62,7 +67,10 @@ fn a_plain_failed_read_after_a_refused_open_is_an_os_failure_under_the_same_erro
     let Error::ManagerUnreadAfterOpenRefused { source, .. } = &back else {
         panic!("{back:?}");
     };
-    assert!(matches!(&**source, Error::Os { what, .. } if what == "read it"), "{back:?}");
+    assert!(
+        matches!(&**source, Error::Os { what, .. } if what == "read it"),
+        "{back:?}"
+    );
 }
 
 /// A target's failure is the goetia error it carries, under a step that says what was done, else an OS
@@ -70,9 +78,16 @@ fn a_plain_failed_read_after_a_refused_open_is_an_os_failure_under_the_same_erro
 #[skuld::test]
 fn a_targets_failure_keeps_what_was_done_whether_or_not_it_carries_a_goetia_error() {
     let carrying = target_failed("kill `x`", io::Error::other(Error::blob("carried")));
-    assert!(matches!(&carrying, Error::Step { what, .. } if what == "failed to kill `x`"), "{carrying:?}");
+    assert!(
+        matches!(&carrying, Error::Step { what, .. } if what == "failed to kill `x`"),
+        "{carrying:?}"
+    );
     assert!(matches!(carrying.cause(), Error::Blob { .. }), "{carrying:?}");
-    assert!(carrying.report().to_string().starts_with("failed to kill `x`: "), "{}", carrying.report());
+    assert!(
+        carrying.report().to_string().starts_with("failed to kill `x`: "),
+        "{}",
+        carrying.report()
+    );
 
     let plain = target_failed("kill `x`", denied());
     assert_eq!(plain.report().to_string(), "failed to kill `x`: denied");
