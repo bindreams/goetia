@@ -112,7 +112,10 @@ pub fn account_holds_right(sid: &[u8], right: &str) -> bool {
         // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS`.
         let win32 = unsafe { LsaNtStatusToWinError(status) };
         // An account with no rights at all is not found by the policy: it holds none.
-        assert_eq!(win32, ERROR_FILE_NOT_FOUND, "enumerate the rights of the account: NTSTATUS {status:#x}");
+        assert_eq!(
+            win32, ERROR_FILE_NOT_FOUND,
+            "enumerate the rights of the account: NTSTATUS {status:#x}"
+        );
     }
     // SAFETY: `policy` was opened above and is closed once, after its last use.
     unsafe { LsaClose(policy) };

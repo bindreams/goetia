@@ -135,7 +135,10 @@ mod system {
         /// ask for what they use. A SID that is not whole is an error. `principals` is not empty: no account could
         /// write the records.
         pub(crate) fn for_runs(principals: &[Sid]) -> Result<Self> {
-            debug_assert!(!principals.is_empty(), "a record directory names the account that writes to it");
+            debug_assert!(
+                !principals.is_empty(),
+                "a record directory names the account that writes to it"
+            );
             let mut sddl = String::from("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
             for principal in principals {
                 let principal = sid_text(principal, "a run-record directory")?;

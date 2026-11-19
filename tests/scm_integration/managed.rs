@@ -869,16 +869,15 @@ impl EventSourceChanged {
     /// Damages the source in each way, and after each runs `install`, an install that finds its daemon up to
     /// date, and requires it to have made the source as an install does.
     pub(crate) fn assert_made_again_by(&self, mut install: impl FnMut()) {
-        let damages: [(&str, fn() -> std::io::Result<()>); 2] = [
-            ("a changed TypesSupported", || {
+        for damage in ["a changed TypesSupported", "a lost key"] {
+            let damaged = if damage == "a lost key" {
+                Self::root().delete_subkey(EVENT_SOURCE_KEY)
+            } else {
                 Self::root()
-                    .open_subkey_with_flags(EVENT_SOURCE_KEY, KEY_WRITE)?
-                    .set_value("TypesSupported", &0u32)
-            }),
-            ("a lost key", || Self::root().delete_subkey(EVENT_SOURCE_KEY)),
-        ];
-        for (damage, apply) in damages {
-            apply().unwrap_or_else(|e| panic!("damage the event source ({damage}): {e}"));
+                    .open_subkey_with_flags(EVENT_SOURCE_KEY, KEY_WRITE)
+                    .and_then(|key| key.set_value("TypesSupported", &0u32))
+            };
+            damaged.unwrap_or_else(|e| panic!("damage the event source ({damage}): {e}"));
 
             install();
 
