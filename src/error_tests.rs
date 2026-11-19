@@ -254,9 +254,9 @@ fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is()
             terminate_failed: Arc::new(std::io::Error::other("t")),
             source: Box::new(source),
         }),
-        ("ProcessNotOpened", |source| Error::ProcessNotOpened {
+        ("ProcessNotHeld", |source| Error::ProcessNotHeld {
             id: "x".to_string(),
-            open_failed: std::io::Error::other("o"),
+            hold_failed: std::io::Error::other("o"),
             source: Box::new(source),
         }),
         ("ManagerUnreadAfterOpenRefused", |source| {
@@ -316,15 +316,12 @@ fn the_search_finds_what_a_wrapper_says_in_its_words_and_what_it_wraps_but_not_w
     };
     assert!(finds_os_code(&unconfirmed, 5), "{unconfirmed:?}");
     assert!(!finds_os_code(&unconfirmed, 6), "{unconfirmed:?}");
-    let unopened = Error::ProcessNotOpened {
+    let unheld = Error::ProcessNotHeld {
         id: "x".to_string(),
-        open_failed: std::io::Error::from_raw_os_error(6),
+        hold_failed: std::io::Error::from_raw_os_error(6),
         source: Box::new(os_code(5)),
     };
-    assert!(
-        finds_os_code(&unopened, 5) && finds_os_code(&unopened, 6),
-        "{unopened:?}"
-    );
+    assert!(finds_os_code(&unheld, 5) && finds_os_code(&unheld, 6), "{unheld:?}");
     let unread = Error::ManagerUnreadAfterOpenRefused {
         pid: 7,
         open_refused: std::io::Error::from_raw_os_error(6),
@@ -718,9 +715,9 @@ fn every_variant_written_from_its_pieces_is_classified_and_renders_as_them() {
             terminate_failed: Arc::new(io()),
             source: boxed(not_installed()),
         },
-        Error::ProcessNotOpened {
+        Error::ProcessNotHeld {
             id: "x".to_string(),
-            open_failed: io(),
+            hold_failed: io(),
             source: boxed(not_installed()),
         },
         Error::ManagerUnreadAfterOpenRefused {

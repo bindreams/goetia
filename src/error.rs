@@ -59,6 +59,10 @@ pub enum Error {
     /// An OS failure that says nothing of its own: the words of the error around it say what failed, as
     /// those of [`ManagerUnreadAfterOpenRefused`](Error::ManagerUnreadAfterOpenRefused) do. `os` is
     /// rendered as any error is, and is not the [`source`](std::error::Error::source).
+    ///
+    /// It is also the goetia error that a shared payload of `os` holds, which cannot be moved out of it: the
+    /// text, the remedies, the search and [`is_indeterminate`](Error::is_indeterminate) read that error
+    /// through `os`; [`cause`](Error::cause) and [`map_cause`](Error::map_cause) do not.
     #[error("{}", Written(self))]
     RawOs { os: std::io::Error },
 
@@ -764,11 +768,11 @@ pub enum Error {
     },
 
     /// A `stop` of `id` that could not wait for the service's process, because goetia could not hold
-    /// it: `open_failed`, a cause. `source` is the stop's failure, whose class the error has.
+    /// it: `hold_failed`, a cause. `source` is the stop's failure, whose class the error has.
     #[error("{}", Written(self))]
-    ProcessNotOpened {
+    ProcessNotHeld {
         id: String,
-        open_failed: std::io::Error,
+        hold_failed: std::io::Error,
         #[source]
         source: Box<Error>,
     },
@@ -813,7 +817,7 @@ macro_rules! wrapper {
         Error::Step { source: $source, .. }
             | Error::StartJudgedWithoutBlob { source: $source, .. }
             | Error::ProcessExitUnconfirmed { source: $source, .. }
-            | Error::ProcessNotOpened { source: $source, .. }
+            | Error::ProcessNotHeld { source: $source, .. }
             | Error::ManagerUnreadAfterOpenRefused { source: $source, .. }
             | Error::OutputAlsoFailed { source: $source, .. }
             | Error::InstalledUnreadable { source: $source, .. }
@@ -842,9 +846,10 @@ impl Error {
             | Error::RunUnrecorded { .. } => true,
             wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
+            // The goetia error a shared payload holds, which `within::told` could not move out.
+            Error::RawOs { os } => within::look(os).carried.is_some_and(Error::is_indeterminate),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
-            | Error::RawOs { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
             | Error::ConcurrentChange { .. }
@@ -1026,7 +1031,7 @@ impl Error {
             Error::ProcessExitUnconfirmed {
                 id, terminate_failed, ..
             } => Some(process_exit_unconfirmed_message(id, terminate_failed)),
-            Error::ProcessNotOpened { id, open_failed, .. } => Some(process_not_opened_message(id, open_failed)),
+            Error::ProcessNotHeld { id, hold_failed, .. } => Some(process_not_held_message(id, hold_failed)),
             Error::ManagerUnreadAfterOpenRefused { pid, open_refused, .. } => {
                 Some(manager_unread_after_open_refused_message(*pid, open_refused))
             }
@@ -1459,11 +1464,11 @@ fn process_exit_unconfirmed_message<'a>(id: &str, terminate_failed: &'a std::io:
     )
 }
 
-/// The message of [`Error::ProcessNotOpened`]: `open_failed` is why the process could not be opened.
-fn process_not_opened_message<'a>(id: &str, open_failed: &'a std::io::Error) -> Pieces<'a> {
+/// The message of [`Error::ProcessNotHeld`]: `hold_failed` is why the process could not be held.
+fn process_not_held_message<'a>(id: &str, hold_failed: &'a std::io::Error) -> Pieces<'a> {
     Pieces::new()
         .text(format!("goetia could not hold `{id}`'s process ("))
-        .cause(open_failed)
+        .cause(hold_failed)
         .text("), so it could not wait for the process to exit")
 }
 
@@ -1576,14 +1581,19 @@ fn loaded_in_doubt_tail(id: &str, restore_failed: bool) -> String {
 }
 
 /// What `Display` writes for a variant whose message sets errors inside it: its [`pieces`](Error::pieces).
+/// A variant that `pieces` leaves unclassified is written as its `Debug`, and a debug build asserts: no
+/// `Display` fails or panics in a release build, and a test renders every such variant.
 struct Written<'a>(&'a Error);
 
 impl fmt::Display for Written<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
-            .pieces()
-            .expect("a variant written from its pieces is classified by `pieces`")
-            .fmt(f)
+        match self.0.pieces() {
+            Some(pieces) => pieces.fmt(f),
+            None => {
+                debug_assert!(false, "a variant written from its pieces is classified by `pieces`");
+                write!(f, "{:?}", self.0)
+            }
+        }
     }
 }
 

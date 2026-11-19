@@ -585,7 +585,7 @@ impl Scm {
     /// tree may still be running) is a failed stop, once the process is ended; `uninstall` fails the
     /// same way, and leaves the service stopped, disabled and not deleted (see [`uninstall_stop_on`]).
     ///
-    /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
+    /// A process that cannot be held is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
     ///
     /// The gap: if the held process crashes and Windows' recovery restarts the service before the
@@ -995,7 +995,7 @@ pub(super) fn stop_on<A: super::wait::ScmActor, P: HeldProcess>(
                 Err(process_wait_failed(id, format!("stop `{id}`"), failure))
             }
         });
-    // A process that cannot be opened is not waited for (see `stop_and_await_exit`), and a `stop`
+    // A process that cannot be held is not waited for (see `stop_and_await_exit`), and a `stop`
     // that succeeds has no channel to say so: the reason leads the error of one that fails.
     stopped.map_err(|error| match held {
         HoldOutcome::Refused(reason) => unwaited(id, reason, error),
@@ -1502,7 +1502,7 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
 /// before the process exits, and reports no pid after it. It may be running an older file than the
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
-/// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
+/// process that cannot be held is none (see [`hold_if_possible`]). The service handle each hold
 /// uses is closed before it returns, or the service could not be deleted.
 fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
@@ -1788,7 +1788,7 @@ fn is_gone_or_marked(error: &Error) -> bool {
 /// before the process exits, and reports no pid after it. For an uninstall it may be running an
 /// older file than the one registered (an `Update` it has not restarted into), which no read of the
 /// registry shows. [`HoldOutcome::NoProcess`] when SCM reports none, and [`HoldOutcome::Refused`],
-/// with why, when the process cannot be opened (see [`hold_if_possible`]): the caller goes on, and
+/// with why, when the process cannot be held (see [`hold_if_possible`]): the caller goes on, and
 /// what that process runs stays referenced by its image until it exits. A failure to read SCM is an
 /// error, led by `not_done`, what the caller did not do. The wait for SCM to let go of a pid whose
 /// process is gone ends at `deadline`, and is [`HoldOutcome::Expired`]: a `stop` sends its STOP all
@@ -1853,12 +1853,12 @@ fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Er
     }
 }
 
-/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not open, for
+/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not hold, for
 /// `reason`: led by what that left undone, with the class of `error`.
 fn unwaited(id: &Id, reason: std::io::Error, error: Error) -> Error {
-    Error::ProcessNotOpened {
+    Error::ProcessNotHeld {
         id: id.to_string(),
-        open_failed: reason,
+        hold_failed: reason,
         source: Box::new(error),
     }
 }

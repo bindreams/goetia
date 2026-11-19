@@ -128,7 +128,13 @@ const NOTICE_AFTER: Duration = Duration::from_secs(1);
 
 /// What an unbounded wait for the manager's record of `id`'s process `pid` says it is blocked on.
 fn recording_notice(id: &str, pid: u32) -> String {
-    format!("{id}: waiting for the manager to record that process {pid} has exited")
+    format!("{id}: {}", recording_wait(pid))
+}
+
+/// What the wait for the manager's record of `pid` is, in words true whether the process exited or the
+/// manager moved off it.
+fn recording_wait(pid: u32) -> String {
+    format!("waiting for the manager to stop reporting process {pid}")
 }
 
 /// `wait` under [`NOTICE_AFTER`], and once it has lasted that long `line` said and `wait` again with no
@@ -163,6 +169,16 @@ fn wait_unbounded_saying<T: KillTarget>(
 ///
 /// The signal is sent before any wait, so a caller that dies in the wait still has the process ended.
 pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillOutcome> {
+    kill_service_naming(target, id, |e| e)
+}
+
+/// [`kill_service`], where the failure of the first read of the manager is told by `unread`: a caller that
+/// kills one of several processes of `id` says which in it.
+pub(crate) fn kill_service_naming<T: KillTarget>(
+    target: &mut T,
+    id: &str,
+    unread: impl FnOnce(io::Error) -> io::Error,
+) -> io::Result<KillOutcome> {
     match hold_once(target, Budget::Bounded(NOTICE_AFTER).start()) {
         // The hold's wait for the record of a process gone before it could be opened is the kill's own.
         Err(HoldError::Expired { pid }) => {
@@ -172,7 +188,8 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             .map_err(|e| of_process(pid, Step::Recording, e))?;
             Ok(KillOutcome::Ended)
         }
-        Err(HoldError::Unread(e) | HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
+        Err(HoldError::Unread(e)) => Err(unread(e)),
+        Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
         Ok(Hold::NoProcess) => Ok(KillOutcome::NotRunning),
         // The process held is not the service's, or was gone: it is not signalled, and a manager may
         // still report its pid for a moment, so the kill waits for the record as after a signal.
@@ -277,7 +294,7 @@ fn of_process(pid: u32, step: Step, e: io::Error) -> io::Error {
         match step {
             Step::Opening => format!("opening process {pid}"),
             Step::Confirming => format!("confirming that process {pid} is the daemon's"),
-            Step::Recording => format!("waiting for the manager to record that process {pid} has exited"),
+            Step::Recording => recording_wait(pid),
         },
         e,
     )

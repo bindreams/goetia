@@ -150,6 +150,10 @@ fn carried_in_each_payload(carried: fn() -> Error) -> Vec<(&'static str, io::Err
     ]
 }
 
+fn carries_error(e: &io::Error) -> bool {
+    look(e).carried.is_some()
+}
+
 fn blob() -> Error {
     Error::blob("carried")
 }

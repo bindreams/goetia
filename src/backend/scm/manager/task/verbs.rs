@@ -4,7 +4,7 @@
 //! by the pid the listing gives and held, the listing is read again, and only a pid it still names is
 //! the run's, since Task Scheduler holds its own handle to the process for as long as it lists the pid,
 //! so no stranger can have the number (L1, M5). [`RunTarget`] is that for one run, a
-//! [`KillTarget`]: `kill` is [`kill_service`] over it, and `stop` holds through the same
+//! [`KillTarget`]: `kill` is [`kill_service_naming`] over it, and `stop` holds through the same
 //! [`hold_once`].
 //!
 //! Three things differ from a service.
@@ -24,14 +24,14 @@ use super::live::{Liveness, probe};
 use super::read::live_runs;
 use super::{TaskApi, TaskPath};
 use crate::backend::kill::{
-    Hold, HoldError, KillTarget, Waited, hold_once, kill_failed, kill_service, wait_saying, waiting_notice,
+    Hold, HoldError, KillTarget, Waited, hold_once, kill_failed, kill_service_naming, wait_saying, waiting_notice,
 };
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::manager::{Scm, open_refused};
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::error::{Error, Result, target_failed};
+use crate::error::{Error, Result, target_failed, within};
 use crate::manager::Budget;
 use crate::manager::budget::{self, Deadline};
 use crate::spec::Id;
@@ -418,7 +418,7 @@ impl Scm {
         self.task_kill_with(id, &mut System)
     }
 
-    /// Ends every run of the task that is alive through its held process ([`kill_service`] over each).
+    /// Ends every run of the task that is alive through its held process ([`kill_service_naming`] over each).
     /// Every process is held before the first is terminated, so a run whose process cannot be opened
     /// fails the call with nothing killed; once they are, a run that cannot be ended is an error beside
     /// the ones that were. None alive is [`Error::NotRunning`]; a run with no process any more has
@@ -439,7 +439,11 @@ impl Scm {
             let mut target = RunTarget::new(&*self.tasks, &path, instance.id, &mut *processes);
             target.held = Some(process);
             // `NotRunning` is a run the listing dropped since: it is over.
-            if let Err(e) = kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e)) {
+            // The first read is made before the listing names a process: this loop knows which run it is for.
+            let killed = kill_service_naming(&mut target, id.as_str(), |e| {
+                within(format!("reading the process of the run (pid {})", instance.pid), e)
+            });
+            if let Err(e) = killed.map_err(|e| kill_failed(id.as_str(), e)) {
                 failures.push(e);
             }
         }

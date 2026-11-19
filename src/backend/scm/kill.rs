@@ -132,7 +132,7 @@ pub(crate) enum HoldOutcome<P> {
     Held(P),
     /// A service with no process.
     NoProcess,
-    /// SCM vouches for the service's process and it cannot be opened (a right removed by policy),
+    /// SCM vouches for the service's process and it cannot be held (a right removed by policy),
     /// for the reason given: the caller goes on without it, since what that process runs is still
     /// found by its image, and says that no wait for it was possible.
     Refused(io::Error),

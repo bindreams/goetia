@@ -42,15 +42,46 @@ fn said_within(context: String, delivered: bool, source: io::Error) -> io::Error
 /// knows how [`within`] is laid in it.
 enum Layer<'a> {
     Context(&'a Within),
-    Carried,
+    Carried(&'a Error),
     Os,
 }
 
 fn layer(e: &io::Error) -> Layer<'_> {
     match seen(e) {
-        Seen::Ours(_) => Layer::Carried,
+        Seen::Ours(carried) => Layer::Carried(carried),
         Seen::Other(inner) => inner.downcast_ref::<Within>().map_or(Layer::Os, Layer::Context),
         Seen::Composite(_) => Layer::Os,
+    }
+}
+
+/// What one look at an [`io::Error`] found, through its contexts: the one read of what an error says of its
+/// signal and of the goetia error it carries, which [`target_failed`] and `debug_privilege_also_failed`
+/// (Windows) both take their answers from, and [`Error::is_indeterminate`] for an error [`told`] could not
+/// move.
+pub(super) struct Looked<'a> {
+    /// A context said by [`within_delivered`] is among those the error is said within: see there.
+    delivered: bool,
+    /// The goetia [`Error`] the error carries, directly or under [`within`] contexts.
+    pub(super) carried: Option<&'a Error>,
+}
+
+pub(super) fn look(e: &io::Error) -> Looked<'_> {
+    match layer(e) {
+        Layer::Context(within) => {
+            let under = look(&within.source);
+            Looked {
+                delivered: within.delivered || under.delivered,
+                carried: under.carried,
+            }
+        }
+        Layer::Carried(carried) => Looked {
+            delivered: false,
+            carried: Some(carried),
+        },
+        Layer::Os => Looked {
+            delivered: false,
+            carried: None,
+        },
     }
 }
 
@@ -64,45 +95,35 @@ fn take_payload<T: std::error::Error + 'static>(e: io::Error) -> Result<T, io::E
     Ok(*payload.downcast::<T>().expect("a `T` was just seen"))
 }
 
-/// Whether `e` carries a goetia [`Error`], directly or under [`within`] contexts: the question
-/// [`target_failed`] and `debug_privilege_also_failed` (Windows) ask.
-pub(super) fn carries_error(e: &io::Error) -> bool {
-    match layer(e) {
-        Layer::Context(within) => carries_error(&within.source),
-        Layer::Carried => true,
-        Layer::Os => false,
-    }
-}
-
-/// Whether `e` says, directly or under other [`within`] contexts, that the signal of its operation was
-/// delivered: see [`within_delivered`].
-fn delivered(e: &io::Error) -> bool {
-    match layer(e) {
-        Layer::Context(within) => within.delivered || delivered(&within.source),
-        Layer::Carried | Layer::Os => false,
-    }
-}
-
 /// `e` as an [`Error`]: the goetia error it carries, else its failure alone as [`Error::RawOs`]. A
-/// context it is said within is a [`Error::Step`] over what is under it. What a shared payload holds
-/// cannot be moved out of it: it is `e` alone as [`Error::RawOs`], which every walk looks through.
+/// context it is said within is a [`Error::Step`] over what is under it. An `io::Error` that holds
+/// another is its carrier, and is looked through. What a shared payload holds cannot be moved out of it:
+/// it is `e` alone as [`Error::RawOs`], which [`Error::is_indeterminate`] and the printer and the search
+/// read through, and [`Error::cause`] does not.
 fn told(e: io::Error) -> Error {
-    match layer(&e) {
-        Layer::Os => Error::RawOs { os: e },
-        Layer::Carried => match take_payload::<Error>(e) {
-            Ok(carried) => carried,
-            Err(e) => match take_payload::<Box<Error>>(e) {
-                Ok(carried) => *carried,
-                Err(e) => Error::RawOs { os: e },
-            },
-        },
-        Layer::Context(_) => match take_payload::<Within>(e) {
-            Ok(Within { context, source, .. }) => Error::Step {
+    if matches!(layer(&e), Layer::Os) {
+        return Error::RawOs { os: e };
+    }
+    let e = match take_payload::<io::Error>(e) {
+        Ok(inner) => return told(inner),
+        Err(e) => e,
+    };
+    let e = match take_payload::<Within>(e) {
+        Ok(Within { context, source, .. }) => {
+            return Error::Step {
                 what: context,
                 source: Box::new(told(source)),
-            },
-            Err(e) => Error::RawOs { os: e },
-        },
+            };
+        }
+        Err(e) => e,
+    };
+    let e = match take_payload::<Error>(e) {
+        Ok(carried) => return carried,
+        Err(e) => e,
+    };
+    match take_payload::<Box<Error>>(e) {
+        Ok(carried) => *carried,
+        Err(e) => Error::RawOs { os: e },
     }
 }
 
@@ -116,12 +137,14 @@ fn told(e: io::Error) -> Error {
 ///   failure.
 pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
     let what = what.into();
-    if delivered(&e) {
+    let looked = look(&e);
+    let (delivered, carried) = (looked.delivered, looked.carried.is_some());
+    if delivered {
         Error::Step {
             what,
             source: Box::new(told(e)),
         }
-    } else if carries_error(&e) {
+    } else if carried {
         Error::Step {
             what: format!("failed to {what}"),
             source: Box::new(told(e)),

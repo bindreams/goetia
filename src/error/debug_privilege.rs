@@ -5,7 +5,7 @@ use std::io;
 
 use super::composite::{Composite, carry};
 use super::report::Pieces;
-use super::within::carries_error;
+use super::within::look;
 
 /// An open that was denied and the step that enabling `SeDebugPrivilege` for it failed at, the second told
 /// after the first: `open (enabling SeDebugPrivilege for the open also failed: step)`. The
@@ -41,7 +41,7 @@ impl std::error::Error for DebugPrivilegeAlsoFailed {}
 /// it, with `open`'s kind kept.
 pub(crate) fn debug_privilege_also_failed(open: io::Error, step: io::Error) -> io::Error {
     debug_assert!(
-        !carries_error(&open) && !carries_error(&step),
+        look(&open).carried.is_none() && look(&step).carried.is_none(),
         "a pair is two OS failures: {open:?}, {step:?}"
     );
     carry(open.kind(), DebugPrivilegeAlsoFailed { open, step })
