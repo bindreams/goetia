@@ -31,7 +31,7 @@ use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::manager::{Scm, open_refused};
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::error::{Error, Result, carried};
+use crate::error::{Error, Result, target_failed};
 use crate::manager::Budget;
 use crate::manager::budget::{self, Deadline};
 use crate::spec::Id;
@@ -169,8 +169,10 @@ pub(super) fn hold_run<P: Processes>(
             &format!("open the process of `{id}`'s run (pid {pid}) to wait for its exit"),
             e,
         )),
-        Err(e) => Err(carried(io::Error::from(e))
-            .unwrap_or_else(|e| Error::os(format!("hold the process of `{id}`'s run (pid {pid})"), e))),
+        Err(e) => Err(target_failed(
+            format!("hold the process of `{id}`'s run (pid {pid})"),
+            io::Error::from(e),
+        )),
     }
 }
 

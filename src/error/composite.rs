@@ -14,7 +14,7 @@ pub(crate) trait Composite: std::error::Error + Send + Sync + 'static {
     fn pieces(&self) -> Pieces<'_>;
 
     /// The goetia [`Error`] this stands for, when it carries one that decides how the failure is classified,
-    /// else itself. What is told besides that error is dropped.
+    /// else itself. The error comes back with everything this tells beside it.
     fn into_carried(self: Box<Self>) -> Result<Error, Box<dyn Composite>>;
 }
 

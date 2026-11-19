@@ -30,31 +30,67 @@ fn a_report_prints_the_context_and_then_the_cause_once() {
     assert_eq!(e.report().to_string(), "failed to capture: read stdout: denied");
 }
 
-/// A goetia error that a pair's primary carries comes back as itself, classified as it was, whatever
-/// is told after it.
+/// A goetia error that a pair's primary carries comes back as the pair's [`PairKind`] around it: its
+/// class is the pair's, and the second is told with it.
 #[skuld::test]
-fn a_goetia_error_carried_by_a_pairs_primary_comes_back_with_its_class() {
+fn a_goetia_error_carried_by_a_pairs_primary_is_the_source_of_the_error_the_pair_becomes() {
     let primary = io::Error::other(Error::RequestInDoubt {
         request: "read".to_string(),
         reached: false,
         note: None,
         source: "no answer".into(),
     });
-    let pair = paired(primary, "and also", denied());
+    let pair = paired(primary, PairKind::ManagerUnreadAfterOpenRefused, denied());
 
     let back = carried(pair).expect("the primary carries a goetia error");
 
     assert!(back.is_indeterminate(), "{back:?}");
-    assert!(matches!(back, Error::RequestInDoubt { .. }), "{back:?}");
+    let Error::ManagerUnreadAfterOpenRefused { open_refused, source } = &back else {
+        panic!("{back:?}");
+    };
+    assert_eq!(open_refused.to_string(), "denied");
+    assert!(matches!(**source, Error::RequestInDoubt { .. }), "{back:?}");
 }
 
 /// A pair whose primary carries no goetia error is not one: it stays the pair, whole.
 #[skuld::test]
 fn a_pair_whose_primary_carries_no_goetia_error_stays_a_pair() {
-    let pair = paired(denied(), "and also", io::Error::other("second"));
+    let pair = paired(
+        denied(),
+        PairKind::ManagerUnreadAfterOpenRefused,
+        io::Error::other("second"),
+    );
 
     let back = carried(pair).expect_err("no goetia error is carried");
 
-    assert_eq!(back.to_string(), "denied (and also second)");
+    assert_eq!(
+        back.to_string(),
+        "denied (after the service's process could not be opened: second)"
+    );
     assert_eq!(back.kind(), io::ErrorKind::PermissionDenied);
+}
+
+/// A pair of two OS failures has no goetia error to classify: even one its primary carries leaves it whole.
+#[cfg(windows)]
+#[skuld::test]
+fn a_pair_of_a_denied_open_and_a_failed_step_stays_whole_whatever_its_primary_carries() {
+    let primary = io::Error::other(Error::blob("carried"));
+    let pair = paired(primary, PairKind::DebugPrivilegeAlsoFailed, denied());
+
+    let back = carried(pair).expect_err("this pair carries no class");
+
+    assert_eq!(
+        back.to_string(),
+        "blob: carried (enabling SeDebugPrivilege for the open also failed: denied)"
+    );
+}
+
+/// A target's failure is the goetia error it carries, else an OS failure of what was done.
+#[skuld::test]
+fn a_targets_failure_is_the_error_it_carries_else_an_os_failure_of_what_was_done() {
+    let carrying = target_failed("kill `x`", io::Error::other(Error::blob("carried")));
+    assert!(matches!(carrying, Error::Blob { .. }), "{carrying:?}");
+
+    let plain = target_failed("kill `x`", denied());
+    assert_eq!(plain.report().to_string(), "failed to kill `x`: denied");
 }

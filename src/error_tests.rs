@@ -242,7 +242,7 @@ fn a_start_judged_without_its_blob_is_indeterminate_when_the_failed_start_is() {
 #[skuld::test]
 fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is() {
     type Wrap = fn(Error) -> Error;
-    let wrappers: [(&str, Wrap); 4] = [
+    let wrappers: [(&str, Wrap); 5] = [
         ("StartJudgedWithoutBlob", |source| Error::StartJudgedWithoutBlob {
             id: "x".to_string(),
             judged_as: crate::spec::Protocol::Plain,
@@ -258,6 +258,12 @@ fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is()
             id: "x".to_string(),
             open_failed: std::io::Error::other("o"),
             source: Box::new(source),
+        }),
+        ("ManagerUnreadAfterOpenRefused", |source| {
+            Error::ManagerUnreadAfterOpenRefused {
+                open_refused: std::io::Error::other("o"),
+                source: Box::new(source),
+            }
         }),
         ("OutputAlsoFailed", |source| Error::OutputAlsoFailed {
             id: "x".to_string(),
@@ -318,6 +324,12 @@ fn the_search_finds_what_a_wrapper_says_in_its_words_and_what_it_wraps_but_not_w
         finds_os_code(&unopened, 5) && finds_os_code(&unopened, 6),
         "{unopened:?}"
     );
+    let unread = Error::ManagerUnreadAfterOpenRefused {
+        open_refused: std::io::Error::from_raw_os_error(6),
+        source: Box::new(os_code(5)),
+    };
+    assert!(finds_os_code(&unread, 5), "{unread:?}");
+    assert!(!finds_os_code(&unread, 6), "{unread:?}");
 }
 
 /// A run that ended without a recorded exit says why in `reason`, and a failed read of the record is its
@@ -1526,7 +1538,10 @@ fn the_os_error_of_an_error_a_sentence_only_mentions_is_not_found() {
 #[skuld::test]
 fn the_os_error_of_a_pair_is_its_primarys_and_never_its_seconds() {
     let pair = |primary: std::io::Error, second: std::io::Error| {
-        Error::os("kill", crate::error::paired(primary, "and also", second))
+        Error::os(
+            "kill",
+            crate::error::paired(primary, crate::error::PairKind::ManagerUnreadAfterOpenRefused, second),
+        )
     };
     let coded = |code| std::io::Error::from_raw_os_error(code);
     assert_eq!(pair(coded(5), coded(8)).raw_os_error(), Some(5));

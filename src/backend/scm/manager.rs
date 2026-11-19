@@ -142,7 +142,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Reason, Result, carried_composite, os_error_in};
+use crate::error::{Error, Reason, Result, carried_composite, os_error_in, target_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
@@ -1676,9 +1676,10 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
     hold_if_possible(&mut target, deadline).map_err(|e| not_done(hold_failed(id, e)))
 }
 
-/// The failure to read SCM while holding `id`'s process, as `hold_process` reports it.
+/// The failure `e` to read SCM while holding `id`'s process, as `hold_process` reports it: a goetia error
+/// that `e` carries is the error, with its class.
 fn hold_failed(id: &Id, e: std::io::Error) -> Error {
-    Error::os(format!("hold `{id}`'s process to wait for its exit"), e)
+    target_failed(format!("hold `{id}`'s process to wait for its exit"), e)
 }
 
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]

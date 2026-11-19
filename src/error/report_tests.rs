@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::*;
 use crate::error::Reason;
 use crate::error::error_tests::{exit_status, id, os, undetermined};
-use crate::error::{Composite, carried_composite, carry, paired};
+use crate::error::{Composite, PairKind, carried_composite, carry, paired};
 
 /// A remedy is its own sentence: it follows a period the words before it already ended with, and
 /// supplies one when they did not.
@@ -394,7 +394,7 @@ fn a_standard_printer_shows_each_failure_of_a_composite_once() {
     };
     let pair = paired(
         std::io::Error::other("primary failure"),
-        "and then",
+        PairKind::ManagerUnreadAfterOpenRefused,
         std::io::Error::other("second failure"),
     );
     let blob = Error::StartJudgedWithoutBlob {

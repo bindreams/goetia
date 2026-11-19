@@ -19,7 +19,7 @@
 use std::io;
 use std::time::Duration;
 
-use crate::error::{Error, Pieces, carried, paired, terminating_failed, within};
+use crate::error::{Error, PairKind, Pieces, paired, target_failed, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
 #[cfg(unix)]
@@ -55,7 +55,7 @@ pub enum KillOutcome {
 /// signal that was delivered ([`signalled_but`]) is the source of a step that says so. Any other error
 /// is an OS failure of the kill.
 pub(crate) fn kill_failed(id: &str, e: io::Error) -> Error {
-    carried(e).unwrap_or_else(|e| Error::os(format!("kill `{id}`"), e))
+    target_failed(format!("kill `{id}`"), e)
 }
 
 /// What a [`KillTarget`] needs of the world, so the order of the steps is testable without one.
@@ -237,7 +237,7 @@ pub(crate) fn hold_once<T: KillTarget>(
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => Err(HoldError::Read(paired(
                     read,
-                    "after the service's process could not be opened:",
+                    PairKind::ManagerUnreadAfterOpenRefused,
                     e,
                 ))),
             };

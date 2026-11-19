@@ -24,7 +24,7 @@ pub(crate) use report::find;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
 pub(crate) use report::{Chain, Pieces};
-pub(crate) use within::{carried, paired, within};
+pub(crate) use within::{PairKind, paired, target_failed, within};
 
 use report::Report;
 
@@ -767,6 +767,16 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// A hold of a service's process whose open was refused, and whose manager could not be read after
+    /// that, `source`, so that it is not known whether the refusal was the service's: `open_refused`, which
+    /// the message only mentions. The read's class is the error's.
+    #[error("{}", manager_unread_after_open_refused_message(open_refused))]
+    ManagerUnreadAfterOpenRefused {
+        open_refused: std::io::Error,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A run of `id` whose wait failed, `source`, and whose output could not be shown either: `shown`,
     /// printed in the message. The wait's class is the error's, so a wait that left the outcome open
     /// stays open, which a [`Both`](Error::Both) of the two would not.
@@ -795,6 +805,7 @@ macro_rules! wrapper {
             | Error::StartJudgedWithoutBlob { source: $source, .. }
             | Error::ProcessExitUnconfirmed { source: $source, .. }
             | Error::ProcessNotOpened { source: $source, .. }
+            | Error::ManagerUnreadAfterOpenRefused { source: $source, .. }
             | Error::OutputAlsoFailed { source: $source, .. }
             | Error::InstalledUnreadable { source: $source, .. }
     };
@@ -1005,6 +1016,9 @@ impl Error {
                 id, terminate_failed, ..
             } => Some(process_exit_unconfirmed_message(id, terminate_failed)),
             Error::ProcessNotOpened { id, open_failed, .. } => Some(process_not_opened_message(id, open_failed)),
+            Error::ManagerUnreadAfterOpenRefused { open_refused, .. } => {
+                Some(manager_unread_after_open_refused_message(open_refused))
+            }
             Error::OutputAlsoFailed { id, shown, .. } => Some(output_also_failed_message(id, shown)),
             Error::ProcessWaitTimeout {
                 id,
@@ -1439,6 +1453,14 @@ fn process_not_opened_message<'a>(id: &str, open_failed: &'a std::io::Error) -> 
         .text(format!("goetia could not open `{id}`'s process ("))
         .cause(open_failed)
         .text("), so it could not wait for the process to exit")
+}
+
+/// The message of [`Error::ManagerUnreadAfterOpenRefused`]: `open_refused` is only mentioned.
+fn manager_unread_after_open_refused_message(open_refused: &std::io::Error) -> Pieces<'_> {
+    Pieces::new()
+        .text("reading the manager failed after the service's process could not be opened (")
+        .mentioned(open_refused)
+        .text(")")
 }
 
 /// The message of [`Error::OutputAlsoFailed`]: `shown` is why the output could not be shown.
