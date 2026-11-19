@@ -29,6 +29,7 @@ pub mod service_ctrl;
 pub mod service_guard;
 #[cfg(unix)]
 pub mod tasks;
+pub mod wait;
 #[cfg(windows)]
 pub mod windows_tasks;
 #[cfg(windows)]

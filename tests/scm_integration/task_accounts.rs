@@ -11,7 +11,7 @@ use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{CONNECT_BACK, PRINT_AND_EXIT, RUN_UNTIL_KILLED};
 use crate::support::windows_tasks::{ServiceAccountHost, task_spec};
-use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, cleanup, kill, scm_group};
+use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, cleanup, scm_group, wait};
 use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
 
 /// The password of the accounts these tests make: at most 14 characters, since a longer one makes
@@ -247,7 +247,7 @@ fn a_task_installed_as_another_account_over_the_first_ones_records_still_records
     // `start`, not `run`: a write of a run nobody waits for prunes the records of both runs before it.
     mgr.start(id, Budget::DEFAULT)
         .unwrap_or_else(|e| panic!("start as NetworkService: {}", e.report()));
-    kill::until(|| {
+    wait::until(|| {
         let now = record_files(id);
         now.len() == 1 && !second_records.contains(&now[0])
     });

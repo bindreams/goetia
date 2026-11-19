@@ -14,7 +14,7 @@ use goetia::backend::systemd::manager::Systemd;
 use serde_json::Value;
 
 use crate::linux::{UNIT_DIR_EXCLUSIVE, timer_path, timer_wants_symlink, unit_path, wait_for_started};
-use crate::support::cron_oracle::{self, expected_next_runs};
+use crate::support::cron_oracle::expected_next_runs;
 use crate::support::demonstration::{
     Cli, Expect, LastResult, Manifest, Time, ZONE, ZONE_OFFSET, assert_task_fields, instant, text_field, text_state,
 };
@@ -23,12 +23,16 @@ use crate::support::{self, Group, ServiceGuard, systemd_group};
 
 const EVERY_MINUTE: &str = "* * * * *";
 
-/// A daily schedule whose time is about 12 hours from now, in the zone systemd reads `OnCalendar` in
-/// (`/etc/localtime`, whatever `TZ` the test process has). The armed task has a next fire that far
-/// away and nothing fires while it is read. A clock step of 12 hours is outside what the lanes do.
+/// A daily schedule whose time is about 12 hours from now, in the container's local zone: the zone
+/// systemd reads `OnCalendar` in (the test's process sets no `TZ`). The armed task has a next fire
+/// that far away and nothing fires while it is read. A clock step of 12 hours is outside what the
+/// lanes do.
 fn daily_in_half_a_day() -> String {
-    let at = jiff::Timestamp::now()
-        .to_zoned(cron_oracle::manager_zone().clone())
+    assert!(
+        std::env::var_os("TZ").is_none(),
+        "the test process has a `TZ`, and systemd reads `OnCalendar` in /etc/localtime, not in `TZ`"
+    );
+    let at = jiff::Zoned::now()
         .checked_add(jiff::Span::new().hours(12))
         .expect("12 hours from now");
     format!("{} {} * * *", at.minute(), at.hour())

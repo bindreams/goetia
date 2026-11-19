@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::tasks::{mkfifo, task_status};
-use crate::support::{self, Group, ServiceGuard, cmd, kill, may_account_for, systemd_group};
+use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group, wait};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
 /// every test that runs `daemon list` over it. While `list_does_not_hang_on_a_fifo_in_the_unit_directory`
@@ -2826,19 +2826,9 @@ pub(crate) fn unit_of(id: &str) -> String {
     format!("{id}.service")
 }
 
-/// Waits until journald has stored everything sent to it before the call.
-fn sync_journal() {
-    cmd::run("journalctl", &["--sync"]).expect_ok();
-}
-
 /// The entries `journalctl` holds for `args`, after a `--sync`, as JSON objects.
 fn journalctl_entries(args: &[&str]) -> Vec<Value> {
-    sync_journal();
-    read_journal(args)
-}
-
-/// [`journalctl_entries`] without the `--sync`.
-fn read_journal(args: &[&str]) -> Vec<Value> {
+    cmd::run("journalctl", &["--sync"]).expect_ok();
     let mut all = vec!["-a", "-o", "json", "--no-pager"];
     all.extend_from_slice(args);
     cmd::run("journalctl", &all)
@@ -2855,15 +2845,6 @@ fn read_journal(args: &[&str]) -> Vec<Value> {
 /// `matches` hold no `+`: `_PID=1` is added once, and a `+` would split the query into halves of which
 /// only the last has it. A query of two scopes is two calls.
 pub(crate) fn manager_entries<S: AsRef<str>>(matches: &[S]) -> Vec<Value> {
-    journalctl_entries(&manager_args(matches))
-}
-
-/// [`manager_entries`] without the `--sync`.
-fn manager_entries_unsynced<S: AsRef<str>>(matches: &[S]) -> Vec<Value> {
-    read_journal(&manager_args(matches))
-}
-
-fn manager_args<S: AsRef<str>>(matches: &[S]) -> Vec<&str> {
     let mut args = vec!["--system"];
     args.extend(matches.iter().map(AsRef::as_ref));
     assert!(
@@ -2871,7 +2852,7 @@ fn manager_args<S: AsRef<str>>(matches: &[S]) -> Vec<&str> {
         "a `+` in a manager query ({args:?}) would leave `_PID=1` out of a half"
     );
     args.push(FROM_PID_1);
-    args
+    journalctl_entries(&args)
 }
 
 /// The entries holding `matches` in every journal file the reader may open, oldest first: `goetia`'s
@@ -2905,14 +2886,10 @@ pub(crate) fn started_invocations(id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Blocks until the journal holds a `Starting` entry for a run of `id`'s unit. journald is synced once,
-/// and each turn then reads the manager's `Starting` entries with one `journalctl`; the wait ends on
-/// the entry itself and has no cap.
+/// Blocks until the journal holds a `Starting` entry for a run of `id`'s unit. Each turn syncs journald
+/// and reads [`started_invocations`] (one query); the wait ends on the entry itself and has no cap.
 pub(crate) fn wait_for_started(id: &str) {
-    sync_journal();
-    kill::until_paced(Duration::from_millis(100), || {
-        !manager_entries_unsynced(&starting_matches(id)).is_empty()
-    });
+    wait::until_paced(Duration::from_millis(100), || !started_invocations(id).is_empty());
 }
 
 /// A task that exits with `code` the moment it starts, and runs daily at 03:30.

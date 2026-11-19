@@ -20,15 +20,15 @@ use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 
 use crate::linux::{
-    CreatedRoot, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, main_pid, manager_entries, output_entries,
-    started_invocations, starting_matches, timer_path, timer_wants_symlink, unit_of,
+    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, main_pid, manager_entries,
+    output_entries, started_invocations, starting_matches, timer_path, timer_wants_symlink, unit_of,
 };
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
 use crate::support::cron_oracle::assert_next_run;
 use crate::support::tasks::{
     Held, Lines, assert_same_text, id_of, run_task, sh, status_with_result, task_status, with_logs,
 };
-use crate::support::{self, Group, ServiceGuard, cmd, cron_oracle, kill, systemd_group};
+use crate::support::{self, Group, ServiceGuard, cmd, cron_oracle, systemd_group, wait};
 
 /// Held by the tests that rewrite journald's configuration (and restart it) while they run.
 #[skuld::label]
@@ -771,7 +771,7 @@ fn run_of_a_start_job_canceled_before_it_ran_ends_with_an_unknown_outcome(#[fixt
     let result = std::thread::scope(|scope| {
         let running = scope.spawn(|| mgr.run(&task_id, &mut Vec::new()));
         // The job is queued once the manager lists it; then it is canceled.
-        kill::until(|| {
+        wait::until(|| {
             cmd::run("systemctl", &["list-jobs", "--no-legend"])
                 .stdout
                 .lines()
@@ -1096,19 +1096,21 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
 
     let unit = unit_of(&id);
     let (by_manager, by_unit) = (format!("UNIT={unit}"), format!("_SYSTEMD_UNIT={unit}"));
-    // One query for each scope, as `goetia` reads them. Their order is the monotonic clock's.
-    let manager = manager_entries(&[by_manager.as_str()]);
-    let output = output_entries(&[by_unit.as_str(), "_TRANSPORT=stdout"]);
-    let monotonic = |entry: &serde_json::Value| -> u64 {
-        field(entry, "__MONOTONIC_TIMESTAMP")
-            .and_then(|micros| micros.parse().ok())
-            .expect("an entry has a monotonic time")
-    };
-    let starting = manager
+    // Both scopes in one query, so the output's, with the manager's `_PID=1` in its own half:
+    // `manager_entries` refuses a `+`, so this query cannot use it.
+    let entries = output_entries(&[
+        "--system",
+        by_manager.as_str(),
+        FROM_PID_1,
+        "+",
+        by_unit.as_str(),
+        "_TRANSPORT=stdout",
+    ]);
+    let starting = entries
         .iter()
-        .find(|entry| field(entry, "MESSAGE_ID") == Some(STARTING))
+        .position(|entry| field(entry, "MESSAGE_ID") == Some(STARTING))
         .expect("a Starting entry");
-    let invocation = field(starting, "INVOCATION_ID").expect("an invocation");
+    let invocation = field(&entries[starting], "INVOCATION_ID").expect("an invocation");
     assert!(
         invocation.len() == 32
             && invocation

@@ -1,6 +1,6 @@
 //! A brute-force reading of a cron schedule: the first minute after a moment (or the latest at or before
 //! it) that the schedule's resolved fields name, found by looking at every minute in turn with libc's
-//! local time (on Linux, the zone systemd reads, `/etc/localtime`) and `goetia::testing::cron_matches`. It shares nothing with a backend's rendering of the
+//! local time and `goetia::testing::cron_matches`. It shares nothing with a backend's rendering of the
 //! schedule, so a backend's `next_run` is checked against it.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -95,44 +95,16 @@ pub fn latest_minute_at_or_before(schedule: &Schedule, at: SystemTime) -> System
 }
 
 fn names(schedule: &Schedule, epoch_secs: u64) -> bool {
-    let [minute, hour, day, month, weekday] = local_fields(epoch_secs);
-    goetia::testing::cron_matches(schedule, minute, hour, day, month, weekday)
-}
-
-/// The zone systemd reads `OnCalendar` in: `/etc/localtime`, whatever `TZ` the test process has; UTC
-/// where there is no such file, as systemd has it.
-#[cfg(target_os = "linux")]
-pub fn manager_zone() -> &'static jiff::tz::TimeZone {
-    static ZONE: std::sync::OnceLock<jiff::tz::TimeZone> = std::sync::OnceLock::new();
-    ZONE.get_or_init(|| match std::fs::read("/etc/localtime") {
-        Ok(bytes) => jiff::tz::TimeZone::tzif("/etc/localtime", &bytes).expect("/etc/localtime is a tzif file"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => jiff::tz::TimeZone::UTC,
-        Err(e) => panic!("read /etc/localtime: {e}"),
-    })
-}
-
-/// `[minute, hour, day, month, weekday (Sunday is 0)]` of `epoch_secs` in the manager's local time.
-#[cfg(target_os = "linux")]
-fn local_fields(epoch_secs: u64) -> [u8; 5] {
-    let secs = i64::try_from(epoch_secs).expect("an i64 time");
-    let at = manager_zone().to_datetime(jiff::Timestamp::from_second(secs).expect("a time jiff holds"));
-    [
-        u8::try_from(at.minute()).expect("a minute"),
-        u8::try_from(at.hour()).expect("an hour"),
-        u8::try_from(at.day()).expect("a day"),
-        u8::try_from(at.month()).expect("a month"),
-        u8::try_from(at.weekday().to_sunday_zero_offset()).expect("a weekday"),
-    ]
-}
-
-/// The same fields in the process's local time, as libc reads it (`TZ`, then `/etc/localtime`).
-#[cfg(not(target_os = "linux"))]
-fn local_fields(epoch_secs: u64) -> [u8; 5] {
     let time = libc::time_t::try_from(epoch_secs).expect("a time_t");
     // SAFETY: an all-zero `tm` is a valid value, and `localtime_r` fills the one it is given.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers are valid for the call.
     let filled = unsafe { libc::localtime_r(&time, &mut tm) };
     assert!(!filled.is_null(), "localtime_r failed for {epoch_secs}");
-    [tm.tm_min, tm.tm_hour, tm.tm_mday, tm.tm_mon + 1, tm.tm_wday].map(|field| u8::try_from(field).expect("a tm field"))
+    let [Ok(minute), Ok(hour), Ok(day), Ok(month), Ok(weekday)] =
+        [tm.tm_min, tm.tm_hour, tm.tm_mday, tm.tm_mon + 1, tm.tm_wday].map(u8::try_from)
+    else {
+        return false;
+    };
+    goetia::testing::cron_matches(schedule, minute, hour, day, month, weekday)
 }
