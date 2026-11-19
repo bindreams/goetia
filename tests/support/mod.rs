@@ -11,6 +11,7 @@ pub mod cmd;
 pub mod connect_back;
 #[cfg(unix)]
 pub mod cron_oracle;
+pub mod demonstration;
 pub mod failed_install;
 pub mod kill;
 pub mod list_json;

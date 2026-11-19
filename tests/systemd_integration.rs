@@ -10,6 +10,10 @@
 mod support;
 
 #[cfg(target_os = "linux")]
+#[path = "systemd_integration/demonstration.rs"]
+mod demonstration;
+
+#[cfg(target_os = "linux")]
 #[path = "systemd_integration/linux.rs"]
 mod linux;
 

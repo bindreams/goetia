@@ -44,20 +44,35 @@ fn parse(text: &str, id: &Id) -> Schedule {
 
 /// `next_run` is one of [`expected_next_runs`]: for systemd, whose clock may step back.
 pub fn assert_next_run(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
-    assert_in(status, text, &expected_next_runs(text, id, before, after));
+    assert_next_run_time(status.next_run, text, id, before, after);
+}
+
+/// [`assert_next_run`] for a time read from somewhere other than a [`TaskStatus`] (the CLI's document).
+pub fn assert_next_run_time(next_run: Option<SystemTime>, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
+    assert_in(next_run, text, &expected_next_runs(text, id, before, after));
 }
 
 /// `next_run` is the next minute after `before` or the next after `after`, and never the minute at or
 /// before `before`: for launchd, whose `next_run` goetia computes from the clock it reads.
 pub fn assert_next_run_strict(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
-    assert_in(status, text, &strict_next_runs(&parse(text, id), before, after));
+    assert_next_run_strict_time(status.next_run, text, id, before, after);
 }
 
-fn assert_in(status: &TaskStatus, text: &str, expected: &[SystemTime]) {
+/// [`assert_next_run_strict`] for a time read from somewhere other than a [`TaskStatus`].
+pub fn assert_next_run_strict_time(
+    next_run: Option<SystemTime>,
+    text: &str,
+    id: &Id,
+    before: SystemTime,
+    after: SystemTime,
+) {
+    assert_in(next_run, text, &strict_next_runs(&parse(text, id), before, after));
+}
+
+fn assert_in(next_run: Option<SystemTime>, text: &str, expected: &[SystemTime]) {
     assert!(
-        status.next_run.is_some_and(|next| expected.contains(&next)),
-        "`{text}`: next_run {:?}, the cron says {expected:?}",
-        status.next_run
+        next_run.is_some_and(|next| expected.contains(&next)),
+        "`{text}`: next_run {next_run:?}, the cron says {expected:?}"
     );
 }
 
