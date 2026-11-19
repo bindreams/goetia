@@ -91,6 +91,57 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
     mgr.uninstall(id).expect("uninstall");
 }
 
+/// `disable` stops a repetition that is in progress: a disabled `* * * * *` starts nothing at the boundaries
+/// that follow. Read in the stored state, with no window in which no run came: a second task, armed alike,
+/// starts at every boundary, so its last run moving past two boundaries is Task Scheduler's own sign that
+/// they have passed, and the disabled task's last run is what it was. `enable` then starts it again.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixture(scm_group)] _group: &Group) {
+    let (subject, control) = (TaskGuard::new(), TaskGuard::new());
+    let mgr = support::stock_shim_manager();
+    let (subject_listener, control_listener) = (ConnectBack::listen(), ConnectBack::listen());
+    for (guard, listener) in [(&subject, &subject_listener), (&control, &control_listener)] {
+        mgr.install(
+            &task_spec(&guard.id, connects_back(listener), Some("* * * * *"), User::Root, None),
+            false,
+        )
+        .expect("install");
+        mgr.enable(&guard.id).expect("enable");
+    }
+    // Both have started, so the repetition of the hour is in progress.
+    subject_listener.accept_unbounded();
+    control_listener.accept_unbounded();
+
+    mgr.disable(&subject.id).expect("disable");
+    // A run the disable found alive is over before the last start is read.
+    let before = status_once_ended(&mgr, &subject.id).last_run;
+    assert!(before.is_some(), "the task ran before it was disabled");
+
+    let next_control_run = |after: SystemTime| {
+        let mut found = after;
+        wait::until(|| match task_status(&mgr, &control.id).last_run {
+            Some(run) if run > after => {
+                found = run;
+                true
+            }
+            _ => false,
+        });
+        found
+    };
+    let first = next_control_run(SystemTime::now());
+    let second = next_control_run(first);
+
+    let after = task_status(&mgr, &subject.id);
+    assert_eq!(
+        after.last_run, before,
+        "the disabled task started at a boundary the control started at"
+    );
+    assert_eq!(after.common.state, State::Idle, "{after:?}");
+
+    mgr.enable(&subject.id).expect("enable again");
+    wait::until(|| task_status(&mgr, &subject.id).last_run.is_some_and(|run| run > second));
+}
+
 /// A task that is not armed still starts when asked, and stays not armed.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn start_of_a_disarmed_task_runs_it(#[fixture(scm_group)] _group: &Group) {

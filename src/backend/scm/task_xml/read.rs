@@ -177,6 +177,14 @@ impl TaskXml {
         }
         Ok(out)
     }
+
+    pub(crate) fn without_triggers(_xml: &str) -> Result<String, Error> {
+        todo!()
+    }
+
+    pub(crate) fn with_triggers(_xml: &str, _spec: &DaemonSpec) -> Result<String, Error> {
+        todo!()
+    }
 }
 
 /// The edit that gives `trigger`, which states no `Enabled`, the flag `false`: after its boundary

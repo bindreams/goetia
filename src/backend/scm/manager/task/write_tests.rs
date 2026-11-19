@@ -1030,7 +1030,7 @@ fn the_three_well_known_accounts_have_their_sids() {
 // Enable and disable ==================================================================================================
 
 /// What the installed XML holds beyond what goetia wrote: a hand edit of a value, which `enable` and
-/// `disable` keep because they change the flags and nothing else.
+/// `disable` keep because they change the triggers and nothing else.
 fn hand_edited(registered: &Registered) -> Registered {
     Registered {
         xml: registered
@@ -1041,42 +1041,90 @@ fn hand_edited(registered: &Registered) -> Registered {
     }
 }
 
+/// `disable` registers the stored XML with no triggers, and `enable` registers it with the triggers the
+/// blob's schedule compiles to; each keeps a hand edit made elsewhere, and neither touches the task's own flag.
 #[skuld::test]
-fn enable_then_disable_flip_only_the_flags_and_keep_a_hand_edit() {
+fn disable_writes_no_triggers_and_enable_writes_the_compiled_ones_and_both_keep_a_hand_edit() {
     let spec = task_spec(Some("30 3 * * *"));
-    let registered = hand_edited(&registered_task(&spec, false));
-    assert!(registered.xml.contains("<Priority>6</Priority>"), "the edit is made");
-    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered.clone());
+    let armed = hand_edited(&registered_task(&spec, true));
+    assert!(armed.xml.contains("<Priority>6</Priority>"), "the edit is made");
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created))
         .on_register(Ok(Registration::Created));
     let scm = scm(&fake);
 
-    scm.task_set_armed_with(&installed, true, || panic!("a service account reads no password"))
-        .unwrap();
-    let armed = Registered {
-        xml: TaskXml::with_armed(&registered.xml, true).unwrap(),
-        data: registered.data.clone(),
-        enabled: registered.enabled,
+    scm.task_set_armed_with(
+        &TaskSnapshot::new(id(), Ok(blob(&spec)), armed.clone()),
+        false,
+        || panic!("a service account reads no password"),
+    )
+    .unwrap();
+    let calls = fake.calls();
+    let Call::Register { xml: disarmed, who, update, .. } = &calls[0] else {
+        panic!("disable registers: {calls:?}");
     };
-    scm.task_set_armed_with(&TaskSnapshot::new(id(), Ok(blob(&spec)), armed.clone()), false, || {
+    assert!(!disarmed.contains("<Triggers"), "disable writes no triggers: {disarmed}");
+    assert!(!TaskXml::armed(disarmed));
+    assert!(disarmed.contains("<Priority>6</Priority>"), "a hand edit survives disable");
+    assert_eq!((who, update), (&root(), &true));
+
+    let disabled = Registered {
+        xml: disarmed.clone(),
+        data: armed.data.clone(),
+        enabled: armed.enabled,
+    };
+    scm.task_set_armed_with(&TaskSnapshot::new(id(), Ok(blob(&spec)), disabled), true, || {
         panic!("a service account reads no password")
     })
     .unwrap();
-
     let calls = fake.calls();
-    let Call::Register { xml, who, update, .. } = &calls[0] else {
+    let Call::Register { xml: rearmed, update, .. } = &calls[1] else {
         panic!("enable registers: {calls:?}");
     };
-    assert_eq!(xml, &armed.xml, "enable flips the flags and nothing else");
-    assert!(TaskXml::armed(xml));
-    assert!(xml.contains("<Priority>6</Priority>"), "a hand edit survives enable");
-    assert_eq!((who, update), (&root(), &true));
-    let Call::Register { xml, .. } = &calls[1] else {
+    assert!(TaskXml::armed(rearmed), "enable writes the triggers: {rearmed}");
+    assert_eq!(
+        TaskXml::parse(rearmed, &armed.data).unwrap().to_string(),
+        definition(&spec).to_string(),
+        "the compiled triggers are the spec's"
+    );
+    assert!(rearmed.contains("<Priority>6</Priority>"), "a hand edit survives enable");
+    assert!(update);
+    assert_eq!(rearmed, &armed.xml, "enable writes back the armed task's stored XML");
+    fake.finish();
+}
+
+/// A blob that will not decode names no schedule, so `enable` has no triggers to write and says why; `disable`
+/// needs none, and works.
+#[skuld::test]
+fn enable_of_a_task_whose_blob_will_not_decode_is_refused_before_a_write_and_disable_works() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let armed = registered_task(&spec, true);
+    let undecodable = |registered: Registered| {
+        TaskSnapshot::new(
+            id(),
+            Err(std::sync::Arc::new(Error::blob("the blob will not decode"))),
+            registered,
+        )
+    };
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let scm = scm(&fake);
+
+    scm.task_set_armed_with(&undecodable(armed.clone()), false, || Ok(None)).unwrap();
+    let calls = fake.calls();
+    let Call::Register { xml: disarmed, .. } = &calls[0] else {
         panic!("disable registers: {calls:?}");
     };
-    assert_eq!(xml, &registered.xml, "disable puts the flags back");
-    assert!(xml.contains("<Priority>6</Priority>"), "a hand edit survives disable");
+    assert!(!TaskXml::armed(disarmed));
+
+    let disabled = Registered {
+        xml: disarmed.clone(),
+        data: armed.data.clone(),
+        enabled: armed.enabled,
+    };
+    let refused = scm.task_set_armed_with(&undecodable(disabled), true, || Ok(None)).unwrap_err();
+    assert!(refused.to_string().contains("will not decode"), "{refused}");
+    assert_eq!(fake.calls().len(), 1, "nothing was sent");
     fake.finish();
 }
 

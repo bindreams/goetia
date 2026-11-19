@@ -384,10 +384,10 @@ fn a_well_known_account_registers_by_its_sid(#[fixture(scm_group)] _group: &Grou
     }
 }
 
-/// A trigger goetia did not write, disarmed by `with_armed`: Task Scheduler takes the flag where it puts
-/// it (first among the trigger's children, or after a boundary), and reads it back as disabled.
+/// A trigger goetia did not write, taken out by `without_triggers`: the task is updated in place, and reads
+/// back with no trigger, disarmed. The triggers put back by `with_triggers` read back armed.
 #[skuld::test]
-fn a_hand_added_logon_trigger_disarmed_by_with_armed_registers_and_reads_back_disarmed(
+fn a_hand_added_trigger_taken_out_by_without_triggers_updates_and_reads_back_disarmed(
     #[fixture(scm_group)] _group: &Group,
 ) {
     use crate::backend::scm::task_xml::TaskXml;
@@ -399,17 +399,18 @@ fn a_hand_added_logon_trigger_disarmed_by_with_armed_registers_and_reads_back_di
     let triggers = [
         "<LogonTrigger></LogonTrigger>",
         "<LogonTrigger><UserId>S-1-5-18</UserId><Delay>PT1M</Delay></LogonTrigger>",
-        "<LogonTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary></LogonTrigger>",
         "<BootTrigger><Delay>PT1M</Delay></BootTrigger>",
     ];
 
     for trigger in triggers {
-        let text = with(trigger);
-        let disarmed = TaskXml::with_armed(&text, false).unwrap();
-        assert!(disarmed.contains("<Enabled>false</Enabled>"), "{disarmed}");
+        Com.register(&path, &with(trigger), &system(), None, false)
+            .unwrap_or_else(|e| panic!("{trigger}: {}", e.report()));
+        let armed = Com.get(&path).unwrap().expect("the task is registered");
+        assert!(TaskXml::armed(&armed.xml), "{trigger}: {}", armed.xml);
 
-        Com.register(&path, &disarmed, &system(), None, false)
-            .unwrap_or_else(|e| panic!("{trigger}: registered as {disarmed}: {}", e.report()));
+        let disarmed = TaskXml::without_triggers(&armed.xml).unwrap();
+        Com.register(&path, &disarmed, &system(), None, true)
+            .unwrap_or_else(|e| panic!("{trigger}: updated as {disarmed}: {}", e.report()));
 
         let read = Com.get(&path).unwrap().expect("the task is registered");
         assert!(
