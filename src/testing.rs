@@ -207,12 +207,49 @@ pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<S
     }
 }
 
-/// Starts the task `\Goetia\<id>` through Task Scheduler's own `Run`, and returns its last result once a
-/// run has ended: the exit code of the shim that Task Scheduler started as the task's action. A verb of
-/// goetia cannot be used for this, since it pins the run records before it asks for the run.
+/// Starts the task `\Goetia\<id>` through Task Scheduler's own `Run`, and returns once Task Scheduler has
+/// accepted the request: for a test of the shim host as Task Scheduler starts it. A verb of goetia
+/// cannot be used for this, since it pins the run records before it asks for the run. The run's end is
+/// the caller's to wait for.
 #[cfg(windows)]
-pub fn run_task_until_it_ends(id: &Id) -> Result<i32> {
-    crate::backend::scm::manager::task::run_until_it_ends(id)
+pub fn run_task(id: &Id) -> Result<()> {
+    use crate::backend::scm::instance::TaskPath;
+    use crate::backend::scm::manager::task::{Com, TaskApi as _};
+
+    Com.run(&TaskPath::of(id)).map(drop)
+}
+
+/// The removal's marker of the task `id`'s run records, placed as an uninstall or an account change that
+/// began leaves it (`Runs::close`), and taken away when it drops (`Runs::reopen`), retrying a failure for
+/// about five seconds and then warning. Never panics on drop.
+#[cfg(windows)]
+pub struct RemovalMarker(crate::backend::scm::runs::Runs);
+
+#[cfg(windows)]
+impl RemovalMarker {
+    /// Places the marker. Fails when the task has no run records, which there is no marker for.
+    pub fn place(id: &Id) -> Result<Self> {
+        use crate::backend::scm::runs::{Closed, Runs};
+
+        let program_data = crate::backend::scm::folder::program_data()?;
+        let runs = Runs::of(&program_data, id);
+        match runs.close()? {
+            Closed::Placed => Ok(Self(runs)),
+            Closed::NoRecords => Err(crate::error::Error::os(
+                "place the removal's marker",
+                std::io::Error::other(format!("the task `{id}` has no run records")),
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RemovalMarker {
+    fn drop(&mut self) {
+        cleanup::warn_left_behind(cleanup::retrying(|| {
+            self.0.reopen().err().map(|e| format!("take the removal's marker away: {e}"))
+        }));
+    }
 }
 
 /// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for

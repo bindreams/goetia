@@ -335,6 +335,158 @@ pub(crate) fn effective_rights(path: &std::path::Path, sid: &mut [u8]) -> u32 {
     rights
 }
 
+/// What happened to the names in one directory, in the order Windows reported it, from the moment of
+/// [`DirWatch::new`]: a test of the order of two changes reads it after the fact, with no timing in it.
+#[cfg(windows)]
+pub(crate) struct DirWatch {
+    dir: std::fs::File,
+    event: std::os::windows::io::OwnedHandle,
+    /// `u64`s, so the buffer is aligned for `FILE_NOTIFY_INFORMATION`.
+    buffer: Box<[u64; 2048]>,
+    overlapped: Box<windows_sys::Win32::System::IO::OVERLAPPED>,
+}
+
+/// One change of a name in a watched directory.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameChange {
+    Added(String),
+    Removed(String),
+    /// A rename to this name.
+    RenamedTo(String),
+    /// A rename from this name.
+    RenamedFrom(String),
+}
+
+#[cfg(windows)]
+impl DirWatch {
+    /// Starts watching the names in `dir`: every change from now on is kept for [`DirWatch::until_added`].
+    pub(crate) fn new(dir: &std::path::Path) -> DirWatch {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED)
+            .open(dir)
+            .unwrap();
+        // SAFETY: an unnamed manual-reset event with default security; a null handle is the failure.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!event.is_null(), "CreateEventW: {}", std::io::Error::last_os_error());
+        // SAFETY: `event` is a handle this call owns.
+        let event = unsafe { OwnedHandle::from_raw_handle(event.cast()) };
+        let mut watch = DirWatch {
+            dir,
+            event,
+            buffer: Box::new([0; 2048]),
+            // SAFETY: an all-zero `OVERLAPPED` is the documented initial state.
+            overlapped: Box::new(unsafe { std::mem::zeroed() }),
+        };
+        watch.issue();
+        watch
+    }
+
+    /// Asks for the next batch of changes. The buffer and the `OVERLAPPED` are boxed, so they stay where the
+    /// request left them until it completes or is cancelled ([`Drop`]).
+    fn issue(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_NOTIFY_CHANGE_FILE_NAME, ReadDirectoryChangesW};
+
+        // SAFETY: an all-zero `OVERLAPPED` is the documented initial state.
+        *self.overlapped = unsafe { std::mem::zeroed() };
+        self.overlapped.hEvent = self.event.as_raw_handle() as HANDLE;
+        // SAFETY: the handle is live and overlapped; the buffer and the `OVERLAPPED` outlive the request.
+        let ok = unsafe {
+            ReadDirectoryChangesW(
+                self.dir.as_raw_handle() as HANDLE,
+                self.buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&*self.buffer) as u32,
+                0,
+                FILE_NOTIFY_CHANGE_FILE_NAME,
+                std::ptr::null_mut(),
+                &mut *self.overlapped,
+                None,
+            )
+        };
+        assert!(ok != 0, "ReadDirectoryChangesW: {}", std::io::Error::last_os_error());
+    }
+
+    /// Every change since the watch began, in order, up to and including the addition of the name `last`.
+    /// The test makes `last` itself once the changes it wants are made, so the wait is for a change that
+    /// is bound to come. Windows keeps what happens between two requests for the next one.
+    pub(crate) fn until_added(&mut self, last: &str) -> Vec<NameChange> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
+        };
+        use windows_sys::Win32::System::IO::GetOverlappedResult;
+
+        let mut changes = Vec::new();
+        loop {
+            let mut returned = 0u32;
+            // SAFETY: the handle and the `OVERLAPPED` of a request in flight; `1` waits for it.
+            let ok = unsafe {
+                GetOverlappedResult(self.dir.as_raw_handle() as HANDLE, &*self.overlapped, &mut returned, 1)
+            };
+            assert!(ok != 0, "the watch of the directory failed: {}", std::io::Error::last_os_error());
+            assert!(returned > 0, "the watch's buffer overflowed: changes were lost");
+            let bytes: Vec<u8> = self.buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
+            let bytes = &bytes[..returned as usize];
+            self.issue();
+            let mut at = 0usize;
+            loop {
+                let word = |offset: usize| u32::from_ne_bytes(bytes[at + offset..at + offset + 4].try_into().unwrap());
+                let (next, action, length) = (word(0) as usize, word(4), word(8) as usize);
+                let name: Vec<u16> = bytes[at + 12..at + 12 + length]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                    .collect();
+                let name = String::from_utf16(&name).unwrap();
+                changes.push(match action {
+                    FILE_ACTION_ADDED => NameChange::Added(name),
+                    FILE_ACTION_REMOVED => NameChange::Removed(name),
+                    FILE_ACTION_RENAMED_NEW_NAME => NameChange::RenamedTo(name),
+                    FILE_ACTION_RENAMED_OLD_NAME => NameChange::RenamedFrom(name),
+                    other => panic!("an action no one asked for: {other}"),
+                });
+                if next == 0 {
+                    break;
+                }
+                at += next;
+            }
+            if changes.contains(&NameChange::Added(last.to_owned())) {
+                return changes;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DirWatch {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
+
+        // The request in flight is cancelled and waited out, since the kernel still writes to the buffer.
+        let handle = self.dir.as_raw_handle() as HANDLE;
+        let mut returned = 0u32;
+        // SAFETY: the handle and `OVERLAPPED` are those of the request in flight.
+        unsafe {
+            CancelIoEx(handle, &*self.overlapped);
+            GetOverlappedResult(handle, &*self.overlapped, &mut returned, 1);
+        }
+    }
+}
+
 /// Makes the account `sid` (SDDL text) the owner of the existing file `path`, as `icacls /setowner` does, which
 /// takes the privilege an administrator needs for it. The test is elevated.
 #[cfg(windows)]

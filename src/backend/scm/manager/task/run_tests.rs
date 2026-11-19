@@ -381,8 +381,10 @@ fn wait_is_unrecorded_when_the_process_ended_and_no_record_exists() {
     );
     assert_eq!(
         UNRECORDED,
-        "it was stopped or killed, Windows shut down, goetia-shim failed, or the task could not log on (a \
-         missing logon right or a changed password starts nothing and raises nothing); see the task's log"
+        "it left no record: either its program ran and its record could not be written (it was stopped or \
+         killed, Windows shut down, or goetia-shim failed), or its shim started no program (goetia-shim \
+         refused or failed to, or the task could not log on, which a missing logon right or a changed \
+         password causes and raises nothing about); the task's log and the Event Log say which"
     );
 }
 

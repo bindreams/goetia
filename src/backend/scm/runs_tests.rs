@@ -904,6 +904,21 @@ fn write_with_its_own_pin_prunes_and_is_not_blocked_by_it() {
     assert_eq!(names(&runs), [file_of(&instance(2))], "the pin is gone");
 }
 
+/// A write with the writer's own pin goes through the directory handle the pin was made through, as every
+/// read of a pin does, and not through the path again: a `Runs` whose path is another directory still lands
+/// the record where the pin is.
+#[skuld::test]
+fn write_with_its_own_pin_writes_through_the_pins_directory() {
+    let (_pinned_dir, pinned) = fixture();
+    let (_other_dir, other) = fixture();
+    let own = pinned.hold().unwrap();
+
+    other.write(&record(1, 1), Some(own)).unwrap();
+
+    assert_eq!(names(&pinned), [file_of(&instance(1))], "the record is where the pin was");
+    assert_eq!(names(&other), Vec::<String>::new(), "nothing went by the path");
+}
+
 /// A marker an uninstall that died left does not block the removal that finishes it.
 #[skuld::test]
 fn remove_all_is_not_blocked_by_a_marker_a_cut_short_removal_left() {

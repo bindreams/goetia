@@ -3,12 +3,13 @@
 //! program is this binary in a shim fixture mode (`fixture.rs`). The tasks of a service account run a
 //! copy of the shim and of this binary that the account can execute (`WorldReadableExe`).
 
-use std::path::PathBuf;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
 
-use goetia::manager::{Budget, Exit, ServiceManager as _, State};
+use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status};
 use goetia::spec::{Id, User};
+use goetia::testing::RemovalMarker;
 
 use crate::common::{UNIT_DIR_EXCLUSIVE, fixture_command, fixture_command_with_exe, manager};
 use crate::supervisor_integration::pid_is_alive;
@@ -185,30 +186,10 @@ fn a_task_runs_at_normal_priority(#[fixture(scm_group)] _group: &Group) {
     mgr.uninstall(&id).expect("uninstall");
 }
 
-/// The removal's marker of the task `id`, placed by hand as an uninstall or an account change that began
-/// leaves it, and taken away when it drops.
-struct RemovalMarker(PathBuf);
-
-impl RemovalMarker {
-    fn place(id: &Id) -> Self {
-        let path = goetia::testing::program_data()
-            .join("Goetia")
-            .join("runs")
-            .join(format!("{id}~removing"));
-        std::fs::File::create(&path).unwrap_or_else(|e| panic!("place {}: {e}", path.display()));
-        Self(path)
-    }
-}
-
-impl Drop for RemovalMarker {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// The shim Task Scheduler starts obeys the removal's marker: its pin is refused, so it starts no program
 /// and ends as a shim failure, which is the task's last result. The run is started through Task Scheduler's
-/// own `Run`, since a verb of goetia would be refused by the marker before it asked for anything.
+/// own `Run`, since a verb of goetia would be refused by the marker before it asked for anything. This run
+/// is the one waited for: the status has a `last_run` that the task did not have before it, and is idle.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
     let id = task_id();
@@ -218,12 +199,26 @@ fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
     let command = fixture_command("exit", &[&reported.port().to_string(), "7"]);
     mgr.install(&task_spec(&id, command, None, User::Root, None), false)
         .expect("install");
-    let marker = RemovalMarker::place(&id);
+    let status_of = || match mgr.status(&id).expect("status") {
+        Status::Task(status) => status,
+        Status::Service(status) => panic!("`{id}` reads as a service: {status:?}"),
+    };
+    let before = status_of().last_run;
+    let marker = RemovalMarker::place(&id).unwrap_or_else(|e| panic!("place the marker: {}", e.report()));
 
-    let result = goetia::testing::run_task_until_it_ends(&id).unwrap_or_else(|e| panic!("run: {}", e.report()));
+    goetia::testing::run_task(&id).unwrap_or_else(|e| panic!("run: {}", e.report()));
+    let mut ended = None;
+    wait::until_paced(Duration::from_millis(100), || {
+        let status = status_of();
+        let this_run = status.last_run != before && status.last_run.is_some();
+        let done = this_run && status.common.state == State::Idle && status.last_result.is_some();
+        ended = Some(status);
+        done
+    });
 
     assert_eq!(
-        result, ERROR_GEN_FAILURE as i32,
+        ended.expect("a status was read").last_result,
+        Some(Exit::Code(ERROR_GEN_FAILURE as i32)),
         "the shim's failure, not the program's 7"
     );
     // The run has ended, so no later connection is possible: this is an observation, not a race.

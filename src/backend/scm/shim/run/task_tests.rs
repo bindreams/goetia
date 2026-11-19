@@ -29,7 +29,7 @@ use crate::backend::scm::shim::run::test_support::{
 };
 use crate::backend::scm::task_xml::Token;
 use crate::backend::scm::test_support::{
-    A_STRANGER, TASK_TOKEN, directory_with_a_file, make_mount_point, registered_task, registered_task_with, set_dacl,
+    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, directory_with_a_file, make_mount_point, registered_task, registered_task_with, set_dacl,
     task_token,
 };
 use crate::elevation::test_support::process_user_sid;
@@ -576,7 +576,9 @@ fn refused_shim_opens_no_log() {
     run.run();
 
     assert_eq!(run.fake.calls(Op::OpenLog), 0);
+    assert_eq!(run.fake.default_log_opens(), 0, "the refusal's line opened the default log");
     assert_eq!(Run::default_log_holds(&run.fake.take_channel_calls()), 0);
+    run.fake.take_failures();
 }
 
 /// The pin is taken before the default log is held: a shim whose pin fails never holds it, and one whose
@@ -713,10 +715,13 @@ fn shim_rechecks_the_marker_after_its_listing() {
 }
 
 /// The run's pin is held through the listing and the run, and released as its record is renamed in place,
-/// before its own prune: the records of other runs are kept while it is held and gone after.
+/// before its own prune: the records of other runs are kept while it is held and gone after, and the
+/// directory reports the record's rename before the pin's removal, so no other run's prune could have
+/// found the record's temp file with no pin held.
 #[skuld::test]
 fn a_run_records_under_its_own_pin_and_drops_it_after_the_rename() {
     let run = Run::of(&spec_logging_to(None));
+    let mut watch = DirWatch::new(&run.records_dir());
     let other = run.hand();
     let earlier = |n: u8| RunRecord {
         instance: InstanceId::parse(&format!("{n:032x}")).unwrap(),
@@ -744,6 +749,18 @@ fn a_run_records_under_its_own_pin_and_drops_it_after_the_rename() {
         "pruned once the pin is gone"
     );
     assert_eq!(run.runs.read(&second.instance).unwrap(), None);
+    // The directory's own account of the order: the last name is the test's, made once the run is over.
+    std::fs::write(run.records_dir().join("done"), "").unwrap();
+    let changes = watch.until_added("done");
+    let position = |wanted: &dyn Fn(&NameChange) -> bool| changes.iter().position(wanted);
+    let own = format!("{}.json", instance().hex());
+    let renamed_in = position(&|change| *change == NameChange::RenamedTo(own.clone()));
+    let pin_removed = position(&|change| matches!(change, NameChange::Removed(name) if name.ends_with(".pin")));
+    assert!(
+        renamed_in.is_some() && pin_removed.is_some() && renamed_in < pin_removed,
+        "the record was renamed in at {renamed_in:?}, the pin removed at {pin_removed:?}: {changes:?}"
+    );
+    drop(watch);
     run.finish();
     run.no_pin_is_left();
 }

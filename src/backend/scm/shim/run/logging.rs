@@ -99,8 +99,9 @@ impl Log {
     }
 
     /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
-    /// ([`Channels::hold_default`]). Call it once, when the shim starts and
-    /// knows its `id`, before anything an install can change. A log that cannot be held is told to the Event
+    /// ([`Channels::hold_default`]). Call it once, when the shim knows its `id`, before anything an install
+    /// can change; task mode calls it after its pin on the run records, so a refused shim holds none
+    /// ([`Log::refusal`]). A log that cannot be held is told to the Event
     /// Log, once, with the error: the shim goes on. What the opens that follow meet is theirs to tell.
     pub(crate) fn hold_default(&self, id: &str) {
         let Some(path) = self.default_log_path(id) else {
@@ -174,6 +175,14 @@ impl Log {
     /// unavailable.
     pub(crate) fn failure(&self, id: &str, message: &str) {
         self.report(id, Severity::Error, message);
+    }
+
+    /// [`Log::failure`] for a line told before the shim holds or opens any log file: it goes to the Event Log
+    /// alone, since a file append would open and hold the default log, which a refused shim never does.
+    pub(crate) fn refusal(&self, id: &str, message: &str) {
+        let line = failure_line(id, message);
+        eprintln!("{line}");
+        self.channels.event_log(Severity::Error, &line);
     }
 
     /// [`Log::failure`] for a condition that does not stop the daemon from running: the Event Log
