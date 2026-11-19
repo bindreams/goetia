@@ -14,7 +14,7 @@ use super::api::{Registered, Registration};
 use super::live::Liveness;
 use super::verbs::{Processes, System, gone};
 use super::{TaskApi, TaskPath, TaskSnapshot};
-use crate::backend::scm::default_log::{self, EnsureOutcome, Naming, Step};
+use crate::backend::scm::default_log::{self, Naming, Step};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
@@ -194,17 +194,7 @@ impl Scm {
         let changed = snapshot.filter(|old| stored_principal(old.registered()).as_ref() != Some(&prepared.principal));
         match changed {
             None => {
-                let made = task_records(id, runs, &prepared, &[])?;
-                default_log::tell_if_made_while_running(
-                    runs.program_data(),
-                    id,
-                    spec.common().logs.as_deref(),
-                    made,
-                    || match snapshot {
-                        Some(old) => Ok(self.task_state_with(old, |pid| processes.alive(pid))? == State::Running),
-                        None => Ok(false),
-                    },
-                );
+                task_records(id, runs, &prepared, &[])?;
                 self.task_register(
                     id,
                     definition,
@@ -344,10 +334,10 @@ fn run_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
 /// [`run_records`], and the default log of `id`, which the account may append to (the shim opens it and
 /// never makes it) and so may `kept`: the accounts a write that changes the account leaves the daemon running
 /// as until it lands ([`landed`] follows it). Nothing is read back.
-fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, kept: &[Sid]) -> Result<EnsureOutcome> {
+fn task_records(id: &Id, runs: &Runs, prepared: &Prepared, kept: &[Sid]) -> Result<()> {
     run_records(id, runs, prepared)?;
     let accounts = [kept, std::slice::from_ref(&prepared.principal)].concat();
-    default_log::ensure(runs.program_data(), id, &Naming::alike(&accounts))
+    default_log::ensure(runs.program_data(), id, &Naming::alike(&accounts)).map(drop)
 }
 
 /// Once a registration that changed the account, or a service into a task, has landed (`wrote` is
@@ -391,9 +381,9 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
 
 /// The default log of the task `installed`, for the account it is registered as: what an install that finds
 /// the task up to date makes again if it is gone, since the shim makes none.
-pub(in crate::backend::scm) fn task_default_log(installed: &TaskSnapshot) -> Result<EnsureOutcome> {
+pub(in crate::backend::scm) fn task_default_log(installed: &TaskSnapshot) -> Result<()> {
     let principal = principal_sid(installed.registered())?;
-    default_log::ensure(&program_data()?, installed.id(), &Naming::alike(&[principal]))
+    default_log::ensure(&program_data()?, installed.id(), &Naming::alike(&[principal])).map(drop)
 }
 
 // Enable and disable ==================================================================================================
@@ -458,7 +448,7 @@ impl Scm {
             || service_gate(definition, written),
             |gated| {
                 apply_gated(definition, gated.password, true)?;
-                make_default_log(spec, definition, gated.checked.as_ref(), &[], Step::Narrow)?;
+                make_default_log(spec, definition, gated.checked.as_ref(), &[], Step::Narrow, None)?;
                 Ok(WriteOutcome::Done)
             },
         )?;

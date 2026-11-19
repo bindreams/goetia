@@ -1098,9 +1098,11 @@ changes the account (SCM does not restart the service) leaves the running shim i
 changes the account while the service is starting, or has to make the file for a running service, leaves the old
 account named beside the new one in the file's permissions until the next install. If you delete
 `<id>.log` while the daemon runs, Windows frees the name at once on current NTFS: `goetia daemon install`
-makes a new `<id>.log` and says that the running daemon's output goes to the deleted one until you restart it,
-so restart it. Where the delete is deferred until the daemon's handle closes, the name stays and
-`goetia daemon install` fails saying so: stop the daemon, then install again.
+makes a new `<id>.log` and says that the running daemon's output goes to the deleted one (may go, while it is
+still starting) until you restart it, so restart it; until that restart, a run started before an earlier install
+changed the account writes its own lines to the Event Log only, not to the new `<id>.log`. Where the delete is
+deferred until the daemon's handle closes, the name stays and `goetia daemon install` fails saying so: stop the
+daemon, then install again.
 
 A `logs:` that is inside `%ProgramData%\Goetia\logs` is refused at install, whichever file it
 names (the folder is the shim's default logs, which a daemon's own account cannot make a file in).

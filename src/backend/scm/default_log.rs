@@ -63,6 +63,31 @@ impl Naming {
     }
 }
 
+/// What an install did to the file, and how far the service's run was while it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogChange {
+    pub outcome: EnsureOutcome,
+    pub run: Run,
+}
+
+impl LogChange {
+    /// Whether the file was made while a run of the service was live: the one fact that the warning of
+    /// [`made_while_running`] and the [`Step::Leave`] of the install's next step both follow.
+    pub(crate) fn under_live_run(&self) -> bool {
+        self.outcome == EnsureOutcome::Made && self.run.is_live()
+    }
+
+    /// The step of the same install that follows the change of account: [`Step::Leave`] for a file this step made
+    /// under a live run, which narrowing would take from the shim that may reopen it, else [`Step::Narrow`].
+    pub(crate) fn step_after(&self) -> Step {
+        if self.under_live_run() {
+            Step::Leave
+        } else {
+            Step::Narrow
+        }
+    }
+}
+
 /// What [`ensure`] did to the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnsureOutcome {
@@ -91,15 +116,21 @@ pub(crate) enum Step {
 pub(crate) enum Run {
     /// None. A start after the install runs as the account it names.
     Stopped,
-    /// `START_PENDING`: a shim launched as a kept account may not yet hold its log, which it does before it
-    /// registers the control handler, so the first status it reports says it has.
+    /// `START_PENDING`: the shim opens the log, as the account it was launched as, and spawns the daemon before it
+    /// reports `RUNNING`, so it may or may not hold the log yet.
     Starting,
     /// Past its start: the shim holds the log it opened, and reopens by path, as its own account, one that was
-    /// made in its place.
+    /// made in its place. That account is a kept one: a run started before an earlier change of account is not
+    /// named.
     Up,
 }
 
 impl Run {
+    /// Whether a shim of the run may hold the log, or reopen it by path: a start in progress and any run past it.
+    pub(crate) fn is_live(self) -> bool {
+        self != Self::Stopped
+    }
+
     pub(crate) fn of(state: ServiceState) -> Self {
         match state {
             ServiceState::Stopped => Self::Stopped,
@@ -114,10 +145,11 @@ impl Run {
 }
 
 /// What a log names, and what is done with the one there, at `step` for the new account `new` and the accounts
-/// `kept` (those the service ran as before the change), while the service's run is `run`. A file is not rewritten
-/// while a start is in progress, and one that has to be made names the kept accounts too. A file made under an up
-/// run names them as well, since that run's shim, which holds the file that was there, reopens the path as its own
-/// account if it was deleted; the one there is narrowed, as that shim holds it.
+/// `kept` (the account this install changes the service from), while the service's run is `run`. A file is not
+/// rewritten while a start is in progress, and one that has to be made names the kept accounts too. A file made under
+/// an up run names them as well, since that run's shim, which holds the file that was there, reopens the path as its
+/// own account if it was deleted; the one there is narrowed, as that shim holds it. A run older than `kept`, started
+/// before an earlier change of account, is not named: until it restarts it writes its own lines to the Event Log only.
 pub(crate) fn naming(step: Step, run: Run, kept: &[Sid], new: &Sid) -> Naming {
     let with_kept = || [kept, std::slice::from_ref(new)].concat();
     match (step, run) {
@@ -132,6 +164,12 @@ pub(crate) fn naming(step: Step, run: Run, kept: &[Sid], new: &Sid) -> Naming {
             existing: Existing::Set(vec![new.clone()]),
         },
     }
+}
+
+/// [`ensure`] for the [`naming`] of `step`, `kept` and `new` while the run is `run`.
+pub(crate) fn make(program_data: &Path, id: &Id, step: Step, run: Run, kept: &[Sid], new: &Sid) -> Result<LogChange> {
+    let outcome = ensure(program_data, id, &naming(step, run, kept, new))?;
+    Ok(LogChange { outcome, run })
 }
 
 /// Makes the default log of `id` under `program_data` empty, or, as `naming` says, sets the owner and the
@@ -181,56 +219,47 @@ fn distinct(accounts: &[Sid]) -> Vec<Sid> {
     named
 }
 
-/// What an install says of a default log it made, if a run of the daemon was up and its output goes to the default
-/// log (`logs` is the daemon's `logs:`, which names another file where it is set): the log it made is not the file
-/// the run writes. The delete of a file frees its name at once on current NTFS (POSIX semantics) even while a
-/// handle is open on it, so the install made a new file, and the daemon's output goes on into the deleted one until
-/// the daemon is started again. `None` for any other case.
+/// What an install says of a default log it made while a run of the daemon was live and its output goes to the
+/// default log (`logs_elsewhere` is whether the definition the run started from names a `logs:`): the log it made is
+/// not the file the run writes. The delete of a file frees its name at once on current NTFS (POSIX semantics) even
+/// while a handle is open on it, so the install made a new file, and the daemon's output goes on into the deleted one
+/// until the daemon is started again. A start in progress may not hold the log yet, so that is told as a
+/// possibility. `None` for any other case.
 pub(crate) fn made_while_running(
     program_data: &Path,
     id: &Id,
-    logs: Option<&Path>,
-    outcome: EnsureOutcome,
-    running: bool,
+    change: &LogChange,
+    logs_elsewhere: bool,
 ) -> Option<String> {
+    if !change.under_live_run() || logs_elsewhere {
+        return None;
+    }
     let path = path_in(&logs_folder(program_data), id.as_str());
-    (outcome == EnsureOutcome::Made && running && logs.is_none()).then(|| {
-        format!(
+    Some(match change.run {
+        Run::Starting => format!(
+            "`{id}` was starting when its default log {} was made again: its output may go to the deleted log until \
+             it is restarted; if it does, restart it",
+            path.display()
+        ),
+        Run::Up | Run::Stopped => format!(
             "`{id}` was running when its default log {} was made again: its output goes to the deleted log until it \
              is restarted; restart it",
             path.display()
-        )
+        ),
     })
 }
 
-/// Prints [`made_while_running`] when `outcome` is [`EnsureOutcome::Made`] and `running` (asked only then) says
-/// the daemon is up past its start. A `running` that cannot say is told as running, with why.
-pub(crate) fn tell_if_made_while_running(
-    program_data: &Path,
-    id: &Id,
-    logs: Option<&Path>,
-    outcome: EnsureOutcome,
-    running: impl FnOnce() -> Result<bool>,
-) {
-    if outcome != EnsureOutcome::Made {
-        return;
-    }
-    let (running, unread) = match running() {
-        Ok(running) => (running, String::new()),
-        Err(e) => (
-            true,
-            format!("could not tell whether it runs ({}); if it does, ", e.report()),
-        ),
-    };
-    if let Some(said) = made_while_running(program_data, id, logs, outcome, running) {
-        eprintln!("warning: {unread}{said}");
+/// Prints [`made_while_running`] as a warning.
+pub(crate) fn tell_if_made_while_running(program_data: &Path, id: &Id, change: &LogChange, logs_elsewhere: bool) {
+    if let Some(said) = made_while_running(program_data, id, change, logs_elsewhere) {
+        eprintln!("warning: {said}");
     }
 }
 
 /// A deleted log whose handle a daemon still holds keeps its name where the delete is not POSIX (the daemon's
 /// output handle is on the file), and an open answers access denied; the error says to stop the daemon and install
-/// again. A directory at the name, and a link, are told as what they are. The status of an open of the name tells either from a permission
-/// that refuses the install: the Win32 error is access denied for all three.
+/// again. A directory at the name, and a link, are told as what they are. The status of an open of the name tells
+/// each of the three from a permission that refuses the install: the Win32 error is access denied for all four.
 fn make_error(path: &Path, e: io::Error) -> Error {
     if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
         match what_is_at(path) {

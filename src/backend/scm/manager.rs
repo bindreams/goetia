@@ -747,20 +747,10 @@ impl Backend for Scm {
         snapshot: &WindowsSnapshot,
     ) -> Result<()> {
         match (definition, snapshot) {
-            (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
-                make_default_log(spec, definition, None, &[], default_log::Step::Narrow).map(drop)
+            (WindowsDefinition::Service(definition), WindowsSnapshot::Service(installed)) => {
+                make_default_log(spec, definition, None, &[], default_log::Step::Narrow, Some(installed)).map(drop)
             }
-            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => {
-                let made = task_default_log(installed)?;
-                default_log::tell_if_made_while_running(
-                    &program_data()?,
-                    installed.id(),
-                    spec.common().logs.as_deref(),
-                    made,
-                    || Ok(self.task_run_state(installed)? == State::Running),
-                );
-                Ok(())
-            }
+            (WindowsDefinition::Task(_), WindowsSnapshot::Task(installed)) => task_default_log(installed),
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
             | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
         }
@@ -1226,12 +1216,18 @@ fn apply(
         } else {
             default_log::Step::Narrow
         };
-        if make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)? {
-            after = default_log::Step::Leave;
-        }
+        let change = make_default_log(
+            spec,
+            reg,
+            gated.checked.as_ref(),
+            before.as_slice(),
+            step,
+            Some(installed),
+        )?;
+        after = change.map_or(default_log::Step::Narrow, |change| change.step_after());
     }
     apply_gated(reg, gated.password, installed.is_none())?;
-    make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
+    make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after, installed).map(drop)
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of
@@ -1312,36 +1308,44 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
 /// The default log of the service `reg` registers, for the account it runs as, made or set to name it:
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
 /// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
-/// account up again), else the one the spec gave as a SID, else the registered name's. `kept` are the accounts
-/// it names beside it, those the service may still run as, at `step` ([`default_log::naming`]), by how far the
-/// service's run is ([`default_log::Run`]), which SCM is asked once: a shim holds its log from before its first status
-/// report, and reopens by path one that was deleted. Call it once
-/// the service exists (a virtual account's SID resolves only then) and before it starts, or for the account an
-/// update is about to give a service that exists. Whether it made the log under a run that is up, which a later
-/// step of the same install ([`default_log::Step::Leave`]) leaves naming the kept accounts.
+/// account up again), else the one the spec gave as a SID, else the registered name's. `kept` is the account
+/// it names beside it, the one this install changes the service from, at `step` ([`default_log::naming`]), by how
+/// far the service's run is ([`default_log::Run`]), which SCM is asked once: a shim holds its log from before its
+/// first status report, and reopens by path one that was deleted. Call it once the service exists (a virtual
+/// account's SID resolves only then) and before it starts, or for the account an update is about to give a
+/// service that exists. A log made under a live run is told, by where `installed`, the definition the run was
+/// started from, sends its output ([`installed_writes_default_log`]). The change it returns says what the install's
+/// next step does with the file ([`default_log::LogChange::step_after`]); `None` for a service with no default log.
 fn make_default_log(
     spec: &DaemonSpec,
     reg: &ScmRegistration,
     checked: Option<&Sid>,
     kept: &[Sid],
     step: default_log::Step,
-) -> Result<bool> {
+    installed: Option<&ScmSnapshot>,
+) -> Result<Option<default_log::LogChange>> {
     if !generate::hosted(spec) {
-        return Ok(false);
+        return Ok(None);
     }
+    let id = &spec.common().id;
     let account = match checked {
         Some(sid) => sid.clone(),
         None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
     };
-    let id = &spec.common().id;
-    let run = service_run(id)?;
-    let naming = default_log::naming(step, run, kept, &account);
     let program_data = program_data()?;
-    let made = default_log::ensure(&program_data, id, &naming)?;
-    default_log::tell_if_made_while_running(&program_data, id, spec.common().logs.as_deref(), made, || {
-        Ok(run == default_log::Run::Up)
-    });
-    Ok(made == default_log::EnsureOutcome::Made && run == default_log::Run::Up)
+    let change = default_log::make(&program_data, id, step, service_run(id)?, kept, &account)?;
+    default_log::tell_if_made_while_running(&program_data, id, &change, !installed_writes_default_log(installed));
+    Ok(Some(change))
+}
+
+/// Whether the definition a service is installed with sends its daemon's output to the default log: it names no
+/// `logs:`. A live run was started from this definition, not from the one being installed, so an install that adds
+/// or removes `logs:` is told by what the run does. A definition that cannot be read is not known to log elsewhere,
+/// and a create has no run.
+fn installed_writes_default_log(installed: Option<&ScmSnapshot>) -> bool {
+    installed
+        .and_then(|installed| installed.blob().ok())
+        .is_none_or(|blob| blob.spec.common().logs.is_none())
 }
 
 /// How far the run of the service `id` is, from the state SCM reports for it.
