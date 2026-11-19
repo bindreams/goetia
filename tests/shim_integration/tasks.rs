@@ -184,6 +184,38 @@ fn a_task_runs_at_normal_priority(#[fixture(scm_group)] _group: &Group) {
     mgr.uninstall(&id).expect("uninstall");
 }
 
+/// An uninstall of a task whose run is in flight stops the run before it deletes the task: when it returns,
+/// no program of the task is alive.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_with_a_run_in_flight_leaves_no_program(#[fixture(scm_group)] _group: &Group) {
+    let id = task_id();
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = manager();
+    let (child_reported, grandchild_reported) = (ConnectBack::listen(), ConnectBack::listen());
+    let command = fixture_command(
+        "spawn-grandchild",
+        &[
+            &child_reported.port().to_string(),
+            &grandchild_reported.port().to_string(),
+        ],
+    );
+    mgr.install(&task_spec(&id, command, None, User::Root, None), false)
+        .expect("install");
+    mgr.start(&id, Budget::DEFAULT).expect("start");
+    let ends_the_run = EndsTheRunOnPanic::new(&id);
+    let child = child_reported.accept_line("the direct child to start and report its pid");
+    let grandchild = grandchild_reported.accept_line("the grandchild to start and report its pid");
+
+    mgr.uninstall(&id).expect("uninstall");
+    ends_the_run.defuse();
+
+    // Gone is a state the kernel reaches as the shim's job closes, so it is waited for.
+    for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
+        wait::until(|| !pid_is_alive(&pid));
+        assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
+    }
+}
+
 /// The shim Task Scheduler starts obeys the removal's marker: its pin is refused, so it starts no program
 /// and ends as a shim failure, which is the task's last result. The run is started through Task Scheduler's
 /// own `Run`, since a verb of goetia would be refused by the marker before it asked for anything. This run

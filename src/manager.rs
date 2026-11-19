@@ -51,6 +51,12 @@ pub trait ServiceManager {
     /// A run due while `install` changes an enabled task's schedule is missed on systemd and
     /// launchd: the task is disarmed and armed again around the change, and arming makes up no run
     /// the schedule named meanwhile. `goetia daemon start <id>` runs it.
+    ///
+    /// A scheduled run that falls while `install` changes the task's account, or while `uninstall` removes
+    /// it, does not run, even when that install is then refused. The task's log and the Event Log say so,
+    /// and its last result is the shim's failure. (This is a Windows task's.)
+    /// A change of a task's account is refused while a run is alive, or while the run records are held by a
+    /// `run` or a `stop`, and the error says which; retry when it ends.
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
     /// What [`Self::install`] would do for `spec`, without doing it, always
@@ -68,6 +74,10 @@ pub trait ServiceManager {
     /// still deleted and the error says so: re-run `uninstall` to retry it. `uninstall` of an id that
     /// is not installed is the same retry, and reports [`Error::NotInstalled`]
     /// when it has nothing left to do.
+    ///
+    /// A Windows task's `uninstall` stops every run that is alive and reads its record before it deletes
+    /// the task, and a scheduled run that falls meanwhile does not run (see [`Self::install`]). An
+    /// incomplete stop keeps the task, disabled: re-run `uninstall`.
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
