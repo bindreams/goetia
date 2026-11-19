@@ -247,7 +247,10 @@ impl RemovalMarker {
 impl Drop for RemovalMarker {
     fn drop(&mut self) {
         cleanup::warn_left_behind(cleanup::retrying(|| {
-            self.0.reopen().err().map(|e| format!("take the removal's marker away: {e}"))
+            self.0
+                .reopen()
+                .err()
+                .map(|e| format!("take the removal's marker away: {e}"))
         }));
     }
 }

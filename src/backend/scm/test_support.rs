@@ -433,10 +433,13 @@ impl DirWatch {
         loop {
             let mut returned = 0u32;
             // SAFETY: the handle and the `OVERLAPPED` of a request in flight; `1` waits for it.
-            let ok = unsafe {
-                GetOverlappedResult(self.dir.as_raw_handle() as HANDLE, &*self.overlapped, &mut returned, 1)
-            };
-            assert!(ok != 0, "the watch of the directory failed: {}", std::io::Error::last_os_error());
+            let ok =
+                unsafe { GetOverlappedResult(self.dir.as_raw_handle() as HANDLE, &*self.overlapped, &mut returned, 1) };
+            assert!(
+                ok != 0,
+                "the watch of the directory failed: {}",
+                std::io::Error::last_os_error()
+            );
             assert!(returned > 0, "the watch's buffer overflowed: changes were lost");
             let bytes: Vec<u8> = self.buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
             let bytes = &bytes[..returned as usize];

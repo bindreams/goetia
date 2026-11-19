@@ -915,7 +915,11 @@ fn write_with_its_own_pin_writes_through_the_pins_directory() {
 
     other.write(&record(1, 1), Some(own)).unwrap();
 
-    assert_eq!(names(&pinned), [file_of(&instance(1))], "the record is where the pin was");
+    assert_eq!(
+        names(&pinned),
+        [file_of(&instance(1))],
+        "the record is where the pin was"
+    );
     assert_eq!(names(&other), Vec::<String>::new(), "nothing went by the path");
 }
 
