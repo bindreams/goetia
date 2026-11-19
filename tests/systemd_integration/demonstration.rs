@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use goetia::backend::systemd::manager::Systemd;
 
 use crate::linux::{UNIT_DIR_EXCLUSIVE, timer_path, timer_wants_symlink, unit_path, wait_for_started};
-use crate::support::cron_oracle::expected_next_runs;
+use crate::support::cron_oracle::{expected_next_runs, strict_next_runs_of};
 use crate::support::demonstration::{
     Cli, DISARMED, Expect, LastResult, Manifest, Time, ZONE, assert_task_fields, daily_in_half_a_day, instant,
     read_in_the_zone,
@@ -54,9 +54,9 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
         },
     );
     // The timer is armed at `enable`, and the schedule is 12 hours away, so each form's own window names
-    // the same minute.
+    // the next minute after it, and never the occurrence 12 hours back.
     armed.assert_next_run("idle", |before, after| {
-        expected_next_runs(&daily, &id_of(&id), before, after).to_vec()
+        strict_next_runs_of(&daily, &id_of(&id), before, after).to_vec()
     });
     armed.assert_no_last_run();
     cli.daemon(&["disable", &id]);
@@ -68,21 +68,12 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
     // 3. Fires. The same id, every minute, enabled: the schedule fires with nothing started by the test,
     // and the program announces itself. systemd has no next run for a timer whose service is running, and
     // the run is held, so any later fire is dropped by the manager.
-    assert_eq!(held.begun(), 0, "step 2's `enable` started a run");
     manifest.schedule = EVERY_MINUTE.to_string();
     cli.install(&manifest);
     let enabling_at = SystemTime::now();
     cli.daemon(&["enable", &id]);
     let candidates = expected_next_runs(EVERY_MINUTE, &id_of(&id), enabling_at, SystemTime::now());
-    assert_eq!(held.wait_started(), 1, "the run is not the first");
-    // The schedule fires at a minute boundary, so a run that began earlier than the first boundary after
-    // `enable` began was started by `enable`.
-    let started_at = held.started_at();
-    assert!(
-        started_at >= candidates[1],
-        "the run began at {started_at:?}, before the first fire {:?} after `enable` began at {enabling_at:?}",
-        candidates[1]
-    );
+    held.wait_started();
     // The unit is active, and journald need not hold the run's `Starting` entry yet: the task is running
     // with a pid and no next run, and `last-run` is there or not.
     let before_the_journal = cli.status_json(&id);

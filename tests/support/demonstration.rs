@@ -370,7 +370,7 @@ impl Zoned {
     pub fn assert_state(&self, state: &str) {
         for read in self.reads() {
             assert_eq!(read.state, state, "{}: {self:?}", read.form);
-            assert_eq!(read.next_run.as_deref().map(instant), None, "{}: {self:?}", read.form);
+            assert_eq!(read.next_run, None, "{}: {self:?}", read.form);
         }
     }
 
