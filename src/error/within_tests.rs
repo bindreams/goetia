@@ -110,3 +110,19 @@ fn a_failure_said_within_a_context_by_a_target_is_still_a_failure_of_the_operati
     let plain = target_failed("kill `x`", within("stdout", denied()));
     assert_eq!(plain.report().to_string(), "failed to kill `x`: stdout: denied");
 }
+
+/// The delivered signal is the chain's: a context said around the one that says it keeps the report from
+/// reading as a failed operation.
+#[skuld::test]
+fn a_context_around_a_delivered_signal_still_says_it_was_delivered() {
+    for source in [denied(), io::Error::other(Error::blob("carried"))] {
+        let wrapped = within("outer", within_delivered("process 7 was signalled, but waiting failed", source));
+
+        let report = target_failed("kill `x`", wrapped).report().to_string();
+
+        assert!(
+            report.starts_with("kill `x`: outer: process 7 was signalled, but waiting failed: "),
+            "{report}"
+        );
+    }
+}

@@ -439,7 +439,9 @@ fn an_instance_that_cannot_be_opened_fails_the_stop_before_any_stop_is_sent() {
 
     let failed = stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap_err();
 
-    assert!(failed.report().to_string().contains("denied access"), "{failed}");
+    let report = failed.report().to_string();
+    assert!(report.contains("denied access"), "{failed}");
+    assert!(report.contains("process 200"), "{failed}");
     assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
     assert!(machine.waited.is_empty());
 }
@@ -476,9 +478,9 @@ fn a_hold_whose_re_read_failed_after_a_refused_open_names_the_pid_once() {
     );
 }
 
-/// A plain failure of the read that confirms a run's process says which of the runs it was for, once.
+/// A plain failure of the read that confirms a run's process says which of the runs it was for.
 #[skuld::test]
-fn a_hold_whose_confirming_read_failed_names_which_run_it_was_for_once() {
+fn a_hold_whose_confirming_read_failed_names_which_run_it_was_for() {
     let fake = Fake::new();
     fake.on_instances(two()).on_instances(Err(Error::os(
         "list the runs of `nightly`",
@@ -498,7 +500,7 @@ fn a_hold_whose_confirming_read_failed_names_which_run_it_was_for_once() {
 
     assert_eq!(
         failed.report().to_string(),
-        "failed to hold the process of `nightly`'s run: confirming that process 200 is the service's: failed to \
+        "failed to hold the process of `nightly`'s run: confirming that process 200 is the daemon's: failed to \
          list the runs of `nightly`: listing failed"
     );
 }

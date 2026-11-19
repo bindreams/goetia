@@ -272,7 +272,7 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
     let error = hold_service_process(&mut target, unbounded()).expect_err("a refused open");
 
     assert!(matches!(error, HoldError::Refused(_)), "{error:?}");
-    assert_eq!(io::Error::from(error).to_string(), "access denied");
+    assert_eq!(io::Error::from(error).to_string(), "opening process 100");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -335,7 +335,7 @@ fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
     let HoldOutcome::Refused(reason) = outcome else {
         panic!("expected the refusal, got {outcome:?}");
     };
-    assert_eq!(reason.to_string(), "access denied");
+    assert_eq!(reason.to_string(), "opening process 100");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 

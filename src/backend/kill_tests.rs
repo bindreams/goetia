@@ -222,6 +222,9 @@ impl KillTarget for Scripted {
             Some(_) => format!("await_recorded {pid}"),
             None => format!("await_recorded {pid} unheld"),
         });
+        if self.lagging_record && deadline.remaining().is_some() {
+            return Ok(Waited::Expired);
+        }
         if self.failing_recorded {
             return Err(io::Error::new(READ_FAILED_KIND, "manager read failed"));
         }
@@ -229,9 +232,6 @@ impl KillTarget for Scripted {
         // restart that happened under the kill is a state the machine could read, and does not.
         while self.pids.len() > 1 {
             self.pids.pop_front();
-        }
-        if self.lagging_record && deadline.remaining().is_some() {
-            return Ok(Waited::Expired);
         }
         if self.expiring_recorded {
             assert!(
@@ -446,7 +446,11 @@ fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "manager read failed");
+    assert_eq!(e.kind(), READ_FAILED_KIND);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: waiting for the manager to record that process 100 is gone: manager read failed"
+    );
     assert!(!target.log().iter().any(|call| call.starts_with("terminate")));
 }
 
@@ -544,7 +548,11 @@ fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_eq!(e.to_string(), "access denied");
+    assert_eq!(e.kind(), io::ErrorKind::Other);
+    assert_eq!(
+        kill_failed(ID, e).report().to_string(),
+        "failed to kill `frpc`: opening process 100: access denied"
+    );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -673,7 +681,7 @@ fn a_failed_confirming_read_closes_the_process_and_signals_nothing() {
     assert_eq!(e.kind(), READ_FAILED_KIND);
     assert_eq!(
         kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: confirming that process 100 is the service's: manager read failed"
+        "failed to kill `frpc`: confirming that process 100 is the daemon's: manager read failed"
     );
     assert_eq!(
         target.log(),
@@ -742,18 +750,47 @@ fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
     );
 }
 
-/// A hold that fails after the manager named the process says which process, once, whichever step failed.
+/// A kill that fails after the manager named the process says which process, whichever step failed and
+/// whenever: in the hold, or in the record wait after the hold found the process gone or not the service's.
 #[skuld::test]
-fn every_failure_of_a_hold_with_a_pid_names_it_once() {
+fn every_failure_of_a_kill_after_the_pid_is_read_says_which_process() {
+    let refused = Scripted::new([Some(100)], [Open::Fails]);
     let confirming = Scripted::new([Some(100)], [Open::Found]).failing_read(2);
     let recording = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
-    let pair = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);
-    for mut target in [confirming, recording, pair] {
+    let recording_after_expiry = Scripted::new([Some(100)], [Open::Gone]).lagging_record().failing_recorded();
+    let recording_after_ended = Scripted::new([Some(100)], [Open::Found]).disowning().failing_recorded();
+    for (what, mut target) in [
+        ("refused open", refused),
+        ("confirming read", confirming),
+        ("record wait in the hold", recording),
+        ("record wait after Expired", recording_after_expiry),
+        ("record wait after Ended", recording_after_ended),
+    ] {
+        let e = kill_service(&mut target, ID).unwrap_err();
+
+        let report = kill_failed(ID, e).report().to_string();
+
+        assert!(report.contains("process 100"), "{what}: {report}");
+    }
+}
+
+/// The hold itself says which process, for every caller of it: the one that waits on the process and the
+/// one that kills it.
+#[skuld::test]
+fn every_failure_of_a_hold_after_the_pid_is_read_says_which_process() {
+    let refused = Scripted::new([Some(100)], [Open::Fails]);
+    let confirming = Scripted::new([Some(100)], [Open::Found]).failing_read(2);
+    let recording = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+    for (what, mut target) in [
+        ("refused open", refused),
+        ("confirming read", confirming),
+        ("record wait", recording),
+    ] {
         let failed = hold_once(&mut target, Budget::Unbounded.start()).expect_err("a failed hold");
 
         let report = target_failed("hold", io::Error::from(failed)).report().to_string();
 
-        assert_eq!(report.matches("100").count(), 1, "{report}");
+        assert!(report.contains("process 100"), "{what}: {report}");
     }
 }
 
