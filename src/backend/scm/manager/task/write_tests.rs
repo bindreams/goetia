@@ -87,8 +87,7 @@ fn prepared(principal: Sid, password: Option<&str>) -> impl FnOnce(&TaskAccount)
     move |_| Ok(Prepared { principal, password })
 }
 
-/// The call a registration under `token` makes. A test of an update passes the token it kept; a test of a create
-/// passes the one the create wrote ([`registered_token`]) and asserts separately that it is a new one.
+/// The call a registration under `token` makes.
 fn register_call(
     spec: &DaemonSpec,
     armed: bool,
@@ -368,6 +367,11 @@ fn an_update_over_a_malformed_token_writes_a_well_formed_one() {
                 .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
             ..stored
         };
+        assert_eq!(
+            TaskXml::token_of(&malformed.xml, ID).unwrap(),
+            None,
+            "the edit made the token malformed"
+        );
         let fake = Fake::new();
         fake.on_register(Ok(Registration::Created));
 
@@ -383,6 +387,7 @@ fn an_update_over_a_malformed_token_writes_a_well_formed_one() {
             .unwrap();
 
         // `registered_token` reads a token from the one registration the fake saw, so a well-formed one is there.
+        assert_ne!(registered_token(&fake), task_token(), "armed={armed}: a fresh token");
         assert_eq!(
             fake.calls(),
             [register_call(
@@ -614,6 +619,7 @@ fn a_stored_principal_that_cannot_be_read_is_an_account_change() {
         fake.calls().last(),
         Some(Call::Register { update: false, .. })
     ));
+    assert_ne!(registered_token(&fake), task_token(), "a new registration: a new token");
     fake.finish();
 }
 

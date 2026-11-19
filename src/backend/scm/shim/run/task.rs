@@ -4,7 +4,7 @@
 //! ([`Runs`]), which `goetia daemon run` and status read.
 //!
 //! The arguments say which mode the shim is in: a task's action ends in
-//! [`TASK_MODE_ARG`], the task's id and the registration's token ([`requested`]), and anything else
+//! `--goetia-task`, the task's id and the registration's token ([`requested`]), and anything else
 //! is service mode. Task mode never reports to SCM.
 //!
 //! **A stop** reaches the shim as `CTRL_CLOSE_EVENT` on its console, from `IRunningTask::Stop`.
@@ -30,10 +30,11 @@ use super::stop_bus::{StopBus, Supervisor};
 use crate::backend::scm::exit_status::Reported;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
+use crate::backend::scm::manager::task::api::Registered;
 use crate::backend::scm::manager::task::clock::file_time_of;
 use crate::backend::scm::manager::task::{Com, TaskApi};
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::backend::scm::task_xml::{TASK_MODE_ARG, TaskXml, Token, extract_from_data};
+use crate::backend::scm::task_xml::{TaskXml, Token, ending, extract_from_data};
 use crate::error::Chain;
 use crate::spec::{DaemonSpec, Id};
 
@@ -47,18 +48,16 @@ const NOT_A_TASK: &str = "this is a service's blob; task mode runs only tasks";
 // Entry ===============================================================================================================
 
 /// The task's id and the token of the registration the shim was started under, when `args` (the
-/// process's arguments after the program) end with [`TASK_MODE_ARG`], an id and a well-formed
-/// [`Token`]: task mode. Anything else, a malformed token included, is service mode.
-pub(super) fn requested(args: &[OsString]) -> Option<(&str, Token)> {
-    match args {
-        [.., flag, id, token] if *flag == *TASK_MODE_ARG => Some((id.to_str()?, Token::parse(token.to_str()?)?)),
-        _ => None,
-    }
+/// process's arguments after the program) have an [`ending`]: task mode. The token is `None` for an
+/// ending that has no well-formed one, which [`run_in`] reports. Anything else is service mode.
+pub(super) fn requested(args: &[OsString]) -> Option<(String, Option<Token>)> {
+    let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+    ending(&args).map(|(id, token)| (id.to_owned(), token))
 }
 
 /// Runs the task `id` started under the registration `token` and ends the process with the run's code.
 /// Never returns.
-pub(super) fn run(id: &str, token: Token) -> ! {
+pub(super) fn run(id: &str, token: Option<Token>) -> ! {
     let real = Arc::new(Real::default());
     let log = Arc::new(Log::real(Arc::clone(&real)));
     log.hold_default(id);
@@ -85,7 +84,7 @@ pub(super) fn run(id: &str, token: Token) -> ! {
         // A task that is not an id is refused by `run_in`.
         (Ok(_), Err(_)) => None,
     };
-    let code = run_in(id, &token, &supervisor, &Com, runs.as_ref(), std::process::id());
+    let code = run_in(id, token, &supervisor, &Com, runs.as_ref(), std::process::id());
     exit::end_process(code as i32)
 }
 
@@ -95,7 +94,8 @@ pub(super) fn run(id: &str, token: Token) -> ! {
 ///
 /// In order, every failure before the program starts logged: reads the task through `api` (a service's
 /// blob is refused; a registration that is not the one this shim was started under, by `token`, is
-/// reported as a shim failure), waits for its own instance by `own_pid` to be listed ([`own_instance`]),
+/// reported as a shim failure, and again while the wait goes on), waits for its own instance by `own_pid` to
+/// be listed ([`own_instance`]),
 /// sets the diagnostics log, writes the run's marker as the first line of `logs` when there is one, runs
 /// the program, and writes the one record into `runs`. A listing that cannot be read, and a record that
 /// cannot be written, are logged and do not stop the program or change its code. A stop during the
@@ -103,7 +103,7 @@ pub(super) fn run(id: &str, token: Token) -> ! {
 /// code.
 pub(super) fn run_in(
     id: &str,
-    token: &Token,
+    token: Option<Token>,
     supervisor: &Supervisor,
     api: &dyn TaskApi,
     runs: Option<&Runs>,
@@ -117,9 +117,13 @@ pub(super) fn run_in(
             return stop.reported.process_exit_code() as u32;
         }
     };
-    let instance = match own_instance(id, api, &path, own_pid, supervisor) {
+    let instance = match own_instance(id, token, api, &path, own_pid, supervisor) {
         OwnInstanceOutcome::Listed(instance) => Some(instance),
         OwnInstanceOutcome::Unread => None,
+        OwnInstanceOutcome::Replaced(stop) => {
+            log.failure(id, &stop.message);
+            return stop.reported.process_exit_code() as u32;
+        }
         OwnInstanceOutcome::Stopped(instance) => {
             record_run(log, id, runs, instance, file_time_now(), Some(RunOutcome::Stopped));
             return STOPPED_EXIT;
@@ -165,30 +169,16 @@ fn record_run(
 
 /// The task's own spec, and its path. A task that is gone, not goetia's, undecodable or a service's is
 /// refused; a read that did not complete is a shim failure carrying the OS error it met. So is a
-/// registration that is not the one this shim was started under (`token`): its token differs, it has
-/// none, or its XML cannot be read.
-fn own_spec(id: &str, token: &Token, api: &dyn TaskApi) -> Result<(DaemonSpec, TaskPath), SpecStop> {
+/// registration that is not the one this shim was started under (`token`): its token differs, either
+/// has none, or its XML cannot be read.
+fn own_spec(id: &str, token: Option<Token>, api: &dyn TaskApi) -> Result<(DaemonSpec, TaskPath), SpecStop> {
     let refused = |message: String| SpecStop {
         message,
         reported: Reported::Refused,
     };
     let task = Id::try_from(id).map_err(|e| refused(format!("`{id}` is not a goetia id: {}", e.report())))?;
     let path = TaskPath::of(&task);
-    let registered = match api.get(&path) {
-        Ok(Some(registered)) => registered,
-        Ok(None) => {
-            return Err(refused(format!(
-                "the task {} is gone: no program was started",
-                path.as_str()
-            )));
-        }
-        Err(e) => {
-            return Err(SpecStop {
-                message: format!("read the task {}: {}", path.as_str(), e.report()),
-                reported: Reported::shim_failure(Some(e.raw_os_error().unwrap_or(ERROR_INVALID_DATA as i32))),
-            });
-        }
-    };
+    let registered = registration(&path, api)?;
     let spec = match extract_from_data(&registered.data) {
         Ok(Some(blob)) if matches!(blob.spec, DaemonSpec::Task(_)) => blob.spec,
         Ok(Some(_)) => return Err(refused(NOT_A_TASK.to_string())),
@@ -200,23 +190,46 @@ fn own_spec(id: &str, token: &Token, api: &dyn TaskApi) -> Result<(DaemonSpec, T
         }
         Err(e) => return Err(refused(format!("decode the task's Data: {}", e.report()))),
     };
+    started_under(&path, id, token, &registered.xml)?;
+    Ok((spec, path))
+}
+
+/// The task's registration as Task Scheduler holds it now. A task that is gone is refused; a read that
+/// did not complete is a shim failure carrying the OS error it met.
+fn registration(path: &TaskPath, api: &dyn TaskApi) -> Result<Registered, SpecStop> {
+    match api.get(path) {
+        Ok(Some(registered)) => Ok(registered),
+        Ok(None) => Err(SpecStop {
+            message: format!("the task {} is gone: no program was started", path.as_str()),
+            reported: Reported::Refused,
+        }),
+        Err(e) => Err(SpecStop {
+            message: format!("read the task {}: {}", path.as_str(), e.report()),
+            reported: Reported::shim_failure(Some(e.raw_os_error().unwrap_or(ERROR_INVALID_DATA as i32))),
+        }),
+    }
+}
+
+/// Whether the registration with the stored `xml` is the one the shim was started under (`token`); a
+/// shim failure when it is not.
+fn started_under(path: &TaskPath, id: &str, token: Option<Token>, xml: &str) -> Result<(), SpecStop> {
     let not_started_under = |message: String| SpecStop {
         message,
         reported: Reported::shim_failure(None),
     };
-    match TaskXml::token_of(&registered.xml, id) {
-        Ok(Some(registered)) if registered == *token => Ok((spec, path)),
-        Ok(Some(_)) => Err(not_started_under(format!(
+    match (TaskXml::token_of(xml, id), token) {
+        (Ok(Some(registered)), Some(token)) if registered == token => Ok(()),
+        (Ok(Some(_)), _) => Err(not_started_under(format!(
             "the task {}'s registration is not the one this shim was started under (another install registered it \
              again, or the shim was started by hand): no program was started",
             path.as_str()
         ))),
-        Ok(None) => Err(not_started_under(format!(
+        (Ok(None), _) => Err(not_started_under(format!(
             "the task {}'s registration carries no goetia ending for this task, so it is not the one this shim was \
              started under; `goetia daemon install {id}` registers it again: no program was started",
             path.as_str()
         ))),
-        Err(e) => Err(not_started_under(format!(
+        (Err(e), _) => Err(not_started_under(format!(
             "read the registration of the task {}: {}",
             path.as_str(),
             e.report()
@@ -234,6 +247,8 @@ enum OwnInstanceOutcome {
     /// A stop arrived while no such instance was listed, so no program is to start. Holds the
     /// instance when the read the stop woke found it; when it did not, that is said in the log.
     Stopped(Option<InstanceId>),
+    /// The registration was replaced while the wait went on, or gone: no program is to start.
+    Replaced(SpecStop),
 }
 
 /// The pace of the re-reads of Task Scheduler's listing while it does not hold the shim yet. Each
@@ -244,9 +259,12 @@ const LISTING_PACE: Duration = Duration::from_millis(100);
 /// lists a run once it has started the action's process, which can be after that process reads the
 /// listing, so a listing without the shim is read again, paced and without a cap: the shim is the
 /// instance's process, and a task that was stopped or deleted meanwhile ends it. A failed read ends
-/// the wait ([`OwnInstanceOutcome::Unread`]); a stop does too, after one more read.
+/// the wait ([`OwnInstanceOutcome::Unread`]); a stop does too, after one more read. Each listing that
+/// misses the shim has the registration read again: one that is no longer the shim's (an account change
+/// registered the task again) never lists it, so it ends the wait ([`OwnInstanceOutcome::Replaced`]).
 fn own_instance(
     id: &str,
+    token: Option<Token>,
     api: &dyn TaskApi,
     path: &TaskPath,
     own_pid: u32,
@@ -264,7 +282,11 @@ fn own_instance(
     loop {
         match read() {
             Ok(Some(own)) => return OwnInstanceOutcome::Listed(own),
-            Ok(None) => {}
+            Ok(None) => {
+                if let Err(stop) = registration(path, api).and_then(|now| started_under(path, id, token, &now.xml)) {
+                    return OwnInstanceOutcome::Replaced(stop);
+                }
+            }
             Err(e) => {
                 log.failure(
                     id,

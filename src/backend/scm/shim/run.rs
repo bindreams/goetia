@@ -36,7 +36,7 @@ pub(crate) fn run() -> ! {
     std::hint::black_box(&marker::MARKER);
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match task::requested(&args) {
-        Some((id, token)) => task::run(id, token),
+        Some((id, token)) => task::run(&id, token),
         None => service::run(),
     }
 }

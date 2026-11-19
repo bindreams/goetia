@@ -40,20 +40,18 @@ mod read;
 /// this, the task's id and the registration's [`Token`].
 pub(crate) const TASK_MODE_ARG: &str = "--goetia-task";
 
-/// What tells one registration of a task from another: the last argument of its action. A create makes a
-/// fresh one and an update keeps it, so a shim started under a registration that has since been
-/// replaced finds another in the task it reads, and starts no program. It is no part of a
-/// [`TaskXml`]: what an install compares is the definition.
+/// What tells one registration of a task from another: the last argument of its action. Not part of a
+/// [`TaskXml`], which an install compares by definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Token([u8; 16]);
 
 impl Token {
-    /// A token no earlier one equals: 128 random bits.
+    /// 128 random bits.
     pub(crate) fn fresh() -> Token {
         Token(rand::random::<u128>().to_be_bytes())
     }
 
-    /// `text` as a token: exactly 32 hex digits.
+    /// `text` as a token: exactly 32 hex digits, of either case.
     pub(crate) fn parse(text: &str) -> Option<Token> {
         bytes_of_hex(text).map(Token)
     }
@@ -61,6 +59,21 @@ impl Token {
     /// The 32 lower-case hex digits the action's arguments end with.
     pub(crate) fn hex(&self) -> String {
         hex_of(&self.0)
+    }
+}
+
+/// The task-mode ending of `args`, the arguments after the program: [`TASK_MODE_ARG`], a task's id and,
+/// last, the registration's token, which is `None` when absent or not a [`Token`]. What an install writes
+/// (`args` of the stored XML) and what Task Scheduler passes the shim (its argv) are read by this one
+/// matcher. `None` when `args` end otherwise.
+pub(crate) fn ending<S: AsRef<str>>(args: &[S]) -> Option<(&str, Option<Token>)> {
+    let tail = |n: usize| args.len().checked_sub(n).map(|from| &args[from..]);
+    match (tail(3), tail(2)) {
+        (Some([flag, id, last]), _) if flag.as_ref() == TASK_MODE_ARG => {
+            Some((id.as_ref(), Token::parse(last.as_ref())))
+        }
+        (_, Some([flag, id])) if flag.as_ref() == TASK_MODE_ARG => Some((id.as_ref(), None)),
+        _ => None,
     }
 }
 

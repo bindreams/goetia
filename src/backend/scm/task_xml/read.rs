@@ -10,7 +10,7 @@ use cosca::quote::windows::split_wide;
 use roxmltree::{Document, Node};
 
 use super::{
-    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, Stored, TASK_MODE_ARG, TaskXml, Token, WEEKDAYS, account_of,
+    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, Stored, TASK_MODE_ARG, TaskXml, Token, WEEKDAYS, account_of, ending,
     extract_from_data, triggers_of, triggers_xml,
 };
 use crate::backend::scm::instance::TaskAccount;
@@ -211,7 +211,7 @@ fn token_in(document: &Document<'_>, id: &str) -> Option<Token> {
         .and_then(|exec| child(exec, "Arguments"))
         .map(text)
         .unwrap_or_default();
-    ending_of(&split_arguments(&arguments), id).and_then(Token::parse)
+    ending_of(&split_arguments(&arguments), id)
 }
 
 fn armed_in(document: &Document<'_>) -> bool {
@@ -332,7 +332,7 @@ fn action_of(root: Node<'_, '_>, id: &Id, unrecognised: &mut Vec<String>) -> Res
     }
 
     let mut args = split_arguments(&child(exec, "Arguments").map(text).unwrap_or_default());
-    if ending_of(&args, id.as_str()).and_then(Token::parse).is_some() {
+    if ending_of(&args, id.as_str()).is_some() {
         args.truncate(args.len() - 3);
     } else {
         unrecognised.push(format!("Arguments do not end with {TASK_MODE_ARG} {id} <token>"));
@@ -343,14 +343,12 @@ fn action_of(root: Node<'_, '_>, id: &Id, unrecognised: &mut Vec<String>) -> Res
     })
 }
 
-/// The last argument, the token's text, when `args` end as an install writes them: [`TASK_MODE_ARG`], the
-/// task's `id` and a token (which [`Token::parse`] judges). The one definition of goetia's ending; its three
-/// arguments are no part of the host.
-fn ending_of<'a>(args: &'a [String], id: &str) -> Option<&'a str> {
-    match args {
-        [.., flag, named, token] if flag == TASK_MODE_ARG && named == id => Some(token),
-        _ => None,
-    }
+/// The token of the [`ending`] `args` have for the task `id`; `None` for no ending, another task's, or a
+/// last argument that is no token. An action whose ending is not this is not what an install writes.
+fn ending_of(args: &[String], id: &str) -> Option<Token> {
+    ending(args)
+        .filter(|(named, _)| *named == id)
+        .and_then(|(_, token)| token)
 }
 
 /// The arguments of an `Arguments` text, as `CommandLineToArgvW` reads them after the program.

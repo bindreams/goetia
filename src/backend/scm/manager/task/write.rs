@@ -186,12 +186,11 @@ impl Scm {
     /// again ([`Self::task_register_again`]): disabled, refused while the old one runs (its shim still writes
     /// its record), then, with the record directory made to name the old account and the new one, the
     /// registration alone is deleted (its records stay) and created, under a fresh token, with the armed
-    /// state it had. A failure between the delete and the create leaves nothing at the id, which an install
-    /// that runs again creates (disarmed: `enable` arms it).
+    /// state it had.
     ///
     /// A stored registration whose XML cannot be read at all, or whose account lookup failed for a reason other
     /// than "no such account", fails the write before anything is sent to Task Scheduler: that is not a change of
-    /// account. A token that is not goetia's ending (a hand edit) is no failure: the update writes a fresh one.
+    /// account.
     pub(super) fn task_write_with<P: Processes>(
         &self,
         spec: &DaemonSpec,
@@ -202,8 +201,7 @@ impl Scm {
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        // The stored registration is read once, here, before `prepare` touches the machine: its principal, its
-        // armed state and its token.
+        // Read before `prepare` touches the machine.
         let stored = snapshot
             .map(|old| old.stored().map(|stored| (old, stored)))
             .transpose()?;
@@ -228,7 +226,8 @@ impl Scm {
     /// ([`Error::AccountChangeRunning`]), the record directory is made, the task is deleted, and created
     /// with the armed state it had. A failure after the disable puts the flag back as it was found (a task
     /// found disabled, or whose flag was not read, is not touched), and a flag that cannot be put back is
-    /// reported with the failure.
+    /// reported with the failure. A failure between the delete and the create leaves nothing at the id,
+    /// which an install that runs again creates (disarmed: `enable` arms it).
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
@@ -307,9 +306,7 @@ impl Scm {
         }
     }
 
-    /// The registration itself, once what it needs is acquired. The token policy is here and nowhere
-    /// else: a create is a new registration and takes a fresh token; an update keeps the one it replaces
-    /// and, where the stored registration has none (a hand edit), takes a fresh one.
+    /// The registration itself, once what it needs is acquired. The one place a token is chosen.
     fn task_register(
         &self,
         id: &Id,
@@ -339,8 +336,8 @@ impl Scm {
 enum Registering {
     /// A new registration of the task, armed or not, under a fresh token.
     Create { armed: bool },
-    /// The stored task written again in place: as armed as it is (`armed`), under its own `token`, if it
-    /// carries one.
+    /// The stored task written again in place: as armed as it is (`armed`), under its own `token`; or, where
+    /// it has none (a hand edit), a fresh one.
     Update { armed: bool, token: Option<Token> },
 }
 

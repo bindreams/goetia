@@ -27,7 +27,7 @@ use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 use crate::backend::scm::task_xml::Token;
-use crate::backend::scm::test_support::{TASK_TOKEN, registered_task, task_token};
+use crate::backend::scm::test_support::{TASK_TOKEN, registered_task, registered_task_with, task_token};
 use crate::elevation::test_support::process_user_sid;
 use crate::error::Error;
 use crate::spec::{DaemonFields, DaemonSpec, ServiceSpec, TaskFields, TaskSpec};
@@ -131,6 +131,14 @@ impl Run {
         self
     }
 
+    /// The registration is read `times` more, as each listing that misses the shim has it checked.
+    fn read_again(self, times: usize) -> Run {
+        for _ in 0..times {
+            self.api.on_get(Ok(Some(data_of(&spec_logging_to(None)))));
+        }
+        self
+    }
+
     /// The program is spawned, with a thread made to wait on it first.
     fn program(self, process: FakeProcess) -> Run {
         self.fake.will_make_thread();
@@ -141,7 +149,7 @@ impl Run {
     fn run(&self) -> u32 {
         run_in(
             ID,
-            &task_token(),
+            Some(task_token()),
             &self.supervisor,
             &self.api,
             Some(&self.runs),
@@ -190,29 +198,31 @@ fn args(list: &[&str]) -> Vec<OsString> {
     list.iter().map(OsString::from).collect()
 }
 
-#[skuld::test]
-fn task_mode_is_requested_by_the_trailing_arguments_only() {
-    assert_eq!(
-        requested(&args(&["--goetia-task", "frpc", TASK_TOKEN])),
-        Some(("frpc", task_token()))
-    );
-    assert_eq!(
-        requested(&args(&["--host-flag", "value", "--goetia-task", "frpc", TASK_TOKEN])),
-        Some(("frpc", task_token()))
-    );
+fn requested_of(list: &[&str]) -> Option<(String, Option<Token>)> {
+    requested(&args(list))
 }
 
 #[skuld::test]
-fn arguments_not_ending_in_the_task_flag_the_id_and_the_token_are_service_mode() {
-    assert_eq!(requested(&args(&[])), None);
-    assert_eq!(requested(&args(&["frpc"])), None);
-    assert_eq!(requested(&args(&["--goetia-task"])), None);
-    assert_eq!(requested(&args(&["--goetia-task", "frpc"])), None);
-    assert_eq!(requested(&args(&["--goetia-task", "frpc", TASK_TOKEN, "extra"])), None);
-    // A last argument that is no token is no ending of goetia's.
-    assert_eq!(requested(&args(&["--goetia-task", "frpc", "0123"])), None);
-    assert_eq!(requested(&args(&["--goetia-task", "frpc", &"g".repeat(32)])), None);
-    assert_eq!(requested(&args(&["--other", "frpc", TASK_TOKEN])), None);
+fn task_mode_is_requested_by_the_trailing_arguments_only() {
+    assert_eq!(
+        requested_of(&["--goetia-task", "frpc", TASK_TOKEN]),
+        Some(("frpc".to_owned(), Some(task_token())))
+    );
+    assert_eq!(
+        requested_of(&["--host-flag", "value", "--goetia-task", "frpc", TASK_TOKEN]),
+        Some(("frpc".to_owned(), Some(task_token())))
+    );
+}
+
+/// A registration edited by hand has an ending Task Scheduler passes on as it is: task mode all the same,
+/// with no token to run under.
+#[skuld::test]
+fn a_task_ending_with_no_well_formed_token_is_task_mode_with_none() {
+    let named = |token| Some(("frpc".to_owned(), token));
+    assert_eq!(requested_of(&["--goetia-task", "frpc"]), named(None));
+    assert_eq!(requested_of(&["--host-flag", "--goetia-task", "frpc"]), named(None));
+    assert_eq!(requested_of(&["--goetia-task", "frpc", "0123"]), named(None));
+    assert_eq!(requested_of(&["--goetia-task", "frpc", &"g".repeat(32)]), named(None));
     let not_utf8 = OsString::from_wide(&[0xD800]);
     assert_eq!(
         requested(&[
@@ -220,12 +230,17 @@ fn arguments_not_ending_in_the_task_flag_the_id_and_the_token_are_service_mode()
             OsString::from("frpc"),
             not_utf8.clone()
         ]),
-        None
+        named(None)
     );
-    assert_eq!(
-        requested(&[OsString::from("--goetia-task"), not_utf8, OsString::from(TASK_TOKEN)]),
-        None
-    );
+}
+
+#[skuld::test]
+fn arguments_not_ending_in_the_task_flag_and_an_id_are_service_mode() {
+    assert_eq!(requested_of(&[]), None);
+    assert_eq!(requested_of(&["frpc"]), None);
+    assert_eq!(requested_of(&["--goetia-task"]), None);
+    assert_eq!(requested_of(&["--goetia-task", "frpc", TASK_TOKEN, "extra"]), None);
+    assert_eq!(requested_of(&["--other", "frpc", TASK_TOKEN]), None);
 }
 
 // What the task says ==================================================================================================
@@ -276,66 +291,145 @@ fn a_task_that_is_gone_or_not_goetias_is_refused_and_nothing_runs() {
     }
 }
 
-/// A shim that another registration has outlived: the task it reads is not the one it was started under,
-/// so it starts no program, and states no listing of its own to wait for.
+fn not_the_registration_started_under() -> String {
+    format!(
+        "the task \\Goetia\\{ID}'s registration is not the one this shim was started under (another install \
+         registered it again, or the shim was started by hand): no program was started"
+    )
+}
+
+fn no_ending_for_this_task() -> String {
+    format!(
+        "the task \\Goetia\\{ID}'s registration carries no goetia ending for this task, so it is not the one \
+         this shim was started under; `goetia daemon install {ID}` registers it again: no program was started"
+    )
+}
+
+/// A shim whose registration was replaced starts no program and waits for no listing.
 #[skuld::test]
 fn a_registration_with_another_token_starts_no_program() {
     let run = Run::of(&spec_logging_to(None));
 
     let other = Token::parse(OTHER_TOKEN).unwrap();
-    let code = run_in(ID, &other, &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+    let code = run_in(ID, Some(other), &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
 
     assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
-    assert_one_failure(
-        &run.fake.take_failures(),
-        ID,
-        &format!(
-            "the task \\Goetia\\{ID}'s registration is not the one this shim was started under (another install \
-             registered it again, or the shim was started by hand): no program was started"
-        ),
-    );
+    assert_one_failure(&run.fake.take_failures(), ID, &not_the_registration_started_under());
     assert_eq!(run.fake.calls(Op::Spawn), 0);
     assert_eq!(run.record(), None);
     run.api.finish();
 }
 
-/// A registration whose arguments end with no goetia ending for this task (a hand edit: no ending, the ending
-/// of another id, or a malformed token) is not the one the shim was started under.
+/// A registration whose arguments end with no goetia ending for this task (a hand edit) is not the one
+/// the shim was started under. Each case runs with the arguments Task Scheduler passes: a shim started
+/// after the edit gets the edited ending, one started before it the old one.
 #[skuld::test]
 fn a_registration_with_no_ending_for_this_task_starts_no_program() {
     let stored = registered_task(&spec_logging_to(None), false);
-    for edited in [
-        stored
-            .xml
-            .replace(&format!(" {TASK_TOKEN}</Arguments>"), " 0123</Arguments>"),
-        stored
-            .xml
-            .replace(&format!(" {ID} {TASK_TOKEN}</Arguments>"), "</Arguments>"),
-        stored.xml.replace(
-            &format!(" {ID} {TASK_TOKEN}</Arguments>"),
-            &format!(" other {TASK_TOKEN}</Arguments>"),
+    let ending = format!(" {ID} {TASK_TOKEN}</Arguments>");
+    let before = ["--goetia-task", ID, TASK_TOKEN];
+    let cases = [
+        (
+            stored.xml.replace(&ending, &format!(" {ID} 0123</Arguments>")),
+            ["--goetia-task", ID, "0123"].as_slice(),
         ),
-    ] {
+        (
+            stored.xml.replace(&ending, &format!(" {ID}</Arguments>")),
+            ["--goetia-task", ID].as_slice(),
+        ),
+        (stored.xml.replace(&ending, "</Arguments>"), before.as_slice()),
+        (
+            stored.xml.replace(&ending, &format!(" other {TASK_TOKEN}</Arguments>")),
+            before.as_slice(),
+        ),
+    ];
+    for (edited, argv) in cases {
+        assert_ne!(edited, stored.xml, "the edit did not apply: {argv:?}");
         let run = Run::reading(Ok(Some(Registered {
             xml: edited,
             ..stored.clone()
         })));
+        let (id, token) = requested_of(argv).expect("an ending with the task flag is task mode");
 
-        let code = run.run();
+        let code = run_in(&id, token, &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
 
-        assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
-        assert_one_failure(
-            &run.fake.take_failures(),
-            ID,
-            &format!(
-                "the task \\Goetia\\{ID}'s registration carries no goetia ending for this task, so it is not the \
-                 one this shim was started under; `goetia daemon install {ID}` registers it again: no program \
-                 was started"
-            ),
+        assert_eq!(
+            code,
+            Reported::shim_failure(None).process_exit_code() as u32,
+            "{argv:?}"
         );
+        assert_one_failure(&run.fake.take_failures(), ID, &no_ending_for_this_task());
         assert_eq!(run.fake.calls(Op::Spawn), 0);
         run.api.finish();
     }
+}
+
+/// A shim started with no token, under a registration that has one, is not under that registration.
+#[skuld::test]
+fn a_shim_started_with_no_token_under_a_registration_with_one_starts_no_program() {
+    let run = Run::of(&spec_logging_to(None));
+
+    let code = run_in(ID, None, &run.supervisor, &run.api, Some(&run.runs), OWN_PID);
+
+    assert_eq!(code, Reported::shim_failure(None).process_exit_code() as u32);
+    assert_one_failure(&run.fake.take_failures(), ID, &not_the_registration_started_under());
+    assert_eq!(run.fake.calls(Op::Spawn), 0);
+    run.api.finish();
+}
+
+/// An account change that registers the task again while a shim waits for its listing ends the wait: the
+/// new registration never lists the old shim.
+#[skuld::test]
+fn a_registration_replaced_while_waiting_for_the_listing_ends_the_wait() {
+    let spec = spec_logging_to(None);
+    let other = Token::parse(OTHER_TOKEN).unwrap();
+    let cases = [
+        (
+            Ok(Some(registered_task_with(&spec, false, &other))),
+            not_the_registration_started_under(),
+        ),
+        (
+            Ok(Some(Registered {
+                xml: registered_task(&spec, false).xml.replace(TASK_TOKEN, "0123"),
+                ..registered_task(&spec, false)
+            })),
+            no_ending_for_this_task(),
+        ),
+    ];
+    for (second_read, message) in cases {
+        let run = Run::of(&spec);
+        run.api.on_instances(Ok(vec![])).on_get(second_read);
+
+        let code = run.run();
+
+        assert_eq!(
+            code,
+            Reported::shim_failure(None).process_exit_code() as u32,
+            "{message}"
+        );
+        assert_one_failure(&run.fake.take_failures(), ID, &message);
+        assert_eq!(run.fake.calls(Op::Spawn), 0);
+        assert_eq!(run.record(), None);
+        run.api.finish();
+    }
+}
+
+/// A task deleted while the shim waits for its listing is gone, as when it is read first.
+#[skuld::test]
+fn a_task_deleted_while_waiting_for_the_listing_ends_the_wait() {
+    let run = Run::of(&spec_logging_to(None));
+    run.api.on_instances(Ok(vec![])).on_get(Ok(None));
+
+    let code = run.run();
+
+    assert_eq!(code, Reported::Refused.process_exit_code() as u32);
+    assert_one_failure(
+        &run.fake.take_failures(),
+        ID,
+        &format!(r"the task \Goetia\{ID} is gone: no program was started"),
+    );
+    assert_eq!(run.fake.calls(Op::Spawn), 0);
+    run.api.finish();
 }
 
 /// XML that cannot be read says nothing of the registration, so no program is started under it.
@@ -567,7 +661,7 @@ fn a_stop_during_the_com_reads_is_not_lost() {
             at,
         };
 
-        let code = run_in(ID, &task_token(), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+        let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
 
         assert_eq!(code, STOPPED, "a stop during {at:?}");
         assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped), "{at:?}");
@@ -812,7 +906,7 @@ fn an_unreadable_listing_runs_the_program_and_writes_no_record() {
 /// the shim reads again, and the program starts when its own instance is listed.
 #[skuld::test]
 fn a_listing_that_misses_the_shim_is_read_again_and_the_run_is_recorded() {
-    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    let run = Run::of(&spec_logging_to(Some(LOGS))).read_again(1);
     run.api.on_instances(Ok(vec![])).on_instances(Ok(listed()));
     let run = run.program(exits(0));
 
@@ -834,7 +928,7 @@ fn a_listing_of_other_processes_is_read_again() {
         id: InstanceId::parse(&format!("{:032x}", 7)).unwrap(),
         pid: OWN_PID + 1,
     }];
-    let run = Run::of(&spec_logging_to(None));
+    let run = Run::of(&spec_logging_to(None)).read_again(1);
     run.api.on_instances(Ok(others)).on_instances(Ok(listed()));
     let run = run.program(exits(3));
 
@@ -848,7 +942,7 @@ fn a_listing_of_other_processes_is_read_again() {
 /// when the instance is found by the read the stop wakes.
 #[skuld::test]
 fn a_stop_while_the_instance_is_not_listed_starts_nothing_and_records_the_run_stopped() {
-    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    let run = Run::of(&spec_logging_to(Some(LOGS))).read_again(1);
     run.api.on_instances(Ok(vec![])).on_instances(Ok(listed()));
     let api = StopsDuring {
         inner: run.api.clone(),
@@ -856,7 +950,7 @@ fn a_stop_while_the_instance_is_not_listed_starts_nothing_and_records_the_run_st
         at: Read::Instances,
     };
 
-    let code = run_in(ID, &task_token(), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+    let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
 
     assert_eq!(code, STOPPED);
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
@@ -874,7 +968,7 @@ fn a_stop_while_the_instance_is_not_listed_starts_nothing_and_records_the_run_st
 /// that is logged, and the process still ends with the stop's code.
 #[skuld::test]
 fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded() {
-    let run = Run::of(&spec_logging_to(None));
+    let run = Run::of(&spec_logging_to(None)).read_again(1);
     run.api.on_instances(Ok(vec![])).on_instances(Ok(vec![]));
     let api = StopsDuring {
         inner: run.api.clone(),
@@ -883,7 +977,7 @@ fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded(
     };
     let pin = run.runs.pin().unwrap();
 
-    let code = run_in(ID, &task_token(), &run.supervisor, &api, Some(&run.runs), OWN_PID);
+    let code = run_in(ID, Some(task_token()), &run.supervisor, &api, Some(&run.runs), OWN_PID);
 
     assert_eq!(code, STOPPED);
     assert_eq!(pin.appeared().unwrap(), vec![]);
@@ -906,7 +1000,14 @@ fn a_failed_record_write_still_returns_the_programs_code() {
     let unmade = Runs::of(dir.path(), &Id::try_from(ID).unwrap());
     let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(5));
 
-    let code = run_in(ID, &task_token(), &run.supervisor, &run.api, Some(&unmade), OWN_PID);
+    let code = run_in(
+        ID,
+        Some(task_token()),
+        &run.supervisor,
+        &run.api,
+        Some(&unmade),
+        OWN_PID,
+    );
 
     assert_eq!(code, 5);
     assert_eq!(unmade.read(&instance()).unwrap(), None);
@@ -969,7 +1070,7 @@ fn a_prune_problem_is_logged_and_does_not_change_the_runs_end() {
 fn a_run_with_nowhere_to_record_still_runs() {
     let run = Run::of(&spec_logging_to(None)).listed().program(exits(3));
 
-    let code = run_in(ID, &task_token(), &run.supervisor, &run.api, None, OWN_PID);
+    let code = run_in(ID, Some(task_token()), &run.supervisor, &run.api, None, OWN_PID);
 
     assert_eq!(code, 3);
     assert_eq!(run.record(), None);
@@ -985,7 +1086,14 @@ fn an_id_that_is_not_an_id_reads_nothing_and_runs_nothing() {
     let fake = FakeGuard::new();
     let api = TaskFake::new();
 
-    let code = run_in("not an id!", &task_token(), &supervisor(&fake), &api, None, OWN_PID);
+    let code = run_in(
+        "not an id!",
+        Some(task_token()),
+        &supervisor(&fake),
+        &api,
+        None,
+        OWN_PID,
+    );
 
     assert_eq!(code, Reported::Refused.process_exit_code() as u32);
     let failures = fake.take_failures();

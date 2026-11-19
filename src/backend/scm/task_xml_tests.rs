@@ -218,6 +218,10 @@ fn the_token_is_32_hex_digits_and_two_fresh_ones_differ() {
         assert_eq!(Token::parse(&text).as_ref(), Some(token));
     }
     assert_eq!(token().hex(), TOKEN);
+    // Upper-case digits are the same token, and are written in lower case.
+    let upper = Token::parse(&TOKEN.to_uppercase()).expect("hex digits of either case");
+    assert_eq!(upper, token());
+    assert_eq!(upper.hex(), TOKEN);
     for refused in [
         "",
         "0123456789abcdef",
@@ -237,7 +241,6 @@ fn token_of_reads_the_token_the_xml_carries() {
         TaskXml::token_of(&built(&spec).to_xml(true, &token()), ID).unwrap(),
         Some(token())
     );
-    // As Task Scheduler reads it back.
     assert_eq!(
         TaskXml::token_of(&readback(&spec, &host(), DAILY_AT_0330), ID).unwrap(),
         Some(token())
@@ -245,9 +248,8 @@ fn token_of_reads_the_token_the_xml_carries() {
     assert!(TaskXml::token_of("<Task><Actions>", ID).is_err());
 }
 
-/// One read of the stored XML says what its three single readers say.
 #[skuld::test]
-fn stored_reads_the_principal_the_armed_state_and_the_token_at_once() {
+fn stored_agrees_with_principal_armed_and_token_of() {
     let spec = spec();
     for armed in [true, false] {
         let xml = built(&spec).to_xml(armed, &token());
@@ -267,6 +269,24 @@ fn stored_reads_the_principal_the_armed_state_and_the_token_at_once() {
 fn token_of_reads_only_an_ending_that_names_the_task() {
     let xml = readback(&spec(), &host(), DAILY_AT_0330);
     assert_eq!(TaskXml::token_of(&xml, "other").unwrap(), None);
+}
+
+#[skuld::test]
+fn an_ending_is_the_flag_an_id_and_at_most_a_token_at_the_end() {
+    let ending = |args: &[&str]| ending(args).map(|(id, token)| (id.to_owned(), token));
+    let named = |id: &str, token: Option<Token>| Some((id.to_owned(), token));
+    assert_eq!(ending(&[TASK_MODE_ARG, ID, TOKEN]), named(ID, Some(token())));
+    assert_eq!(ending(&["--host", TASK_MODE_ARG, ID, TOKEN]), named(ID, Some(token())));
+    // No token, or one that is none, still ends the task's own way.
+    assert_eq!(ending(&[TASK_MODE_ARG, ID]), named(ID, None));
+    assert_eq!(ending(&["--host", TASK_MODE_ARG, ID]), named(ID, None));
+    assert_eq!(ending(&[TASK_MODE_ARG, ID, "0123"]), named(ID, None));
+    // Anything else is no ending.
+    assert_eq!(ending(&[]), None);
+    assert_eq!(ending(&[ID]), None);
+    assert_eq!(ending(&[TASK_MODE_ARG]), None);
+    assert_eq!(ending(&["--other", ID, TOKEN]), None);
+    assert_eq!(ending(&[TASK_MODE_ARG, ID, TOKEN, "extra"]), None);
 }
 
 #[skuld::test]
@@ -904,8 +924,7 @@ fn arming_and_disarming_both_set_the_tasks_own_flag() {
     );
 }
 
-/// The three edits that disarm and arm the stored XML change the triggers and the own flag, never the
-/// action: its arguments, the registration's token included, are the stored ones.
+/// Disarm and arm edit the triggers and the own flag, never the action (its token included).
 #[skuld::test]
 fn disabling_and_enabling_leave_the_token_unchanged() {
     let spec = spec();
