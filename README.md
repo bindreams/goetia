@@ -658,8 +658,8 @@ What holds on every platform:
   runs are not offered. On Windows two runs can still be alive at once, by two
   routes: for a task whose account logs on with a password, a start can be
   accepted before the previous run's process has exited (measured up to about
-  20 ms; slower exits can widen it); and a run started outside goetia, from Task
-  Scheduler or with `RunEx` ignoring constraints, can overlap a goetia run for
+  20 ms; slower exits can widen it); and a run started outside goetia with
+  `RunEx` ignoring constraints (`schtasks /run /I`) can overlap a goetia run for
   any account. `status` shows one pid, and `stop`, `kill` and `uninstall` act on
   every run alive.
 - **Catch-up is always on**, with no field to turn it off: a run missed while
@@ -811,19 +811,20 @@ shell, not systemd's `203/EXEC`.
 `status` and `list` report a task with the fields of
 [the `--json` document](#the-document).
 `state` is `running` while a run is in flight and `idle` between runs; `pid` is
-the run's process (on Windows, the task's shim host: `goetia-shim.exe` where an
-installer places it, `goetia-shim-<hex>.exe` with `EmbeddedStockShim`, the
-program itself where it calls `goetia::shim::main()`, or whatever a custom
-`ShimProvider` supplies). `enabled` is whether the schedule is armed.
+the run's process (on Windows, the task's shim host:
+`%ProgramFiles%\Goetia\goetia-shim-<hex>.exe` for the `goetia` CLI and
+`EmbeddedStockShim`, `goetia-shim.exe` where an installer places it for
+`StandaloneShim`, the program itself where it calls `goetia::shim::main()`, or
+whatever a custom `ShimProvider` supplies). `enabled` is whether the schedule is armed.
 `last-result` is how the most recent finished
 run ended, `last-run` when it started and `next-run` when the schedule starts
 the next one. A task that has never run is `idle` with `last-result` and
-`last-run` `null`, and `status` still exits `0`. Its `next-run` is `null`
-exactly where nothing will start a run: the task is disabled or has no
-`schedule`; its schedule never fires (`0 0 30 2 *`); or it is enabled but its
-timer is not loaded or not active (launchd after an interrupted `enable` or
-`install`, systemd with the timer stopped by hand). Otherwise an enabled task
-has its next run before it has had a first.
+`last-run` `null`, and `status` still exits `0`. Its `next-run` is `null` where
+the schedule is not armed: the task is disabled or has no `schedule`, its
+schedule never fires (`0 0 30 2 *`), or an `enable` or `install` was
+interrupted before the schedule was armed again (launchd). Otherwise an enabled
+task has its next run before it has had a first. A task's timer or triggers
+changed by hand outside goetia may read otherwise.
 
 The three differ by platform where a run is in flight, or the manager failed
 a run before it exited:
@@ -881,8 +882,11 @@ with the request standing.
 - **launchd:** `stop` sends `SIGTERM` only, and waits (bounded by `--timeout`).
   A task that ignores it keeps running; `kill` ends it: it reads the run's pid
   from launchd, holds that process, confirms with `launchctl procinfo` that
-  it is the job's, and sends `SIGKILL` to the held process. Only `stop` and
-  `run` signal by label (`run` resumes its held launch with `SIGCONT`). goetia never boots the job out for either. A `stop` under any budget,
+  it is the job's, and sends `SIGKILL` to the held process. goetia boots the
+  job out for neither `stop` nor `kill`. Only `stop` and `run` signal by label:
+  `run` sends `SIGCONT` to the launch that took its hold, its own or a
+  scheduled one that took the hold of an earlier interrupted `run`, and follows
+  that launch. A `stop` under any budget,
   `--timeout 0` included, first waits for a start launchd has accepted to
   begin, so that it can end it, and it also ends a run that begins while it
   stops.
@@ -1263,8 +1267,8 @@ as it was.
 - systemd and SCM: a changed task takes effect at its next run, and the one in
   flight is not touched.
 - launchd updates an idle task, which launchd holds loaded without a process:
-  it boots the timer out where the timer renders differently, the job is
-  booted out, or the timer is stray, writes the plists, and, if the task was
+  it boots the timer out where the timer renders differently, the schedule is
+  dropped, the job is booted out, or the timer is stray, writes the plists, and, if the task was
   enabled, loads the job and then the timer again, so the schedule stays armed.
   It refuses only when the job's rendering, apart from goetia's metadata
   comment, changes, the job is loaded and a run is in flight (exit `1`, naming
