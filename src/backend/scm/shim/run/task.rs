@@ -150,11 +150,14 @@ fn record_run(
     outcome: Option<RunOutcome>,
 ) {
     if let (Some(runs), Some(instance), Some(outcome)) = (runs, instance, outcome) {
-        match runs.write(&RunRecord {
-            instance,
-            started,
-            outcome,
-        }) {
+        match runs.write(
+            &RunRecord {
+                instance,
+                started,
+                outcome,
+            },
+            None,
+        ) {
             Ok(problems) => {
                 for problem in problems {
                     log.warning(id, &format!("prune the run records: {problem}"));

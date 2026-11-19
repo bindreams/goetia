@@ -203,6 +203,25 @@ impl Entry {
     }
 }
 
+/// How [`Runs::close`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Closed {
+    /// The marker stands.
+    Placed,
+    /// `runs` is gone, so no marker was placed: there are no records.
+    NoRecords,
+}
+
+/// Whether a pin looks for the removal's marker once it is made ([`Runs::hold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkerCheck {
+    /// A marker that stands refuses the pin: the shim's, a `run`'s, a stop's.
+    Refuse,
+    /// The pin is made whatever stands: the holder placed the marker itself.
+    #[cfg_attr(not(test), allow(dead_code))] // the uninstall's own pin is its one caller, in a later change
+    Ignore,
+}
+
 /// What a [`Runs::remove_all`] pause waits for, for the note it makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PauseKind {
@@ -266,10 +285,36 @@ impl Runs {
             }
             made => made,
         }?;
-        // A marker another program holds is an error as any: the install that calls this is run again.
+        self.reopen()
+    }
+
+    /// Places the removal's marker, beside the directory: from then on no pin is accepted
+    /// ([`Runs::hold`]) and the pins that exist are final. Placing it again changes nothing. With `runs` gone
+    /// nothing is placed ([`Closed::NoRecords`]): there are no records to protect.
+    pub(crate) fn close(&self) -> Result<Closed> {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.marker)
+        {
+            Ok(_) => Ok(Closed::Placed),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Closed::NoRecords),
+            Err(e) => Err(Error::os_at("place the removal's marker", &self.marker, e)),
+        }
+    }
+
+    /// Takes the removal's marker away; one that is not there is `Ok`. A marker another program holds is an
+    /// error as any: the install that calls this is run again.
+    pub(crate) fn reopen(&self) -> io::Result<()> {
         self.delete_marker()
             .into_result()
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", self.marker.display())))
+    }
+
+    /// Whether the removal's marker stands: what a pin looks for after it is made ([`Runs::hold`]).
+    pub(crate) fn is_closed(&self) -> io::Result<bool> {
+        self.marker.try_exists()
     }
 
     /// Writes the record of a run, replacing one of the same instance, then prunes. The record is
@@ -277,7 +322,11 @@ impl Runs {
     /// What the prune could not do, and a failure of its own (not a file that is gone or held), is
     /// returned as one line each for the caller to log: it never fails the write. A directory that is a
     /// link is refused ([`Runs::ensure`]), and nothing is written.
-    pub(crate) fn write(&self, record: &RunRecord) -> io::Result<Vec<String>> {
+    ///
+    /// `own` is the writer's own pin ([`Runs::hold`]): it is held until the record is renamed into place and
+    /// released before the prune, which a held pin would stop, so the writer's own pin never blocks its own
+    /// prune. A write that fails releases it too.
+    pub(crate) fn write(&self, record: &RunRecord, own: Option<Pin>) -> io::Result<Vec<String>> {
         let dir = Dir::open(&self.dir)?;
         let name = record.instance.hex();
         let temp = OsString::from(format!("{name}{TEMP}"));
@@ -293,6 +342,7 @@ impl Runs {
             .and_then(|()| file.sync_all())
             .and_then(|()| files::rename_over(&dir, &file, &record_name(&record.instance)));
         drop(file);
+        drop(own);
         if let Err(e) = landed {
             // Best effort: a temp that stays is pruned by a later write.
             let _ = files::delete(&dir, &temp);
@@ -313,7 +363,7 @@ impl Runs {
     /// Takes a pin, then lists the records there are. Do it before asking for the run whose record
     /// is waited for: whatever [`Pin::appeared`] lists is then newer than the pin.
     pub(crate) fn pin(&self) -> io::Result<Pin> {
-        let mut pin = self.hold_in(Dir::open(&self.dir)?)?;
+        let mut pin = self.hold_in(Dir::open(&self.dir)?, MarkerCheck::Refuse)?;
         let listing = entries(&pin.dir)?
             .into_iter()
             .filter_map(|entry| match entry {
@@ -340,10 +390,12 @@ impl Runs {
     /// error that says the records are being removed. It is not [`io::ErrorKind::NotFound`], which a
     /// directory already removed gives and which a caller may take as "no records".
     pub(crate) fn hold(&self) -> io::Result<Pin> {
-        self.hold_in(Dir::open(&self.dir)?)
+        self.hold_in(Dir::open(&self.dir)?, MarkerCheck::Refuse)
     }
 
-    fn hold_in(&self, dir: Dir) -> io::Result<Pin> {
+    /// [`Runs::hold`] in `dir`, which was opened for the pin's life; the marker is looked for as `check`
+    /// says. A holder that placed the marker itself ([`Runs::close`]) takes its own pin past it.
+    fn hold_in(&self, dir: Dir, check: MarkerCheck) -> io::Result<Pin> {
         let mut names = Builder::new();
         names.prefix("pin-").suffix(PIN).disable_cleanup(true);
         let made = names.make_in(&self.dir, |path| {
@@ -351,7 +403,10 @@ impl Runs {
         });
         // Looked for when the pin was not made as well: a removal deleting the directory fails the create,
         // and that is no "no records".
-        let removing = self.marker.try_exists();
+        let removing = match check {
+            MarkerCheck::Refuse => self.is_closed(),
+            MarkerCheck::Ignore => Ok(false),
+        };
         if matches!(removing, Ok(true)) {
             return Err(io::Error::new(
                 io::ErrorKind::ResourceBusy,
@@ -405,17 +460,9 @@ impl Runs {
     /// action. The removal does not tell a delete that is pending from a refusal: it fails, naming the
     /// path and the error Windows gave, and a re-run finishes once the program has let go.
     pub(crate) fn remove_all(&self, mut waiting: impl FnMut(&Path, PauseKind)) -> Result<()> {
-        // The marker first, then the pins: see [`Runs::hold`].
-        match fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.marker)
-        {
-            Ok(_) => {}
-            // `runs` is gone: so is everything in it.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::os_at("place the removal's marker", &self.marker, e)),
+        // The marker first, then the pins: see [`Runs::hold`]. With `runs` gone so is everything in it.
+        if self.close()? == Closed::NoRecords {
+            return Ok(());
         }
         let mut said = Said::Nothing;
         loop {
