@@ -1,6 +1,6 @@
-//! Removing a task: disable it so that nothing starts another run, stop every run, delete the task and its
-//! run records, and sweep the shim file nothing references any more. None of it needs the account's
-//! password.
+//! Removing a task: disable it so that nothing starts another run, close its run records to any new shim,
+//! stop every run, delete the task and then its run records, and sweep the shim file nothing references
+//! any more. None of it needs the account's password.
 //!
 //! A re-run finishes what a failure left. The steps run in an order whose every prefix is a state the
 //! next `uninstall` reads and completes: a task that is registered and disabled, a task that is gone
@@ -9,13 +9,13 @@
 use std::path::{Path, PathBuf};
 
 use super::api::Registered;
-use super::verbs::{Processes, System, gone};
+use super::verbs::{Processes, System, gone, pin_records};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::InstalledService;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::kill::HoldOutcome;
 use crate::backend::scm::manager::{Scm, Uninstalled, shim_exe};
-use crate::backend::scm::runs::{PauseKind, Runs};
+use crate::backend::scm::runs::{MarkerCheck, PauseKind, Runs};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
 use crate::error::{Error, Result};
@@ -177,7 +177,13 @@ impl Scm {
             Err(e) => return Err(uninstall_failed(id, Left::Unknown, e)),
         }
 
-        self.task_stop_with("uninstall", id, Budget::Unbounded, runs, None, processes)
+        // The marker, then the own pin past it: a shim that checks the marker after this sees it, and one
+        // that checked before is listed by the stop's first read, which comes after (design section 4).
+        runs.close().map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
+        let pin = pin_records("uninstall", id, runs, MarkerCheck::Ignore)
+            .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
+        // The pin is released when the stop returns, so the delete is made with none of the uninstall's own.
+        self.task_stop_with("uninstall", id, Budget::Unbounded, runs, pin, processes)
             .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
 
         match self.tasks.delete(&path) {

@@ -7,15 +7,14 @@ use std::time::Duration;
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
 use super::super::support::{
-    Machine, PATH, id, instance, instance_id, linked_records, pins_in, record, records, scm, shim_writes,
-    snapshot_of,
+    Machine, PATH, id, instance, instance_id, linked_records, pins_in, record, records, scm, shim_writes, snapshot_of,
 };
 use super::*;
-use crate::backend::scm::runs::MarkerCheck;
 use crate::backend::Backend;
 use crate::backend::scm::manager::WindowsSnapshot;
 use crate::backend::scm::manager::task::api::Started;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
+use crate::backend::scm::runs::MarkerCheck;
 use crate::backend::scm::runs::RunOutcome;
 use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::sid::try_sid_display;
@@ -447,7 +446,11 @@ fn stop_with_the_callers_pin_takes_none_of_its_own() {
         .task_stop_with("uninstall", &id(), Budget::Unbounded, &runs, Some(pin), &mut machine)
         .unwrap();
 
-    assert_eq!(*seen.lock().unwrap(), [1], "the caller's pin, and no other, while the run ended");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [1],
+        "the caller's pin, and no other, while the run ended"
+    );
     assert_eq!(pins_in(&path), 0, "the caller's pin is released when the stop returns");
     fake.finish();
 }
