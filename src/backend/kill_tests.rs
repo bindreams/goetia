@@ -35,6 +35,9 @@ struct Scripted {
     failing_reads: Vec<usize>,
     /// The OS error code the failed reads carry, if they carry one.
     read_os_error: Option<i32>,
+    /// The goetia error the first failed read carries, passed through an `io::Error` as a manager's
+    /// target does.
+    read_carrying: Option<Error>,
     reads: usize,
     failing_terminate: bool,
     failing_exit: bool,
@@ -59,6 +62,7 @@ impl Scripted {
             opens: opens.into(),
             failing_reads: Vec::new(),
             read_os_error: None,
+            read_carrying: None,
             reads: 0,
             failing_terminate: false,
             failing_exit: false,
@@ -80,6 +84,12 @@ impl Scripted {
     /// The failed reads carry an OS error of this code.
     fn reading_fails_with_os_error(mut self, code: i32) -> Self {
         self.read_os_error = Some(code);
+        self
+    }
+
+    /// The failed read carries this goetia error.
+    fn reading_fails_carrying(mut self, error: Error) -> Self {
+        self.read_carrying = Some(error);
         self
     }
 
@@ -145,6 +155,9 @@ impl KillTarget for Scripted {
         self.log.borrow_mut().push("service_pid".to_string());
         self.reads += 1;
         if self.failing_reads.contains(&self.reads) {
+            if let Some(error) = self.read_carrying.take() {
+                return Err(io::Error::other(error));
+            }
             return Err(match self.read_os_error {
                 Some(code) => io::Error::from_raw_os_error(code),
                 None => io::Error::new(READ_FAILED_KIND, "manager read failed"),
@@ -602,6 +615,25 @@ fn a_failed_read_after_a_refused_open_keeps_the_kills_context() {
             "failed to kill `{ID}`: manager read failed (after the service's process could not be opened: access denied)"
         )
     );
+}
+
+/// A read that failed with a goetia error that left the outcome open keeps that classification when a
+/// refused open is told after it: the CLI exits `4`, not `1`.
+#[skuld::test]
+fn a_failed_read_after_a_refused_open_keeps_what_the_read_carries() {
+    let read = Error::Undetermined {
+        id: ID.to_string(),
+        reason: Box::new(Error::os("read", io::Error::other("manager read failed"))),
+        recovery: "re-run".to_string(),
+    };
+    let mut target = Scripted::new([Some(100)], [Open::Fails])
+        .failing_read(2)
+        .reading_fails_carrying(read);
+
+    let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
+
+    assert!(failed.is_indeterminate(), "{failed:?}");
+    assert!(matches!(failed.cause(), Error::Undetermined { .. }), "{failed:?}");
 }
 
 /// An error of goetia's that the refused open carries is written in full, as the report writes any:

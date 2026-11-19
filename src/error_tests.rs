@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use std::error::Error as _;
 
-use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
+use super::{BoxError, Error, Occupant, PutBackFound, SharedError, VersionReading};
 use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
 use crate::spec::DaemonKind;
 
@@ -1459,6 +1459,34 @@ fn the_os_error_inside_any_payload_of_an_io_error_is_found() {
         Error::os("read", std::io::Error::other(Payload(std::io::Error::other("x")))).raw_os_error(),
         None
     );
+}
+
+/// A source held as an `Arc<dyn Error>` (what `Blob` and `Invalid` keep) is no obstacle to the search: the
+/// code under it is found, whether the shared error is the `io::Error` or carries one.
+#[skuld::test]
+fn the_os_error_under_a_shared_source_is_found() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("a payload")]
+    struct Payload(#[source] std::io::Error);
+
+    let shared = |e: Payload| -> SharedError { Arc::new(e) };
+    let code = || std::io::Error::from_raw_os_error(8);
+    let blob = |source: SharedError| Error::Blob {
+        message: "m".to_string(),
+        source: Some(source),
+    };
+    let invalid = |source: SharedError| Error::Invalid {
+        daemon: "d".to_string(),
+        message: "m".to_string(),
+        source: Some(source),
+    };
+
+    assert_eq!(blob(Arc::new(code())).raw_os_error(), Some(8));
+    assert_eq!(invalid(Arc::new(code())).raw_os_error(), Some(8));
+    assert_eq!(blob(shared(Payload(code()))).raw_os_error(), Some(8));
+    assert_eq!(invalid(shared(Payload(code()))).raw_os_error(), Some(8));
+    assert_eq!(Error::blob_from("m", code()).raw_os_error(), Some(8));
+    assert_eq!(Error::os("read", shared(Payload(code()))).raw_os_error(), Some(8));
 }
 
 /// The search looks at an error, then at its `source()` chain, then at the errors its own text
