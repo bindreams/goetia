@@ -106,8 +106,8 @@ pub(crate) enum Step {
     Widen,
     /// Once it has, or where there is none: the log names the account the service now runs as.
     Narrow,
-    /// Once it has, after a step of the same install that made the log under a live run (starting or up): that log stays as
-    /// it is, naming the kept accounts too, until the next install narrows it.
+    /// Once it has, after a step of the same install that made the log under a live run (starting or up): that
+    /// log stays as it is, naming the kept accounts too, until the next install narrows it.
     Leave,
 }
 
