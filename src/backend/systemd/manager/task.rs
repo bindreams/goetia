@@ -244,7 +244,7 @@ impl Systemd {
             },
             || {
                 self.systemctl.require_supported(held)?;
-                self.systemctl.timer_arming(id, held)
+                self.systemctl.timer_arming(id)
             },
         )?;
 
@@ -507,7 +507,7 @@ impl Systemd {
         let (enabled, next_run) = match snapshot.timer() {
             None => (false, None),
             Some(_) => (
-                self.systemctl.timer_arming(id, &mut Held::default())?.enabled,
+                self.systemctl.timer_arming(id)?.enabled,
                 self.busctl.next_elapse(&unit_name(id, UnitKind::Timer))?,
             ),
         };

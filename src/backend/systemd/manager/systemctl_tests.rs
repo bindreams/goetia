@@ -564,7 +564,7 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
     assert!(matches!(e, Error::RequestInDoubt { reached: false, .. }), "{e:?}");
 }
 
-/// A `daemon-reload` in doubt after `install` wrote the unit stays in doubt — exit `4` — and says
+/// A `daemon-reload` in doubt after `install` wrote the unit stays in doubt, exit `4`, and says
 /// the unit was written; any other failure there is exit `1`, and says so too.
 #[skuld::test]
 fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
@@ -576,7 +576,7 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
         "{e:?}"
     );
     let msg = e.report().to_string();
-    assert!(msg.contains("wrote the unit for `x`"), "{msg}");
+    assert!(msg.contains("the unit file for `x` is on disk"), "{msg}");
     assert!(msg.contains("the wait failed"), "{msg}");
 
     let refused = gate_then([reply(&["daemon-reload"], exited(1, "", "Access denied\n"))]);
@@ -586,7 +586,7 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
     assert!(matches!(e, Error::Step { .. }), "{e:?}");
     assert!(!e.is_indeterminate(), "{e:?}");
     let msg = e.report().to_string();
-    assert!(msg.contains("wrote the unit for `x`"), "{msg}");
+    assert!(msg.contains("the unit file for `x` is on disk"), "{msg}");
     assert!(msg.contains("Access denied"), "{msg}");
 }
 
@@ -805,7 +805,7 @@ fn every_path() -> Vec<Way> {
         Way {
             name: "show stamp".to_string(),
             gated: false,
-            run: Box::new(|s: &Systemctl| s.timer_stamp("x", &mut Held::default()).map(drop)),
+            run: Box::new(|s: &Systemctl| s.timer_stamp("x").map(drop)),
         },
         Way::request("start job", |s: &Systemctl| {
             s.start_job("x", &mut Held::default()).map(drop)
@@ -818,7 +818,7 @@ fn every_path() -> Vec<Way> {
         Way {
             name: "show timer arming".to_string(),
             gated: false,
-            run: Box::new(|s: &Systemctl| s.timer_arming("x", &mut Held::default()).map(drop)),
+            run: Box::new(|s: &Systemctl| s.timer_arming("x").map(drop)),
         },
     ];
     for budget in [
@@ -1021,7 +1021,7 @@ fn a_show_answer_without_every_property_is_not_a_state() {
 fn a_unit_systemd_has_not_loaded_is_not_a_state() {
     for (active, unit_file) in [("inactive", ""), ("active", "enabled")] {
         let answer = format!("ActiveState={active}\nMainPID=0\nUnitFileState={unit_file}\nLoadState=not-found\n");
-        let msg = on_booted(not_loaded_then_reloaded(&answer, &answer))
+        let msg = showing(&answer)
             .status_from_unit("x.service")
             .expect_err(&answer)
             .to_string();
@@ -1211,7 +1211,7 @@ fn a_timer_s_stamp_is_cleared_when_it_is_settled_and_can_be_cleaned_of_state() {
     ] {
         let answer = format!("CanClean={can_clean}\nActiveState={active}\nLoadState=loaded\n");
         assert_eq!(
-            showing(&answer).timer_stamp("x", &mut Held::default()).expect(&answer),
+            showing(&answer).timer_stamp("x").expect(&answer),
             expected,
             "{can_clean:?} {active:?}"
         );
@@ -1223,13 +1223,15 @@ fn a_timer_s_stamp_is_cleared_when_it_is_settled_and_can_be_cleaned_of_state() {
 fn a_timer_in_a_state_arming_does_not_know_is_an_error_naming_it() {
     for active in ["activating", "deactivating", "maintenance", "reloading"] {
         let answer = format!("CanClean=state\nActiveState={active}\nLoadState=loaded\n");
-        let e = showing(&answer)
-            .timer_stamp("x", &mut Held::default())
-            .expect_err(&answer);
-        assert!(matches!(e, Error::IncompleteAnswer { .. }), "{e:?}");
-        let msg = e.report().to_string();
-        assert!(msg.contains(&format!("ActiveState={active}")), "{msg}");
-        assert!(msg.contains("x.timer"), "{msg}");
+        let msg = showing(&answer)
+            .timer_stamp("x")
+            .expect_err(&answer)
+            .report()
+            .to_string();
+        assert_eq!(
+            msg,
+            format!("failed to arm `x.timer`: found it in state `{active}`, which goetia has no rule for")
+        );
     }
 }
 
@@ -1237,9 +1239,7 @@ fn a_timer_in_a_state_arming_does_not_know_is_an_error_naming_it() {
 fn the_timer_is_asked_about_its_stamp_by_its_own_name_in_one_show() {
     let fake = Fake::new([timer_shows("state", "inactive")]);
 
-    on_booted(fake.clone())
-        .timer_stamp("x", &mut Held::default())
-        .expect("timer_stamp");
+    on_booted(fake.clone()).timer_stamp("x").expect("timer_stamp");
 
     assert_eq!(
         fake.calls(),
@@ -1436,103 +1436,80 @@ fn task_state_table() {
 #[skuld::test]
 fn a_task_job_systemd_has_not_loaded_is_not_a_state() {
     let answer = "ActiveState=inactive\nMainPID=0\nInvocationID=\nLoadState=not-found\n";
-    let e = on_booted(not_loaded_then_reloaded(answer, answer))
-        .task_state("x.service")
-        .expect_err(answer);
+    let e = showing(answer).task_state("x.service").expect_err(answer);
     assert!(matches!(e, Error::UnitNotLoaded { .. }), "{e:?}");
 }
 
-/// A `show` that finds a unit goetia wrote and systemd has not loaded, then the version gate a reload asks
-/// for itself, the reload, and the `show` again, answering `after`.
-fn not_loaded_then_reloaded(not_found: &str, after: &str) -> Fake {
-    let mut entries = vec![reply(&["show"], exited(0, not_found, ""))];
-    entries.extend(gate_passes());
-    entries.push(reply(&["daemon-reload"], exited(0, "", "")));
-    entries.push(reply(&["show"], exited(0, after, "")));
-    Fake::new(entries)
-}
-
-/// A unit file written and not reloaded reads `not-found` to every read of an installed unit: it is
-/// reloaded and asked about again, whichever read it was.
+/// A read is no request: of a unit systemd has not loaded it sends the one `show` and reloads nothing,
+/// so it needs no privilege and no gate.
 #[skuld::test]
-fn a_unit_written_and_not_reloaded_is_reloaded_by_every_read_of_it() {
+fn a_read_of_a_unit_systemd_has_not_loaded_sends_nothing_else() {
+    let answer = "ActiveState=inactive\nMainPID=0\nUnitFileState=\nInvocationID=\nLoadState=not-found\n";
     type Read = fn(&Systemctl) -> Result<()>;
-    let reads: [(&str, &str, Read); 4] = [
-        (
-            "status",
-            "ActiveState=active\nMainPID=42\nUnitFileState=enabled\nLoadState=",
-            |s| {
-                let status = s.status_from_unit("x.service")?;
-                assert_eq!(
-                    (status.state, status.pid, status.enabled),
-                    (State::Running, Some(42), true)
-                );
-                Ok(())
-            },
-        ),
-        (
-            "task",
-            "ActiveState=inactive\nMainPID=0\nInvocationID=\nLoadState=",
-            |s| {
-                assert_eq!(s.task_state("x.service")?.state, State::Idle);
-                Ok(())
-            },
-        ),
-        ("pid", "MainPID=42\nLoadState=", |s| {
-            assert_eq!(s.main_pid_of("x.service")?, Some(42));
-            Ok(())
-        }),
-        ("arming", "ActiveState=active\nUnitFileState=enabled\nLoadState=", |s| {
-            let arming = s.timer_arming("x", &mut Held::default())?;
-            assert_eq!((arming.active, arming.enabled), (true, true));
-            Ok(())
-        }),
+    let reads: [(&str, Read); 4] = [
+        ("status", |s| s.status_from_unit("x.service").map(drop)),
+        ("task", |s| s.task_state("x.service").map(drop)),
+        ("pid", |s| s.main_pid_of("x.service").map(drop)),
+        ("arming", |s| s.timer_arming("x").map(drop)),
     ];
-    for (name, answer, read) in reads {
-        let fake = not_loaded_then_reloaded(&format!("{answer}not-found\n"), &format!("{answer}loaded\n"));
-        read(&on_booted(fake.clone())).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        let verbs: Vec<_> = fake.calls().iter().map(|call| call[0].clone()).collect();
-        assert_eq!(verbs, ["show", "--version", "show", "daemon-reload", "show"], "{name}");
+    for (name, read) in reads {
+        let fake = Fake::new([reply(&["show"], exited(0, answer, ""))]);
+        let e = read(&on_booted(fake.clone())).expect_err(name);
+        assert!(matches!(e, Error::UnitNotLoaded { .. }), "{name}: {e:?}");
+        assert_eq!(fake.calls().len(), 1, "{name}");
     }
 }
 
-/// A unit systemd still cannot see after the reload is not loaded, as for any unit it cannot see.
+/// An install that finds the units up to date reloads once when systemd reads one of them not found, and
+/// only then: a unit it has loaded sends no request.
 #[skuld::test]
-fn a_unit_still_not_loaded_after_the_reload_is_not_loaded() {
-    let answer = "ActiveState=inactive\nMainPID=0\nUnitFileState=\nLoadState=not-found\n";
-    let fake = not_loaded_then_reloaded(answer, answer);
+fn an_up_to_date_install_reloads_when_a_unit_reads_not_found() {
+    let loaded = || reply(&["show"], exited(0, "LoadState=loaded\n", ""));
+    let not_found = || reply(&["show"], exited(0, "LoadState=not-found\n", ""));
+    let kinds = [UnitKind::Service, UnitKind::Timer];
 
-    let e = on_booted(fake.clone())
-        .status_from_unit("x.service")
-        .expect_err("not loaded");
+    let fake = Fake::new([loaded(), loaded()]);
+    on_booted(fake.clone())
+        .reload_if_unloaded("x", &kinds, &mut Held::default())
+        .expect("both loaded");
+    assert_eq!(fake.calls().len(), 2, "two shows, no request");
 
-    assert!(matches!(e, Error::UnitNotLoaded { .. }), "{e:?}");
-    assert_eq!(fake.calls().len(), 5, "show, the gate's two probes, reload, show");
+    let mut entries = vec![loaded(), not_found()];
+    entries.extend(gate_passes());
+    entries.push(reply(&["daemon-reload"], exited(0, "", "")));
+    let fake = Fake::new(entries);
+    on_booted(fake.clone())
+        .reload_if_unloaded("x", &kinds, &mut Held::default())
+        .expect("reloaded");
+    let verbs: Vec<_> = fake.calls().iter().map(|call| call[0].clone()).collect();
+    assert_eq!(verbs, ["show", "show", "--version", "show", "daemon-reload"]);
 }
 
-/// A reload that fails or is in doubt keeps its context: the read says the unit was written and what
-/// the reload said, and a reload in doubt stays in doubt.
+/// A reload that fails keeps its context: the unit file is on disk and not picked up, and a reload in
+/// doubt stays in doubt. The arm and the install that finds the files up to date say the same.
 #[skuld::test]
-fn a_reload_a_read_made_and_lost_keeps_its_context() {
-    let answer = "ActiveState=inactive\nMainPID=0\nUnitFileState=\nLoadState=not-found\n";
-    let mut entries = vec![reply(&["show"], exited(0, answer, ""))];
-    entries.extend(gate_passes());
-    entries.push(fail(&["daemon-reload"], lost(false)));
+fn a_reload_that_fails_after_a_not_found_keeps_its_context() {
+    let not_found = || {
+        reply(
+            &["show"],
+            exited(0, "CanClean=\nActiveState=inactive\nLoadState=not-found\n", ""),
+        )
+    };
 
-    let e = on_booted(Fake::new(entries))
-        .status_from_unit("x.service")
+    let e = on_booted(gate_then([not_found(), fail(&["daemon-reload"], lost(false))]))
+        .arm_timer("x", &mut Held::default())
         .expect_err("injected");
-
     assert!(matches!(&e, Error::RequestInDoubt { .. }), "{e:?}");
     let msg = e.report().to_string();
-    assert!(msg.contains("wrote the unit for `x.service`"), "{msg}");
+    assert!(msg.contains("the unit file for `x` is on disk"), "{msg}");
+    assert!(!msg.contains("wrote"), "{msg}");
 
-    let mut entries = vec![reply(&["show"], exited(0, answer, ""))];
-    entries.extend(gate_passes());
-    entries.push(reply(&["daemon-reload"], exited(1, "", "Access denied\n")));
-    let e = on_booted(Fake::new(entries))
-        .status_from_unit("x.service")
-        .expect_err("refused");
+    let e = on_booted(gate_then([
+        not_found(),
+        reply(&["daemon-reload"], exited(1, "", "Access denied\n")),
+    ]))
+    .arm_timer("x", &mut Held::default())
+    .expect_err("refused");
     assert!(matches!(e, Error::Step { .. }), "{e:?}");
     assert!(e.report().to_string().contains("Access denied"));
 }
@@ -1552,7 +1529,7 @@ fn a_timer_s_activity_and_its_link_are_read_apart() {
         ("inactive", "", (false, false)),
     ] {
         let answer = format!("ActiveState={active}\nUnitFileState={state}\nLoadState=loaded\n");
-        let arming = showing(&answer).timer_arming("x", &mut Held::default()).expect(&answer);
+        let arming = showing(&answer).timer_arming("x").expect(&answer);
         assert_eq!((arming.active, arming.enabled), expected, "{active:?} {state:?}");
     }
 }
@@ -1564,9 +1541,7 @@ fn the_timer_is_asked_about_by_its_own_name() {
         exited(0, "ActiveState=active\nUnitFileState=enabled\nLoadState=loaded\n", ""),
     )]);
 
-    on_booted(fake.clone())
-        .timer_arming("x", &mut Held::default())
-        .expect("timer_arming");
+    on_booted(fake.clone()).timer_arming("x").expect("timer_arming");
 
     assert_eq!(
         fake.calls(),

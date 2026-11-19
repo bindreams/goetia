@@ -204,7 +204,8 @@ pub enum Error {
     /// The manager does not know a unit goetia finds installed.
     #[error(
         "systemd has not loaded the unit file goetia finds installed for `{unit}` (`LoadState=not-found`), so what it \
-         reports is not that unit's state"
+         reports is not that unit's state. If goetia wrote the unit and its reload failed, `goetia daemon install \
+         <id>` (or `systemctl daemon-reload`) loads it"
     )]
     UnitNotLoaded { unit: String },
 

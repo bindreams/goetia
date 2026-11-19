@@ -2382,3 +2382,42 @@ fn a_service_status_is_read_from_its_unit_alone() {
         (State::Running, Some(5), true)
     );
 }
+
+/// An install that finds the units up to date asks systemd about each unit the definition holds (a
+/// timer only for a task that has one), and reloads once if any reads not found: a reinstall repairs a
+/// write whose reload failed.
+#[skuld::test]
+fn an_up_to_date_install_reloads_a_unit_systemd_has_not_loaded() {
+    let show = |load: &str| reply(&["show"], exited(0, &format!("LoadState={load}\n"), ""));
+    for (spec, shows) in [
+        (service_spec("x"), vec![show("not-found")]),
+        (
+            task_spec("x", "/bin/a", Some("30 3 * * *")),
+            vec![show("loaded"), show("not-found")],
+        ),
+    ] {
+        let mut entries = shows;
+        entries.extend(crate::backend::systemd::manager::systemctl::systemctl_tests::gate_passes());
+        entries.push(reply(&["daemon-reload"], exited(0, "", "")));
+        let systemctl = Fake::new(entries);
+
+        over(&systemctl)
+            .ensure_beside(&spec, &units_of(&spec), &fragment(&spec))
+            .expect("ensure_beside");
+
+        let verbs: Vec<_> = systemctl.calls().iter().map(|call| call[0].clone()).collect();
+        assert_eq!(verbs.last().map(String::as_str), Some("daemon-reload"), "{spec:?}");
+        assert_eq!(
+            verbs.iter().filter(|verb| *verb == "daemon-reload").count(),
+            1,
+            "{spec:?}"
+        );
+    }
+
+    let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
+    let systemctl = Fake::new([show("loaded"), show("loaded")]);
+    over(&systemctl)
+        .ensure_beside(&spec, &units_of(&spec), &fragment(&spec))
+        .expect("ensure_beside");
+    assert_eq!(systemctl.calls().len(), 2, "two shows and no request");
+}

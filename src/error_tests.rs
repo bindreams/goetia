@@ -773,7 +773,8 @@ fn report_of_a_unit_the_manager_has_not_loaded() {
         .report()
         .to_string(),
         "systemd has not loaded the unit file goetia finds installed for `x.service` (`LoadState=not-found`), so what \
-         it reports is not that unit's state"
+         it reports is not that unit's state. If goetia wrote the unit and its reload failed, `goetia daemon install \
+         <id>` (or `systemctl daemon-reload`) loads it"
     );
 }
 
