@@ -1,9 +1,6 @@
 //! Reading a task's XML as Task Scheduler stores it: the definition ([`TaskXml::parse`]), the armed
-//! state, which is whether it has a trigger that is switched on ([`TaskXml::armed`]), and the three
-//! edits of the stored XML that arm and disarm it:
-//! - `disable` registers [`TaskXml::without_triggers`];
-//! - `enable` of a task with no trigger switched on registers [`TaskXml::with_triggers`] (the blob's schedule);
-//! - `enable` of a task whose stored triggers are on registers [`TaskXml::with_own_flag`], keeping them.
+//! state, which is whether it has a trigger that is switched on ([`TaskXml::armed`]), and the edits of
+//! the stored XML that arm and disarm it.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -66,7 +63,6 @@ impl TaskXml {
         let mut unrecognised = Vec::new();
         let stored: Vec<Node<'_, '_>> = child(root, "Triggers").into_iter().flat_map(elements).collect();
         let triggers = if stored.is_empty() {
-            // A disarmed task has none: it reads as what arming it would write.
             triggers_of(&blob.spec)?
         } else {
             let mut read = Vec::new();
@@ -125,9 +121,9 @@ impl TaskXml {
             .collect())
     }
 
-    /// Whether the task `xml` describes has a trigger that is switched on and is itself enabled
-    /// (`Settings/Enabled`, which Task Scheduler leaves out while it is true): a task that is not
-    /// enabled is started by nothing, and one with no live trigger has nothing to start it. XML that cannot be read is not armed.
+    /// Whether `xml` has a trigger whose own flag is true or absent and the task is itself enabled
+    /// (`Settings/Enabled`, which Task Scheduler leaves out while it is true). XML that cannot be read is
+    /// not armed.
     pub(crate) fn armed(xml: &str) -> bool {
         let Ok(document) = document(xml) else {
             return false;
@@ -191,10 +187,8 @@ impl TaskXml {
     }
 }
 
-/// The edit that sets the task's own flag to `value` where the XML states it, and for `false` where it
-/// does not (a flag that is not stated is true): first among the `Settings`, whose order is free. None
-/// for a true flag that is not stated. A `Settings` that is empty is written with the flag in it, and one
-/// that is missing is written before `Actions`, as a trigger is.
+/// The edit that sets the task's own flag to `value`: first among the `Settings`. None for a true flag
+/// that is not stated (that is the default).
 fn own_flag_edit(document: &Document<'_>, value: bool) -> Result<Vec<(Range<usize>, String)>, Error> {
     let settings = child(document.root_element(), "Settings");
     if let Some(flag) = settings.and_then(|settings| child(settings, "Enabled")) {

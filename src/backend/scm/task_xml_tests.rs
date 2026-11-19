@@ -884,8 +884,7 @@ const HAND_ADDED: &str = r#"<Triggers>
     <BootTrigger />
   </Triggers>"#;
 
-/// Triggers goetia does not write are armed triggers and drift; `disable` takes them out with the rest, and
-/// the next `enable` writes the spec's own.
+/// Triggers goetia does not write are armed triggers and drift; `disable` takes them out with the rest.
 #[skuld::test]
 fn a_hand_added_trigger_is_armed_and_drift_until_a_disable() {
     let spec = spec();

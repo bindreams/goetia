@@ -418,6 +418,14 @@ fn a_hand_added_trigger_taken_out_by_without_triggers_updates_and_reads_back_dis
             "{trigger}: reads back disarmed: {}",
             read.xml
         );
+
+        // The empty `<Triggers />` a removal leaves is filled in place.
+        let spec = crate::testing::task("goetia-com-logon", vec!["ping.exe".to_owned()], Some("*/5 * * * *"));
+        let rearmed = TaskXml::with_triggers(&read.xml, &spec).unwrap();
+        Com.register(&path, &rearmed, &system(), None, true)
+            .unwrap_or_else(|e| panic!("{trigger}: re-armed as {rearmed}: {}", e.report()));
+        let again = Com.get(&path).unwrap().expect("the task is registered");
+        assert!(TaskXml::armed(&again.xml), "{trigger}: reads back armed: {}", again.xml);
         assert!(Com.delete(&path).unwrap());
     }
 }
@@ -474,5 +482,44 @@ fn a_query_of_a_missing_task_is_not_installed(#[fixture(scm_group)] _group: &Gro
         Com.run(&path).map(drop),
     ] {
         assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
+    }
+}
+
+/// `task_run_times` of a disarmed task leaves the stored XML as it found it, and a task with no schedule has
+/// no run times and is not written at all.
+#[skuld::test]
+fn the_run_times_of_a_disarmed_task_restore_its_stored_xml(#[fixture(scm_group)] _group: &Group) {
+    use crate::backend::scm::task_xml::TaskXml;
+    use crate::spec::DaemonSpec;
+    use std::time::{Duration, SystemTime};
+
+    let _lock = InstallLock::acquire().unwrap();
+    let (_guard, path) = TaskGuard::new("goetia-com-run-times");
+    let host = crate::shim::HostCommand {
+        exe: "ping.exe".into(),
+        args: Vec::new(),
+    };
+    let (from, to) = (SystemTime::now(), SystemTime::now() + Duration::from_secs(3 * 3600));
+
+    for (schedule, listed) in [(Some("*/5 * * * *"), true), (None, false)] {
+        let spec: DaemonSpec = crate::testing::task("goetia-com-run-times", vec!["x".to_owned()], schedule);
+        let text = TaskXml::new(&spec, host.clone()).unwrap().to_xml(false);
+        Com.register(&path, &text, &system(), None, false)
+            .unwrap_or_else(|e| panic!("{schedule:?}: {}", e.report()));
+        let before = Com.get(&path).unwrap().expect("the task is registered");
+        assert!(!TaskXml::has_triggers(&before.xml), "{schedule:?}: {}", before.xml);
+
+        let times = crate::testing::task_run_times(&Id::try_from("goetia-com-run-times").unwrap(), from, to)
+            .unwrap_or_else(|e| panic!("{schedule:?}: {}", e.report()));
+        assert_eq!(!times.is_empty(), listed, "{schedule:?}: {times:?}");
+
+        let after = Com.get(&path).unwrap().expect("the task is registered");
+        assert!(!TaskXml::has_triggers(&after.xml), "{schedule:?}: {}", after.xml);
+        assert_eq!(
+            TaskXml::parse(&after.xml, &after.data).unwrap().to_string(),
+            TaskXml::parse(&before.xml, &before.data).unwrap().to_string(),
+            "{schedule:?}: the stored definition is as it was"
+        );
+        assert!(Com.delete(&path).unwrap());
     }
 }

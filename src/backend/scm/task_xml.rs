@@ -15,10 +15,10 @@
 //! A disarmed task has none: disabling a trigger would leave a repetition in progress firing, and
 //! removing the triggers stops it. So [`TaskXml::to_xml`] writes the triggers only for an armed task, and
 //! what is read back of a task with none is the definition it would arm: the triggers its blob's
-//! schedule compiles to. Three edits of the stored XML change the state:
-//! - `disable` uses [`TaskXml::without_triggers`];
-//! - `enable` of a task with no trigger switched on uses [`TaskXml::with_triggers`];
-//! - `enable` of a task whose stored triggers are on uses [`TaskXml::with_own_flag`], which keeps them.
+//! schedule compiles to. The edits of the stored XML:
+//! - `disable`: [`TaskXml::without_triggers`];
+//! - `enable`, no trigger on: [`TaskXml::with_triggers`];
+//! - `enable`, a trigger on: [`TaskXml::with_own_flag`].
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -354,7 +354,7 @@ fn refuse_percent(id: &Id, host: &HostCommand) -> Result<(), Error> {
 // The triggers --------------------------------------------------------------------------------------------------------
 
 /// The triggers `spec`'s schedule compiles to: none for a task with no schedule.
-pub(super) fn triggers_of(spec: &DaemonSpec) -> Result<Vec<Trigger>, Error> {
+pub(crate) fn triggers_of(spec: &DaemonSpec) -> Result<Vec<Trigger>, Error> {
     let DaemonSpec::Task(task) = spec else {
         return Err(Error::blob(format!(
             "`{}` is a service, not a task, so it has no triggers",

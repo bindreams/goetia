@@ -91,12 +91,10 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
     mgr.uninstall(id).expect("uninstall");
 }
 
-/// `disable` stops a repetition that is in progress: a disabled `* * * * *` starts nothing at the boundaries
-/// that follow. Read in the stored state, with no window in which no run came: a second task, armed alike,
-/// starts at every boundary, so its last run reaching `B1 + 60 s` (`B1` the first boundary after `disable`)
-/// is Task Scheduler's own sign that `B1` has passed, where the bug would have started the disabled task.
-/// Its last run, if any, is earlier than `B1 - 1 s`: that allows a start dispatched at or before `disable`,
-/// and a `LastRunTime` that precedes its boundary by milliseconds. `enable` then starts it again.
+/// `disable` stops a repetition in progress: a disabled `* * * * *` task starts nothing at later boundaries.
+/// A control task armed alike marks when boundary B1 (the first after the clock read before `disable`) has
+/// passed; the disabled task's last run must predate B1 - 1 s (tolerating a start dispatched before
+/// `disable` and millisecond skew). `enable` then starts it again.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixture(scm_group)] _group: &Group) {
     let (subject, control) = (TaskGuard::new(), TaskGuard::new());
@@ -114,11 +112,11 @@ fn a_disabled_minutely_task_starts_nothing_at_the_boundaries_that_follow(#[fixtu
     subject_listener.accept_unbounded();
     control_listener.accept_unbounded();
 
+    let before_disable = SystemTime::now();
     mgr.disable(&subject.id).expect("disable");
-    let disabled_at = SystemTime::now();
 
     let minute = Duration::from_secs(60);
-    let epoch_secs = disabled_at
+    let epoch_secs = before_disable
         .duration_since(UNIX_EPOCH)
         .expect("after the epoch")
         .as_secs();

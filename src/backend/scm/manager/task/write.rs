@@ -8,8 +8,8 @@
 //! A task is armed when it has triggers; an install makes it disarmed and keeps what is installed. `disable`
 //! registers the stored XML with no `Triggers`, and `enable` the stored XML as it is when it has triggers,
 //! and with the ones the blob's schedule compiles to when it has none; everything outside `<Triggers>` is
-//! the stored XML's, so a hand edit of it survives, and a hand-added trigger goes at `disable`, as it
-//! does at the next install. Re-registering a task that logs on with a
+//! the stored XML's, so a hand edit of it survives, and a hand-added trigger goes at `disable`.
+//! Re-registering a task that logs on with a
 //! password takes the password (M3): `enable` and `disable` of a real user's task read
 //! `GOETIA_SERVICE_PASSWORD` as an install does.
 
@@ -83,7 +83,7 @@ pub(super) fn password_of(
     }
 }
 
-/// The password a registration of a task that runs as `account` needs, read as `enable` and `disable` read it.
+/// As above, for the test helper.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn registration_password(account: &TaskAccount) -> Result<Option<String>> {
     password_of(account, identity::service_password)
@@ -474,10 +474,10 @@ impl Scm {
         self.task_set_armed_with(snapshot, false, identity::service_password)
     }
 
-    /// Registers `snapshot`'s task again armed or not, and nothing else changed: armed, with the
-    /// triggers it holds that are switched on, or when it holds none the ones its blob's schedule compiles to (a blob that
-    /// will not decode names none, so it is the error); not armed, with none. Either way the task's
-    /// own flag is true.
+    /// Registers `snapshot`'s task again armed or not, and nothing else changed. `disable` removes the
+    /// triggers. `enable`, when at least one stored trigger is switched on, keeps the stored triggers as
+    /// they are and sets the task's own flag; when there is none, it compiles them from the blob (a blob
+    /// that will not decode is the error). Either way the task's own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
     pub(super) fn task_set_armed_with(
         &self,
