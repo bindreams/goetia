@@ -1571,6 +1571,23 @@ fn a_failure_after_the_disarming_whose_arming_fails_too_names_the_recovery_and_t
     assert!(report.contains("enable refused"), "{report}");
 }
 
+/// An arming that fails definitively leaves the task known to be unarmed, so the install has failed
+/// (exit 1) even where what ended the update was in doubt: `Both` is in doubt only when both halves are.
+#[skuld::test]
+fn an_update_in_doubt_whose_arming_fails_definitively_is_a_definite_failure() {
+    let in_doubt = || Error::WaitTimeout {
+        id: "x".to_string(),
+        awaited: "running",
+        waited: Duration::ZERO,
+        recovery: String::new(),
+    };
+    let refused = || Error::os_at("enable", "x.timer", std::io::Error::other("enable refused"));
+
+    assert!(in_doubt().is_indeterminate());
+    assert!(!left_disabled("x", Some(in_doubt()), refused()).is_indeterminate());
+    assert!(left_disabled("x", Some(in_doubt()), in_doubt()).is_indeterminate());
+}
+
 /// A race that finds the arming failing is as stranded as any other: no cause, and the same recovery.
 #[skuld::test]
 fn a_race_whose_arming_fails_names_the_recovery(#[fixture(systemd_group)] _group: &Group) {
