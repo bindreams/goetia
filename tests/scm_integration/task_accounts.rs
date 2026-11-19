@@ -17,9 +17,8 @@ use crate::support::windows_tasks::{ServiceAccountHost, manager_hosted_by, task_
 use crate::support::{self, ConnectBack, Group, LocalUserGuard, ServiceGuard, cleanup, scm_group, wait};
 use crate::tasks::{SCHEDULE, TaskGuard, records_of, task_as, task_exists, task_status, test_id};
 
-/// The password of the accounts these tests make: at most 14 characters, since a longer one makes
-/// `net user ... /add` ask about pre-Windows-2000 compatibility and wait on stdin.
-const PASSWORD: &str = "Goetia!Test12";
+/// The password of the accounts these tests make.
+const PASSWORD: &str = LocalUserGuard::PASSWORD;
 
 /// `verb` of a task made by the install helper, a child process that has the password in its environment
 /// and no other process does (see `install_helper`).
@@ -107,6 +106,34 @@ fn a_real_user_task_installs_arms_and_runs(#[fixture(scm_group)] _group: &Group)
     mgr.uninstall(id).expect("uninstall without the password");
     assert!(!task_exists(id));
     assert!(!records_of(id).exists());
+}
+
+/// An install that finds a real user's task up to date reads no password (the task is not registered again) and
+/// still grants the account `SeBatchLogonRight`, which a task of it needs for a first start.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_of_a_real_users_task_needs_no_password_and_grants_the_batch_right(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    assert!(
+        std::env::var_os("GOETIA_SERVICE_PASSWORD").is_none(),
+        "precondition: this process holds no password, so its `install` shows it needs none"
+    );
+    // Declared first, so the account goes after the task, whose logon it is.
+    let user = LocalUserGuard::create_random();
+    let id = &test_id();
+    let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = host.manager();
+    let command = vec![host.exe.path_str(), PRINT_AND_EXIT.to_owned()];
+    assert_succeeded("install", &as_user("install", id, user.name(), &host, &command));
+    user.revoke("SeBatchLogonRight");
+    assert!(!user.holds("SeBatchLogonRight"), "the right is taken away");
+    let spec = task_spec(id, command, Some(SCHEDULE), User::Name(user.name().to_owned()), None);
+
+    let again = mgr.install(&spec, false).expect("install again without the password");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(user.holds("SeBatchLogonRight"), "the install granted the right again");
 }
 
 /// `NT SERVICE\<name>` is a virtual account, and Task Scheduler would run a task registered with one as
