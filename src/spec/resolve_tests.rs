@@ -3419,6 +3419,45 @@ command: [bin/frpc]
         assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
     }
 
+    #[cfg(unix)]
+    #[skuld::test]
+    fn a_systemd_host_refuses_a_special_command_zero_for_a_service_and_not_for_a_task() {
+        for command in [r"/opt/a\b", "/opt/a\"b", "/opt/a'b", "/opt/a "] {
+            let service = format!(
+                "id: frpc\ncommand: [\"{}\"]\n",
+                command.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+            let task = format!("{service}type: task\nschedule: '0 3 * * *'\n");
+            let msg = resolve_yaml_as(BackendKind::Systemd, &service)
+                .expect_err(command)
+                .to_string();
+            assert!(msg.contains("`command[0]`"), "{command:?}: {msg}");
+            let (spec, _) = resolve_yaml_as(BackendKind::Systemd, &task).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+            assert_eq!(spec.common().command, [command], "{command:?}");
+        }
+    }
+
+    /// A `type` that only substitution supplies is known when the paths are judged: a task's special
+    /// `command[0]` is accepted, and a bad `type` is reported before a service's path rule can speak.
+    #[cfg(unix)]
+    #[skuld::test]
+    fn a_substituted_type_decides_the_command_zero_rules_and_its_own_error_comes_first(
+        #[fixture(temp_dir)] dir: &Path,
+    ) {
+        let yaml = "id: frpc\ncommand: ['/opt/a\\b']\ntype: ${T}\nschedule: '0 3 * * *'\n";
+
+        write_fixture(dir, yaml, Some("T=task\n"));
+        let (spec, _) = resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Systemd)).expect("a task");
+        assert_eq!(spec.common().command, ["/opt/a\\b"]);
+
+        write_fixture(dir, yaml, Some("T=simple\n"));
+        let msg = resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Systemd))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("`type: simple` is now `protocol: plain`"), "{msg}");
+        assert!(!msg.contains("`command[0]`"), "{msg}");
+    }
+
     #[skuld::test]
     fn edge_whitespace_in_dash_f_is_blamed_on_dash_f_for_cwd_and_logs() {
         let dir = abs("a ");

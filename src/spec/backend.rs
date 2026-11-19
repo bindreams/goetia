@@ -204,13 +204,14 @@ impl BackendKind {
     pub(super) fn refuse_path(
         self,
         id: &Id,
+        kind: DaemonKind,
         field: &Field,
         written: &str,
         joined: &str,
         base_dir: &Path,
     ) -> Result<(), Refused> {
         match self {
-            BackendKind::Systemd => systemd_path_refusal(id, field, written, joined, base_dir),
+            BackendKind::Systemd => systemd_path_refusal(id, kind, field, written, joined, base_dir),
             BackendKind::Launchd | BackendKind::Scm => Ok(()),
         }
     }
@@ -315,13 +316,13 @@ fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Su
 ///
 /// - `command[0]`, `cwd` and `logs`: see [`systemd_path_field_defect`].
 /// - Then the others: see [`systemd_value_defect`].
-pub(crate) fn systemd_defect(common: &DaemonFields) -> Option<String> {
+pub(crate) fn systemd_defect(common: &DaemonFields, kind: DaemonKind) -> Option<String> {
     let values = FieldValues::from(common);
     [Field::Command(0), Field::Cwd, Field::Logs]
         .iter()
         .find_map(|field| {
             let text = values.path(field)?.to_string_lossy();
-            systemd_path_field_defect(field, &text)
+            systemd_path_field_defect(field, kind, &text)
         })
         .or_else(|| systemd_value_defect(&values).map(|(_, defect)| defect))
 }
@@ -362,18 +363,19 @@ fn systemd_refusal(spec: &ShapedSpec) -> Result<(), Refused> {
 /// ([`DirJoin`](super::resolve::DirJoin)). `-f` is blamed and no field carries it, or else the field is.
 pub(super) fn systemd_path_refusal(
     id: &Id,
+    kind: DaemonKind,
     field: &Field,
     written: &str,
     joined: &str,
     base_dir: &Path,
 ) -> Result<(), Refused> {
-    let Some(defect) = systemd_path_field_defects(field, joined).next() else {
+    let Some(defect) = systemd_path_field_defects(field, kind, joined).next() else {
         return Ok(());
     };
     let described = defect.describe(field, joined);
     let has_defect = |p: &Path| {
         p.to_str()
-            .is_some_and(|text| systemd_path_field_defects(field, text).any(|d| d == defect))
+            .is_some_and(|text| systemd_path_field_defects(field, kind, text).any(|d| d == defect))
     };
     let written = Path::new(written);
     if directory_is_to_blame(dir_join(written), written, Path::new(joined), has_defect) {
@@ -400,12 +402,12 @@ const STRIPPED_BY_SYSTEMD: [char; 4] = [' ', '\t', '\n', '\r'];
 /// written text's ([`systemd_path_refusal`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathDefect {
-    /// `command[0]` holds a backslash, `"` or `'` (after unquoting and specifiers): systemd refuses
-    /// the whole unit with "Executable name contains special characters", however the word was
+    /// A service's `command[0]` holds a backslash, `"` or `'` (after unquoting and specifiers): systemd
+    /// refuses the whole unit with "Executable name contains special characters", however the word was
     /// quoted. Later arguments take all three.
     SpecialChars,
-    /// `command[0]` ends in a space: systemd 255 keeps the path but the service exits with 203/EXEC
-    /// (242 runs it; both are refused). Interior spaces, other trailing whitespace and later
+    /// A service's `command[0]` ends in a space: systemd 255 keeps the path but the service exits with
+    /// 203/EXEC (242 runs it; both are refused). Interior spaces, other trailing whitespace and later
     /// arguments are fine.
     TrailingSpace,
     /// `cwd` or `logs` holds a `..` component: systemd 242 refuses a non-normalized path in both
@@ -448,11 +450,13 @@ fn path_directive(field: &Field) -> &'static str {
 /// a path it can, and for a field that is no path. The one place that says which rule a field is
 /// under.
 ///
-/// - `command[0]`: [`PathDefect::SpecialChars`], [`PathDefect::TrailingSpace`].
+/// - `command[0]` of a service: [`PathDefect::SpecialChars`], [`PathDefect::TrailingSpace`]. A task's
+///   has none: it is an argument of the `sh` that starts it, which execs it as written.
 /// - `cwd` (`WorkingDirectory=`) and `logs` (the `append:` path of `StandardOutput=` and
 ///   `StandardError=`): [`PathDefect::ParentDir`], [`PathDefect::EdgeWhitespace`].
-fn systemd_path_field_defects(field: &Field, text: &str) -> impl Iterator<Item = PathDefect> {
+fn systemd_path_field_defects(field: &Field, kind: DaemonKind, text: &str) -> impl Iterator<Item = PathDefect> {
     let (first, second) = match field {
+        Field::Command(0) if kind == DaemonKind::Task => (None, None),
         Field::Command(0) => (
             text.contains(['\\', '"', '\'']).then_some(PathDefect::SpecialChars),
             text.ends_with(' ').then_some(PathDefect::TrailingSpace),
@@ -470,8 +474,8 @@ fn systemd_path_field_defects(field: &Field, text: &str) -> impl Iterator<Item =
 }
 
 /// [`systemd_path_field_defects`], the first one worded.
-fn systemd_path_field_defect(field: &Field, text: &str) -> Option<String> {
-    let defect = systemd_path_field_defects(field, text).next()?;
+fn systemd_path_field_defect(field: &Field, kind: DaemonKind, text: &str) -> Option<String> {
+    let defect = systemd_path_field_defects(field, kind, text).next()?;
     Some(defect.describe(field, text))
 }
 

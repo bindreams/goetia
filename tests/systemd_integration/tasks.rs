@@ -695,6 +695,33 @@ fn a_task_whose_env_sh_resets_is_refused_before_anything_is_written(#[fixture(sy
     assert!(!crate::linux::unit_path(&id).exists() && !timer_path(&id).exists());
 }
 
+/// `sh` execs a task's `command[0]` as written, so the program runs and its output arrives.
+#[skuld::test]
+fn a_task_whose_command_has_a_backslash_quote_or_trailing_space_installs_and_runs(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    for name in [r"a\b", "a\"b", "a'b", "a ", "a\\b\"c'd "] {
+        let program = dir.path().join(name);
+        fs::write(&program, "#!/bin/sh\necho announced\n").expect("write the program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("make it executable");
+        let id = support::random_test_id();
+        let _guard = ServiceGuard::new(&id);
+        let task_id = id_of(&id);
+        let mgr = Systemd::new();
+        let command = vec![program.to_str().expect("a UTF-8 path").to_string()];
+        mgr.install(&task(&id, command, None), false)
+            .unwrap_or_else(|e| panic!("{name:?}: install: {}", e.report()));
+
+        let (exit, out) = run_task(&mgr, &task_id);
+
+        assert_eq!(exit, Exit::Code(0), "{name:?}");
+        assert_eq!(String::from_utf8_lossy(&out), "announced\n", "{name:?}");
+    }
+}
+
 // run =================================================================================================================
 
 /// What a run shows and how it ends, through the library and through `goetia daemon run`: stdout and

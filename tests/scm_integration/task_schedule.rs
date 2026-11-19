@@ -138,28 +138,82 @@ fn a_date_no_month_has_is_installed_armed_and_never_fires(#[fixture(scm_group)] 
 
 // The run times =======================================================================================================
 
-/// The civil minutes, in the machine's zone, that Task Scheduler runs the task `text` at in the two years
-/// 2027 and 2028 (2028 is a leap year), compared with every minute of them against the cron's own reading
-/// of it, in both directions: a run time the cron does not name and a minute it names that has none. The
-/// range is fixed and not derived from today's date; the zone is the machine's, and the comparison
-/// assumes it has no daylight-saving change in those years (CI's is UTC).
+/// The end of 2028, a leap year.
+fn end_of_two_years() -> DateTime {
+    civil::date(2028, 12, 31).at(23, 59, 0, 0)
+}
+
+/// The end of January 2027.
+fn end_of_january() -> DateTime {
+    civil::date(2027, 1, 31).at(23, 59, 0, 0)
+}
+
+/// More run times in the two years than this, and a schedule is checked over January 2027 only.
+/// `GetRunTimes` cost grows with the square of the run times it returns (about 150 s for 261,000), and the
+/// nextest `ci` profile kills a test after 300 s.
+const MANY_RUN_TIMES: usize = 100_000;
+
+/// The schedules of [`FIRING_SCHEDULES`] with more than [`MANY_RUN_TIMES`] run times in the two years,
+/// and so the only ones cut to January 2027. The check is two-way: a schedule over the limit that is not
+/// listed fails, and so does a listed one that is not in [`FIRING_SCHEDULES`] or no longer over it.
+const CUT_TO_JANUARY: [&str; 2] = ["* * * * *", "*/7 * * * *"];
+
+fn cron_names(schedule: &Schedule, minute: DateTime) -> bool {
+    cron_matches(
+        schedule,
+        u8::try_from(minute.minute()).expect("a minute"),
+        u8::try_from(minute.hour()).expect("an hour"),
+        u8::try_from(minute.day()).expect("a day"),
+        u8::try_from(minute.month()).expect("a month"),
+        u8::try_from(minute.weekday().to_sunday_zero_offset()).expect("a weekday"),
+    )
+}
+
+/// Compares Task Scheduler's run times with the cron's own reading, every minute of the range, both
+/// directions: an extra run time and a missing one. The zone is the machine's and must have no DST change
+/// in the range (CI's is UTC).
 fn assert_runs_as_cron_says(texts: &[&str]) {
     let mgr = support::stock_shim_manager();
     let zone = TimeZone::system();
     let first = civil::date(2027, 1, 1).at(0, 0, 0, 0);
-    let last = civil::date(2028, 12, 31).at(23, 59, 0, 0);
     // The window is `(from, to]`.
     let instant = |at: DateTime| SystemTime::from(at.to_zoned(zone.clone()).expect("a time in the zone").timestamp());
-    let (from, to) = (instant(first - 1.minute()), instant(last));
 
+    let end = end_of_two_years();
+    for text in CUT_TO_JANUARY {
+        assert!(
+            FIRING_SCHEDULES.iter().any(|group| group.contains(&text)),
+            "`{text}` is in CUT_TO_JANUARY but not in FIRING_SCHEDULES"
+        );
+    }
     for text in texts {
         let guard = TaskGuard::new();
         let id = &guard.id;
+        let seed = HashSeed {
+            hostname: "testing",
+            id,
+        };
+        let schedule = Schedule::parse(text, &seed).unwrap_or_else(|e| panic!("`{text}`: {e}"));
+        let named_until = |last: DateTime| {
+            std::iter::successors(Some(first), |&minute| Some(minute + 1.minute()))
+                .take_while(move |&minute| minute <= last)
+                .filter(|&minute| cron_names(&schedule, minute))
+        };
+        let many = named_until(end).count() > MANY_RUN_TIMES;
+        assert_eq!(
+            many,
+            CUT_TO_JANUARY.contains(text),
+            "`{text}`: over {MANY_RUN_TIMES} run times in the two years is {many}, and CUT_TO_JANUARY must agree"
+        );
+        let last = if many { end_of_january() } else { end };
+        let named: BTreeSet<DateTime> = named_until(last).collect();
+        let (from, to) = (instant(first - 1.minute()), instant(last));
+
         mgr.install(&task_as(id, User::Root, Some(text)), false)
             .unwrap_or_else(|e| panic!("`{text}` is refused: {}", e.report()));
         let times =
             task_run_times(id, from, to).unwrap_or_else(|e| panic!("the run times of `{text}`: {}", e.report()));
-        let fired: BTreeSet<DateTime> = times
+        let mut listed: Vec<DateTime> = times
             .into_iter()
             .map(|time| {
                 Timestamp::try_from(time)
@@ -168,49 +222,25 @@ fn assert_runs_as_cron_says(texts: &[&str]) {
                     .datetime()
             })
             .collect();
-        let seed = HashSeed {
-            hostname: "testing",
-            id,
-        };
-        let schedule = Schedule::parse(text, &seed).unwrap_or_else(|e| panic!("`{text}`: {e}"));
-
-        let mut wrong = Vec::new();
-        let mut minute = first;
-        while minute <= last {
-            let named = cron_matches(
-                &schedule,
-                u8::try_from(minute.minute()).expect("a minute"),
-                u8::try_from(minute.hour()).expect("an hour"),
-                u8::try_from(minute.day()).expect("a day"),
-                u8::try_from(minute.month()).expect("a month"),
-                u8::try_from(minute.weekday().to_sunday_zero_offset()).expect("a weekday"),
-            );
-            if named != fired.contains(&minute) {
-                let (cron, scheduler) = if named {
-                    ("names it", "has no run")
-                } else {
-                    ("does not", "runs")
-                };
-                wrong.push(format!("{minute}: the cron {cron}, Task Scheduler {scheduler}"));
-            }
-            minute += 1.minute();
+        // A minute listed twice would be a double start: a set would merge it.
+        listed.sort();
+        if let Some(twice) = listed.windows(2).find(|pair| pair[0] == pair[1]) {
+            panic!("`{text}`: Task Scheduler lists {} twice", twice[0]);
         }
-        assert!(
-            wrong.is_empty(),
-            "`{text}`: {} minutes disagree, the first: {}",
-            wrong.len(),
-            wrong[0]
-        );
-        // A run time that is no whole minute of the range is an extra the loop above cannot see.
-        assert!(
-            fired
-                .iter()
-                .all(|time| time.second() == 0 && *time >= first && *time <= last),
-            "`{text}`: a run time that is no minute of the range: {:?}",
-            fired
-                .iter()
-                .find(|time| time.second() != 0 || **time < first || **time > last)
-        );
+        let fired: BTreeSet<DateTime> = listed.into_iter().collect();
+
+        let wrong: BTreeSet<DateTime> = named.symmetric_difference(&fired).copied().collect();
+        if let Some(minute) = wrong.first() {
+            let (cron, scheduler) = if named.contains(minute) {
+                ("names it", "has no run")
+            } else {
+                ("does not", "runs")
+            };
+            panic!(
+                "`{text}`: {} minutes disagree, the first: {minute}: the cron {cron}, Task Scheduler {scheduler}",
+                wrong.len()
+            );
+        }
         mgr.uninstall(id).expect("uninstall");
     }
 }
@@ -221,7 +251,7 @@ fn every_cron_shape_matches_the_schedulers_run_times(#[fixture(scm_group)] _grou
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_time_with_no_single_progression_matches_the_schedulers_run_times(#[fixture(scm_group)] _group: &Group) {
+fn irregular_times_of_day_match_the_schedulers_run_times(#[fixture(scm_group)] _group: &Group) {
     assert_runs_as_cron_says(FIRING_SCHEDULES[1]);
 }
 
@@ -238,12 +268,7 @@ fn a_fifth_weekday_matches_the_schedulers_run_times(#[fixture(scm_group)] _group
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_refused_schedule_writes_nothing(#[fixture(scm_group)] _group: &Group) {
     let mgr = support::stock_shim_manager();
-    for text in [
-        "0-29,31-35,37,40 0,1,3,7,9,10 * * *",
-        "0 0 */2 * 1",
-        "0 0 1 * 1",
-        "30 3 1,15 * 1-5",
-    ] {
+    for text in ["1,2,4,8,16 * * * *", "0 0 */2 * 1", "0 0 1 * 1", "30 3 1,15 * 1-5"] {
         let guard = TaskGuard::new();
         let id = &guard.id;
 

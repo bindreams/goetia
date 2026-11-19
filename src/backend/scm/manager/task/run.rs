@@ -258,7 +258,7 @@ impl Scm {
 
         let live = live_runs(&*self.tasks, "run", &id, &path, |pid| processes.alive(pid))
             .map_err(|e| unfollowed(&id, "tell which run it began", &e))?;
-        let appeared = runs.appeared(&pin).map_err(|e| {
+        let appeared = pin.appeared().map_err(|e| {
             unfollowed(
                 &id,
                 "tell which run it began",

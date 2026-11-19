@@ -109,7 +109,7 @@ fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
 
 /// A service's unit, up to the `[X-Goetia]` section.
 fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
-    refuse_unrepresentable(&service.common, id)?;
+    refuse_unrepresentable(&service.common, DaemonKind::Service, id)?;
     service
         .stop_action
         .refuse(BackendKind::Systemd, DaemonKind::Service, service.protocol)
@@ -157,7 +157,7 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 /// No `LogRateLimit*` line: a per-unit limit does not lift journald's (measured), so it would only
 /// look like a guarantee.
 fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
-    refuse_unrepresentable(&task.common, id)?;
+    refuse_unrepresentable(&task.common, DaemonKind::Task, id)?;
     task.stop_action
         .refuse(BackendKind::Systemd, DaemonKind::Task, Protocol::Plain)
         .into_result(&task.common.id)?;
@@ -317,8 +317,8 @@ fn numbers(values: &BTreeSet<u8>, range_len: usize) -> String {
 /// with its measurement, and which `resolve` runs too, since a `DaemonSpec` can come from a blob that
 /// never passed it) and the `User=` identity. The list is what is refused, not everything systemd
 /// cannot carry.
-fn refuse_unrepresentable(common: &DaemonFields, id: &Identity) -> Result<(), Error> {
-    let defect = systemd_defect(common).or_else(|| systemd_raw_value_defect("User=", &id.user));
+fn refuse_unrepresentable(common: &DaemonFields, kind: DaemonKind, id: &Identity) -> Result<(), Error> {
+    let defect = systemd_defect(common, kind).or_else(|| systemd_raw_value_defect("User=", &id.user));
     match defect {
         Some(message) => Err(Error::Invalid {
             daemon: common.id.to_string(),

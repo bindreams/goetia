@@ -368,6 +368,11 @@ fn resolve_shape(
         },
         Phase::Authored,
     );
+    // `command[0]`'s systemd rules depend on `type`, and its error outranks theirs. An absent `type` is a
+    // service; `native` is set only once substitution is done, so `type` is never deferred when it is read.
+    let daemon_type = shape(id, Field::Type, raw.daemon_type, substitution, parse_type)?;
+    let kind = daemon_type.parsed().unwrap_or(DaemonKind::Service);
+    let native = native.map(|backend| (backend, kind));
     let mut command = raw.command;
     let mut cwd = raw.cwd;
     let mut logs = raw.logs;
@@ -389,7 +394,6 @@ fn resolve_shape(
     let logs = logs.map(PathBuf::from);
     let env = raw.env;
 
-    let daemon_type = shape(id, Field::Type, raw.daemon_type, substitution, parse_type)?;
     refuse_fields_of_the_other_type(
         id,
         &daemon_type,
@@ -842,7 +846,7 @@ fn resolve_path_string(
     raw: &str,
     base_dir: &Path,
     substitution: Substitution,
-    native: Option<BackendKind>,
+    native: Option<(BackendKind, DaemonKind)>,
     warnings: &mut Vec<Warning>,
 ) -> Result<String, Refused> {
     let name = field.name();
@@ -897,8 +901,8 @@ fn resolve_path_string(
         .into_os_string()
         .into_string()
         .expect("`check_resolved` refused a path that is not valid UTF-8");
-    if let Some(native) = native {
-        native.refuse_path(id, &field.field(), raw, &joined, base_dir)?;
+    if let Some((native, kind)) = native {
+        native.refuse_path(id, kind, &field.field(), raw, &joined, base_dir)?;
     }
     Ok(joined)
 }

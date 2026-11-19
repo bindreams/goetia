@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, shim_writes, snapshot_of};
+use super::super::support::{
+    Machine, PATH, id, instance, instance_id, linked_records, record, records, scm, shim_writes, snapshot_of,
+};
 use super::*;
 use crate::backend::Backend;
 use crate::backend::scm::manager::WindowsSnapshot;
@@ -294,17 +296,16 @@ impl<'a> Denied<'a> {
     fn new(path: &'a std::path::Path) -> Self {
         let me = try_sid_display(&process_user_sid()).unwrap();
         // READ_CONTROL, WRITE_DAC and SYNCHRONIZE (which `CreateFile` adds to every open).
-        Descriptor::from_sddl(&format!("D:P(A;;FA;;;SY)(A;;0x160000;;;{me})"))
-            .unwrap()
-            .set_dacl(path)
-            .unwrap();
+        let denied = Descriptor::from_sddl(&format!("D:P(A;;FA;;;SY)(A;;0x160000;;;{me})")).unwrap();
+        crate::backend::scm::test_support::set_dacl(&denied, path).unwrap();
         Denied(path)
     }
 }
 
 impl Drop for Denied<'_> {
     fn drop(&mut self) {
-        let restored = Descriptor::for_runs(&process_user_sid()).map(|wanted| wanted.set_dacl(self.0));
+        let restored = Descriptor::for_runs(&process_user_sid())
+            .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
         if !matches!(restored, Ok(Ok(()))) {
             eprintln!(
                 "warning: could not restore the permissions of {}: {restored:?}",
@@ -367,7 +368,7 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
     let mut held = Some(runs.pin().unwrap());
     let mut during = None;
 
-    runs.remove_all(|_| {
+    runs.remove_all(|_, _| {
         during.get_or_insert_with(|| stopped(&fake, &mut machine, &runs, Budget::Unbounded));
         drop(held.take());
     })
@@ -378,6 +379,26 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
     assert!(report.contains("being removed"), "{report}");
     assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
     assert!(machine.waited.is_empty());
+}
+
+/// The account can make its records directory a link. A link has no records to pin or read, as a
+/// directory that is gone has none: the stop goes on and ends the run, and what the link points to is
+/// not read (it holds an incomplete stop of that run).
+#[skuld::test]
+fn a_stop_of_a_task_whose_records_directory_is_a_link_goes_on_and_reads_nothing_through_it() {
+    let (_dir, _path, runs, _target) = linked_records();
+    let fake = Fake::new();
+    fake.on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_stop(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
+
+    assert!(fake.calls().contains(&stop_call(1)), "the stop was sent");
+    assert_eq!(machine.waited, [(4242, 4)]);
+    fake.finish();
 }
 
 /// With the pin released, the records the stop read are pruned by the next write as ever.
