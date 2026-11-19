@@ -851,6 +851,25 @@ pub(in crate::backend::scm) mod windows {
         )));
     }
 
+    /// Only the read that failed on the object is that object's: one that sits in a `Both` or under a
+    /// wrapper, which says what else failed, is not.
+    #[skuld::test]
+    fn an_unreadable_read_inside_another_error_is_not_the_unreadable_read() {
+        let owner = system();
+        let mut acl = acl_with_entry(4, &owner);
+        let acl = acl.as_mut_ptr().cast();
+        // SAFETY: `owner` is a valid SID and `acl` a valid ACL, both live for the call.
+        let unreadable = unsafe { parse(owner.as_ptr() as _, acl, Path::new("f")) }.unwrap_err();
+        assert!(is_unreadable(&unreadable), "{unreadable:?}");
+
+        let both = Error::Both {
+            first: Box::new(unreadable),
+            then: Box::new(Error::os("write", io::Error::other("failed"))),
+        };
+
+        assert!(!is_unreadable(&both), "{both:?}");
+    }
+
     #[skuld::test]
     fn an_entry_goetia_can_read_is_read() {
         let owner = system();

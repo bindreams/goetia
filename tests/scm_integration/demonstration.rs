@@ -15,11 +15,11 @@ use goetia::testing::task_run_times;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
-use serde_json::Value;
 
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::demonstration::{
-    Cli, Expect, LastResult, Manifest, Time, ZONE, assert_task_fields, daily_in_half_a_day, instant, read_in_the_zone,
+    Cli, DISARMED, Expect, LastResult, Manifest, Time, ZONE, assert_task_fields, daily_in_half_a_day, instant,
+    read_in_the_zone,
 };
 use crate::support::sentinel::RUN_UNTIL_RELEASED;
 use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
@@ -101,18 +101,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
 
     // 1. Installed, the task is idle and disarmed.
     cli.install(&manifest);
-    assert_task_fields(
-        &cli.status_json(id),
-        id,
-        Expect {
-            state: "idle",
-            enabled: false,
-            pid: Time::Null,
-            last_result: LastResult::Null,
-            last_run: Time::Null,
-            next_run: Time::Null,
-        },
-    );
+    assert_task_fields(&cli.status_json(id), id, DISARMED);
 
     // 2. Armed. Enabled with a schedule 12 hours away, it is idle with the next run Task Scheduler itself
     // lists first, never run, in every form and at the offset of `TZ`. Nothing fires, so one read is the read.
@@ -145,25 +134,13 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
             next_run: Time::Present,
         },
     );
-    armed.assert_state("idle", Some(next));
-    for read in armed.reads() {
-        assert!(read.last_run.is_none(), "{armed:?}");
-    }
+    armed.assert_next_run("idle", |_, _| vec![next]);
+    armed.assert_no_last_run();
     cli.daemon(&["disable", id]);
     let disarmed = read_in_the_zone(&in_zone, id);
-    assert_task_fields(
-        &disarmed.json,
-        id,
-        Expect {
-            state: "idle",
-            enabled: false,
-            pid: Time::Null,
-            last_result: LastResult::Null,
-            last_run: Time::Null,
-            next_run: Time::Null,
-        },
-    );
-    disarmed.assert_state("idle", None);
+    assert_task_fields(&disarmed.json, id, DISARMED);
+    disarmed.assert_state("idle");
+    disarmed.assert_no_last_run();
 
     // 3. Fires. The same id, every minute, enabled: the schedule fires with nothing started by the test,
     // and the program connects back. It then runs until the test drops the connection, so any later fire
@@ -210,24 +187,20 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
         },
     );
     let times = upcoming("running");
+    let mut fire_minute = None;
     for read in running.reads() {
-        assert_eq!(read.state, "running", "{running:?}");
         let started = read.last_run.as_deref().unwrap_or_else(|| {
             panic!("a run is in flight, and a read shows no last-run: {running:?}");
         });
         assert_fired_in_range(read.form, started);
-        let next = read
-            .next_run
-            .as_deref()
-            .map(instant)
-            .unwrap_or_else(|| panic!("an armed task has a next run: {running:?}"));
-        // Not strictly after the fire: `NextRunTime` may not have moved past it when the program connects.
-        assert!(
-            times.contains(&next) && next >= to_the_minute(instant(started)),
-            "{}: next-run {next:?} is not a run time of {times:?} at or after the fire's minute: {running:?}",
-            read.form
-        );
+        let minute = to_the_minute(instant(started));
+        fire_minute = Some(fire_minute.map_or(minute, |earliest: SystemTime| earliest.min(minute)));
     }
+    let fire_minute = fire_minute.expect("three reads");
+    // Not strictly after the fire: `NextRunTime` may not have moved past it when the program connects.
+    running.assert_next_run("running", |_, _| {
+        times.iter().copied().filter(|time| *time >= fire_minute).collect()
+    });
     // No fire can come between the end of the run and the reads that follow it.
     cli.daemon(&["disable", id]);
     drop(held);
@@ -245,7 +218,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
             next_run: Time::Null,
         },
     );
-    finished.assert_state("idle", None);
+    finished.assert_state("idle");
     for (before, after) in running.reads().into_iter().zip(finished.reads()) {
         assert_eq!(before.last_run, after.last_run, "{running:?} then {finished:?}");
         assert_fired_in_range(
@@ -307,10 +280,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
 
     // 6. `uninstall` removes it.
     cli.daemon(&["uninstall", id]);
-    let gone = cli.run(&["daemon", "status", id, "--json"]);
-    assert_eq!(gone.code, Some(1), "{gone}");
-    let doc: Value = serde_json::from_str(&gone.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {gone}"));
-    assert_eq!(doc["errors"][0]["kind"], "not-installed", "{gone}");
+    cli.assert_not_installed(id);
     assert!(!task_exists(&task_id), "the task is left behind");
     assert!(
         !records_of(&task_id).exists(),

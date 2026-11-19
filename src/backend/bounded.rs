@@ -536,16 +536,16 @@ fn last_read(alive: impl Fn() -> Liveness, bound: Duration) -> Liveness {
 
 /// Whether `e` is the `EPERM` a child on its way out gives, bare or as cosca wraps it (macOS reads
 /// the child's identity before a send, and its refused read is an `io::Error` of kind
-/// `PermissionDenied` with no code of its own, the `EPERM` its source). Another code of that kind
-/// (`EACCES`) is not one, nor is an error that is not `Io`: those do not wait.
+/// `PermissionDenied` with no code of its own, the `EPERM` its source or its payload). Another code of
+/// that kind (`EACCES`) is not one, nor is an error that is not `Io`, whatever it carries: those do not
+/// wait.
 fn is_eperm(e: &cosca::error::Error) -> bool {
-    let cosca::error::Error::Io(e) = e else {
-        return false;
-    };
-    std::iter::successors(Some(e as &(dyn std::error::Error + 'static)), |e| e.source()).any(|e| {
-        e.downcast_ref::<io::Error>()
-            .is_some_and(|e| e.raw_os_error() == Some(libc::EPERM))
-    })
+    matches!(e, cosca::error::Error::Io(_))
+        && crate::error::find(e, &|e| {
+            e.downcast_ref::<io::Error>()
+                .filter(|e| e.raw_os_error() == Some(libc::EPERM))
+        })
+        .is_some()
 }
 
 /// What [`kill_root`] makes of a refused kill, given what [`last_read`] read: no error for `Dead`,

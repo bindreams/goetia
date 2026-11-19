@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use goetia::backend::systemd::manager::Systemd;
-use serde_json::Value;
 
 use crate::linux::{UNIT_DIR_EXCLUSIVE, timer_path, timer_wants_symlink, unit_path, wait_for_started};
-use crate::support::cron_oracle::expected_next_runs;
+use crate::support::cron_oracle::{expected_next_runs, strict_next_runs_of};
 use crate::support::demonstration::{
-    Cli, Expect, LastResult, Manifest, Time, ZONE, assert_task_fields, daily_in_half_a_day, instant, read_in_the_zone,
+    Cli, DISARMED, Expect, LastResult, Manifest, Time, ZONE, assert_task_fields, daily_in_half_a_day, instant,
+    read_in_the_zone,
 };
 use crate::support::tasks::{Held, id_of, sh, status_with_result};
 use crate::support::{self, Group, ServiceGuard, systemd_group};
@@ -35,24 +35,11 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
 
     // 1. Installed, the task is idle and disarmed.
     cli.install(&manifest);
-    assert_task_fields(
-        &cli.status_json(&id),
-        &id,
-        Expect {
-            state: "idle",
-            enabled: false,
-            pid: Time::Null,
-            last_result: LastResult::Null,
-            last_run: Time::Null,
-            next_run: Time::Null,
-        },
-    );
+    assert_task_fields(&cli.status_json(&id), &id, DISARMED);
 
     // 2. Armed. Enabled with a schedule 12 hours away, it is idle with the next run the cron names, never
     // run, in every form and at the offset of `TZ`. Nothing fires, so one read is the read.
-    let enabled_at = SystemTime::now();
     cli.daemon(&["enable", &id]);
-    let [_, next, _] = expected_next_runs(&daily, &id_of(&id), enabled_at, SystemTime::now());
     let armed = read_in_the_zone(&in_zone, &id);
     assert_task_fields(
         &armed.json,
@@ -66,25 +53,17 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
             next_run: Time::Present,
         },
     );
-    armed.assert_state("idle", Some(next));
-    for read in armed.reads() {
-        assert!(read.last_run.is_none(), "{armed:?}");
-    }
+    // The timer is armed at `enable`, and the schedule is 12 hours away, so each form's own window names
+    // the next minute after it, and never the occurrence 12 hours back.
+    armed.assert_next_run("idle", |before, after| {
+        strict_next_runs_of(&daily, &id_of(&id), before, after).to_vec()
+    });
+    armed.assert_no_last_run();
     cli.daemon(&["disable", &id]);
     let disarmed = read_in_the_zone(&in_zone, &id);
-    assert_task_fields(
-        &disarmed.json,
-        &id,
-        Expect {
-            state: "idle",
-            enabled: false,
-            pid: Time::Null,
-            last_result: LastResult::Null,
-            last_run: Time::Null,
-            next_run: Time::Null,
-        },
-    );
-    disarmed.assert_state("idle", None);
+    assert_task_fields(&disarmed.json, &id, DISARMED);
+    disarmed.assert_state("idle");
+    disarmed.assert_no_last_run();
 
     // 3. Fires. The same id, every minute, enabled: the schedule fires with nothing started by the test,
     // and the program announces itself. systemd has no next run for a timer whose service is running, and
@@ -139,7 +118,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
             next_run: Time::Null,
         },
     );
-    running.assert_state("running", None);
+    running.assert_state("running");
     for read in running.reads() {
         let time = read.last_run.as_deref().unwrap_or_else(|| {
             panic!("journald holds the run's Starting entry, and a read shows no last-run: {running:?}")
@@ -163,7 +142,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
             next_run: Time::Null,
         },
     );
-    finished.assert_state("idle", None);
+    finished.assert_state("idle");
     for (before, after) in running.reads().into_iter().zip(finished.reads()) {
         assert_eq!(before.last_run, after.last_run, "{running:?} then {finished:?}");
     }
@@ -180,10 +159,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
 
     // 5. `uninstall` removes it.
     cli.daemon(&["uninstall", &id]);
-    let gone = cli.run(&["daemon", "status", &id, "--json"]);
-    assert_eq!(gone.code, Some(1), "{gone}");
-    let doc: Value = serde_json::from_str(&gone.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {gone}"));
-    assert_eq!(doc["errors"][0]["kind"], "not-installed", "{gone}");
+    cli.assert_not_installed(&id);
     for path in [unit_path(&id), timer_path(&id), timer_wants_symlink(&id)] {
         assert!(
             std::fs::symlink_metadata(&path).is_err(),

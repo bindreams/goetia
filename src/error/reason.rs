@@ -3,8 +3,8 @@
 use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
-use super::report::{Sink, write_chain, write_remedies, write_sentence};
-use super::{Error, Sentence};
+use super::Error;
+use super::report::{Pieces, Sink, write_chain, write_remedies};
 
 /// Why goetia says what it does about an id it cannot use or classify: a refused install, or a
 /// `list` entry. It is cheap to clone, and two reasons are equal when they read the same.
@@ -81,15 +81,11 @@ impl Reason {
         match self {
             Reason::Said(text) => out.write_str(text)?,
             Reason::Failed(error) => write_chain(error.as_ref(), out, &mut remedies)?,
-            Reason::Around { before, error, after } => {
-                let sentence = Sentence {
-                    before: before.as_str().into(),
-                    error: Some(error.as_ref()),
-                    error_is_cause: true,
-                    after: after.as_str().into(),
-                };
-                write_sentence(sentence, out, &mut remedies)?;
-            }
+            Reason::Around { before, error, after } => Pieces::new()
+                .text(before.as_str())
+                .cause(error.as_ref())
+                .text(after.as_str())
+                .write(out, &mut remedies)?,
         }
         write_remedies(out, &remedies)
     }
