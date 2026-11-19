@@ -1460,33 +1460,8 @@ fn a_read_of_a_unit_systemd_has_not_loaded_sends_nothing_else() {
     }
 }
 
-/// An install that finds the units up to date reloads once when systemd reads one of them not found, and
-/// only then: a unit it has loaded sends no request.
-#[skuld::test]
-fn an_up_to_date_install_reloads_when_a_unit_reads_not_found() {
-    let loaded = || reply(&["show"], exited(0, "LoadState=loaded\n", ""));
-    let not_found = || reply(&["show"], exited(0, "LoadState=not-found\n", ""));
-    let kinds = [UnitKind::Service, UnitKind::Timer];
-
-    let fake = Fake::new([loaded(), loaded()]);
-    on_booted(fake.clone())
-        .reload_if_unloaded("x", &kinds, &mut Held::default())
-        .expect("both loaded");
-    assert_eq!(fake.calls().len(), 2, "two shows, no request");
-
-    let mut entries = vec![loaded(), not_found()];
-    entries.extend(gate_passes());
-    entries.push(reply(&["daemon-reload"], exited(0, "", "")));
-    let fake = Fake::new(entries);
-    on_booted(fake.clone())
-        .reload_if_unloaded("x", &kinds, &mut Held::default())
-        .expect("reloaded");
-    let verbs: Vec<_> = fake.calls().iter().map(|call| call[0].clone()).collect();
-    assert_eq!(verbs, ["show", "show", "--version", "show", "daemon-reload"]);
-}
-
 /// A reload that fails keeps its context: the unit file is on disk and not picked up, and a reload in
-/// doubt stays in doubt. The arm and the install that finds the files up to date say the same.
+/// doubt stays in doubt.
 #[skuld::test]
 fn a_reload_that_fails_after_a_not_found_keeps_its_context() {
     let not_found = || {

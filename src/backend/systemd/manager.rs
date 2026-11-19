@@ -225,18 +225,6 @@ impl Backend for Systemd {
         }
     }
 
-    /// An install that finds the units up to date while systemd reads one not found (a write whose
-    /// reload failed) reloads systemd once, so a reinstall repairs it. The units are `definition`'s,
-    /// which is what is installed.
-    fn ensure_beside(&self, spec: &DaemonSpec, definition: &Units, _snapshot: &Fragment) -> Result<()> {
-        let mut kinds = vec![UnitKind::Service];
-        if definition.timer.is_some() {
-            kinds.push(UnitKind::Timer);
-        }
-        self.systemctl
-            .reload_if_unloaded(spec.common().id.as_str(), &kinds, &mut Held::default())
-    }
-
     /// Whether the job's unit is `definition`'s, as `discover` reads it: the unit is what names the
     /// directories. A timer names none.
     fn standing(&self, spec: &DaemonSpec, definition: &Units) -> Standing {

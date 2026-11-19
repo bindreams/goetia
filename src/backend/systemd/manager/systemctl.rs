@@ -496,19 +496,6 @@ impl Systemctl {
             },
         })
     }
-
-    /// `daemon-reload`, once, if systemd reads any of `id`'s units (`kinds`) as not found: an install that
-    /// finds the files up to date repairs a write whose reload failed. Reads each unit's `LoadState`
-    /// first, which is no request; asks the gate itself, as `held` here is not the install's.
-    pub(super) fn reload_if_unloaded(&self, id: &str, kinds: &[UnitKind], held: &mut Held) -> Result<()> {
-        for kind in kinds {
-            let shown = self.show_properties(&unit_name(id, *kind), &["LoadState"])?;
-            if not_found(&shown) {
-                return self.daemon_reload_or_report(id, held);
-            }
-        }
-        Ok(())
-    }
 }
 
 // The version gate ====================================================================================================
@@ -981,9 +968,8 @@ impl Systemctl {
     /// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
     /// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
     /// say. A file written and not yet reloaded can read so too: a read never reloads, which is a
-    /// request, and [`Systemctl::arm_timer`] and an install that finds the files up to date
-    /// ([`Systemctl::reload_if_unloaded`]) do. What systemd reports for such a name is not that unit's
-    /// state, and never read as one.
+    /// request, and [`Systemctl::arm_timer`] does. What systemd reports for such a name is not that
+    /// unit's state, and never read as one.
     fn show_installed(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
         let mut asked = props.to_vec();
         asked.push("LoadState");

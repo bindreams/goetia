@@ -172,7 +172,8 @@ pub(super) struct Before {
 /// What `update_units` has to do before it replaces the job. `timer_dropins`: the id's timer has a
 /// drop-in in the directory the update deletes. `arming`: how the timer stands. Each is asked only when
 /// the update replaces a timer by a timer; `timer_dropins` only when the schedule is unchanged, `arming`
-/// only when the timer changes.
+/// only when the timer changes. `arming` reads a timer systemd has not loaded as not armed
+/// ([`TimerArming::default`]): it was written and never loaded, so it cannot be active.
 ///
 /// The timers are compared as the reload acts on them: the schedule is unchanged when the old timer's
 /// text and the text to be written both contain [`generate::timer_schedule`], as launchd's
@@ -244,7 +245,11 @@ impl Systemd {
             },
             || {
                 self.systemctl.require_supported(held)?;
-                self.systemctl.timer_arming(id)
+                match self.systemctl.timer_arming(id) {
+                    // A timer systemd reads as not found was written and never loaded: not active.
+                    Err(Error::UnitNotLoaded { .. }) => Ok(TimerArming::default()),
+                    other => other,
+                }
             },
         )?;
 
