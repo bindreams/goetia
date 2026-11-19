@@ -503,9 +503,30 @@ fn a_hold_whose_first_read_failed_names_which_run_it_was_for() {
 
     assert_eq!(
         failed.report().to_string(),
-        "failed to hold the process of `nightly`'s run: failed to list the instances of `nightly` for its run \
-         (pid 200): failed to list the runs of `nightly`: listing failed"
+        "failed to hold the process of `nightly`'s run: finding the run with process 200: failed to list the runs \
+         of `nightly`: listing failed"
     );
+}
+
+/// Which run a failed first read was for does not depend on what the target was asked before: the hold
+/// words its first read's failure itself.
+#[skuld::test]
+fn a_hold_names_the_run_of_its_first_read_whatever_the_target_was_asked_before() {
+    let fake = Fake::new();
+    fake.on_instances(one(100)).on_instances(Err(Error::os(
+        "list the runs of `nightly`",
+        io::Error::other("listing failed"),
+    )));
+    let mut machine = Machine::new(&fake, &[100]);
+    let path = TaskPath::of(&id());
+    let mut target = RunTarget::new(&fake, &path, &instance(1, 100), &mut machine);
+    target.service_pid().unwrap();
+
+    let Err(HoldError::Unread(e)) = hold_once(&mut target, Budget::Unbounded.start()) else {
+        panic!("the first read of the hold did not fail unread");
+    };
+
+    assert_eq!(e.to_string(), "finding the run with process 100");
 }
 
 /// A plain failure of the read that confirms a run's process says which of the runs it was for.
@@ -654,7 +675,7 @@ fn a_refusal_on_the_second_run_leaves_the_first_unkilled() {
 }
 
 /// A run whose listing cannot be read at the kill's first read says which run it was, and each run's
-/// failure says its own: with two runs, the report names both pids.
+/// failure says its own: with two runs, the report names both, in the wording a failed hold gives.
 #[skuld::test]
 fn a_kill_whose_first_read_of_each_run_failed_names_each_run() {
     let fake = Fake::new();
@@ -668,12 +689,13 @@ fn a_kill_whose_first_read_of_each_run_failed_names_each_run() {
 
     let failed = scm(&fake).task_kill_with(&id(), &mut machine).unwrap_err();
 
-    let report = failed.report().to_string();
-    for pid in [100, 200] {
-        let said = format!("failed to list the instances of `nightly` for its run (pid {pid}): ");
-        assert_eq!(report.matches(&said).count(), 1, "{report}");
-    }
-    assert!(machine.terminated.is_empty(), "{report}");
+    assert_eq!(
+        failed.report().to_string(),
+        "failed to kill `nightly`: finding the run with process 100: failed to list the instances: listing failed; \
+         then: failed to kill `nightly`: finding the run with process 200: failed to list the instances: listing \
+         failed"
+    );
+    assert!(machine.terminated.is_empty(), "{failed}");
     fake.finish();
 }
 
