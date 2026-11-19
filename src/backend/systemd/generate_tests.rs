@@ -1284,11 +1284,32 @@ fn a_value_no_encoding_carries_is_refused_for_a_task_too() {
     };
     assert_refused_as_stripped(unit(&task_with(|_| {}), &account), "User=", "svc ");
 
-    let spec = task_with(|c| c.command = vec![format!(r"{PROGRAM}\y")]);
+    let spec = task_with(|c| c.cwd = Some(abs("opt/x/../y")));
     let err = units(&spec, &minimal_identity()).unwrap_err();
     let Error::Invalid { daemon, message, .. } = &err else {
         panic!("expected Error::Invalid, got {err:?}");
     };
     assert_eq!(daemon, "frpc");
-    assert!(message.contains("`command[0]`"), "{message}");
+    assert!(message.contains("`cwd`"), "{message}");
+}
+
+/// A task's `command[0]` is an ordinary word after the wrapper, which `sh` execs as written.
+#[skuld::test]
+fn a_tasks_executable_path_may_hold_a_backslash_quote_or_trailing_space() {
+    for (suffix, written) in [
+        (r"\y", r#""{p}\\y""#),
+        (r"\", r#""{p}\\""#),
+        ("\"y", r#""{p}\"y""#),
+        ("'y", r#""{p}'y""#),
+        (" ", r#""{p} ""#),
+    ] {
+        let spec = task_with(|c| c.command = vec![format!("{PROGRAM}{suffix}"), "a".to_string()]);
+        let text = unit(&spec, &minimal_identity()).unwrap_or_else(|e| panic!("{suffix:?}: {e}"));
+        assert_eq!(
+            line_of(&text, "ExecStart="),
+            format!("ExecStart={WRAPPER} {} a", written.replace("{p}", PROGRAM)),
+            "{suffix:?}"
+        );
+        assert_eq!(extract(&text).unwrap().unwrap().spec, spec, "{suffix:?}");
+    }
 }
