@@ -58,20 +58,39 @@ fn the_scheduler_fires_the_task_by_itself(#[fixture(scm_group)] _group: &Group) 
 }
 
 /// Re-arming a task makes up no run its schedule named while it was disarmed, though `StartWhenAvailable`
-/// is set: the task runs by itself once, is disarmed, a minute boundary passes (the clock is the event
-/// waited for), and is armed again. The next run to begin is a scheduled one, at or after the next run
-/// read at the re-arming; a run made up for the minute that passed would begin before it.
+/// is set: the task runs by itself once, is disarmed, a minute boundary passes, and is armed again. The
+/// next run to begin is a scheduled one, at or after the next run read at the re-arming; a run made up
+/// for the minute that passed would begin before it.
+///
+/// The re-arming waits for Task Scheduler to have handled the boundary, not for the clock to reach it: a
+/// task armed in the second after the boundary may still be started for it, which is a scheduled run and
+/// not a made-up one. A second task of the same schedule, armed throughout, shows the boundary was
+/// handled when it has started for it. A run made up long after the re-arming (the documented delay of
+/// `StartWhenAvailable` is 10 minutes) is no part of this: see the knowledge base's measurement.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn rearming_a_task_makes_up_no_missed_run(#[fixture(scm_group)] _group: &Group) {
     let guard = TaskGuard::new();
-    let id = &guard.id;
+    let witness_guard = TaskGuard::new();
+    let (id, witness) = (&guard.id, &witness_guard.id);
     let mgr = support::stock_shim_manager();
-    let listener = ConnectBack::listen();
+    let (listener, witness_listener) = (ConnectBack::listen(), ConnectBack::listen());
+    mgr.install(
+        &task_spec(
+            witness,
+            connects_back(&witness_listener),
+            Some("* * * * *"),
+            User::Root,
+            None,
+        ),
+        false,
+    )
+    .expect("install the witness");
     mgr.install(
         &task_spec(id, connects_back(&listener), Some("* * * * *"), User::Root, None),
         false,
     )
     .expect("install");
+    mgr.enable(witness).expect("enable the witness");
     mgr.enable(id).expect("enable");
     listener.accept_unbounded();
     let first = status_once_ended(&mgr, id);
@@ -81,7 +100,7 @@ fn rearming_a_task_makes_up_no_missed_run(#[fixture(scm_group)] _group: &Group) 
         .expect("a clock after 1970")
         .as_secs();
     let passed = UNIX_EPOCH + Duration::from_secs((secs / 60 + 1) * 60);
-    kill::until(|| SystemTime::now() >= passed);
+    kill::until(|| task_status(&mgr, witness).last_run.is_some_and(|began| began >= passed));
 
     mgr.enable(id).expect("enable again");
 
@@ -107,7 +126,9 @@ fn rearming_a_task_makes_up_no_missed_run(#[fixture(scm_group)] _group: &Group) 
         began >= scheduled,
         "the run began at {began:?}, before the scheduled {scheduled:?}: a run made up for {passed:?}"
     );
+    mgr.disable(witness).expect("disable the witness");
     mgr.disable(id).expect("disable");
+    mgr.uninstall(witness).expect("uninstall the witness");
     mgr.uninstall(id).expect("uninstall");
 }
 
