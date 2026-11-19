@@ -1119,16 +1119,16 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
         "`{invocation}` is not 32 lowercase hex digits"
     );
     let marker = format!("goetia-run {invocation}");
-    let marked = output
+    let at = entries
         .iter()
-        .find(|entry| field(entry, "MESSAGE") == Some(marker.as_str()))
+        .position(|entry| field(entry, "MESSAGE") == Some(marker.as_str()))
         .expect("the marker line is in the journal");
     assert!(
-        monotonic(marked) > monotonic(starting),
-        "the marker ({marked}) is before the Starting entry ({starting})"
+        at > starting,
+        "the marker (entry {at}) is before the Starting entry ({starting})"
     );
 
-    let after = format!("--after-cursor={}", field(marked, "__CURSOR").expect("a cursor"));
+    let after = format!("--after-cursor={}", field(&entries[at], "__CURSOR").expect("a cursor"));
     let later = output_entries(&[after.as_str(), by_unit.as_str(), "_TRANSPORT=stdout"]);
     let lines: Vec<_> = later.iter().filter_map(|entry| field(entry, "MESSAGE")).collect();
     assert_eq!(lines, ["one", "two"]);
