@@ -36,21 +36,21 @@ use windows_sys::Win32::Foundation::{
     STATUS_REPARSE_POINT_NOT_RESOLVED, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileAttributeTagInfo, FileDispositionInfoEx,
+    DELETE, FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfoEx,
     FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdInfo, GetFileInformationByHandleEx, READ_CONTROL,
     SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+use crate::backend::scm::link::is_link;
 use crate::backend::scm::wide::wide_null;
 
 /// What every handle in a records directory shares: all of it. A holder that shared less would make
 /// another party's open, the account's or the removal's, a sharing violation of its own.
-pub(super) const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+pub(in crate::backend::scm) const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
 /// What the handle on the directory is opened for: to list it, to make files in it and to open its
 /// entries. Deleting an entry needs no more of it ([`files::delete`](super::files::delete)), and the
@@ -67,12 +67,6 @@ pub(super) fn is_bare(name: &OsStr) -> bool {
     name.encode_wide().all(|unit| unit != u16::from(b'\\'))
 }
 
-/// `IsReparseTagNameSurrogate`: whether a reparse `tag` says the file is another name for something else
-/// (a mount point, a symlink), which is bit 29. Any other tag is data on the file itself.
-pub(super) const fn is_name_surrogate(tag: u32) -> bool {
-    tag & 0x2000_0000 != 0
-}
-
 /// One entry of a directory's listing.
 pub(super) struct Listed {
     pub name: OsString,
@@ -82,7 +76,7 @@ pub(super) struct Listed {
 }
 
 /// A directory open for the elevated side's work on it, or for the account's own writes.
-pub(super) struct Dir {
+pub(in crate::backend::scm) struct Dir {
     file: File,
     path: PathBuf,
     link: bool,
@@ -92,7 +86,7 @@ impl Dir {
     /// Opens the directory `path` without following a link at it, and refuses one: a link where goetia made
     /// a directory is not goetia's ([`ErrorKind::NotADirectory`](io::ErrorKind::NotADirectory)). A directory
     /// that is not there is [`NotFound`](io::ErrorKind::NotFound).
-    pub(super) fn open(path: &Path) -> io::Result<Dir> {
+    pub(in crate::backend::scm) fn open(path: &Path) -> io::Result<Dir> {
         Self::open_with(path, ACCESS)?.not_a_link()
     }
 
@@ -117,23 +111,10 @@ impl Dir {
     }
 
     /// `file`, which was opened without following a link, as the directory at `path`. It is a link when it
-    /// has a reparse point whose tag is a name surrogate ([`is_name_surrogate`]); a directory with any
-    /// other tag is data goetia has no reason to refuse.
+    /// has a reparse point whose tag is a name surrogate ([`is_link`]); a directory with any other tag is
+    /// data goetia has no reason to refuse.
     pub(super) fn from_open(file: File, path: PathBuf) -> io::Result<Dir> {
-        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
-        // SAFETY: `info` is `size_of::<FILE_ATTRIBUTE_TAG_INFO>()` writable bytes; the handle is live.
-        let ok = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle() as HANDLE,
-                FileAttributeTagInfo,
-                (&raw mut info).cast(),
-                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let link = info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && is_name_surrogate(info.ReparseTag);
+        let link = is_link(&file)?;
         Ok(Dir { file, path, link })
     }
 
@@ -238,7 +219,7 @@ impl Dir {
     /// [`SYNCHRONOUS_IO`]; one for a delete, a rename or a query has neither
     /// ([`files::delete`](super::files::delete)). The error is the `NTSTATUS`, which tells a pending delete
     /// from a refusal where the Win32 code does not; [`Dir::open_error`] words it.
-    pub(super) fn open_in(
+    pub(in crate::backend::scm) fn open_in(
         &self,
         name: &OsStr,
         access: u32,
