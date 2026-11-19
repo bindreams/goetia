@@ -1011,7 +1011,7 @@ fn account_change_takes_armed_from_the_triggers_alone() {
     }
 }
 
-// The order of an account change -------------------------------------------------------------------------------------
+// The order of an account change --------------------------------------------------------------------------------------
 
 /// What the world looks like to one call of the fake, noted as the call is made: `at`, whether the removal's
 /// marker stands, and whether the record directory names the new account ([`users`]).
