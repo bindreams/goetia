@@ -2866,7 +2866,10 @@ fn manager_entries_unsynced<S: AsRef<str>>(matches: &[S]) -> Vec<Value> {
 fn manager_args<S: AsRef<str>>(matches: &[S]) -> Vec<&str> {
     let mut args = vec!["--system"];
     args.extend(matches.iter().map(AsRef::as_ref));
-    assert!(!args.contains(&"+"), "a `+` in a manager query ({args:?}) would leave `_PID=1` out of a half");
+    assert!(
+        !args.contains(&"+"),
+        "a `+` in a manager query ({args:?}) would leave `_PID=1` out of a half"
+    );
     args.push(FROM_PID_1);
     args
 }
