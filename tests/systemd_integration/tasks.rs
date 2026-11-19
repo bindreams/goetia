@@ -20,7 +20,7 @@ use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 
 use crate::linux::{
-    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, main_pid, manager_entries,
+    CreatedRoot, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, main_pid, manager_entries,
     output_entries, started_invocations, starting_matches, timer_path, timer_wants_symlink, unit_of,
 };
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
@@ -1096,19 +1096,19 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
 
     let unit = unit_of(&id);
     let (by_manager, by_unit) = (format!("UNIT={unit}"), format!("_SYSTEMD_UNIT={unit}"));
-    // Both scopes in one query, so the output's, with the manager's `_PID=1` in its own half.
-    let entries = output_entries(&[
-        by_manager.as_str(),
-        FROM_PID_1,
-        "+",
-        by_unit.as_str(),
-        "_TRANSPORT=stdout",
-    ]);
-    let starting = entries
+    // One query for each scope, as `goetia` reads them. Their order is the monotonic clock's.
+    let manager = manager_entries(&[by_manager.as_str()]);
+    let output = output_entries(&[by_unit.as_str(), "_TRANSPORT=stdout"]);
+    let monotonic = |entry: &serde_json::Value| -> u64 {
+        field(entry, "__MONOTONIC_TIMESTAMP")
+            .and_then(|micros| micros.parse().ok())
+            .expect("an entry has a monotonic time")
+    };
+    let starting = manager
         .iter()
-        .position(|entry| field(entry, "MESSAGE_ID") == Some(STARTING))
+        .find(|entry| field(entry, "MESSAGE_ID") == Some(STARTING))
         .expect("a Starting entry");
-    let invocation = field(&entries[starting], "INVOCATION_ID").expect("an invocation");
+    let invocation = field(starting, "INVOCATION_ID").expect("an invocation");
     assert!(
         invocation.len() == 32
             && invocation
@@ -1117,16 +1117,16 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
         "`{invocation}` is not 32 lowercase hex digits"
     );
     let marker = format!("goetia-run {invocation}");
-    let at = entries
+    let marked = output
         .iter()
-        .position(|entry| field(entry, "MESSAGE") == Some(marker.as_str()))
+        .find(|entry| field(entry, "MESSAGE") == Some(marker.as_str()))
         .expect("the marker line is in the journal");
     assert!(
-        at > starting,
-        "the marker (entry {at}) is before the Starting entry ({starting})"
+        monotonic(marked) > monotonic(starting),
+        "the marker ({marked}) is before the Starting entry ({starting})"
     );
 
-    let after = format!("--after-cursor={}", field(&entries[at], "__CURSOR").expect("a cursor"));
+    let after = format!("--after-cursor={}", field(marked, "__CURSOR").expect("a cursor"));
     let later = output_entries(&[after.as_str(), by_unit.as_str(), "_TRANSPORT=stdout"]);
     let lines: Vec<_> = later.iter().filter_map(|entry| field(entry, "MESSAGE")).collect();
     assert_eq!(lines, ["one", "two"]);

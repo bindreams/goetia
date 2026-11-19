@@ -14,7 +14,7 @@ use goetia::backend::systemd::manager::Systemd;
 use serde_json::Value;
 
 use crate::linux::{UNIT_DIR_EXCLUSIVE, timer_path, timer_wants_symlink, unit_path, wait_for_started};
-use crate::support::cron_oracle::expected_next_runs;
+use crate::support::cron_oracle::{self, expected_next_runs};
 use crate::support::demonstration::{
     Cli, Expect, LastResult, Manifest, Time, ZONE, ZONE_OFFSET, assert_task_fields, instant, text_field, text_state,
 };
@@ -23,16 +23,12 @@ use crate::support::{self, Group, ServiceGuard, systemd_group};
 
 const EVERY_MINUTE: &str = "* * * * *";
 
-/// A daily schedule whose time is about 12 hours from now, in the container's local zone: the zone
-/// systemd reads `OnCalendar` in (the test's process sets no `TZ`). The armed task has a next fire
-/// that far away and nothing fires while it is read. A clock step of 12 hours is outside what the
-/// lanes do.
+/// A daily schedule whose time is about 12 hours from now, in the zone systemd reads `OnCalendar` in
+/// (`/etc/localtime`, whatever `TZ` the test process has). The armed task has a next fire that far
+/// away and nothing fires while it is read. A clock step of 12 hours is outside what the lanes do.
 fn daily_in_half_a_day() -> String {
-    assert!(
-        std::env::var_os("TZ").is_none(),
-        "the test process has a `TZ`, and systemd reads `OnCalendar` in /etc/localtime, not in `TZ`"
-    );
-    let at = jiff::Zoned::now()
+    let at = jiff::Timestamp::now()
+        .to_zoned(cron_oracle::manager_zone().clone())
         .checked_add(jiff::Span::new().hours(12))
         .expect("12 hours from now");
     format!("{} {} * * *", at.minute(), at.hour())
@@ -196,8 +192,9 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
     held.wait_started();
     // The unit is active, and journald need not hold the run's `Starting` entry yet: the task is running
     // with a pid and no next run, and `last-run` is there or not.
+    let before_the_journal = cli.status_json(&id);
     assert_task_fields(
-        &cli.status_json(&id),
+        &before_the_journal,
         &id,
         Expect {
             state: "running",
@@ -208,6 +205,19 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
             next_run: Time::Null,
         },
     );
+    // One range: `enable` may span a minute boundary or more, and the minutes between candidates are
+    // the schedule's too.
+    let (first, last) = (candidates[0], candidates[2] + Duration::from_secs(60));
+    let assert_fired_in_range = |form: &str, time: &str| {
+        let fired = instant(time);
+        assert!(
+            fired >= first && fired < last,
+            "{form}: last-run {fired:?} is not in [{first:?}, {last:?}) of {candidates:?}"
+        );
+    };
+    if let Some(time) = before_the_journal["last-run"].as_str() {
+        assert_fired_in_range("status --json before the journal", time);
+    }
     // `last-run` is read from the journal: wait for the `Starting` entry `goetia` matches, and then one
     // read must show the `last-run`.
     wait_for_started(&id);
@@ -229,15 +239,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(systemd_group)] _group: &
         let time = read.last_run.as_deref().unwrap_or_else(|| {
             panic!("journald holds the run's Starting entry, and a read shows no last-run: {running:?}")
         });
-        let fired = instant(time);
-        // One range: `enable` may span a minute boundary or more, and the minutes between candidates are
-        // the schedule's too.
-        let (first, last) = (candidates[0], candidates[2] + Duration::from_secs(60));
-        assert!(
-            fired >= first && fired < last,
-            "{}: last-run {fired:?} is not in [{first:?}, {last:?}) of {candidates:?}",
-            read.form
-        );
+        assert_fired_in_range(read.form, time);
     }
     // No fire can come between the end of the run and the reads that follow it.
     cli.daemon(&["disable", &id]);

@@ -24,6 +24,14 @@ pub fn until(mut condition: impl FnMut() -> bool) {
     }
 }
 
+/// [`until`] for a condition that costs a process or a query to check: it sleeps `pause` between
+/// checks, and the state still ends the wait.
+pub fn until_paced(pause: std::time::Duration, mut condition: impl FnMut() -> bool) {
+    while !condition() {
+        std::thread::sleep(pause);
+    }
+}
+
 /// The identity of the running process `pid`: its start time and unique id along with the number, so
 /// that a process that is later given the same number is another.
 pub fn identity_of(pid: u32) -> ProcessId {
