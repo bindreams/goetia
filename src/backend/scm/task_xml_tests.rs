@@ -10,8 +10,13 @@ use roxmltree::{Document, Node};
 
 const ID: &str = "nightly";
 const SCHEDULE: &str = "30 3 * * *";
+const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 // Fixtures ============================================================================================================
+
+fn token() -> Token {
+    Token::parse(TOKEN).expect("a fixture token is 32 lower-case hex digits")
+}
 
 fn spec_of(user: User, schedule: Option<&str>) -> DaemonSpec {
     let DaemonSpec::Task(task) = task(ID, vec![program("job"), "--flag".to_owned()], schedule) else {
@@ -127,7 +132,7 @@ fn readback(spec: &DaemonSpec, host: &HostCommand, triggers: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{exe}</Command>
-      <Arguments>{args} {TASK_MODE_ARG} {ID}</Arguments>
+      <Arguments>{args} {TASK_MODE_ARG} {ID} {TOKEN}</Arguments>
     </Exec>
   </Actions>
 </Task>"#
@@ -161,7 +166,7 @@ fn argv_of(exe: &str, arguments: &str) -> Vec<String> {
 }
 
 #[skuld::test]
-fn a_task_is_one_exec_action_of_the_host_in_task_mode() {
+fn arguments_end_with_the_flag_the_id_and_the_token() {
     let args = [
         "--plain",
         "with space",
@@ -173,7 +178,7 @@ fn a_task_is_one_exec_action_of_the_host_in_task_mode() {
         "ünï",
     ];
     let exe = abs("Program Files/Goetia/goetia-shim.exe");
-    let xml = definition(&spec(), host_at(&exe, &args)).unwrap().to_xml(true);
+    let xml = definition(&spec(), host_at(&exe, &args)).unwrap().to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
 
     assert_eq!(names_under(&document, "Task/Actions"), ["Exec"], "one action");
@@ -187,7 +192,7 @@ fn a_task_is_one_exec_action_of_the_host_in_task_mode() {
     );
     let mut expected = vec![exe.to_string_lossy().into_owned()];
     expected.extend(args.iter().map(|arg| (*arg).to_owned()));
-    expected.extend([TASK_MODE_ARG.to_owned(), ID.to_owned()]);
+    expected.extend([TASK_MODE_ARG.to_owned(), ID.to_owned(), TOKEN.to_owned()]);
     assert_eq!(
         argv_of(
             &exe.to_string_lossy(),
@@ -195,6 +200,42 @@ fn a_task_is_one_exec_action_of_the_host_in_task_mode() {
         ),
         expected
     );
+}
+
+#[skuld::test]
+fn the_token_is_32_lower_case_hex_and_two_fresh_ones_differ() {
+    let (first, second) = (Token::fresh(), Token::fresh());
+    assert_ne!(first, second);
+    for token in [&first, &second] {
+        let text = token.as_str();
+        assert_eq!(text.len(), 32, "{text}");
+        assert!(text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')), "{text}");
+        assert_eq!(Token::parse(text).as_ref(), Some(token));
+    }
+    for refused in [
+        "",
+        "0123456789abcdef",
+        &TOKEN.to_uppercase(),
+        &format!("{TOKEN}0"),
+        &"g".repeat(32),
+    ] {
+        assert_eq!(Token::parse(refused), None, "{refused:?}");
+    }
+}
+
+#[skuld::test]
+fn token_of_reads_the_token_the_xml_carries() {
+    let spec = spec();
+    assert_eq!(
+        TaskXml::token_of(&built(&spec).to_xml(true, &token())).unwrap(),
+        Some(token())
+    );
+    // As Task Scheduler reads it back.
+    assert_eq!(
+        TaskXml::token_of(&readback(&spec, &host(), DAILY_AT_0330)).unwrap(),
+        Some(token())
+    );
+    assert!(TaskXml::token_of("<Task><Actions>").is_err());
 }
 
 #[skuld::test]
@@ -217,7 +258,7 @@ fn a_percent_in_the_host_exe_or_arguments_is_refused_naming_the_limit() {
 
 #[skuld::test]
 fn the_blob_is_a_top_level_data_element_with_lf_only() {
-    let xml = built(&spec()).to_xml(true);
+    let xml = built(&spec()).to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
 
     let data = at(&document, "Task/Data").expect("`Data` is a child of `Task`");
@@ -231,7 +272,7 @@ fn the_blob_is_a_top_level_data_element_with_lf_only() {
 #[skuld::test]
 fn the_blob_round_trips_through_extract_from_data() {
     let spec = spec();
-    let xml = built(&spec).to_xml(true);
+    let xml = built(&spec).to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
     let data = at(&document, "Task/Data").unwrap();
 
@@ -259,7 +300,7 @@ fn data_that_is_not_goetias_is_foreign_and_a_marker_with_a_broken_blob_is_an_err
 #[skuld::test]
 fn the_never_trigger_is_a_one_time_trigger_at_the_fixed_past_boundary() {
     let spec = spec_of(User::Root, Some("0 0 30 2 *"));
-    let xml = built(&spec).to_xml(true);
+    let xml = built(&spec).to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
 
     assert_eq!(names_under(&document, "Task/Triggers"), ["TimeTrigger"]);
@@ -272,7 +313,7 @@ fn the_never_trigger_is_a_one_time_trigger_at_the_fixed_past_boundary() {
 
 #[skuld::test]
 fn the_design_settings_are_written() {
-    let xml = built(&spec()).to_xml(true);
+    let xml = built(&spec()).to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
 
     for (path, value) in [
@@ -296,7 +337,7 @@ fn the_design_settings_are_written() {
 
 #[skuld::test]
 fn a_trigger_is_written_with_local_time_and_no_zone() {
-    let xml = built(&spec_of(User::Root, Some("15,30,45 9 * 3-5 1-5"))).to_xml(true);
+    let xml = built(&spec_of(User::Root, Some("15,30,45 9 * 3-5 1-5"))).to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
 
     let trigger = "Task/Triggers/CalendarTrigger";
@@ -357,7 +398,7 @@ fn each_account_maps_to_its_principal() {
     ];
     for (user, sid) in services {
         let task = built(&spec_of(user.clone(), Some(SCHEDULE)));
-        let xml = task.to_xml(true);
+        let xml = task.to_xml(true, &token());
         let document = Document::parse(&xml).unwrap();
         assert_eq!(
             at(&document, "Task/Principals/Principal/UserId").as_deref(),
@@ -372,7 +413,7 @@ fn each_account_maps_to_its_principal() {
     }
 
     let task = built(&spec_of(User::Name("alice".into()), Some(SCHEDULE)));
-    let xml = task.to_xml(true);
+    let xml = task.to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
     assert_eq!(
         at(&document, "Task/Principals/Principal/UserId").as_deref(),
@@ -418,7 +459,7 @@ fn parse_of_task_scheduler_normalised_xml_is_the_definition() {
         let desired = built(&spec);
         // The readback differs from what was written in every way M4 measured; only the triggers are
         // taken from what was written, since a literal for each shape would restate the writer.
-        let written = desired.to_xml(true);
+        let written = desired.to_xml(true, &token());
         let triggers = {
             let document = Document::parse(&written).unwrap();
             node_at(&document, "Task/Triggers").map(|node| written[node.range()].to_owned())
@@ -439,6 +480,44 @@ fn parse_of_task_scheduler_normalised_xml_is_the_definition() {
 }
 
 #[skuld::test]
+fn parse_ignores_the_token_so_equal_definitions_stay_equal() {
+    let spec = spec();
+    let first = TaskXml::parse(&readback(&spec, &host(), DAILY_AT_0330), &data_of(&spec)).unwrap();
+    let other = readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "fedcba9876543210fedcba9876543210");
+    let second = TaskXml::parse(&other, &data_of(&spec)).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.to_string(), second.to_string());
+    assert_eq!(first.to_string(), built(&spec).to_string());
+    assert_eq!(first.host(), host());
+}
+
+#[skuld::test]
+fn a_registration_without_a_token_reads_as_unrecognised() {
+    let spec = spec();
+    let legacy = readback(&spec, &host(), DAILY_AT_0330).replace(&format!(" {TOKEN}"), "");
+    assert_eq!(TaskXml::token_of(&legacy).unwrap(), None);
+
+    let installed = TaskXml::parse(&legacy, &data_of(&spec)).unwrap();
+    assert!(
+        installed
+            .to_string()
+            .contains(&format!("Arguments do not end with {TASK_MODE_ARG} {ID} <token>")),
+        "{installed}"
+    );
+    assert_ne!(installed.to_string(), built(&spec).to_string());
+    // The old ending is no part of the host, so that an install writes the host's own arguments again.
+    assert_eq!(installed.host(), host());
+
+    // A last argument that is no token is none.
+    for wrong in [TOKEN.to_uppercase(), "0123".to_owned()] {
+        let xml = readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, &wrong);
+        assert_eq!(TaskXml::token_of(&xml).unwrap(), None, "{wrong}");
+        let installed = TaskXml::parse(&xml, &data_of(&spec)).unwrap();
+        assert_ne!(installed.to_string(), built(&spec).to_string(), "{wrong}");
+    }
+}
+
+#[skuld::test]
 fn the_account_is_the_blobs_and_never_read_from_the_principal() {
     let spec = spec_of(User::Name("alice".into()), Some(SCHEDULE));
     // Task Scheduler rewrites the account to a SID, which is no name the spec holds.
@@ -455,13 +534,13 @@ fn the_account_is_the_blobs_and_never_read_from_the_principal() {
 /// `uninstall` that disarms it first): a password logon is a user's, anything else a service account.
 #[skuld::test]
 fn a_stored_principal_names_the_account_to_register_again_as() {
-    let service = built(&spec()).to_xml(true);
+    let service = built(&spec()).to_xml(true, &token());
     assert_eq!(
         TaskXml::principal(&service).unwrap(),
         TaskAccount::Service("S-1-5-18".to_owned())
     );
 
-    let user = built(&spec_of(User::Name("alice".into()), Some(SCHEDULE))).to_xml(true);
+    let user = built(&spec_of(User::Name("alice".into()), Some(SCHEDULE))).to_xml(true, &token());
     assert_eq!(
         TaskXml::principal(&user).unwrap(),
         TaskAccount::User("alice".to_owned())
@@ -484,10 +563,10 @@ fn a_readback_is_a_fixed_point() {
     let spec = spec();
     let first = TaskXml::parse(&readback(&spec, &host(), DAILY_AT_0330), &data_of(&spec)).unwrap();
     // Rendered with a trigger the readback dropped the flag of, then read again.
-    let again = TaskXml::parse(&first.to_xml(true), &data_of(&spec)).unwrap();
+    let again = TaskXml::parse(&first.to_xml(true, &token()), &data_of(&spec)).unwrap();
     assert_eq!(first, again);
     assert_eq!(first.to_string(), again.to_string());
-    let disarmed = TaskXml::parse(&first.to_xml(false), &data_of(&spec)).unwrap();
+    let disarmed = TaskXml::parse(&first.to_xml(false, &token()), &data_of(&spec)).unwrap();
     assert_eq!(first, disarmed, "the flags are not part of the definition");
 }
 
@@ -665,10 +744,10 @@ fn armed_flags_are_not_in_display() {
     assert_eq!(armed.to_string(), disarmed.to_string());
     let desired = built(&spec);
     assert_eq!(desired.to_string(), armed.to_string());
-    assert!(desired.to_xml(true).contains("<Enabled>true</Enabled>"));
-    assert!(desired.to_xml(false).contains("<Enabled>false</Enabled>"));
-    assert!(TaskXml::armed(&desired.to_xml(true)));
-    assert!(!TaskXml::armed(&desired.to_xml(false)));
+    assert!(desired.to_xml(true, &token()).contains("<Enabled>true</Enabled>"));
+    assert!(desired.to_xml(false, &token()).contains("<Enabled>false</Enabled>"));
+    assert!(TaskXml::armed(&desired.to_xml(true, &token())));
+    assert!(!TaskXml::armed(&desired.to_xml(false, &token())));
 }
 
 #[skuld::test]
@@ -676,7 +755,7 @@ fn a_task_with_no_schedule_has_no_triggers_and_is_never_armed() {
     let spec = spec_of(User::Root, None);
     let task = built(&spec);
     for armed in [true, false] {
-        let xml = task.to_xml(armed);
+        let xml = task.to_xml(armed, &token());
         let document = Document::parse(&xml).unwrap();
         assert!(
             node_at(&document, "Task/Triggers").is_none_or(|node| node.children().all(|child| !child.is_element())),
@@ -774,7 +853,7 @@ fn a_repetition_trigger_reads_back_in_task_schedulers_order() {
 fn a_lone_zero_trigger_and_a_repetition_in_one_hour_read_back_unchanged() {
     let spec = spec_of(User::Root, Some("*/15 9 * * *"));
     let task = built(&spec);
-    let xml = task.to_xml(true);
+    let xml = task.to_xml(true, &token());
     let document = Document::parse(&xml).unwrap();
     assert_eq!(
         names_under(&document, "Task/Triggers"),
@@ -808,9 +887,9 @@ fn a_lone_zero_trigger_and_a_repetition_in_one_hour_read_back_unchanged() {
 fn a_schedule_that_never_fires_has_a_trigger_and_can_be_armed() {
     let spec = spec_of(User::Root, Some("0 0 31 4,6 *"));
     let task = built(&spec);
-    assert!(!TaskXml::armed(&task.to_xml(false)));
-    assert!(TaskXml::armed(&task.to_xml(true)));
-    let armed = TaskXml::with_armed(&task.to_xml(false), true).unwrap();
+    assert!(!TaskXml::armed(&task.to_xml(false, &token())));
+    assert!(TaskXml::armed(&task.to_xml(true, &token())));
+    let armed = TaskXml::with_armed(&task.to_xml(false, &token()), true).unwrap();
     assert!(TaskXml::armed(&armed));
 }
 

@@ -70,8 +70,17 @@ pub(crate) fn task_host() -> crate::shim::HostCommand {
     }
 }
 
-/// What Task Scheduler holds for `spec` run through [`task_host`]: the XML goetia registers, its
-/// triggers enabled or not, and the blob as its `Data`.
+/// The token of every registration [`registered_task`] makes.
+#[cfg(windows)]
+pub(crate) const TASK_TOKEN: &str = "feedfeedfeedfeedfeedfeedfeedfeed";
+
+#[cfg(windows)]
+pub(crate) fn task_token() -> crate::backend::scm::task_xml::Token {
+    crate::backend::scm::task_xml::Token::parse(TASK_TOKEN).expect("a fixture token is 32 lower-case hex digits")
+}
+
+/// What Task Scheduler holds for `spec` run through [`task_host`]: the XML goetia registers with the
+/// token [`TASK_TOKEN`], its triggers enabled or not, and the blob as its `Data`.
 #[cfg(windows)]
 pub(crate) fn registered_task(
     spec: &crate::spec::DaemonSpec,
@@ -79,7 +88,7 @@ pub(crate) fn registered_task(
 ) -> crate::backend::scm::manager::task::api::Registered {
     let definition = crate::backend::scm::task_xml::TaskXml::new(spec, task_host()).unwrap();
     crate::backend::scm::manager::task::api::Registered {
-        xml: definition.to_xml(armed),
+        xml: definition.to_xml(armed, &task_token()),
         data: crate::blob::metadata_text(spec),
         enabled: Some(true),
     }

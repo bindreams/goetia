@@ -15,7 +15,7 @@ use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::shim::acl::read_object;
 use crate::backend::scm::sid::{Sid, sid_from_parts, system};
-use crate::backend::scm::test_support::{registered_task, task_host, task_spec, task_spec_as};
+use crate::backend::scm::test_support::{registered_task, task_host, task_spec, task_spec_as, task_token};
 use crate::blob::Blob;
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::elevation::test_support::process_user_sid;
@@ -87,7 +87,7 @@ fn prepared(principal: Sid, password: Option<&str>) -> impl FnOnce(&TaskAccount)
 fn register_call(spec: &DaemonSpec, armed: bool, who: TaskAccount, password: Option<&str>, update: bool) -> Call {
     Call::Register {
         path: PATH.to_owned(),
-        xml: definition(spec).to_xml(armed),
+        xml: definition(spec).to_xml(armed, &task_token()),
         who,
         password: password.map(str::to_owned),
         update,
@@ -96,6 +96,52 @@ fn register_call(spec: &DaemonSpec, armed: bool, who: TaskAccount, password: Opt
 
 fn root() -> TaskAccount {
     TaskAccount::Service("S-1-5-18".to_owned())
+}
+
+/// The calls the fake saw, a registered token read as the fixture's ([`task_token`]): a create's is fresh, so a
+/// test that compares the whole call reads it as the one `register_call` writes.
+fn calls_of(fake: &Fake) -> Vec<Call> {
+    fake.calls()
+        .into_iter()
+        .map(|call| match call {
+            Call::Register {
+                path,
+                xml,
+                who,
+                password,
+                update,
+            } => {
+                let xml = match TaskXml::token_of(&xml) {
+                    Ok(Some(token)) => xml.replace(token.as_str(), task_token().as_str()),
+                    _ => xml,
+                };
+                Call::Register {
+                    path,
+                    xml,
+                    who,
+                    password,
+                    update,
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// The token of the one registration the fake saw.
+fn registered_token(fake: &Fake) -> Token {
+    let tokens: Vec<_> = fake
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            Call::Register { xml, .. } => Some(TaskXml::token_of(xml).unwrap().expect("a registration has a token")),
+            _ => None,
+        })
+        .collect();
+    let [token] = tokens.as_slice() else {
+        panic!("one registration expected: {tokens:?}")
+    };
+    token.clone()
 }
 
 // Install =============================================================================================================
@@ -119,7 +165,7 @@ fn install_of_a_task_creates_it_disarmed() {
         .unwrap();
 
     assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
-    assert_eq!(fake.calls(), [register_call(&spec, false, root(), None, false)]);
+    assert_eq!(calls_of(&fake), [register_call(&spec, false, root(), None, false)]);
     fake.finish();
 }
 
@@ -262,7 +308,7 @@ fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_sta
         // The disable is first: a scheduled fire between the check of the old account's runs and the delete
         // would start a run as the old account that nothing waits for.
         assert_eq!(
-            fake.calls(),
+            calls_of(&fake),
             [
                 Call::SetEnabled(PATH.to_owned(), false),
                 Call::Instances(PATH.to_owned()),
@@ -1198,7 +1244,7 @@ fn install_of_a_real_user_task_grants_the_batch_right_before_the_first_write() {
 
     assert!(granted.get());
     assert_eq!(
-        fake.calls(),
+        calls_of(&fake),
         [register_call(
             &spec,
             false,
@@ -1794,7 +1840,7 @@ fn a_service_is_removed_after_the_task_is_acquired_and_before_it_is_registered()
     assert!(matches!(wrote, WriteOutcome::Done), "{wrote:?}");
     assert!(retired.get());
     assert_eq!(
-        fake.calls(),
+        calls_of(&fake),
         [register_call(&spec, false, root(), None, false)],
         "a create, disarmed"
     );

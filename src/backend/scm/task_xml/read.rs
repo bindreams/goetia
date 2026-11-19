@@ -9,7 +9,8 @@ use cosca::quote::windows::split_wide;
 use roxmltree::{Document, Node};
 
 use super::{
-    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, TASK_MODE_ARG, TaskXml, WEEKDAYS, account_of, extract_from_data,
+    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, TASK_MODE_ARG, TaskXml, Token, WEEKDAYS, account_of,
+    extract_from_data,
 };
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::triggers::{Repeat, Trigger};
@@ -100,6 +101,23 @@ impl TaskXml {
             TaskAccount::User(user)
         } else {
             TaskAccount::Service(user)
+        })
+    }
+
+    /// The token the first action's arguments end with (`... --goetia-task <id> <token>`), the
+    /// registration's own. `None` when they carry none: a registration made before the token, or one
+    /// whose last argument is no token. An error only for XML that cannot be read.
+    pub(crate) fn token_of(xml: &str) -> Result<Option<Token>, Error> {
+        let document = document(xml)?;
+        let arguments = child(document.root_element(), "Actions")
+            .and_then(|actions| elements(actions).next())
+            .filter(|action| action.tag_name().name() == "Exec")
+            .and_then(|exec| child(exec, "Arguments"))
+            .map(text)
+            .unwrap_or_default();
+        Ok(match split_arguments(&arguments).as_slice() {
+            [.., flag, _, token] if flag == TASK_MODE_ARG => Token::parse(token),
+            _ => None,
         })
     }
 
@@ -280,15 +298,30 @@ fn action_of(root: Node<'_, '_>, id: &Id, unrecognised: &mut Vec<String>) -> Res
     }
 
     let mut args = split_arguments(&child(exec, "Arguments").map(text).unwrap_or_default());
-    if args.ends_with(&[TASK_MODE_ARG.to_owned(), id.as_str().to_owned()]) {
-        args.truncate(args.len() - 2);
-    } else {
-        unrecognised.push(format!("Arguments do not end with {TASK_MODE_ARG} {id}"));
-    }
+    let task_mode = [TASK_MODE_ARG, id.as_str()];
+    let ending = match args.as_slice() {
+        [.., flag, named, token] if [flag, named] == task_mode && Token::parse(token).is_some() => 3,
+        // A registration made before the token: its ending is no part of the host, so that writing
+        // the task again does not repeat it, and it is different from the one an install writes.
+        [.., flag, named] if [flag, named] == task_mode => {
+            unrecognised.push(missing_ending(id));
+            2
+        }
+        _ => {
+            unrecognised.push(missing_ending(id));
+            0
+        }
+    };
+    args.truncate(args.len() - ending);
     Ok(HostCommand {
         exe: PathBuf::from(text(command)),
         args,
     })
+}
+
+/// The line a definition shows for an action whose arguments do not end as an install writes them.
+fn missing_ending(id: &Id) -> String {
+    format!("Arguments do not end with {TASK_MODE_ARG} {id} <token>")
 }
 
 /// The arguments of an `Arguments` text, as `CommandLineToArgvW` reads them after the program.

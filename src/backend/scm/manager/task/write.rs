@@ -29,7 +29,7 @@ use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::sid::{Sid, distinct, sid_from_parts};
-use crate::backend::scm::task_xml::{TaskXml, builtin_sid};
+use crate::backend::scm::task_xml::{TaskXml, Token, builtin_sid};
 use crate::backend::{Identity, InstalledService, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::manager::State;
@@ -311,7 +311,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let registered = self.tasks.register(
             &TaskPath::of(id),
-            &definition.to_xml(armed),
+            &definition.to_xml(armed, &Token::fresh()),
             &definition.account(),
             prepared.password.as_deref(),
             update,

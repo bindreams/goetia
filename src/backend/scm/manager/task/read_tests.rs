@@ -124,7 +124,7 @@ fn the_host_a_task_is_regenerated_with_is_the_installed_actions_not_a_providers(
     };
     let definition = crate::backend::scm::task_xml::TaskXml::new(&spec, moved.clone()).unwrap();
     let registered = Registered {
-        xml: definition.to_xml(false),
+        xml: definition.to_xml(false, &crate::backend::scm::test_support::task_token()),
         data: crate::blob::metadata_text(&spec),
         enabled: Some(true),
     };

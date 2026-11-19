@@ -9,7 +9,8 @@
 //! [`TaskXml`] built from the elements goetia owns, with a dropped one read as its default, and the
 //! account is the blob's, never the principal's. [`Display`](fmt::Display) is the definition's
 //! canonical text: the same for what is generated and what is read back, and with no armed state,
-//! which is the triggers' `Enabled` flags ([`TaskXml::armed`], [`TaskXml::with_armed`]).
+//! which is the triggers' `Enabled` flags ([`TaskXml::armed`], [`TaskXml::with_armed`]), and no
+//! registration [`Token`] ([`TaskXml::token_of`]).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -27,8 +28,32 @@ use crate::spec::{AccountId, Builtin, DaemonSpec, Id, User, invalid, windows_bui
 mod read;
 
 /// The argument that makes the shim run as a task: the action's arguments are the host's own, then
-/// this and the task's id.
+/// this, the task's id and the registration's [`Token`].
 pub(crate) const TASK_MODE_ARG: &str = "--goetia-task";
+
+/// What tells one registration of a task from another: the last argument of its action. A create makes a
+/// fresh one and an update keeps it, so a shim started under a registration that has since been
+/// replaced finds another in the task it reads, and starts no program. It is no part of a
+/// [`TaskXml`]: what an install compares is the definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Token(String);
+
+impl Token {
+    /// A token no earlier one equals: 128 random bits as 32 lower-case hex digits.
+    pub(crate) fn fresh() -> Token {
+        Token(format!("{:032x}", rand::random::<u128>()))
+    }
+
+    /// `text` as a token: exactly 32 lower-case hex digits.
+    pub(crate) fn parse(text: &str) -> Option<Token> {
+        let valid = text.len() == 32 && text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        valid.then(|| Token(text.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Where a schedule that never fires is anchored: a one-time trigger at a fixed past instant fires
 /// nothing at registration or when it is enabled, and reads no next run.
@@ -185,8 +210,9 @@ impl TaskXml {
     }
 
     /// The XML to register. `armed` is every trigger's `Enabled` flag, written explicitly; it is
-    /// the installation's state and no part of the definition.
-    pub(crate) fn to_xml(&self, armed: bool) -> String {
+    /// the installation's state and no part of the definition. `token` is the registration's, the
+    /// action's last argument.
+    pub(crate) fn to_xml(&self, armed: bool, token: &Token) -> String {
         let mut out = String::new();
         out.push_str("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n");
         out.push_str("<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">");
@@ -215,7 +241,7 @@ impl TaskXml {
         out.push_str(&format!(
             "<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>",
             xml_escape(&self.host.exe.to_string_lossy()),
-            xml_escape(&self.arguments())
+            xml_escape(&self.arguments(token))
         ));
         out.push_str("</Task>");
         out
@@ -260,15 +286,15 @@ impl TaskXml {
         out
     }
 
-    /// The action's `Arguments`: the host's, the task-mode argument and the id, quoted as
+    /// The action's `Arguments`: the host's, the task-mode argument, the id and the token, quoted as
     /// `CommandLineToArgvW` reads them back (they arrive verbatim after the quoted command).
-    fn arguments(&self) -> String {
+    fn arguments(&self, token: &Token) -> String {
         let wide: Vec<Vec<u16>> = self
             .host
             .args
             .iter()
             .map(String::as_str)
-            .chain([TASK_MODE_ARG, self.id.as_str()])
+            .chain([TASK_MODE_ARG, self.id.as_str(), token.as_str()])
             .map(|arg| arg.encode_utf16().collect())
             .collect();
         let borrowed: Vec<&[u16]> = wide.iter().map(Vec::as_slice).collect();
@@ -443,7 +469,7 @@ pub(crate) fn extract_from_data(data: &str) -> Result<Option<Blob>, Error> {
 // Rendering ===========================================================================================================
 
 /// The definition's canonical text, for diffing: the same for a generated definition and a readback
-/// of it, with no armed state. Every value goetia owns is shown, a default Task Scheduler dropped
+/// of it, with no armed state and no token. Every value goetia owns is shown, a default Task Scheduler dropped
 /// included; the account is a well-known account's name or the user's.
 impl fmt::Display for TaskXml {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
