@@ -910,9 +910,10 @@ fn a_pid_the_caller_read_whose_process_is_gone_is_ended_with_no_read_of_the_mana
 fn an_open_that_failed_on_a_pid_the_caller_read_is_a_refusal_only_while_the_manager_names_it() {
     let mut named = Scripted::new([Some(100)], [Open::Fails]);
     let error = hold_pid(&mut named, 100).expect_err("a refusal");
-    assert!(
-        matches!(&error, HoldError::Refused(e) if e.to_string() == "access denied"),
-        "{error:?}"
+    assert!(matches!(error, HoldError::Refused(_)), "{error:?}");
+    assert_eq!(
+        kill_failed(ID, error.into()).report().to_string(),
+        "failed to kill `frpc`: opening process 100: access denied"
     );
     assert_eq!(named.log(), steps(["open 100", "service_pid"]));
 
