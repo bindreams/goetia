@@ -1051,6 +1051,10 @@ starts nothing and raises nothing.
   nothing is installed at the id: install again, and `enable` it if it was
   armed. A wrong `GOETIA_SERVICE_PASSWORD` fails that way: Task Scheduler
   checks it only when it registers the new task.
+- An install or an `uninstall` that did not finish can leave the task switched
+  off: nothing starts it, and `start` and `run` fail saying so. Run the install
+  again with `--force` (without it the switched-off task reads as a hand edit),
+  or uninstall it.
 - A service `uninstall` while Task Scheduler is unusable cannot tell whether a
   task still references the host's file, so it leaves the file and reports it;
   the next sweep removes it.
