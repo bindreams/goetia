@@ -17,7 +17,9 @@ use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, conformance};
-use goetia::spec::{AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use goetia::spec::{
+    AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
+};
 use goetia::testing::service_fields;
 use serde_json::Value;
 
@@ -463,7 +465,7 @@ fn start_stop_status_reflect_reality(#[fixture(systemd_group)] _group: &Group) {
     assert_eq!(status.common().state, State::Running, "{status:?}");
     assert!(status.common().pid.is_some(), "{status:?}");
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     let status = mgr.status(&spec.common().id).expect("status after stop");
     assert_ne!(status.common().state, State::Running, "{status:?}");
     assert!(status.common().pid.is_none(), "{status:?}");
@@ -620,7 +622,7 @@ fn killing_a_stopped_unit_is_not_running(#[fixture(systemd_group)] _group: &Grou
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 }
 
@@ -676,7 +678,7 @@ fn a_stop_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Grou
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
-    mgr.stop(&spec.common().id, Budget::Immediate)
+    mgr.stop(&spec.common().id, Some(Budget::Immediate))
         .expect("a stop with no budget issues the request and returns");
 
     let (state, job) = active_state_and_job(guard.id());
@@ -743,7 +745,7 @@ fn a_stop_that_can_never_complete_times_out_with_the_job_standing(#[fixture(syst
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let err = mgr
-        .stop(&spec.common().id, Budget::Bounded(Duration::from_secs(1)))
+        .stop(&spec.common().id, Some(Budget::Bounded(Duration::from_secs(1))))
         .expect_err("a stop that can never complete must not report stopped");
 
     assert!(
@@ -767,7 +769,7 @@ fn a_stop_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gro
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let err = mgr
-        .stop(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)))
+        .stop(&spec.common().id, Some(Budget::Bounded(Duration::from_nanos(1))))
         .expect_err("a stop that can never complete must not report stopped");
 
     assert!(
@@ -982,7 +984,7 @@ fn a_stop_of_a_unit_systemd_cannot_load_has_nothing_to_stop(#[fixture(systemd_gr
     assert_eq!(load_state.stdout.trim(), "bad-setting");
 
     for budget in [Budget::DEFAULT, Budget::Unbounded, Budget::Immediate] {
-        mgr.stop(&Id::try_from(guard.id()).unwrap(), budget)
+        mgr.stop(&Id::try_from(guard.id()).unwrap(), Some(budget))
             .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
         assert_eq!(
             active_state_and_job(guard.id()),
@@ -3017,4 +3019,144 @@ fn a_retyped_daemon_keeps_nothing_of_the_old_kind_that_still_acts(#[fixture(syst
     );
     let active = cmd::run("systemctl", &["is-active", &format!("{id}.timer")]);
     assert!(!active.ok(), "the timer is not running: {active}");
+}
+
+// stop-action =========================================================================================================
+
+/// One property of the unit as `systemctl show` reports it.
+fn show_property(id: &str, name: &str) -> String {
+    let unit = format!("{id}.service");
+    let run = cmd::run("systemctl", &["show", "--value", &format!("--property={name}"), &unit]).expect_ok();
+    run.stdout.trim().to_string()
+}
+
+#[skuld::test]
+fn the_units_stop_signal_and_timeout_are_what_systemd_runs(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let usr1 = "sigusr1".parse::<StopSignal>().unwrap();
+    let spec = support::stopping_by(
+        mk(guard.id()),
+        support::tasks::sh("exec /bin/sleep infinity"),
+        StopAction {
+            send_signal: usr1,
+            timeout: Some(Duration::from_secs(7)),
+        },
+    );
+    Systemd::new().install(&spec, false).expect("install");
+
+    // SIGUSR1 is 10 on Linux, which is how systemd reports it.
+    assert_eq!(show_property(guard.id(), "KillSignal"), "10");
+    assert_eq!(show_property(guard.id(), "TimeoutStopUSec"), "7s");
+}
+
+#[skuld::test]
+fn no_timeout_is_an_infinite_stop_timeout_for_systemd(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = support::stopping_by(
+        mk(guard.id()),
+        support::tasks::sh("exec /bin/sleep infinity"),
+        StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: None,
+        },
+    );
+    Systemd::new().install(&spec, false).expect("install");
+
+    assert_eq!(show_property(guard.id(), "TimeoutStopUSec"), "infinity");
+    assert_eq!(show_property(guard.id(), "KillSignal"), "15");
+}
+
+/// A daemon that saves and exits on the signal it is asked with ends cleanly: `stop` returns `Ok`, and
+/// the unit's result is `success`, not a kill.
+#[skuld::test]
+fn a_daemon_that_answers_the_stop_signal_ends_cleanly(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let listener = support::ConnectBack::listen();
+    let spec = support::stopping_by(
+        mk(guard.id()),
+        listener.sh_after("trap 'exit 0' USR1", "/bin/sleep infinity & wait"),
+        StopAction {
+            send_signal: "sigusr1".parse::<StopSignal>().unwrap(),
+            timeout: Some(Duration::from_secs(30)),
+        },
+    );
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to have installed its trap");
+
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
+
+    assert_eq!(show_property(guard.id(), "Result"), "success");
+    assert_eq!(show_property(guard.id(), "ExecMainStatus"), "0");
+}
+
+/// A daemon that ignores the stop signal is killed once the timeout has passed, and the stop reports
+/// stopped: the timeout is the grace, not a wait that fails.
+#[skuld::test]
+fn a_daemon_that_ignores_the_stop_signal_is_killed_after_the_timeout(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let listener = support::ConnectBack::listen();
+    let spec = support::stopping_by(
+        mk(guard.id()),
+        listener.sh_after("trap '' TERM", "exec /bin/sleep infinity"),
+        StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: Some(Duration::from_secs(2)),
+        },
+    );
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to be ignoring SIGTERM");
+
+    mgr.stop(&spec.common().id, Some(Budget::Bounded(Duration::from_secs(60))))
+        .expect("stop");
+
+    let status = mgr.status(&spec.common().id).expect("status");
+    assert_ne!(status.common().state, State::Running, "{status:?}");
+    assert_eq!(show_property(guard.id(), "Result"), "timeout");
+}
+
+/// `kill` ends the daemon at once, however it traps: no grace to wait out. The daemon reports in after
+/// its `trap`, so the stop meets a run that ignores `SIGTERM` and `SIGINT`: it ends by the kill itself
+/// (status 9), and not by systemd's stop timeout, which the unit has by default and which is far longer
+/// than the stop's own bound.
+#[skuld::test]
+fn kill_ends_a_daemon_that_ignores_everything_at_once(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let listener = support::ConnectBack::listen();
+    let spec = support::stopping_by(
+        mk(guard.id()),
+        listener.sh_after("trap '' TERM INT", "exec /bin/sleep infinity"),
+        StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None,
+        },
+    );
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    // No `TimeoutStopSec=` is written, so systemd's own default bounds a process the kernel holds.
+    assert_eq!(show_property(guard.id(), "KillSignal"), "9");
+    assert_ne!(show_property(guard.id(), "TimeoutStopUSec"), "infinity");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to be ignoring SIGTERM and SIGINT");
+
+    // `Budget::DEFAULT` is shorter than systemd's default stop timeout: a stop that had to wait that out
+    // would not return `Ok`.
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
+
+    let status = mgr.status(&spec.common().id).expect("status");
+    assert_ne!(status.common().state, State::Running, "{status:?}");
+    assert_eq!(show_property(guard.id(), "ExecMainStatus"), "9", "the run was killed");
+    assert_ne!(
+        show_property(guard.id(), "Result"),
+        "timeout",
+        "the stop timeout did not end it"
+    );
 }

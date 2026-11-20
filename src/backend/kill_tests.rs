@@ -188,8 +188,8 @@ impl KillTarget for Scripted {
         }
     }
 
-    fn terminate(&mut self, process: &Held) -> io::Result<()> {
-        self.log.borrow_mut().push(format!("terminate {}", process.pid));
+    fn force_end(&mut self, process: &Held) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("force_end {}", process.pid));
         if self.failing_terminate {
             return Err(io::Error::other("terminate failed"));
         }
@@ -278,7 +278,7 @@ fn the_process_is_held_from_the_open_through_the_waits_and_signalled_before_any_
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
@@ -299,7 +299,7 @@ fn a_wait_for_a_process_that_has_not_exited_says_why_before_it_blocks() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100 for the notice",
             "notice frpc: waiting for process 100 to exit",
             "await_exit 100",
@@ -358,7 +358,7 @@ fn a_wait_for_the_manager_to_record_the_exit_says_why_before_it_blocks() {
         (
             "after a signal",
             signalled,
-            vec!["terminate 100", "await_exit 100 for the notice"],
+            vec!["force_end 100", "await_exit 100 for the notice"],
         ),
         ("for an ended process", ended, vec![]),
     ] {
@@ -452,7 +452,7 @@ fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
         kill_failed(ID, e).report().to_string(),
         "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
     );
-    assert!(!target.log().iter().any(|call| call.starts_with("terminate")));
+    assert!(!target.log().iter().any(|call| call.starts_with("force_end")));
 }
 
 /// The manager reports another process by the confirmation: it has moved off the one held, which is
@@ -513,7 +513,7 @@ fn a_restart_during_the_kill_is_not_followed() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
@@ -718,7 +718,7 @@ fn a_failed_record_wait_after_the_signal_says_the_signal_was_delivered() {
             "service_pid",
             "open 100",
             "service_pid",
-            "terminate 100",
+            "force_end 100",
             "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
@@ -810,7 +810,7 @@ fn a_failed_signal_is_an_error_and_waits_for_nothing() {
     assert!(text.ends_with("terminate failed"), "{text}");
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "service_pid", "terminate 100", "close 100"]),
+        steps(["service_pid", "open 100", "service_pid", "force_end 100", "close 100"]),
         "the process is let go on the error path too"
     );
 }
@@ -837,7 +837,7 @@ fn a_record_the_manager_does_not_make_by_the_deadline_expires_the_hold() {
 fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
 
-    let Ok(Hold::Held { pid, process }) = hold_once(&mut target, Budget::Unbounded.start()) else {
+    let Ok(Some(Hold::Held { pid, process })) = hold_once(&mut target, Budget::Unbounded.start()) else {
         panic!("a held process");
     };
 
@@ -845,6 +845,86 @@ fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
     drop(process);
     assert_eq!(target.log().last().map(String::as_str), Some("close 100"));
+}
+
+/// A service the manager reports with no process is not held: there is nothing to hold, and it is read once.
+#[skuld::test]
+fn a_service_with_no_process_is_not_held() {
+    let mut target = Scripted::new([None], []);
+
+    let hold = hold_once(&mut target, Budget::Unbounded.start()).expect("a read");
+
+    assert!(hold.is_none(), "{hold:?}");
+    assert_eq!(target.log(), steps(["service_pid"]));
+}
+
+/// A process gone before it could be opened is waited for in the manager, until the deadline: once the
+/// manager has recorded it, it is [`Hold::Ended`].
+#[skuld::test]
+fn a_process_gone_before_the_open_is_ended_once_the_manager_records_it() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone]);
+
+    let hold = hold_once(&mut target, Budget::Unbounded.start()).expect("a record");
+
+    assert!(matches!(hold, Some(Hold::Ended { pid: 100, held: None })), "{hold:?}");
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "await_recorded 100 unheld"])
+    );
+}
+
+// A pid already read --------------------------------------------------------------------------------------------------
+
+/// A caller that has read the manager's pid itself (a launchd stop, which watches it before it holds it)
+/// holds that pid: the manager is not asked for it again, only whether it still vouches for it.
+#[skuld::test]
+fn a_pid_the_caller_read_is_held_without_reading_the_manager_for_it() {
+    let mut target = Scripted::new([Some(100)], [Open::Found]);
+
+    let Ok(Hold::Held { pid, process }) = hold_pid(&mut target, 100) else {
+        panic!("a held process");
+    };
+
+    assert_eq!(pid, 100);
+    assert_eq!(target.log(), steps(["open 100", "service_pid"]));
+    drop(process);
+}
+
+/// A pid whose process is gone is [`Hold::Ended`] with no read of the manager made for it: a caller that
+/// paces its own next read (a launchd stop, whose deadline is spent) does not read twice, and a gone
+/// process is never an error of that read.
+#[skuld::test]
+fn a_pid_the_caller_read_whose_process_is_gone_is_ended_with_no_read_of_the_manager() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone])
+        .failing_recorded()
+        .failing_read(1);
+
+    let hold = hold_pid(&mut target, 100).expect("an ended process, not a read error");
+
+    assert!(matches!(hold, Hold::Ended { pid: 100, held: None }), "{hold:?}");
+    assert_eq!(target.log(), steps(["open 100"]), "the manager is not read");
+}
+
+/// The failed-open rule is the one `hold_once` has: a refusal only while the manager still names the pid.
+#[skuld::test]
+fn an_open_that_failed_on_a_pid_the_caller_read_is_a_refusal_only_while_the_manager_names_it() {
+    let mut named = Scripted::new([Some(100)], [Open::Fails]);
+    let error = hold_pid(&mut named, 100).expect_err("a refusal");
+    assert!(matches!(error, HoldError::Refused(_)), "{error:?}");
+    assert_eq!(
+        kill_failed(ID, error.into()).report().to_string(),
+        "failed to kill `frpc`: opening process 100: access denied"
+    );
+    assert_eq!(named.log(), steps(["open 100", "service_pid"]));
+
+    for moved_off in [Some(200), None] {
+        let mut gone = Scripted::new([moved_off], [Open::Fails]);
+        let hold = hold_pid(&mut gone, 100).expect("an ended process, not a refusal");
+        assert!(
+            matches!(hold, Hold::Ended { pid: 100, held: None }),
+            "{moved_off:?}: {hold:?}"
+        );
+    }
 }
 
 // The error of a kill -------------------------------------------------------------------------------------------------

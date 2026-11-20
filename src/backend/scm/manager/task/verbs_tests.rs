@@ -7,18 +7,17 @@ use std::time::Duration;
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
 use super::super::support::{
-    Machine, PATH, id, instance, instance_id, linked_records, record, records, scm, shim_writes, snapshot_of,
+    Denied, Machine, PATH, id, instance, instance_id, linked_records, pins_in, record, records, scm, shim_writes,
+    snapshot_of,
 };
 use super::*;
 use crate::backend::Backend;
 use crate::backend::scm::manager::WindowsSnapshot;
 use crate::backend::scm::manager::task::api::Started;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
+use crate::backend::scm::runs::MarkerCheck;
 use crate::backend::scm::runs::RunOutcome;
-use crate::backend::scm::shim::acl::Descriptor;
-use crate::backend::scm::sid::try_sid_display;
 use crate::backend::scm::test_support::task_spec;
-use crate::elevation::test_support::process_user_sid;
 
 /// A pid no process has: Windows pids are far below it.
 const NO_SUCH_PID: u32 = 0xFFFF_FFFC;
@@ -43,7 +42,7 @@ fn two() -> Result<Vec<Instance>> {
 }
 
 fn stopped(fake: &Fake, machine: &mut Machine, runs: &Runs, budget: Budget) -> Result<()> {
-    scm(fake).task_stop_with("stop", &id(), budget, runs, machine)
+    scm(fake).task_stop_with("stop", &id(), budget, runs, StopPin::Own, machine)
 }
 
 // Stop ================================================================================================================
@@ -286,35 +285,6 @@ fn a_later_runs_write_does_not_prune_an_earlier_runs_incomplete_stop_before_it_i
     fake.finish();
 }
 
-/// The record directory with no right for the account this test runs as but to read and change its own
-/// permissions, until it is dropped: nothing can be created in it, as for a caller who is not an
-/// Administrator. Dropping restores the entry the directory is made with, so the test's directory can
-/// be removed.
-struct Denied<'a>(&'a std::path::Path);
-
-impl<'a> Denied<'a> {
-    fn new(path: &'a std::path::Path) -> Self {
-        let me = try_sid_display(&process_user_sid()).unwrap();
-        // READ_CONTROL, WRITE_DAC and SYNCHRONIZE (which `CreateFile` adds to every open).
-        let denied = Descriptor::from_sddl(&format!("D:P(A;;FA;;;SY)(A;;0x160000;;;{me})")).unwrap();
-        crate::backend::scm::test_support::set_dacl(&denied, path).unwrap();
-        Denied(path)
-    }
-}
-
-impl Drop for Denied<'_> {
-    fn drop(&mut self) {
-        let restored = Descriptor::for_runs(&[process_user_sid()])
-            .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
-        if !matches!(restored, Ok(Ok(()))) {
-            eprintln!(
-                "warning: could not restore the permissions of {}: {restored:?}",
-                self.0.display()
-            );
-        }
-    }
-}
-
 /// A stop with nothing running has no record to keep, so it needs no pin and does not fail on one, as a
 /// caller who cannot write the record directory cannot take it.
 #[skuld::test]
@@ -376,7 +346,10 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
 
     let failed = during.expect("the removal waited").unwrap_err();
     let report = failed.report().to_string();
-    assert!(report.contains("being removed"), "{report}");
+    assert!(
+        report.contains("`nightly` is being, or did not finish being, installed or uninstalled"),
+        "{report}"
+    );
     assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
     assert!(machine.waited.is_empty());
 }
@@ -414,13 +387,57 @@ fn the_stops_pin_is_released_when_it_returns() {
 
     stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
 
-    let pins = std::fs::read_dir(&path)
-        .unwrap()
-        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
-        .count();
-    assert_eq!(pins, 0);
+    assert_eq!(pins_in(&path), 0);
     fake.finish();
     drop(dir);
+}
+
+/// A stop of the run `1` whose shim writes its record as it ends: the pins the records hold at that moment,
+/// and the pins left once the stop has returned. With a `caller`, the uninstall's marker stands and the pin
+/// is the caller's, taken past it.
+fn pins_while_the_run_ends(caller: bool) -> (Vec<usize>, usize) {
+    let (dir, path, runs) = records();
+    let pin = if caller {
+        runs.close().unwrap();
+        StopPin::Caller(Some(runs.hold_with(MarkerCheck::Ignore).unwrap()))
+    } else {
+        StopPin::Own
+    };
+    let fake = Fake::new();
+    fake.on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_stop(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+    let shim = Runs::of(dir.path(), &id());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let watcher = seen.clone();
+    let watched = path.clone();
+    machine.on_exit = Box::new(move |_| {
+        watcher.lock().unwrap().push(pins_in(&watched));
+        shim_writes(&shim, &record(1, RunOutcome::Stopped));
+    });
+
+    scm(&fake)
+        .task_stop_with("uninstall", &id(), Budget::Unbounded, &runs, pin, &mut machine)
+        .unwrap();
+
+    fake.finish();
+    let seen = seen.lock().unwrap().clone();
+    (seen, pins_in(&path))
+}
+
+/// A stop under the caller's pin takes none of its own: the marker the caller placed would refuse it, and
+/// the one pin there is, is the caller's, which the stop lets go of when it returns.
+#[skuld::test]
+fn stop_with_the_callers_pin_takes_none_of_its_own() {
+    assert_eq!(pins_while_the_run_ends(true), (vec![1], 0));
+}
+
+/// A stop that is not given a pin takes its own while a run ends, as it always has.
+#[skuld::test]
+fn stop_with_no_pin_takes_its_own_as_before() {
+    assert_eq!(pins_while_the_run_ends(false), (vec![1], 0));
 }
 
 #[skuld::test]
@@ -838,7 +855,7 @@ fn a_start_after_an_unwaited_stop_is_not_sent_when_a_runs_liveness_cannot_be_jud
         fn open(&mut self, _: u32) -> io::Result<Option<u32>> {
             unreachable!("a start holds no process")
         }
-        fn terminate(&mut self, _: &u32) -> io::Result<()> {
+        fn force_end(&mut self, _: &u32) -> io::Result<()> {
             unreachable!("a start terminates nothing")
         }
         fn await_exit(&mut self, _: &u32, _: Deadline) -> io::Result<Waited> {

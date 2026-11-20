@@ -323,9 +323,13 @@ fn logged_task(path: &Path) -> DaemonSpec {
         logs: Some(path.to_path_buf()),
         ..base_fields("x", vec!["/bin/a".to_string()]).common
     };
-    TaskSpec::new(TaskFields { common, schedule: None })
-        .expect("a task with logs")
-        .into()
+    TaskSpec::new(TaskFields {
+        common,
+        schedule: None,
+        stop_action: Default::default(),
+    })
+    .expect("a task with logs")
+    .into()
 }
 
 fn log_source(run: &Run) -> (std::path::PathBuf, u64) {

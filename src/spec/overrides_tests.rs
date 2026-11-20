@@ -4,14 +4,15 @@ use super::{RawOverride, Supplied};
 use crate::spec::BackendKind;
 use crate::spec::field::Field;
 use crate::spec::raw::RawSpec;
+use crate::spec::stop_action::RawTimeout;
 use crate::spec::user::RawUser;
 
 fn parse(yaml: &str) -> Result<RawSpec, yaml_serde::Error> {
     RawSpec::parse(yaml)
 }
 
-/// The eleven field names an override may write, byte-exact with `OverrideWire`'s serde names.
-const OVERRIDABLE_FIELDS: [&str; 11] = [
+/// The twelve field names an override may write, byte-exact with `OverrideWire`'s serde names.
+const OVERRIDABLE_FIELDS: [&str; 12] = [
     "name",
     "command",
     "cwd",
@@ -23,6 +24,7 @@ const OVERRIDABLE_FIELDS: [&str; 11] = [
     "type",
     "protocol",
     "schedule",
+    "stop-action",
 ];
 
 #[skuld::test]
@@ -214,6 +216,7 @@ backend-specific:
     type: task
     protocol: native
     schedule: 30 3 * * *
+    stop-action: kill
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let scm = &manifest.backend_specific[&BackendKind::Scm];
@@ -229,6 +232,7 @@ backend-specific:
     assert!(scm.daemon_type.is_some());
     assert!(scm.protocol.is_some());
     assert!(scm.schedule.is_some());
+    assert!(scm.stop_action.is_some());
 }
 
 #[skuld::test]
@@ -255,6 +259,7 @@ backend-specific:
             "command" => "an explicit `null` is not a command",
             "env" => "invalid type: unit value, expected a mapping of environment variable name to value",
             "user" => "an explicit `null` is not a user",
+            "stop-action" => "an explicit `null` is not a stop action",
             _ => "an explicit `null` is not a way to unset this field",
         };
         assert!(
@@ -711,4 +716,51 @@ backend-specific:
     let spec = parse(yaml).expect("valid manifest should parse");
     let (_merged, supplied) = spec.merged_for(BackendKind::Systemd);
     assert_eq!(supplied, Supplied::NONE);
+}
+
+// `stop-action` =======================================================================================================
+
+#[skuld::test]
+fn an_override_supplies_the_stop_action_leaves_it_wrote_and_merges_them_over_the_base() {
+    let yaml = "id: d\ncommand: [/x]\nstop-action: {send-signal: quit, timeout: 90s}\nbackend-specific:\n  systemd: {stop-action: {timeout: null}}\n  launchd: {stop-action: terminate}\n";
+    let spec = parse(yaml).expect("valid manifest should parse");
+
+    let (merged, supplied) = spec.merged_for(BackendKind::Systemd);
+    assert_eq!(
+        supplied,
+        Supplied {
+            stop_timeout: true,
+            ..Supplied::NONE
+        }
+    );
+    let action = merged.stop_action.unwrap();
+    assert_eq!(action.send_signal.as_deref(), Some("quit"));
+    assert_eq!(action.timeout, Some(RawTimeout::Null));
+
+    let (merged, supplied) = spec.merged_for(BackendKind::Launchd);
+    assert_eq!(
+        supplied,
+        Supplied {
+            stop_signal: true,
+            ..Supplied::NONE
+        }
+    );
+    let action = merged.stop_action.unwrap();
+    assert_eq!(action.send_signal.as_deref(), Some("terminate"));
+    assert_eq!(action.timeout, Some(RawTimeout::Text("90s".to_string())));
+
+    // No entry: the base, supplying nothing.
+    let (merged, supplied) = spec.merged_for(BackendKind::Scm);
+    assert_eq!(supplied, Supplied::NONE);
+    assert_eq!(merged.stop_action, spec.stop_action);
+    assert_eq!(spec.without_overrides().stop_action, spec.stop_action);
+}
+
+#[skuld::test]
+fn an_override_may_write_a_stop_action_the_base_lacks() {
+    let spec = parse("id: d\ncommand: [/x]\nbackend-specific:\n  systemd: {stop-action: kill}\n").unwrap();
+    assert_eq!(spec.merged_for(BackendKind::Scm).0.stop_action, None);
+    let action = spec.merged_for(BackendKind::Systemd).0.stop_action.unwrap();
+    assert_eq!(action.send_signal.as_deref(), Some("kill"));
+    assert_eq!(action.timeout, None);
 }

@@ -138,10 +138,17 @@ pub enum DaemonCommand {
     /// Start a daemon now. Does not change its boot-enablement.
     Start(start::Args),
     /// Stop a daemon now. Does not change its boot-enablement.
+    ///
+    /// With no `--timeout` or `--no-timeout`, the wait comes from the daemon's stop action, so a daemon whose
+    /// definition goetia cannot read is refused; either flag runs the stop anyway.
     Stop(stop::Args),
     /// Kill a daemon's running process as a failure, leaving any restart to its restart policy.
     Kill(kill::Args),
     /// Stop then start a daemon. Does not change its boot-enablement.
+    ///
+    /// With no `--timeout` or `--no-timeout`, the stop's wait comes from the daemon's stop action, so a daemon
+    /// whose definition goetia cannot read is refused before anything is stopped; either flag runs the restart
+    /// anyway.
     Restart(restart::Args),
     /// Run an idle task once, now: show its output as it is written and exit with the run's own code.
     Run(run::Args),

@@ -391,6 +391,35 @@ fn a_registration_by_released_0_1_0_is_stale_under_this_build() {
     );
 }
 
+/// An install from before a schema bump regenerates differently from what is on disk (the unit has no
+/// `TimeoutStopSec=`), with no hand-edit and the same version: it is stale, as a different version is.
+#[skuld::test]
+fn an_older_schema_is_stale_not_conflict() {
+    let spec = spec_fixture();
+    let on_disk = "ARTIFACT OF AN OLDER SCHEMA";
+    let mut found = ours(&spec, RUNNING_VERSION, "REGENERATED UNDER THE CURRENT SCHEMA", on_disk);
+    let Ownership::Ours { blob, .. } = &mut found else {
+        unreachable!()
+    };
+    blob.schema = blob::SCHEMA - 1;
+
+    let outcome = decide(
+        &found,
+        "DESIRED",
+        &spec,
+        RUNNING_VERSION,
+        false,
+        &ExternalConfig::Absent,
+    );
+
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: RUNNING_VERSION.to_owned()
+        }
+    );
+}
+
 #[skuld::test]
 fn older_version_is_stale_not_conflict() {
     let spec = spec_fixture();

@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer};
 
 use super::no_null::reject_nulls;
 use super::overrides::BackendOverrides;
+use super::stop_action::{RawStopAction, deserialize_stop_action};
 use super::user::{RawUser, deserialize_user};
 
 /// The whole `goetia.yaml` document: one daemon, exactly as written in
@@ -50,6 +51,7 @@ pub(super) struct RawSpec {
     pub daemon_type: Option<String>,
     pub protocol: Option<String>,
     pub schedule: Option<String>,
+    pub stop_action: Option<RawStopAction>,
     pub backend_specific: BackendOverrides,
 }
 
@@ -88,6 +90,8 @@ struct Wire {
     protocol: Option<String>,
     #[serde(default)]
     schedule: Option<String>,
+    #[serde(rename = "stop-action", default, deserialize_with = "deserialize_stop_action")]
+    stop_action: Option<RawStopAction>,
     #[serde(
         rename = "backend-specific",
         default,

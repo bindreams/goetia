@@ -18,7 +18,7 @@ use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
 use goetia::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step};
 use goetia::shim::HostCommand;
-use goetia::spec::{DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
+use goetia::spec::{DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal};
 use goetia::testing::service_fields;
 
 #[path = "support/mod.rs"]
@@ -353,7 +353,7 @@ impl Sequence for Direct<'_> {
     fn enable(&mut self, id: &Id) -> goetia::Result<()> {
         self.0.enable(id)
     }
-    fn stop(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&mut self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
     fn start(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
@@ -426,7 +426,7 @@ impl ServiceManager for FlakyManager {
         self.injected_start(id)?;
         self.inner.request_start_after_stop(id)
     }
-    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.inner.stop(id, budget)
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
@@ -1214,7 +1214,7 @@ impl ServiceManager for PanicsOnStart {
     fn request_start_after_stop(&self, _id: &Id) -> goetia::Result<()> {
         panic!("restart on an absent id must never reach start")
     }
-    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
@@ -3637,7 +3637,7 @@ impl ServiceManager for PanicsOnStatus {
     fn request_start_after_stop(&self, id: &Id) -> goetia::Result<()> {
         self.0.request_start_after_stop(id)
     }
-    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
@@ -4166,6 +4166,7 @@ fn restart_prepares_both_legs_under_its_budget() {
     let two_legs: &[(&str, &str)] = &[("stop", "frpc"), ("start", "frpc"), ("stop", "web"), ("start", "web")];
     let native: &[(&str, &str)] = &[("restart", "frpc"), ("restart", "web")];
     for (budget, given, one_request, sent) in [
+        // No flag: a wait; each leg takes its own default as it is issued.
         (&[][..], Budget::DEFAULT, false, two_legs),
         (&["--no-timeout"][..], Budget::Unbounded, false, two_legs),
         (
@@ -5217,4 +5218,205 @@ fn install_of_a_scheduleless_task_without_enable_is_installed() {
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert_eq!(fake.writes(), 1);
+}
+
+// The wait of `stop` and `restart` follows the daemon's stop action ===================================================
+
+/// `frpc` installed with a stop action of `signal` and `timeout` (whole seconds, `None` for none).
+fn installed_with_stop_action(signal: &str, timeout: Option<u64>) -> Fake {
+    let fake = Fake::new();
+    let spec = ServiceSpec::new(ServiceFields {
+        stop_action: StopAction {
+            send_signal: match signal {
+                "terminate" => StopSignal::Terminate,
+                "interrupt" => StopSignal::Interrupt,
+                "kill" => StopSignal::Kill,
+                other => panic!("no fixture for `{other}`"),
+            },
+            timeout: timeout.map(Duration::from_secs),
+        },
+        ..service_fields(mk("frpc"))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    fake.install(&spec, false).unwrap();
+    fake
+}
+
+/// The budget the one reservation of `verb` on `frpc` was made under.
+fn budget_of(fake: &Fake, verb: &str, flags: &[&str]) -> Budget {
+    let mut args = vec!["goetia", "daemon", verb, "frpc"];
+    args.extend_from_slice(flags);
+    let before = fake.prepared().len();
+    let (code, out, err) = dispatch_elevated(&args, fake);
+    assert_eq!(code, 0, "{args:?}\nstdout:\n{out}\nstderr:\n{err}");
+    let prepared = fake.prepared();
+    assert_eq!(prepared.len(), before + 1, "{args:?}: {prepared:?}");
+    prepared.last().unwrap().1
+}
+
+fn secs(n: u64) -> Budget {
+    Budget::Bounded(Duration::from_secs(n))
+}
+
+#[skuld::test]
+fn the_default_wait_of_stop_is_the_stop_timeout_plus_ten_seconds() {
+    for (signal, timeout, expected) in [
+        ("terminate", Some(30), secs(40)),
+        ("terminate", Some(5), secs(15)),
+        ("terminate", Some(86_400), secs(86_410)),
+        ("interrupt", Some(120), secs(130)),
+        // No timeout waits as long as the platform does.
+        ("terminate", None, Budget::Unbounded),
+        // `kill` has nothing to wait for: the wait is what it was.
+        ("kill", None, Budget::DEFAULT),
+    ] {
+        let fake = installed_with_stop_action(signal, timeout);
+        assert_eq!(budget_of(&fake, "stop", &[]), expected, "stop {signal} {timeout:?}");
+    }
+}
+
+/// `restart` with no flag reserves for a wait and nothing more: each leg takes its own default as it is
+/// issued ([`the_stop_leg_of_a_restart_waits_the_stop_timeout_plus_ten_seconds`]), so the reservation is
+/// one that waits, whatever the daemon's stop action says.
+#[skuld::test]
+fn a_restart_with_no_flag_reserves_for_a_wait_whatever_the_stop_action_says() {
+    for (signal, timeout) in [("terminate", Some(30)), ("terminate", None), ("kill", None)] {
+        let fake = installed_with_stop_action(signal, timeout);
+        assert_eq!(
+            budget_of(&fake, "restart", &[]),
+            Budget::DEFAULT,
+            "restart {signal} {timeout:?}"
+        );
+    }
+}
+
+/// The stop leg waits the daemon's own stop timeout plus ten seconds, and the start leg its own ten: the
+/// budget each reports having waited is its own, not a total spread over both.
+#[skuld::test]
+fn the_stop_leg_of_a_restart_waits_the_stop_timeout_plus_ten_seconds() {
+    let fake = installed_with_stop_action("terminate", Some(30));
+    fake.seed_stop_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
+
+    assert_eq!(
+        code, 4,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(err.contains("did not report stopped within 40s:"), "{err}");
+}
+
+#[skuld::test]
+fn the_start_leg_of_a_restart_waits_ten_seconds_whatever_the_stop_action_gave_the_stop() {
+    let fake = installed_with_stop_action("terminate", Some(30));
+    fake.seed_start_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
+
+    assert_eq!(
+        code, 4,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(err.contains("did not report running within 10s:"), "{err}");
+}
+
+#[skuld::test]
+fn a_wait_flag_overrides_the_stop_actions_wait() {
+    for verb in ["stop", "restart"] {
+        for (flags, expected) in [
+            (&["--timeout", "3s"][..], secs(3)),
+            (&["--timeout", "0"], Budget::Immediate),
+            (&["--no-timeout"], Budget::Unbounded),
+        ] {
+            let fake = installed_with_stop_action("terminate", Some(300));
+            assert_eq!(budget_of(&fake, verb, flags), expected, "{verb} {flags:?}");
+        }
+    }
+}
+
+/// What a refused flagless stop of a definition that will not decode tells the user: the stop was refused and
+/// nothing was sent, both flags that name the wait, and the decode failure it stands on.
+fn assert_names_the_flags_that_name_the_wait(err: &str) {
+    assert!(err.contains("the stop was refused and nothing was sent"), "{err}");
+    assert!(err.contains("--timeout <duration>"), "{err}");
+    assert!(err.contains("--no-timeout"), "{err}");
+    assert!(err.contains("blob"), "the decode failure: {err}");
+}
+
+/// The daemon's own wait is read from its stop action, and a definition that will not decode has none: the
+/// stop fails with the decode failure and reserves nothing. A wait the user names needs no definition.
+#[skuld::test]
+fn a_daemon_whose_definition_will_not_decode_is_stopped_only_under_a_wait_the_user_names() {
+    let fake = Fake::new();
+    fake.seed_unusable("frpc");
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
+    assert_eq!(code, 1, "{err}");
+    assert_names_the_flags_that_name_the_wait(&err);
+    assert!(fake.prepared().is_empty(), "nothing was reserved");
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc", "--timeout", "3s"], &fake);
+    assert_eq!(code, 0, "{err}");
+}
+
+/// `restart` stops first, so it fails the same way, before it stops or starts anything; `--timeout` runs it.
+#[skuld::test]
+fn a_restart_of_a_definition_that_will_not_decode_fails_with_no_wait_flag_and_starts_nothing() {
+    let fake = Fake::new();
+    fake.seed_unusable("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_names_the_flags_that_name_the_wait(&err);
+    assert_eq!(fake.calls(), vec![], "nothing was stopped or started");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc", "--timeout", "3s"], &fake);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+}
+
+#[skuld::test]
+fn stop_and_restart_of_an_id_that_is_not_installed_say_so_as_before() {
+    for verb in ["stop", "restart"] {
+        let fake = Fake::new();
+        let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", verb, "ghost"], &fake);
+        assert_eq!(code, 1, "{verb}: {err}");
+        assert!(err.contains("not installed"), "{verb}: {err}");
+    }
+}
+
+#[skuld::test]
+fn each_id_waits_for_its_own_stop_action() {
+    let fake = installed_with_stop_action("terminate", Some(5));
+    let other = ServiceSpec::new(ServiceFields {
+        stop_action: StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: Some(Duration::from_secs(60)),
+        },
+        ..service_fields(mk("web"))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    fake.install(&other, false).unwrap();
+    let installed = fake.prepared().len();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc", "web"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let budgets: Vec<Budget> = fake.prepared()[installed..].iter().map(|(_, budget)| *budget).collect();
+    assert_eq!(budgets, [secs(15), secs(70)]);
+}
+
+#[skuld::test]
+fn the_default_wait_reports_a_confirmed_stop() {
+    let fake = installed_with_stop_action("terminate", Some(5));
+    let (code, out, _err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
+    assert_eq!(code, 0);
+    assert_eq!(out, "frpc: stopped\n");
 }

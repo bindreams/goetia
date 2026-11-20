@@ -694,7 +694,7 @@ fn run_of_a_stopped_run_reports_sigterm(#[fixture(systemd_group)] _group: &Group
         while !seen.windows(6).any(|window| window == b"ready\n") {
             seen.extend(shown.recv().expect("the run ended before the task said ready"));
         }
-        mgr.stop(task_id, Budget::DEFAULT).expect("stop");
+        mgr.stop(task_id, Some(Budget::DEFAULT)).expect("stop");
         run.join().expect("the run's thread")
     });
 

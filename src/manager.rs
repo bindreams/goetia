@@ -51,6 +51,12 @@ pub trait ServiceManager {
     /// A run due while `install` changes an enabled task's schedule is missed on systemd and
     /// launchd: the task is disarmed and armed again around the change, and arming makes up no run
     /// the schedule named meanwhile. `goetia daemon start <id>` runs it.
+    ///
+    /// On Windows, changing a task's account is refused while a run of it is alive or its run records are
+    /// held (by a run that is starting, a `run` or `stop` of it, or another program); the error says which,
+    /// and the install can be retried when that ends. A scheduled run that comes due during the change does
+    /// not run, even when the change is then refused. A failure after the old task was removed leaves
+    /// nothing installed, and the error says so: run the install again.
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
     /// What [`Self::install`] would do for `spec`, without doing it, always
@@ -68,6 +74,12 @@ pub trait ServiceManager {
     /// still deleted and the error says so: re-run `uninstall` to retry it. `uninstall` of an id that
     /// is not installed is the same retry, and reports [`Error::NotInstalled`]
     /// when it has nothing left to do.
+    ///
+    /// A Windows task's `uninstall` disables the task, so no scheduled run starts from then on, and stops
+    /// every live run before it deletes the task. One that fails or is interrupted leaves the task disabled
+    /// or, after the delete, only its run records: re-run `uninstall`, or run the install again with
+    /// `--force`. Once it has closed the task's run records, `enable`, `disable`, `run`, and a `stop` that
+    /// finds a run to wait for refuse until one of those two has finished.
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
@@ -196,8 +208,13 @@ pub trait ServiceManager {
     /// waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;
 
-    /// Stop the service now, waiting up to `budget` for it. Does not change
-    /// its boot-enablement.
+    /// Stop the service now, waiting up to `budget` for it, or, with `None`, for as long as the daemon's
+    /// own stop takes ([`Budget::for_stop`]): its `stop-action` `timeout` plus
+    /// [`StopAction::TEARDOWN_MARGIN`](crate::spec::StopAction::TEARDOWN_MARGIN), without bound where it has
+    /// no `timeout`, and [`Budget::DEFAULT`] for `send-signal: kill`. `None` is read from the definition this
+    /// call reads and acts on, so the wait and the stop cannot disagree; a definition that does not decode
+    /// has none to read, and `None` is then [`Error::StopActionUnreadable`], over the decode failure.
+    /// Does not change its boot-enablement.
     ///
     /// `Ok(())` means the service manager reports the service as stopped, on
     /// the same terms as [`Self::start`]; `budget` bounds only the wait, as
@@ -213,13 +230,21 @@ pub trait ServiceManager {
     /// README's "Waiting for a start or stop".
     ///
     /// **A task's stop ends the run in flight and leaves its schedule armed;** the task is then
-    /// [`State::Idle`]. On macOS, a task's `stop` sends SIGTERM only and waits until the run ends
-    /// (bounded by `budget`); a task that ignores SIGTERM keeps running, and `kill` ends it. `stop` also
-    /// ends a run that begins while it is stopping. On macOS, a task's `stop` under every budget (`Immediate`
-    /// and a zero bound included) also waits for a start launchd has accepted to begin, so it can end it;
-    /// then it signals, and returns `Ok` under `Immediate` and [`Error::WaitTimeout`] under a zero
-    /// `Bounded` bound, the signal standing. If launchd shows the job with no process in a state that does
-    /// not say it is idle, or the read fails, the result is [`Error::StopUnconfirmed`].
+    /// [`State::Idle`]. On macOS, a task's `stop` is always issued, as on the other backends, whatever the
+    /// budget (`Immediate` and a zero bound included): the run in flight is sent its `stop-action`'s signal
+    /// (SIGTERM, or SIGKILL for `send-signal: kill`), after a wait for a start launchd has accepted to begin,
+    /// so it can end it. It then waits until the run ends (bounded by `budget`; `Immediate` does not wait). A
+    /// run that has not answered SIGTERM when the action's `timeout` is over is sent SIGKILL, if the budget
+    /// lasts that long. Once the first signal is sent, a `Bounded` deadline that is spent sends nothing more:
+    /// no SIGKILL, and no first signal to a run that began later. The stop then reads once, and returns `Ok`
+    /// if the job is idle, else [`Error::WaitTimeout`], what it sent standing; a task that ignores SIGTERM past
+    /// the budget keeps running, and `kill` ends it. The deadline is decided right before each send, not
+    /// atomically with it. `stop` also ends a run that begins while it is stopping. If launchd shows the job
+    /// with no process in a state that does not say it is idle, or the read fails, the result is
+    /// [`Error::StopUnconfirmed`]. Under `Immediate`, a pid launchd shows that the stop cannot reach (it has
+    /// ended, or it is not the job's) is followed at once by another reading: another pid is attempted like the
+    /// first, and the same pid twice in a row is the same error, with nothing sent and a word to run the stop
+    /// again.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
@@ -230,7 +255,7 @@ pub trait ServiceManager {
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::ProcessWaitTimeout`]: crate::Error::ProcessWaitTimeout
     /// [`Error::StopUnconfirmed`]: crate::Error::StopUnconfirmed
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
+    fn stop(&self, id: &Id, budget: Option<Budget>) -> Result<()>;
 
     /// End the process the manager reports as the service's, as a failure, and return once it has
     /// exited and the manager no longer reports it: on every backend, the next `status` does not show
@@ -350,8 +375,9 @@ pub trait Sequence {
     /// See [`ServiceManager::enable`], including the refusal of a task with no schedule.
     fn enable(&mut self, id: &Id) -> Result<()>;
 
-    /// See [`ServiceManager::stop`].
-    fn stop(&mut self, id: &Id, budget: Budget) -> Result<()>;
+    /// See [`ServiceManager::stop`], including [`Error::StopActionUnreadable`] for a `None` budget, which
+    /// spends no step.
+    fn stop(&mut self, id: &Id, budget: Option<Budget>) -> Result<()>;
 
     /// See [`ServiceManager::start`].
     fn start(&mut self, id: &Id, budget: Budget) -> Result<()>;
@@ -363,6 +389,10 @@ pub trait Sequence {
 // Installed / Status / State ==========================================================================================
 
 /// One entry from [`ServiceManager::list`].
+// `Ours` embeds a full `DaemonSpec` and its status; boxing it would ripple into every match arm of the
+// 90 sites that read one, and `list` builds one per daemon, never in a hot loop. Same call as
+// `decide::Ownership`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Installed {
     /// A Goetia-marked service whose blob decoded successfully.

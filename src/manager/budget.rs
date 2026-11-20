@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::spec::{StopAction, StopSignal};
+
 // Budget ==============================================================================================================
 
 /// How long a caller is willing to wait for a service manager to report a
@@ -20,16 +22,36 @@ pub enum Budget {
 }
 
 impl Budget {
-    pub const DEFAULT: Budget = Budget::Bounded(Duration::from_secs(10));
+    /// How long a verb waits when no flag and no daemon says otherwise.
+    pub const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+    pub const DEFAULT: Budget = Budget::Bounded(Self::DEFAULT_WAIT);
+
+    /// The wait of a `stop` that names none: the daemon's own stop action, with
+    /// [`StopAction::TEARDOWN_MARGIN`] to be torn down and recorded ([`StopAction::longest_stop`]); no bound
+    /// for a stop action with no `timeout`; and [`Self::DEFAULT`], what it always was, for `kill`, which
+    /// sends nothing to answer.
+    pub fn for_stop(action: &StopAction) -> Budget {
+        match action.send_signal {
+            StopSignal::Kill => Budget::DEFAULT,
+            _ => action.longest_stop().map_or(Budget::Unbounded, Budget::Bounded),
+        }
+    }
 
     /// Whether this budget permits any waiting at all. `false` for
     /// `Immediate` and for `Bounded(Duration::ZERO)` alike: a zero-length
     /// bound behaves as `Immediate` everywhere a caller branches on this, and
     /// folding it in here spares every call site from doing so. The one
     /// exception is a launchd task's `stop`, which matches on the budget itself:
-    /// it waits for a queued start's pid under every budget, signals, and then
-    /// returns `Ok` under `Immediate` and [`Error::WaitTimeout`](crate::Error::WaitTimeout)
-    /// under a zero bound, which is a bound that has run out.
+    /// under every budget it waits for a queued start's pid and sends the run its
+    /// first signal, as every backend's stop is issued. Under `Immediate` it
+    /// returns `Ok` once it has sent the run its signal, without waiting for the
+    /// exit; where launchd shows a pid the stop cannot reach, it reads again at
+    /// once, and the same pid twice in a row ends it with nothing sent, as
+    /// [`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed). A zero bound is a bound that has run out, so after
+    /// that signal it sends nothing more, does one reading (`read_up`), and
+    /// returns `Ok` if the job is idle, else
+    /// [`Error::WaitTimeout`](crate::Error::WaitTimeout), a pid launchd has
+    /// not cleared included.
     pub fn waits(self) -> bool {
         !matches!(self, Budget::Immediate | Budget::Bounded(Duration::ZERO))
     }
@@ -46,8 +68,20 @@ impl Budget {
         self.start_at(Instant::now())
     }
 
-    /// [`Self::start`] as of `now`, so a test can hold the instant fixed.
-    fn start_at(self, now: Instant) -> Deadline {
+    /// This budget with `by` added to a bound: what a verb reports having waited when part of its wait was
+    /// not counted against it, and, with `start_at` over the instant the verb began, its deadline.
+    /// `Immediate` and `Unbounded` have no bound to move; a bound that overflows is [`Duration::MAX`], which
+    /// no clock reaches, so its deadline never expires, as in [`Self::start`].
+    pub fn extended(self, by: Duration) -> Budget {
+        match self {
+            Budget::Bounded(d) => Budget::Bounded(d.saturating_add(by)),
+            other => other,
+        }
+    }
+
+    /// [`Self::start`] as of `now`: a test can hold the instant fixed, and a verb that moves its budget
+    /// ([`Self::extended`]) derives the deadline from the instant it began, so the two cannot drift.
+    pub(crate) fn start_at(self, now: Instant) -> Deadline {
         match self {
             Budget::Immediate => Deadline(Some(now)),
             Budget::Bounded(d) => Deadline(now.checked_add(d)),
@@ -178,6 +212,16 @@ impl Deadline {
 
     pub fn expired(&self) -> bool {
         self.remaining() == Some(Duration::ZERO)
+    }
+
+    /// Whether this deadline comes before `other`; an unbounded one never does, and any bounded one comes
+    /// before an unbounded one.
+    pub fn ends_before(&self, other: Deadline) -> bool {
+        match (self.0, other.0) {
+            (Some(a), Some(b)) => a < b,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
     }
 
     /// [`Self::remaining`] in whole milliseconds, rounded up, capped below

@@ -93,12 +93,12 @@ fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_
         let child = child_reported.accept_line("the direct child to start and report its pid");
         let grandchild = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
-        mgr.stop(&id, Budget::DEFAULT).expect("stop");
+        mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
         ends_the_run.defuse();
 
         let exit = run.join().expect("the run thread").expect("run");
         assert_eq!(exit, STOPPED, "one record, `Stopped`");
-        // Gone is a state the kernel reaches as the shim's job closes, so it is waited for.
+        // The kernel reaches Gone as the shim's job closes: wait for it.
         for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
             wait::until(|| !pid_is_alive(&pid));
             assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
@@ -155,7 +155,7 @@ fn a_spec_without_cwd_runs_in_system32(#[fixture(scm_group)] _group: &Group) {
         cwd.eq_ignore_ascii_case(&system32),
         "a spec with no `cwd` runs where Task Scheduler starts the shim: {cwd} (want {system32})"
     );
-    mgr.stop(&id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
     mgr.uninstall(&id).expect("uninstall");
 }
 
@@ -182,6 +182,46 @@ fn a_task_runs_at_normal_priority(#[fixture(scm_group)] _group: &Group) {
         "NORMAL_PRIORITY_CLASS"
     );
     mgr.uninstall(&id).expect("uninstall");
+}
+
+/// An uninstall of a task whose run is in flight stops the run before it deletes the task.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_with_a_run_in_flight_leaves_no_program(#[fixture(scm_group)] _group: &Group) {
+    let id = task_id();
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = manager();
+    let (child_reported, grandchild_reported) = (ConnectBack::listen(), ConnectBack::listen());
+    let command = fixture_command(
+        "spawn-grandchild",
+        &[
+            &child_reported.port().to_string(),
+            &grandchild_reported.port().to_string(),
+        ],
+    );
+    mgr.install(&task_spec(&id, command, None, User::Root, None), false)
+        .expect("install");
+    mgr.start(&id, Budget::DEFAULT).expect("start");
+    let ends_the_run = EndsTheRunOnPanic::new(&id);
+    let child = child_reported.accept_line("the direct child to start and report its pid");
+    let grandchild = grandchild_reported.accept_line("the grandchild to start and report its pid");
+
+    mgr.uninstall(&id).expect("uninstall");
+    ends_the_run.defuse();
+
+    // The kernel reaches Gone as the shim's job closes: wait for it.
+    for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
+        wait::until(|| !pid_is_alive(&pid));
+        assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
+    }
+    let absent = mgr.status(&id).expect_err("the task was deleted");
+    assert!(
+        matches!(absent.cause(), goetia::Error::NotInstalled { .. }),
+        "{absent:?}"
+    );
+    let records = support::task_records(id.as_str());
+    assert!(!records.exists(), "the run records {} are gone", records.display());
+    let marker = records.with_file_name(format!("{id}~removing"));
+    assert!(!marker.exists(), "and so is the marker {}", marker.display());
 }
 
 /// The shim obeys the removal's marker: its pin is refused, no program starts, and the task's last result
