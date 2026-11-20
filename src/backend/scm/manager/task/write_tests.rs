@@ -838,7 +838,10 @@ fn a_failure_after_the_delete_says_what_it_left() {
     let Error::Step { what, .. } = &failed else {
         panic!("a failure after the delete is told as what it left: {failed:?}")
     };
-    assert!(what.contains("already removed") && what.contains("re-run install"), "{what}");
+    assert!(
+        what.contains("already removed") && what.contains("re-run install"),
+        "{what}"
+    );
     assert!(
         failed.report().to_string().contains("run records"),
         "{}",
