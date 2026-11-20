@@ -321,9 +321,7 @@ fn no_records(error: &io::Error) -> bool {
 }
 
 /// A pin on the run records of `id`, held until the caller lets it go: `None` when there are no records to
-/// keep (the directory is gone or is a link, [`no_records`]). Any other refusal is an error worded as any
-/// verb's is, a denial for access denied: that includes a pin refused because the records are being removed
-/// (as `check` looks for the marker), which is not "no records".
+/// keep ([`no_records`]). A pin refused by the removal's marker is an error, not "no records".
 pub(super) fn pin_records(operation: &str, id: &Id, runs: &Runs, check: MarkerCheck) -> Result<Option<Pin>> {
     match runs.hold_with(check) {
         Ok(pin) => Ok(Some(pin)),
@@ -356,9 +354,8 @@ fn check_stopped(id: &Id, runs: &Runs, stopped: &[InstanceId]) -> Result<()> {
 
 /// Who holds the pin of [`Scm::task_stop_with`].
 pub(super) enum StopPin {
-    /// The caller took it before the call, or found no records to pin (`None`): the stop takes no other.
+    /// The caller's pin (`None`: no records); the stop lets go of it on return.
     Caller(Option<Pin>),
-    /// The stop takes its own, when it has a run to wait for.
     Own,
 }
 
@@ -405,19 +402,10 @@ impl Scm {
     /// Every run of the task ended ([`stop_runs`]), and then read in its record: a stop whose shim could
     /// not end the program's tree is a failed stop. `operation` is the verb, which a denial names.
     ///
-    /// When there is a run to stop and the budget waits, a [`Pin`] is
-    /// held from before the first `Stop` is sent until every record is read: the shims write as their
-    /// runs end, and without it the write of a later run prunes the record of an earlier one before it
-    /// is read. A task with no run to stop has no records to keep, so it takes none (a caller who is not
-    /// an Administrator cannot); one whose record directory is gone has none either (`NotFound`), nor has
-    /// one where the directory is a link ([`pin_records`]), and the stop goes on. Any
-    /// other refusal is an error, worded as any verb's refusal is (a denial for access denied): that
-    /// includes the pin refused because the records are being removed, which is not "no records".
-    ///
-    /// `pin` is who takes the pin: [`StopPin::Caller`] has taken it before the call (an uninstall that placed
-    /// the marker itself takes its pin past it, [`pin_records`]), possibly none for a task with no records:
-    /// the stop takes none of its own, and lets go of the caller's when it returns. [`StopPin::Own`] is a stop
-    /// that takes its own, as a `stop` does.
+    /// When there is a run to stop and the budget waits, a [`Pin`] is held from before the first `Stop`
+    /// until every record is read: the shims write as their runs end, and without it a later run's write
+    /// prunes an earlier record before it is read. No run to stop, or no records ([`pin_records`]): no pin.
+    /// A `Caller` pin is let go when the stop returns.
     pub(super) fn task_stop_with<P: Processes>(
         &self,
         operation: &'static str,

@@ -2591,9 +2591,8 @@ fn enable_of_a_task_that_went_meanwhile_is_not_installed() {
     assert!(matches!(failed, Error::NotInstalled { id } if id == "nightly"));
 }
 
-/// A marker that stands means an install or an uninstall is running or did not finish, and only those two finish
-/// it: `enable` and `disable` refuse before the password is asked for, send nothing to Task Scheduler and leave
-/// the marker.
+/// Under the marker ([`unfinished_change`]) `enable` and `disable` refuse before the password is asked for, send
+/// nothing to Task Scheduler and leave the marker.
 fn arming_is_refused_while_the_marker_stands(armed: bool) {
     let spec = task_spec(Some("30 3 * * *"));
     let (_dir, runs) = made_records();
@@ -2624,6 +2623,37 @@ fn enable_is_refused_while_the_marker_stands() {
 #[skuld::test]
 fn disable_is_refused_while_the_marker_stands() {
     arming_is_refused_while_the_marker_stands(false);
+}
+
+/// A look for the marker that fails is no "no marker": `enable` and `disable` fail on it, before the password is
+/// asked for, and send nothing. The failing look is a root with a character no path holds.
+fn arming_fails_when_the_marker_cannot_be_looked_for(armed: bool) {
+    let spec = task_spec(Some("30 3 * * *"));
+    let runs = Runs::of(std::path::Path::new(r"C:\goetia-test|unlookable"), &id());
+    let fake = Fake::new();
+
+    let failed = scm(&fake)
+        .task_set_armed_with(&snapshot_of(&spec, !armed), armed, &runs, || {
+            panic!("the failure comes before the password is asked for")
+        })
+        .unwrap_err();
+
+    let text = failed.report().to_string();
+    assert!(
+        text.contains("check whether `nightly` is being installed or uninstalled"),
+        "{text}"
+    );
+    assert_eq!(fake.calls(), [], "nothing was sent to Task Scheduler");
+}
+
+#[skuld::test]
+fn enable_fails_when_the_marker_cannot_be_looked_for() {
+    arming_fails_when_the_marker_cannot_be_looked_for(true);
+}
+
+#[skuld::test]
+fn disable_fails_when_the_marker_cannot_be_looked_for() {
+    arming_fails_when_the_marker_cannot_be_looked_for(false);
 }
 
 /// A task whose blob will not decode still has a principal, and a verb that re-registers it uses that.

@@ -529,8 +529,7 @@ impl Scm {
     /// that will not decode is the error). Either way the task's own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
     ///
-    /// A marker that stands in `runs` means an install or an uninstall is running or did not finish, and only
-    /// those two finish it: both verbs refuse first, before the password is asked for, and send nothing.
+    /// Refused first under the removal's marker ([`unfinished_change`]), before the password is asked for.
     pub(super) fn task_set_armed_with(
         &self,
         snapshot: &TaskSnapshot,

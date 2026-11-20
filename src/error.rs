@@ -1562,8 +1562,7 @@ fn account_change_running(id: &str) -> String {
     )
 }
 
-/// What can hold a task's run records, as a message says it: the holders an account change
-/// ([`Error::AccountChangeHeld`]) and an uninstall's wait for the records both name.
+/// What can hold a task's run records, worded for a message.
 pub(crate) const RECORD_HOLDERS: &str = "a run that is starting, a `run` or `stop` of the task, or another program";
 
 /// The message of [`Error::AccountChangeHeld`].

@@ -132,8 +132,7 @@ pub(crate) fn com_code(error: &Error) -> Option<HRESULT> {
 
 /// `error`, from the start of the task `id`, worded for a task whose own flag is false (`Run` refuses
 /// one with `SCHED_E_TASK_DISABLED`): goetia leaves a task so when an install or an uninstall of it did not
-/// finish. The message says so as every refusal by the marker does ([`unfinished_change`]), with the two
-/// remedies that are always right. Any other failure is as it was.
+/// finish; the message is [`unfinished_change`]'s. Any other failure is as it was.
 pub(crate) fn disabled_run(error: Error, id: &str) -> Error {
     if com_code(&error) != Some(SCHED_E_TASK_DISABLED) {
         return error;

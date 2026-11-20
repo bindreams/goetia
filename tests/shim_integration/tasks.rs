@@ -98,7 +98,7 @@ fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_
 
         let exit = run.join().expect("the run thread").expect("run");
         assert_eq!(exit, STOPPED, "one record, `Stopped`");
-        // Gone is a state the kernel reaches as the shim's job closes, so it is waited for.
+        // The kernel reaches Gone as the shim's job closes: wait for it.
         for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
             wait::until(|| !pid_is_alive(&pid));
             assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
@@ -184,8 +184,7 @@ fn a_task_runs_at_normal_priority(#[fixture(scm_group)] _group: &Group) {
     mgr.uninstall(&id).expect("uninstall");
 }
 
-/// An uninstall of a task whose run is in flight stops the run before it deletes the task: when it returns,
-/// no program of the task is alive.
+/// An uninstall of a task whose run is in flight stops the run before it deletes the task.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_with_a_run_in_flight_leaves_no_program(#[fixture(scm_group)] _group: &Group) {
     let id = task_id();
@@ -209,11 +208,20 @@ fn uninstall_with_a_run_in_flight_leaves_no_program(#[fixture(scm_group)] _group
     mgr.uninstall(&id).expect("uninstall");
     ends_the_run.defuse();
 
-    // Gone is a state the kernel reaches as the shim's job closes, so it is waited for.
+    // The kernel reaches Gone as the shim's job closes: wait for it.
     for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
         wait::until(|| !pid_is_alive(&pid));
         assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
     }
+    let absent = mgr.status(&id).expect_err("the task was deleted");
+    assert!(
+        matches!(absent.cause(), goetia::Error::NotInstalled { .. }),
+        "{absent:?}"
+    );
+    let records = support::task_records(id.as_str());
+    assert!(!records.exists(), "the run records {} are gone", records.display());
+    let marker = records.with_file_name(format!("{id}~removing"));
+    assert!(!marker.exists(), "and so is the marker {}", marker.display());
 }
 
 /// The shim obeys the removal's marker: its pin is refused, no program starts, and the task's last result

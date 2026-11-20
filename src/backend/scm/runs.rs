@@ -418,8 +418,7 @@ impl Runs {
     /// and drops the pin. The marker is beside the directory and goes after it, so no pin is accepted at
     /// any point of the delete; one about to be refused can be in the directory for a moment, and is waited
     /// for as any is. A pin that finds the marker is refused with an [`io::ErrorKind::ResourceBusy`]
-    /// error that says an install or an uninstall is running or did not finish ([`unfinished_change`]). It is not [`io::ErrorKind::NotFound`], which a
-    /// directory already removed gives and which a caller may take as "no records".
+    /// error ([`unfinished_change`]).
     pub(crate) fn hold(&self) -> io::Result<Pin> {
         self.hold_with(MarkerCheck::Refuse)
     }

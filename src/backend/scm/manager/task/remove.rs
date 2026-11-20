@@ -6,9 +6,11 @@
 //! next `uninstall` reads and completes: a task that is registered and disabled, a task that is gone
 //! with its records left (`uninstall` of an id that is absent removes them), or nothing.
 //!
-//! Until that re-run (or an install run again with `--force`), the removal's marker stands, and `enable`,
-//! `disable`, `run` and `stop` refuse with the message of
-//! [`unfinished_change`](crate::backend::scm::runs::unfinished_change).
+//! The task is disabled first, so a trigger that comes due after that does not fire; only a run launched
+//! just before the disable can reach the marker and be refused by its shim. The marker stands from the
+//! step that places it until the re-run (or an install run again with `--force`) finishes: a failure
+//! before it leaves the task disabled with `enable` and `disable` working, and the verbs refuse after it
+//! with the message of [`unfinished_change`](crate::backend::scm::runs::unfinished_change).
 
 use std::path::{Path, PathBuf};
 
@@ -88,8 +90,7 @@ fn task_shim_host(registered: &Registered) -> Result<Option<PathBuf>> {
 impl Scm {
     /// `uninstall` of a task: under the install lock, the task and its records are removed
     /// ([`Self::task_remove`]), and the shim file nothing references is swept as a service's uninstall
-    /// sweeps it. Every run listed has exited by then; a shim that pinned the records before the marker may
-    /// still be exiting, which the removal of the records waits for.
+    /// sweeps it.
     pub(in crate::backend::scm) fn task_uninstall(&self, snapshot: TaskSnapshot) -> Result<()> {
         let _lock = InstallLock::acquire()?;
         let host = task_shim_host(snapshot.registered());
@@ -160,12 +161,11 @@ impl Scm {
     ///    task, disabled, and the marker: the re-run takes its own pin past it and finishes. The pin is
     ///    let go once the records are read.
     /// 5. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder
-    ///    (a shim that pinned before the marker leaves once it reads the task gone), with no bound, and
-    ///    says on stderr what it waits for. The install lock is held throughout.
+    ///    (a shim that pinned before the marker leaves once it reads the task gone).
     ///
-    /// A task that is gone has nothing to disable or stop; the rest finds nothing, and a failure from
-    /// the marker on says it is not installed and records are what is left. A task with no directory of
-    /// records has no pin to take; its marker is placed all the same, unless the `runs` folder is gone too
+    /// A task that is gone has nothing to disable or stop; a failure after that says it is not installed
+    /// and records are what is left. A task with no directory of records has no pin to take; its marker
+    /// is placed all the same, unless the `runs` folder is gone too
     /// ([`Closed::NoRecords`](crate::backend::scm::runs::Closed::NoRecords)).
     pub(super) fn task_remove_with<P: Processes>(
         &self,
@@ -183,11 +183,8 @@ impl Scm {
             Err(e) => return Err(uninstall_failed(id, Left::Unknown, e)),
         };
 
-        // The marker, then the own pin past it: a shim that checks the marker after this sees it, and one
-        // that checked before is listed by the stop's first read, which comes after.
         runs.close().map_err(|e| uninstall_failed(id, left, e))?;
         let pin = pin_records("uninstall", id, runs, MarkerCheck::Ignore).map_err(|e| uninstall_failed(id, left, e))?;
-        // The pin is released when the stop returns, so the delete is made with none of the uninstall's own.
         self.task_stop_with(
             "uninstall",
             id,

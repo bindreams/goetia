@@ -75,12 +75,11 @@ pub trait ServiceManager {
     /// is not installed is the same retry, and reports [`Error::NotInstalled`]
     /// when it has nothing left to do.
     ///
-    /// A Windows task's `uninstall` stops every run that is alive and reads its record before it deletes
-    /// the task, and a scheduled run that falls meanwhile does not run: the Event Log says so, and the
-    /// task's last result is the shim's failure. An uninstall that fails or is interrupted after it began
-    /// (an incomplete stop, for one) leaves the task disabled, and its run records closed to a new
-    /// run: `enable`, `disable`, `run` and `stop` refuse, naming the two ways on, which are to re-run
-    /// `uninstall`, or to run the install again with `--force`.
+    /// A Windows task's `uninstall` disables the task, so no scheduled run starts from then on, and stops
+    /// every live run before it deletes the task. One that fails or is interrupted leaves the task disabled
+    /// or, after the delete, only its run records: re-run `uninstall`, or run the install again with
+    /// `--force`. Once it has closed the task's run records, `enable`, `disable`, `run`, and a `stop` that
+    /// finds a run to wait for refuse until one of those two has finished.
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if

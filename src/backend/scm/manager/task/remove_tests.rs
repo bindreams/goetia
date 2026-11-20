@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
 use super::super::support::{
-    Machine, PATH, id, instance, instance_id, linked_records, pins_in, record, records, scm, shim_writes, snapshot_of,
+    Denied, Machine, PATH, id, instance, instance_id, linked_records, pins_in, record, records, scm, shim_writes,
+    snapshot_of,
 };
 use super::*;
 use crate::backend::ReadOutcome;
@@ -498,7 +499,68 @@ fn a_failed_delete_leaves_the_records_for_the_retry() {
     assert!(records_dir.exists());
 }
 
-// The order -----------------------------------------------------------------------------------------------------------
+/// A marker that cannot be placed fails the uninstall before any run is read: the task is registered and
+/// disabled, and the failure says so.
+#[skuld::test]
+fn a_marker_that_cannot_be_placed_fails_the_uninstall_before_any_run_is_read() {
+    let (_dir, records_dir, runs) = records();
+    // A directory at the marker's name cannot be opened as the file.
+    std::fs::create_dir(records_dir.with_file_name(format!("{}~removing", id()))).unwrap();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .unwrap_err();
+
+    let text = failed.to_string();
+    assert!(
+        text.contains("NOT deleted") && text.contains("It is disabled"),
+        "{text}"
+    );
+    assert!(
+        failed.report().to_string().contains("place the removal's marker"),
+        "{}",
+        failed.report()
+    );
+    assert_eq!(fake.calls(), [disable_call()], "no run is read, stopped or deleted");
+    assert!(machine.held.is_empty());
+    assert!(records_dir.exists());
+    fake.finish();
+}
+
+/// The uninstall's own pin refused for a reason other than the marker fails it before any `Stop`, with the
+/// task registered, disabled and under its marker, which the re-run finishes.
+#[skuld::test]
+fn a_pin_the_uninstall_cannot_take_fails_it_before_any_stop() {
+    let (_dir, records_dir, runs) = records();
+    let _denied = Denied::new(&records_dir);
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .unwrap_err();
+
+    let text = failed.to_string();
+    assert!(
+        text.contains("NOT deleted") && text.contains("It is disabled"),
+        "{text}"
+    );
+    let report = failed.report().to_string();
+    assert!(
+        report.contains("`uninstall` was denied access to the run records of `nightly`"),
+        "{report}"
+    );
+    assert_eq!(fake.calls(), [disable_call()], "no run is read, stopped or deleted");
+    assert!(machine.held.is_empty());
+    assert!(runs.is_closed().unwrap(), "the marker stands for the re-run");
+    fake.finish();
+}
 
 /// What the world looks like at a step of an uninstall: a log that effects of the fake and of the machine
 /// add to, with whether the removal's marker stands, how many pins the records hold and whether the
@@ -540,8 +602,8 @@ impl Watch {
     }
 }
 
-/// The marker is placed after the disable and before any run is read; the uninstall's own pin is held from
-/// then until the runs are stopped and read, and is released before the delete; and the records go last.
+/// The marker follows the disable and precedes the first read; the own pin is held until the runs are read,
+/// and let go before the delete.
 #[skuld::test]
 fn uninstall_order() {
     let (dir, records_dir, runs) = records();
@@ -585,8 +647,7 @@ fn uninstall_order() {
     fake.finish();
 }
 
-/// The uninstall's own marker does not refuse its own pin: a run is stopped and read under the marker the
-/// uninstall placed, or one a failed uninstall left.
+/// The uninstall's own pin is taken past its marker.
 #[skuld::test]
 fn uninstall_does_not_refuse_itself_with_its_own_marker() {
     let (_dir, records_dir, runs) = records();
@@ -610,8 +671,8 @@ fn uninstall_does_not_refuse_itself_with_its_own_marker() {
     fake.finish();
 }
 
-/// With no directory of records there is no pin to take, and nothing is waited for: the run is stopped, its
-/// record is none, and the task goes. The marker is placed all the same, while the `runs` folder stands.
+/// With no directory of records the marker is placed and no pin is taken; the run is stopped, and the marker
+/// goes with the task.
 #[skuld::test]
 fn uninstall_of_a_task_with_no_records_directory_waits_for_nothing() {
     let (dir, records_dir, runs) = records();
@@ -638,11 +699,12 @@ fn uninstall_of_a_task_with_no_records_directory_waits_for_nothing() {
         "the marker stood at the first listing, though there is no directory"
     );
     assert_eq!(machine.waited.len(), 1);
+    assert!(!watch.marker_stands(), "the marker is gone");
+    assert!(!records_dir.exists(), "and no records directory was made");
     fake.finish();
 }
 
-/// An uninstall whose own pin found no records (the directory was not there then) takes no second pin: the
-/// marker it placed would refuse one. The run is stopped all the same.
+/// A stop takes no second pin when the uninstall's own found no records: its marker would refuse it.
 #[skuld::test]
 fn uninstall_whose_own_pin_found_no_records_is_not_refused_by_its_marker() {
     let (_dir, records_dir, runs) = records();
@@ -694,8 +756,7 @@ fn a_failure_after_a_disable_that_found_the_task_gone_does_not_say_it_is_disable
     assert!(text.contains("`nightly` is not installed"), "{text}");
 }
 
-/// An uninstall that failed after its marker (an incomplete stop) leaves the task disabled and the marker; the
-/// re-run takes its own pin past that marker and finishes.
+/// An uninstall that failed after its marker leaves the task disabled and the marker; the re-run finishes.
 #[skuld::test]
 fn rerun_after_an_incomplete_stop_finishes() {
     let (dir, records_dir, runs) = records();
@@ -710,9 +771,27 @@ fn rerun_after_an_incomplete_stop_finishes() {
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
     machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::IncompleteStop)));
-    scm(&fake)
+    let failed = scm(&fake)
         .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
         .unwrap_err();
+    let text = failed.to_string();
+    assert!(
+        text.contains("NOT deleted") && text.contains("It is disabled"),
+        "{text}"
+    );
+    assert!(
+        failed
+            .report()
+            .to_string()
+            .contains("could not end the program's process tree"),
+        "the incomplete stop: {}",
+        failed.report()
+    );
+    assert!(
+        !fake.calls().iter().any(|call| matches!(call, Call::Delete(..))),
+        "the task is kept"
+    );
+    fake.finish();
     assert!(watch.marker_stands(), "the failed uninstall keeps its marker");
     assert_eq!(pins_in(&records_dir), 0, "and not its pin");
 
@@ -730,11 +809,10 @@ fn rerun_after_an_incomplete_stop_finishes() {
     again.finish();
 }
 
-/// A shim that pinned the records before the marker (it was listed and passed its check earlier) holds its
-/// pin while the task is deleted, and lets go once the task is gone, as a shim reading a deleted task does:
-/// the uninstall does not wait for it before the delete, and finishes once it has.
+/// A pin taken before the marker is still held when the task is deleted: nothing waits for it before the
+/// delete. (That `remove_all` waits for it is `runs_tests`'s.)
 #[skuld::test]
-fn a_shim_pinned_before_the_marker_ends_when_the_task_is_deleted() {
+fn a_pin_taken_before_the_marker_is_held_across_the_delete() {
     let (dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
     let watch = Watch::new(dir.path(), &records_dir);
