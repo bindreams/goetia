@@ -290,6 +290,18 @@ impl Runs {
         self.reopen()
     }
 
+    /// What [`Runs::ensure`] would refuse of the directory as it stands, found without changing anything: one
+    /// that is there and is no directory of goetia's (a link: [`io::ErrorKind::NotADirectory`]). One that is
+    /// not there is fine, since `ensure` makes it. What cannot be foreseen (a write of the permissions that is
+    /// denied at that moment) is for `ensure`.
+    pub(crate) fn check_directory(&self) -> io::Result<()> {
+        match Dir::open(&self.dir) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Places the removal's marker, beside the directory: from then on no pin is accepted
     /// ([`Runs::hold`]) and the pins that exist are final. Placing it again changes nothing. With `runs` gone
     /// nothing is placed ([`Closed::NoRecords`]): there are no records to protect.
@@ -450,7 +462,7 @@ impl Runs {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::os_at("list", &self.dir, e)),
         };
-        Ok(match pins_of(&dir, &entries)? {
+        Ok(match pins_of(&dir, &entries, "tell whether a run holds")? {
             Pins::Held(path) => Some(path),
             Pins::Free | Pins::Linked => None,
         })
@@ -593,7 +605,7 @@ impl Runs {
     /// A `dir` that became a link since `entries` was listed has none of them: the pass stops at the first
     /// delete that says so, with nothing held and nothing failed, and the caller deletes the link.
     fn delete_entries(&self, dir: &Dir, entries: &[Entry]) -> Result<Option<PathBuf>> {
-        match pins_of(dir, entries)? {
+        match pins_of(dir, entries, "remove")? {
             Pins::Linked => return Ok(None),
             Pins::Held(path) => return Ok(Some(path)),
             Pins::Free => {}
@@ -831,8 +843,9 @@ enum Pins {
 
 /// [`scan_pins`] over the entries of `entries` that are no directory (a directory is no pin, whatever its
 /// name: a removal takes it with the rest), with a pin whose state could not be told an error naming every
-/// such pin: no delete may run while a pin may be held.
-fn pins_of(dir: &Dir, entries: &[Entry]) -> Result<Pins> {
+/// such pin: no delete may run while a pin may be held. `doing` is what the caller was doing, for the error
+/// ("remove", "tell whether a run holds").
+fn pins_of(dir: &Dir, entries: &[Entry], doing: &str) -> Result<Pins> {
     let scan = scan_pins(dir, entries.iter().filter(|entry| !entry.directory()));
     if scan.linked {
         return Ok(Pins::Linked);
@@ -840,7 +853,7 @@ fn pins_of(dir: &Dir, entries: &[Entry]) -> Result<Pins> {
     let unclassified = scan
         .unclassified
         .into_iter()
-        .map(|(pin, e)| Error::os_at("remove", pin, e));
+        .map(|(pin, e)| Error::os_at(doing, pin, e));
     if let Some(failed) = Error::both_all(unclassified) {
         return Err(failed);
     }

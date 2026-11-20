@@ -213,31 +213,41 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, naming: &Naming) -> Result<En
 /// again. A directory at the name, and a link, are told as what they are. The status of an open of the name tells
 /// each of the three from a permission that refuses the install: the Win32 error is access denied for all four.
 fn make_error(path: &Path, e: io::Error) -> Error {
-    if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
-        match what_is_at(path) {
-            AtName::Directory => {
-                return Error::os(
-                    "use the default log",
-                    io::Error::other(format!(
-                        "{} is a directory, which goetia did not make; remove it and install the daemon again",
-                        path.display()
-                    )),
-                );
-            }
-            AtName::Link => return Error::os("use the default log", link_error(path)),
-            AtName::DeletePending => {
-                return Error::os(
-                    "use the default log",
-                    io::Error::other(format!(
-                        "{} is being deleted while a run of the daemon still writes it; stop the daemon, then install it again",
-                        path.display()
-                    )),
-                );
-            }
-            AtName::Other => {}
-        }
+    if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+        && let Some(refusal) = refusal_at(path, what_is_at(path))
+    {
+        return refusal;
     }
     Error::os_at("make", path, e)
+}
+
+/// What [`ensure`] refuses of what `at` says is at `path`, if it refuses it.
+fn refusal_at(path: &Path, at: AtName) -> Option<Error> {
+    let said = match at {
+        AtName::Directory => format!(
+            "{} is a directory, which goetia did not make; remove it and install the daemon again",
+            path.display()
+        ),
+        AtName::Link => return Some(Error::os("use the default log", link_error(path))),
+        AtName::DeletePending => format!(
+            "{} is being deleted while a run of the daemon still writes it; stop the daemon, then install it again",
+            path.display()
+        ),
+        AtName::Other => return None,
+    };
+    Some(Error::os("use the default log", io::Error::other(said)))
+}
+
+/// What [`ensure`] would refuse of the default log of `id` under `program_data` as it stands, found without
+/// changing anything: a directory, a link or a pending delete at its name, told as `ensure` tells them. A file
+/// that is not there, or one `ensure` would only set, passes; so does what cannot be foreseen (a write of the
+/// permissions that is denied at that moment).
+pub(crate) fn check(program_data: &Path, id: &Id) -> Result<()> {
+    let path = path_in(&logs_folder(program_data), id.as_str());
+    match refusal_at(&path, what_is_at(&path)) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
 }
 
 /// What a name that refused an open with access denied is.
