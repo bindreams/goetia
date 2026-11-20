@@ -32,15 +32,17 @@ arming a task's timer runs `systemctl clean` on it (243+) to clear its stamp,
 which is how arming a task again makes up no run missed while goetia's
 `disable` had disarmed it.
 
-On Linux and macOS goetia finds `systemctl` and `launchctl` by searching the
-caller's `PATH`, and nowhere else. Every `PATH` entry before the one that holds
-the tool must be one the calling account can search: an entry it cannot search
-stops the search with an error that names the entry, even when a later entry
-holds the tool (for example after switching user while keeping the old
-`PATH`). A `PATH` must be set: with none the tool is not found, and there is no
-default search path. The first file of that name on `PATH` is the one run,
+On Linux goetia finds `systemctl`, `journalctl` and `busctl`, and on macOS
+`launchctl`, by searching the caller's `PATH`. Every `PATH` entry before the
+one that holds the tool must be one the calling account can search: an entry it
+cannot search stops the search with an error that names the entry, even when a
+later entry holds the tool (for example after switching user while keeping the
+old `PATH`). A `PATH` must be set: with none the tool is not found, and there is
+no default search path. The first file of that name on `PATH` is the one run,
 executable or not. To recover, remove or fix the entry, or run with a system
-`PATH` such as `/usr/bin:/bin:/usr/sbin:/sbin`.
+`PATH` such as `/usr/bin:/bin:/usr/sbin:/sbin`. (`plutil`, which `install` runs
+on macOS to check a plist, is not found this way: the operating system finds
+it.)
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
