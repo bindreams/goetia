@@ -273,6 +273,7 @@ fn task_running(
             ..base.common
         },
         schedule: None,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()

@@ -91,6 +91,12 @@ impl Held {
         Held::spawned(Command::new(&copy).args(["-c", &format!("echo up; {script}")]))
     }
 
+    /// A child that ignores SIGTERM, as a run that does not answer it: it ends of SIGKILL, or of its stdin
+    /// closing.
+    pub(in crate::backend::launchd::manager) fn ignoring_sigterm() -> Held {
+        Held::spawned(Command::new("/bin/sh").args(["-c", "trap '' TERM; echo up; read _; exit 0"]))
+    }
+
     fn running(script: &str) -> Held {
         Held::spawned(Command::new("/bin/sh").args(["-c", &format!("echo up; {script}")]))
     }
@@ -120,12 +126,17 @@ impl Held {
     /// Continues the child (a no-op for one that is not stopped), lets it go and reaps it, so its exit has
     /// happened (and its event been queued) when this returns. Its exit code.
     pub(in crate::backend::launchd::manager) fn finish(&mut self) -> Option<i32> {
+        self.reap().code()
+    }
+
+    /// [`Self::finish`], with the whole status: a signal that ended the child is in it.
+    pub(in crate::backend::launchd::manager) fn reap(&mut self) -> std::process::ExitStatus {
         if self.stdin.take().is_some() {
             // SAFETY: `kill` takes plain integers; the child is this process's own and not yet reaped, as
             // its stdin is still held.
             unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) };
         }
-        self.child.wait().expect("wait for the child").code()
+        self.child.wait().expect("wait for the child")
     }
 }
 

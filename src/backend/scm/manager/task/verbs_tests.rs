@@ -838,7 +838,7 @@ fn a_start_after_an_unwaited_stop_is_not_sent_when_a_runs_liveness_cannot_be_jud
         fn open(&mut self, _: u32) -> io::Result<Option<u32>> {
             unreachable!("a start holds no process")
         }
-        fn terminate(&mut self, _: &u32) -> io::Result<()> {
+        fn force_end(&mut self, _: &u32) -> io::Result<()> {
             unreachable!("a start terminates nothing")
         }
         fn await_exit(&mut self, _: &u32, _: Deadline) -> io::Result<Waited> {

@@ -17,12 +17,14 @@ use crate::manager::Budget;
 /// argument counts as present, which would make `--timeout` indistinguishable
 /// from its absence, and [`dispatch`](super::dispatch)'s `install` refusal
 /// needs that distinction (see [`Self::was_given`]). Clap therefore cannot
-/// render `[default: 10s]`, so the help text states the default in words.
+/// render `[default: 10s]`, so the help text states the default in words, and `stop` and
+/// `restart` take theirs from the daemon ([`Self::given`] is `None`).
 #[derive(ClapArgs, Debug, Default)]
 pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
-    /// state asked for. Defaults to 10s. `--timeout 0` issues the request
-    /// and returns without waiting, establishing nothing. On macOS, a stop and
+    /// state asked for. Defaults to 10s; for `stop`, the daemon's own stop timeout plus 10s, and for
+    /// `restart` that for the stop and 10s for the start (see `stop-action` in the README). `--timeout 0` issues
+    /// the request and returns without waiting, establishing nothing. On macOS, a stop and
     /// some starts and installs also wait for launchd to remove a job; see the
     /// README. Write a compound duration unspaced (`2m30s`), or quote it as
     /// one argument: every verb taking this flag also takes a variadic id
@@ -48,6 +50,13 @@ impl WaitArgs {
             Some(Duration::ZERO) => Budget::Immediate,
             Some(d) => Budget::Bounded(d),
         }
+    }
+
+    /// The [`Budget`] the flags name, or `None` when neither was given: a verb that stops a daemon then leaves
+    /// the wait to the manager, which resolves it from the definition it stops
+    /// ([`ServiceManager::stop`](crate::manager::ServiceManager::stop)).
+    pub fn given(&self) -> Option<Budget> {
+        self.was_given().then(|| self.budget())
     }
 
     /// Whether either flag was actually given, which [`Self::budget`] cannot

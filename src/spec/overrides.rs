@@ -6,15 +6,16 @@
 //! - Keyed by `systemd`, `launchd`, or `scm`. An unknown key is an error
 //!   naming it; a repeated key is too.
 //! - Every field but the daemon's id and `type` is overridable: `name`, `command`,
-//!   `cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `protocol`, `schedule`. `type` is
+//!   `cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `protocol`, `schedule`, `stop-action`. `type` is
 //!   parsed only to be refused by name ("cannot be set per backend"), so that it is not an
 //!   unknown field.
 //! - A scalar or list field replaces the base value outright; `env` merges
-//!   key by key instead, the override winning where both set the same key.
+//!   key by key instead, the override winning where both set the same key, and so does
+//!   `stop-action`, leaf by leaf (`send-signal`, `timeout`).
 //!   A key repeated *within* one `env` map, or colliding with another by
 //!   case alone, is an error naming it — `raw.rs`'s check, reused here.
-//! - An explicit YAML `null` is an error for all eleven fields and for every
-//!   leaf under them. That is `no_null`'s scan, not this module: the scan
+//! - An explicit YAML `null` is an error for all twelve fields and for every
+//!   leaf under them, except `stop-action`'s `timeout`, where `null` means no timeout. That is `no_null`'s scan, not this module: the scan
 //!   is schema-blind, so it walks an override like any other subtree, and
 //!   `Slot` routes one exactly like the document it overrides.
 //! - `${VAR}` is substituted only in the override for the backend actually
@@ -35,6 +36,7 @@ use serde::{Deserialize, Deserializer};
 use super::BackendKind;
 use super::field::Field;
 use super::raw::{EnvVisitor, RawSpec};
+use super::stop_action::{RawStopAction, deserialize_stop_action};
 use super::user::{RawUser, deserialize_user};
 
 pub(super) type BackendOverrides = BTreeMap<BackendKind, RawOverride>;
@@ -56,6 +58,7 @@ pub(super) struct RawOverride {
     pub daemon_type: Option<String>,
     pub protocol: Option<String>,
     pub schedule: Option<String>,
+    pub stop_action: Option<RawStopAction>,
 }
 
 /// `RawOverride`'s serde shape; read only under `RawSpec::parse` (see `Wire`).
@@ -88,6 +91,8 @@ struct OverrideWire {
     protocol: Option<String>,
     #[serde(default)]
     schedule: Option<String>,
+    #[serde(rename = "stop-action", default, deserialize_with = "deserialize_stop_action")]
+    stop_action: Option<RawStopAction>,
 }
 
 struct OverrideEntry(RawOverride);
@@ -113,6 +118,9 @@ pub(super) struct Supplied {
     pub command: bool,
     pub cwd: bool,
     pub logs: bool,
+    /// `stop-action`'s `send-signal` and `timeout`, each on its own: an override may write one.
+    pub stop_signal: bool,
+    pub stop_timeout: bool,
     /// The `env` names the override wrote.
     pub env: BTreeSet<String>,
 }
@@ -125,6 +133,8 @@ impl Supplied {
         command: false,
         cwd: false,
         logs: false,
+        stop_signal: false,
+        stop_timeout: false,
         env: BTreeSet::new(),
     };
 
@@ -137,6 +147,8 @@ impl Supplied {
             Field::Command(_) => self.command,
             Field::Cwd => self.cwd,
             Field::Logs => self.logs,
+            Field::StopSignal => self.stop_signal,
+            Field::StopTimeout => self.stop_timeout,
             Field::EnvKey(key) => self.env.contains(&**key),
             Field::EnvValue(key) => self.env.contains(key),
             Field::Restart | Field::RestartDelay | Field::Type | Field::Protocol | Field::Schedule => false,
@@ -153,6 +165,8 @@ impl RawOverride {
             command: self.command.is_some(),
             cwd: self.cwd.is_some(),
             logs: self.logs.is_some(),
+            stop_signal: self.stop_action.as_ref().is_some_and(|a| a.send_signal.is_some()),
+            stop_timeout: self.stop_action.as_ref().is_some_and(|a| a.timeout.is_some()),
             env: self.env.iter().flat_map(|env| env.keys().cloned()).collect(),
         }
     }
@@ -192,6 +206,10 @@ impl RawSpec {
             daemon_type: self.daemon_type.clone(),
             protocol: ovr.protocol.clone().or_else(|| self.protocol.clone()),
             schedule: ovr.schedule.clone().or_else(|| self.schedule.clone()),
+            stop_action: match &ovr.stop_action {
+                Some(ovr) => Some(ovr.over(&self.stop_action)),
+                None => self.stop_action.clone(),
+            },
             backend_specific: BackendOverrides::new(),
         };
 
@@ -213,6 +231,7 @@ impl RawSpec {
             daemon_type: self.daemon_type.clone(),
             protocol: self.protocol.clone(),
             schedule: self.schedule.clone(),
+            stop_action: self.stop_action.clone(),
             backend_specific: BackendOverrides::new(),
         }
     }

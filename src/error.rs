@@ -383,6 +383,22 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// The `stop` of `id` named no wait, so it takes the daemon's stop action for one, and the installed
+    /// definition that holds it will not decode; `source` is the decode failure. Nothing was sent. A stop
+    /// that names its wait does not read the definition, so the remedy, which [`report`](Error::report)
+    /// prints last, is the flags that name one. `source` is always [`Kept`](Error::Kept), which ends every
+    /// walk of the chain, so this is no wrapper of `wrapper!`; it is as indeterminate as `source` is. The
+    /// message leaves `id` out: the CLI prefixes it.
+    #[error(
+        "the stop was refused and nothing was sent: with no `--timeout` or `--no-timeout` the wait comes from \
+         the daemon's stop action, which could not be taken from its installed definition"
+    )]
+    StopActionUnreadable {
+        id: String,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -568,12 +584,17 @@ pub enum Error {
 
     /// An install that changes the account a task runs as registers the task again (an update would
     /// leave it unreadable by the new account), which removes the old registration first, and so it
-    /// refuses while the task runs. Determinate: nothing was changed.
-    #[error(
-        "`{id}` is running, and installing it as another account registers it again, which removes the running \
-         task first: run `goetia daemon stop {id}`, then re-run install"
-    )]
+    /// refuses while a run of the task is alive (whether or not its records are held too). Determinate: the old
+    /// task stays, its flag on again (one that cannot be put back is reported with this error); a scheduled run
+    /// that fell between the disable and the refusal was skipped.
+    #[error("{}", account_change_running(id))]
     AccountChangeRunning { id: String },
+
+    /// An account change ([`Error::AccountChangeRunning`]) that finds no run alive but the task's run records
+    /// held: `pin` is what holds them (a run that is starting, a `run` or `stop` of the task, or another
+    /// program). Determinate; leaves the same traces as [`Error::AccountChangeRunning`].
+    #[error("{}", account_change_held(id, pin))]
+    AccountChangeHeld { id: String, pin: PathBuf },
 
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
@@ -840,7 +861,9 @@ impl Error {
             | Error::StopUnconfirmed { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunUnrecorded { .. } => true,
-            wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
+            wrapper!(source)
+            | Error::ServiceImageUnreadable { source, .. }
+            | Error::StopActionUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
@@ -887,6 +910,7 @@ impl Error {
             | Error::StillRunning { .. }
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
+            | Error::AccountChangeHeld { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -993,6 +1017,9 @@ impl Error {
                 "An administrator must make each named service's registry key readable, or let SCM query it \
                  (`SERVICE_QUERY_CONFIG`)",
             ),
+            Error::StopActionUnreadable { .. } => {
+                Some("Pass `--timeout <duration>` or `--no-timeout` to name the wait yourself.")
+            }
             Error::Kept(kept) => kept.remedy(),
             _ => None,
         }
@@ -1047,6 +1074,7 @@ impl Error {
             | Error::Step { .. }
             | Error::InstalledUnreadable { .. }
             | Error::ServiceImageUnreadable { .. }
+            | Error::StopActionUnreadable { .. }
             | Error::ConcurrentChange { .. }
             | Error::QuarantineStranded { .. }
             | Error::AmbiguousInstall { .. }
@@ -1091,6 +1119,7 @@ impl Error {
             | Error::StillRunning { .. }
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
+            | Error::AccountChangeHeld { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }
@@ -1132,6 +1161,12 @@ impl Error {
     #[cfg(feature = "cli")]
     pub(crate) fn write_report(&self, out: &mut Sink) -> fmt::Result {
         report::write_report(self, out)
+    }
+
+    /// The error a snapshot kept, handed out again: what each verb that reads a blob that will not
+    /// decode returns for it.
+    pub(crate) fn kept(kept: &Arc<Error>) -> Error {
+        Error::Kept(Arc::clone(kept))
     }
 
     /// This error, or the error it hands out if it is a [`Kept`](Error::Kept) one.
@@ -1544,6 +1579,24 @@ fn retype_running(id: &str, old: crate::spec::DaemonKind) -> String {
     format!(
         "`{id}` is running as a {old}, and changing it to a {new} removes it first: run `goetia daemon stop {id}`, \
          then re-run install"
+    )
+}
+
+/// The message of [`Error::AccountChangeRunning`].
+fn account_change_running(id: &str) -> String {
+    format!(
+        "`{id}` is running, and installing it as another account registers it again, which removes the running \
+         task first: run `goetia daemon stop {id}`, then re-run install"
+    )
+}
+
+/// The message of [`Error::AccountChangeHeld`].
+fn account_change_held(id: &str, pin: &Path) -> String {
+    format!(
+        "`{id}` cannot change its account now: its run records are held (`{}`) by a run that is starting, a \
+         `run` or `stop` of it, or another program, and installing it as another account registers it again, \
+         which hands them to the new account: wait for that to end, then re-run install",
+        pin.display()
     )
 }
 

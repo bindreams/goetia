@@ -55,11 +55,14 @@ use super::field::Field;
 use super::interpolate::{self, Substitution};
 use super::overrides::Supplied;
 use super::raw::RawSpec;
+use super::stop_action::{
+    BaseSignal, RawStopAction, RawTimeout, kill_with_timeout, parse_stop_signal, parse_stop_timeout,
+};
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
 use super::{
     DaemonFields, DaemonKind, DaemonSpec, HashSeed, Id, Protocol, Restart, Schedule, ServiceFields, ServiceSpec,
-    TaskFields, TaskSpec, Warning, schedule,
+    StopAction, StopSignal, TaskFields, TaskSpec, Warning, schedule,
 };
 use crate::error::Error;
 
@@ -153,7 +156,9 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
             if Some(backend) == native {
                 return Ok(());
             }
-            backend.error(&shaped, &supplied, Substitution::Pending)
+            backend
+                .error(&shaped, &supplied, Substitution::Pending)
+                .map_err(Error::from)
         })();
         sweep.map_err(|e| annotate_sweep_error(e, backend, has_entry))?;
     }
@@ -178,11 +183,11 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     };
     let (shaped, mut daemon_warnings) =
         resolve_shape(&id, native_merged, base_dir, Substitution::Done, native, &hostname).map_err(blame)?;
-    // `error` reads only `native_supplied` fields, and only `user`: it is the backend's verdict on
+    // `error` reads only `native_supplied` fields (`user`, `stop-action`): it is the backend's verdict on
     // what the override wrote, so it names the backend too, ahead of the `.env` attribution.
     if let Some(b) = native {
         b.error(&shaped, &native_supplied, Substitution::Done)
-            .map_err(|e| attribute_to(Refused::at(Field::User, e).attributed(&from_env), b))?;
+            .map_err(|refused| attribute_to(refused.attributed(&from_env), b))?;
         b.refuse(&shaped).map_err(blame)?;
         b.warn(&shaped, &mut daemon_warnings);
     }
@@ -282,8 +287,9 @@ impl Refused {
         }
     }
 
-    /// An error no field's text is to blame for: the manifest directory's (`-f`).
-    pub(super) fn of_manifest_dir(err: Error) -> Self {
+    /// An error that carries its own blame, and that no field's text is to blame for in the merged
+    /// spec: the manifest directory's (`-f`), or a value the override replaced.
+    pub(super) fn unattributed(err: Error) -> Self {
         Refused { field: None, err }
     }
 
@@ -411,6 +417,7 @@ fn resolve_shape(
     let schedule = shape(id, Field::Schedule, raw.schedule, substitution, |id, text| {
         Schedule::parse(text, &HashSeed { hostname, id })
     })?;
+    let (stop_signal, stop_timeout) = shape_stop_action(id, raw.stop_action.unwrap_or_default(), substitution)?;
 
     Ok((
         ShapedSpec {
@@ -426,9 +433,96 @@ fn resolve_shape(
             daemon_type,
             protocol,
             schedule,
+            stop_signal,
+            stop_timeout,
         },
         warnings,
     ))
+}
+
+/// `stop-action`'s two leaves, shaped like any other field. A `null` timeout is a value, not an
+/// absence: it parses to `None` (no timeout) and needs no substitution. A timeout beside `kill`, once
+/// both are known, is refused, since `kill` ends the daemon at once; but a base's timeout that an
+/// override's `kill` merely leaves in place is not the override's to refuse, and is dropped. So is a
+/// base `kill`'s `null`, which an override's other signal does not take: it has the signal's default. So is
+/// the `null` of a base signal that is unknown (it did not substitute), which may have been `kill`.
+fn shape_stop_action(
+    id: &Id,
+    action: RawStopAction,
+    substitution: Substitution,
+) -> Result<(Shaped<StopSignal>, Shaped<Option<Duration>>), Refused> {
+    let timeout_from_base = action.timeout_from_base;
+    let signal = shape(
+        id,
+        Field::StopSignal,
+        action.send_signal,
+        substitution,
+        parse_stop_signal,
+    )?;
+    let timeout = match action.timeout {
+        None => Shaped::Absent,
+        Some(RawTimeout::Null) => Shaped::Parsed(None),
+        Some(RawTimeout::Text(text)) => shape(id, Field::StopTimeout, Some(text), substitution, |id, text| {
+            parse_stop_timeout(id, text).map(Some)
+        })?,
+    };
+    // The base's signal, which the override replaced, is shaped whether or not it is used. A plainly invalid
+    // one never gets here: the base is shaped alone first (`Pending`), which refuses it. One that
+    // substituted into something that is not a signal is refused here; `None` is one that did not substitute
+    // at all, which is not known to be anything.
+    let base_signal = match action.base_signal {
+        None => Some(Shaped::Absent),
+        Some(BaseSignal::Written(text)) => Some(shape(
+            id,
+            Field::StopSignal,
+            Some(text),
+            substitution,
+            parse_stop_signal,
+        )?),
+        Some(BaseSignal::Substituted { text, from_env }) => Some(
+            shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal)
+                .map_err(|refused| refused_in_the_base(refused, from_env))?,
+        ),
+        Some(BaseSignal::Unsubstituted) => None,
+    };
+    if timeout_from_base && matches!(timeout, Shaped::Parsed(None)) && !matches!(signal, Shaped::Deferred) {
+        // The `null` is the base `kill`'s own unless the base's signal is another one, and a base signal not
+        // known to be anything may have been `kill`: it is not handed on.
+        match (&signal, base_signal) {
+            (Shaped::Parsed(StopSignal::Kill), _) => {}
+            (_, None | Some(Shaped::Parsed(StopSignal::Kill))) => return Ok((signal, Shaped::Absent)),
+            (_, Some(Shaped::Deferred)) => return Ok((signal, Shaped::Deferred)),
+            _ => {}
+        }
+    }
+    match (&signal, &timeout) {
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(_))) if timeout_from_base => {
+            Ok((signal, Shaped::Parsed(None)))
+        }
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(Some(timeout))) => Err(Refused::at(
+            Field::StopTimeout,
+            invalid(id, &kill_with_timeout(*timeout)),
+        )),
+        _ => Ok((signal, timeout)),
+    }
+}
+
+/// `refused`, an error of the base's `send-signal` that an override replaced: the base's own to refuse, and
+/// `.env`'s when `.env` supplied it, never the override's.
+fn refused_in_the_base(refused: Refused, from_env: bool) -> Refused {
+    let from_env: BTreeSet<Field> = from_env.then_some(Field::StopSignal).into_iter().collect();
+    match refused.attributed(&from_env) {
+        Error::Invalid {
+            daemon,
+            message,
+            source,
+        } => Refused::unattributed(Error::Invalid {
+            daemon,
+            message: format!("in the base, whose `send-signal` the override replaced: {message}"),
+            source,
+        }),
+        other => Refused::unattributed(other),
+    }
 }
 
 /// Keep the parse in the shape phase, deferring exactly the values [`Substitution::defers`] names:
@@ -501,6 +595,8 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         daemon_type,
         protocol,
         schedule,
+        stop_signal,
+        stop_timeout,
     } = shaped;
 
     // Absent and empty share one check, so they cannot diverge in message.
@@ -509,6 +605,7 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
 
     let daemon_type = settled(&id, "type", daemon_type)?.unwrap_or(DaemonKind::Service);
     let daemon = id.clone();
+    let stop_action = settled_stop_action(&daemon, stop_signal, stop_timeout)?;
     let common = DaemonFields {
         id,
         name,
@@ -535,6 +632,7 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
                 restart,
                 restart_delay,
                 protocol,
+                stop_action,
             })
             .map(DaemonSpec::from)
             .map_err(refused)
@@ -545,11 +643,28 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
             unset(&daemon, "restart-delay", &restart_delay)?;
             unset(&daemon, "protocol", &protocol)?;
             let schedule = settled(&daemon, "schedule", schedule)?;
-            TaskSpec::new(TaskFields { common, schedule })
-                .map(DaemonSpec::from)
-                .map_err(refused)
+            TaskSpec::new(TaskFields {
+                common,
+                schedule,
+                stop_action,
+            })
+            .map(DaemonSpec::from)
+            .map_err(refused)
         }
     }
+}
+
+/// The [`StopAction`] a substituted pass leaves of the two leaves: what the manifest wrote, over the
+/// defaults, of which the timeout depends on the signal.
+fn settled_stop_action(
+    id: &Id,
+    signal: Shaped<StopSignal>,
+    timeout: Shaped<Option<Duration>>,
+) -> Result<StopAction, Error> {
+    Ok(StopAction::from_leaves(
+        settled(id, "stop-action.send-signal", signal)?,
+        settled(id, "stop-action.timeout", timeout)?,
+    ))
 }
 
 /// A defect of this crate, not of any manifest: something an earlier step ruled out happened. An
@@ -865,7 +980,7 @@ fn check_resolved(id: &Id, field: PathField, raw: &str, resolved: &Path, join: D
         ),
     );
     Err(if from_directory {
-        Refused::of_manifest_dir(err)
+        Refused::unattributed(err)
     } else {
         Refused::at(field.field(), err)
     })
@@ -1025,6 +1140,15 @@ pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
         verdict.result?;
     }
     Ok(())
+}
+
+/// The rule over a finished daemon's [`StopAction`], for [`ServiceSpec::new`] and [`TaskSpec::new`]: a
+/// value no manifest could write (a blob's) is refused as the manifest's is.
+pub(super) fn check_stop_action(id: &Id, action: &StopAction) -> Result<(), Error> {
+    match action.defect() {
+        Some(defect) => Err(invalid(id, &defect)),
+        None => Ok(()),
+    }
 }
 
 /// The values the field rules read, as the caller holds them: authored text, or a finished
@@ -1382,7 +1506,7 @@ pub(crate) fn invalid(id: &Id, message: &str) -> Error {
 
 /// [`invalid`], for a rejection that is `source` failing to parse or resolve what the manifest
 /// holds.
-fn invalid_from(id: &Id, message: &str, source: impl std::error::Error + Send + Sync + 'static) -> Error {
+pub(super) fn invalid_from(id: &Id, message: &str, source: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::Invalid {
         daemon: id.as_str().to_string(),
         message: message.to_string(),

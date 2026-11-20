@@ -265,15 +265,16 @@ fn begin_run_takes_the_pin_and_lists_before_run_is_called() {
     older.write(&written(9, 0, RunOutcome::Exited(7)), None).unwrap();
     let fake = Fake::new();
     let shim = Runs::of(dir.path(), &id());
-    fake.on_run_during(Ok(unnamed(1)), move || {
-        let pins = fs::read_dir(&path)
-            .unwrap()
-            .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
-            .count();
-        assert_eq!(pins, 1, "the pin is held when Run is called");
-        shim.write(&written(1, 5, RunOutcome::Exited(0)), None).unwrap();
-    })
-    .on_instances(Ok(Vec::new()));
+    fake.on_run(Ok(unnamed(1)))
+        .during(move || {
+            let pins = fs::read_dir(&path)
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
+                .count();
+            assert_eq!(pins, 1, "the pin is held when Run is called");
+            shim.write(&written(1, 5, RunOutcome::Exited(0)), None).unwrap();
+        })
+        .on_instances(Ok(Vec::new()));
 
     let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
 
@@ -402,7 +403,8 @@ fn exited_stopped_and_incomplete_records_map_to_their_results() {
         let shim = Runs::of(dir.path(), &id());
         let fake = Fake::new();
         // The run ended while `Run` was being answered.
-        fake.on_run_during(Ok(named(1, 4242)), move || shim_writes(&shim, &record(1, outcome)))
+        fake.on_run(Ok(named(1, 4242)))
+            .during(move || shim_writes(&shim, &record(1, outcome)))
             .on_instances(Ok(Vec::new()));
 
         let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
@@ -426,10 +428,11 @@ fn the_end_of_a_run_does_not_wait_for_the_listing_to_drop() {
     let (dir, _path, runs) = records();
     let shim = Runs::of(dir.path(), &id());
     let fake = Fake::new();
-    fake.on_run_during(Ok(named(1, 4242)), move || {
-        shim.write(&record(1, RunOutcome::Exited(0)), None).unwrap();
-    })
-    .on_instances(Ok(vec![instance(1, 4242)]));
+    fake.on_run(Ok(named(1, 4242)))
+        .during(move || {
+            shim.write(&record(1, RunOutcome::Exited(0)), None).unwrap();
+        })
+        .on_instances(Ok(vec![instance(1, 4242)]));
 
     let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
 

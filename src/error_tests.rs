@@ -106,6 +106,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             old: crate::spec::DaemonKind::Task,
         },
         Error::AccountChangeRunning { id: id() },
+        Error::AccountChangeHeld {
+            id: id(),
+            pin: PathBuf::new(),
+        },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -396,6 +400,31 @@ fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_
             .count(),
         1
     );
+}
+
+/// The refusal of a stop for want of a readable stop action, as the stop builds it (over a kept failure), is as
+/// indeterminate as the failure under it. The kept error ends every walk, so the refusal is no wrapper: it is its
+/// own `cause`, and `map_cause` hands it whole to the mapper.
+#[skuld::test]
+fn an_unreadable_stop_action_is_as_indeterminate_as_the_kept_failure_and_is_its_own_cause() {
+    let over = |source: Error| Error::StopActionUnreadable {
+        id: "x".to_string(),
+        source: Box::new(Error::kept(&Arc::new(source))),
+    };
+    assert!(!over(Error::blob("bad")).is_indeterminate());
+    assert!(over(in_doubt()).is_indeterminate());
+
+    let refusal = over(not_installed());
+    assert!(
+        matches!(refusal.cause(), Error::StopActionUnreadable { .. }),
+        "{refusal:?}"
+    );
+    assert!(!refusal.wraps_unreadable_host());
+    let mapped = refusal.map_cause(|leaf| {
+        assert!(matches!(leaf, Error::StopActionUnreadable { .. }), "{leaf:?}");
+        in_doubt()
+    });
+    assert!(matches!(mapped, Error::WaitTimeout { .. }), "{mapped:?}");
 }
 
 #[cfg(unix)]
@@ -1656,6 +1685,17 @@ fn error_messages_and_exit_class() {
             Error::AccountChangeRunning { id: id() },
             "`nightly` is running, and installing it as another account registers it again, which removes the \
              running task first: run `goetia daemon stop nightly`, then re-run install",
+            false,
+        ),
+        (
+            Error::AccountChangeHeld {
+                id: id(),
+                pin: PathBuf::from(r"C:\ProgramData\Goetia\runs\nightly\pin-1.pin"),
+            },
+            "`nightly` cannot change its account now: its run records are held (`C:\\ProgramData\\Goetia\\runs\\nightly\\pin-1.pin`) \
+             by a run that is starting, a `run` or `stop` of it, or another program, and installing it as another \
+             account registers it again, which hands them to the new account: wait for that to end, then re-run \
+             install",
             false,
         ),
         (

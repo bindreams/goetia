@@ -425,7 +425,7 @@ fn a_process_that_cannot_be_judged_fails_the_uninstall_before_a_stop() {
         fn open(&mut self, _: u32) -> io::Result<Option<()>> {
             unreachable!("a process that cannot be judged is not held")
         }
-        fn terminate(&mut self, _: &()) -> io::Result<()> {
+        fn force_end(&mut self, _: &()) -> io::Result<()> {
             unreachable!()
         }
         fn await_exit(&mut self, _: &(), _: Deadline) -> io::Result<Waited> {

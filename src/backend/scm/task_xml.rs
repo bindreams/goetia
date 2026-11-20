@@ -82,8 +82,8 @@ pub(crate) fn ending<S: AsRef<str>>(args: &[S]) -> Option<(&str, Option<Token>)>
 pub(crate) struct Stored {
     /// The account its principal names ([`TaskXml::principal`]).
     pub principal: Option<TaskAccount>,
-    /// Whether it is armed ([`TaskXml::armed`]).
-    pub armed: bool,
+    /// Whether it holds a trigger that is switched on, whatever the task's own flag ([`TaskXml::has_triggers`]).
+    pub has_triggers: bool,
     /// The token its arguments end with, `None` when they end with no goetia ending for the task
     /// ([`TaskXml::token_of`]).
     pub token: Option<Token>,
@@ -235,6 +235,11 @@ impl TaskXml {
     /// The account, which says which logon type the registration needs.
     pub(crate) fn account(&self) -> TaskAccount {
         self.account.clone()
+    }
+
+    /// Whether the definition has a schedule, so a task made from it can be armed (`enable` refuses one with none).
+    pub(crate) fn has_schedule(&self) -> bool {
+        !self.triggers.is_empty()
     }
 
     /// The XML to register. The triggers are written only when `armed`, which is the installation's

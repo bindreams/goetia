@@ -11,7 +11,6 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use super::api::{Instance, Started};
 use super::read::live_runs;
@@ -251,13 +250,7 @@ impl Scm {
     ) -> Result<TaskRun<P>> {
         let id = snapshot.id().clone();
         let path = TaskPath::of(&id);
-        let logs = snapshot
-            .blob()
-            .map_err(|e| Error::Kept(Arc::clone(e)))?
-            .spec
-            .common()
-            .logs
-            .clone();
+        let logs = snapshot.blob().map_err(Error::kept)?.spec.common().logs.clone();
 
         let pin = runs
             .pin()

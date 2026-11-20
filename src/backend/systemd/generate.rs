@@ -25,8 +25,8 @@ use crate::backend::{Identity, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
 use crate::spec::{
-    DaemonFields, DaemonKind, DaemonSpec, DayRule, Restart, Schedule, ServiceSpec, TaskSpec, systemd_defect,
-    systemd_raw_value_defect,
+    BackendKind, DaemonFields, DaemonKind, DaemonSpec, DayRule, Protocol, Restart, Schedule, ServiceSpec, StopAction,
+    StopSignal, TaskSpec, systemd_defect, systemd_raw_value_defect,
 };
 
 // Generation ==========================================================================================================
@@ -124,6 +124,10 @@ fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
 /// A service's unit, up to the `[X-Goetia]` section.
 fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&service.common, DaemonKind::Service, id)?;
+    service
+        .stop_action
+        .refuse(BackendKind::Systemd, DaemonKind::Service, service.protocol)
+        .into_result(&service.common.id)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
@@ -149,6 +153,7 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
     if let Some(delay) = service.restart_delay {
         out.push_str(&format!("RestartSec={}\n", delay.as_secs_f64()));
     }
+    out.push_str(&stop_lines(&service.stop_action));
     out.push_str(&log_lines(&service.common));
     out.push('\n');
 
@@ -167,6 +172,9 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 /// look like a guarantee.
 fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&task.common, DaemonKind::Task, id)?;
+    task.stop_action
+        .refuse(BackendKind::Systemd, DaemonKind::Task, Protocol::Plain)
+        .into_result(&task.common.id)?;
     refuse_env_sh_resets(&task.common, &RESET_BY_SH, "a task")?;
     let mut out = String::new();
 
@@ -184,6 +192,7 @@ fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
         id,
         &render_task_exec_start(&task.common.command),
     ));
+    out.push_str(&stop_lines(&task.stop_action));
     out.push_str(&log_lines(&task.common));
 
     Ok(out)
@@ -236,6 +245,31 @@ fn exec_lines(common: &DaemonFields, id: &Identity, exec_start: &str) -> String 
     }
     out.push_str(&format!("User={}\n", raw_value(&id.user)));
     out
+}
+
+/// `[Service]`'s stop lines, which a service and a task share, written for the default too so no unit
+/// depends on systemd's own stop timeout (90 s). A stop sends `KillSignal=` and, if the unit is still
+/// running after `TimeoutStopSec=`, systemd sends `SIGKILL`; `infinity` never does. `kill` writes no
+/// `TimeoutStopSec=`: it has no timeout of its own, and systemd's default still bounds a process the
+/// kernel holds in uninterruptible sleep.
+fn stop_lines(stop_action: &StopAction) -> String {
+    let signal = match stop_action.send_signal {
+        StopSignal::Terminate => "SIGTERM".to_string(),
+        StopSignal::Interrupt => "SIGINT".to_string(),
+        StopSignal::Quit => "SIGQUIT".to_string(),
+        StopSignal::Kill => "SIGKILL".to_string(),
+        StopSignal::Native(signal) => signal.to_string(),
+        // Refused by `StopAction::refuse` before this is reached.
+        StopSignal::CtrlC | StopSignal::CtrlBreak | StopSignal::WmClose => {
+            unreachable!("a Windows signal is refused before the unit is written")
+        }
+    };
+    let timeout = match (stop_action.send_signal, stop_action.timeout) {
+        (StopSignal::Kill, _) => return format!("KillSignal={signal}\n"),
+        (_, Some(timeout)) => format!("{}s", timeout.as_secs()),
+        (_, None) => "infinity".to_string(),
+    };
+    format!("KillSignal={signal}\nTimeoutStopSec={timeout}\n")
 }
 
 /// `[Service]`'s log lines, which a service and a task share. A service puts `Restart=` between
