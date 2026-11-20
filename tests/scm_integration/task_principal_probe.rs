@@ -204,7 +204,28 @@ fn principal_of_a_dead_account(spelled_as_sid: bool, recreate: bool, runs: bool)
     say(&format!("{label}: stored after the installs"), &probe_principal(id));
     if runs {
         who("after the install");
+        let ran = mgr.run(id, &mut Vec::new());
+        say(
+            &format!("{label}: goetia's own run after the install"),
+            &match ran {
+                Ok(exit) => format!("OK {exit:?}"),
+                Err(e) => format!("ERR {}", e.report()),
+            },
+        );
         say(&format!("{label}: Task Scheduler log"), &log.events_of(id));
+        let shim_log = support::shim_default_log(&support::program_data(), id.as_str());
+        say(
+            &format!("{label}: the default log {}", shim_log.display()),
+            &std::fs::read_to_string(&shim_log).unwrap_or_else(|e| format!("unreadable: {e}")),
+        );
+        let records = crate::tasks::records_of(id);
+        say(
+            &format!("{label}: the records {}", records.display()),
+            &format!(
+                "{:?}",
+                std::fs::read_dir(&records).map(|d| d.filter_map(|e| Some(e.ok()?.file_name())).collect::<Vec<_>>())
+            ),
+        );
         say(&format!("{label}: stored after the last run"), &probe_principal(id));
     }
 }

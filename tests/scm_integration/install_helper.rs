@@ -53,7 +53,7 @@ fn finish<T: std::fmt::Debug>(result: goetia::Result<T>) -> ! {
             std::process::exit(0);
         }
         Err(e) => {
-            println!("ERR {e}");
+            println!("ERR {}", e.report());
             std::process::exit(1);
         }
     }
