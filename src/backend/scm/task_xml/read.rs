@@ -105,12 +105,12 @@ impl TaskXml {
     }
 
     /// What the stored `xml` of the task `id` says of its registration, from one parse: [`TaskXml::principal`],
-    /// [`TaskXml::armed`] and [`TaskXml::token_of`]. An error only for XML that cannot be read.
+    /// [`TaskXml::has_triggers`] and [`TaskXml::token_of`]. An error only for XML that cannot be read.
     pub(crate) fn stored(xml: &str, id: &str) -> Result<Stored, Error> {
         let document = document(xml)?;
         Ok(Stored {
             principal: principal_in(&document),
-            armed: armed_in(&document),
+            has_triggers: has_triggers(&document),
             token: token_in(&document, id),
         })
     }
@@ -144,9 +144,9 @@ impl TaskXml {
     /// among them) and nothing else changed but the task's own flag: a hand edit elsewhere in the
     /// task is kept. This is what `disable` registers; the next `enable` writes the spec's triggers.
     ///
-    /// **The task's own flag (`Settings/Enabled`) is set true,** where it is stated: an `uninstall`
-    /// that did not finish leaves it false, and `enable` and `disable` both make the task one that can
-    /// be started again. One that states none is enabled already.
+    /// **The task's own flag (`Settings/Enabled`) is set true,** where it is stated: an install or an
+    /// `uninstall` that did not finish leaves it false, and `enable` and `disable` both make the task
+    /// one that can be started again. One that states none is enabled already.
     pub(crate) fn without_triggers(xml: &str) -> Result<String, Error> {
         let document = document(xml)?;
         let mut edits = own_flag_edit(&document, true)?;
