@@ -16,7 +16,7 @@ use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, conformance};
+use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, TaskStatus, conformance};
 use goetia::spec::{
     AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
 };
@@ -24,7 +24,7 @@ use goetia::testing::service_fields;
 use serde_json::Value;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
-use crate::support::tasks::{mkfifo, task_status};
+use crate::support::tasks::{mkfifo, status_until, task_status};
 use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group, wait};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
@@ -2896,6 +2896,48 @@ pub(crate) fn wait_for_started(id: &str) {
     wait::until_paced(Duration::from_millis(100), || !started_invocations(id).is_empty());
 }
 
+/// What systemd says of `id`'s timer, as `ActiveState/SubState`, from one `show`. A timer reads
+/// `active/waiting` when armed, `active/running` from its fire until the run it started has ended (it
+/// has no next elapse then), and `active/elapsed` when no time of its schedule is left.
+pub(crate) fn timer_state(id: &str) -> String {
+    let shown = cmd::run(
+        "systemctl",
+        &[
+            "show",
+            "--property=ActiveState",
+            "--property=SubState",
+            &format!("{id}.timer"),
+        ],
+    )
+    .expect_ok();
+    let value = |name: &str| {
+        shown
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("`systemctl show` of {id}.timer has no {name}: {}", shown.stdout))
+    };
+    format!("{}/{}", value("ActiveState"), value("SubState"))
+}
+
+/// Whether `status`, a read of `id`'s armed timer, carries its next run. A timer whose run is in flight
+/// has none: `false` while the timer says `active/running`, and `active/waiting` for a read that met the
+/// end of the run (the timer has armed again since). A timer in any other state has no next run to wait
+/// for, and the test fails naming it.
+pub(crate) fn has_next_run(id: &Id, status: &TaskStatus) -> bool {
+    status.next_run.is_some()
+        || match timer_state(id.as_str()).as_str() {
+            "active/running" | "active/waiting" => false,
+            state => panic!("the timer of {id} is {state} and will not arm again: {status:?}"),
+        }
+}
+
+/// The status of `id`'s armed timer, once it reports a next run ([`has_next_run`]). For a read right
+/// after an `enable` of a schedule that can come due while the test runs.
+pub(crate) fn armed_status(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
+    status_until(mgr, id, |status| has_next_run(id, status))
+}
+
 /// A task that exits with `code` the moment it starts, and runs daily at 03:30.
 pub(crate) fn exiting(id: &str, code: i32) -> DaemonSpec {
     goetia::testing::task(
@@ -2930,7 +2972,7 @@ fn a_task_is_installed_armed_run_reported_and_uninstalled(#[fixture(systemd_grou
     );
 
     mgr.enable(&task_id).expect("enable");
-    let status = task_status(&mgr, &task_id);
+    let status = armed_status(&mgr, &task_id);
     assert!(status.common.enabled, "{status:?}");
     assert!(
         status.next_run.is_some(),
@@ -2949,7 +2991,7 @@ fn a_task_is_installed_armed_run_reported_and_uninstalled(#[fixture(systemd_grou
     let run = cmd::run("systemctl", &["start", &format!("{id}.service")]);
     assert!(!run.ok(), "the run exits 3, which fails the start: {run}");
     cmd::run("journalctl", &["--sync"]).expect_ok();
-    let status = task_status(&mgr, &task_id);
+    let status = armed_status(&mgr, &task_id);
     assert_eq!(
         status.common.state,
         State::Idle,

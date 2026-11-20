@@ -141,16 +141,22 @@ pub fn task_status(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
     }
 }
 
-/// The status of `id` once its newest run has a result.
-pub fn status_with_result(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
+/// The first status of `id` that `ready` accepts, read again until then with no cap: the state `ready`
+/// names ends the wait, and a state that never comes hangs the test (unless `ready` panics on it).
+pub fn status_until(mgr: &dyn ServiceManager, id: &Id, mut ready: impl FnMut(&TaskStatus) -> bool) -> TaskStatus {
     let mut found = None;
     wait::until(|| {
         let status = task_status(mgr, id);
-        let done = status.last_result.is_some();
+        let done = ready(&status);
         found = Some(status);
         done
     });
     found.expect("a status was read")
+}
+
+/// The status of `id` once its newest run has a result.
+pub fn status_with_result(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
+    status_until(mgr, id, |status| status.last_result.is_some())
 }
 
 /// What `run` shows, and how it ended.

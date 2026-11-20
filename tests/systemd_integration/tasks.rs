@@ -20,13 +20,14 @@ use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 
 use crate::linux::{
-    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, main_pid, manager_entries,
-    output_entries, started_invocations, starting_matches, timer_path, timer_wants_symlink, unit_of,
+    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, armed_status, create_root, exiting, field, has_next_run,
+    main_pid, manager_entries, output_entries, started_invocations, starting_matches, timer_path, timer_state,
+    timer_wants_symlink, unit_of,
 };
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
 use crate::support::cron_oracle::assert_next_run;
 use crate::support::tasks::{
-    Held, Lines, assert_same_text, id_of, run_task, sh, status_with_result, task_status, with_logs,
+    Held, Lines, assert_same_text, id_of, run_task, sh, status_until, status_with_result, task_status, with_logs,
 };
 use crate::support::{self, Group, ServiceGuard, cmd, cron_oracle, systemd_group, wait};
 
@@ -315,7 +316,9 @@ fn the_rendered_on_calendar_fires_at_the_resolved_fields(#[fixture(systemd_group
             .expect("install");
         let before = SystemTime::now();
         mgr.enable(&id_of(&id)).expect("enable");
-        let status = task_status(&mgr, &id_of(&id));
+        // A schedule's minute can come due here, and a run the timer started has no next run until it
+        // ends: `after` is taken once the read has returned, so the window covers a fire.
+        let status = armed_status(&mgr, &id_of(&id));
         let after = SystemTime::now();
 
         assert_next_run(&status, text, &id_of(&id), before, after);
@@ -549,10 +552,11 @@ fn dropping_the_schedule_disarms_the_timer(#[fixture(systemd_group)] _group: &Gr
 
 /// The timer starts the task by itself: the test starts nothing, and blocks on the program's own
 /// announcement. The first read is of an armed timer, or of a timer that has fired already (the
-/// minute can turn between `enable` and the read, and a timer whose run is in flight has no next run).
-/// Each read is judged by what it reports: an armed timer's `last_run` is in the minute its next run
-/// named, and a fired one's run is the timer's, since the test starts nothing, and it is armed for a
-/// next run after that run.
+/// minute can turn between `enable` and the read). Its subject is the fire, so that read is judged by
+/// the timer's state: a next run names the minute of the fire, and none is confirmed to be a timer whose
+/// run is in flight (the run is held, so it is until `release`). Either way the run is the timer's,
+/// since the test starts nothing, and `last_run` lies in the minute before the next run the timer
+/// re-armed for (one minute after the one the first read named, when it named one).
 #[skuld::test]
 fn the_timer_fires_by_itself(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -563,33 +567,41 @@ fn the_timer_fires_by_itself(#[fixture(systemd_group)] _group: &Group) {
     mgr.install(&task(&id, held.command.clone(), Some("* * * * *")), false)
         .expect("install");
     mgr.enable(&task_id).expect("enable");
-    // No next run is a timer that fired between reads of the status, so nothing else of this read is judged.
+    // `None` is a timer that fired after `enable` and before this read: its run is in flight, and
+    // systemd reports no next run then. Confirmed by the timer's own state, which holds until `release`.
     let scheduled = task_status(&mgr, &task_id).next_run;
+    if scheduled.is_none() {
+        assert_eq!(
+            timer_state(&id),
+            "active/running",
+            "no next run is a timer whose run is in flight"
+        );
+    }
 
     held.wait_started();
 
     let running = task_status(&mgr, &task_id);
     assert_eq!(running.common.state, State::Running, "{running:?}");
     held.release();
-    // A status is several reads, so the timer's next run can come back after the result does.
-    let mut found = None;
-    wait::until(|| {
-        let status = task_status(&mgr, &task_id);
-        let done = status.last_result.is_some() && status.next_run.is_some();
-        found = Some(status);
-        done
+    // The result and the timer's next run are separate reads, and either can come first.
+    let finished = status_until(&mgr, &task_id, |status| {
+        status.last_result.is_some() && has_next_run(&task_id, status)
     });
-    let finished = found.expect("a status was read");
     assert_eq!(finished.last_result, Some(Exit::Code(0)), "{finished:?}");
     let fired = finished.last_run.expect("a run that ended started");
+    let next = finished.next_run.expect("the wait ended on a next run");
+    let minute = Duration::from_secs(60);
+    assert!(
+        fired >= next - minute && fired < next,
+        "last_run {fired:?} is not in the minute before the next run {next:?}"
+    );
     if let Some(scheduled) = scheduled {
-        assert!(
-            fired >= scheduled && fired < scheduled + Duration::from_secs(60),
-            "last_run {fired:?} is not in the minute of {scheduled:?}"
+        assert_eq!(
+            next,
+            scheduled + minute,
+            "the next run is the minute after the one the timer named"
         );
     }
-    let next = finished.next_run.expect("the wait ended on a next run");
-    assert!(next > fired, "the next run {next:?} is not after last_run {fired:?}");
     assert!(finished.common.enabled, "the schedule stays armed: {finished:?}");
 }
 
