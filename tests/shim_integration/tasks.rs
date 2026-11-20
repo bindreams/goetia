@@ -216,10 +216,9 @@ fn uninstall_with_a_run_in_flight_leaves_no_program(#[fixture(scm_group)] _group
     }
 }
 
-/// The shim Task Scheduler starts obeys the removal's marker: its pin is refused, so it starts no program
-/// and ends as a shim failure, which is the task's last result. The run is started through Task Scheduler's
-/// own `Run`, since a verb of goetia would be refused by the marker before it asked for anything. This run
-/// is the one waited for: the status has a `last_run` that the task did not have before it, and is idle.
+/// The shim obeys the removal's marker: its pin is refused, no program starts, and the task's last result
+/// is the shim failure. Started through Task Scheduler's `Run`, since a goetia verb is refused by the marker
+/// first.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
     let id = task_id();
@@ -229,16 +228,31 @@ fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
     let command = fixture_command("exit", &[&reported.port().to_string(), "7"]);
     mgr.install(&task_spec(&id, command, None, User::Root, None), false)
         .expect("install");
+    // The install makes the default log, empty: the refused shim appends nothing to it.
+    let default_log = support::program_data()
+        .join("Goetia")
+        .join("logs")
+        .join(format!("{id}.log"));
+    assert_eq!(
+        std::fs::metadata(&default_log).expect("the install made the log").len(),
+        0
+    );
     let marker = RemovalMarker::place(&id).unwrap_or_else(|e| panic!("place the marker: {}", e.report()));
 
     goetia::testing::run_task(&id).unwrap_or_else(|e| panic!("run: {}", e.report()));
 
+    let status = status_once_ended(&mgr, &id);
+    assert!(status.last_run.is_some(), "the task has not run");
     assert_eq!(
-        status_once_ended(&mgr, &id).last_result,
+        status.last_result,
         Some(Exit::Code(ERROR_GEN_FAILURE as i32)),
         "the shim's failure, not the program's 7"
     );
-    // The run has ended, so no later connection is possible: this is an observation, not a race.
+    assert_eq!(
+        std::fs::metadata(&default_log).expect("the log is still there").len(),
+        0,
+        "the refused shim wrote to the default log"
+    );
     assert!(!reported.connected_yet(), "the program ran under a marker");
     drop(marker);
     mgr.uninstall(&id).expect("uninstall");

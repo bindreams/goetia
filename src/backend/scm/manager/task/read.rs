@@ -36,8 +36,10 @@ pub(super) struct StoredRegistration {
     /// The SID of the account its principal names; `None` when the XML names no principal or the name names no
     /// account: not known to be any account being installed.
     pub principal: Option<Sid>,
-    /// Whether it has triggers and is itself enabled.
-    pub armed: bool,
+    /// Whether it has a trigger that is switched on, whatever the task's own flag is: the armed state an account
+    /// change or an install gives the registration it writes, since the flag may be off only because an earlier
+    /// change or uninstall that was cut short disabled the task.
+    pub has_triggers: bool,
     /// The token its arguments end with; `None` when they end with no goetia ending for this task (a hand
     /// edit, a malformed token included).
     pub token: Option<Token>,
@@ -70,7 +72,7 @@ impl TaskSnapshot {
         };
         Ok(StoredRegistration {
             principal,
-            armed: stored.armed,
+            has_triggers: stored.has_triggers,
             token: stored.token,
         })
     }
@@ -78,13 +80,6 @@ impl TaskSnapshot {
     /// Whether the task has triggers and is itself enabled.
     pub(super) fn armed(&self) -> bool {
         TaskXml::armed(&self.registered.xml)
-    }
-
-    /// Whether the stored XML has a trigger that is switched on, whatever the task's own flag is: the armed
-    /// state an account change gives the registration it makes, since the flag may be off only because an
-    /// earlier change or uninstall that was cut short disabled the task.
-    pub(super) fn has_triggers(&self) -> bool {
-        TaskXml::has_triggers(&self.registered.xml)
     }
 
     /// The definition as Task Scheduler stores it: what a verb that registers the task again starts from.

@@ -9,8 +9,7 @@
 //! task, and while any pin is live a write prunes nothing. With none, a write removes every record
 //! but its own. **A run pins too:** the shim takes a pin before it reads anything, and holds it until its
 //! own record is renamed into place; it releases it before its own prune, so a run's pin never stops its
-//! own prune. So a run in flight stops every other run's prune, and its own record's prune comes when it
-//! ends: records pile up only for as long as runs overlap. A pin is a file held open with no sharing: it
+//! own prune. A pin is a file held open with no sharing: it
 //! goes when its holder does, however it ends, and while it is held nothing can delete it, whoever tries.
 //! One left by a power cut is held by nothing, and the next write finds it by deleting it: a sharing
 //! violation says it is live ([`files::delete`] reads every failed delete, here and in the removal). What a
@@ -290,6 +289,16 @@ impl Runs {
         self.reopen()
     }
 
+    /// Read-only: refuses what [`Runs::ensure`] would refuse of an existing directory (a link: NotADirectory). A
+    /// missing directory passes; so does a permissions write that later fails.
+    pub(crate) fn check_directory(&self) -> io::Result<()> {
+        match Dir::open(&self.dir) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Places the removal's marker, beside the directory: from then on no pin is accepted
     /// ([`Runs::hold`]) and the pins that exist are final. Placing it again changes nothing. With `runs` gone
     /// nothing is placed ([`Closed::NoRecords`]): there are no records to protect.
@@ -330,10 +339,9 @@ impl Runs {
     /// returned as one line each for the caller to log: it never fails the write. A directory that is a
     /// link is refused ([`Runs::ensure`]), and nothing is written.
     ///
-    /// `own` is the writer's own pin ([`Runs::hold`]): it is held until the record is renamed into place and
-    /// released before the prune, which a held pin would stop, so the writer's own pin never blocks its own
-    /// prune. A write that fails releases it too. With a pin, the write goes through the directory handle
-    /// the pin was made through, as every read of a pin does, and not through the path again.
+    /// `own` is the writer's pin: held until the record is renamed into place, then released before the
+    /// prune, which a held pin would stop. A failed write releases it too. The write goes through the pin's
+    /// directory handle, not the path.
     pub(crate) fn write(&self, record: &RunRecord, own: Option<Pin>) -> io::Result<Vec<String>> {
         let (dir, own) = match own {
             Some(Pin { _file, dir, .. }) => (dir, Some(_file)),
@@ -442,7 +450,8 @@ impl Runs {
 
     /// The first pin a handle holds, if one does: the directory listed once, every pin asked
     /// ([`pins_of`]), and never waited for. A pin whose state cannot be told may be held, and is an error that
-    /// names it. A directory that is gone, or is a link, holds none.
+    /// names it. A directory that is gone, or is a link, holds none. **Not read-only:** each stale pin is
+    /// removed as it is judged ([`scan_pins`]).
     pub(crate) fn held_pin(&self) -> Result<Option<PathBuf>> {
         let dir = match Dir::open_even_if_link(&self.dir) {
             Ok(dir) => dir,
@@ -457,7 +466,7 @@ impl Runs {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::os_at("list", &self.dir, e)),
         };
-        Ok(match pins_of(&dir, &entries)? {
+        Ok(match pins_of(&dir, &entries, "tell whether a run holds")? {
             Pins::Held(path) => Some(path),
             Pins::Free | Pins::Linked => None,
         })
@@ -600,7 +609,7 @@ impl Runs {
     /// A `dir` that became a link since `entries` was listed has none of them: the pass stops at the first
     /// delete that says so, with nothing held and nothing failed, and the caller deletes the link.
     fn delete_entries(&self, dir: &Dir, entries: &[Entry]) -> Result<Option<PathBuf>> {
-        match pins_of(dir, entries)? {
+        match pins_of(dir, entries, "remove")? {
             Pins::Linked => return Ok(None),
             Pins::Held(path) => return Ok(Some(path)),
             Pins::Free => {}
@@ -838,8 +847,9 @@ enum Pins {
 
 /// [`scan_pins`] over the entries of `entries` that are no directory (a directory is no pin, whatever its
 /// name: a removal takes it with the rest), with a pin whose state could not be told an error naming every
-/// such pin: no delete may run while a pin may be held.
-fn pins_of(dir: &Dir, entries: &[Entry]) -> Result<Pins> {
+/// such pin: no delete may run while a pin may be held. `doing` is what the caller was doing, for the error
+/// ("remove", "tell whether a run holds").
+fn pins_of(dir: &Dir, entries: &[Entry], doing: &str) -> Result<Pins> {
     let scan = scan_pins(dir, entries.iter().filter(|entry| !entry.directory()));
     if scan.linked {
         return Ok(Pins::Linked);
@@ -847,7 +857,7 @@ fn pins_of(dir: &Dir, entries: &[Entry]) -> Result<Pins> {
     let unclassified = scan
         .unclassified
         .into_iter()
-        .map(|(pin, e)| Error::os_at("remove", pin, e));
+        .map(|(pin, e)| Error::os_at(doing, pin, e));
     if let Some(failed) = Error::both_all(unclassified) {
         return Err(failed);
     }

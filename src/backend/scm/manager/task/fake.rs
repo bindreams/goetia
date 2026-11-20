@@ -33,8 +33,13 @@ pub(crate) enum Call {
     Stop(String, InstanceId),
 }
 
+/// Gives the reply a [`Fake::state`] queued last its effect: the one way back to it.
+type Setter = Box<dyn FnOnce(&mut Script, Effect) + Send>;
+
 #[derive(Default)]
 struct Script {
+    /// How to give the reply stated last an effect, until one is given ([`Fake::during`]).
+    last: Option<Setter>,
     calls: Vec<Call>,
     unstated: Vec<Call>,
     get: VecDeque<Reply<Option<Registered>>>,
@@ -103,84 +108,65 @@ impl Fake {
     }
 
     pub(crate) fn on_get(&self, reply: Result<Option<Registered>>) -> &Self {
-        self.state(|s| &mut s.get, reply, None)
+        self.state(|s| &mut s.get, reply)
     }
 
     pub(crate) fn on_names(&self, reply: Result<Vec<String>>) -> &Self {
-        self.state(|s| &mut s.names, reply, None)
+        self.state(|s| &mut s.names, reply)
     }
 
     pub(crate) fn on_register(&self, reply: Result<Registration>) -> &Self {
-        self.state(|s| &mut s.register, reply, None)
+        self.state(|s| &mut s.register, reply)
     }
 
     pub(crate) fn on_set_enabled(&self, reply: Result<()>) -> &Self {
-        self.state(|s| &mut s.set_enabled, reply, None)
-    }
-
-    /// [`Self::on_set_enabled`], where `during` happens when the flag is set, before the reply is given.
-    pub(crate) fn on_set_enabled_during(&self, reply: Result<()>, during: impl FnOnce() + Send + 'static) -> &Self {
-        self.state(|s| &mut s.set_enabled, reply, Some(Box::new(during)))
-    }
-
-    /// [`Self::on_register`], where `during` happens when the task is registered, before the reply is given.
-    pub(crate) fn on_register_during(
-        &self,
-        reply: Result<Registration>,
-        during: impl FnOnce() + Send + 'static,
-    ) -> &Self {
-        self.state(|s| &mut s.register, reply, Some(Box::new(during)))
+        self.state(|s| &mut s.set_enabled, reply)
     }
 
     pub(crate) fn on_delete(&self, reply: Result<bool>) -> &Self {
-        self.state(|s| &mut s.delete, reply, None)
-    }
-
-    /// [`Self::on_delete`], where `during` happens when the task is deleted, before the reply is given.
-    pub(crate) fn on_delete_during(&self, reply: Result<bool>, during: impl FnOnce() + Send + 'static) -> &Self {
-        self.state(|s| &mut s.delete, reply, Some(Box::new(during)))
+        self.state(|s| &mut s.delete, reply)
     }
 
     pub(crate) fn on_instances(&self, reply: Result<Vec<Instance>>) -> &Self {
-        self.state(|s| &mut s.instances, reply, None)
-    }
-
-    /// [`Self::on_instances`], where `during` happens when the listing is read, before the reply is given:
-    /// what the world does while the scheduler is asked.
-    pub(crate) fn on_instances_during(
-        &self,
-        reply: Result<Vec<Instance>>,
-        during: impl FnOnce() + Send + 'static,
-    ) -> &Self {
-        self.state(|s| &mut s.instances, reply, Some(Box::new(during)))
+        self.state(|s| &mut s.instances, reply)
     }
 
     pub(crate) fn on_info(&self, reply: Result<TaskInfo>) -> &Self {
-        self.state(|s| &mut s.info, reply, None)
+        self.state(|s| &mut s.info, reply)
     }
 
     pub(crate) fn on_run(&self, reply: Result<Started>) -> &Self {
-        self.state(|s| &mut s.run, reply, None)
-    }
-
-    /// [`Self::on_run`], where `during` happens before the reply is given: what the world does while the
-    /// scheduler starts the task.
-    pub(crate) fn on_run_during(&self, reply: Result<Started>, during: impl FnOnce() + Send + 'static) -> &Self {
-        self.state(|s| &mut s.run, reply, Some(Box::new(during)))
+        self.state(|s| &mut s.run, reply)
     }
 
     pub(crate) fn on_stop(&self, reply: Result<()>) -> &Self {
-        self.state(|s| &mut s.stop, reply, None)
+        self.state(|s| &mut s.stop, reply)
     }
 
-    /// Queues `result`, with `during` to happen when the call is made, in the queue `queue` names.
-    fn state<T>(
+    /// Attaches `effect` to the last-stated reply; runs when the call is made, before the reply is given. One per
+    /// reply. Panics if there is no unused reply.
+    pub(crate) fn during(&self, effect: impl FnOnce() + Send + 'static) -> &Self {
+        let mut script = lock(&self.0);
+        let set = script.last.take().expect("`during` follows a stated reply");
+        set(&mut script, Box::new(effect));
+        drop(script);
+        self
+    }
+
+    fn state<T: 'static>(
         &self,
-        queue: impl FnOnce(&mut Script) -> &mut VecDeque<Reply<T>>,
+        queue: impl Fn(&mut Script) -> &mut VecDeque<Reply<T>> + Send + 'static,
         result: Result<T>,
-        during: Option<Effect>,
     ) -> &Self {
-        queue(&mut lock(&self.0)).push_back(Reply { result, during });
+        let mut script = lock(&self.0);
+        queue(&mut script).push_back(Reply { result, during: None });
+        script.last = Some(Box::new(move |script, effect| {
+            queue(script)
+                .back_mut()
+                .expect("the reply stated last was already used: `during` must come before the call it answers")
+                .during = Some(effect);
+        }));
+        drop(script);
         self
     }
 

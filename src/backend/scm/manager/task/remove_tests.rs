@@ -544,12 +544,15 @@ fn uninstall_order() {
     let spec = task_spec(Some("30 3 * * *"));
     let watch = Watch::new(&records_dir);
     let fake = Fake::new();
-    fake.on_set_enabled_during(Ok(()), watch.at("disable"))
-        .on_instances_during(Ok(vec![instance(1, 4242)]), watch.at("list"))
+    fake.on_set_enabled(Ok(()))
+        .during(watch.at("disable"))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .during(watch.at("list"))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()))
-        .on_delete_during(Ok(true), watch.at("delete"));
+        .on_delete(Ok(true))
+        .during(watch.at("delete"));
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
     let exiting = watch.clone();
@@ -614,9 +617,8 @@ fn uninstall_stops_a_run_listed_only_after_the_marker() {
     let seen = after_marker.clone();
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
-        .on_instances_during(Ok(vec![instance(1, 4242)]), move || {
-            seen.store(marker.exists(), Ordering::SeqCst)
-        })
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .during(move || seen.store(marker.exists(), Ordering::SeqCst))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()))
@@ -711,7 +713,8 @@ fn a_shim_pinned_before_the_marker_ends_when_the_task_is_deleted() {
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
         .on_instances(Ok(Vec::new()))
-        .on_delete_during(Ok(true), {
+        .on_delete(Ok(true))
+        .during({
             let delete = watch.at("delete");
             move || {
                 delete();

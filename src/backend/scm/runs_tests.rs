@@ -17,7 +17,9 @@ use super::*;
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
 use crate::backend::scm::shim::acl::{Ace, CheckPermissions, ObjectSecurity, is_as_wanted, read_object};
 use crate::backend::scm::sid::{administrators, sid_from_parts, system};
-use crate::backend::scm::test_support::{delete_pending, directory_held_open, directory_with_a_file, make_mount_point};
+use crate::backend::scm::test_support::{
+    Undeletable, delete_pending, directory_held_open, directory_with_a_file, make_mount_point,
+};
 use crate::elevation::test_support::process_user_sid;
 use crate::testing::groups::{Group, scm_group};
 
@@ -545,37 +547,6 @@ fn remove_all_does_not_wait_for_a_stale_pin_it_has_no_entry_on() {
     assert!(!runs.dir.exists());
 }
 
-/// The files `names` of `runs`' directory, whose delete is refused for no handle and no pending delete, to
-/// every account and an elevated token too: they carry SYSTEM's entry alone, and the directory grants no
-/// right to delete entries. Dropping restores the directory, so that the test's own can be removed.
-struct Undeletable<'a>(&'a Path);
-
-impl<'a> Undeletable<'a> {
-    fn new(runs: &'a Runs, names: &[&str]) -> Self {
-        let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
-        for name in names {
-            crate::backend::scm::test_support::set_dacl(&system_only, &runs.dir.join(name)).unwrap();
-        }
-        // Read, list and add a file, which `Dir::open` asks for; not `DELETE_CHILD`.
-        let listable = Descriptor::from_sddl("D:P(A;;0x1200a3;;;WD)").unwrap();
-        crate::backend::scm::test_support::set_dacl(&listable, &runs.dir).unwrap();
-        Undeletable(&runs.dir)
-    }
-}
-
-impl Drop for Undeletable<'_> {
-    fn drop(&mut self) {
-        let restored = Descriptor::for_runs(&[process_user_sid()])
-            .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
-        if !matches!(restored, Ok(Ok(()))) {
-            eprintln!(
-                "warning: could not restore the permissions of {}: {restored:?}",
-                self.0.display()
-            );
-        }
-    }
-}
-
 /// Pins whose state cannot be told (their delete fails, and not for a handle) may be held, and none can be
 /// taken now: the removal returns the failure, naming every one of them, before it deletes anything, and
 /// does not wait for a handle that may never go. Once they can be told about, the same call finishes.
@@ -587,7 +558,7 @@ fn remove_all_with_pins_it_cannot_tell_about_deletes_nothing_and_names_each() {
     fs::write(runs.dir.join("pin-odd.pin"), "").unwrap();
     fs::write(runs.dir.join("pin-odd2.pin"), "").unwrap();
     let before = names(&runs);
-    let refused = Undeletable::new(&runs, &["pin-odd.pin", "pin-odd2.pin"]);
+    let refused = Undeletable::new(&runs.dir, &["pin-odd.pin", "pin-odd2.pin"]);
 
     let failed = runs.remove_all(no_note).unwrap_err();
 
@@ -889,7 +860,7 @@ fn hold_with_the_marker_is_refused_busy_and_hold_ignoring_it_is_not() {
     drop(own);
 }
 
-/// A held pin is named at once, whoever holds it (a shim's, a `run`'s, a stop's): the one pass never waits.
+/// A held pin is named at once, whoever holds it (a shim's, a `run`'s, a stop's).
 #[skuld::test]
 fn held_pin_reports_the_path_of_a_held_pin_at_once() {
     let (_dir, runs) = fixture();
@@ -923,17 +894,24 @@ fn an_unjudgeable_pin_is_an_error() {
     let (_dir, runs) = fixture();
     fs::write(runs.dir.join("pin-odd.pin"), "").unwrap();
     let before = names(&runs);
-    let refused = Undeletable::new(&runs, &["pin-odd.pin"]);
+    let refused = Undeletable::new(&runs.dir, &["pin-odd.pin"]);
 
     let failed = runs.held_pin().unwrap_err();
 
-    assert!(failed.report().to_string().contains("pin-odd.pin"), "{failed}");
+    let said = failed.report().to_string();
+    assert!(said.contains("pin-odd.pin"), "{said}");
+    let Error::Os { what, .. } = &failed else {
+        panic!("one pin that cannot be judged is one error: {failed:?}")
+    };
+    assert_eq!(
+        what, "tell whether a run holds",
+        "a question about a run does not say goetia failed to remove"
+    );
     assert_eq!(names(&runs), before);
     drop(refused);
 }
 
-/// The writer's own pin is held until its record is in place and gone before its prune, which a held pin
-/// would stop: so it never blocks its own prune, and a write with no pin of its own is as before.
+/// The writer's pin never blocks its own prune.
 #[skuld::test]
 fn write_with_its_own_pin_prunes_and_is_not_blocked_by_it() {
     let (_dir, runs) = fixture();
@@ -947,9 +925,7 @@ fn write_with_its_own_pin_prunes_and_is_not_blocked_by_it() {
     assert_eq!(names(&runs), [file_of(&instance(2))], "the pin is gone");
 }
 
-/// A write with the writer's own pin goes through the directory handle the pin was made through, as every
-/// read of a pin does, and not through the path again: a `Runs` whose path is another directory still lands
-/// the record where the pin is.
+/// A write with a pin lands where the pin's handle is, not at the path.
 #[skuld::test]
 fn write_with_its_own_pin_writes_through_the_pins_directory() {
     let (_pinned_dir, pinned) = fixture();
@@ -1394,6 +1370,29 @@ fn ensure_refuses_a_link_and_leaves_what_it_points_to_alone() {
         before,
         "the target's permissions are not rewritten"
     );
+    assert!(target_is_untouched(&target));
+}
+
+/// `check_directory` passes a directory that is not there, and one `ensure` would only set the permissions of,
+/// and changes nothing; it refuses a link as `ensure` does.
+#[skuld::test]
+fn check_directory_passes_what_ensure_would_not_refuse_and_refuses_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = Runs::of(dir.path(), &id());
+    absent.check_directory().unwrap();
+    assert!(!absent.dir.exists(), "nothing is made");
+
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let before = entries_of(&runs.dir);
+    runs.check_directory().unwrap();
+    assert_eq!(entries_of(&runs.dir), before, "the permissions are not set");
+    assert_eq!(names(&runs), [file_of(&instance(1))]);
+
+    let (_link_dir, linking) = fixture();
+    let (_target_dir, target) = linked(&linking);
+    let refused = linking.check_directory().unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::NotADirectory);
     assert!(target_is_untouched(&target));
 }
 

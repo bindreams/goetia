@@ -105,7 +105,11 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             old: crate::spec::DaemonKind::Task,
         },
-        Error::AccountChangeRunning { id: id(), held: None },
+        Error::AccountChangeRunning { id: id() },
+        Error::AccountChangeHeld {
+            id: id(),
+            pin: PathBuf::new(),
+        },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -1653,15 +1657,15 @@ fn error_messages_and_exit_class() {
             false,
         ),
         (
-            Error::AccountChangeRunning { id: id(), held: None },
+            Error::AccountChangeRunning { id: id() },
             "`nightly` is running, and installing it as another account registers it again, which removes the \
              running task first: run `goetia daemon stop nightly`, then re-run install",
             false,
         ),
         (
-            Error::AccountChangeRunning {
+            Error::AccountChangeHeld {
                 id: id(),
-                held: Some(PathBuf::from(r"C:\ProgramData\Goetia\runs\nightly\pin-1.pin")),
+                pin: PathBuf::from(r"C:\ProgramData\Goetia\runs\nightly\pin-1.pin"),
             },
             "`nightly` cannot change its account now: its run records are held (`C:\\ProgramData\\Goetia\\runs\\nightly\\pin-1.pin`) \
              by a run that is starting, a `run` or `stop` of it, or another program, and installing it as another \

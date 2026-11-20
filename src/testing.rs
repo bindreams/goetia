@@ -220,8 +220,7 @@ pub fn run_task(id: &Id) -> Result<()> {
 }
 
 /// The removal's marker of the task `id`'s run records, placed as an uninstall or an account change that
-/// began leaves it (`Runs::close`), and taken away when it drops (`Runs::reopen`), retrying a failure for
-/// about five seconds and then warning. Never panics on drop.
+/// began leaves it (`Runs::close`), and taken away when it drops (`Runs::reopen`). Never panics on drop.
 #[cfg(windows)]
 pub struct RemovalMarker(crate::backend::scm::runs::Runs);
 

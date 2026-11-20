@@ -59,8 +59,9 @@ pub(super) fn requested(args: &[OsString]) -> Option<(String, Option<Token>)> {
 /// Never returns.
 pub(super) fn run(id: &str, token: Option<Token>) -> ! {
     let real = Arc::new(Real::default());
+    let program_data = program_data();
     // Closed to the default log until the pin is taken: a line before then tells the Event Log alone.
-    let log = Arc::new(Log::real(Arc::clone(&real)).closed_until_held());
+    let log = Arc::new(Log::from_program_data(real.clone(), &program_data).closed_until_held());
     exit::keep_log(Arc::clone(&log));
     exit::name_run(id);
     let supervisor = Supervisor::new(real, Arc::clone(&log));
@@ -69,13 +70,14 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
         log.failure(id, &format!("register the console control handler: {}", Chain(&e)));
         exit::end_process(Reported::shim_failure(e.raw_os_error()).process_exit_code());
     }
-    // Without records to pin `run_in` starts no program: a task that is not an id is refused by it, and
-    // `Log::real` told why `%ProgramData%` could not be located.
-    let runs = match (program_data(), Id::try_from(id)) {
-        (Ok(program_data), Ok(id)) => Some(Runs::of(&program_data, &id)),
-        (Err(_), _) | (Ok(_), Err(_)) => None,
-    };
-    let code = run_in(id, token, &supervisor, &Com, runs.as_ref(), std::process::id());
+    let code = run_in(
+        id,
+        token,
+        &supervisor,
+        &Com,
+        program_data.as_deref(),
+        std::process::id(),
+    );
     exit::end_process(code as i32)
 }
 
@@ -89,11 +91,10 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 /// refused first, and reads nothing. The shim's log is closed to the default file until the pin is taken
 /// ([`Log::closed_until_held`]), so a step before it tells the Event Log alone.
 ///
-/// 1. Takes a pin on the run records ([`Runs::hold`]): **any** failure ends the shim (the removal's marker
-///    stands, the directory is denied, gone or a link, there is no `runs` since `%ProgramData%` could not be
-///    located), before Task Scheduler is asked anything or a log is held. An uninstall or an account change
-///    places the marker, then reads every pin and the listing, so this pin is read by it, or the marker by
-///    this: a run that falls then does not run.
+/// 1. Takes a pin on the run records ([`Runs::hold`]), first: an uninstall or an account change places the
+///    marker and then reads every pin, so it reads this pin or this shim sees its marker. **Any** failure
+///    ends the shim (the marker stands, the directory is denied, gone or a link, or `%ProgramData%` could
+///    not be located).
 /// 2. Holds the default log ([`Log::hold_default`]); a failure of that is told and the shim goes on.
 /// 3. Reads the task through `api`: a task that is gone, a read that fails, and a registration that is not
 ///    the one this shim was started under (by `token`) end the shim; a blob that is foreign, undecodable or a
@@ -112,7 +113,7 @@ pub(super) fn run_in(
     token: Option<Token>,
     supervisor: &Supervisor,
     api: &dyn TaskApi,
-    runs: Option<&Runs>,
+    program_data: Result<&Path, &Error>,
     own_pid: u32,
 ) -> u32 {
     let log = &*supervisor.log;
@@ -129,14 +130,20 @@ pub(super) fn run_in(
             });
         }
     };
-    let Some(runs) = runs else {
-        return end(SpecStop {
-            message: "no program was started: the run records cannot be held, since the machine's %ProgramData% \
-                      could not be located"
-                .to_string(),
-            reported: Reported::shim_failure(None),
-        });
+    let program_data = match program_data {
+        Ok(program_data) => program_data,
+        Err(e) => {
+            return end(SpecStop {
+                message: format!(
+                    "no program was started: the run records cannot be held, since the machine's %ProgramData% \
+                     could not be located: {}",
+                    e.report()
+                ),
+                reported: Reported::shim_failure(e.raw_os_error()),
+            });
+        }
     };
+    let runs = &Runs::of(program_data, &task);
     let pin = match runs.hold() {
         Ok(pin) => pin,
         Err(e) => {
@@ -229,9 +236,7 @@ fn record_run(
 // The task ------------------------------------------------------------------------------------------------------------
 
 /// The task's own spec, and its path. A task that is not goetia's, undecodable or a service's is refused;
-/// one that is gone, and a read that did not complete (which carries the OS error it met), are shim
-/// failures. So is a registration that is not the one this shim was started under (`token`): its token
-/// differs, either has none, or its XML cannot be read.
+/// the failures of [`registration`] and [`started_under`] are shim failures.
 fn own_spec(task: &Id, id: &str, token: Option<Token>, api: &dyn TaskApi) -> Result<(DaemonSpec, TaskPath), SpecStop> {
     let refused = |message: String| SpecStop {
         message,
@@ -280,8 +285,8 @@ fn read_failed(e: &Error) -> Reported {
     Reported::shim_failure(Some(e.raw_os_error().unwrap_or(ERROR_INVALID_DATA as i32)))
 }
 
-/// Whether the registration with the stored `xml` is the one the shim was started under (`token`); a
-/// shim failure when it is not.
+/// Whether the registration with the stored `xml` is the one the shim was started under (`token`). It is
+/// not when its token differs, either has none, or its XML cannot be read: a shim failure.
 fn started_under(path: &TaskPath, id: &str, token: Option<Token>, xml: &str) -> Result<(), SpecStop> {
     let not_started_under = |message: String| SpecStop {
         message,

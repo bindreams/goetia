@@ -568,11 +568,17 @@ pub enum Error {
 
     /// An install that changes the account a task runs as registers the task again (an update would
     /// leave it unreadable by the new account), which removes the old registration first, and so it
-    /// refuses while the task runs or its run records are held. `held` is the pin that holds them (a run
-    /// that is starting, a `run` or `stop` of the task, or another program), and is `None` when a run is
-    /// alive. Determinate: nothing was changed.
-    #[error("{}", account_change_running(id, held))]
-    AccountChangeRunning { id: String, held: Option<PathBuf> },
+    /// refuses while a run of the task is alive (whether or not its records are held too). Determinate: the old
+    /// task stays, its flag on again (one that cannot be put back is reported with this error); a scheduled run
+    /// that fell between the disable and the refusal was skipped.
+    #[error("{}", account_change_running(id))]
+    AccountChangeRunning { id: String },
+
+    /// An account change ([`Error::AccountChangeRunning`]) that finds no run alive but the task's run records
+    /// held: `pin` is what holds them (a run that is starting, a `run` or `stop` of the task, or another
+    /// program). Determinate; leaves the same traces as [`Error::AccountChangeRunning`].
+    #[error("{}", account_change_held(id, pin))]
+    AccountChangeHeld { id: String, pin: PathBuf },
 
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
@@ -886,6 +892,7 @@ impl Error {
             | Error::StillRunning { .. }
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
+            | Error::AccountChangeHeld { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -1090,6 +1097,7 @@ impl Error {
             | Error::StillRunning { .. }
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
+            | Error::AccountChangeHeld { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }
@@ -1547,19 +1555,21 @@ fn retype_running(id: &str, old: crate::spec::DaemonKind) -> String {
 }
 
 /// The message of [`Error::AccountChangeRunning`].
-fn account_change_running(id: &str, held: &Option<PathBuf>) -> String {
-    match held {
-        None => format!(
-            "`{id}` is running, and installing it as another account registers it again, which removes the running \
-             task first: run `goetia daemon stop {id}`, then re-run install"
-        ),
-        Some(pin) => format!(
-            "`{id}` cannot change its account now: its run records are held (`{}`) by a run that is starting, a \
-             `run` or `stop` of it, or another program, and installing it as another account registers it again, \
-             which hands them to the new account: wait for that to end, then re-run install",
-            pin.display()
-        ),
-    }
+fn account_change_running(id: &str) -> String {
+    format!(
+        "`{id}` is running, and installing it as another account registers it again, which removes the running \
+         task first: run `goetia daemon stop {id}`, then re-run install"
+    )
+}
+
+/// The message of [`Error::AccountChangeHeld`].
+fn account_change_held(id: &str, pin: &Path) -> String {
+    format!(
+        "`{id}` cannot change its account now: its run records are held (`{}`) by a run that is starting, a \
+         `run` or `stop` of it, or another program, and installing it as another account registers it again, \
+         which hands them to the new account: wait for that to end, then re-run install",
+        pin.display()
+    )
 }
 
 /// The message of [`Error::LoadedJobInDoubt`].

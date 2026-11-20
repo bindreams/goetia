@@ -178,7 +178,7 @@ impl Scm {
         }
 
         // The marker, then the own pin past it: a shim that checks the marker after this sees it, and one
-        // that checked before is listed by the stop's first read, which comes after (design section 4).
+        // that checked before is listed by the stop's first read, which comes after.
         runs.close().map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
         let pin = pin_records("uninstall", id, runs, MarkerCheck::Ignore)
             .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
