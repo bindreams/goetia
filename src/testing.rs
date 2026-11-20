@@ -219,6 +219,12 @@ pub fn run_task(id: &Id) -> Result<()> {
     Com.run(&TaskPath::of(id)).map(drop)
 }
 
+/// PROBE ONLY: what Task Scheduler stores of the principal of the task `id`, and what goetia's readers make of it.
+#[cfg(windows)]
+pub fn probe_principal(id: &Id) -> String {
+    crate::backend::scm::manager::task::probe::probe_principal(id)
+}
+
 /// The removal's marker of the task `id`'s run records, placed as an uninstall or an account change that
 /// began leaves it (`Runs::close`), and taken away when it drops (`Runs::reopen`). Never panics on drop.
 #[cfg(windows)]

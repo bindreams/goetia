@@ -49,8 +49,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        toolchain: [floor, stable]
+        os: [windows-latest]
+        toolchain: [floor]
 
     steps:
       - name: Checkout
@@ -78,7 +78,7 @@ jobs:
       # self dev-dependency turns on) of the whole workspace and
       # the library-only build.
       - name: Clippy
-        if: matrix.toolchain != 'stable'
+        if: false
         run: prek run --all-files cargo-clippy cargo-clippy-lib-only
 
       - name: Install cargo-nextest
@@ -139,7 +139,7 @@ jobs:
           set -euo pipefail
 
           nextest="$(command -v cargo-nextest)"
-          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail)
+          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail --no-capture -E 'binary(scm_integration) & test(/probe_(principal_spellings|a_task|a_sid)/)')
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             mkdir -p target/nextest-extract
             "$nextest" "${args[@]}" --extract-to target/nextest-extract --extract-overwrite
@@ -162,7 +162,7 @@ jobs:
       # three OS targets, and links to `#[cfg]`-gated items resolve on one OS and break on another, so
       # each OS runs the doc hooks.
       - name: Rustdoc
-        if: ${{ !cancelled() && matrix.toolchain != 'stable' }}
+        if: false
         run: prek run --stage manual --all-files cargo-doc cargo-doc-lib-only cargo-doc-tests
 
   lint:

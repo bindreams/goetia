@@ -67,7 +67,13 @@ fn task_verb_as(args: &[String]) -> ! {
     let mgr = support::shim_manager_at(shim.into());
     match verb.as_str() {
         "install" => {
-            let spec = task_spec(&id, command.to_vec(), Some(SCHEDULE), User::Name(account.clone()), None);
+            // PROBE: a SID string is written as `user: {id: ...}`.
+            let user = if account.starts_with("S-1-") {
+                User::Id(AccountId::Sid(account.clone()))
+            } else {
+                User::Name(account.clone())
+            };
+            let spec = task_spec(&id, command.to_vec(), Some(SCHEDULE), user, None);
             finish(mgr.install(&spec, false))
         }
         "enable" => finish(mgr.enable(&id)),

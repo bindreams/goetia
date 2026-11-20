@@ -37,6 +37,9 @@ mod managed;
 #[path = "scm_integration/task_accounts.rs"]
 mod task_accounts;
 #[cfg(windows)]
+#[path = "scm_integration/task_principal_probe.rs"]
+mod task_principal_probe;
+#[cfg(windows)]
 #[path = "scm_integration/task_schedule.rs"]
 mod task_schedule;
 #[cfg(windows)]

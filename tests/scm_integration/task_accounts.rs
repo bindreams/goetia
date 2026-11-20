@@ -24,7 +24,7 @@ const PASSWORD: &str = LocalUserGuard::PASSWORD;
 
 /// `verb` of a task made by the install helper, a child process that has the password in its environment
 /// and no other process does (see `install_helper`).
-fn as_user(verb: &str, id: &Id, account: &str, host: &ServiceAccountHost, command: &[String]) -> Output {
+pub(crate) fn as_user(verb: &str, id: &Id, account: &str, host: &ServiceAccountHost, command: &[String]) -> Output {
     Command::new(support::current_exe_str())
         .args([TASK_AS, verb, id.as_str(), account, &host.shim_path()])
         .args(command)
@@ -34,7 +34,7 @@ fn as_user(verb: &str, id: &Id, account: &str, host: &ServiceAccountHost, comman
 }
 
 #[track_caller]
-fn assert_succeeded(what: &str, output: &Output) {
+pub(crate) fn assert_succeeded(what: &str, output: &Output) {
     assert!(
         output.status.success(),
         "{what} failed: stdout={} stderr={}",

@@ -39,6 +39,10 @@ pub const REPORT_UID: &str = "--goetia-report-uid";
 #[cfg(unix)]
 pub const CONTAINED_CHILD: &str = "--goetia-contained-child";
 
+/// PROBE: `<exe> --goetia-report-user <port>`: send `whoami /user` of this process to the listener.
+#[cfg(windows)]
+pub const REPORT_USER: &str = "--goetia-report-user";
+
 /// `<exe> --goetia-print-and-exit <code> <text>`: print `<text> <pid>` on a line and exit with `<code>`.
 /// The pid tells one run's line from another's.
 #[cfg(windows)]
@@ -99,6 +103,17 @@ pub fn run_if_requested() -> bool {
         }
         #[cfg(windows)]
         Some(PRINT_WHEN_RELEASED) => print_when_released(args[2].parse().expect("port argument"), &args[3]),
+        #[cfg(windows)]
+        Some(REPORT_USER) => {
+            // PROBE: who this process runs as, by `whoami`.
+            let out = std::process::Command::new("whoami.exe")
+                .args(["/user", "/fo", "csv", "/nh"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_else(|e| format!("whoami failed: {e}"));
+            send_line(args[2].parse().expect("port argument"), &out);
+            true
+        }
         #[cfg(windows)]
         Some(PRINT_AND_EXIT) => {
             println!("{} {}", args[3], std::process::id());

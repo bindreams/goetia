@@ -12,6 +12,8 @@ mod com;
 #[cfg(test)]
 pub(crate) mod fake;
 mod live;
+#[cfg(feature = "testing")]
+pub(crate) mod probe;
 mod read;
 mod remove;
 mod run;
