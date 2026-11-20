@@ -51,6 +51,11 @@ fn to_the_second(time: SystemTime) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
+/// `time` as RFC 3339, for a failure message.
+fn rfc3339(time: SystemTime) -> Timestamp {
+    Timestamp::try_from(time).expect("a time jiff holds")
+}
+
 /// The next time after `after` that the clock of the machine's zone reads the hour and minute of
 /// `daily` (`M H * * *`): its civil date, hour and minute worked out here, not read from Task Scheduler.
 ///
@@ -144,6 +149,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     cli.daemon(&["enable", id]);
     // The program connects when the schedule fires, at a minute Task Scheduler chooses: no bound fits.
     let held = listener.accept_unbounded();
+    let connected_at = SystemTime::now();
     // Disarmed at once: a later fire, which `IgnoreNew` rejects while the run is held, cannot touch
     // `LastTaskResult` or `LastRunTime` under the reads below, and none can come between the end of the run
     // and the reads that follow it.
@@ -151,18 +157,6 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     // The run is in flight and disarmed: `last-result` reads null (`LastTaskResult` says it is running),
     // `last-run` is the run's start, there is no next run, and the three forms show the same start.
     let running = read_in_the_zone(&in_zone, id);
-    let read_at = SystemTime::now();
-    // The run is the schedule's own: nothing else in this step starts the task, and it is armed only by
-    // `enable`. So its start lies between the call to `enable` and this read. Task Scheduler's listed times
-    // are no bound: a run starts about a second after its minute, so the minute can precede `enabling_at`
-    // while the run follows it, and then no listed time lies in the window.
-    let assert_fired_in_range = |form: &str, time: &str| {
-        let fired = instant(time);
-        assert!(
-            fired >= to_the_second(enabling_at) && fired <= read_at,
-            "{form}: last-run {fired:?} is not between `enable` at {enabling_at:?} and the read at {read_at:?}"
-        );
-    };
     assert_task_fields(
         &running.json,
         id,
@@ -184,8 +178,20 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
             "{}: the forms disagree on last-run: {running:?}",
             read.form
         );
-        assert_fired_in_range(read.form, started);
     }
+    // `last-run` is the launch, which lies between the arming and the program's connection: the run is the
+    // schedule's own (nothing else in this step starts the task), and the launch precedes the connection.
+    // Task Scheduler's listed minutes are no bound: the run for a minute that began just before the arming
+    // starts inside the window. The stamp is Task Scheduler's clock, which may precede the boundary by a few
+    // milliseconds, so the lower bound is a second early.
+    let fired = instant(started);
+    let earliest = to_the_second(enabling_at) - Duration::from_secs(1);
+    assert!(
+        fired >= earliest && fired <= connected_at,
+        "last-run `{started}` is not between {} (`enable`, less a second) and {} (the program's connection)",
+        rfc3339(earliest),
+        rfc3339(connected_at)
+    );
     drop(held);
     status_once_ended(&mgr, &task_id);
     let finished = read_in_the_zone(&in_zone, id);
@@ -204,10 +210,6 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     finished.assert_state("idle");
     for (before, after) in running.reads().into_iter().zip(finished.reads()) {
         assert_eq!(before.last_run, after.last_run, "{running:?} then {finished:?}");
-        assert_fired_in_range(
-            after.form,
-            after.last_run.as_deref().expect("a finished run has a last-run"),
-        );
     }
 
     // 4. `run` shows the output and exits with the run's result. The same id, installed again with another
