@@ -249,14 +249,13 @@ fn token_of_reads_the_token_the_xml_carries() {
 }
 
 #[skuld::test]
-fn stored_agrees_with_principal_armed_and_token_of() {
+fn stored_agrees_with_principal_and_token_of() {
     let spec = spec();
     for armed in [true, false] {
         let xml = built(&spec).to_xml(armed, &token());
         let stored = TaskXml::stored(&xml, ID).unwrap();
         assert_eq!(stored.principal, TaskXml::principal(&xml).unwrap());
         assert_eq!(stored.principal, Some(TaskAccount::Service("S-1-5-18".to_owned())));
-        assert_eq!(stored.armed, armed);
         assert_eq!(stored.token, Some(token()));
     }
     let tokenless = readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123");

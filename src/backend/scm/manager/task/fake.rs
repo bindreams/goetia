@@ -143,12 +143,8 @@ impl Fake {
         self.state(|s| &mut s.stop, reply)
     }
 
-    /// Gives the reply stated last an effect: what the world does while the scheduler is asked, which happens
-    /// when the call is made, before the reply is given and whichever the reply is. One effect to a reply.
-    ///
-    /// # Panics
-    ///
-    /// If no reply was stated since the last effect, or the reply stated last was already used by a call.
+    /// Attaches `effect` to the last-stated reply; runs when the call is made, before the reply is given. One per
+    /// reply. Panics if there is no unused reply.
     pub(crate) fn during(&self, effect: impl FnOnce() + Send + 'static) -> &Self {
         let mut script = lock(&self.0);
         let set = script.last.take().expect("`during` follows a stated reply");
@@ -157,7 +153,6 @@ impl Fake {
         self
     }
 
-    /// Queues `result` in the queue `queue` names, and notes how to reach it for [`Self::during`].
     fn state<T: 'static>(
         &self,
         queue: impl Fn(&mut Script) -> &mut VecDeque<Reply<T>> + Send + 'static,
@@ -165,7 +160,6 @@ impl Fake {
     ) -> &Self {
         let mut script = lock(&self.0);
         queue(&mut script).push_back(Reply { result, during: None });
-        // Any later reply replaces `last`, so while the queue holds one, the back of it is the reply stated last.
         script.last = Some(Box::new(move |script, effect| {
             queue(script)
                 .back_mut()

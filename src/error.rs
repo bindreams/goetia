@@ -568,16 +568,15 @@ pub enum Error {
 
     /// An install that changes the account a task runs as registers the task again (an update would
     /// leave it unreadable by the new account), which removes the old registration first, and so it
-    /// refuses while a run of the task is alive (whether or not its records are held too). Determinate:
-    /// the old task is as it was, but not untouched: its own flag is on again (a flag that cannot be put back
-    /// is reported with this error), and a scheduled run that fell between the disable and the refusal was
-    /// skipped.
+    /// refuses while a run of the task is alive (whether or not its records are held too). Determinate: the old
+    /// task stays, its flag on again (one that cannot be put back is reported with this error); a scheduled run
+    /// that fell between the disable and the refusal was skipped.
     #[error("{}", account_change_running(id))]
     AccountChangeRunning { id: String },
 
     /// An account change ([`Error::AccountChangeRunning`]) that finds no run alive but the task's run records
     /// held: `pin` is what holds them (a run that is starting, a `run` or `stop` of the task, or another
-    /// program). Determinate, with the same traces as that refusal.
+    /// program). Determinate; leaves the same traces as [`Error::AccountChangeRunning`].
     #[error("{}", account_change_held(id, pin))]
     AccountChangeHeld { id: String, pin: PathBuf },
 

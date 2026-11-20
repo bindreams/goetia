@@ -5,11 +5,9 @@
 //! password and the logon right of a real user, the event source, and the record directory with its
 //! permissions. A failure of any is a failure with nothing sent.
 //!
-//! An account change deletes the old task, and before that it checks what it can: what the records' and the log's
-//! creation would refuse ([`check_records`], which sends nothing to Task Scheduler), then the runs and the pins
-//! (the pin check sweeps the stale pins it finds). What can still fail after the delete is a permissions write,
-//! a link made at `runs\<id>` by the old account during the change, and the create. That leaves nothing at the
-//! id, and the error says so.
+//! An account change checks what it can before it deletes the old task ([`Scm::task_register_again`]). What can
+//! still fail after the delete (a permissions write, a link made at `runs\<id>` by the old account during the
+//! change, the create) leaves nothing at the id, and the error says so.
 //!
 //! A task is armed when it has triggers; an install makes it disarmed and keeps what is installed. `disable`
 //! registers the stored XML with no `Triggers`, and `enable` the stored XML as it is when it has triggers,
@@ -163,7 +161,8 @@ impl Scm {
     }
 
     /// Writes the task `spec` is: a create when nothing is installed, otherwise an update of
-    /// `snapshot`'s task that keeps whether it is armed (a create is disarmed). A task installed over
+    /// `snapshot`'s task, armed when it has triggers, whatever its own flag (a create is disarmed); every
+    /// registration writes the flag true. A task installed over
     /// one of another account is registered again instead ([`Self::task_write_with`]). Write
     /// [`Self::task_write_with`] over the machine's own record directory, processes and account.
     ///
@@ -218,8 +217,8 @@ impl Scm {
             Some((old, stored)) if stored.principal.as_ref() != Some(&prepared.principal) => {
                 return self.task_register_again(old, definition, runs, processes, &prepared);
             }
-            Some((_, stored)) => Registering::Update {
-                armed: stored.armed,
+            Some((old, stored)) => Registering::Update {
+                armed: old.has_triggers(),
                 token: stored.token,
             },
             None => Registering::Create { armed: false },
@@ -243,7 +242,7 @@ impl Scm {
     /// was placed) is taken away, and a flag or a marker that cannot be put back is reported with the failure.
     /// **After the delete** these can fail:
     /// - a permissions write;
-    /// - a link made at `runs\<id>` by the old account during the change fails it after the delete;
+    /// - a link made at `runs\<id>` by the old account during the change;
     /// - the create, which is also where Task Scheduler checks a real user's password.
     ///
     /// That leaves nothing at the id, which no flag is put back on: the error says the old task is removed and
@@ -251,8 +250,7 @@ impl Scm {
     /// after, as an install makes it disarmed). The install that runs again clears the marker with its
     /// narrowing.
     ///
-    /// **A scheduled run that falls in the window of the disable does not run**, even when the change is then
-    /// refused after the marker: its shim finds the marker, logs it, and ends as a shim failure.
+    /// **A scheduled run that falls in the window of the disable does not run.**
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
@@ -266,19 +264,17 @@ impl Scm {
         check_records(id, runs)?;
         let disabled = match self.tasks.set_enabled(&path, false) {
             Ok(()) => true,
-            // The task is gone: there is nothing to put back.
             Err(e) if gone(&e) => false,
             Err(e) => return Err(e),
         };
         if let Err(failed) = self.delete_for_account_change(old, runs, processes) {
-            // The old task is still there, and its shims may serve it again.
             return Err(if disabled {
                 self.enable_again(id, failed)
             } else {
                 failed
             });
         }
-        // No run of the old account can be left: the one that spawned held a pin or was listed.
+        // No run of the old account can be left (it held a pin or was listed).
         let created = task_records(id, runs, &prepared.principal, &[]).and_then(|()| {
             let registering = Registering::Create {
                 armed: old.has_triggers(),
@@ -308,11 +304,9 @@ impl Scm {
         }
     }
 
-    /// [`Self::task_register_again`] from the marker to the delete. The marker first, then every pin and the
-    /// listing: a shim that pins before the marker is seen by the pin check or the listing, and one that pins
-    /// after it is refused ([`Runs::hold`]). A failure leaves the old task. The marker is taken away once it is
-    /// placed (a failure to place it leaves none), and one that cannot be taken away is reported with the
-    /// failure.
+    /// Places the marker, refuses a run or held records ([`Self::refuse_account_change_while_running`]), and
+    /// deletes the registration. A failure takes the marker away; one that cannot be taken away is reported with
+    /// it.
     fn delete_for_account_change<P: Processes>(
         &self,
         old: &TaskSnapshot,
@@ -384,8 +378,8 @@ impl Scm {
 enum Registering {
     /// A new registration of the task, armed or not, under a fresh token.
     Create { armed: bool },
-    /// The stored task written again in place: as armed as it is (`armed`), under its own `token`; or, where
-    /// it has none (a hand edit), a fresh one.
+    /// The stored task written again in place: armed when it has triggers (`armed`), under its own `token`; or,
+    /// where it has none (a hand edit), a fresh one.
     Update { armed: bool, token: Option<Token> },
 }
 
@@ -399,9 +393,9 @@ fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
     })
 }
 
-/// What an account change tells when it fails after it deleted the old task of `id`: the task is gone, so the
-/// failure is no refusal that left it. An install creates a task disarmed, so one that was armed is enabled after
-/// (`enable_after`: the old task was armed and the new definition has a schedule, which `enable` needs).
+/// The error of an account change that fails after deleting the old task: it is gone, install again.
+/// `enable_after`: the old task was armed and the new definition has a schedule, so say to `enable` it (an install
+/// creates it disarmed).
 fn removed_and_not_recreated(id: &Id, enable_after: bool) -> String {
     let enable = if enable_after {
         format!(", then run `goetia daemon enable {id}`, as the old task was armed")
@@ -435,8 +429,8 @@ fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept_log: &[Sid]) -> Resu
 
 /// What [`task_records`] would refuse as things stand, found without changing anything: the record directory
 /// that is a link ([`Runs::check_directory`]), and the default log that is a directory, a link or being deleted
-/// ([`default_log::check`]). Both are the judgements `task_records` makes, so none is written twice. An account
-/// change calls it first, before anything is sent: the delete of the old task would otherwise leave nothing at the id.
+/// ([`default_log::check`]). An account change calls it first, before anything is sent: the delete of the old task
+/// would otherwise leave nothing at the id.
 fn check_records(id: &Id, runs: &Runs) -> Result<()> {
     runs.check_directory()
         .map_err(|e| Error::os(format!("use the run records of `{id}`"), e))?;
@@ -468,47 +462,63 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
     }
 }
 
-/// What an install that finds the task `installed` up to date makes again if it is gone ([`task_beside_with`]),
-/// under the machine's `%ProgramData%`: the folders above the record directory are always judged, as a write
-/// does ([`runs_for_write`]).
-pub(in crate::backend::scm) fn task_beside(
-    spec: &DaemonSpec,
-    definition: &TaskXml,
-    installed: &TaskSnapshot,
-) -> Result<()> {
-    task_beside_with(
-        &program_data()?,
-        &FolderCheck::new(CheckPermissions::Enable),
-        spec,
-        definition,
-        installed,
-        prepare,
-    )
-}
+impl Scm {
+    /// What an install that finds the task `installed` up to date makes again if it is gone
+    /// ([`Self::task_beside_with`]), under the machine's `%ProgramData%`: the folders above the record directory
+    /// are always judged, as a write does ([`runs_for_write`]).
+    pub(in crate::backend::scm) fn task_beside(
+        &self,
+        spec: &DaemonSpec,
+        definition: &TaskXml,
+        installed: &TaskSnapshot,
+    ) -> Result<()> {
+        self.task_beside_with(
+            &program_data()?,
+            &FolderCheck::new(CheckPermissions::Enable),
+            spec,
+            definition,
+            installed,
+            prepare,
+        )
+    }
 
-/// What a write of the task `installed` makes besides its registration, made again: the folders above the record
-/// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for the account
-/// `definition` registers (`prepare`, with [`Password::Unneeded`]: the event source and a real user's logon right,
-/// but no password, for the task is not registered again), the record directory with the marker a dead uninstall
-/// left cleared ([`Runs::ensure`]), and the default log ([`task_records`]). They name the account `prepare` found
-/// alone. The record directory is not made by `runs_in`, but the folders above it may be; a refusal there comes
-/// before anything the account needs (the logon right, the event source, the records, the log). Moving the task to
-/// another account is a write's job, which finds the task registered as another.
-fn task_beside_with(
-    program_data: &Path,
-    folders: &FolderCheck,
-    spec: &DaemonSpec,
-    definition: &TaskXml,
-    installed: &TaskSnapshot,
-    prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
-) -> Result<()> {
-    let runs = runs_in(program_data, installed.id(), folders)?;
-    let prepared = prepare(
-        &definition.account(),
-        written_user(&spec.common().user),
-        Password::Unneeded,
-    )?;
-    task_records(installed.id(), &runs, &prepared.principal, &[])
+    /// What a write of the task `installed` makes besides its registration, made again: the folders above the
+    /// record directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for
+    /// the account `definition` registers (`prepare`, with [`Password::Unneeded`]: the event source and a real
+    /// user's logon right, but no password, for the task is not registered again), the record directory with the
+    /// marker a dead uninstall left cleared ([`Runs::ensure`]), the default log ([`task_records`]), and the task's
+    /// own flag ([`Self::own_flag_back`]). They name the account `prepare` found alone. The record directory is
+    /// not made by `runs_in`, but the folders above it may be; a refusal there comes before anything the account
+    /// needs (the logon right, the event source, the records, the log). Moving the task to another account is a
+    /// write's job, which finds the task registered as another.
+    pub(super) fn task_beside_with(
+        &self,
+        program_data: &Path,
+        folders: &FolderCheck,
+        spec: &DaemonSpec,
+        definition: &TaskXml,
+        installed: &TaskSnapshot,
+        prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
+    ) -> Result<()> {
+        let runs = runs_in(program_data, installed.id(), folders)?;
+        let prepared = prepare(
+            &definition.account(),
+            written_user(&spec.common().user),
+            Password::Unneeded,
+        )?;
+        task_records(installed.id(), &runs, &prepared.principal, &[])?;
+        self.own_flag_back(installed)
+    }
+
+    /// Sets the own flag of `installed` on when it has triggers and the flag is off (an account change or an
+    /// uninstall that was cut short disabled it). One with no triggers is disarmed, and one whose flag is on is
+    /// left as it is.
+    fn own_flag_back(&self, installed: &TaskSnapshot) -> Result<()> {
+        if installed.has_triggers() && !installed.armed() {
+            self.tasks.set_enabled(&TaskPath::of(installed.id()), true)?;
+        }
+        Ok(())
+    }
 }
 
 // Enable and disable ==================================================================================================

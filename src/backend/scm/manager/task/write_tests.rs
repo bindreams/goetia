@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tempfile::TempDir;
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+};
 
 use super::*;
 use crate::backend::scm::instance::InstanceId;
@@ -938,6 +940,126 @@ fn a_marker_that_cannot_be_placed_puts_back_the_flag_and_no_marker() {
     fake.finish();
 }
 
+/// The marker is placed before the pins are read: with the marker refused the pin check is never reached, so the
+/// stale pin it sweeps is still there.
+#[skuld::test]
+fn the_marker_is_placed_before_the_pins_are_read() {
+    let (dir, runs) = made_records();
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    std::fs::create_dir(dir.path().join("Goetia").join("runs").join("nightly~removing")).unwrap();
+    let stale = records_dir(&dir).join("pin-stale.pin");
+    std::fs::write(&stale, "").unwrap();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(())).on_set_enabled(Ok(()));
+
+    scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+
+    assert!(stale.exists(), "the pin check did not run");
+    fake.finish();
+}
+
+/// A marker that cannot be taken away (something holds it open) is reported beside the failure that made it
+/// necessary, a refusal and a failed delete alike; the flag is put back all the same.
+#[skuld::test]
+fn a_marker_that_cannot_be_taken_away_is_reported_with_the_failure() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    for ending in ["refused", "delete fails"] {
+        let (dir, runs) = made_records();
+        let holder = Arc::new(Mutex::new(None));
+        let hold = {
+            let (holder, marker) = (
+                Arc::clone(&holder),
+                dir.path().join("Goetia").join("runs").join("nightly~removing"),
+            );
+            move || {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .open(marker)
+                    .unwrap();
+                *holder.lock().unwrap() = Some(file);
+            }
+        };
+        let fake = Fake::new();
+        fake.on_set_enabled(Ok(()));
+        let mut processes = Running(if ending == "refused" { vec![4242] } else { vec![] });
+        if ending == "refused" {
+            fake.on_instances(Ok(vec![running_run()])).during(hold);
+        } else {
+            fake.on_instances(Ok(Vec::new()))
+                .during(hold)
+                .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))));
+        }
+        fake.on_set_enabled(Ok(()));
+
+        let failed = scm(&fake)
+            .task_write_with(
+                &new,
+                &definition(&new),
+                Some(&snapshot_of(&old, true)),
+                &runs,
+                &mut processes,
+                prepared(users(), None),
+            )
+            .unwrap_err();
+
+        let report = failed.report().to_string();
+        assert!(report.contains("take the removal's marker away"), "{ending}: {report}");
+        let cause = if ending == "refused" {
+            "goetia daemon stop"
+        } else {
+            "denied"
+        };
+        assert!(report.contains(cause), "{ending}: {report}");
+        assert_eq!(
+            fake.calls().last(),
+            Some(&Call::SetEnabled(PATH.to_owned(), true)),
+            "{ending}: the flag is put back"
+        );
+        fake.finish();
+    }
+}
+
+/// With `runs` gone there are no records, so no marker is placed and none is taken away: a refusal is the one
+/// error, and the flag is put back.
+#[skuld::test]
+fn an_account_change_with_no_records_places_no_marker_and_takes_none_away() {
+    let (dir, runs) = made_records();
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    std::fs::remove_dir_all(dir.path().join("Goetia").join("runs")).unwrap();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![running_run()]))
+        .on_set_enabled(Ok(()));
+
+    let refused = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![4242]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::AccountChangeRunning { .. }), "{refused:?}");
+    assert!(!runs.is_closed().unwrap(), "no marker was placed");
+    fake.finish();
+}
+
 /// A flag that cannot be put back is reported with the failure that made it necessary.
 #[skuld::test]
 fn an_enabled_flag_that_cannot_be_put_back_is_reported_with_the_failure() {
@@ -1122,7 +1244,118 @@ fn account_change_takes_armed_from_the_triggers_alone() {
     }
 }
 
-// The order of an account change --------------------------------------------------------------------------------------
+/// What Task Scheduler holds of `spec`'s task with its own flag off and, as `triggers` says, with or without
+/// triggers: what an account change or an uninstall that was cut short leaves.
+fn registered_flag_off(spec: &DaemonSpec, triggers: bool) -> Registered {
+    let registered = registered_task(spec, triggers);
+    Registered {
+        xml: TaskXml::with_own_flag(&registered.xml, false).unwrap(),
+        enabled: Some(false),
+        ..registered
+    }
+}
+
+/// An install over a task of the same account whose own flag is off (a change that was cut short disabled it)
+/// is armed as its triggers say, as an account change is, and writes the flag true: a task with triggers is not
+/// silently disarmed, and one with none stays so.
+#[skuld::test]
+fn an_update_of_a_task_with_its_flag_off_is_armed_by_its_triggers_alone() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let rescheduled = task_spec(Some("0 4 * * *"));
+    for triggers in [true, false] {
+        let (_dir, runs) = made_records();
+        let fake = Fake::new();
+        fake.on_register(Ok(Registration::Created));
+        let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_flag_off(&spec, triggers));
+
+        scm(&fake)
+            .task_write_with(
+                &rescheduled,
+                &definition(&rescheduled),
+                Some(&installed),
+                &runs,
+                &mut Running(vec![]),
+                prepared(system(), None),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fake.calls(),
+            [register_call(&rescheduled, triggers, root(), None, true, &task_token())],
+            "triggers={triggers}"
+        );
+        fake.finish();
+    }
+}
+
+/// An install that finds a task up to date sets the own flag of one that has triggers and is itself disabled,
+/// which is armed in every way but that; one that has none stays disarmed, and one whose flag is on is not
+/// written to.
+#[skuld::test]
+fn an_up_to_date_install_sets_the_own_flag_of_a_task_that_has_triggers() {
+    let spec = task_spec(Some("30 3 * * *"));
+    for (found, sets) in [
+        (registered_flag_off(&spec, true), true),
+        (registered_flag_off(&spec, false), false),
+        (registered_task(&spec, true), false),
+        (registered_task(&spec, false), false),
+    ] {
+        let fake = Fake::new();
+        if sets {
+            fake.on_set_enabled(Ok(()));
+        }
+        let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), found);
+
+        scm(&fake).own_flag_back(&installed).unwrap();
+
+        let expected: Vec<Call> = sets
+            .then(|| Call::SetEnabled(PATH.to_owned(), true))
+            .into_iter()
+            .collect();
+        assert_eq!(fake.calls(), expected, "sets={sets}");
+        fake.finish();
+    }
+}
+
+/// ... and a flag that cannot be set fails the install.
+#[skuld::test]
+fn an_up_to_date_install_fails_when_the_own_flag_cannot_be_set() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Err(Error::os("enable", std::io::Error::other("busy"))));
+    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_flag_off(&spec, true));
+
+    let failed = scm(&fake).own_flag_back(&installed).unwrap_err();
+
+    assert!(failed.report().to_string().contains("busy"), "{}", failed.report());
+    fake.finish();
+}
+
+/// An install that finds the task up to date calls it, once the records are made.
+#[skuld::test]
+fn an_up_to_date_install_sets_the_own_flag_after_the_records(#[fixture(scm_group)] _group: &Group) {
+    let spec = users_spec();
+    let (dir, _runs) = records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()));
+    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_flag_off(&spec, true));
+
+    beside_over(&fake, &dir, &spec, &installed, prepared_beside(users())).unwrap();
+
+    assert_eq!(fake.calls(), [Call::SetEnabled(PATH.to_owned(), true)]);
+    assert!(records_dir(&dir).is_dir());
+    fake.finish();
+}
+
+/// What the machine holds for a task up to date that runs as `principal`.
+fn prepared_beside(principal: Sid) -> impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared> {
+    move |_, _, _| {
+        Ok(Prepared {
+            principal,
+            password: None,
+        })
+    }
+}
 
 /// What the world looks like to one call of the fake, noted as the call is made: `at`, whether the removal's
 /// marker stands, and whether the record directory names the new account ([`users`]).
@@ -1151,7 +1384,7 @@ impl Seen {
 }
 
 /// An account change goes in order: disable, marker, the check of the pins, the listing, the delete, the records
-/// narrowed to the new account (which takes the marker away), the create. The pin check's place is the next test's.
+/// narrowed to the new account (which takes the marker away), the create.
 #[skuld::test]
 fn account_change_order() {
     let (dir, runs) = made_records();
@@ -1321,17 +1554,26 @@ fn unjudgeable_pin_fails_the_change_before_the_delete() {
 /// What the records' creation would refuse is refused before anything is sent to Task Scheduler, and before the
 /// marker, which the refusal would otherwise have to take away: a link where the task's directory should be, and
 /// at its default log's name a directory, a link and a delete that is pending. The old task is not disabled, so
-/// no scheduled run in the window is skipped, and there is no flag to put back.
+/// no scheduled run in the window is skipped. Each refusal says what it is: no other case's words are in it.
 #[skuld::test]
 fn what_the_records_will_refuse_is_refused_before_the_delete() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
-    for what in [
+    let says = [
+        "is a link, which goetia did not make; uninstalling the task removes it",
+        "is a directory, which goetia did not make",
+        "is a link, which goetia did not make; delete it and install the daemon again",
+        "is being deleted while something still has it open",
+    ];
+    for (what, own) in [
         "a link at runs",
         "a directory at the log",
         "a link at the log",
         "a delete pending at the log",
-    ] {
+    ]
+    .into_iter()
+    .zip(says)
+    {
         let (dir, runs) = made_records();
         let target = tempfile::tempdir().unwrap();
         let mut _pending = None;
@@ -1368,6 +1610,10 @@ fn what_the_records_will_refuse_is_refused_before_the_delete() {
             .unwrap_err();
 
         assert!(matches!(failed, Error::Os { .. }), "{what}: {failed:?}");
+        let report = failed.report().to_string();
+        for phrase in says {
+            assert_eq!(report.contains(phrase), phrase == own, "{what}: `{phrase}` in {report}");
+        }
         assert_eq!(fake.calls(), [], "{what}: nothing is sent to Task Scheduler");
         assert!(!runs.is_closed().unwrap(), "{what}: no marker is placed");
         fake.finish();
@@ -1483,7 +1729,6 @@ fn rerun_after_a_dead_change_with_the_marker_left_proceeds() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
 
-    // The task is there, disabled, and the marker stands.
     let (_dir, runs) = made_records();
     runs.close().unwrap();
     let fake = Fake::new();
@@ -1505,7 +1750,6 @@ fn rerun_after_a_dead_change_with_the_marker_left_proceeds() {
     assert!(!runs.is_closed().unwrap());
     fake.finish();
 
-    // Nothing is at the id, and the marker stands.
     let (_dir, runs) = made_records();
     runs.close().unwrap();
     let fake = Fake::new();
@@ -1797,7 +2041,18 @@ fn beside_of(
     snapshot: &TaskSnapshot,
     prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
 ) -> Result<()> {
-    task_beside_with(
+    beside_over(&Fake::new(), dir, spec, snapshot, prepare)
+}
+
+/// [`beside_of`] over `fake`, which answers what the install sends to Task Scheduler.
+fn beside_over(
+    fake: &Fake,
+    dir: &TempDir,
+    spec: &DaemonSpec,
+    snapshot: &TaskSnapshot,
+    prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
+) -> Result<()> {
+    scm(fake).task_beside_with(
         dir.path(),
         &FolderCheck::new(CheckPermissions::Disable),
         spec,

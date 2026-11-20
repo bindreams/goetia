@@ -860,7 +860,7 @@ fn hold_with_the_marker_is_refused_busy_and_hold_ignoring_it_is_not() {
     drop(own);
 }
 
-/// A held pin is named at once, whoever holds it (a shim's, a `run`'s, a stop's): the one pass never waits.
+/// A held pin is named at once, whoever holds it (a shim's, a `run`'s, a stop's).
 #[skuld::test]
 fn held_pin_reports_the_path_of_a_held_pin_at_once() {
     let (_dir, runs) = fixture();
@@ -1370,6 +1370,29 @@ fn ensure_refuses_a_link_and_leaves_what_it_points_to_alone() {
         before,
         "the target's permissions are not rewritten"
     );
+    assert!(target_is_untouched(&target));
+}
+
+/// `check_directory` passes a directory that is not there, and one `ensure` would only set the permissions of,
+/// and changes nothing; it refuses a link as `ensure` does.
+#[skuld::test]
+fn check_directory_passes_what_ensure_would_not_refuse_and_refuses_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = Runs::of(dir.path(), &id());
+    absent.check_directory().unwrap();
+    assert!(!absent.dir.exists(), "nothing is made");
+
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let before = entries_of(&runs.dir);
+    runs.check_directory().unwrap();
+    assert_eq!(entries_of(&runs.dir), before, "the permissions are not set");
+    assert_eq!(names(&runs), [file_of(&instance(1))]);
+
+    let (_link_dir, linking) = fixture();
+    let (_target_dir, target) = linked(&linking);
+    let refused = linking.check_directory().unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::NotADirectory);
     assert!(target_is_untouched(&target));
 }
 

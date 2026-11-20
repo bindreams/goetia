@@ -528,6 +528,24 @@ fn a_log_with_a_tag_that_is_no_link_has_its_permissions_set() {
     assert_eq!(entries_of(&log), entries_wanted_for(std::slice::from_ref(&me)));
 }
 
+/// `check` passes what `ensure` does not refuse: nothing at the name, and a file `ensure` would only set (one with
+/// a tag that is no link too). It changes nothing.
+#[skuld::test]
+fn check_passes_a_missing_log_and_one_ensure_would_only_set() {
+    let (dir, log) = program_data_with_logs();
+
+    check(dir.path(), &id()).unwrap();
+    assert!(!log.exists(), "nothing is made");
+
+    fs::write(&log, "").unwrap();
+    let before = entries_of(&log);
+    check(dir.path(), &id()).unwrap();
+    set_reparse_point(&log, A_TAG, b"x");
+    check(dir.path(), &id()).unwrap();
+
+    assert_eq!(entries_of(&log), before, "the permissions are not set");
+}
+
 /// The folder is an install's, made before the file: where it is not there nothing is made.
 #[skuld::test]
 fn a_missing_logs_folder_is_an_error_and_nothing_is_made() {

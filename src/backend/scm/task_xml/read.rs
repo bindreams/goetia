@@ -104,13 +104,12 @@ impl TaskXml {
         Ok(token_in(&document(xml)?, id))
     }
 
-    /// What the stored `xml` of the task `id` says of its registration, from one parse: [`TaskXml::principal`],
-    /// [`TaskXml::armed`] and [`TaskXml::token_of`]. An error only for XML that cannot be read.
+    /// What the stored `xml` of the task `id` says of its registration, from one parse: [`TaskXml::principal`]
+    /// and [`TaskXml::token_of`]. An error only for XML that cannot be read.
     pub(crate) fn stored(xml: &str, id: &str) -> Result<Stored, Error> {
         let document = document(xml)?;
         Ok(Stored {
             principal: principal_in(&document),
-            armed: armed_in(&document),
             token: token_in(&document, id),
         })
     }

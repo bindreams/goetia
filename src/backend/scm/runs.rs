@@ -290,10 +290,8 @@ impl Runs {
         self.reopen()
     }
 
-    /// What [`Runs::ensure`] would refuse of the directory as it stands, found without changing anything: one
-    /// that is there and is no directory of goetia's (a link: [`io::ErrorKind::NotADirectory`]). One that is
-    /// not there is fine, since `ensure` makes it. What cannot be foreseen (a write of the permissions that is
-    /// denied at that moment) is for `ensure`.
+    /// Read-only: refuses what [`Runs::ensure`] would refuse of an existing directory (a link: NotADirectory). A
+    /// missing directory passes; so does a permissions write that later fails.
     pub(crate) fn check_directory(&self) -> io::Result<()> {
         match Dir::open(&self.dir) {
             Ok(_) => Ok(()),

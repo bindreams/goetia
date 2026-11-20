@@ -210,9 +210,8 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, naming: &Naming) -> Result<En
 
 /// A deleted log whose handle something still holds (a daemon's output handle, or a program reading it) keeps its
 /// name where the delete is not POSIX, and an open answers access denied; the error says to end what holds it and
-/// install again. A directory at the name, and a link, are told as what they are. The status of an open of the
-/// name tells each of the three from a permission that refuses the install: the Win32 error is access denied for
-/// all four.
+/// install again. A directory at the name, and a link, are told as what they are. The Win32 error is access denied
+/// for all four (these three and a permission refusal), so the status of the open tells them apart.
 fn make_error(path: &Path, e: io::Error) -> Error {
     if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
         && let Some(refusal) = refusal_at(path, what_is_at(path))
@@ -240,10 +239,8 @@ fn refusal_at(path: &Path, at: AtName) -> Option<Error> {
     Some(Error::os("use the default log", io::Error::other(said)))
 }
 
-/// What [`ensure`] would refuse of the default log of `id` under `program_data` as it stands, found without
-/// changing anything: a directory, a link or a pending delete at its name, told as `ensure` tells them. A file
-/// that is not there, or one `ensure` would only set, passes; so does what cannot be foreseen (a write of the
-/// permissions that is denied at that moment).
+/// Read-only: what [`ensure`] would refuse of `id`'s default log (a directory, a link, a pending delete), with
+/// the same error. A missing file, one `ensure` would only set, and a permissions write that later fails pass.
 pub(crate) fn check(program_data: &Path, id: &Id) -> Result<()> {
     let path = path_in(&logs_folder(program_data), id.as_str());
     match refusal_at(&path, what_is_at(&path)) {
