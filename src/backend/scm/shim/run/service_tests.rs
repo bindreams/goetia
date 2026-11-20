@@ -23,13 +23,13 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::*;
-use crate::backend::scm::shim::run::os::Parents;
+use crate::backend::scm::shim::run::os::LogKind;
 use crate::backend::scm::shim::run::os::fake::{
-    FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, tree_kill_refused,
-    wait_failed, wait_failed_with_code,
+    ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd,
+    tree_kill_refused, wait_failed, wait_failed_with_code,
 };
 use crate::backend::scm::shim::run::test_support::{
-    assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
+    assert_failures, assert_one_failure, chained, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
@@ -315,6 +315,33 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     assert!(daemon.dropped());
 }
 
+/// A default log that is not there: the shim's hold of it says so, and the daemon's output open that follows
+/// fails for the same reason and says what that costs. The hold's line does not silence it.
+#[skuld::test]
+fn a_default_log_that_could_not_be_held_still_has_the_outputs_open_failure_told() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new();
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+    let default = Path::new(FAKE_LOGS).join(format!("{ID}.log"));
+    fake.will_fail_hold(&default);
+    fake.will_fail_open_log(&default);
+    let supervisor = supervisor(&fake);
+
+    supervisor.log.hold_default(ID);
+    let launched = launch(&spec_logging_to(None), &supervisor, ID);
+
+    assert!(launched.is_ok(), "the daemon still runs");
+    let told = fake.take_failures();
+    let [held, opened] = told.as_slice() else {
+        panic!("the hold's line and the open's: {told:?}");
+    };
+    assert!(held.contains("hold the default log"), "{held}");
+    assert!(opened.contains("this daemon's output will not be captured"), "{opened}");
+    drop(launched);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
 #[skuld::test]
 fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs() {
     let fake = FakeGuard::new();
@@ -323,7 +350,7 @@ fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs()
     fake.will_spawn(daemon.clone());
     let log = Arc::new(Log::from_program_data(
         fake.channels(),
-        Err(crate::error::Error::os(
+        &Err(crate::error::Error::os(
             "locate %ProgramData%",
             std::io::Error::other("x"),
         )),
@@ -347,9 +374,9 @@ fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs()
 /// runs as the service's account, makes no folder for.
 #[skuld::test]
 fn the_daemons_log_has_its_folders_made_only_when_it_is_the_users_own() {
-    for (logs, parents) in [
-        (Some(PathBuf::from(DAEMON_LOG)), Parents::Create),
-        (None, Parents::Never),
+    for (logs, kind) in [
+        (Some(PathBuf::from(DAEMON_LOG)), LogKind::Own),
+        (None, LogKind::Default),
     ] {
         let fake = FakeGuard::new();
         let daemon = FakeProcess::new();
@@ -359,10 +386,43 @@ fn the_daemons_log_has_its_folders_made_only_when_it_is_the_users_own() {
         let launched = launch(&spec_logging_to(logs.clone()), &supervisor(&fake), ID);
 
         assert!(launched.is_ok(), "{logs:?}");
-        assert_eq!(fake.opened_log_parents(0), parents, "{logs:?}");
+        assert_eq!(fake.opened_log_kind(0), kind, "{logs:?}");
         drop(launched);
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     }
+}
+
+/// A `logs:` equal to the default log as written, which a service installed by an earlier version may carry,
+/// is the default log in everything: its output is opened as the default log, and a failure line goes to it
+/// once, not once as the user's own and once as the default.
+#[skuld::test]
+fn a_logs_equal_to_the_default_log_is_the_default_log_for_output_and_for_failures() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new();
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+    let default = Path::new(FAKE_LOGS).join(format!("{ID}.log"));
+    let spec = spec_logging_to(Some(default.clone()));
+    let supervisor = supervisor(&fake);
+
+    let launched = launch(&spec, &supervisor, ID);
+
+    assert!(launched.is_ok());
+    assert_eq!(fake.opened_log_kind(0), LogKind::Default);
+    assert_eq!(fake.opened_log_path(0), default);
+    drop(launched);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    set_daemon_log(&supervisor.log, ID, &spec);
+    supervisor.log.failure(ID, "the line");
+    let appended: Vec<(PathBuf, LogKind)> = fake
+        .take_channel_calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            ChannelCall::Append { path, kind, .. } => Some((path, kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(appended, vec![(default, LogKind::Default)]);
 }
 
 // run_daemon ==========================================================================================================
@@ -1450,11 +1510,6 @@ fn a_failed_dispatcher_connection_names_the_os_reason() {
     );
 }
 
-/// A cause that has a cause: `Chain` prints `context: cause`.
-fn chained() -> std::io::Error {
-    crate::error::within("the context", std::io::Error::other("the cause"))
-}
-
 #[skuld::test]
 fn a_refused_thread_prints_the_cause_of_the_refusal() {
     let text = thread_refused(&["daemon".to_string()], &chained());
@@ -1462,16 +1517,6 @@ fn a_refused_thread_prints_the_cause_of_the_refusal() {
     assert_eq!(
         text,
         r#"make the thread that waits on ["daemon"]: the context: the cause; it was not spawned, so nothing of this daemon is running"#
-    );
-}
-
-#[skuld::test]
-fn a_log_file_that_cannot_be_opened_prints_the_cause_of_the_failure() {
-    let text = log_open_failed(Path::new("daemon.log"), &chained());
-
-    assert_eq!(
-        text,
-        "open log file daemon.log: the context: the cause (this daemon's output will not be captured; it is still being run)"
     );
 }
 

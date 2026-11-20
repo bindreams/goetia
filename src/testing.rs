@@ -58,6 +58,13 @@ pub fn program_data() -> PathBuf {
         .unwrap_or_else(|e| panic!("cannot locate %ProgramData%: {}", e.report()))
 }
 
+/// The version marker every service host carries and an install checks for, which a program that is no host
+/// (a test binary a test installs as one) is given by appending it.
+#[cfg(windows)]
+pub fn host_marker() -> Vec<u8> {
+    crate::backend::scm::shim::marker::MARKER.to_vec()
+}
+
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
 /// a test never takes a placeholder for a SID.
 #[cfg(windows)]
@@ -72,12 +79,183 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     crate::backend::scm::manager::sid_for_account_name(account_name, None).map(|(sid, _kind)| sid)
 }
 
+/// Whether the account `sid` holds the logon right `right` (`"SeBatchLogonRight"`), as the local security
+/// policy says (`LsaEnumerateAccountRights`). A failure to ask fails the calling test.
+#[cfg(windows)]
+pub fn account_holds_right(sid: &[u8], right: &str) -> bool {
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        LSA_UNICODE_STRING, LsaClose, LsaEnumerateAccountRights, LsaFreeMemory, LsaNtStatusToWinError,
+        POLICY_LOOKUP_NAMES,
+    };
+    use windows_sys::Win32::Security::PSID;
+
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+    let policy = open_policy(POLICY_LOOKUP_NAMES as u32);
+
+    let mut rights: *mut LSA_UNICODE_STRING = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: `policy` was opened above; `sid` is a SID buffer live for the call; the out-params are valid.
+    let status = unsafe { LsaEnumerateAccountRights(policy, sid.as_ptr() as PSID, &mut rights, &mut count) };
+    let mut held = false;
+    if status == 0 {
+        // SAFETY: on success `rights` points at `count` strings, each `Length` bytes of UTF-16 at `Buffer`.
+        held = unsafe { std::slice::from_raw_parts(rights, count as usize) }
+            .iter()
+            .any(|name| {
+                let units = unsafe { std::slice::from_raw_parts(name.Buffer, name.Length as usize / 2) };
+                String::from_utf16_lossy(units) == right
+            });
+        // SAFETY: `rights` was allocated by `LsaEnumerateAccountRights` and is freed once.
+        unsafe { LsaFreeMemory(rights.cast()) };
+    } else {
+        // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS`.
+        let win32 = unsafe { LsaNtStatusToWinError(status) };
+        // An account with no rights at all is not found by the policy: it holds none.
+        assert_eq!(
+            win32, ERROR_FILE_NOT_FOUND,
+            "enumerate the rights of the account: NTSTATUS {status:#x}"
+        );
+    }
+    // SAFETY: `policy` was opened above and is closed once, after its last use.
+    unsafe { LsaClose(policy) };
+    held
+}
+
+/// Takes the logon right `right` away from the account `sid`, so that a test can show an install grants it again.
+/// A right the account does not hold is done. A failure fails the calling test.
+#[cfg(windows)]
+pub fn revoke_right(sid: &[u8], right: &str) {
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        LSA_UNICODE_STRING, LsaClose, LsaNtStatusToWinError, LsaRemoveAccountRights, POLICY_CREATE_ACCOUNT,
+        POLICY_LOOKUP_NAMES,
+    };
+    use windows_sys::Win32::Security::PSID;
+
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+    let policy = open_policy((POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES) as u32);
+    let mut text: Vec<u16> = right.encode_utf16().collect();
+    let bytes = (text.len() * 2) as u16;
+    let name = LSA_UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: text.as_mut_ptr(),
+    };
+    // SAFETY: `policy` was opened above; `sid` is a SID buffer and `name` points into `text`, both live for the call.
+    let status = unsafe { LsaRemoveAccountRights(policy, sid.as_ptr() as PSID, false, &name, 1) };
+    // SAFETY: `policy` was opened above and is closed once, after its last use.
+    unsafe { LsaClose(policy) };
+    if status != 0 {
+        // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS`.
+        let win32 = unsafe { LsaNtStatusToWinError(status) };
+        assert_eq!(win32, ERROR_FILE_NOT_FOUND, "remove {right}: NTSTATUS {status:#x}");
+    }
+}
+
+/// The local security policy opened for `access`. A failure fails the calling test.
+#[cfg(windows)]
+fn open_policy(access: u32) -> isize {
+    use windows_sys::Win32::Security::Authentication::Identity::{LSA_OBJECT_ATTRIBUTES, LsaOpenPolicy};
+
+    let mut policy: isize = 0;
+    let attributes = LSA_OBJECT_ATTRIBUTES::default();
+    // SAFETY: `attributes` is a valid, zeroed `LSA_OBJECT_ATTRIBUTES`; a null system name is the local one.
+    let status = unsafe { LsaOpenPolicy(std::ptr::null(), &attributes, access, &mut policy) };
+    assert_eq!(status, 0, "open the local security policy: NTSTATUS {status:#x}");
+    policy
+}
+
 /// When Task Scheduler itself says the task `id` runs between `from` and `to`: its `GetRunTimes`, the
 /// oracle the schedule tests compare the cron they translated with.
+///
+/// A disarmed task has no triggers, so there is nothing to ask. Its schedule's triggers are written for
+/// the question with the task's own flag false, which no start can come of (`GetRunTimes` lists a
+/// disabled task's times, M2), and the task is registered again as it was after; an armed task is asked as
+/// it is. A task that logs on with a password is registered again with `GOETIA_SERVICE_PASSWORD`, as the
+/// verbs do, and is [`PasswordRequired`](crate::error::Error::PasswordRequired) without it, before anything is written.
+/// A task whose schedule compiles to no triggers has no run times: the list is empty, and nothing is written.
 #[cfg(windows)]
 pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
     use crate::backend::scm::instance::TaskPath;
-    crate::backend::scm::manager::task::Com.run_times(&TaskPath::of(id), from, to)
+    use crate::backend::scm::manager::task::{Com, TaskApi as _, registration_password, stored_account};
+    use crate::backend::scm::task_xml::{TaskXml, extract_from_data, triggers_of};
+    use crate::error::Error;
+
+    let path = TaskPath::of(id);
+    let registered = Com
+        .get(&path)?
+        .ok_or_else(|| Error::NotInstalled { id: id.to_string() })?;
+    if TaskXml::armed(&registered.xml) {
+        return Com.run_times(&path, from, to);
+    }
+    let blob = extract_from_data(&registered.data)?.ok_or_else(|| Error::blob("the task's `Data` is not goetia's"))?;
+    if triggers_of(&blob.spec)?.is_empty() {
+        return Ok(Vec::new());
+    }
+    let account = stored_account(&registered)?;
+    let password = registration_password(&account)?;
+    let held = TaskXml::with_own_flag(&TaskXml::with_triggers(&registered.xml, &blob.spec)?, false)?;
+    Com.register(&path, &held, &account, password.as_deref(), true)?;
+    let times = Com.run_times(&path, from, to);
+    let back = Com.register(&path, &registered.xml, &account, password.as_deref(), true);
+    match (times, back) {
+        (Ok(times), Ok(_)) => Ok(times),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        // The restore failed too: report the held task, not this.
+        (Err(times), Err(back)) => Err(Error::both_all([back, times]).expect("two errors")),
+    }
+}
+
+/// Starts the task `\Goetia\<id>` through Task Scheduler's own `Run`, and returns once Task Scheduler has
+/// accepted the request: for a test of the shim host as Task Scheduler starts it. A verb of goetia
+/// cannot be used for this, since it pins the run records before it asks for the run. The run's end is
+/// the caller's to wait for.
+#[cfg(windows)]
+pub fn run_task(id: &Id) -> Result<()> {
+    use crate::backend::scm::instance::TaskPath;
+    use crate::backend::scm::manager::task::{Com, TaskApi as _};
+
+    Com.run(&TaskPath::of(id)).map(drop)
+}
+
+/// The removal's marker of the task `id`'s run records, placed as an uninstall or an account change that
+/// began leaves it (`Runs::close`), and taken away when it drops (`Runs::reopen`). Never panics on drop.
+#[cfg(windows)]
+pub struct RemovalMarker(crate::backend::scm::runs::Runs);
+
+#[cfg(windows)]
+impl RemovalMarker {
+    /// Places the marker. Fails when the shared `Goetia\runs` folder is missing, which holds the marker and
+    /// every task's records: there are then no records to protect.
+    pub fn place(id: &Id) -> Result<Self> {
+        use crate::backend::scm::runs::{Closed, Runs};
+
+        let program_data = crate::backend::scm::folder::program_data()?;
+        let runs = Runs::of(&program_data, id);
+        match runs.close()? {
+            Closed::Placed => Ok(Self(runs)),
+            Closed::NoRecords => Err(crate::error::Error::os(
+                "place the removal's marker",
+                std::io::Error::other(format!(
+                    "the folder {} of the run records is missing",
+                    runs.dir().parent().unwrap_or(runs.dir()).display()
+                )),
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RemovalMarker {
+    fn drop(&mut self) {
+        cleanup::warn_left_behind(cleanup::retrying(|| {
+            self.0
+                .reopen()
+                .err()
+                .map(|e| format!("take the removal's marker away: {e}"))
+        }));
+    }
 }
 
 /// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for
@@ -90,6 +268,29 @@ pub fn remove_task(id: &Id) {
 
 #[cfg(windows)]
 pub use crate::backend::scm::shim::acl::{Ace, Dacl, kernel_object_dacl};
+
+/// The DACL of the file or folder `path`, as an install reads one, not following a link at it.
+#[cfg(windows)]
+pub fn file_dacl(path: &std::path::Path) -> Result<Dacl> {
+    let security = crate::backend::scm::shim::acl::read_path(path)?;
+    Ok(Dacl {
+        protected: security.protected,
+        aces: security.dacl,
+    })
+}
+
+/// The binary SID with `authority` as its identifier authority and `subauthorities` after it, as an
+/// [`Ace`] names its trustee.
+#[cfg(windows)]
+pub fn sid_of(authority: u8, subauthorities: &[u32]) -> Vec<u8> {
+    crate::backend::scm::sid::sid_from_parts(authority, subauthorities)
+}
+/// The key of the `Goetia` Event Log source an install registers, under `HKEY_LOCAL_MACHINE`.
+#[cfg(windows)]
+pub const EVENT_SOURCE_KEY: &str = crate::backend::scm::manager::EVENT_SOURCE_KEY;
+/// What an install writes as the source's `TypesSupported`.
+#[cfg(windows)]
+pub const EVENT_TYPES_SUPPORTED: u32 = crate::backend::scm::manager::EVENT_TYPES_SUPPORTED;
 #[cfg(windows)]
 pub use crate::backend::scm::wide::{units_until_nul, wide_null};
 

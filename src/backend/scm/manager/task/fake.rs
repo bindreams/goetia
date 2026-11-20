@@ -37,19 +37,27 @@ pub(crate) enum Call {
 struct Script {
     calls: Vec<Call>,
     unstated: Vec<Call>,
-    get: VecDeque<Result<Option<Registered>>>,
-    names: VecDeque<Result<Vec<String>>>,
-    register: VecDeque<Result<Registration>>,
-    set_enabled: VecDeque<Result<()>>,
-    delete: VecDeque<Result<bool>>,
-    instances: VecDeque<Result<Vec<Instance>>>,
-    info: VecDeque<Result<TaskInfo>>,
-    run: VecDeque<Result<(Started, Option<Effect>)>>,
-    stop: VecDeque<Result<()>>,
+    get: VecDeque<Reply<Option<Registered>>>,
+    names: VecDeque<Reply<Vec<String>>>,
+    register: VecDeque<Reply<Registration>>,
+    set_enabled: VecDeque<Reply<()>>,
+    delete: VecDeque<Reply<bool>>,
+    instances: VecDeque<Reply<Vec<Instance>>>,
+    info: VecDeque<Reply<TaskInfo>>,
+    run: VecDeque<Reply<Started>>,
+    stop: VecDeque<Reply<()>>,
 }
 
-/// What happens in the world while a call is answered: a run that ends, a record the shim writes.
+/// What happens in the world while a call is answered: a run that ends, a record the shim writes, a
+/// marker that is placed.
 type Effect = Box<dyn FnOnce() + Send>;
+
+/// A stated reply, `Ok` or `Err`, and the effect that happens when the call is made, before the reply is
+/// given and whichever it is.
+struct Reply<T> {
+    result: Result<T>,
+    during: Option<Effect>,
+}
 
 /// The test [`TaskApi`]. Clones share one script, so a test keeps a handle after the manager takes one.
 #[derive(Clone, Default)]
@@ -95,65 +103,81 @@ impl Fake {
     }
 
     pub(crate) fn on_get(&self, reply: Result<Option<Registered>>) -> &Self {
-        lock(&self.0).get.push_back(reply);
-        self
+        self.state(|s| &mut s.get, reply, None)
     }
 
     pub(crate) fn on_names(&self, reply: Result<Vec<String>>) -> &Self {
-        lock(&self.0).names.push_back(reply);
-        self
+        self.state(|s| &mut s.names, reply, None)
     }
 
     pub(crate) fn on_register(&self, reply: Result<Registration>) -> &Self {
-        lock(&self.0).register.push_back(reply);
-        self
+        self.state(|s| &mut s.register, reply, None)
     }
 
     pub(crate) fn on_set_enabled(&self, reply: Result<()>) -> &Self {
-        lock(&self.0).set_enabled.push_back(reply);
-        self
+        self.state(|s| &mut s.set_enabled, reply, None)
     }
 
     pub(crate) fn on_delete(&self, reply: Result<bool>) -> &Self {
-        lock(&self.0).delete.push_back(reply);
-        self
+        self.state(|s| &mut s.delete, reply, None)
     }
 
     pub(crate) fn on_instances(&self, reply: Result<Vec<Instance>>) -> &Self {
-        lock(&self.0).instances.push_back(reply);
-        self
+        self.state(|s| &mut s.instances, reply, None)
+    }
+
+    /// [`Self::on_instances`], where `during` happens when the listing is read, before the reply is given:
+    /// what the world does while the scheduler is asked.
+    pub(crate) fn on_instances_during(
+        &self,
+        reply: Result<Vec<Instance>>,
+        during: impl FnOnce() + Send + 'static,
+    ) -> &Self {
+        self.state(|s| &mut s.instances, reply, Some(Box::new(during)))
     }
 
     pub(crate) fn on_info(&self, reply: Result<TaskInfo>) -> &Self {
-        lock(&self.0).info.push_back(reply);
-        self
+        self.state(|s| &mut s.info, reply, None)
     }
 
     pub(crate) fn on_run(&self, reply: Result<Started>) -> &Self {
-        lock(&self.0).run.push_back(reply.map(|started| (started, None)));
-        self
+        self.state(|s| &mut s.run, reply, None)
     }
 
     /// [`Self::on_run`], where `during` happens before the reply is given: what the world does while the
     /// scheduler starts the task.
     pub(crate) fn on_run_during(&self, reply: Result<Started>, during: impl FnOnce() + Send + 'static) -> &Self {
-        lock(&self.0)
-            .run
-            .push_back(reply.map(|started| (started, Some(Box::new(during) as Effect))));
-        self
+        self.state(|s| &mut s.run, reply, Some(Box::new(during)))
     }
 
     pub(crate) fn on_stop(&self, reply: Result<()>) -> &Self {
-        lock(&self.0).stop.push_back(reply);
+        self.state(|s| &mut s.stop, reply, None)
+    }
+
+    /// Queues `result`, with `during` to happen when the call is made, in the queue `queue` names.
+    fn state<T>(
+        &self,
+        queue: impl FnOnce(&mut Script) -> &mut VecDeque<Reply<T>>,
+        result: Result<T>,
+        during: Option<Effect>,
+    ) -> &Self {
+        queue(&mut lock(&self.0)).push_back(Reply { result, during });
         self
     }
 
-    /// Records `call` and takes the next reply `queue` holds, or records it as unstated and panics.
-    fn answer<T>(&self, call: Call, queue: impl FnOnce(&mut Script) -> &mut VecDeque<Result<T>>) -> Result<T> {
+    /// Records `call` and takes the next reply `queue` holds, or records it as unstated and panics. The
+    /// reply's effect happens first, with the script unlocked, whether the reply is `Ok` or `Err`.
+    fn answer<T>(&self, call: Call, queue: impl FnOnce(&mut Script) -> &mut VecDeque<Reply<T>>) -> Result<T> {
         let mut script = lock(&self.0);
         script.calls.push(call.clone());
         match queue(&mut script).pop_front() {
-            Some(reply) => reply,
+            Some(Reply { result, during }) => {
+                drop(script);
+                if let Some(during) = during {
+                    during();
+                }
+                result
+            }
             None => {
                 script.unstated.push(call.clone());
                 drop(script);
@@ -209,11 +233,7 @@ impl TaskApi for Fake {
     }
 
     fn run(&self, path: &TaskPath) -> Result<Started> {
-        let (started, during) = self.answer(Call::Run(path.as_str().to_owned()), |s| &mut s.run)?;
-        if let Some(during) = during {
-            during();
-        }
-        Ok(started)
+        self.answer(Call::Run(path.as_str().to_owned()), |s| &mut s.run)
     }
 
     fn stop(&self, path: &TaskPath, instance: &InstanceId) -> Result<()> {

@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
+use std::error::Error as _;
+
+use super::{BoxError, Error, Occupant, PutBackFound, SharedError, VersionReading};
 use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
 use crate::spec::DaemonKind;
 
@@ -60,7 +62,8 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::RunStateUnknown { id: id() },
         Error::RunUnrecorded {
             id: id(),
-            reason: String::new(),
+            reason: "because".to_string(),
+            source: None,
         },
     ];
     for e in &in_doubt {
@@ -127,7 +130,9 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             detail: String::new(),
             source: None,
         },
-        Error::StartAsManaged {
+        Error::StartJudgedWithoutBlob {
+            id: "x".to_string(),
+            judged_as: crate::spec::Protocol::Native,
             blob: Arc::new(Error::blob(String::new())),
             source: Box::new(not_installed()),
         },
@@ -221,13 +226,140 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
 }
 
 #[skuld::test]
-fn a_start_judged_as_managed_is_indeterminate_when_the_failed_start_is() {
-    let over = |source: Error| Error::StartAsManaged {
+fn a_start_judged_without_its_blob_is_indeterminate_when_the_failed_start_is() {
+    let over = |source: Error| Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob(String::new())),
         source: Box::new(source),
     };
     assert!(over(in_doubt()).is_indeterminate());
     assert!(!over(not_installed()).is_indeterminate());
+}
+
+/// The variants that set an error inside their words and wrap another are wrappers: classification and
+/// `cause` read through them as through a `Step`, and `map_cause` keeps them around the result.
+#[skuld::test]
+fn the_wrappers_that_say_an_error_in_their_words_are_read_through_as_a_step_is() {
+    type Wrap = fn(Error) -> Error;
+    let wrappers: [(&str, Wrap); 5] = [
+        ("StartJudgedWithoutBlob", |source| Error::StartJudgedWithoutBlob {
+            id: "x".to_string(),
+            judged_as: crate::spec::Protocol::Plain,
+            blob: Arc::new(Error::blob("b")),
+            source: Box::new(source),
+        }),
+        ("ProcessExitUnconfirmed", |source| Error::ProcessExitUnconfirmed {
+            id: "x".to_string(),
+            terminate_failed: Arc::new(std::io::Error::other("t")),
+            source: Box::new(source),
+        }),
+        ("ProcessNotHeld", |source| Error::ProcessNotHeld {
+            id: "x".to_string(),
+            hold_failed: std::io::Error::other("o"),
+            source: Box::new(source),
+        }),
+        ("ManagerUnreadAfterOpenRefused", |source| {
+            Error::ManagerUnreadAfterOpenRefused {
+                pid: 7,
+                open_refused: std::io::Error::other("o"),
+                source: Box::new(source),
+            }
+        }),
+        ("OutputAlsoFailed", |source| Error::OutputAlsoFailed {
+            id: "x".to_string(),
+            shown: Box::new(Error::blob("s")),
+            source: Box::new(source),
+        }),
+    ];
+    for (name, over) in wrappers {
+        assert!(over(in_doubt()).is_indeterminate(), "{name}");
+        assert!(!over(not_installed()).is_indeterminate(), "{name}");
+        assert!(
+            matches!(over(not_installed()).cause(), Error::NotInstalled { .. }),
+            "{name}"
+        );
+        let mapped = over(not_installed()).map_cause(|_| in_doubt());
+        assert!(
+            mapped.is_indeterminate(),
+            "{name}: the wrapper stays around the mapped cause"
+        );
+        assert!(mapped.source().is_some(), "{name}");
+    }
+}
+
+/// What a wrapper says inside its words and what it wraps are both found by the one search; a mentioned
+/// error is not.
+#[skuld::test]
+fn the_search_finds_what_a_wrapper_says_in_its_words_and_what_it_wraps_but_not_what_it_mentions() {
+    let named = |name: &'static str| move |e: &Error| matches!(e, Error::Blob { message, .. } if message == name);
+    let blob = |message: &str| Error::blob(message.to_string());
+    let judged = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Plain,
+        blob: Arc::new(blob("said")),
+        source: Box::new(blob("wrapped")),
+    };
+    let output = Error::OutputAlsoFailed {
+        id: "x".to_string(),
+        shown: Box::new(blob("said")),
+        source: Box::new(blob("wrapped")),
+    };
+    for e in [&judged, &output] {
+        assert!(finds_error(e, named("said")), "{e:?}");
+        assert!(finds_error(e, named("wrapped")), "{e:?}");
+    }
+    let unconfirmed = Error::ProcessExitUnconfirmed {
+        id: "x".to_string(),
+        terminate_failed: Arc::new(std::io::Error::from_raw_os_error(6)),
+        source: Box::new(os_code(5)),
+    };
+    assert!(finds_os_code(&unconfirmed, 5), "{unconfirmed:?}");
+    assert!(!finds_os_code(&unconfirmed, 6), "{unconfirmed:?}");
+    let unheld = Error::ProcessNotHeld {
+        id: "x".to_string(),
+        hold_failed: std::io::Error::from_raw_os_error(6),
+        source: Box::new(os_code(5)),
+    };
+    assert!(finds_os_code(&unheld, 5) && finds_os_code(&unheld, 6), "{unheld:?}");
+    let unread = Error::ManagerUnreadAfterOpenRefused {
+        pid: 7,
+        open_refused: std::io::Error::from_raw_os_error(6),
+        source: Box::new(os_code(5)),
+    };
+    assert!(finds_os_code(&unread, 5), "{unread:?}");
+    assert!(!finds_os_code(&unread, 6), "{unread:?}");
+}
+
+/// A run that ended without a recorded exit says why in `reason`, and a failed read of the record is its
+/// `source`, told after it.
+#[skuld::test]
+fn an_unrecorded_run_says_its_reason_and_returns_the_failed_read_as_its_source() {
+    let said = Error::RunUnrecorded {
+        id: "x".to_string(),
+        reason: "why".to_string(),
+        source: None,
+    };
+    assert_eq!(
+        said.to_string(),
+        "the run of `x` ended without recording its exit status: why"
+    );
+    assert!(said.source().is_none());
+
+    let read = Error::RunUnrecorded {
+        id: "x".to_string(),
+        reason: "its record could not be read".to_string(),
+        source: Some(Box::new(Error::blob("unreadable"))),
+    };
+    assert_eq!(
+        read.to_string(),
+        "the run of `x` ended without recording its exit status: its record could not be read"
+    );
+    assert_eq!(
+        read.report().to_string(),
+        "the run of `x` ended without recording its exit status: its record could not be read: blob: unreadable"
+    );
+    assert!(read.is_indeterminate());
 }
 
 #[skuld::test]
@@ -282,6 +414,20 @@ pub(crate) fn os(what: &str, path: &str, cause: &str) -> Error {
         path: Some(PathBuf::from(path)),
         source: std::io::Error::other(cause.to_string()).into(),
     }
+}
+
+/// Whether [`find`](crate::error::find) reaches an [`io::Error`](std::io::Error) of OS code `code` in `e`.
+pub(crate) fn finds_os_code(e: &(dyn std::error::Error + 'static), code: i32) -> bool {
+    crate::error::find(e, &|e| {
+        e.downcast_ref::<std::io::Error>()
+            .filter(|io| io.raw_os_error() == Some(code))
+    })
+    .is_some()
+}
+
+/// Whether [`find`](crate::error::find) reaches a goetia error that satisfies `is` in `e`.
+pub(crate) fn finds_error(e: &(dyn std::error::Error + 'static), is: impl Fn(&Error) -> bool) -> bool {
+    crate::error::find(e, &|e| e.downcast_ref::<Error>().filter(|e| is(e))).is_some()
 }
 
 pub(crate) fn not_installed() -> Error {
@@ -441,7 +587,9 @@ fn step(what: &str, source: Error) -> Error {
 }
 
 fn start_as_managed(source: Error) -> Error {
-    Error::StartAsManaged {
+    Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob("corrupt")),
         source: Box::new(source),
     }
@@ -503,10 +651,10 @@ fn a_kept_error_reads_as_the_error_it_keeps() {
     assert!(undetermined.is_indeterminate());
 }
 
-/// The errors written into a variant's own `Display` are exactly those `sentence` names, so
+/// The errors written into a variant's own `Display` are exactly those `pieces` names, so
 /// `report` can collect their remedies.
 #[skuld::test]
-fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
+fn pieces_name_the_errors_a_variant_writes_into_its_own_text() {
     let inner = || undetermined("re-run as root");
     let loaded = Error::LoadedStateInDoubt {
         id: id(),
@@ -514,19 +662,79 @@ fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
         restore_failed: None,
     };
     fn embedded(e: &Error) -> Option<&Error> {
-        e.sentence().and_then(|s| s.error?.downcast_ref::<Error>())
+        e.pieces()?
+            .errors()
+            .find_map(|(error, _)| error.downcast_ref::<Error>())
     }
     assert!(matches!(embedded(&loaded), Some(Error::Undetermined { .. })));
     assert!(matches!(
         embedded(&start_as_managed(not_installed())),
         Some(Error::Blob { .. })
     ));
-    assert!(matches!(
-        embedded(&Error::Kept(Arc::new(loaded))),
-        Some(Error::Undetermined { .. })
-    ));
-    assert!(not_installed().sentence().is_none());
-    assert!(step("a", inner()).sentence().is_none());
+    // A kept error states no shape of its own: the walks read the error it holds.
+    let kept = Error::Kept(Arc::new(loaded));
+    assert!(kept.pieces().is_none());
+    assert_eq!(kept.report().to_string(), kept.unkept().report().to_string());
+    assert!(kept.report().to_string().ends_with(". re-run as root"));
+    assert!(not_installed().pieces().is_none());
+    assert!(step("a", inner()).pieces().is_none());
+}
+
+/// A variant whose `#[error]` is `Written` renders its pieces, so `pieces` must classify it: none of them
+/// is left unclassified, which would be a `Display` with nothing to write.
+#[skuld::test]
+fn every_variant_written_from_its_pieces_is_classified_and_renders_as_them() {
+    let io = || std::io::Error::other("io");
+    let boxed = |e: Error| Box::new(e);
+    let written = [
+        Error::RawOs { os: io() },
+        Error::Both {
+            first: boxed(not_installed()),
+            then: boxed(not_installed()),
+        },
+        Error::ProcessWaitTimeout {
+            id: "x".to_string(),
+            pid: 1,
+            waited: Duration::ZERO,
+            terminate_failed: Some(Arc::new(io())),
+            recovery: "r".to_string(),
+        },
+        Error::LoadedStateInDoubt {
+            id: "x".to_string(),
+            read_failed: boxed(not_installed()),
+            restore_failed: None,
+        },
+        Error::StaleJobBootedOut {
+            id: "x".to_string(),
+            path: PathBuf::new(),
+            found: Occupant::File,
+        },
+        start_as_managed(not_installed()),
+        Error::ProcessExitUnconfirmed {
+            id: "x".to_string(),
+            terminate_failed: Arc::new(io()),
+            source: boxed(not_installed()),
+        },
+        Error::ProcessNotHeld {
+            id: "x".to_string(),
+            hold_failed: io(),
+            source: boxed(not_installed()),
+        },
+        Error::ManagerUnreadAfterOpenRefused {
+            pid: 7,
+            open_refused: io(),
+            source: boxed(not_installed()),
+        },
+        Error::OutputAlsoFailed {
+            id: "x".to_string(),
+            shown: boxed(not_installed()),
+            source: boxed(not_installed()),
+        },
+    ];
+    for e in &written {
+        let pieces = e.pieces().unwrap_or_else(|| panic!("{e:?} is written from its pieces"));
+        assert_eq!(e.to_string(), pieces.to_string(), "{e:?}");
+    }
 }
 
 /// A kept error answers `stderr` as the error it holds, however deep.
@@ -1148,7 +1356,9 @@ fn report_of_an_account_lookup_ends_in_its_cause_when_it_has_one() {
 
 #[skuld::test]
 fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_failure() {
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob("invalid blob JSON: EOF".to_string())),
         source: Box::new(os("start", "/p", "stopped")),
     };
@@ -1188,7 +1398,9 @@ fn a_failed_read_of_the_installed_host_is_found_under_every_wrapper_and_only_the
         what: "regenerate".to_string(),
         source: Box::new(source),
     };
-    let start = |source: Error| Error::StartAsManaged {
+    let start = |source: Error| Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(Error::blob(String::new())),
         source: Box::new(source),
     };
@@ -1258,13 +1470,147 @@ fn the_os_error_of_an_embedded_error_is_found() {
         read_failed: Box::new(os_code(8)),
         restore_failed: None,
     };
-    let blob_unreadable = Error::StartAsManaged {
+    let blob_unreadable = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(os_code(9)),
         source: Box::new(not_installed()),
     };
 
     assert_eq!(embedded.raw_os_error(), Some(8));
     assert_eq!(blob_unreadable.raw_os_error(), Some(9));
+}
+
+/// A target passes goetia's own error through an `io::Error`, and an OS failure wraps that: the code
+/// the embedded error carries is still found.
+#[skuld::test]
+fn the_os_error_inside_an_error_carried_by_an_io_error_is_found() {
+    let carried = || {
+        std::io::Error::other(Error::LoadedStateInDoubt {
+            id: "x".to_string(),
+            read_failed: Box::new(os_code(8)),
+            restore_failed: None,
+        })
+    };
+
+    assert_eq!(Error::os("read", carried()).raw_os_error(), Some(8));
+    assert_eq!(
+        Error::os("read", crate::error::within("the read", carried())).raw_os_error(),
+        Some(8)
+    );
+    assert_eq!(
+        Error::os("read", std::io::Error::other(not_installed())).raw_os_error(),
+        None
+    );
+}
+
+/// An `io::Error` that carries any error is searched through what it carries: a custom payload's
+/// `source()` is its own, which skips the payload.
+#[skuld::test]
+fn the_os_error_inside_any_payload_of_an_io_error_is_found() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("a payload")]
+    struct Payload(#[source] std::io::Error);
+
+    assert_eq!(
+        Error::os("read", std::io::Error::other(std::io::Error::from_raw_os_error(8))).raw_os_error(),
+        Some(8)
+    );
+    assert_eq!(
+        Error::os(
+            "read",
+            std::io::Error::other(Payload(std::io::Error::from_raw_os_error(8)))
+        )
+        .raw_os_error(),
+        Some(8)
+    );
+    assert_eq!(
+        Error::os("read", std::io::Error::other(Payload(std::io::Error::other("x")))).raw_os_error(),
+        None
+    );
+}
+
+/// A source held as an `Arc<dyn Error>` (what `Blob` and `Invalid` keep) is no obstacle to the search: the
+/// code under it is found, whether the shared error is the `io::Error` or carries one.
+#[skuld::test]
+fn the_os_error_under_a_shared_source_is_found() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("a payload")]
+    struct Payload(#[source] std::io::Error);
+
+    let shared = |e: Payload| -> SharedError { Arc::new(e) };
+    let code = || std::io::Error::from_raw_os_error(8);
+    let blob = |source: SharedError| Error::Blob {
+        message: "m".to_string(),
+        source: Some(source),
+    };
+    let invalid = |source: SharedError| Error::Invalid {
+        daemon: "d".to_string(),
+        message: "m".to_string(),
+        source: Some(source),
+    };
+
+    assert_eq!(blob(Arc::new(code())).raw_os_error(), Some(8));
+    assert_eq!(invalid(Arc::new(code())).raw_os_error(), Some(8));
+    assert_eq!(blob(shared(Payload(code()))).raw_os_error(), Some(8));
+    assert_eq!(invalid(shared(Payload(code()))).raw_os_error(), Some(8));
+    assert_eq!(Error::blob_from("m", code()).raw_os_error(), Some(8));
+    assert_eq!(Error::os("read", shared(Payload(code()))).raw_os_error(), Some(8));
+}
+
+/// The search looks at an error, then at its `source()` chain, then at the errors its own text
+/// embeds as causes.
+#[skuld::test]
+fn the_os_error_of_a_source_is_found_before_that_of_an_embedded_error() {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
+        blob: Arc::new(os_code(9)),
+        source: Box::new(os_code(10)),
+    };
+    assert_eq!(e.raw_os_error(), Some(10));
+}
+
+/// A failed attempt to end a process, which a timeout's text only mentions, is not what the timeout is.
+#[skuld::test]
+fn the_os_error_of_an_error_a_sentence_only_mentions_is_not_found() {
+    let timeout = |terminate_failed| Error::ProcessWaitTimeout {
+        id: "x".to_string(),
+        pid: 1,
+        waited: Duration::ZERO,
+        terminate_failed,
+        recovery: "wait".to_string(),
+    };
+    let failed = Arc::new(std::io::Error::from_raw_os_error(5));
+    assert!(
+        timeout(Some(Arc::clone(&failed)))
+            .to_string()
+            .contains("terminating it failed")
+    );
+    assert_eq!(timeout(Some(failed)).raw_os_error(), None);
+}
+
+/// The denied open of a failed privilege step is the failure's cause, and the step only told after it.
+#[cfg(windows)]
+#[skuld::test]
+fn the_os_error_of_a_denied_open_is_the_opens_and_never_the_steps() {
+    let pair = |primary: std::io::Error, second: std::io::Error| {
+        Error::os("kill", crate::error::debug_privilege_also_failed(primary, second))
+    };
+    let coded = |code| std::io::Error::from_raw_os_error(code);
+    assert_eq!(pair(coded(5), coded(8)).raw_os_error(), Some(5));
+    assert_eq!(pair(std::io::Error::other("no code"), coded(8)).raw_os_error(), None);
+}
+
+/// An `Arc<io::Error>` (how `cosca` shares one) is looked through as the `io::Error` it holds.
+#[skuld::test]
+fn the_os_error_inside_a_shared_io_error_is_found() {
+    let shared = || Arc::new(std::io::Error::from_raw_os_error(8));
+    assert_eq!(Error::os("read", shared()).raw_os_error(), Some(8));
+    assert_eq!(
+        Error::os("read", std::io::Error::other(shared())).raw_os_error(),
+        Some(8)
+    );
 }
 
 #[skuld::test]
@@ -1329,6 +1675,7 @@ fn error_messages_and_exit_class() {
             Error::RunUnrecorded {
                 id: id(),
                 reason: "the journal has no exit".to_string(),
+                source: None,
             },
             "the run of `nightly` ended without recording its exit status: the journal has no exit",
             true,

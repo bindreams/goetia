@@ -11,7 +11,7 @@ use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
-use goetia::testing::service_fields;
+use goetia::testing::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED, service_fields};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
@@ -814,6 +814,158 @@ fn install_twice_is_up_to_date_for_both_kinds(#[fixture(scm_group)] _group: &Gro
     }
 }
 
+/// An install that finds a service up to date still sees that its default log is there: the shim makes no
+/// log, and the message it gives for one that is gone says to install again, so that install makes it.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_makes_a_deleted_default_log_again(#[fixture(scm_group)] _group: &Group) {
+    let mgr = support::stock_shim_manager();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = ServiceSpec::new(ServiceFields {
+        protocol: Protocol::Plain,
+        ..support::base_fields(&id, fixture_command(&id, 1, 1, "plain"))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let log = support::shim_default_log(&support::program_data(), &id);
+    let first = mgr.install(&spec, false).expect("install");
+    assert!(matches!(first, Outcome::Create), "{first:?}");
+    assert!(log.is_file(), "the install made {}", log.display());
+    std::fs::remove_file(&log).unwrap_or_else(|e| panic!("delete {}: {e}", log.display()));
+
+    let again = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(log.is_file(), "the install made {} again", log.display());
+}
+
+/// The `Goetia` event source, which an install registers for its daemons and no daemon's removal takes back. Taken
+/// while it is registered, it puts back what it found when it is dropped, whatever the test did to it.
+pub(crate) struct EventSourceChanged {
+    message_file: String,
+}
+
+impl EventSourceChanged {
+    fn root() -> winreg::RegKey {
+        winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+    }
+
+    pub(crate) fn capture() -> Self {
+        let key = Self::root()
+            .open_subkey_with_flags(EVENT_SOURCE_KEY, KEY_READ)
+            .expect("the event source is registered");
+        Self {
+            message_file: key.get_value("EventMessageFile").expect("read EventMessageFile"),
+        }
+    }
+
+    /// The key as an install leaves it, made if it is gone.
+    fn put_back(&self) -> std::io::Result<()> {
+        let (key, _) = Self::root().create_subkey_with_flags(EVENT_SOURCE_KEY, KEY_READ | KEY_WRITE)?;
+        key.set_value("EventMessageFile", &self.message_file)?;
+        key.set_value("TypesSupported", &EVENT_TYPES_SUPPORTED)
+    }
+
+    /// Damages the source in each way, and after each runs `install`, an install that finds its daemon up to
+    /// date, and requires it to have made the source as an install does.
+    pub(crate) fn assert_made_again_by(&self, mut install: impl FnMut()) {
+        for damage in ["a changed TypesSupported", "a lost key"] {
+            let damaged = if damage == "a lost key" {
+                Self::root().delete_subkey(EVENT_SOURCE_KEY)
+            } else {
+                Self::root()
+                    .open_subkey_with_flags(EVENT_SOURCE_KEY, KEY_WRITE)
+                    .and_then(|key| key.set_value("TypesSupported", &0u32))
+            };
+            damaged.unwrap_or_else(|e| panic!("damage the event source ({damage}): {e}"));
+
+            install();
+
+            let key = Self::root()
+                .open_subkey_with_flags(EVENT_SOURCE_KEY, KEY_READ)
+                .unwrap_or_else(|e| panic!("{damage}: the install did not make {EVENT_SOURCE_KEY}: {e}"));
+            assert_eq!(
+                key.get_value::<String, _>("EventMessageFile").ok().as_deref(),
+                Some(self.message_file.as_str()),
+                "{damage}: EventMessageFile"
+            );
+            assert_eq!(
+                key.get_value::<u32, _>("TypesSupported").ok(),
+                Some(EVENT_TYPES_SUPPORTED),
+                "{damage}: TypesSupported"
+            );
+        }
+    }
+}
+
+impl Drop for EventSourceChanged {
+    /// Never panics, so a drop that runs while the test unwinds still goes on.
+    fn drop(&mut self) {
+        support::cleanup::warn_left_behind(support::cleanup::retrying(|| {
+            self.put_back()
+                .err()
+                .map(|e| format!("put back {EVENT_SOURCE_KEY}: {e}"))
+        }));
+    }
+}
+
+/// An install that finds a service up to date still registers the `Goetia` event source, restoring a changed or
+/// missing key. Serial: every install writes that key.
+#[skuld::test(serial)]
+fn an_up_to_date_install_registers_the_event_source_again(#[fixture(scm_group)] _group: &Group) {
+    let mgr = support::stock_shim_manager();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = ServiceSpec::new(ServiceFields {
+        protocol: Protocol::Plain,
+        ..support::base_fields(&id, fixture_command(&id, 1, 1, "plain"))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let first = mgr.install(&spec, false).expect("install");
+    assert!(matches!(first, Outcome::Create), "{first:?}");
+
+    EventSourceChanged::capture().assert_made_again_by(|| {
+        let again = mgr.install(&spec, false).expect("install again");
+        assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    });
+}
+
+/// A `logs:` in goetia's log folder is refused at install, whether it names this daemon's default log, which
+/// is not there yet on a first install, or another daemon's: a service account cannot make a file in the
+/// folder, and a SYSTEM service would append to another daemon's log. Nothing is installed.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_logs_in_goetias_log_folder_is_refused_at_install(#[fixture(scm_group)] _group: &Group) {
+    let mgr = support::stock_shim_manager();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    for named in [id.as_str(), "another-daemon"] {
+        let logs = support::shim_default_log(&support::program_data(), named);
+        let base = support::base_fields(&id, fixture_command(&id, 1, 1, "plain"));
+        let spec = ServiceSpec::new(ServiceFields {
+            common: DaemonFields {
+                logs: Some(logs),
+                ..base.common
+            },
+            protocol: Protocol::Plain,
+            ..base
+        })
+        .map(DaemonSpec::from)
+        .unwrap();
+
+        let refused = mgr.install(&spec, false).expect_err("a `logs:` in the logs folder");
+
+        let said = refused.report().to_string();
+        assert!(said.contains("is inside goetia's own log folder"), "{named}: {said}");
+        assert!(said.contains("remove `logs:`"), "{named}: {said}");
+        let absent = mgr.status(&id_of(&id)).expect_err("nothing was installed");
+        assert!(
+            matches!(absent.cause(), goetia::Error::NotInstalled { .. }),
+            "{named}: {absent:?}"
+        );
+    }
+}
+
 /// goetia owns `Parameters` whole: `install --force` removes a stray value and a subkey, and a
 /// marker stored in another case is still ours, so the service reads as unchanged afterwards.
 #[skuld::test]
@@ -1167,6 +1319,42 @@ fn real_account_gets_service_logon_right(#[fixture(scm_group)] _group: &Group) {
     let status = mgr.status(&target).expect("status");
     assert_eq!(status.common().state, State::Running);
     let _ = mgr.stop(&target, Budget::DEFAULT);
+}
+
+/// An install that finds a real user's service up to date reads no password and still grants the account
+/// `SeServiceLogonRight`, which a start under it needs.
+#[skuld::test]
+fn an_up_to_date_install_of_a_real_users_service_needs_no_password_and_grants_the_service_right(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let user = support::LocalUserGuard::create_random();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    // A child makes each install, as `real_account_gets_service_logon_right` does: the variable is the child's own.
+    let install = |password: Option<&str>| {
+        let mut child = Command::new(support::current_exe_str());
+        child.arg(INSTALL_AS).arg(&id).arg(format!(r".\{}", user.name()));
+        match password {
+            Some(password) => child.env("GOETIA_SERVICE_PASSWORD", password),
+            None => child.env_remove("GOETIA_SERVICE_PASSWORD"),
+        };
+        let output = child.output().expect("spawn the install-as-account helper");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "install failed: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    install(Some(support::LocalUserGuard::PASSWORD));
+    user.revoke("SeServiceLogonRight");
+    assert!(!user.holds("SeServiceLogonRight"), "the right is taken away");
+
+    let again = install(None);
+
+    assert!(again.starts_with("OK UpToDate"), "{again}");
+    assert!(user.holds("SeServiceLogonRight"), "the install granted the right again");
 }
 
 // Step 8: built-in service accounts install and run without a password or a logon-right grant =========================

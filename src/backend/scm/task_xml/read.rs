@@ -1,5 +1,6 @@
-//! Reading a task's XML as Task Scheduler stores it: the definition ([`TaskXml::parse`]) and the
-//! armed state, which is the triggers' `Enabled` flags ([`TaskXml::armed`], [`TaskXml::with_armed`]).
+//! Reading a task's XML as Task Scheduler stores it: the definition ([`TaskXml::parse`]), the armed
+//! state, which is whether it has a trigger that is switched on ([`TaskXml::armed`]), and the edits of
+//! the stored XML that arm and disarm it.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -9,13 +10,15 @@ use cosca::quote::windows::split_wide;
 use roxmltree::{Document, Node};
 
 use super::{
-    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, TASK_MODE_ARG, TaskXml, WEEKDAYS, account_of, extract_from_data,
+    MONTHS, NEVER_AT, SETTINGS, START_DATE, Scope, Stored, TASK_MODE_ARG, TaskXml, Token, WEEKDAYS, account_of, ending,
+    extract_from_data, triggers_of, triggers_xml,
 };
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::triggers::{Repeat, Trigger};
 use crate::error::Error;
+use crate::manager::flow::NOTHING_TO_ARM;
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Id};
+use crate::spec::{DaemonSpec, Id, invalid};
 
 impl TaskXml {
     /// The definition of the installed task whose XML is `xml` and whose `Data` is `data`
@@ -25,8 +28,9 @@ impl TaskXml {
     /// rewrites a name to a SID. The settings are read, an element Task Scheduler dropped as its
     /// default read as that default, so a hand edit of one shows as a difference. A trigger or an
     /// action goetia does not write is kept as text in the definition, so that it shows as a
-    /// difference too. An element goetia does not own (`URI`, `UseUnifiedSchedulingEngine`, ...) is
-    /// ignored.
+    /// difference too. A task with no trigger is a disarmed one, and its triggers are the ones its
+    /// blob's schedule compiles to. An element goetia does not own (`URI`, `UseUnifiedSchedulingEngine`,
+    /// ...) is ignored.
     ///
     /// An error: `data` is not a task's blob, the XML is not well-formed, or it has no `Exec` action.
     pub(crate) fn parse(xml: &str, data: &str) -> Result<TaskXml, Error> {
@@ -57,18 +61,19 @@ impl TaskXml {
             .collect();
 
         let mut unrecognised = Vec::new();
-        let triggers = child(root, "Triggers")
-            .map(|triggers| {
-                let mut read = Vec::new();
-                for node in elements(triggers) {
-                    match trigger_of(node) {
-                        Some(trigger) => read.push(trigger),
-                        None => unrecognised.push(squashed(node)),
-                    }
+        let stored: Vec<Node<'_, '_>> = child(root, "Triggers").into_iter().flat_map(elements).collect();
+        let triggers = if stored.is_empty() {
+            triggers_of(&blob.spec)?
+        } else {
+            let mut read = Vec::new();
+            for node in stored {
+                match trigger_of(node) {
+                    Some(trigger) => read.push(trigger),
+                    None => unrecognised.push(squashed(node)),
                 }
-                read
-            })
-            .unwrap_or_default();
+            }
+            read
+        };
         let host = action_of(root, &common.id, &mut unrecognised)?;
 
         Ok(TaskXml {
@@ -85,21 +90,28 @@ impl TaskXml {
 
     /// The account `xml`'s principal names, for registering the task again when its blob cannot say
     /// (see [`TaskXml::parse`], which reads it from the blob): a password logon is a user's, any other
-    /// a service account's. The name is as Task Scheduler stores it, usually a SID.
-    pub(crate) fn principal(xml: &str) -> Result<TaskAccount, Error> {
+    /// a service account's. The name is as Task Scheduler stores it, usually a SID. `None` when the XML
+    /// names no principal; an error only for XML that cannot be read.
+    pub(crate) fn principal(xml: &str) -> Result<Option<TaskAccount>, Error> {
+        Ok(principal_in(&document(xml)?))
+    }
+
+    /// The token the first action's arguments end with (`... --goetia-task <id> <token>`), the
+    /// registration's own, for the task `id`. `None` when they end with no goetia ending for `id`
+    /// ([`ending_of`]: a hand edit, another task's, or a malformed token). An error only for XML that
+    /// cannot be read.
+    pub(crate) fn token_of(xml: &str, id: &str) -> Result<Option<Token>, Error> {
+        Ok(token_in(&document(xml)?, id))
+    }
+
+    /// What the stored `xml` of the task `id` says of its registration, from one parse: [`TaskXml::principal`],
+    /// [`TaskXml::armed`] and [`TaskXml::token_of`]. An error only for XML that cannot be read.
+    pub(crate) fn stored(xml: &str, id: &str) -> Result<Stored, Error> {
         let document = document(xml)?;
-        let principal = child(document.root_element(), "Principals")
-            .and_then(|principals| child(principals, "Principal"))
-            .and_then(|principal| child(principal, "UserId").map(|user| (principal, text(user))))
-            .filter(|(_, user)| !user.is_empty());
-        let Some((principal, user)) = principal else {
-            return Err(Error::blob("the task's XML names no principal"));
-        };
-        let password = child(principal, "LogonType").is_some_and(|logon| text(logon).eq_ignore_ascii_case("Password"));
-        Ok(if password {
-            TaskAccount::User(user)
-        } else {
-            TaskAccount::Service(user)
+        Ok(Stored {
+            principal: principal_in(&document),
+            armed: armed_in(&document),
+            token: token_in(&document, id),
         })
     }
 
@@ -116,98 +128,136 @@ impl TaskXml {
             .collect())
     }
 
-    /// Whether every trigger of `xml` is enabled, and the task itself is (`Settings/Enabled`, which
-    /// Task Scheduler leaves out while it is true): a task that is not enabled is started by nothing.
-    /// A task with no trigger is not armed, and neither is XML that cannot be read.
+    /// Whether `xml` has a trigger whose own flag is true or absent and the task is itself enabled
+    /// (`Settings/Enabled`, which Task Scheduler leaves out while it is true). XML that cannot be read is
+    /// not armed.
     pub(crate) fn armed(xml: &str) -> bool {
-        let Ok(document) = document(xml) else {
-            return false;
-        };
-        if !own_flag_is_true(document.root_element()) {
-            return false;
-        }
-        let Some(triggers) = child(document.root_element(), "Triggers") else {
-            return false;
-        };
-        let mut any = false;
-        for trigger in elements(triggers) {
-            any = true;
-            if !enabled(trigger) {
-                return false;
-            }
-        }
-        any
+        document(xml).is_ok_and(|document| armed_in(&document))
     }
 
-    /// `xml` with every trigger's `Enabled` flag set to `armed`, and nothing else changed but the
-    /// task's own flag: a hand edit elsewhere in the task is kept. A flag Task Scheduler dropped (an
-    /// enabled trigger) is written when `armed` is false, and left out when it is true.
+    /// Whether `xml` holds a trigger whose own flag is true or absent. XML that cannot be read holds none.
+    pub(crate) fn has_triggers(xml: &str) -> bool {
+        document(xml).is_ok_and(|document| has_triggers(&document))
+    }
+
+    /// `xml` with its triggers taken out (the `Triggers` element, empty or not, a hand-added trigger
+    /// among them) and nothing else changed but the task's own flag: a hand edit elsewhere in the
+    /// task is kept. This is what `disable` registers; the next `enable` writes the spec's triggers.
     ///
-    /// **The task's own flag (`Settings/Enabled`) is set true in both directions,** where it is stated:
-    /// an `uninstall` that did not finish leaves it false, and `enable` and `disable` both make the task
-    /// one that can be started again, `disable` with its triggers disabled. One that states none is
-    /// enabled already.
-    pub(crate) fn with_armed(xml: &str, armed: bool) -> Result<String, Error> {
+    /// **The task's own flag (`Settings/Enabled`) is set true,** where it is stated: an `uninstall`
+    /// that did not finish leaves it false, and `enable` and `disable` both make the task one that can
+    /// be started again. One that states none is enabled already.
+    pub(crate) fn without_triggers(xml: &str) -> Result<String, Error> {
         let document = document(xml)?;
-        let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-        if let Some(flag) = child(document.root_element(), "Settings").and_then(|settings| child(settings, "Enabled")) {
-            edits.push(match flag.first_child().filter(Node::is_text) {
-                Some(value) => (value.range(), "true".to_owned()),
-                None => (flag.range(), "<Enabled>true</Enabled>".to_owned()),
-            });
+        let mut edits = own_flag_edit(&document, true)?;
+        if let Some(triggers) = child(document.root_element(), "Triggers") {
+            edits.push((triggers.range(), String::new()));
         }
-        for trigger in child(document.root_element(), "Triggers")
-            .into_iter()
-            .flat_map(elements)
-        {
-            match child(trigger, "Enabled") {
-                Some(flag) => edits.push(match flag.first_child().filter(Node::is_text) {
-                    Some(value) => (value.range(), armed.to_string()),
-                    None => (flag.range(), format!("<Enabled>{armed}</Enabled>")),
-                }),
-                None if !armed => edits.push(insert_flag(xml, trigger)),
-                None => {}
+        Ok(edited(xml, edits))
+    }
+
+    /// `xml` with the task's own flag set to `flag` and nothing else changed: the triggers it holds are
+    /// kept. A true flag is set where it is stated (one that states none is enabled already), a false
+    /// one is stated. `enable` registers a task that has triggers so, with `true`.
+    pub(crate) fn with_own_flag(xml: &str, flag: bool) -> Result<String, Error> {
+        let document = document(xml)?;
+        Ok(edited(xml, own_flag_edit(&document, flag)?))
+    }
+
+    /// `xml` with the triggers `spec`'s schedule compiles to in place of any it holds (an empty
+    /// `Triggers` element is replaced), before `Actions` when it holds none, and nothing else
+    /// changed but the task's own flag, which is set true as [`TaskXml::without_triggers`] sets it.
+    /// This is what `enable` registers for a task that has none: the blob names the schedule. A spec
+    /// with no schedule has nothing to arm ([`Error::Invalid`]), and a service's is no task's
+    /// ([`Error::Blob`]).
+    pub(crate) fn with_triggers(xml: &str, spec: &DaemonSpec) -> Result<String, Error> {
+        let triggers = triggers_of(spec)?;
+        if triggers.is_empty() {
+            return Err(invalid(&spec.common().id, NOTHING_TO_ARM));
+        }
+        let text = triggers_xml(&triggers);
+        let document = document(xml)?;
+        let mut edits = own_flag_edit(&document, true)?;
+        edits.push(match child(document.root_element(), "Triggers") {
+            Some(stored) => (stored.range(), text),
+            None => {
+                let actions =
+                    child(document.root_element(), "Actions").ok_or_else(|| Error::blob("the task has no actions"))?;
+                let at = actions.range().start;
+                (at..at, text)
             }
-        }
-        // From the end, so that an edit does not move the ones before it.
-        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-        let mut out = xml.to_owned();
-        for (range, text) in edits {
-            out.replace_range(range, &text);
-        }
-        Ok(out)
+        });
+        Ok(edited(xml, edits))
     }
 }
 
-/// The edit that gives `trigger`, which states no `Enabled`, the flag `false`: after its boundary
-/// when it has one, otherwise first among its children, or as its only child when it has none (a
-/// self-closing element is opened for it). Any trigger type, one goetia did not write included,
-/// takes it: Task Scheduler's own readbacks place a trigger's common children in different orders.
-fn insert_flag(xml: &str, trigger: Node<'_, '_>) -> (Range<usize>, String) {
+fn principal_in(document: &Document<'_>) -> Option<TaskAccount> {
+    let (principal, user) = child(document.root_element(), "Principals")
+        .and_then(|principals| child(principals, "Principal"))
+        .and_then(|principal| child(principal, "UserId").map(|user| (principal, text(user))))
+        .filter(|(_, user)| !user.is_empty())?;
+    let password = child(principal, "LogonType").is_some_and(|logon| text(logon).eq_ignore_ascii_case("Password"));
+    Some(if password {
+        TaskAccount::User(user)
+    } else {
+        TaskAccount::Service(user)
+    })
+}
+
+fn token_in(document: &Document<'_>, id: &str) -> Option<Token> {
+    let arguments = child(document.root_element(), "Actions")
+        .and_then(|actions| elements(actions).next())
+        .filter(|action| action.tag_name().name() == "Exec")
+        .and_then(|exec| child(exec, "Arguments"))
+        .map(text)
+        .unwrap_or_default();
+    ending_of(&split_arguments(&arguments), id)
+}
+
+fn armed_in(document: &Document<'_>) -> bool {
+    own_flag_is_true(document.root_element()) && has_triggers(document)
+}
+
+/// The edit that sets the task's own flag to `value`: first among the `Settings`. None for a true flag
+/// that is not stated (that is the default).
+fn own_flag_edit(document: &Document<'_>, value: bool) -> Result<Vec<(Range<usize>, String)>, Error> {
+    let settings = child(document.root_element(), "Settings");
+    if let Some(flag) = settings.and_then(|settings| child(settings, "Enabled")) {
+        return Ok(vec![match flag.first_child().filter(Node::is_text) {
+            Some(text) => (text.range(), value.to_string()),
+            None => (flag.range(), format!("<Enabled>{value}</Enabled>")),
+        }]);
+    }
+    if value {
+        return Ok(Vec::new());
+    }
     let flag = "<Enabled>false</Enabled>";
-    if let Some(boundary) = ["EndBoundary", "StartBoundary"]
-        .into_iter()
-        .find_map(|name| child(trigger, name))
-    {
-        let end = boundary.range().end;
-        return (end..end, flag.to_owned());
-    }
-    if let Some(first) = trigger.first_child() {
-        let start = first.range().start;
-        return (start..start, flag.to_owned());
-    }
-    let range = trigger.range();
-    let source = &xml[range.clone()];
-    match source.strip_suffix("/>") {
-        Some(open) => {
-            let name = &source[1..][..source[1..].find(|c: char| c.is_whitespace() || c == '/').unwrap_or(0)];
-            (range, format!("{}>{flag}</{name}>", open.trim_end()))
-        }
+    Ok(vec![match settings {
+        Some(settings) => match settings.first_child() {
+            Some(first) => {
+                let at = first.range().start;
+                (at..at, flag.to_owned())
+            }
+            None => (settings.range(), format!("<Settings>{flag}</Settings>")),
+        },
         None => {
-            let close = range.start + source.rfind("</").unwrap_or(source.len());
-            (close..close, flag.to_owned())
+            let actions =
+                child(document.root_element(), "Actions").ok_or_else(|| Error::blob("the task has no actions"))?;
+            let at = actions.range().start;
+            (at..at, format!("<Settings>{flag}</Settings>"))
         }
+    }])
+}
+
+/// `xml` with `edits` made, each a range of `xml` and its replacement.
+fn edited(xml: &str, mut edits: Vec<(Range<usize>, String)>) -> String {
+    // From the end, so that an edit does not move the ones before it.
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut out = xml.to_owned();
+    for (range, text) in edits {
+        out.replace_range(range, &text);
     }
+    out
 }
 
 // The document --------------------------------------------------------------------------------------------------------
@@ -245,8 +295,10 @@ fn only(node: Node<'_, '_>, allowed: &[&str]) -> Option<()> {
         .then_some(())
 }
 
-fn enabled(trigger: Node<'_, '_>) -> bool {
-    flag_is_true(child(trigger, "Enabled"))
+/// Whether the document holds a trigger that is not switched off (its own `Enabled`, as `trigger_of` reads it).
+fn has_triggers(document: &Document<'_>) -> bool {
+    child(document.root_element(), "Triggers")
+        .is_some_and(|triggers| elements(triggers).any(|trigger| flag_is_true(child(trigger, "Enabled"))))
 }
 
 /// Whether the task's own flag, `Settings/Enabled`, is true: it is when Task Scheduler states none.
@@ -280,15 +332,23 @@ fn action_of(root: Node<'_, '_>, id: &Id, unrecognised: &mut Vec<String>) -> Res
     }
 
     let mut args = split_arguments(&child(exec, "Arguments").map(text).unwrap_or_default());
-    if args.ends_with(&[TASK_MODE_ARG.to_owned(), id.as_str().to_owned()]) {
-        args.truncate(args.len() - 2);
+    if ending_of(&args, id.as_str()).is_some() {
+        args.truncate(args.len() - 3);
     } else {
-        unrecognised.push(format!("Arguments do not end with {TASK_MODE_ARG} {id}"));
+        unrecognised.push(format!("Arguments do not end with {TASK_MODE_ARG} {id} <token>"));
     }
     Ok(HostCommand {
         exe: PathBuf::from(text(command)),
         args,
     })
+}
+
+/// The token of the [`ending`] `args` have for the task `id`; `None` for no ending, another task's, or a
+/// last argument that is no token. An action whose ending is not this is not what an install writes.
+fn ending_of(args: &[String], id: &str) -> Option<Token> {
+    ending(args)
+        .filter(|(named, _)| *named == id)
+        .and_then(|(_, token)| token)
 }
 
 /// The arguments of an `Arguments` text, as `CommandLineToArgvW` reads them after the program.
@@ -306,6 +366,8 @@ fn split_arguments(arguments: &str) -> Vec<String> {
 
 /// The [`Trigger`] goetia writes that `node` is, or `None` for any other trigger.
 fn trigger_of(node: Node<'_, '_>) -> Option<Trigger> {
+    // A trigger that is switched off is not what goetia writes: an install writes the desired one over it.
+    flag_is_true(child(node, "Enabled")).then_some(())?;
     match node.tag_name().name() {
         "TimeTrigger" => {
             only(node, &["StartBoundary", "Enabled"])?;

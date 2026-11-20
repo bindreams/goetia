@@ -8,15 +8,25 @@
 //! `UseUnifiedSchedulingEngine`, and rewrites the principal's account to a SID. So a readback is a
 //! [`TaskXml`] built from the elements goetia owns, with a dropped one read as its default, and the
 //! account is the blob's, never the principal's. [`Display`](fmt::Display) is the definition's
-//! canonical text: the same for what is generated and what is read back, and with no armed state,
-//! which is the triggers' `Enabled` flags ([`TaskXml::armed`], [`TaskXml::with_armed`]).
+//! canonical text: the same for what is generated and what is read back, with no registration
+//! [`Token`] ([`TaskXml::token_of`]).
+//!
+//! **A task is armed when it has triggers that are switched on** ([`TaskXml::armed`]; its own
+//! `Settings/Enabled` stays true, since Task Scheduler refuses a `Run` of a task whose own flag is false).
+//! A disarmed task has none: disabling a trigger would leave a repetition in progress firing, and
+//! removing the triggers stops it. So [`TaskXml::to_xml`] writes the triggers only for an armed task, and
+//! what is read back of a task with none is the definition it would arm: the triggers its blob's
+//! schedule compiles to. The edits of the stored XML:
+//! - `disable`: [`TaskXml::without_triggers`];
+//! - `enable`, no trigger on: [`TaskXml::with_triggers`];
+//! - `enable`, a trigger on: [`TaskXml::with_own_flag`].
 
 use std::collections::BTreeSet;
 use std::fmt;
 
 use cosca::quote::windows::join_wide;
 
-use crate::backend::scm::instance::TaskAccount;
+use crate::backend::scm::instance::{TaskAccount, bytes_of_hex, hex_of};
 use crate::backend::scm::triggers::{Repeat, Trigger, compile};
 use crate::backend::xml_escape;
 use crate::blob::{self, Blob};
@@ -27,8 +37,57 @@ use crate::spec::{AccountId, Builtin, DaemonSpec, Id, User, invalid, windows_bui
 mod read;
 
 /// The argument that makes the shim run as a task: the action's arguments are the host's own, then
-/// this and the task's id.
+/// this, the task's id and the registration's [`Token`].
 pub(crate) const TASK_MODE_ARG: &str = "--goetia-task";
+
+/// What tells one registration of a task from another: the last argument of its action. Not part of a
+/// [`TaskXml`], which an install compares by definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Token([u8; 16]);
+
+impl Token {
+    /// 128 random bits.
+    pub(crate) fn fresh() -> Token {
+        Token(rand::random::<u128>().to_be_bytes())
+    }
+
+    /// `text` as a token: exactly 32 hex digits, of either case.
+    pub(crate) fn parse(text: &str) -> Option<Token> {
+        bytes_of_hex(text).map(Token)
+    }
+
+    /// The 32 lower-case hex digits the action's arguments end with.
+    pub(crate) fn hex(&self) -> String {
+        hex_of(&self.0)
+    }
+}
+
+/// The task-mode ending of `args`, the arguments after the program: [`TASK_MODE_ARG`], a task's id and,
+/// last, the registration's token, which is `None` when absent or not a [`Token`]. What an install writes
+/// (`args` of the stored XML) and what Task Scheduler passes the shim (its argv) are read by this one
+/// matcher. `None` when `args` end otherwise.
+pub(crate) fn ending<S: AsRef<str>>(args: &[S]) -> Option<(&str, Option<Token>)> {
+    let tail = |n: usize| args.len().checked_sub(n).map(|from| &args[from..]);
+    match (tail(3), tail(2)) {
+        (Some([flag, id, last]), _) if flag.as_ref() == TASK_MODE_ARG => {
+            Some((id.as_ref(), Token::parse(last.as_ref())))
+        }
+        (_, Some([flag, id])) if flag.as_ref() == TASK_MODE_ARG => Some((id.as_ref(), None)),
+        _ => None,
+    }
+}
+
+/// What the stored XML of a task says of its registration ([`TaskXml::stored`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Stored {
+    /// The account its principal names ([`TaskXml::principal`]).
+    pub principal: Option<TaskAccount>,
+    /// Whether it is armed ([`TaskXml::armed`]).
+    pub armed: bool,
+    /// The token its arguments end with, `None` when they end with no goetia ending for the task
+    /// ([`TaskXml::token_of`]).
+    pub token: Option<Token>,
+}
 
 /// Where a schedule that never fires is anchored: a one-time trigger at a fixed past instant fires
 /// nothing at registration or when it is enabled, and reads no next run.
@@ -99,7 +158,8 @@ const fn setting(scope: Scope, name: &'static str, value: &'static str, absent: 
 }
 
 /// The settings of a task: no run is bounded in time, a run that is alive makes a new start a no-op,
-/// a missed start runs when the machine is back, and the battery, idle, network and wake flags are
+/// a start missed while the machine was off runs when it is back (one that came due while the task was
+/// disarmed is not made up), and the battery, idle, network and wake flags are
 /// off. `Priority` 5 gives the normal class a service runs at; the default 7 is below normal.
 const SETTINGS: [Setting; 16] = [
     setting(Scope::Principal, "RunLevel", "HighestAvailable", "LeastPrivilege"),
@@ -123,7 +183,7 @@ const SETTINGS: [Setting; 16] = [
 // TaskXml =============================================================================================================
 
 /// What goetia registers for a task, or reads back of one: the action, the account, the triggers,
-/// the settings and the blob. It has no armed state: see [`TaskXml::to_xml`].
+/// the settings and the blob. Whether the task is armed is no part of it: see [`TaskXml::to_xml`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskXml {
     id: Id,
@@ -151,16 +211,10 @@ impl TaskXml {
     ///
     /// The account is read from the spec alone, so that a readback can say the same.
     pub(crate) fn new(spec: &DaemonSpec, host: HostCommand) -> Result<TaskXml, Error> {
-        let DaemonSpec::Task(task) = spec else {
-            unreachable!("a service is not a task: `registration` matches the spec once")
-        };
         let common = spec.common();
         let account = account_of(&common.id, &common.user)?;
         refuse_percent(&common.id, &host)?;
-        let triggers = match &task.schedule {
-            Some(schedule) => compile(schedule, &common.id)?,
-            None => Vec::new(),
-        };
+        let triggers = triggers_of(spec)?;
         Ok(TaskXml {
             id: common.id.clone(),
             name: common.name.clone(),
@@ -183,9 +237,10 @@ impl TaskXml {
         self.account.clone()
     }
 
-    /// The XML to register. `armed` is every trigger's `Enabled` flag, written explicitly; it is
-    /// the installation's state and no part of the definition.
-    pub(crate) fn to_xml(&self, armed: bool) -> String {
+    /// The XML to register. The triggers are written only when `armed`, which is the installation's
+    /// state and no part of the definition: an install over a disarmed task keeps it without any.
+    /// `token` is the registration's, the action's last argument.
+    pub(crate) fn to_xml(&self, armed: bool, token: &Token) -> String {
         let mut out = String::new();
         out.push_str("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n");
         out.push_str("<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">");
@@ -204,17 +259,13 @@ impl TaskXml {
         ));
         out.push_str(&self.settings_xml());
         out.push_str(&format!("<Data>{}</Data>", xml_escape(&self.data)));
-        if !self.triggers.is_empty() {
-            out.push_str("<Triggers>");
-            for trigger in &self.triggers {
-                out.push_str(&trigger_xml(trigger, armed));
-            }
-            out.push_str("</Triggers>");
+        if armed {
+            out.push_str(&triggers_xml(&self.triggers));
         }
         out.push_str(&format!(
             "<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>",
             xml_escape(&self.host.exe.to_string_lossy()),
-            xml_escape(&self.arguments())
+            xml_escape(&self.arguments(token))
         ));
         out.push_str("</Task>");
         out
@@ -259,15 +310,15 @@ impl TaskXml {
         out
     }
 
-    /// The action's `Arguments`: the host's, the task-mode argument and the id, quoted as
+    /// The action's `Arguments`: the host's, the task-mode argument, the id and the token, quoted as
     /// `CommandLineToArgvW` reads them back (they arrive verbatim after the quoted command).
-    fn arguments(&self) -> String {
+    fn arguments(&self, token: &Token) -> String {
         let wide: Vec<Vec<u16>> = self
             .host
             .args
             .iter()
             .map(String::as_str)
-            .chain([TASK_MODE_ARG, self.id.as_str()])
+            .chain([TASK_MODE_ARG, self.id.as_str(), token.hex().as_str()])
             .map(|arg| arg.encode_utf16().collect())
             .collect();
         let borrowed: Vec<&[u16]> = wide.iter().map(Vec::as_slice).collect();
@@ -276,6 +327,15 @@ impl TaskXml {
 }
 
 // The account ---------------------------------------------------------------------------------------------------------
+
+/// The SID text of a well-known account, as Task Scheduler reads it back.
+pub(in crate::backend::scm) fn builtin_sid(builtin: Builtin) -> &'static str {
+    match builtin {
+        Builtin::LocalSystem => SYSTEM,
+        Builtin::LocalService => LOCAL_SERVICE,
+        Builtin::NetworkService => NETWORK_SERVICE,
+    }
+}
 
 /// The account a task runs as, from the spec's user. Well-known accounts are named by SID, as Task
 /// Scheduler reads them back.
@@ -291,9 +351,7 @@ fn account_of(id: &Id, user: &User) -> Result<TaskAccount, Error> {
         }
     };
     let sid = match windows_builtin(name) {
-        Some(Builtin::LocalSystem) => Some(SYSTEM),
-        Some(Builtin::LocalService) => Some(LOCAL_SERVICE),
-        Some(Builtin::NetworkService) => Some(NETWORK_SERVICE),
+        Some(builtin) => Some(builtin_sid(builtin)),
         None => [SYSTEM, LOCAL_SERVICE, NETWORK_SERVICE]
             .into_iter()
             .find(|sid| sid.eq_ignore_ascii_case(name)),
@@ -346,11 +404,33 @@ fn refuse_percent(id: &Id, host: &HostCommand) -> Result<(), Error> {
 
 // The triggers --------------------------------------------------------------------------------------------------------
 
-fn trigger_xml(trigger: &Trigger, armed: bool) -> String {
-    let flag = format!("<Enabled>{armed}</Enabled>");
+/// The triggers `spec`'s schedule compiles to: none for a task with no schedule.
+pub(crate) fn triggers_of(spec: &DaemonSpec) -> Result<Vec<Trigger>, Error> {
+    let DaemonSpec::Task(task) = spec else {
+        return Err(Error::blob(format!(
+            "`{}` is a service, not a task, so it has no triggers",
+            spec.common().id
+        )));
+    };
+    match &task.schedule {
+        Some(schedule) => compile(schedule, &spec.common().id),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The `Triggers` element of `triggers`, empty text for none.
+fn triggers_xml(triggers: &[Trigger]) -> String {
+    if triggers.is_empty() {
+        return String::new();
+    }
+    let inner: String = triggers.iter().map(trigger_xml).collect();
+    format!("<Triggers>{inner}</Triggers>")
+}
+
+fn trigger_xml(trigger: &Trigger) -> String {
     let (at, repeat, schedule) = match trigger {
         Trigger::Never => {
-            return format!("<TimeTrigger><StartBoundary>{NEVER_AT}</StartBoundary>{flag}</TimeTrigger>");
+            return format!("<TimeTrigger><StartBoundary>{NEVER_AT}</StartBoundary></TimeTrigger>");
         }
         Trigger::Daily { every_days, at, repeat } => (
             at,
@@ -405,7 +485,7 @@ fn trigger_xml(trigger: &Trigger, armed: bool) -> String {
         None => String::new(),
     };
     format!(
-        "<CalendarTrigger><StartBoundary>{START_DATE}T{:02}:{:02}:00</StartBoundary>{flag}{repetition}{schedule}\
+        "<CalendarTrigger><StartBoundary>{START_DATE}T{:02}:{:02}:00</StartBoundary>{repetition}{schedule}\
          </CalendarTrigger>",
         at.0, at.1
     )
@@ -435,7 +515,7 @@ pub(crate) fn extract_from_data(data: &str) -> Result<Option<Blob>, Error> {
 // Rendering ===========================================================================================================
 
 /// The definition's canonical text, for diffing: the same for a generated definition and a readback
-/// of it, with no armed state. Every value goetia owns is shown, a default Task Scheduler dropped
+/// of it, with no armed state and no token. Every value goetia owns is shown, a default Task Scheduler dropped
 /// included; the account is a well-known account's name or the user's.
 impl fmt::Display for TaskXml {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {

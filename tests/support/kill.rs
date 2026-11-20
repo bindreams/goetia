@@ -16,14 +16,6 @@ use goetia::spec::Id;
 
 use super::ConnectBack;
 
-/// Re-check `condition` until it holds, with no cap: it is the state being waited for that ends the
-/// wait. A state that never arrives hangs the test.
-pub fn until(mut condition: impl FnMut() -> bool) {
-    while !condition() {
-        std::thread::yield_now();
-    }
-}
-
 /// The identity of the running process `pid`: its start time and unique id along with the number, so
 /// that a process that is later given the same number is another.
 pub fn identity_of(pid: u32) -> ProcessId {

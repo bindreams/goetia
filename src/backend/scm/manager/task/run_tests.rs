@@ -262,7 +262,7 @@ fn failure<T>(begun: Result<T>) -> Error {
 fn begin_run_takes_the_pin_and_lists_before_run_is_called() {
     let (dir, path, runs) = records();
     let older = Runs::of(dir.path(), &id());
-    older.write(&written(9, 0, RunOutcome::Exited(7))).unwrap();
+    older.write(&written(9, 0, RunOutcome::Exited(7)), None).unwrap();
     let fake = Fake::new();
     let shim = Runs::of(dir.path(), &id());
     fake.on_run_during(Ok(unnamed(1)), move || {
@@ -271,7 +271,7 @@ fn begin_run_takes_the_pin_and_lists_before_run_is_called() {
             .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
             .count();
         assert_eq!(pins, 1, "the pin is held when Run is called");
-        shim.write(&written(1, 5, RunOutcome::Exited(0))).unwrap();
+        shim.write(&written(1, 5, RunOutcome::Exited(0)), None).unwrap();
     })
     .on_instances(Ok(Vec::new()));
 
@@ -353,7 +353,7 @@ fn a_process_gone_at_the_open_reads_the_record_by_the_instance() {
     let mut machine = Machine::new(&fake, &[4242]);
     machine.holdable.clear();
     Runs::of(dir.path(), &id())
-        .write(&record(1, RunOutcome::Exited(4)))
+        .write(&record(1, RunOutcome::Exited(4)), None)
         .unwrap();
 
     let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
@@ -381,8 +381,8 @@ fn wait_is_unrecorded_when_the_process_ended_and_no_record_exists() {
     );
     assert_eq!(
         UNRECORDED,
-        "it was stopped or killed, Windows shut down, goetia-shim failed, or the task could not log on (a \
-         missing logon right or a changed password starts nothing and raises nothing); see the task's log"
+        "it left no record: its program may have run and failed to record, its shim may have started no \
+         program, or it may have been killed or failed to log on; the task's log and the Event Log may say more"
     );
 }
 
@@ -427,7 +427,7 @@ fn the_end_of_a_run_does_not_wait_for_the_listing_to_drop() {
     let shim = Runs::of(dir.path(), &id());
     let fake = Fake::new();
     fake.on_run_during(Ok(named(1, 4242)), move || {
-        shim.write(&record(1, RunOutcome::Exited(0))).unwrap();
+        shim.write(&record(1, RunOutcome::Exited(0)), None).unwrap();
     })
     .on_instances(Ok(vec![instance(1, 4242)]));
 
@@ -493,4 +493,56 @@ fn a_run_that_never_writes_its_marker_still_ends_and_is_unrecorded() {
     assert_eq!(offset, 0, "a log that is not there is empty");
     assert_eq!(marker.unwrap().line, format!("goetia-run {}", instance_id(1).hex()));
     assert!(matches!(run.wait().unwrap_err(), Error::RunUnrecorded { .. }));
+}
+
+// The error of a run that could not be followed is the unrecorded run's source ----------------------------------------
+
+/// A run that began and could not be told apart: the failure that said so is the error's source, so its OS
+/// code is found and its remedy is collected, and the text is as it was.
+#[skuld::test]
+fn an_unfollowed_run_returns_the_failure_that_left_it_unfollowed() {
+    let (_dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Err(Error::os("list the runs", io::Error::from_raw_os_error(1722))));
+
+    let failed = failure(begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])));
+
+    assert_eq!(failed.raw_os_error(), Some(1722), "{failed:?}");
+    assert!(std::error::Error::source(&failed).is_some(), "{failed:?}");
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "the run of `nightly` ended without recording its exit status: goetia could not tell which run it \
+             began: failed to list the runs: {}",
+            io::Error::from_raw_os_error(1722)
+        )
+    );
+}
+
+/// A record that cannot be read leaves the run unrecorded, and the failed read is the error's source.
+#[skuld::test]
+fn a_run_whose_record_cannot_be_read_returns_the_failed_read() {
+    let (_dir, path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let mut machine = Machine::new(&fake, &[4242]);
+    let record_path = path.join(format!("{}.json", instance_id(1).hex()));
+    machine.on_exit = Box::new(move |_| fs::write(&record_path, b"not a record").unwrap());
+
+    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
+    let failed = run.wait().unwrap_err();
+
+    assert!(matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
+    assert!(std::error::Error::source(&failed).is_some(), "{failed:?}");
+    let report = failed.report().to_string();
+    assert!(
+        report.starts_with(
+            "the run of `nightly` ended without recording its exit status: its record could not be read: failed to read it: "
+        ),
+        "{report}"
+    );
 }

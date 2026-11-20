@@ -15,6 +15,10 @@ mod support;
 #[path = "launchd_integration/calendar.rs"]
 mod calendar;
 
+#[cfg(all(target_os = "macos", feature = "cli"))]
+#[path = "launchd_integration/demonstration.rs"]
+mod demonstration;
+
 #[cfg(target_os = "macos")]
 #[path = "launchd_integration/launchd.rs"]
 mod launchd;

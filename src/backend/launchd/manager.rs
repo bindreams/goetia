@@ -89,7 +89,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Occupant, PutBackFound, Reason, Result, carried};
+use crate::error::{Error, Occupant, PutBackFound, Reason, Result, target_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
 use crate::spec::{DaemonKind, DaemonSpec, Id, Restart};
@@ -819,7 +819,7 @@ impl Until<'_> {
                         pid,
                         || names(pid).map_err(io::Error::other),
                     )
-                    .map_err(|e| carried(e).unwrap_or_else(|e| Error::os(format!("read what has process {pid}"), e)))?
+                    .map_err(|e| target_failed(format!("read what has process {pid}"), e))?
             }
         })
     }

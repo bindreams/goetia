@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
-use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, TaskStatus, conformance};
+use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, conformance};
 use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 use goetia::testing::{remove_task, service_fields};
 
 use crate::common::conformance_mk;
-use crate::managed::UNIT_DIR_EXCLUSIVE;
+use crate::managed::{EventSourceChanged, UNIT_DIR_EXCLUSIVE};
 use crate::support::sentinel::{PRINT_AND_EXIT, RUN_UNTIL_KILLED};
-use crate::support::windows_tasks::{EndsTheRunOnPanic, ProcessHandle, task_spec};
-use crate::support::{self, ConnectBack, Group, ServiceGuard, kill, scm_group};
+use crate::support::windows_tasks::{EndsTheRunOnPanic, ProcessHandle, task_spec, task_status};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group};
 
 pub(crate) const SCHEDULE: &str = "30 3 * * *";
 
@@ -62,24 +62,90 @@ fn service_as(id: &Id, protocol: Protocol) -> DaemonSpec {
     DaemonSpec::from(ServiceSpec::new(fields).expect("a valid service"))
 }
 
-pub(crate) fn task_status(mgr: &Scm, id: &Id) -> TaskStatus {
-    match mgr.status(id).expect("status of a task") {
-        Status::Task(status) => status,
-        Status::Service(status) => panic!("`{id}` reads as a service: {status:?}"),
-    }
+/// An install that finds a task up to date still sees that its default log is there: see
+/// `managed::an_up_to_date_install_makes_a_deleted_default_log_again`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_of_a_task_makes_a_deleted_default_log_again(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let spec = task_as(id, User::Root, Some(SCHEDULE));
+    let log = support::shim_default_log(&support::program_data(), id.as_str());
+    mgr.install(&spec, false).expect("install");
+    assert!(log.is_file(), "the install made {}", log.display());
+    std::fs::remove_file(&log).unwrap_or_else(|e| panic!("delete {}: {e}", log.display()));
+
+    let again = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(log.is_file(), "the install made {} again", log.display());
 }
 
-/// The status of `id` once its run has ended and Task Scheduler has recorded how: idle, with a last
-/// result. Read again with no cap, since the run's end is a state of the machine and not a time.
-pub(crate) fn status_once_ended(mgr: &Scm, id: &Id) -> TaskStatus {
-    let mut found = None;
-    kill::until(|| {
-        let status = task_status(mgr, id);
-        let ended = status.common.state == State::Idle && status.last_result.is_some();
-        found = Some(status);
-        ended
+/// An install that finds a task up to date makes its run-record directory again, which the shim only opens,
+/// and clears the marker a dead uninstall left, which would make a `run` of the task back off.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_up_to_date_install_of_a_task_makes_its_run_records_again(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let spec = task_as(id, User::Root, Some(SCHEDULE));
+    let records = records_of(id);
+    let marker = records.with_file_name(format!("{id}~removing"));
+    mgr.install(&spec, false).expect("install");
+    std::fs::remove_dir(&records).unwrap_or_else(|e| panic!("delete {}: {e}", records.display()));
+    // Removed on every end of the test, and declared before the marker is written.
+    let _marker = support::cleanup::FileGuard::new(marker.clone());
+    std::fs::write(&marker, "").unwrap_or_else(|e| panic!("make {}: {e}", marker.display()));
+
+    let again = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert!(records.is_dir(), "the install made {} again", records.display());
+    assert!(!marker.exists(), "and took away {}", marker.display());
+}
+
+/// An install that finds a task up to date still registers the `Goetia` event source, restoring a changed or
+/// missing key. Serial: every install writes that key.
+#[skuld::test(serial)]
+fn an_up_to_date_install_of_a_task_registers_the_event_source_again(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let mgr = support::stock_shim_manager();
+    let spec = task_as(&guard.id, User::Root, Some(SCHEDULE));
+    mgr.install(&spec, false).expect("install");
+
+    EventSourceChanged::capture().assert_made_again_by(|| {
+        let again = mgr.install(&spec, false).expect("install again");
+        assert!(matches!(again, Outcome::UpToDate), "{again:?}");
     });
-    found.expect("a status was read")
+}
+
+/// A `logs:` in goetia's log folder is refused at a task's install, as at a service's
+/// (`managed::a_logs_in_goetias_log_folder_is_refused_at_install`). Nothing is installed.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_logs_in_goetias_log_folder_is_refused_at_a_tasks_install(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    for named in [id.as_str(), "another-daemon"] {
+        let logs = support::shim_default_log(&support::program_data(), named);
+        let spec = task_spec(
+            id,
+            vec![support::current_exe_str()],
+            Some(SCHEDULE),
+            User::Root,
+            Some(&logs),
+        );
+
+        let refused = mgr.install(&spec, false).expect_err("a `logs:` in the logs folder");
+
+        let said = refused.report().to_string();
+        assert!(said.contains("is inside goetia's own log folder"), "{named}: {said}");
+        let absent = mgr.status(id).expect_err("nothing was installed");
+        assert!(
+            matches!(absent.cause(), Error::NotInstalled { .. }),
+            "{named}: {absent:?}"
+        );
+    }
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]

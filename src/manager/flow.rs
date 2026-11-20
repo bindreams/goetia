@@ -219,6 +219,12 @@ pub(crate) fn install<B: Backend>(
             // The desired definition stands here, so what an earlier write made for it is kept.
             Outcome::UpToDate => {
                 scope.settle(|| Standing::Yes);
+                // `decide` finds an install up to date only over a marked snapshot.
+                let Some(snapshot) = found.snapshot.as_ref() else {
+                    debug_assert!(false, "an install is up to date only over a snapshot");
+                    return Ok(outcome);
+                };
+                b.ensure_beside(spec, &desired, snapshot)?;
                 return Ok(outcome);
             }
             Outcome::Conflict { .. }
@@ -427,7 +433,7 @@ impl<R: RunHandle> Waiter<R> {
     ///
     /// The run is in flight, so it is waited for whatever happens to the output. If the wait failed
     /// its error is returned, with the output's failure beside it if that failed too ([`Error::Both`],
-    /// or an [`Error::Step`] around a wait whose outcome is open, so that it stays open). Otherwise a
+    /// or an [`Error::OutputAlsoFailed`] around a wait whose outcome is open, so that it stays open). Otherwise a
     /// failure to show the output is returned, naming the exit.
     fn follow(self, run: R, id: &Id, out: &mut dyn Write) -> Result<Exit> {
         let source = run.output();
@@ -444,8 +450,9 @@ impl<R: RunHandle> Waiter<R> {
         match (waited, shown) {
             // `Both` is indeterminate only when both halves are: a wait that left the outcome open must
             // stay open, so the output's failure is said in a wrapper around the wait.
-            (Err(wait), Err(shown)) if wait.is_indeterminate() => Err(Error::Step {
-                what: format!("goetia could not show the output of `{id}` either: {}", shown.report()),
+            (Err(wait), Err(shown)) if wait.is_indeterminate() => Err(Error::OutputAlsoFailed {
+                id: id.to_string(),
+                shown: Box::new(shown),
                 source: Box::new(wait),
             }),
             (Err(wait), Err(shown)) => Err(Error::Both {

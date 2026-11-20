@@ -44,7 +44,7 @@ pub(super) fn run_state(live: &[Instance]) -> (State, Option<u32>) {
 
 /// The status of a task whose live instances are `live` (see [`run_state`]). Its `last_result` is
 /// [`exit_of`]. A disarmed task has no next run whatever Task Scheduler reports, which computes one
-/// for disabled triggers too; `enabled` is `armed`.
+/// for a task whose own flag is false too; `enabled` is `armed`.
 pub(super) fn task_status(info: &TaskInfo, live: &[Instance], armed: bool) -> TaskStatus {
     let (state, pid) = run_state(live);
     TaskStatus {
