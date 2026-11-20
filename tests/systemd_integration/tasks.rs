@@ -548,7 +548,11 @@ fn dropping_the_schedule_disarms_the_timer(#[fixture(systemd_group)] _group: &Gr
 }
 
 /// The timer starts the task by itself: the test starts nothing, and blocks on the program's own
-/// announcement. `last_run` is when the timer fired, in the minute the schedule named.
+/// announcement. The first read is of an armed timer, or of a timer that has fired already (the
+/// minute can turn between `enable` and the read, and a timer whose run is in flight has no next run).
+/// Each read is judged by what it reports: an armed timer's `last_run` is in the minute its next run
+/// named, and a fired one's run is the timer's, since the test starts nothing, and it is armed for a
+/// next run after that run.
 #[skuld::test]
 fn the_timer_fires_by_itself(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -559,22 +563,33 @@ fn the_timer_fires_by_itself(#[fixture(systemd_group)] _group: &Group) {
     mgr.install(&task(&id, held.command.clone(), Some("* * * * *")), false)
         .expect("install");
     mgr.enable(&task_id).expect("enable");
-    let scheduled = task_status(&mgr, &task_id)
-        .next_run
-        .expect("an armed timer has a next run");
+    // No next run is a timer that fired between reads of the status, so nothing else of this read is judged.
+    let scheduled = task_status(&mgr, &task_id).next_run;
 
     held.wait_started();
 
     let running = task_status(&mgr, &task_id);
     assert_eq!(running.common.state, State::Running, "{running:?}");
     held.release();
-    let finished = status_with_result(&mgr, &task_id);
+    // A status is several reads, so the timer's next run can come back after the result does.
+    let mut found = None;
+    wait::until(|| {
+        let status = task_status(&mgr, &task_id);
+        let done = status.last_result.is_some() && status.next_run.is_some();
+        found = Some(status);
+        done
+    });
+    let finished = found.expect("a status was read");
     assert_eq!(finished.last_result, Some(Exit::Code(0)), "{finished:?}");
     let fired = finished.last_run.expect("a run that ended started");
-    assert!(
-        fired >= scheduled && fired < scheduled + Duration::from_secs(60),
-        "last_run {fired:?} is not in the minute of {scheduled:?}"
-    );
+    if let Some(scheduled) = scheduled {
+        assert!(
+            fired >= scheduled && fired < scheduled + Duration::from_secs(60),
+            "last_run {fired:?} is not in the minute of {scheduled:?}"
+        );
+    }
+    let next = finished.next_run.expect("the wait ended on a next run");
+    assert!(next > fired, "the next run {next:?} is not after last_run {fired:?}");
     assert!(finished.common.enabled, "the schedule stays armed: {finished:?}");
 }
 
