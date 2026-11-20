@@ -7,7 +7,8 @@
 //! was written: it reorders elements, drops values equal to its defaults, adds `URI` and
 //! `UseUnifiedSchedulingEngine`, and rewrites the principal's account to a SID. So a readback is a
 //! [`TaskXml`] built from the elements goetia owns, with a dropped one read as its default, and the
-//! account is the blob's, never the principal's. [`Display`](fmt::Display) is the definition's
+//! account is the blob's, unless the caller that looked the principal up shows the registered one in its
+//! place ([`TaskXml::shown_for`]). [`Display`](fmt::Display) is the definition's
 //! canonical text: the same for what is generated and what is read back, with no registration
 //! [`Token`] ([`TaskXml::token_of`]).
 //!
@@ -528,7 +529,8 @@ pub(crate) fn extract_from_data(data: &str) -> Result<Option<Blob>, Error> {
 
 /// The definition's canonical text, for diffing: the same for a generated definition and a readback
 /// of it, with no armed state and no token. Every value goetia owns is shown, a default Task Scheduler dropped
-/// included; the account is a well-known account's name or the user's.
+/// included; the account is a well-known account's name or the user's, or what the task is registered for when
+/// that is another account ([`TaskXml::shown_for`]).
 impl fmt::Display for TaskXml {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(out, "Name: {}", self.id)?;

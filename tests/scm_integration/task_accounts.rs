@@ -118,9 +118,9 @@ fn a_task_whose_user_was_created_again_conflicts_naming_the_old_sid_and_a_forced
     #[fixture(scm_group)] _group: &Group,
 ) {
     let account = format!("gt{:08x}", rand::random::<u32>());
-    // The second guard deletes the account that exists at the end; the first then finds none, which it takes as
-    // done.
-    let _first = LocalUserGuard::create(&account, PASSWORD);
+    // Declared first, so the account goes after the task, whose logon it is. Its drop deletes by name, so it
+    // deletes the account made again below, which has no guard of its own.
+    let _user = LocalUserGuard::create(&account, PASSWORD);
     let old_sid = shown_sid(&sid_for_account_name(&account).expect("the SID of the first account"));
     let id = &test_id();
     let host = ServiceAccountHost::new(id);
@@ -135,7 +135,7 @@ fn a_task_whose_user_was_created_again_conflicts_naming_the_old_sid_and_a_forced
     assert_succeeded("install", &as_user("install", id, &account, &host, &command));
 
     support::cmd::run("net.exe", &["user", &account, "/delete"]).expect_ok();
-    let _second = LocalUserGuard::create(&account, PASSWORD);
+    support::cmd::run("net.exe", &["user", &account, PASSWORD, "/add"]).expect_ok();
     let new_sid = shown_sid(&sid_for_account_name(&account).expect("the SID of the second account"));
     assert_ne!(old_sid, new_sid, "precondition: the account was created again");
 
@@ -151,9 +151,18 @@ fn a_task_whose_user_was_created_again_conflicts_naming_the_old_sid_and_a_forced
         "the conflict names the old SID: {artifact_diff}"
     );
 
-    assert_succeeded(
-        "install --force",
-        &as_user("install-force", id, &account, &host, &command),
+    let forced = as_user("install-force", id, &account, &host, &command);
+    assert_succeeded("install --force", &forced);
+    let outcome = String::from_utf8_lossy(&forced.stdout);
+    assert!(
+        outcome.starts_with("OK Update"),
+        "the forced install changed the registration, it did not find it up to date: {outcome}"
+    );
+    let stored = support::cmd::run("schtasks.exe", &["/query", "/tn", &format!(r"\Goetia\{id}"), "/xml"]).expect_ok();
+    assert!(
+        stored.stdout.contains(&format!("<UserId>{new_sid}</UserId>")),
+        "the registration's principal is the new account's SID: {}",
+        stored.stdout
     );
     let exit = mgr
         .run(id, &mut Vec::new())

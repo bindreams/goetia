@@ -23,7 +23,7 @@ use std::path::Path;
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
-use super::read::StoredRegistration;
+use super::read::{StoredRegistration, sid_of_account};
 use super::verbs::{Processes, System, gone};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::scm::default_log::{self, Naming, Step};
@@ -398,6 +398,16 @@ fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
     })
 }
 
+/// What `enable` and `disable` say of a task whose registration is for `registered`, which is not the account
+/// the blob's user names now.
+fn registered_for_another_account(id: &Id, registered: &str) -> String {
+    format!(
+        "`{id}` is registered for `{registered}`, which is not the account its user names now (a user deleted and \
+         created again, or renamed, keeps the old account's SID); run `goetia daemon install --force` with a `user:` \
+         that exists to register it for that account"
+    )
+}
+
 /// The error of an account change that fails after deleting the old task: it is gone, install again.
 /// `enable_after`: the old task was armed and the new definition has a schedule, so say to `enable` it (an install
 /// creates it disarmed).
@@ -529,7 +539,12 @@ impl Scm {
     /// that will not decode is the error). Either way the task's own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
     ///
-    /// Refused first under the removal's marker ([`unfinished_change`]), before the password is asked for.
+    /// Refused first under the removal's marker ([`unfinished_change`]), before the password is asked for. Then
+    /// refused when the registration is for another account than the blob's user names now
+    /// ([`TaskSnapshot::other_account`], the comparison `read` shows): registering it in place under the blob's
+    /// name would move the principal to that account and keep the old account's security descriptor, so its shim
+    /// could not read the task, and nothing would show it. An install with `--force` registers it again. A lookup
+    /// that cannot answer is no refusal.
     pub(super) fn task_set_armed_with(
         &self,
         snapshot: &TaskSnapshot,
@@ -557,6 +572,14 @@ impl Scm {
             TaskXml::with_triggers(&registered.xml, &blob.spec)?
         };
         let account = stored_account(registered)?;
+        if let TaskAccount::User(name) = &account
+            && let Some(shown) = snapshot.other_account(name, sid_of_account)?
+        {
+            return Err(Error::os(
+                format!("{verb} `{id}`"),
+                std::io::Error::other(registered_for_another_account(id, &shown)),
+            ));
+        }
         let password = password_of(&account, password)?;
         let path = TaskPath::of(snapshot.id());
         match self.tasks.register(&path, &xml, &account, password.as_deref(), true)? {

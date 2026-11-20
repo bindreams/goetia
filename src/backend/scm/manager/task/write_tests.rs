@@ -516,8 +516,8 @@ fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_sta
 }
 
 /// The user a task runs as was deleted and created again under the same name: the registration names the old
-/// account's SID, `read` shows it, and the forced install over it is the account change, with the new account's
-/// password.
+/// account's SID, so the definition `read` shows differs from the spec, the forced install over it decides an
+/// update, and the write of that is the account change, with the new account's password.
 #[skuld::test]
 fn a_task_whose_user_was_created_again_is_deleted_and_created_for_the_new_account() {
     let (dir, runs) = made_records();
@@ -532,8 +532,31 @@ fn a_task_whose_user_was_created_again_is_deleted_and_created_for_the_new_accoun
         .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true))
         .on_register(Ok(Registration::Created));
+    let scm = scm(&fake);
+    // `alice` names the new account now; the registration's text is the old account's SID.
+    let lookup = |name: &str, _: Option<Written<'_>>| match name {
+        "alice" => Ok(sid_from_parts(5, &[21, 1, 2, 3, 1002])),
+        "S-1-5-21-1-2-3-1001" => Ok(sid_from_parts(5, &[21, 1, 2, 3, 1001])),
+        _ => Err(Error::AccountLookup {
+            detail: format!("cannot resolve SID for account `{name}`"),
+            source: None,
+        }),
+    };
+    let decided = decide::decide(
+        &Ownership::Ours {
+            blob: blob(&spec),
+            regenerated: scm.task_regenerate(&spec, &old).unwrap().to_string(),
+            on_disk: scm.task_installed_with(&old, lookup).unwrap().definition.to_string(),
+        },
+        &definition(&spec).to_string(),
+        &spec,
+        crate::version(),
+        true,
+        &ExternalConfig::Absent,
+    );
+    assert!(matches!(decided, decide::Outcome::Update { .. }), "{decided:?}");
 
-    let outcome = scm(&fake)
+    let outcome = scm
         .task_write_with(
             &spec,
             &definition(&spec),
@@ -2578,18 +2601,36 @@ fn enable_of_a_schedule_that_never_fires_arms_it() {
     assert!(TaskXml::armed(xml), "{xml}");
 }
 
+/// Two accounts' SIDs, as text: a `user.id` that spells one resolves to it without looking an account up, so a
+/// task of one registered for the same SID (or another) is stated with SID strings alone.
+const ALICE: &str = "S-1-5-21-1-2-3-1001";
+const BOB: &str = "S-1-5-21-1-2-3-1002";
+
+/// The task of the user `account` (a SID string), registered for the principal `principal` (a SID string).
+fn user_task(account: &str, principal: &str, armed: bool) -> (DaemonSpec, TaskSnapshot) {
+    let spec = task_spec_as(User::Id(AccountId::Sid(account.to_owned())), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, armed);
+    registered.xml = registered.xml.replace(
+        &format!("<UserId>{account}</UserId>"),
+        &format!("<UserId>{principal}</UserId>"),
+    );
+    assert!(registered.xml.contains(principal), "the principal is {principal}");
+    let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+    (spec, snapshot)
+}
+
 /// Re-registering a password-logon task takes its password (M3): without it `enable` and `disable`
 /// refuse, and the scheduler is not asked anything.
 #[skuld::test]
 fn enable_of_a_real_user_task_without_its_password_is_refused_before_any_write() {
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let (_, snapshot) = user_task(ALICE, ALICE, false);
     let fake = Fake::new();
     let (_dir, runs) = records();
 
-    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || Ok(None));
+    let refused = scm(&fake).task_set_armed_with(&snapshot, true, &runs, || Ok(None));
 
     assert!(
-        matches!(&refused, Err(Error::PasswordRequired { account, kind: DaemonKind::Task }) if account == "alice"),
+        matches!(&refused, Err(Error::PasswordRequired { account, kind: DaemonKind::Task }) if account == ALICE),
         "{refused:?}"
     );
     assert_eq!(fake.calls(), []);
@@ -2597,11 +2638,11 @@ fn enable_of_a_real_user_task_without_its_password_is_refused_before_any_write()
 
 #[skuld::test]
 fn disable_of_a_real_user_task_without_its_password_is_refused_before_any_write() {
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let (_, snapshot) = user_task(ALICE, ALICE, true);
     let fake = Fake::new();
     let (_dir, runs) = records();
 
-    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, true), false, &runs, || Ok(None));
+    let refused = scm(&fake).task_set_armed_with(&snapshot, false, &runs, || Ok(None));
 
     assert!(matches!(refused, Err(Error::PasswordRequired { .. })), "{refused:?}");
     assert_eq!(fake.calls(), []);
@@ -2609,15 +2650,13 @@ fn disable_of_a_real_user_task_without_its_password_is_refused_before_any_write(
 
 #[skuld::test]
 fn enable_of_a_real_user_task_registers_it_again_with_its_password() {
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let (_, snapshot) = user_task(ALICE, ALICE, false);
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let (_dir, runs) = records();
 
     scm(&fake)
-        .task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || {
-            Ok(Some("secret".to_owned()))
-        })
+        .task_set_armed_with(&snapshot, true, &runs, || Ok(Some("secret".to_owned())))
         .unwrap();
 
     let calls = fake.calls();
@@ -2627,9 +2666,42 @@ fn enable_of_a_real_user_task_registers_it_again_with_its_password() {
     else {
         panic!("enable registers: {calls:?}");
     };
-    assert_eq!(who, &TaskAccount::User("alice".to_owned()));
+    assert_eq!(who, &TaskAccount::User(ALICE.to_owned()));
     assert_eq!(password.as_deref(), Some("secret"));
     assert!(update);
+}
+
+/// Registering the task again in place under the name the blob has would keep the security descriptor of the
+/// registration (the old account's alone), so the new account's shim could not read its task, and nothing would
+/// show it any more: `enable` and `disable` of a task registered for another account than its user names refuse,
+/// naming the registered SID and the remedy, before the password is asked for and with nothing sent.
+fn arming_a_task_registered_for_another_account_is_refused(armed: bool) {
+    let (_, snapshot) = user_task(BOB, ALICE, !armed);
+    let fake = Fake::new();
+    let (_dir, runs) = records();
+
+    let refused = scm(&fake)
+        .task_set_armed_with(&snapshot, armed, &runs, || {
+            panic!("the refusal comes before the password is asked for")
+        })
+        .unwrap_err();
+
+    let text = refused.report().to_string();
+    assert!(
+        text.contains(ALICE) && text.contains("install --force"),
+        "names the registered SID and the remedy: {text}"
+    );
+    assert_eq!(fake.calls(), [], "nothing was sent to Task Scheduler");
+}
+
+#[skuld::test]
+fn enable_of_a_task_registered_for_another_account_is_refused() {
+    arming_a_task_registered_for_another_account_is_refused(true);
+}
+
+#[skuld::test]
+fn disable_of_a_task_registered_for_another_account_is_refused() {
+    arming_a_task_registered_for_another_account_is_refused(false);
 }
 
 #[skuld::test]

@@ -14,7 +14,7 @@ use crate::blob::Blob;
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::error::Error;
 use crate::manager::{Exit, Installed, State, Status};
-use crate::spec::{DaemonSpec, Protocol, User};
+use crate::spec::{AccountId, DaemonSpec, Protocol, User};
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 fn id() -> Id {
@@ -196,8 +196,8 @@ fn sid_text(text: &str) -> Sid {
 }
 
 /// A lookup that answers from `known`, and says "no such account" for any other name.
-fn knowing(known: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Result<Sid> {
-    move |name| {
+fn knowing(known: &'static [(&'static str, &'static str)]) -> impl Fn(&str, Option<Written<'_>>) -> Result<Sid> {
+    move |name, _| {
         known
             .iter()
             .find(|(known, _)| *known == name)
@@ -232,7 +232,7 @@ fn alices(stored: &str) -> (DaemonSpec, TaskSnapshot) {
 fn install_over(
     spec: &DaemonSpec,
     snapshot: &TaskSnapshot,
-    lookup: impl Fn(&str) -> Result<Sid>,
+    lookup: impl Fn(&str, Option<Written<'_>>) -> Result<Sid>,
 ) -> (String, decide::Outcome) {
     let scm = Scm::new();
     let on_disk = scm
@@ -295,27 +295,25 @@ fn a_blob_name_that_names_no_account_shows_the_registrations_sid() {
     assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
 }
 
-/// A lookup that fails for another reason than "no such account" (a domain controller outage) must not read as a
-/// conflict: the read is the error, whichever of the two accounts it could not look up.
+/// A lookup that fails for another reason than "no such account" (a domain controller outage) is no difference and
+/// fails nothing: the read shows the blob's account, whichever of the two accounts it could not look up.
 #[skuld::test]
-fn a_lookup_that_fails_otherwise_is_the_reads_error() {
-    let (_, snapshot) = alices(OLD_SID);
-    let scm = Scm::new();
-    let alice = |name: &str| match name {
+fn a_lookup_that_fails_otherwise_shows_the_blobs_account() {
+    let (spec, snapshot) = alices(OLD_SID);
+    let alice = |name: &str, _: Option<Written<'_>>| match name {
         "alice" => Err(denied(name)),
         _ => Ok(sid_text(OLD_SID)),
     };
-    let stored = |name: &str| match name {
+    let stored = |name: &str, _: Option<Written<'_>>| match name {
         "alice" => Ok(sid_text(NEW_SID)),
         _ => Err(denied(name)),
     };
 
-    for failed in [
-        scm.task_installed_with(&snapshot, alice),
-        scm.task_installed_with(&snapshot, stored),
-    ] {
-        let error = failed.err().expect("a failed lookup fails the read");
-        assert!(matches!(error, Error::InstalledUnreadable { .. }), "{error:?}");
+    for lookup in [&alice as &dyn Fn(&str, Option<Written<'_>>) -> Result<Sid>, &stored] {
+        let (shown, outcome) = install_over(&spec, &snapshot, lookup);
+
+        assert!(shown.contains(r#"Account: user "alice""#), "{shown}");
+        assert!(matches!(outcome, decide::Outcome::UpToDate), "{outcome:?}");
     }
 }
 
@@ -325,23 +323,66 @@ fn a_built_in_account_is_shown_as_the_blob_has_it_and_is_not_looked_up() {
     let spec = task_spec_as(User::Name("LocalService".to_owned()), Some("30 3 * * *"));
     let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_task(&spec, false));
 
-    let (shown, outcome) = install_over(&spec, &snapshot, |name| panic!("looked up `{name}`"));
+    let (shown, outcome) = install_over(&spec, &snapshot, |name, _| panic!("looked up `{name}`"));
 
     assert!(shown.contains("Account: service LocalService"), "{shown}");
     assert!(matches!(outcome, decide::Outcome::UpToDate), "{outcome:?}");
 }
 
-/// A registration whose XML names no principal has no SID to show: the blob's account stands, as it did before.
+/// A registration whose XML names no principal is for no account the blob's name names: the definition says so,
+/// and an install of it is a conflict, as `task_write_with` treats it as an account change.
 #[skuld::test]
-fn a_registration_that_names_no_principal_shows_the_blobs_account() {
+fn a_registration_that_names_no_principal_shows_that_it_names_none() {
     let spec = task_spec_as(User::Name("alice".to_owned()), Some("30 3 * * *"));
     let mut registered = registered_task(&spec, false);
     registered.xml = registered.xml.replace("<UserId>alice</UserId>", "");
     let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
 
-    let (shown, _) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID)]));
+    let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID)]));
 
-    assert!(shown.contains(r#"Account: user "alice""#), "{shown}");
+    assert!(shown.contains(r#"Account: user "<none>""#), "{shown}");
+    assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
+}
+
+/// A principal that names no account (a name nothing maps, a SID text that is no SID) is shown as it stands, and
+/// an install over it is a conflict: the registration is for no account the blob's name names.
+#[skuld::test]
+fn a_principal_that_names_no_account_is_shown_as_it_stands() {
+    for principal in ["ghost", "S-1-5-garbage"] {
+        let spec = task_spec_as(User::Name("alice".to_owned()), Some("30 3 * * *"));
+        let mut registered = registered_task(&spec, false);
+        registered.xml = registered
+            .xml
+            .replace("<UserId>alice</UserId>", &format!("<UserId>{principal}</UserId>"));
+        let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+
+        let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID)]));
+
+        assert!(shown.contains(&format!("Account: user {principal:?}")), "{shown}");
+        assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
+    }
+}
+
+/// A `user.id` the install resolves as a SID string is resolved so by the read, whatever its case: the same
+/// SID spelled in lower case is the registration's, so the task is up to date.
+#[skuld::test]
+fn a_user_id_the_install_accepts_is_the_account_the_read_resolves() {
+    let written = OLD_SID.to_lowercase();
+    let spec = task_spec_as(User::Id(AccountId::Sid(written.clone())), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, false);
+    registered.xml = registered.xml.replace(
+        &format!("<UserId>{written}</UserId>"),
+        &format!("<UserId>{OLD_SID}</UserId>"),
+    );
+    assert!(
+        registered.xml.contains(OLD_SID),
+        "the principal is the SID in upper case"
+    );
+    let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+
+    let installed = Scm::new().task_installed(&snapshot).unwrap().definition.to_string();
+
+    assert!(installed.contains(&format!("Account: user {written:?}")), "{installed}");
 }
 
 #[skuld::test]
