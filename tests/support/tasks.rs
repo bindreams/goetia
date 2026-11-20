@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use goetia::manager::{Exit, ServiceManager, Status, TaskStatus};
 use goetia::spec::{DaemonSpec, Id, TaskSpec};
@@ -142,10 +143,11 @@ pub fn task_status(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
 }
 
 /// The first status of `id` that `ready` accepts, read again until then with no cap: the state `ready`
-/// names ends the wait, and a state that never comes hangs the test (unless `ready` panics on it).
+/// names ends the wait, and a state that never comes hangs the test (unless `ready` panics on it). A
+/// read is several processes, so the turns are paced.
 pub fn status_until(mgr: &dyn ServiceManager, id: &Id, mut ready: impl FnMut(&TaskStatus) -> bool) -> TaskStatus {
     let mut found = None;
-    wait::until(|| {
+    wait::until_paced(Duration::from_millis(100), || {
         let status = task_status(mgr, id);
         let done = ready(&status);
         found = Some(status);
