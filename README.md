@@ -1049,7 +1049,8 @@ starts nothing and raises nothing.
   while the change, or an `uninstall`, is under way does not run, even when the
   change is then refused. If the change fails after the old task was removed,
   nothing is installed at the id: install again, and `enable` it if it was
-  armed.
+  armed. A wrong `GOETIA_SERVICE_PASSWORD` fails that way: Task Scheduler
+  checks it only when it registers the new task.
 - A service `uninstall` while Task Scheduler is unusable cannot tell whether a
   task still references the host's file, so it leaves the file and reports it;
   the next sweep removes it.
