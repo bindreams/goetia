@@ -14,8 +14,9 @@ Everything documented below — the manifest's interpolation syntax, the
 may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
-On macOS goetia requires **14.4+**: `kill` holds the daemon's process by its
-identity, which the OS offers from 14.4. On Linux it requires **kernel 5.6+**,
+On macOS goetia requires **15+**, the oldest version GitHub still offers a runner
+for, so the oldest that can be measured. (`kill` holds the daemon's process by its
+identity, which the OS offers from 14.4.) On Linux it requires **kernel 5.6+**,
 with `pidfd_open` and `openat2` not blocked by a seccomp profile or an LSM: the
 process library goetia runs `systemctl` with, and holds a daemon's process with
 for `kill`, needs both. It also requires **systemd 243+**
@@ -261,9 +262,7 @@ records the end as it does.
   writes an `ExitTimeOut` of `1`: launchd
   sends `SIGTERM`, and `SIGKILL` a second later. `0`, which `launchd.plist(5)`
   documents as no limit, ends the job at once on macOS 15.7 (Intel) and 26
-  (measured), but macOS 14, which goetia supports, could not be measured:
-  GitHub no longer offers a runner for it. `1` does not depend on what `0` does
-  there.
+  (measured). `1` does not depend on what `0` does.
   `ExitTimeOut` applies only when launchd itself boots a job out, which a task's
   `stop` never does: goetia ends a task's run itself, with `SIGKILL` at once for
   `kill` and otherwise `SIGTERM`, then `SIGKILL` if the run is still going when

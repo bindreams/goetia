@@ -37,10 +37,13 @@ use cosca::identity::Liveness;
 /// descendant that inherited a pipe dies with the child instead of holding its write end open:
 /// [`wait_bounded`] tears the contained tree down with `send_kill_tree` on expiry, and by dropping the
 /// child on every path. Where its output goes is [`spawn`]'s to decide, by [`Role`].
+///
+/// The containment is best effort: a host that cannot set up the strongest mechanism (a cgroup the
+/// process may not use) gets a weaker one, and the `systemctl` or `launchctl` call still runs.
 pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
     let mut cmd = cosca::run(std::iter::once(program).chain(args.iter().copied()));
     cmd.stdin(cosca::Stdio::null())?;
-    cmd.contain();
+    cmd.contain_with(cosca::ContainMode::BestEffort);
     Ok(cmd)
 }
 
@@ -518,9 +521,8 @@ const REREAD: Duration = Duration::from_millis(20);
 /// What `alive` reads once it is `Dead`, or once `bound` has passed and it has been read once more
 /// since: `Alive` and `Unknown` both mean "not yet".
 ///
-/// It polls because cosca 0.8's non-reaping `Process::wait_timeout` needs a `Process`, opened through
-/// an identity read that macOS refuses in the window where the kill is refused. A public non-reaping
-/// wait on `Child` would replace the polling. The reads are of the real condition and the clock only
+/// It polls because `alive` serves a held `cosca::Process` as well as a child, and a `Process`'s wait
+/// needs an identity read that macOS refuses in the window where the kill is refused. The reads are of the real condition and the clock only
 /// says when to give up, so the time spent sleeping never decides the outcome.
 fn last_read(alive: impl Fn() -> Liveness, bound: Duration) -> Liveness {
     let deadline = Budget::Bounded(bound).start();

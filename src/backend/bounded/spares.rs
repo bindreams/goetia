@@ -19,10 +19,11 @@ use crate::backend::standby::Standby;
 /// running: it still exits, and a caller that outlives it must not collect one zombie per expiry.
 /// See [`Reservation`].
 ///
-/// The thread never kills the child, not even after the reap: an expired request is left running.
-/// It [`cosca::Child::detach`]es the reaped child rather than dropping it, because `Drop` tears the
-/// contained tree down, and the request's descendants may still be in it. With nothing to reap, the
-/// request having exited inside its budget, the thread ends.
+/// The thread never kills the child, not even after the exit: an expired request is left running.
+/// [`cosca::Child::wait`] only observes the exit, so it is [`cosca::Child::detach`], which reaps
+/// an exited child, that collects it, rather than a drop, because `Drop` tears the contained tree
+/// down, and the request's descendants may still be in it. With nothing to reap, the request having
+/// exited inside its budget, the thread ends.
 #[derive(Debug)]
 pub(crate) struct Reaper(Standby<cosca::Child>);
 
@@ -56,7 +57,7 @@ impl Reaper {
     }
 }
 
-/// [`cosca::Child::detach`] it. Only Windows' disarm can be refused, and nothing here runs there:
+/// [`cosca::Child::detach`] it, which reaps it if it has exited. Only Windows' disarm can be refused, and nothing here runs there:
 /// on a refusal the child would come back armed, and dropping it would kill the tree.
 fn let_go(child: cosca::Child) {
     if let Err((_armed, e)) = child.detach() {
