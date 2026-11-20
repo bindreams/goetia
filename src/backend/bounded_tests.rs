@@ -84,11 +84,15 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
     let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
-    // A zombie would still answer `kill(pid, 0)` successfully; `ESRCH` is
-    // what proves the reap, not merely the kill.
+    assert_reaped(pid);
+}
+
+/// `pid` is gone, not a zombie: a zombie still answers `kill(pid, 0)` successfully, so `ESRCH` is
+/// what proves the reap, not merely the kill or an exit status seen.
+fn assert_reaped(pid: u32) {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     let err = io::Error::last_os_error();
-    assert_eq!(rc, -1);
+    assert_eq!(rc, -1, "pid {pid} is still there: a zombie, never reaped");
     assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
 }
 
@@ -499,7 +503,7 @@ fn a_left_request_the_caller_kills_takes_its_descendant_with_it() {
         other => panic!("expected Left, got {other:?}"),
     }
 
-    let status = request.reaped.recv().unwrap().unwrap();
+    let status = reaped_status(request.pid, &request.reaped);
     assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
     descendant.0.wait().unwrap();
@@ -758,7 +762,7 @@ mod refused_kill {
         let mut cmd = sh("trap 'exit 7' TERM; sleep 2147483647 & echo $! >&3; wait");
         cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
         cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
-        let Requested { mut child, reaped } = requested(cmd);
+        let Requested { mut child, pid, reaped } = requested(cmd);
         let descendant = descendant_on_fd3(&mut child.child);
         let _refused = test_hook::kill_fails(term_then_eperm);
         let Spawned {
@@ -783,7 +787,7 @@ mod refused_kill {
 
         left.kill();
 
-        let status = reaped.recv().unwrap().unwrap();
+        let status = reaped_status(pid, &reaped);
         assert_eq!(status.code(), Some(7), "{status:?}");
         // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
         descendant.0.wait().unwrap();
@@ -793,7 +797,7 @@ mod refused_kill {
     /// which reaps it once it exits. The bound is `waited_out`'s argument, as above.
     #[skuld::test]
     fn a_left_request_that_cannot_be_ended_is_still_reaped() {
-        let Requested { child, reaped } = requested(released_at_eof("exit 7"));
+        let Requested { child, pid, reaped } = requested(released_at_eof("exit 7"));
         let Spawned {
             child,
             role,
@@ -817,7 +821,7 @@ mod refused_kill {
 
         left.kill();
 
-        let status = reaped.recv().unwrap().unwrap();
+        let status = reaped_status(pid, &reaped);
         assert_eq!(status.code(), Some(7), "{status:?}");
     }
 
@@ -928,16 +932,27 @@ fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> Exit
     let finished = wait_bounded(request.child, Budget::Immediate.start()).unwrap();
 
     settle(finished);
-    request
-        .reaped
-        .recv()
-        .expect("a request left running must be reaped once it exits")
-        .expect("waiting on the child")
+    reaped_status(request.pid, &request.reaped)
 }
 
-/// A [`Role::Request`] spawned from `cmd`, whose stdin is a pipe, and what its reaper reports.
+/// How the child `pid` ended, as its reaper reports it, and that the reaper then reaped it. The
+/// reaper reports once it has let the child go, so the wait is on the reaper's own end and the pid is
+/// checked after it. [`cosca::Child::wait`] only observes an exit, so a status arriving proves no
+/// reap: a reaper that forgot the child instead would report all the same, and leave a zombie.
+fn reaped_status(pid: u32, reaped: &mpsc::Receiver<Result<ExitStatus, cosca::error::Error>>) -> ExitStatus {
+    let status = reaped
+        .recv()
+        .expect("a request left running must be reaped once it exits")
+        .expect("waiting on the child");
+    assert_reaped(pid);
+    status
+}
+
+/// A [`Role::Request`] spawned from `cmd`, whose stdin is a pipe, its pid, and what its reaper
+/// reports.
 struct Requested {
     child: Spawned,
+    pid: u32,
     reaped: mpsc::Receiver<Result<ExitStatus, cosca::error::Error>>,
 }
 
@@ -955,8 +970,9 @@ fn requested(cmd: cosca::Command) -> Requested {
     )
     .unwrap();
     let mut child = spawned(cmd, Role::Request(reaper));
+    let pid = child.child.pid();
     writer_tx.send(child.child.stdin().expect("stdin is piped")).unwrap();
-    Requested { child, reaped }
+    Requested { child, pid, reaped }
 }
 
 /// The child the reaper tests hand their reaper: runs `then` at EOF on its stdin, a pipe the test
