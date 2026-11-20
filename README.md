@@ -665,14 +665,15 @@ What holds on every platform:
   `RunEx` ignoring constraints (`schtasks /run /I`) can overlap a goetia run for
   any account. `status` shows one pid, and `stop`, `kill` and `uninstall` act on
   every run alive.
-- **Catch-up is always on**, with no field to turn it off. On systemd and
-  launchd, a run missed while the machine was off or asleep is made up when it
-  is back, except where [launchd](#launchd-calendar-entries) cannot. On
-  Windows, goetia sets `StartWhenAvailable`, Task Scheduler's own setting for
-  starting a task as soon as possible after a missed start; what Task Scheduler
-  makes up under it is its own behaviour. On every platform, a run that came
-  due while the task was disarmed is never made up, and on Windows an `enable`
-  makes up no run.
+- **Catch-up is always asked for**, with no field to turn it off; what is made
+  up is the manager's own behaviour. systemd (`Persistent=yes`) runs a start
+  the machine missed once it is up. launchd runs one missed while the Mac
+  slept, not one missed while it was off (see
+  [launchd](#launchd-calendar-entries)). On Windows, goetia sets
+  `StartWhenAvailable`, Task Scheduler's setting for starting a task as soon as
+  possible after a missed start. A run that came due while the task was
+  disarmed is not made up on any platform: `enable` starts nothing (on Windows,
+  nothing in the 12 minutes watched after it).
 - **No retry.** A run that fails is not run again; a program that wants one
   retries itself. How it failed is its `last-result`.
 - **Times are local.** See [the schedule](#the-schedule-per-platform).
@@ -710,14 +711,14 @@ All under `goetia daemon`, as for a service:
   schedule has nothing to arm: `enable` is refused, naming the missing
   schedule, and its `enabled` is always `false`. On Windows, `enable` and
   `disable` of a task that runs as a real user need `GOETIA_SERVICE_PASSWORD`
-  (see [Task accounts on Windows](#task-accounts-on-windows)). On every
-  platform, arming makes up no run that came due while the task was disarmed.
+  (see [Task accounts on Windows](#task-accounts-on-windows)). Arming makes up
+  no run (see catch-up, above).
 - **`disable`** disarms it. A run in flight carries on. On Windows it removes
   the task's triggers, which also stops a repetition in progress; a trigger
-  added to the task by hand goes with them. Both `disable` and `enable` set the
+  added or changed by hand goes with them. Both `disable` and `enable` set the
   task's own Enabled flag true and register it under the account it is
-  installed with; those two are goetia's, and a hand edit of anything else in
-  the task survives.
+  installed with. The triggers, that flag and the account are goetia's; a hand
+  edit of anything else in the task survives.
 - **`start`** requests a run now, armed or not, and returns once the manager
   has accepted the request. It says nothing of how the run went: `last-result`
   does. `--timeout` and `--no-timeout` are refused (see
@@ -832,8 +833,8 @@ the next one. A task that has never run is `idle` with `last-result` and
 `last-run` `null`, and `status` still exits `0`. Its `next-run` is `null` where
 the schedule is not armed: the task is disabled or has no `schedule`, its
 schedule never fires (`0 0 30 2 *`), or an `enable` or `install` was
-interrupted before the schedule was armed again (launchd). On systemd it is
-also `null` while a run the schedule started is in flight. Otherwise an enabled
+interrupted before the schedule was armed again (launchd). On systemd it can
+also be `null` while a run is in flight. Otherwise an enabled
 task has its next run before it has had a first. A task's timer or triggers
 changed by hand outside goetia may read otherwise.
 
@@ -1131,7 +1132,7 @@ possibly empty.
 | `daemons[].pid`         | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                                                                                                                                                                                                                                    |
 | `daemons[].last-result` | object or null  | How a task's most recent finished run ended: `{"code": n}` or `{"signal": n}`, where `n` is the signed 32-bit value (a Windows run that was stopped reads `{"code": -1073741510}`, which is `0xC000013A`). `null` on a service, and on a task that has not run or whose run is in flight, where the platform says so: see [Status of a task](#status-of-a-task). |
 | `daemons[].last-run`    | string or null  | When a task's most recent run started, as RFC 3339 with the offset of the system time zone at that instant, to the second: `2026-11-18T03:30:00+02:00`. `null` on a service, on a task that has not run, and always on launchd.                                                                                                                                  |
-| `daemons[].next-run`    | string or null  | When a task's schedule will start it next, in the same form. `null` on a service, on a task whose schedule is not armed, on one with no run to come, and on systemd while a run the schedule started is in flight.                                                                                                                                               |
+| `daemons[].next-run`    | string or null  | When a task's schedule will start it next, in the same form. `null` on a service, on a task whose schedule is not armed, on one with no run to come, and, on systemd, possibly while a run is in flight.                                                                                                                                                         |
 | `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for `unsupported`, and for an `unavailable` that belongs to no id.                                                                                                                                                                                                                          |
 | `errors[].kind`         | string          | See below.                                                                                                                                                                                                                                                                                                                                                       |
 | `errors[].message`      | string          | Human-readable detail.                                                                                                                                                                                                                                                                                                                                           |
