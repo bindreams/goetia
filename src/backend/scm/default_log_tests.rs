@@ -507,10 +507,12 @@ fn a_log_that_is_being_deleted_while_a_run_writes_it_is_refused_with_the_way_out
 
     assert!(refused.contains(&log.display().to_string()), "{refused}");
     assert!(
-        refused.contains("being deleted while a run of the daemon still writes it"),
+        refused.contains(
+            "being deleted while something still has it open (a run of the daemon, or a program reading the log)"
+        ),
         "{refused}"
     );
-    assert!(refused.contains("stop the daemon, then install"), "{refused}");
+    assert!(refused.contains("end that, then install the daemon again"), "{refused}");
 }
 
 /// A tag that names no other file is data on this one, which the install sets the permissions of like any.

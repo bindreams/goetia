@@ -447,7 +447,8 @@ impl Runs {
 
     /// The first pin a handle holds, if one does: the directory listed once, every pin asked
     /// ([`pins_of`]), and never waited for. A pin whose state cannot be told may be held, and is an error that
-    /// names it. A directory that is gone, or is a link, holds none.
+    /// names it. A directory that is gone, or is a link, holds none. **Not read-only:** each stale pin is
+    /// removed as it is judged ([`scan_pins`]).
     pub(crate) fn held_pin(&self) -> Result<Option<PathBuf>> {
         let dir = match Dir::open_even_if_link(&self.dir) {
             Ok(dir) => dir,

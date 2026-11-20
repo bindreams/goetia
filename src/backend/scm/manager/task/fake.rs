@@ -148,7 +148,7 @@ impl Fake {
     ///
     /// # Panics
     ///
-    /// If no reply was stated since the last effect.
+    /// If no reply was stated since the last effect, or the reply stated last was already used by a call.
     pub(crate) fn during(&self, effect: impl FnOnce() + Send + 'static) -> &Self {
         let mut script = lock(&self.0);
         let set = script.last.take().expect("`during` follows a stated reply");
@@ -160,13 +160,17 @@ impl Fake {
     /// Queues `result` in the queue `queue` names, and notes how to reach it for [`Self::during`].
     fn state<T: 'static>(
         &self,
-        queue: impl Fn(&mut Script) -> &mut VecDeque<Reply<T>> + Copy + Send + 'static,
+        queue: impl Fn(&mut Script) -> &mut VecDeque<Reply<T>> + Send + 'static,
         result: Result<T>,
     ) -> &Self {
         let mut script = lock(&self.0);
         queue(&mut script).push_back(Reply { result, during: None });
+        // Any later reply replaces `last`, so while the queue holds one, the back of it is the reply stated last.
         script.last = Some(Box::new(move |script, effect| {
-            queue(script).back_mut().expect("the reply was just queued").during = Some(effect);
+            queue(script)
+                .back_mut()
+                .expect("the reply stated last was already used: `during` must come before the call it answers")
+                .during = Some(effect);
         }));
         drop(script);
         self

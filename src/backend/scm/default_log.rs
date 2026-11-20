@@ -208,9 +208,9 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, naming: &Naming) -> Result<En
     Ok(EnsureOutcome::Set)
 }
 
-/// A deleted log whose handle a daemon still holds keeps its name where the delete is not POSIX (the daemon's
-/// output handle is on the file), and an open answers access denied; the error says to stop the daemon and install
-/// again. A directory at the name, and a link, are told as what they are. The status of an open of the name tells
+/// A deleted log whose handle something still holds (a daemon's output handle, or a program reading it) keeps its
+/// name where the delete is not POSIX, and an open answers access denied; the error says to end what holds it and
+/// install again. A directory at the name, and a link, are told as what they are. The status of an open of the name tells
 /// each of the three from a permission that refuses the install: the Win32 error is access denied for all four.
 fn make_error(path: &Path, e: io::Error) -> Error {
     if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
@@ -230,7 +230,8 @@ fn refusal_at(path: &Path, at: AtName) -> Option<Error> {
         ),
         AtName::Link => return Some(Error::os("use the default log", link_error(path))),
         AtName::DeletePending => format!(
-            "{} is being deleted while a run of the daemon still writes it; stop the daemon, then install it again",
+            "{} is being deleted while something still has it open (a run of the daemon, or a program reading the \
+             log); end that, then install the daemon again",
             path.display()
         ),
         AtName::Other => return None,

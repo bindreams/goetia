@@ -18,7 +18,8 @@ use crate::backend::scm::shim::acl::acl_tests::windows::junction;
 use crate::backend::scm::shim::acl::read_object;
 use crate::backend::scm::sid::{Sid, sid_from_parts, system};
 use crate::backend::scm::test_support::{
-    TASK_TOKEN, Undeletable, registered_task, registered_task_with, task_host, task_spec, task_spec_as, task_token,
+    TASK_TOKEN, Undeletable, delete_pending, make_mount_point, registered_task, registered_task_with, task_host,
+    task_spec, task_spec_as, task_token,
 };
 use crate::blob::Blob;
 use crate::decide::{self, ExternalConfig, Ownership};
@@ -763,7 +764,11 @@ fn a_failure_after_the_disable_puts_the_enabled_flag_back_and_is_the_writes_erro
             prepared(users(), None),
         )
         .unwrap_err();
-    assert!(failed.to_string().contains("run records"), "{failed}");
+    assert!(
+        failed.report().to_string().contains("run records"),
+        "{}",
+        failed.report()
+    );
     assert_eq!(fake.calls(), [disabled.clone(), instances.clone(), delete.clone()]);
     fake.finish();
 
@@ -814,10 +819,114 @@ fn a_failure_after_the_disable_puts_the_enabled_flag_back_and_is_the_writes_erro
             prepared(users(), None),
         )
         .unwrap_err();
-    assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
-    assert!(failed.to_string().contains("register"), "{failed}");
+    assert!(failed.report().to_string().contains("register"), "{}", failed.report());
     assert_eq!(fake.calls().first(), Some(&disabled));
     assert!(matches!(fake.calls().last(), Some(Call::Register { .. })));
+    fake.finish();
+}
+
+/// A failure after the delete is not a refusal that left the task: the old task is gone, nothing is installed at
+/// the id, and an install that runs again creates it disarmed. The error says so, and for a task that was armed
+/// says to arm it after; the failure itself stays under it.
+#[skuld::test]
+fn a_failure_after_the_delete_says_what_it_left() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    for armed in [true, false] {
+        let (_dir, runs) = made_records();
+        let fake = Fake::new();
+        fake.on_set_enabled(Ok(()))
+            .on_instances(Ok(Vec::new()))
+            .on_delete(Ok(true))
+            .on_register(Err(Error::os("register", std::io::Error::other("denied"))));
+
+        let failed = scm(&fake)
+            .task_write_with(
+                &new,
+                &definition(&new),
+                Some(&snapshot_of(&old, armed)),
+                &runs,
+                &mut Running(vec![]),
+                prepared(users(), None),
+            )
+            .unwrap_err();
+
+        let Error::Step { what, source } = &failed else {
+            panic!("armed={armed}: a failure after the delete is told as what it left: {failed:?}")
+        };
+        assert!(what.contains("old task") && what.contains("already removed"), "{what}");
+        assert!(what.contains("nothing is installed"), "{what}");
+        assert!(what.contains("install"), "{what}");
+        assert_eq!(
+            what.contains("goetia daemon enable nightly"),
+            armed,
+            "armed={armed}: only a task that was armed is told to be enabled: {what}"
+        );
+        assert!(matches!(**source, Error::Os { .. }), "{source:?}");
+        assert!(failed.report().to_string().contains("denied"), "{}", failed.report());
+        fake.finish();
+    }
+
+    // The record directory cannot be made: the same, whatever it was that failed.
+    let (_dir, runs) = records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true));
+    let failed = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&failed, Error::Step { what, .. } if what.contains("already removed")),
+        "{failed:?}"
+    );
+    fake.finish();
+}
+
+/// A marker that cannot be placed leaves nothing to take away: the flag is put back, and the one cause is the
+/// one error (not a second one about a marker that was never placed). What stands at the marker's name is left.
+#[skuld::test]
+fn a_marker_that_cannot_be_placed_puts_back_the_flag_and_no_marker() {
+    let (dir, runs) = made_records();
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let marker = dir.path().join("Goetia").join("runs").join("nightly~removing");
+    std::fs::create_dir(&marker).unwrap();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(())).on_set_enabled(Ok(()));
+
+    let failed = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+
+    let report = failed.report().to_string();
+    assert!(report.contains("place the removal's marker"), "{report}");
+    assert!(
+        !report.contains("take the removal's marker away"),
+        "one cause is one error: {report}"
+    );
+    assert_eq!(
+        fake.calls(),
+        [
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::SetEnabled(PATH.to_owned(), true)
+        ]
+    );
+    assert!(marker.is_dir(), "nothing was taken away");
     fake.finish();
 }
 
@@ -920,7 +1029,11 @@ fn the_own_flag_is_true_after_every_outcome() {
             .on_delete(Ok(true))
             .on_register(Err(Error::os("register", std::io::Error::other("denied"))));
         let failed = change(&fake, &runs, &mut Running(vec![])).unwrap_err();
-        assert!(failed.to_string().contains("register"), "{found_flag:?}: {failed}");
+        assert!(
+            failed.report().to_string().contains("register"),
+            "{found_flag:?}: {}",
+            failed.report()
+        );
         assert!(
             matches!(fake.calls().last(), Some(Call::Register { .. })),
             "{found_flag:?}: create failed, and nothing is enabled after it"
@@ -1197,27 +1310,43 @@ fn unjudgeable_pin_fails_the_change_before_the_delete() {
     fake.finish();
 }
 
-/// What the records' creation would refuse is refused before the delete, which would leave nothing at the id: a
-/// link where the task's directory should be, and a directory where its default log should be. The task is
-/// enabled again and the marker is gone.
+/// What the records' creation would refuse is refused before anything is sent to Task Scheduler, and before the
+/// marker, which the refusal would otherwise have to take away: a link where the task's directory should be, and
+/// at its default log's name a directory, a link and a delete that is pending. The old task is not disabled, so
+/// no scheduled run in the window is skipped, and there is no flag to put back.
 #[skuld::test]
 fn what_the_records_will_refuse_is_refused_before_the_delete() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
-    for what in ["a link at runs", "a directory at the log"] {
+    for what in [
+        "a link at runs",
+        "a directory at the log",
+        "a link at the log",
+        "a delete pending at the log",
+    ] {
         let (dir, runs) = made_records();
         let target = tempfile::tempdir().unwrap();
-        if what == "a link at runs" {
-            std::fs::remove_dir(records_dir(&dir)).unwrap();
-            junction(&records_dir(&dir), target.path());
-        } else {
-            std::fs::remove_file(default_log(&dir)).unwrap();
-            std::fs::create_dir(default_log(&dir)).unwrap();
+        let mut _pending = None;
+        match what {
+            "a link at runs" => {
+                std::fs::remove_dir(records_dir(&dir)).unwrap();
+                junction(&records_dir(&dir), target.path());
+            }
+            "a directory at the log" => {
+                std::fs::remove_file(default_log(&dir)).unwrap();
+                std::fs::create_dir(default_log(&dir)).unwrap();
+            }
+            "a link at the log" => {
+                std::fs::remove_file(default_log(&dir)).unwrap();
+                std::fs::create_dir(default_log(&dir)).unwrap();
+                make_mount_point(&default_log(&dir), target.path());
+            }
+            _ => {
+                std::fs::remove_file(default_log(&dir)).unwrap();
+                _pending = Some(delete_pending(&default_log(&dir)));
+            }
         }
         let fake = Fake::new();
-        fake.on_set_enabled(Ok(()))
-            .on_instances(Ok(Vec::new()))
-            .on_set_enabled(Ok(()));
 
         let failed = scm(&fake)
             .task_write_with(
@@ -1231,16 +1360,8 @@ fn what_the_records_will_refuse_is_refused_before_the_delete() {
             .unwrap_err();
 
         assert!(matches!(failed, Error::Os { .. }), "{what}: {failed:?}");
-        assert_eq!(
-            fake.calls(),
-            [
-                Call::SetEnabled(PATH.to_owned(), false),
-                Call::Instances(PATH.to_owned()),
-                Call::SetEnabled(PATH.to_owned(), true)
-            ],
-            "{what}: the old task is left, enabled again"
-        );
-        assert!(!runs.is_closed().unwrap(), "{what}: the marker is taken away");
+        assert_eq!(fake.calls(), [], "{what}: nothing is sent to Task Scheduler");
+        assert!(!runs.is_closed().unwrap(), "{what}: no marker is placed");
         fake.finish();
     }
 }

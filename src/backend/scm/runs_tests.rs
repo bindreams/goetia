@@ -900,9 +900,12 @@ fn an_unjudgeable_pin_is_an_error() {
 
     let said = failed.report().to_string();
     assert!(said.contains("pin-odd.pin"), "{said}");
-    assert!(
-        said.contains("tell whether a run holds") && !said.contains("remove"),
-        "a read-only question does not say goetia failed to remove: {said}"
+    let Error::Os { what, .. } = &failed else {
+        panic!("one pin that cannot be judged is one error: {failed:?}")
+    };
+    assert_eq!(
+        what, "tell whether a run holds",
+        "a question about a run does not say goetia failed to remove"
     );
     assert_eq!(names(&runs), before);
     drop(refused);

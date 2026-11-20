@@ -5,10 +5,10 @@
 //! password and the logon right of a real user, the event source, and the record directory with its
 //! permissions. A failure of any is a failure with nothing sent.
 //!
-//! An account change deletes the old task, and before that it checks everything it can without changing
-//! anything: the runs and the pins, and what the records' and the log's creation would refuse ([`check_records`]).
-//! A failure after the delete is only what cannot be foreseen (a permissions write denied at that moment, the
-//! create), and leaves nothing at the id.
+//! An account change deletes the old task, and before that it checks everything it can: what the records' and the
+//! log's creation would refuse ([`check_records`], which changes nothing), then the runs and the pins (the pin
+//! check sweeps the stale pins it finds). A failure after the delete is only what cannot be foreseen (a
+//! permissions write denied at that moment, the create), and leaves nothing at the id; the error says so.
 //!
 //! A task is armed when it has triggers; an install makes it disarmed and keeps what is installed. `disable`
 //! registers the stored XML with no `Triggers`, and `enable` the stored XML as it is when it has triggers,
@@ -227,24 +227,25 @@ impl Scm {
         self.task_register(id, definition, &prepared, registering)
     }
 
-    /// The account change of [`Self::task_write_with`]. The task is disabled first (its own flag, as an
+    /// The account change of [`Self::task_write_with`]. First the records and the default log are checked for
+    /// what their creation would refuse ([`check_records`]), which depends on neither step below: a refusal
+    /// sends nothing to Task Scheduler, places no marker and changes nothing. Then the task is disabled (its own flag, as an
     /// uninstall does it, which needs no password), whatever its flag was read as: a scheduled fire between the
     /// check of its runs and the delete would start a run as the old account that nothing waits for. Then, in
     /// order: the removal's marker is placed (no shim of the task pins the records from now on); the change is
     /// refused while a run is alive ([`Error::AccountChangeRunning`]) or the records are held
-    /// ([`Error::AccountChangeHeld`]), or if the records or the default log are what their creation would refuse
-    /// ([`check_records`]); the registration is deleted; the records and the default log name the new account
-    /// alone; and the task is created, armed as the old one's triggers say.
+    /// ([`Error::AccountChangeHeld`]), the pin check sweeping the stale pins it finds; the registration is deleted; the records and the default log name the new
+    /// account alone; and the task is created, armed as the old one's triggers say.
     ///
-    /// Everything that can be found out without changing anything is found out before the delete, so a refusal
-    /// leaves the old task: the task's own flag is put back true, the marker is taken away, and a flag or a
-    /// marker that cannot be put back is reported with the failure. **After the delete** only what cannot be
-    /// foreseen can fail (a permissions write denied at that moment, the create). That leaves nothing at the id,
-    /// which no flag is put back on; an install that runs again creates it (disarmed: `enable` arms it) and
-    /// clears the marker with its narrowing.
+    /// A refusal before the delete leaves the old task: the task's own flag is put back true, the marker (if it
+    /// was placed) is taken away, and a flag or a marker that cannot be put back is reported with the failure.
+    /// **After the delete** only what cannot be foreseen can fail (a permissions write denied at that moment, the
+    /// create). That leaves nothing at the id, which no flag is put back on: the error says the old task is
+    /// removed and to install again (and, for one that was armed, to enable it after, as an install makes it
+    /// disarmed). The install that runs again clears the marker with its narrowing.
     ///
     /// **A scheduled run that falls in the window of the disable does not run**, even when the change is then
-    /// refused: its shim finds the marker, logs it, and ends as a shim failure.
+    /// refused after the marker: its shim finds the marker, logs it, and ends as a shim failure.
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
@@ -255,6 +256,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = old.id();
         let path = TaskPath::of(id);
+        check_records(id, runs)?;
         let disabled = match self.tasks.set_enabled(&path, false) {
             Ok(()) => true,
             // The task is gone: there is nothing to put back.
@@ -263,12 +265,6 @@ impl Scm {
         };
         if let Err(failed) = self.delete_for_account_change(old, runs, processes) {
             // The old task is still there, and its shims may serve it again.
-            let failed = match runs.reopen() {
-                Ok(()) => failed,
-                Err(e) => {
-                    Error::both_all([failed, Error::os("take the removal's marker away", e)]).expect("two errors")
-                }
-            };
             return Err(if disabled {
                 self.enable_again(id, failed)
             } else {
@@ -276,11 +272,16 @@ impl Scm {
             });
         }
         // No run of the old account can be left: the one that spawned held a pin or was listed.
-        task_records(id, runs, &prepared.principal, &[])?;
-        let registering = Registering::Create {
-            armed: old.has_triggers(),
-        };
-        self.task_register(id, definition, prepared, registering)
+        let created = task_records(id, runs, &prepared.principal, &[]).and_then(|()| {
+            let registering = Registering::Create {
+                armed: old.has_triggers(),
+            };
+            self.task_register(id, definition, prepared, registering)
+        });
+        created.map_err(|e| Error::Step {
+            what: removed_and_not_recreated(id, old.has_triggers()),
+            source: Box::new(e),
+        })
     }
 
     /// Puts the task's own flag back true after `failed`, which left the task: `failed` is the error, with
@@ -302,8 +303,9 @@ impl Scm {
 
     /// [`Self::task_register_again`] from the marker to the delete. The marker first, then every pin and the
     /// listing: a shim that pins before the marker is seen by the pin check or the listing, and one that pins
-    /// after it is refused ([`Runs::hold`]). A failure leaves the old task and the marker, which the caller
-    /// takes away.
+    /// after it is refused ([`Runs::hold`]). A failure leaves the old task. The marker is taken away once it is
+    /// placed (a failure to place it leaves none), and one that cannot be taken away is reported with the
+    /// failure.
     fn delete_for_account_change<P: Processes>(
         &self,
         old: &TaskSnapshot,
@@ -311,13 +313,18 @@ impl Scm {
         processes: &mut P,
     ) -> Result<()> {
         runs.close()?;
-        self.refuse_account_change_while_running(old, runs, |pid| processes.alive(pid))?;
-        check_records(old.id(), runs)?;
-        match self.tasks.delete(&TaskPath::of(old.id())) {
-            // The task is gone; a folder that stays is still there for the create.
-            Ok(_) | Err(Error::TaskFolderKept { .. }) => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.refuse_account_change_while_running(old, runs, |pid| processes.alive(pid))
+            .and_then(|()| match self.tasks.delete(&TaskPath::of(old.id())) {
+                // The task is gone; a folder that stays is still there for the create.
+                Ok(_) | Err(Error::TaskFolderKept { .. }) => Ok(()),
+                Err(e) => Err(e),
+            })
+            .map_err(|failed| match runs.reopen() {
+                Ok(()) => failed,
+                Err(e) => {
+                    Error::both_all([failed, Error::os("take the removal's marker away", e)]).expect("two errors")
+                }
+            })
     }
 
     /// Refuses installing `old`, a task, as another account while it runs ([`Error::AccountChangeRunning`]) or
@@ -385,6 +392,20 @@ fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
     })
 }
 
+/// What an account change tells when it fails after it deleted the old task of `id`: the task is gone, so the
+/// failure is no refusal that left it. An install creates a task disarmed, so one that was `armed` is enabled after.
+fn removed_and_not_recreated(id: &Id, armed: bool) -> String {
+    let enable = if armed {
+        format!(", then run `goetia daemon enable {id}`, as the old task was armed")
+    } else {
+        String::new()
+    };
+    format!(
+        "installing `{id}` as another account failed after its old task was already removed, so nothing is installed \
+         at `{id}`: re-run install{enable}"
+    )
+}
+
 /// "its account" or "its accounts", counting duplicates once.
 fn whose(accounts: &[Sid]) -> &'static str {
     if distinct(accounts).len() == 1 {
@@ -407,7 +428,7 @@ fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept_log: &[Sid]) -> Resu
 /// What [`task_records`] would refuse as things stand, found without changing anything: the record directory
 /// that is a link ([`Runs::check_directory`]), and the default log that is a directory, a link or being deleted
 /// ([`default_log::check`]). Both are the judgements `task_records` makes, so none is written twice. An account
-/// change calls it before it deletes the old task, which would otherwise leave nothing at the id.
+/// change calls it first, before anything is sent: the delete of the old task would otherwise leave nothing at the id.
 fn check_records(id: &Id, runs: &Runs) -> Result<()> {
     runs.check_directory()
         .map_err(|e| Error::os(format!("use the run records of `{id}`"), e))?;
