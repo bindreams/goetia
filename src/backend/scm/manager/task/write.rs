@@ -35,7 +35,7 @@ use crate::backend::scm::manager::{
     Password, Scm, ScmSnapshot, accounts_kept_before_change, apply_gated, make_default_log, registered_account,
     registered_account_sid, registry, service_gate, written_user,
 };
-use crate::backend::scm::runs::Runs;
+use crate::backend::scm::runs::{Runs, unfinished_change};
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::sid::{Sid, distinct, sid_from_parts};
@@ -514,11 +514,13 @@ fn task_beside_with(
 
 impl Scm {
     pub(in crate::backend::scm) fn task_enable(&self, snapshot: &TaskSnapshot) -> Result<()> {
-        self.task_set_armed_with(snapshot, true, identity::service_password)
+        let runs = Runs::of(&program_data()?, snapshot.id());
+        self.task_set_armed_with(snapshot, true, &runs, identity::service_password)
     }
 
     pub(in crate::backend::scm) fn task_disable(&self, snapshot: &TaskSnapshot) -> Result<()> {
-        self.task_set_armed_with(snapshot, false, identity::service_password)
+        let runs = Runs::of(&program_data()?, snapshot.id());
+        self.task_set_armed_with(snapshot, false, &runs, identity::service_password)
     }
 
     /// Registers `snapshot`'s task again armed or not, and nothing else changed. `disable` removes the
@@ -526,12 +528,26 @@ impl Scm {
     /// they are and sets the task's own flag; when there is none, it compiles them from the blob (a blob
     /// that will not decode is the error). Either way the task's own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
+    ///
+    /// A marker that stands in `runs` means an install or an uninstall is running or did not finish, and only
+    /// those two finish it: both verbs refuse first, before the password is asked for, and send nothing.
     pub(super) fn task_set_armed_with(
         &self,
         snapshot: &TaskSnapshot,
         armed: bool,
+        runs: &Runs,
         password: impl FnOnce() -> Result<Option<String>>,
     ) -> Result<()> {
+        let (verb, id) = (if armed { "enable" } else { "disable" }, snapshot.id());
+        let closed = runs
+            .is_closed()
+            .map_err(|e| Error::os(format!("check whether `{id}` is being installed or uninstalled"), e))?;
+        if closed {
+            return Err(Error::os(
+                format!("{verb} `{id}`"),
+                std::io::Error::new(std::io::ErrorKind::ResourceBusy, unfinished_change(id.as_str())),
+            ));
+        }
         let registered = snapshot.registered();
         let xml = if !armed {
             TaskXml::without_triggers(&registered.xml)?

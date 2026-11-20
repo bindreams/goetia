@@ -354,6 +354,14 @@ fn check_stopped(id: &Id, runs: &Runs, stopped: &[InstanceId]) -> Result<()> {
     Ok(())
 }
 
+/// Who holds the pin of [`Scm::task_stop_with`].
+pub(super) enum StopPin {
+    /// The caller took it before the call, or found no records to pin (`None`): the stop takes no other.
+    Caller(Option<Pin>),
+    /// The stop takes its own, when it has a run to wait for.
+    Own,
+}
+
 impl Scm {
     /// `start` of a task: Task Scheduler is asked to run it, and the call returns once it has accepted.
     /// A run that is alive makes it start nothing (`IgnoreNew`), which is no failure. A restart's start
@@ -391,7 +399,7 @@ impl Scm {
     /// `stop` of a task: [`Self::task_stop_with`] over the machine's processes and the task's records.
     pub(in crate::backend::scm) fn task_stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let runs = Runs::of(&program_data()?, id);
-        self.task_stop_with("stop", id, budget, &runs, None, &mut System)
+        self.task_stop_with("stop", id, budget, &runs, StopPin::Own, &mut System)
     }
 
     /// Every run of the task ended ([`stop_runs`]), and then read in its record: a stop whose shim could
@@ -406,21 +414,25 @@ impl Scm {
     /// other refusal is an error, worded as any verb's refusal is (a denial for access denied): that
     /// includes the pin refused because the records are being removed, which is not "no records".
     ///
-    /// `pin` is the caller's own, taken before the call (an uninstall that placed the marker itself takes
-    /// its pin past it, [`pin_records`]): the stop takes none of its own, and lets go of the caller's when
-    /// it returns. `None` is a stop that takes its own, as a `stop` does.
+    /// `pin` is who takes the pin: [`StopPin::Caller`] has taken it before the call (an uninstall that placed
+    /// the marker itself takes its pin past it, [`pin_records`]), possibly none for a task with no records:
+    /// the stop takes none of its own, and lets go of the caller's when it returns. [`StopPin::Own`] is a stop
+    /// that takes its own, as a `stop` does.
     pub(super) fn task_stop_with<P: Processes>(
         &self,
         operation: &'static str,
         id: &Id,
         budget: Budget,
         runs: &Runs,
-        pin: Option<Pin>,
+        pin: StopPin,
         processes: &mut P,
     ) -> Result<()> {
-        let mut pin = pin;
+        let (mut pin, takes_own) = match pin {
+            StopPin::Caller(pin) => (pin, false),
+            StopPin::Own => (None, true),
+        };
         let stopped = stop_runs(&*self.tasks, operation, id, budget, processes, || {
-            if pin.is_none() {
+            if takes_own {
                 pin = pin_records(operation, id, runs, MarkerCheck::Refuse)?;
             }
             Ok(())

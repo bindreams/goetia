@@ -44,7 +44,7 @@ fn two() -> Result<Vec<Instance>> {
 }
 
 fn stopped(fake: &Fake, machine: &mut Machine, runs: &Runs, budget: Budget) -> Result<()> {
-    scm(fake).task_stop_with("stop", &id(), budget, runs, None, machine)
+    scm(fake).task_stop_with("stop", &id(), budget, runs, StopPin::Own, machine)
 }
 
 // Stop ================================================================================================================
@@ -377,7 +377,10 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
 
     let failed = during.expect("the removal waited").unwrap_err();
     let report = failed.report().to_string();
-    assert!(report.contains("being removed"), "{report}");
+    assert!(
+        report.contains("`nightly` is being, or did not finish being, installed or uninstalled"),
+        "{report}"
+    );
     assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
     assert!(machine.waited.is_empty());
 }
@@ -420,13 +423,17 @@ fn the_stops_pin_is_released_when_it_returns() {
     drop(dir);
 }
 
-/// A stop under the caller's pin takes none of its own: the marker the caller placed would refuse it, and
-/// the one pin there is, is the caller's.
-#[skuld::test]
-fn stop_with_the_callers_pin_takes_none_of_its_own() {
+/// A stop of the run `1` whose shim writes its record as it ends: the pins the records hold at that moment,
+/// and the pins left once the stop has returned. With a `caller`, the uninstall's marker stands and the pin
+/// is the caller's, taken past it.
+fn pins_while_the_run_ends(caller: bool) -> (Vec<usize>, usize) {
     let (dir, path, runs) = records();
-    runs.close().unwrap();
-    let pin = runs.hold_with(MarkerCheck::Ignore).unwrap();
+    let pin = if caller {
+        runs.close().unwrap();
+        StopPin::Caller(Some(runs.hold_with(MarkerCheck::Ignore).unwrap()))
+    } else {
+        StopPin::Own
+    };
     let fake = Fake::new();
     fake.on_instances(one(4242))
         .on_instances(one(4242))
@@ -443,42 +450,25 @@ fn stop_with_the_callers_pin_takes_none_of_its_own() {
     });
 
     scm(&fake)
-        .task_stop_with("uninstall", &id(), Budget::Unbounded, &runs, Some(pin), &mut machine)
+        .task_stop_with("uninstall", &id(), Budget::Unbounded, &runs, pin, &mut machine)
         .unwrap();
 
-    assert_eq!(
-        *seen.lock().unwrap(),
-        [1],
-        "the caller's pin, and no other, while the run ended"
-    );
-    assert_eq!(pins_in(&path), 0, "the caller's pin is released when the stop returns");
     fake.finish();
+    let seen = seen.lock().unwrap().clone();
+    (seen, pins_in(&path))
 }
 
-/// A stop with no pin of the caller's takes its own while a run ends, as it always has.
+/// A stop under the caller's pin takes none of its own: the marker the caller placed would refuse it, and
+/// the one pin there is, is the caller's, which the stop lets go of when it returns.
+#[skuld::test]
+fn stop_with_the_callers_pin_takes_none_of_its_own() {
+    assert_eq!(pins_while_the_run_ends(true), (vec![1], 0));
+}
+
+/// A stop that is not given a pin takes its own while a run ends, as it always has.
 #[skuld::test]
 fn stop_with_no_pin_takes_its_own_as_before() {
-    let (dir, path, runs) = records();
-    let fake = Fake::new();
-    fake.on_instances(one(4242))
-        .on_instances(one(4242))
-        .on_instances(one(4242))
-        .on_stop(Ok(()));
-    let mut machine = Machine::new(&fake, &[4242]);
-    let shim = Runs::of(dir.path(), &id());
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let watcher = seen.clone();
-    let watched = path.clone();
-    machine.on_exit = Box::new(move |_| {
-        watcher.lock().unwrap().push(pins_in(&watched));
-        shim_writes(&shim, &record(1, RunOutcome::Stopped));
-    });
-
-    stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
-
-    assert_eq!(*seen.lock().unwrap(), [1], "its own pin while the run ended");
-    assert_eq!(pins_in(&path), 0);
-    fake.finish();
+    assert_eq!(pins_while_the_run_ends(false), (vec![1], 0));
 }
 
 #[skuld::test]

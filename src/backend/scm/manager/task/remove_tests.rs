@@ -5,7 +5,6 @@
 use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
@@ -508,21 +507,26 @@ fn a_failed_delete_leaves_the_records_for_the_retry() {
 struct Watch {
     log: Arc<Mutex<Vec<String>>>,
     dir: PathBuf,
-    marker: PathBuf,
+    runs: Arc<Runs>,
 }
 
 impl Watch {
-    fn new(dir: &Path) -> Self {
+    /// A watch of the records directory `dir` under the temporary `%ProgramData%` `program_data`.
+    fn new(program_data: &Path, dir: &Path) -> Self {
         Self {
             log: Arc::default(),
-            marker: dir.with_file_name(format!("{}~removing", id())),
+            runs: Arc::new(Runs::of(program_data, &id())),
             dir: dir.to_owned(),
         }
     }
 
+    fn marker_stands(&self) -> bool {
+        self.runs.is_closed().unwrap()
+    }
+
     fn note(&self, step: &str) {
         let pins = if self.dir.exists() { pins_in(&self.dir) } else { 0 };
-        let line = format!("{step}: marker={} pins={pins}", self.marker.exists());
+        let line = format!("{step}: marker={} pins={pins}", self.marker_stands());
         self.log.lock().unwrap().push(line);
     }
 
@@ -542,7 +546,7 @@ impl Watch {
 fn uninstall_order() {
     let (dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
-    let watch = Watch::new(&records_dir);
+    let watch = Watch::new(dir.path(), &records_dir);
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
         .during(watch.at("disable"))
@@ -575,7 +579,7 @@ fn uninstall_order() {
         ]
     );
     assert!(
-        !records_dir.exists() && !watch.marker.exists(),
+        !records_dir.exists() && !watch.marker_stands(),
         "the records and the marker go last"
     );
     fake.finish();
@@ -606,47 +610,18 @@ fn uninstall_does_not_refuse_itself_with_its_own_marker() {
     fake.finish();
 }
 
-/// A run that appears in the listing only after the marker (a shim that passed its own marker check just
-/// before it) is stopped: the first listing is read after the marker, never before.
-#[skuld::test]
-fn uninstall_stops_a_run_listed_only_after_the_marker() {
-    let (_dir, records_dir, runs) = records();
-    let spec = task_spec(Some("30 3 * * *"));
-    let marker = Watch::new(&records_dir).marker;
-    let after_marker = Arc::new(AtomicBool::new(false));
-    let seen = after_marker.clone();
-    let fake = Fake::new();
-    fake.on_set_enabled(Ok(()))
-        .on_instances(Ok(vec![instance(1, 4242)]))
-        .during(move || seen.store(marker.exists(), Ordering::SeqCst))
-        .on_instances(Ok(vec![instance(1, 4242)]))
-        .on_instances(Ok(vec![instance(1, 4242)]))
-        .on_stop(Ok(()))
-        .on_delete(Ok(true));
-    let mut machine = Machine::new(&fake, &[4242]);
-
-    scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
-        .unwrap();
-
-    assert!(
-        after_marker.load(Ordering::SeqCst),
-        "the marker stood at the first listing"
-    );
-    assert!(fake.calls().contains(&Call::Stop(PATH.to_owned(), instance_id(1))));
-    fake.finish();
-}
-
-/// With no directory of records there is no marker to place and no pin to take, and nothing is waited for:
-/// the run is stopped, its record is none, and the task goes.
+/// With no directory of records there is no pin to take, and nothing is waited for: the run is stopped, its
+/// record is none, and the task goes. The marker is placed all the same, while the `runs` folder stands.
 #[skuld::test]
 fn uninstall_of_a_task_with_no_records_directory_waits_for_nothing() {
-    let (_dir, records_dir, runs) = records();
+    let (dir, records_dir, runs) = records();
     std::fs::remove_dir(&records_dir).unwrap();
     let spec = task_spec(Some("30 3 * * *"));
+    let watch = Watch::new(dir.path(), &records_dir);
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
         .on_instances(Ok(vec![instance(1, 4242)]))
+        .during(watch.at("list"))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()))
@@ -657,12 +632,63 @@ fn uninstall_of_a_task_with_no_records_directory_waits_for_nothing() {
         .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
         .unwrap();
 
-    assert!(
-        !Watch::new(&records_dir).marker.exists(),
-        "no marker is placed beside no records"
+    assert_eq!(
+        watch.seen(),
+        ["list: marker=true pins=0"],
+        "the marker stood at the first listing, though there is no directory"
     );
     assert_eq!(machine.waited.len(), 1);
     fake.finish();
+}
+
+/// An uninstall whose own pin found no records (the directory was not there then) takes no second pin: the
+/// marker it placed would refuse one. The run is stopped all the same.
+#[skuld::test]
+fn uninstall_whose_own_pin_found_no_records_is_not_refused_by_its_marker() {
+    let (_dir, records_dir, runs) = records();
+    std::fs::remove_dir(&records_dir).unwrap();
+    let spec = task_spec(Some("30 3 * * *"));
+    let made = records_dir.clone();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .during(move || std::fs::create_dir(&made).unwrap())
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_stop(Ok(()))
+        .on_delete(Ok(true));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .unwrap();
+
+    assert!(fake.calls().contains(&Call::Stop(PATH.to_owned(), instance_id(1))));
+    assert_eq!(machine.waited.len(), 1);
+    fake.finish();
+}
+
+/// A task the disable found gone is not "disabled" when a later step fails: the error says it is not
+/// installed and that records are what is left.
+#[skuld::test]
+fn a_failure_after_a_disable_that_found_the_task_gone_does_not_say_it_is_disabled() {
+    let (_dir, _records_dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Err(Error::NotInstalled { id: "nightly".into() }))
+        .on_instances(Err(Error::os(
+            "list the runs of `nightly`",
+            io::Error::other("listing failed"),
+        )));
+    let mut machine = Machine::new(&fake, &[]);
+
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .unwrap_err();
+
+    let text = failed.to_string();
+    assert!(!text.contains("NOT deleted") && !text.contains("It is disabled"), "{text}");
+    assert!(text.contains("`nightly` is not installed"), "{text}");
 }
 
 /// An uninstall that failed after its marker (an incomplete stop) leaves the task disabled and the marker; the
@@ -671,7 +697,7 @@ fn uninstall_of_a_task_with_no_records_directory_waits_for_nothing() {
 fn rerun_after_an_incomplete_stop_finishes() {
     let (dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
-    let marker = Watch::new(&records_dir).marker;
+    let watch = Watch::new(dir.path(), &records_dir);
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
         .on_instances(Ok(vec![instance(1, 4242)]))
@@ -684,7 +710,7 @@ fn rerun_after_an_incomplete_stop_finishes() {
     scm(&fake)
         .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
         .unwrap_err();
-    assert!(marker.exists(), "the failed uninstall keeps its marker");
+    assert!(watch.marker_stands(), "the failed uninstall keeps its marker");
     assert_eq!(pins_in(&records_dir), 0, "and not its pin");
 
     let again = Fake::new();
@@ -697,7 +723,7 @@ fn rerun_after_an_incomplete_stop_finishes() {
         .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
         .unwrap();
 
-    assert!(!records_dir.exists() && !marker.exists());
+    assert!(!records_dir.exists() && !watch.marker_stands());
     again.finish();
 }
 
@@ -706,9 +732,9 @@ fn rerun_after_an_incomplete_stop_finishes() {
 /// the uninstall does not wait for it before the delete, and finishes once it has.
 #[skuld::test]
 fn a_shim_pinned_before_the_marker_ends_when_the_task_is_deleted() {
-    let (_dir, records_dir, runs) = records();
+    let (dir, records_dir, runs) = records();
     let spec = task_spec(Some("30 3 * * *"));
-    let watch = Watch::new(&records_dir);
+    let watch = Watch::new(dir.path(), &records_dir);
     let shim_pin = runs.hold().unwrap();
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
@@ -732,7 +758,7 @@ fn a_shim_pinned_before_the_marker_ends_when_the_task_is_deleted() {
         ["delete: marker=true pins=1"],
         "the shim's pin was held at the delete"
     );
-    assert!(!records_dir.exists() && !watch.marker.exists());
+    assert!(!records_dir.exists() && !watch.marker_stands());
     fake.finish();
 }
 

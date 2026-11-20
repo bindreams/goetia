@@ -16,8 +16,9 @@
 //! pin's holder did not see yet is whatever [`Pin::appeared`] lists: the records written after the
 //! pin's directory listing, which was taken after the pin. **No operation deletes a record while a pin
 //! is held:** a write prunes nothing, and [`Runs::remove_all`] waits for the pins first. A pin made
-//! after that wait began is refused, by the marker the removal places first ([`Runs::hold`]); so once
-//! the marker is there the pins that exist are final, and the removal waits for those alone.
+//! after the marker is placed is refused ([`Runs::hold`]), but for the one pin of the uninstall that placed
+//! it, taken past it ([`MarkerCheck::Ignore`]) and let go before the removal waits. The pins the removal
+//! waits for are those made before the marker.
 //!
 //! **`started` only orders** the records of runs that overlap: no decision compares it to the time.
 //!
@@ -103,8 +104,18 @@ struct Stored {
     outcome: RunOutcome,
 }
 
+/// What a refusal says when the removal's marker stands: an install or an uninstall of `id` is running or did not
+/// finish, and only those two finish it. One text for every refusal the marker causes.
+pub(crate) fn unfinished_change(id: &str) -> String {
+    format!(
+        "`{id}` is being, or did not finish being, installed or uninstalled; if nothing is doing that now, run the \
+         install again with `--force`, or run `goetia daemon uninstall {id}`"
+    )
+}
+
 /// The directory of one task's records.
 pub(crate) struct Runs {
+    id: String,
     /// `<ProgramData>\Goetia\runs`, which holds the directories and the markers.
     root: PathBuf,
     dir: PathBuf,
@@ -239,6 +250,7 @@ impl Runs {
     pub(crate) fn of(program_data: &std::path::Path, id: &Id) -> Runs {
         let runs = goetia_folder(program_data).join("runs");
         Runs {
+            id: id.to_string(),
             dir: runs.join(id.to_string()),
             marker: runs.join(format!("{id}{REMOVING}")),
             root: runs,
@@ -299,9 +311,9 @@ impl Runs {
         }
     }
 
-    /// Places the removal's marker, beside the directory: from then on no pin is accepted
-    /// ([`Runs::hold`]) and the pins that exist are final. Placing it again changes nothing. With `runs` gone
-    /// nothing is placed ([`Closed::NoRecords`]): there are no records to protect.
+    /// Places the removal's marker, beside the directory: from then on no pin is accepted ([`Runs::hold`]),
+    /// except one taken with [`MarkerCheck::Ignore`] by whoever placed it. Placing it again changes nothing.
+    /// With `runs` gone nothing is placed ([`Closed::NoRecords`]): there are no records to protect.
     pub(crate) fn close(&self) -> Result<Closed> {
         match fs::OpenOptions::new()
             .write(true)
@@ -406,7 +418,7 @@ impl Runs {
     /// and drops the pin. The marker is beside the directory and goes after it, so no pin is accepted at
     /// any point of the delete; one about to be refused can be in the directory for a moment, and is waited
     /// for as any is. A pin that finds the marker is refused with an [`io::ErrorKind::ResourceBusy`]
-    /// error that says the records are being removed. It is not [`io::ErrorKind::NotFound`], which a
+    /// error that says an install or an uninstall is running or did not finish ([`unfinished_change`]). It is not [`io::ErrorKind::NotFound`], which a
     /// directory already removed gives and which a caller may take as "no records".
     pub(crate) fn hold(&self) -> io::Result<Pin> {
         self.hold_with(MarkerCheck::Refuse)
@@ -435,8 +447,11 @@ impl Runs {
         if matches!(removing, Ok(true)) {
             return Err(io::Error::new(
                 io::ErrorKind::ResourceBusy,
-                "the task's run records are being removed or handed to another account (an uninstall, or a change \
-                 of the task's type or account)",
+                format!(
+                    "the run records of `{}` are closed to a new pin: {}",
+                    self.id,
+                    unfinished_change(&self.id)
+                ),
             ));
         }
         let (file, _path) = made?.into_parts();

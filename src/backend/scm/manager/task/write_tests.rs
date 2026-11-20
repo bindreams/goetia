@@ -2347,10 +2347,14 @@ fn disable_writes_no_triggers_and_enable_writes_the_compiled_ones_and_both_keep_
     fake.on_register(Ok(Registration::Created))
         .on_register(Ok(Registration::Created));
     let scm = scm(&fake);
+    let (_dir, runs) = records();
 
-    scm.task_set_armed_with(&TaskSnapshot::new(id(), Ok(blob(&spec)), armed.clone()), false, || {
-        panic!("a service account reads no password")
-    })
+    scm.task_set_armed_with(
+        &TaskSnapshot::new(id(), Ok(blob(&spec)), armed.clone()),
+        false,
+        &runs,
+        || panic!("a service account reads no password"),
+    )
     .unwrap();
     let calls = fake.calls();
     let Call::Register {
@@ -2378,7 +2382,7 @@ fn disable_writes_no_triggers_and_enable_writes_the_compiled_ones_and_both_keep_
         data: armed.data.clone(),
         enabled: armed.enabled,
     };
-    scm.task_set_armed_with(&TaskSnapshot::new(id(), Ok(blob(&spec)), disabled), true, || {
+    scm.task_set_armed_with(&TaskSnapshot::new(id(), Ok(blob(&spec)), disabled), true, &runs, || {
         panic!("a service account reads no password")
     })
     .unwrap();
@@ -2429,7 +2433,8 @@ fn enable_keeps_the_triggers_that_are_there_and_needs_no_blob_for_them() {
         let fake = Fake::new();
         fake.on_register(Ok(Registration::Created));
         let scm = scm(&fake);
-        scm.task_set_armed_with(&TaskSnapshot::new(id(), blob, off.clone()), true, || Ok(None))
+        let (_dir, runs) = records();
+        scm.task_set_armed_with(&TaskSnapshot::new(id(), blob, off.clone()), true, &runs, || Ok(None))
             .unwrap();
         let calls = fake.calls();
         let Call::Register { xml, .. } = &calls[0] else {
@@ -2456,8 +2461,9 @@ fn enable_of_a_task_whose_blob_will_not_decode_is_refused_before_a_write_and_dis
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let scm = scm(&fake);
+    let (_dir, runs) = records();
 
-    scm.task_set_armed_with(&undecodable(armed.clone()), false, || Ok(None))
+    scm.task_set_armed_with(&undecodable(armed.clone()), false, &runs, || Ok(None))
         .unwrap();
     let calls = fake.calls();
     let Call::Register { xml: disarmed, .. } = &calls[0] else {
@@ -2471,7 +2477,7 @@ fn enable_of_a_task_whose_blob_will_not_decode_is_refused_before_a_write_and_dis
         enabled: armed.enabled,
     };
     let refused = scm
-        .task_set_armed_with(&undecodable(disabled), true, || Ok(None))
+        .task_set_armed_with(&undecodable(disabled), true, &runs, || Ok(None))
         .unwrap_err();
     assert!(refused.to_string().contains("will not decode"), "{refused}");
     assert_eq!(fake.calls().len(), 1, "nothing was sent");
@@ -2502,9 +2508,12 @@ fn enable_of_a_schedule_that_never_fires_arms_it() {
     assert!(!installed.armed());
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
 
     scm(&fake)
-        .task_set_armed_with(&installed, true, || panic!("a service account reads no password"))
+        .task_set_armed_with(&installed, true, &runs, || {
+            panic!("a service account reads no password")
+        })
         .unwrap();
 
     let calls = fake.calls();
@@ -2520,8 +2529,9 @@ fn enable_of_a_schedule_that_never_fires_arms_it() {
 fn enable_of_a_real_user_task_without_its_password_is_refused_before_any_write() {
     let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
     let fake = Fake::new();
+    let (_dir, runs) = records();
 
-    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, false), true, || Ok(None));
+    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || Ok(None));
 
     assert!(
         matches!(&refused, Err(Error::PasswordRequired { account, kind: DaemonKind::Task }) if account == "alice"),
@@ -2534,8 +2544,9 @@ fn enable_of_a_real_user_task_without_its_password_is_refused_before_any_write()
 fn disable_of_a_real_user_task_without_its_password_is_refused_before_any_write() {
     let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
     let fake = Fake::new();
+    let (_dir, runs) = records();
 
-    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, true), false, || Ok(None));
+    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, true), false, &runs, || Ok(None));
 
     assert!(matches!(refused, Err(Error::PasswordRequired { .. })), "{refused:?}");
     assert_eq!(fake.calls(), []);
@@ -2546,9 +2557,10 @@ fn enable_of_a_real_user_task_registers_it_again_with_its_password() {
     let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
 
     scm(&fake)
-        .task_set_armed_with(&snapshot_of(&spec, false), true, || Ok(Some("secret".to_owned())))
+        .task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || Ok(Some("secret".to_owned())))
         .unwrap();
 
     let calls = fake.calls();
@@ -2568,12 +2580,48 @@ fn enable_of_a_task_that_went_meanwhile_is_not_installed() {
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Raced));
+    let (_dir, runs) = records();
 
     let failed = scm(&fake)
-        .task_set_armed_with(&snapshot_of(&spec, false), true, || Ok(None))
+        .task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || Ok(None))
         .unwrap_err();
 
     assert!(matches!(failed, Error::NotInstalled { id } if id == "nightly"));
+}
+
+/// A marker that stands means an install or an uninstall is running or did not finish, and only those two finish
+/// it: `enable` and `disable` refuse before the password is asked for, send nothing to Task Scheduler and leave
+/// the marker.
+fn arming_is_refused_while_the_marker_stands(armed: bool) {
+    let spec = task_spec(Some("30 3 * * *"));
+    let (_dir, runs) = made_records();
+    runs.close().unwrap();
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .task_set_armed_with(&snapshot_of(&spec, !armed), armed, &runs, || {
+            panic!("the refusal comes before the password is asked for")
+        })
+        .unwrap_err();
+
+    let text = refused.report().to_string();
+    assert!(
+        text.contains("`nightly` is being, or did not finish being, installed or uninstalled")
+            && text.contains("goetia daemon uninstall nightly"),
+        "{text}"
+    );
+    assert_eq!(fake.calls(), [], "nothing was sent to Task Scheduler");
+    assert!(runs.is_closed().unwrap(), "the marker still stands");
+}
+
+#[skuld::test]
+fn enable_is_refused_while_the_marker_stands() {
+    arming_is_refused_while_the_marker_stands(true);
+}
+
+#[skuld::test]
+fn disable_is_refused_while_the_marker_stands() {
+    arming_is_refused_while_the_marker_stands(false);
 }
 
 /// A task whose blob will not decode still has a principal, and a verb that re-registers it uses that.

@@ -1562,12 +1562,16 @@ fn account_change_running(id: &str) -> String {
     )
 }
 
+/// What can hold a task's run records, as a message says it: the holders an account change
+/// ([`Error::AccountChangeHeld`]) and an uninstall's wait for the records both name.
+pub(crate) const RECORD_HOLDERS: &str = "a run that is starting, a `run` or `stop` of the task, or another program";
+
 /// The message of [`Error::AccountChangeHeld`].
 fn account_change_held(id: &str, pin: &Path) -> String {
     format!(
-        "`{id}` cannot change its account now: its run records are held (`{}`) by a run that is starting, a \
-         `run` or `stop` of it, or another program, and installing it as another account registers it again, \
-         which hands them to the new account: wait for that to end, then re-run install",
+        "`{id}` cannot change its account now: its run records are held (`{}`) by {RECORD_HOLDERS}, and installing \
+         it as another account registers it again, which hands them to the new account: wait for that to end, then \
+         re-run install",
         pin.display()
     )
 }

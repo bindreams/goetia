@@ -741,7 +741,12 @@ fn a_pin_or_hold_taken_after_the_removal_began_backs_off_and_leaves_no_file() {
 
     for refused in [pin, hold] {
         assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy);
-        assert!(refused.to_string().contains("being removed"), "{refused}");
+        let text = refused.to_string();
+        assert!(
+            text.contains("the run records of `frpc`")
+                && text.contains("`frpc` is being, or did not finish being, installed or uninstalled"),
+            "{text}"
+        );
     }
     assert_eq!(names(&runs), [file_of(&instance(1))]);
 }
@@ -1453,7 +1458,7 @@ fn a_pin_that_cannot_be_made_while_the_records_are_being_removed_says_so() {
     let refused = runs.hold_in(held, MarkerCheck::Refuse).err().expect("a pin is refused");
 
     assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy, "{refused}");
-    assert!(refused.to_string().contains("being removed"), "{refused}");
+    assert!(refused.to_string().contains("did not finish being"), "{refused}");
 }
 
 /// The directory becomes a mount point during the removal, as its account can make it of an empty one: here
