@@ -1193,7 +1193,8 @@ fn the_own_flag_is_true_after_every_outcome() {
 
 /// The armed state of the new registration is the old one's triggers and nothing else: a task whose own flag was
 /// off (a change or an uninstall that was cut short disabled it) or not said is still created armed if it had
-/// triggers, and one with none is created without.
+/// triggers, and one with none is created without. The removal's marker stands in each case, as an uninstall that
+/// died leaves it with the flag off, and the change takes it away.
 #[skuld::test]
 fn account_change_takes_armed_from_the_triggers_alone() {
     let old = as_service("LocalService");
@@ -1210,6 +1211,7 @@ fn account_change_takes_armed_from_the_triggers_alone() {
         (unread(false), false),
     ] {
         let (_dir, runs) = made_records();
+        runs.close().unwrap();
         let fake = Fake::new();
         fake.on_set_enabled(Ok(()))
             .on_instances(Ok(Vec::new()))
@@ -1233,6 +1235,7 @@ fn account_change_takes_armed_from_the_triggers_alone() {
             Some(&register_call(&new, armed, service("S-1-5-20"), None, false, &token)),
             "armed={armed}"
         );
+        assert!(!runs.is_closed().unwrap(), "armed={armed}: the marker is taken away");
         fake.finish();
     }
 }
@@ -1251,13 +1254,15 @@ fn registered_flag_off(spec: &DaemonSpec, triggers: bool) -> Registered {
 /// A forced install, or one that finds the blob stale (a plain one is a conflict, the flag being compared), over a
 /// task of the same account whose own flag is off (a change that was cut short disabled it) is armed as its
 /// triggers say, as an account change is, and writes the flag true: a task with triggers is not silently
-/// disarmed, and one with none stays so.
+/// disarmed, and one with none stays so. The removal's marker an uninstall left (the flag is off with it) is
+/// taken away by the write.
 #[skuld::test]
 fn an_update_of_a_task_with_its_flag_off_is_armed_by_its_triggers_alone() {
     let spec = task_spec(Some("30 3 * * *"));
     let rescheduled = task_spec(Some("0 4 * * *"));
     for triggers in [true, false] {
         let (_dir, runs) = made_records();
+        runs.close().unwrap();
         let fake = Fake::new();
         fake.on_register(Ok(Registration::Created));
         let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_flag_off(&spec, triggers));
@@ -1277,6 +1282,10 @@ fn an_update_of_a_task_with_its_flag_off_is_armed_by_its_triggers_alone() {
             fake.calls(),
             [register_call(&rescheduled, triggers, root(), None, true, &task_token())],
             "triggers={triggers}"
+        );
+        assert!(
+            !runs.is_closed().unwrap(),
+            "triggers={triggers}: the marker is taken away"
         );
         fake.finish();
     }
@@ -2405,7 +2414,7 @@ fn enable_keeps_the_triggers_that_are_there_and_needs_no_blob_for_them() {
         enabled: armed.enabled,
     };
     assert!(hand_added.xml.contains("LogonTrigger"), "the edit is made");
-    // Off by its own flag, as an uninstall that did not finish leaves it.
+    // Off by its own flag, as an install or an uninstall that did not finish leaves it.
     let off = Registered {
         xml: hand_added
             .xml

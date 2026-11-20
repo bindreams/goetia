@@ -54,10 +54,12 @@ fn ole_dates_keep_their_order() {
     assert!(apart(later, earlier) >= Duration::from_secs(23 * 3600));
 }
 
-// A task is left with its own flag false by an `uninstall` or an install that changed its account and did not
-// finish, so a `Run` of one names both causes and both remedies: `enable` moves it on, `uninstall` removes it.
+// A task is left with its own flag false by an install or an uninstall that did not finish, so a `Run` of one
+// names that cause and the two remedies that are always right: the install again with `--force`, and `uninstall`.
+// It names no `enable`, which is refused for a task with no schedule, arms one that was disarmed, and leaves the
+// removal's marker.
 #[skuld::test]
-fn a_run_refused_for_a_disabled_task_names_both_causes_and_both_remedies() {
+fn a_run_refused_for_a_disabled_task_names_the_cause_and_both_remedies() {
     use windows::Win32::Foundation::{E_ACCESSDENIED, SCHED_E_TASK_DISABLED};
 
     let disabled = Error::os("start `\\Goetia\\x`", windows::core::Error::from(SCHED_E_TASK_DISABLED));
@@ -65,15 +67,14 @@ fn a_run_refused_for_a_disabled_task_names_both_causes_and_both_remedies() {
 
     let text = said.to_string();
     assert!(
-        text.contains("`x` is disabled")
-            && text.contains("an `uninstall` or an install that changed its account did not finish"),
-        "both causes are named: {text}"
+        text.contains("`x` is disabled") && text.contains("an install or an uninstall of `x` did not finish"),
+        "the cause is named: {text}"
     );
     assert!(
-        text.contains("`goetia daemon enable x` switches it on again")
-            && text.contains("`goetia daemon uninstall x` removes it"),
+        text.contains("Run the install again with `--force`") && text.contains("`goetia daemon uninstall x`"),
         "both remedies are named: {text}"
     );
+    assert!(!text.contains("enable"), "no `enable`: {text}");
     assert!(com_code(&said) == Some(SCHED_E_TASK_DISABLED), "the cause is kept");
 
     let other = Error::os("start `\\Goetia\\x`", windows::core::Error::from(E_ACCESSDENIED));

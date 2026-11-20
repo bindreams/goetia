@@ -23,6 +23,7 @@ use std::path::Path;
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
+use super::read::StoredRegistration;
 use super::verbs::{Processes, System, gone};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::scm::default_log::{self, Naming, Step};
@@ -217,7 +218,7 @@ impl Scm {
         let prepared = prepare(&definition.account())?;
         let registering = match stored {
             Some((old, stored)) if stored.principal.as_ref() != Some(&prepared.principal) => {
-                return self.task_register_again(old, stored.has_triggers, definition, runs, processes, &prepared);
+                return self.task_register_again(old, &stored, definition, runs, processes, &prepared);
             }
             Some((_, stored)) => Registering::Update {
                 armed: stored.has_triggers,
@@ -238,7 +239,8 @@ impl Scm {
     /// marker is placed (no shim of the task pins the records from now on); the change is refused while a run
     /// is alive ([`Error::AccountChangeRunning`]) or the records are held ([`Error::AccountChangeHeld`]), the
     /// pin check sweeping the stale pins it finds; the registration is deleted; the records and the default
-    /// log name the new account alone; and the task is created, armed as the old one's triggers say.
+    /// log name the new account alone; and the task is created, armed as `stored` says: the old registration has
+    /// a trigger that is switched on ([`StoredRegistration::has_triggers`]), whatever its own flag was.
     ///
     /// A refusal before the delete leaves the old task: the task's own flag is put back true, the marker (if it
     /// was placed) is taken away, and a flag or a marker that cannot be put back is reported with the failure.
@@ -256,7 +258,7 @@ impl Scm {
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
-        had_triggers: bool,
+        stored: &StoredRegistration,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -279,11 +281,13 @@ impl Scm {
         }
         // No run of the old account can be left (it held a pin or was listed).
         let created = task_records(id, runs, &prepared.principal, &[]).and_then(|()| {
-            let registering = Registering::Create { armed: had_triggers };
+            let registering = Registering::Create {
+                armed: stored.has_triggers,
+            };
             self.task_register(id, definition, prepared, registering)
         });
         created.map_err(|e| Error::Step {
-            what: removed_and_not_recreated(id, had_triggers && definition.has_schedule()),
+            what: removed_and_not_recreated(id, stored.has_triggers && definition.has_schedule()),
             source: Box::new(e),
         })
     }
