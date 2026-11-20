@@ -78,9 +78,9 @@ pub(crate) fn hold_service_process<T: KillTarget>(
 ) -> std::result::Result<Option<(u32, T::Process)>, HoldError> {
     loop {
         match hold_once(target, deadline)? {
-            Hold::NoProcess => return Ok(None),
-            Hold::Held { pid, process } => return Ok(Some((pid, process))),
-            Hold::Ended { .. } => {}
+            None => return Ok(None),
+            Some(Hold::Held { pid, process }) => return Ok(Some((pid, process))),
+            Some(Hold::Ended { .. }) => {}
         }
     }
 }
@@ -304,7 +304,7 @@ pub(in crate::backend::scm) mod system {
             Held::open(pid)
         }
 
-        fn terminate(&mut self, process: &Held) -> io::Result<()> {
+        fn force_end(&mut self, process: &Held) -> io::Result<()> {
             process.terminate()
         }
 

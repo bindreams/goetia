@@ -1294,6 +1294,7 @@ fn service_mode_refuses_a_task_blob() {
     let task = TaskSpec::new(TaskFields {
         common: base_fields(ID, vec![POWERSHELL.to_string()]).common,
         schedule: None,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap();

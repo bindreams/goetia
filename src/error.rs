@@ -383,6 +383,22 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// The `stop` of `id` named no wait, so it takes the daemon's stop action for one, and the installed
+    /// definition that holds it will not decode; `source` is the decode failure. Nothing was sent. A stop
+    /// that names its wait does not read the definition, so the remedy, which [`report`](Error::report)
+    /// prints last, is the flags that name one. `source` is always [`Kept`](Error::Kept), which ends every
+    /// walk of the chain, so this is no wrapper of `wrapper!`; it is as indeterminate as `source` is. The
+    /// message leaves `id` out: the CLI prefixes it.
+    #[error(
+        "the stop was refused and nothing was sent: with no `--timeout` or `--no-timeout` the wait comes from \
+         the daemon's stop action, which could not be taken from its installed definition"
+    )]
+    StopActionUnreadable {
+        id: String,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -845,7 +861,9 @@ impl Error {
             | Error::StopUnconfirmed { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunUnrecorded { .. } => true,
-            wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
+            wrapper!(source)
+            | Error::ServiceImageUnreadable { source, .. }
+            | Error::StopActionUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
@@ -999,6 +1017,9 @@ impl Error {
                 "An administrator must make each named service's registry key readable, or let SCM query it \
                  (`SERVICE_QUERY_CONFIG`)",
             ),
+            Error::StopActionUnreadable { .. } => {
+                Some("Pass `--timeout <duration>` or `--no-timeout` to name the wait yourself.")
+            }
             Error::Kept(kept) => kept.remedy(),
             _ => None,
         }
@@ -1053,6 +1074,7 @@ impl Error {
             | Error::Step { .. }
             | Error::InstalledUnreadable { .. }
             | Error::ServiceImageUnreadable { .. }
+            | Error::StopActionUnreadable { .. }
             | Error::ConcurrentChange { .. }
             | Error::QuarantineStranded { .. }
             | Error::AmbiguousInstall { .. }
@@ -1139,6 +1161,12 @@ impl Error {
     #[cfg(feature = "cli")]
     pub(crate) fn write_report(&self, out: &mut Sink) -> fmt::Result {
         report::write_report(self, out)
+    }
+
+    /// The error a snapshot kept, handed out again: what each verb that reads a blob that will not
+    /// decode returns for it.
+    pub(crate) fn kept(kept: &Arc<Error>) -> Error {
+        Error::Kept(Arc::clone(kept))
     }
 
     /// This error, or the error it hands out if it is a [`Kept`](Error::Kept) one.

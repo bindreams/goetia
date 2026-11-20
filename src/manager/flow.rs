@@ -254,7 +254,7 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     let snapshot = owned(b, id)?;
-    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+    let blob = snapshot.blob().map_err(Error::kept)?;
     b.regenerate(&blob.spec, &snapshot)
         .map_err(|e| match RegenerationFailure::of(e) {
             RegenerationFailure::HostUnreadable(read) => read,
@@ -373,11 +373,29 @@ pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exi
     }
 }
 
-/// Whether the marked service `snapshot` is a service or a task, from its blob. A blob that will not
-/// decode is its error: the kind is not guessed.
+/// Whether the marked service `snapshot` is a service or a task, from its blob. A blob that will not decode is
+/// its error: what is read of the spec is not guessed.
 pub(crate) fn kind_of<S: InstalledService>(snapshot: &S) -> Result<DaemonKind> {
-    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+    let blob = snapshot.blob().map_err(Error::kept)?;
     Ok(blob.spec.kind())
+}
+
+/// The wait of a `stop` of the marked service `snapshot`: `given`, or, where the caller named none,
+/// [`Budget::for_stop`] of the stop action in the blob this `snapshot` holds, the one the stop then acts on.
+/// A blob that will not decode has no stop action to take the wait from: [`Error::StopActionUnreadable`], with
+/// the decode failure under it. A caller that names the wait needs no blob, and the marker alone is proof of
+/// ownership.
+pub(crate) fn stop_budget<S: InstalledService>(snapshot: &S, given: Option<Budget>) -> Result<Budget> {
+    match given {
+        Some(given) => Ok(given),
+        None => snapshot
+            .stop_action()
+            .map(|action| Budget::for_stop(&action))
+            .map_err(|e| Error::StopActionUnreadable {
+                id: snapshot.id().to_string(),
+                source: Box::new(Error::kept(e)),
+            }),
+    }
 }
 
 /// The thread that waits for a run, made before the run is requested.

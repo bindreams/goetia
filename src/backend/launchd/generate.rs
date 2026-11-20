@@ -21,7 +21,10 @@ use super::calendar::{self, Entry};
 use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets, xml_escape};
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{DaemonFields, DaemonSpec, Id, Restart, Schedule, TaskSpec};
+use crate::spec::{
+    BackendKind, DaemonFields, DaemonKind, DaemonSpec, Id, Protocol, Restart, Schedule, StopAction, StopSignal,
+    TaskSpec,
+};
 
 // Metadata comment ====================================================================================================
 
@@ -313,6 +316,22 @@ pub(crate) fn id_of_timer_stem(stem: &str) -> Option<&str> {
 
 const TIMER_SUFFIX: &str = "@timer";
 
+/// The `ExitTimeOut` of `kill`: launchd sends SIGTERM, and SIGKILL one second later. Not `0`, which
+/// `launchd.plist(5)` documents as no limit: it ends the job at once on macOS 15 and 26 (measured),
+/// but macOS 14 cannot be measured, and a `kill` that never
+/// kills is worse than one that waits a second.
+const KILL_EXIT_TIMEOUT: u64 = 1;
+
+/// `ExitTimeOut` of `stop_action`: its timeout in whole seconds, and [`KILL_EXIT_TIMEOUT`] for `kill`.
+/// Only for an action [`StopAction::refuse`] let through, which has a timeout unless it is `kill`.
+fn exit_time_out(stop_action: &StopAction) -> u64 {
+    match (stop_action.send_signal, stop_action.timeout) {
+        (StopSignal::Kill, _) => KILL_EXIT_TIMEOUT,
+        (_, Some(timeout)) => timeout.as_secs(),
+        (_, None) => unreachable!("a stop action with no timeout is refused for launchd before it is written"),
+    }
+}
+
 /// Render `spec` as launchd plists for the already-resolved account `id`: a service gives its plist;
 /// a task gives its job and, when it has a schedule, the timer that kickstarts it.
 ///
@@ -399,6 +418,9 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     let mut dict = String::new();
     match spec {
         DaemonSpec::Service(s) => {
+            s.stop_action
+                .refuse(BackendKind::Launchd, DaemonKind::Service, s.protocol)
+                .into_result(&s.common.id)?;
             push_job_head(&mut dict, &s.common, id, &s.common.command);
 
             push_keep_alive(&mut dict, INDENT, s.restart);
@@ -409,9 +431,13 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
                 push_key_integer(&mut dict, INDENT, "ThrottleInterval", round_up_seconds(delay));
             }
 
+            push_key_integer(&mut dict, INDENT, "ExitTimeOut", exit_time_out(&s.stop_action));
             push_logs(&mut dict, &s.common);
         }
         DaemonSpec::Task(task) => {
+            task.stop_action
+                .refuse(BackendKind::Launchd, DaemonKind::Task, Protocol::Plain)
+                .into_result(&task.common.id)?;
             let argv = task_argv(task)?;
             push_job_head(&mut dict, &task.common, id, &argv);
 
@@ -419,6 +445,7 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
             // for 10 s after the last one. launchd treats 0 as 1 (measured), so 1 says what happens.
             push_key_integer(&mut dict, INDENT, "ThrottleInterval", 1);
 
+            push_key_integer(&mut dict, INDENT, "ExitTimeOut", exit_time_out(&task.stop_action));
             push_logs(&mut dict, &task.common);
         }
     }

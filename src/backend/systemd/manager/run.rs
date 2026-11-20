@@ -77,7 +77,7 @@ impl Systemd {
     pub(super) fn begin_run(&self, snapshot: Fragment, reservation: &mut Held) -> Result<Run> {
         let id = snapshot.id().clone();
         let unit = unit_name(id.as_str(), UnitKind::Service);
-        let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+        let blob = snapshot.blob().map_err(Error::kept)?;
         let logs = blob.spec.common().logs.clone();
         let mut spares = Spares::make(&id, logs.is_none())?;
         let logs = match logs {

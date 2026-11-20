@@ -39,7 +39,7 @@ use crate::spec::Id;
 // The machine's processes ---------------------------------------------------------------------------------------------
 
 /// The processes of the runs a task lists, as a verb asks about them: whether one is alive, and the held
-/// process of [`KillTarget`] (open, terminate, wait for its exit). [`System`] is the machine's; a test
+/// process of [`KillTarget`] (open, end by force, wait for its exit). [`System`] is the machine's; a test
 /// states them.
 pub(crate) trait Processes {
     /// An open process, which keeps its pid from being given to another.
@@ -52,7 +52,7 @@ pub(crate) trait Processes {
     fn open(&mut self, pid: u32) -> io::Result<Option<Self::Held>>;
 
     /// Ends `held`, through the hold and never by pid, and does not wait for it.
-    fn terminate(&mut self, held: &Self::Held) -> io::Result<()>;
+    fn force_end(&mut self, held: &Self::Held) -> io::Result<()>;
 
     /// Blocks until `held` has exited, or until `deadline`.
     fn await_exit(&mut self, held: &Self::Held, deadline: Deadline) -> io::Result<Waited>;
@@ -72,7 +72,7 @@ impl Processes for System {
         Held::open(pid)
     }
 
-    fn terminate(&mut self, held: &Held) -> io::Result<()> {
+    fn force_end(&mut self, held: &Held) -> io::Result<()> {
         held.terminate()
     }
 
@@ -136,8 +136,8 @@ impl<P: Processes> KillTarget for RunTarget<'_, P> {
         }
     }
 
-    fn terminate(&mut self, process: &P::Held) -> io::Result<()> {
-        self.processes.terminate(process)
+    fn force_end(&mut self, process: &P::Held) -> io::Result<()> {
+        self.processes.force_end(process)
     }
 
     fn await_exit(&mut self, process: &P::Held, deadline: Deadline) -> io::Result<Waited> {
@@ -169,8 +169,8 @@ pub(super) fn hold_run<P: Processes>(
 ) -> Result<Option<P::Held>> {
     let mut target = RunTarget::new(tasks, path, instance, processes);
     match hold_once(&mut target, Budget::Unbounded.start()) {
-        Ok(Hold::Held { process, .. }) => Ok(Some(process)),
-        Ok(Hold::NoProcess | Hold::Ended { .. }) => Ok(None),
+        Ok(Some(Hold::Held { process, .. })) => Ok(Some(process)),
+        Ok(None | Some(Hold::Ended { .. })) => Ok(None),
         Err(HoldError::Refused(e)) => Err(open_refused(
             operation,
             &format!("the process of `{id}`'s run"),

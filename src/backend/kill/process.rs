@@ -51,8 +51,8 @@ impl<R: Reports> KillTarget for Signalling<R> {
         open(pid)
     }
 
-    fn terminate(&mut self, process: &Process) -> io::Result<()> {
-        terminate(process)
+    fn force_end(&mut self, process: &Process) -> io::Result<()> {
+        send_signal(process, Signal::Kill)
     }
 
     fn await_exit(&mut self, process: &Process, deadline: Deadline) -> io::Result<Waited> {
@@ -69,10 +69,38 @@ pub(crate) fn open(pid: u32) -> io::Result<Option<Process>> {
     Process::open_pid(pid).map_err(io::Error::other)
 }
 
-/// `SIGKILL` through the hold. On macOS a send by audit token refuses an exiting process with `EPERM`,
-/// which is success once the process is read to have exited ([`settle_kill`]), and the refusal otherwise.
-pub(crate) fn terminate(process: &Process) -> io::Result<()> {
-    settle_kill(process.kill(), || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
+/// A signal sent through a hold on a process, named as `cosca::Process` names its methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Signal {
+    /// SIGTERM, the request to exit, which a process may answer or ignore. Not a [`KillTarget`] operation:
+    /// only launchd's task stop sends it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Terminate,
+    /// SIGKILL, the forced end that [`KillTarget::force_end`] is.
+    Kill,
+}
+
+impl Signal {
+    /// The signal's name, as a failure says it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Signal::Terminate => "SIGTERM",
+            Signal::Kill => "SIGKILL",
+        }
+    }
+}
+
+/// `signal` through the hold: only to the process opened, never to a later holder of its pid, and not to its
+/// children. A process that has exited is success. On macOS a send by audit token refuses an exiting process
+/// with `EPERM`, which is success once the process is read to have exited ([`settle_kill`]), and the refusal
+/// otherwise.
+pub(crate) fn send_signal(process: &Process, signal: Signal) -> io::Result<()> {
+    let sent = match signal {
+        Signal::Terminate => process.terminate(),
+        Signal::Kill => process.kill(),
+    };
+    settle_kill(sent, || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
         .map(|_| ())
         .map_err(io::Error::other)
 }
