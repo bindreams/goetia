@@ -687,7 +687,10 @@ fn a_failure_after_a_disable_that_found_the_task_gone_does_not_say_it_is_disable
         .unwrap_err();
 
     let text = failed.to_string();
-    assert!(!text.contains("NOT deleted") && !text.contains("It is disabled"), "{text}");
+    assert!(
+        !text.contains("NOT deleted") && !text.contains("It is disabled"),
+        "{text}"
+    );
     assert!(text.contains("`nightly` is not installed"), "{text}");
 }
 

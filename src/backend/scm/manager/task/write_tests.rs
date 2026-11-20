@@ -2560,7 +2560,9 @@ fn enable_of_a_real_user_task_registers_it_again_with_its_password() {
     let (_dir, runs) = records();
 
     scm(&fake)
-        .task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || Ok(Some("secret".to_owned())))
+        .task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || {
+            Ok(Some("secret".to_owned()))
+        })
         .unwrap();
 
     let calls = fake.calls();

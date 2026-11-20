@@ -72,10 +72,7 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
 /// holder.
 fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
     match kind {
-        PauseKind::Held => eprintln!(
-            "waiting for {} to be released by {RECORD_HOLDERS}",
-            waits_for.display()
-        ),
+        PauseKind::Held => eprintln!("waiting for {} to be released by {RECORD_HOLDERS}", waits_for.display()),
         PauseKind::Emptying => eprintln!("waiting for {} to empty", waits_for.display()),
     }
 }
@@ -191,8 +188,15 @@ impl Scm {
         runs.close().map_err(|e| uninstall_failed(id, left, e))?;
         let pin = pin_records("uninstall", id, runs, MarkerCheck::Ignore).map_err(|e| uninstall_failed(id, left, e))?;
         // The pin is released when the stop returns, so the delete is made with none of the uninstall's own.
-        self.task_stop_with("uninstall", id, Budget::Unbounded, runs, StopPin::Caller(pin), processes)
-            .map_err(|e| uninstall_failed(id, left, e))?;
+        self.task_stop_with(
+            "uninstall",
+            id,
+            Budget::Unbounded,
+            runs,
+            StopPin::Caller(pin),
+            processes,
+        )
+        .map_err(|e| uninstall_failed(id, left, e))?;
 
         match self.tasks.delete(&path) {
             Ok(_) => {}
