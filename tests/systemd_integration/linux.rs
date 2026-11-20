@@ -16,7 +16,7 @@ use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, conformance};
+use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, TaskStatus, conformance};
 use goetia::spec::{
     AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
 };
@@ -24,7 +24,7 @@ use goetia::testing::service_fields;
 use serde_json::Value;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
-use crate::support::tasks::{mkfifo, task_status};
+use crate::support::tasks::{mkfifo, status_until, task_status};
 use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group, wait};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
@@ -626,22 +626,27 @@ fn killing_a_stopped_unit_is_not_running(#[fixture(systemd_group)] _group: &Grou
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 }
 
-/// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
-pub(crate) fn active_state_and_job(id: &str) -> (String, String) {
-    let unit = format!("{id}.service");
-    let run = cmd::run(
-        "systemctl",
-        &["show", "--property=ActiveState", "--property=Job", &unit],
-    )
-    .expect_ok();
-    let prop = |name: &str| {
+/// The values of the properties `names` of `unit` (a full unit name), from one `systemctl show`, in the
+/// order of `names`. A property with no value reads as the empty string.
+pub(crate) fn show_properties<const N: usize>(unit: &str, names: [&str; N]) -> [String; N] {
+    let mut args = vec!["show".to_string()];
+    args.extend(names.iter().map(|name| format!("--property={name}")));
+    args.push(unit.to_string());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let run = cmd::run("systemctl", &args).expect_ok();
+    names.map(|name| {
         run.stdout
             .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
             .unwrap_or_else(|| panic!("no {name} in {run}"))
             .to_string()
-    };
-    (prop("ActiveState"), prop("Job"))
+    })
+}
+
+/// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
+pub(crate) fn active_state_and_job(id: &str) -> (String, String) {
+    let [state, job] = show_properties(&unit_of(id), ["ActiveState", "Job"]);
+    (state, job)
 }
 
 /// `Budget::Immediate` is the native `systemctl start --no-block`, and it must actually reach
@@ -2896,6 +2901,65 @@ pub(crate) fn wait_for_started(id: &str) {
     wait::until_paced(Duration::from_millis(100), || !started_invocations(id).is_empty());
 }
 
+/// What systemd says of `id`'s timer from one `show`: its `ActiveState/SubState` and its
+/// `NextElapseUSecRealtime` (empty or `n/a` for a timer with none). A timer reads `active/waiting` when
+/// armed, `active/running` from its fire until the run it started has ended (it has no next elapse then),
+/// and `active/elapsed` when no time of its schedule is left.
+fn timer_read(id: &str) -> (String, String) {
+    let [active, sub, next] = show_properties(
+        &format!("{id}.timer"),
+        ["ActiveState", "SubState", "NextElapseUSecRealtime"],
+    );
+    (format!("{active}/{sub}"), next)
+}
+
+/// `id`'s timer as `ActiveState/SubState`: [`timer_read`]'s first answer.
+pub(crate) fn timer_state(id: &str) -> String {
+    timer_read(id).0
+}
+
+/// The status of `id`'s armed timer once it reports a next run and `ready` accepts it. For a read right
+/// after an `enable` of a schedule that can come due while the test runs: a timer whose run is in flight
+/// has no next run, so a read of none is not yet an answer.
+///
+/// The timer is read between every two status reads. A read of none is legitimate when the timer was
+/// `active/running` (the wait goes on) or changed under the read (the run ended between the timer's read
+/// and goetia's). It is goetia's wrong answer when the timer was `active/waiting` for the same next
+/// elapse at both ends of the read: the test fails naming it, and does not wait for a next run that
+/// will not come. A timer in any other state will not arm again, and the test fails naming it.
+fn armed_status_where(mgr: &dyn ServiceManager, id: &Id, ready: impl Fn(&TaskStatus) -> bool) -> TaskStatus {
+    let mut before = timer_read(id.as_str());
+    status_until(mgr, id, |status| {
+        let after = timer_read(id.as_str());
+        if status.next_run.is_none() {
+            for (state, _) in [&before, &after] {
+                assert!(
+                    matches!(state.as_str(), "active/running" | "active/waiting"),
+                    "the timer of {id} is {state} and will not arm again: {status:?}"
+                );
+            }
+            assert!(
+                !(before == after && after.0 == "active/waiting"),
+                "goetia read no next run of a timer that was waiting for {:?} before and after the read: {status:?}",
+                after.1
+            );
+        }
+        before = after;
+        status.next_run.is_some() && ready(status)
+    })
+}
+
+/// [`armed_status_where`] with nothing more asked of the status.
+pub(crate) fn armed_status(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
+    armed_status_where(mgr, id, |_| true)
+}
+
+/// [`armed_status_where`] for a task whose run has ended: the status carries its result too, and the
+/// result and the timer's next run are separate reads, either of which can come first.
+pub(crate) fn armed_status_with_result(mgr: &dyn ServiceManager, id: &Id) -> TaskStatus {
+    armed_status_where(mgr, id, |status| status.last_result.is_some())
+}
+
 /// A task that exits with `code` the moment it starts, and runs daily at 03:30.
 pub(crate) fn exiting(id: &str, code: i32) -> DaemonSpec {
     goetia::testing::task(
@@ -2930,7 +2994,7 @@ fn a_task_is_installed_armed_run_reported_and_uninstalled(#[fixture(systemd_grou
     );
 
     mgr.enable(&task_id).expect("enable");
-    let status = task_status(&mgr, &task_id);
+    let status = armed_status(&mgr, &task_id);
     assert!(status.common.enabled, "{status:?}");
     assert!(
         status.next_run.is_some(),
@@ -2949,7 +3013,7 @@ fn a_task_is_installed_armed_run_reported_and_uninstalled(#[fixture(systemd_grou
     let run = cmd::run("systemctl", &["start", &format!("{id}.service")]);
     assert!(!run.ok(), "the run exits 3, which fails the start: {run}");
     cmd::run("journalctl", &["--sync"]).expect_ok();
-    let status = task_status(&mgr, &task_id);
+    let status = armed_status_with_result(&mgr, &task_id);
     assert_eq!(
         status.common.state,
         State::Idle,
@@ -3025,9 +3089,8 @@ fn a_retyped_daemon_keeps_nothing_of_the_old_kind_that_still_acts(#[fixture(syst
 
 /// One property of the unit as `systemctl show` reports it.
 fn show_property(id: &str, name: &str) -> String {
-    let unit = format!("{id}.service");
-    let run = cmd::run("systemctl", &["show", "--value", &format!("--property={name}"), &unit]).expect_ok();
-    run.stdout.trim().to_string()
+    let [value] = show_properties(&unit_of(id), [name]);
+    value
 }
 
 #[skuld::test]

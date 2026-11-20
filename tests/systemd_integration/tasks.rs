@@ -20,8 +20,9 @@ use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 
 use crate::linux::{
-    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, create_root, exiting, field, main_pid, manager_entries,
-    output_entries, started_invocations, starting_matches, timer_path, timer_wants_symlink, unit_of,
+    CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, armed_status, create_root, exiting, field, main_pid,
+    manager_entries, output_entries, show_properties, started_invocations, starting_matches, timer_path, timer_state,
+    timer_wants_symlink, unit_of,
 };
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
 use crate::support::cron_oracle::assert_next_run;
@@ -315,8 +316,13 @@ fn the_rendered_on_calendar_fires_at_the_resolved_fields(#[fixture(systemd_group
             .expect("install");
         let before = SystemTime::now();
         mgr.enable(&id_of(&id)).expect("enable");
-        let status = task_status(&mgr, &id_of(&id));
-        let after = SystemTime::now();
+        // A schedule's minute can come due here, and a run the timer started has no next run until it
+        // ends. The window must cover a fire: `after` is the later of the wall clock now and the timer's
+        // last trigger, which systemd stamped from its own clock, so it holds even when the lane's wall
+        // clock steps back between the fire and this read.
+        let status = armed_status(&mgr, &id_of(&id));
+        let now = SystemTime::now();
+        let after = last_trigger_time(&id).map_or(now, |fired| fired.max(now));
 
         assert_next_run(&status, text, &id_of(&id), before, after);
     }
@@ -342,11 +348,23 @@ fn plant_stale_stamp(id: &str) {
 /// elapse. Starting a timer loads it from the stamp, and a run made up for a missed time sets it, so an
 /// empty answer after an arm is the proof that neither happened, with no wait for a run that did not come.
 fn last_trigger(id: &str) -> String {
-    let shown = cmd::run(
-        "systemctl",
-        &["show", "--property=LastTriggerUSec", "--value", &format!("{id}.timer")],
-    );
-    shown.expect_ok().stdout.trim().to_string()
+    let [shown] = show_properties(&format!("{id}.timer"), ["LastTriggerUSec"]);
+    shown
+}
+
+/// [`last_trigger`] as a time, to the whole second `systemctl show` prints it in (the second it falls
+/// in, so never later than the elapse): `None` for a timer that remembers no elapse.
+fn last_trigger_time(id: &str) -> Option<SystemTime> {
+    let shown = last_trigger(id);
+    if shown.is_empty() {
+        return None;
+    }
+    let secs = cmd::run("date", &["-d", &shown, "+%s"]).expect_ok().stdout;
+    let secs = secs
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("`date` read {shown:?} as {secs:?}, not as seconds"));
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// Arming a task again makes up no run its schedule named while goetia's `disable` had it disarmed: the
@@ -548,7 +566,14 @@ fn dropping_the_schedule_disarms_the_timer(#[fixture(systemd_group)] _group: &Gr
 }
 
 /// The timer starts the task by itself: the test starts nothing, and blocks on the program's own
-/// announcement. `last_run` is when the timer fired, in the minute the schedule named.
+/// announcement. The first read is of an armed timer, or of a timer that has fired already (the
+/// minute can turn between `enable` and the read). Its subject is the fire, so that read is judged by
+/// the timer's state: a next run names the minute of the fire, and none is confirmed to be a timer whose
+/// run is in flight (the run is held, so it is until `release`). Either way the run is the timer's,
+/// since the test starts nothing, and `last_run` lies in the minute from the timer's own last trigger
+/// (which, when the first read named a next run, lies in that run's minute). The task is disabled before
+/// `release`, so the timer cannot fire a second run that nobody releases; that leaves no re-arming to
+/// check here, which `a_task_is_installed_armed_run_reported_and_uninstalled` does.
 #[skuld::test]
 fn the_timer_fires_by_itself(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -559,23 +584,40 @@ fn the_timer_fires_by_itself(#[fixture(systemd_group)] _group: &Group) {
     mgr.install(&task(&id, held.command.clone(), Some("* * * * *")), false)
         .expect("install");
     mgr.enable(&task_id).expect("enable");
-    let scheduled = task_status(&mgr, &task_id)
-        .next_run
-        .expect("an armed timer has a next run");
+    // `None` is a timer that fired after `enable` and before this read: its run is in flight, and
+    // systemd reports no next run then. Confirmed by the timer's own state, which holds until `release`.
+    let scheduled = task_status(&mgr, &task_id).next_run;
+    if scheduled.is_none() {
+        assert_eq!(
+            timer_state(&id),
+            "active/running",
+            "no next run is a timer whose run is in flight"
+        );
+    }
 
     held.wait_started();
 
     let running = task_status(&mgr, &task_id);
     assert_eq!(running.common.state, State::Running, "{running:?}");
+    let trigger = last_trigger_time(&id).expect("the timer that started the run remembers its elapse");
+    let minute = Duration::from_secs(60);
+    if let Some(scheduled) = scheduled {
+        assert!(
+            trigger >= scheduled && trigger < scheduled + minute,
+            "the timer fired at {trigger:?}, not in the minute of the next run {scheduled:?} it named"
+        );
+    }
+
+    // A run in flight carries on, and the timer cannot fire again until it has ended.
+    mgr.disable(&task_id).expect("disable");
     held.release();
     let finished = status_with_result(&mgr, &task_id);
     assert_eq!(finished.last_result, Some(Exit::Code(0)), "{finished:?}");
     let fired = finished.last_run.expect("a run that ended started");
     assert!(
-        fired >= scheduled && fired < scheduled + Duration::from_secs(60),
-        "last_run {fired:?} is not in the minute of {scheduled:?}"
+        fired >= trigger && fired < trigger + minute,
+        "last_run {fired:?} is not in the minute from the timer's trigger {trigger:?}"
     );
-    assert!(finished.common.enabled, "the schedule stays armed: {finished:?}");
 }
 
 /// `disable` stops the schedule, not the run in flight.
