@@ -2,7 +2,10 @@
 
 A cross-platform CLI and library that installs system daemons described in a
 `goetia.yaml` manifest as native services: systemd on Linux, launchd on
-macOS, and the Service Control Manager on Windows.
+macOS, and the Service Control Manager on Windows. A daemon is a service, which
+keeps running, or a [task](#tasks), which runs a program to completion on a
+schedule or by hand (systemd timers, launchd calendar jobs and Windows Task
+Scheduler).
 
 ## Status
 
@@ -10,8 +13,8 @@ Pre-1.0. See the [releases page](https://github.com/bindreams/goetia/releases)
 for what has actually shipped.
 
 Everything documented below — the manifest's interpolation syntax, the
-`.env` grammar, the `--json` document, and the exit codes — is **pre-1.0 and
-may still change** between releases. Pin a specific released version, or a
+`.env` grammar, the `--json` document (a task's fields included), and the exit
+codes — is **pre-1.0 and may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
 On macOS goetia requires **14.4+**: `kill` holds the daemon's process by its
@@ -177,22 +180,10 @@ all fire at minute 0. As in Vixie cron, when day-of-month or day-of-week
 starts with `*` both must match; otherwise either may, and a field starting
 with `H` counts as restricted. A schedule that starts with `*` must be quoted in
 YAML: `schedule: "*/15 * * * *"`. A task without a `schedule` is started only by
-hand. Tasks are installed by systemd and launchd; Windows refuses them for now.
-
-A schedule is read in the machine's local time zone, and each backend does its
-own thing where daylight saving time changes the clock. A time that does not
-exist (the clocks jump forward) and a time that happens twice (they go back):
-
-- **systemd** skips the missing time, and runs the repeated one once.
-- **launchd** runs a schedule that names its hour once, at the end of the gap;
-  an hourly or every-minute schedule skips the missing hour. A repeated time
-  is read per entry launchd is given: an entry that names a date (a day, or a
-  month and a day) runs at the first pass only, and one that names no date, or
-  a weekday, runs at both. So `30 1 * * *` runs twice, and `30 1 15 * *` or
-  `30 1 * 11 *` (which names each day of November) once.
-
-`next-run` in `goetia daemon status` follows the backend: on launchd, which
-reports none, goetia computes it by these rules from the entries it gave launchd.
+hand. A schedule is read in the machine's local time zone. Where a platform
+cannot hold a schedule, `install` refuses it, naming the limit; what each
+platform refuses, and what each does at a daylight saving change, is in
+[The schedule, per platform](#the-schedule-per-platform).
 
 `-f` takes a manifest file, or a directory holding `goetia.yaml`. Several
 daemons are several manifests, each installed with its own
@@ -282,8 +273,8 @@ records the end as it does.
 - **Windows** reads, checks and records the field, and does not apply it yet:
   the shim still ends the daemon at once on every stop, `stop`, `restart` and
   `uninstall` included, whatever `stop-action` says. A task is stopped by Task
-  Scheduler, which decides the signal and the wait, so a task refuses
-  `stop-action`; set it under `backend-specific` for systemd and launchd. A
+  Scheduler, which decides the signal and the wait, so a task refuses a
+  `send-signal` or `timeout` that is not the default; set it under `backend-specific` for systemd and launchd. A
   `protocol: native` service handles SCM's own stop itself, so it refuses
   `send-signal`; its `timeout` still sets the wait of `stop` and `restart`.
 
@@ -622,7 +613,8 @@ owns it, since `install` is not a start and you may still be preparing it.
   writing, in one handed to it) is left, and named, and so are the directories above it.
 - **An install stopped abruptly** (power loss, `SIGKILL`) may leave a `.goetia-*` directory beside the
   path, holding only the empty directories it was making. Nothing uses it, and `rm -r` removes it.
-- **scm** creates nothing.
+- **scm** makes none of these at `install`. The shim makes the missing parent of a user's own `logs:` path
+  when the daemon starts.
 
 ## Per-backend overrides
 
@@ -751,6 +743,455 @@ literal would have produced. systemd has no warnings. launchd warns about a
 clamp or round. A value written under a backend's own block is still
 checked, and refused, from any host.
 
+## Tasks
+
+A task is a daemon that runs a program to completion and then waits for its
+next run, which comes from its schedule or from you. It is declared with
+`type: task`:
+
+```yaml
+id: backup
+type: task
+command: [/usr/local/bin/backup, --nightly]
+schedule: "30 3 * * *"
+logs: /var/log/backup/backup.log
+```
+
+A task takes `name`, `command`, `cwd`, `env`, `user`, `logs`, `schedule` and
+[`stop-action`](#stop-action), which says how `stop` ends a run (a Windows task
+has its own rule there); `restart`, `restart-delay` and `protocol` are refused, naming the
+field (see [`type`, `protocol` and `schedule`](#type-protocol-and-schedule)). A task
+without a `schedule` runs only when you ask, which is what a program that
+triggers its own periodic work wants: it gets goetia's account and `env` set-up
+and no timer.
+
+What holds on every platform:
+
+- **One run at a time, by design.** A schedule that fires while a run is in
+  flight starts nothing, and so does a `start` over one (it succeeds). Parallel
+  runs are not offered. On Windows two runs can still be alive at once, by two
+  routes: for a task whose account logs on with a password, a start can be
+  accepted before the previous run's process has exited (measured up to about
+  20 ms; slower exits can widen it); and a run started outside goetia with
+  `RunEx` ignoring constraints (`schtasks /run /I`) can overlap a goetia run for
+  any account. `status` shows one pid, and `stop`, `kill` and `uninstall` act on
+  every run alive.
+- **Catch-up is always asked for**, with no field to turn it off; what is made
+  up is the manager's own behaviour. systemd (`Persistent=yes`) runs a start
+  the machine missed once it is up. launchd runs one missed while the Mac
+  slept, not one missed while it was off (see
+  [launchd](#launchd-calendar-entries)). On Windows, goetia sets
+  `StartWhenAvailable`, Task Scheduler's setting for starting a task as soon as
+  possible after a missed start. A run that came due while the task was
+  disarmed is not made up on any platform: `enable` starts nothing (on Windows,
+  nothing in the 12 minutes watched after it).
+- **No retry.** A run that fails is not run again; a program that wants one
+  retries itself. How it failed is its `last-result`.
+- **Times are local.** See [the schedule](#the-schedule-per-platform).
+
+### Ids are one namespace
+
+A service and a task cannot share an id; on Windows `install` looks in both
+SCM and Task Scheduler. `install` of a manifest whose `type` differs from the
+installed daemon's removes the old daemon and creates the new one, and refuses
+(exit `1`, saying to `stop` it and install again) while the old one runs. A
+`start` made between that check and the removal is your own action, and
+goetia does not guard it. On Windows a crash between the removal and the
+creation leaves nothing at the id: install again.
+
+A task's artifacts, by platform:
+
+| Platform | A task is                                                                                                                                                             |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| systemd  | `<id>.service` (`Type=oneshot`) and `<id>.timer`, both carrying goetia's marker.                                                                                      |
+| launchd  | A job plist `<id>` with no calendar and no `RunAtLoad` or `KeepAlive`, and a timer plist `<id>@timer` that runs `launchctl kickstart` for it at the schedule's times. |
+| Windows  | A Task Scheduler task `\Goetia\<id>` whose action is [the service host](#the-service-host-on-windows) in task mode.                                                   |
+
+### The verbs
+
+All under `goetia daemon`, as for a service:
+
+- **`install`** writes the task disarmed: it will not run by itself until
+  `enable`. An install over an installed task keeps it as armed or disarmed as
+  it was (see [`install` never changes whether a daemon runs](#install-never-changes-whether-a-daemon-runs)).
+  `install --enable` arms it, and is refused for a task with no schedule.
+- **`enable`** arms the schedule, now and across reboots. systemd enables and
+  starts `<id>.timer`; launchd moves both plists into `/Library/LaunchDaemons`
+  and loads the timer; Windows writes the task's triggers back (the stored
+  ones, or the ones the schedule compiles to). A task with no
+  schedule has nothing to arm: `enable` is refused, naming the missing
+  schedule, and its `enabled` is always `false`. On Windows, `enable` and
+  `disable` of a task that runs as a real user need `GOETIA_SERVICE_PASSWORD`
+  (see [Task accounts on Windows](#task-accounts-on-windows)). Arming makes up
+  no run (see catch-up, above).
+- **`disable`** disarms it. A run in flight carries on. On Windows it removes
+  the task's triggers, which also stops a repetition in progress; a trigger
+  added or changed by hand goes with them. Both `disable` and `enable` set the
+  task's own Enabled flag true and register it under the account it is
+  installed with. The triggers, that flag and the account are goetia's; a hand
+  edit of anything else in the task survives.
+- **`start`** requests a run now, armed or not, and returns once the manager
+  has accepted the request. It says nothing of how the run went: `last-result`
+  does. `--timeout` and `--no-timeout` are refused (see
+  [Waiting for a start or stop](#waiting-for-a-start-or-stop)).
+- **`stop`** and **`kill`** end the run in flight and leave the schedule armed
+  ([Stopping and killing a task](#stopping-and-killing-a-task)). **`restart`**
+  is a `stop` and then a `start`.
+- **`run`** starts a run and follows it ([below](#run)).
+- **`uninstall`** ends a run in flight and removes the task. On Windows it also
+  removes the task's run records, and never needs the account's password.
+
+### `run`
+
+`goetia daemon run <id>` starts one run of a task now, shows its output as the
+program writes it, waits for it to end, and exits with its result. It needs
+elevation, and `--json` is refused.
+
+- A service is refused: `run` applies only to a task.
+- A task with a run in flight is refused, as "already running", and no request
+  is sent: `run` does not join a run someone else began. The state is read
+  once, before the request, so a scheduled run that begins between the read and
+  the request is one `run` may follow; it began after the command was asked.
+  Two `run`s of one task at the same moment are your own action: each may
+  follow the other's run, and goetia does not guard it.
+- The output is the program's stdout and stderr merged, in the order it wrote
+  them. It comes from the task's `logs` file or, on systemd with no `logs`, the
+  journal. With neither, `run` prints one note that there is no output to show,
+  and waits.
+- The exit status is the program's own: its exit code, or `128` plus the signal
+  that ended it (see [Exit codes](#exit-codes)). When goetia could not run the
+  task it exits `1`, and when a run began, or may have, and goetia could not
+  establish how it ended, it exits `4`. Repeating `run` after a `4` may repeat
+  the run.
+
+`run` finds its run in a different place on each platform. systemd: the system
+journal, so `run` needs an account that can read it. launchd: goetia holds the
+task's next launch with `launchctl debug`, starts it and watches the process.
+Windows: the host records how each run ended (see
+[the service host](#the-service-host-on-windows)), and `run` reads its run's
+record.
+
+On macOS, one case is not covered by `run`'s own checks:
+
+> macOS: if `goetia daemon run` is killed with SIGKILL while it is starting the
+> run, or while it waits for a scheduled run that started at the same moment, or
+> if `goetia daemon run` fails after holding the next launch, or is interrupted
+> while it waits for a scheduled run, that run or the task's next one may wait
+> stopped, and no scheduled run starts while it waits; `status` shows it as
+> running. `goetia daemon stop <id>` ends it, and later runs start normally.
+
+A `run` that fails or is interrupted in that window says so in its error. A hold
+that no launch has taken is consumed by the next `goetia daemon run <id>`.
+
+A run that began, or may have, and that `run` cannot follow to its exit ends
+with exit `4` and an error saying why. On systemd that is a journal that keeps
+no service-manager messages (see [Status of a task](#status-of-a-task)); on
+launchd, a launch that ended before goetia could follow it; on Windows, a run
+that was killed, whose host failed, or that Windows' shutdown ended, none of
+which leaves a record of the exit.
+
+### Output
+
+Where a task's output goes:
+
+- **With `logs`**, the program's stdout and stderr, as for a service. The host
+  or wrapper writes one line `goetia-run <identifier>` first in each run, which
+  is how `run` finds where its own run starts: it shows the output up to the
+  next such line and hides the lines themselves. A program that prints such a
+  line itself is your own action.
+- **systemd without `logs`**: the system journal, which is also what `journalctl -u <id>`
+  shows. `run` shows it as the journal stores it. The journal stores no empty
+  lines, and journald can store a line twice when it rotates a journal file
+  during the run (measured on systemd 255). Set `logs` to keep the output
+  exactly as the program wrote it. journald also drops lines beyond its
+  per-unit rate limit, `RateLimitBurst` (scaled by free disk space) per
+  `RateLimitIntervalSec` (30 s by default): a task that writes more loses lines,
+  and a run started shortly after such a run may show none (`run` prints a
+  note and the exact exit). Lifting the limit is host-wide: `RateLimitBurst=0`
+  under `[Journal]` in a `journald.conf.d` drop-in, and a restart of journald.
+- **launchd and Windows without `logs`**: nowhere goetia reads, and a Windows
+  task writes its output to `NUL`. `run` waits, reports the exit, and says why
+  it shows no output. This is deliberate: a task with no `logs` may have none
+  for a reason, such as privacy.
+- **Windows, the shim's own diagnostics** (a program that did not start, a stop
+  that could not end everything) go to `%ProgramData%\Goetia\logs\<id>.log`
+  and the Windows Event Log.
+
+Two daemons that share one `logs` path are not refused. On systemd, a task's
+output in that file ends at the next `goetia-run` line, which may be another
+daemon's.
+
+On systemd, a task starts through `/bin/sh`, which prints the marker and then
+`exec`s the program. The program therefore also sees `PWD` (its working
+directory) and, where `/bin/sh` is bash, `SHLVL=0`; an `env` that sets `IFS`,
+`PWD`, `SHLVL`, `PS4`, `_` or `OLDPWD` is refused, because the shell resets
+them. A command that is missing or not executable exits `127` or `126` from the
+shell, not systemd's `203/EXEC`.
+
+### Status of a task
+
+`status` and `list` report a task with the fields of
+[the `--json` document](#the-document).
+`state` is `running` while a run is in flight and `idle` between runs; `pid` is
+the run's process (on Windows, the task's shim host:
+`%ProgramFiles%\Goetia\goetia-shim-<hex>.exe` for the `goetia` CLI and
+`EmbeddedStockShim`, `goetia-shim.exe` where an installer places it for
+`StandaloneShim`, the program itself where it calls `goetia::shim::main()`, or
+whatever a custom `ShimProvider` supplies). `enabled` is whether the schedule is armed.
+`last-result` is how the most recent finished
+run ended, `last-run` when it started and `next-run` when the schedule starts
+the next one. A task that has never run is `idle` with `last-result` and
+`last-run` `null`, and `status` still exits `0`. Its `next-run` is `null` where
+the schedule is not armed: the task is disabled or has no `schedule`, its
+schedule never fires (`0 0 30 2 *`), or an `enable` or `install` was
+interrupted before the schedule was armed again (launchd). On systemd it can
+also be `null` while a run is in flight. Otherwise an enabled
+task has its next run before it has had a first. A task's timer or triggers
+changed by hand outside goetia may read otherwise.
+
+The three differ by platform where a run is in flight, or the manager failed
+a run before it exited:
+
+|                                                                                         | systemd                                                                   | launchd                                                                                      | Windows                                                                        |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Read from                                                                               | the system journal (`last-run`, `last-result`) and the timer (`next-run`) | launchd's last exit code (`last-result`); `next-run` is computed by goetia from the schedule | Task Scheduler (`LastTaskResult`, `LastRunTime`, `NextRunTime`)                |
+| `last-result` while a run is in flight                                                  | `null`                                                                    | the previous run's result (`null` if none ever ended)                                        | `null`                                                                         |
+| `last-run`                                                                              | the start of the newest run, so a run in flight's                         | always `null`                                                                                | the start of the newest run, so a run in flight's; `null` before the first run |
+| A run the manager failed before the program exited (a `resources` or `timeout` failure) | `idle`, `last-run` set, `last-result` `null`                              | not told apart                                                                               | no such case                                                                   |
+
+There is no field that carries the reason for a failed run. On systemd it is in
+`run`'s error and in `journalctl -u <id>` (#287). On Windows, a start that fails
+to log on the account (the account lacks the right to log on as a batch job, or
+its stored password is stale) starts nothing and raises nothing, and leaves the
+previous `last-result` and `last-run` as they were.
+
+On launchd, `next-run` is computed in the zone of `/etc/localtime`, which is the
+zone launchd schedules in, and printed in the process's zone, which honours
+`TZ`. When `TZ` differs from `/etc/localtime`, its wall-clock reading differs
+from the schedule's: `30 3 * * *` can read as another hour. The instant is the
+same.
+
+- **systemd:** `last-run` and `last-result` come from the system journal. An
+  account that cannot read it (not root and not in `systemd-journal`, or
+  `adm`/`wheel` where the distribution grants those) gets an error for the task
+  instead of its status; a service's status needs no journal. On a host whose
+  journal does not keep the service manager's messages (journald off,
+  `Storage=none`, or `MaxLevelStore=` below `info`), `goetia daemon run` cannot
+  follow the run: it ends with an error saying the outcome is unknown (exit
+  `4`); the run itself may still happen. There, `status` shows state and next
+  run but not the last run or its result; use `start`.
+- **Windows:** `last-result` is the exit code Task Scheduler recorded for the
+  host, which is the program's own unless the host ends the run itself: `1003`
+  (it could not show that the program's tree ended), `1` (it refused to run: the
+  id is not a goetia id, or the task has no goetia marker, is a service's, or has
+  data that would not decode) or a Windows error number (it failed at something
+  else; `31`, `ERROR_GEN_FAILURE`, when it has no number of its own: the task is
+  gone, another install registered it again, or a removal marker stands). A program that exits with the same
+  number reads the same. After a stop it is `0xC000013A` whatever happened.
+  An unelevated `status` or `list` of a task that runs as another account (SYSTEM,
+  LocalService, or an administrator's own elevated task) cannot open the run's
+  process, so it cannot tell running from idle. It reports the id as `unusable`,
+  naming the denial, exit `4`. An unelevated `run` never gets that far: it
+  checks for elevation first and fails with the elevation error, exit `1`.
+  Re-running as Administrator clears it.
+
+### Stopping and killing a task
+
+`stop` and `kill` end the run in flight, on every platform leave the schedule
+armed, and leave the task `idle`. A `stop` of a task with no run is a success.
+`stop --timeout` bounds the wait for the run to end, and its expiry is exit `4`
+with the request standing.
+
+- **systemd:** as for a service: `stop` stops the unit, and `kill` sends
+  `SIGKILL` to its main process through a pidfd.
+- **launchd:** `stop` sends `SIGTERM`, then `SIGKILL` once the `stop-action`
+  `timeout` is over, and `SIGKILL` at once for `send-signal: kill`; it waits
+  (bounded by `--timeout`), and what a short budget leaves running is told in
+  [`stop-action`](#stop-action). `kill` sends `SIGKILL` at once: it reads the
+  run's pid from launchd, holds that process, confirms with `launchctl procinfo`
+  that it is the job's, and signals the held process. `stop` signals the held
+  process too, never by label, and goetia boots the job out for neither. Only
+  `run` signals by label: it sends `SIGCONT` to the launch that took its hold,
+  its own or a scheduled one that took the hold of an earlier interrupted `run`,
+  and follows that launch. A `stop` under any budget, `--timeout 0` included,
+  first waits for a start launchd has accepted to begin, so that it can end it.
+  A run that begins while a `stop` waits is ended too; under `--timeout 0`, or
+  once a bounded budget is spent, a run that begins later is sent nothing.
+  A `stop` or `restart` of a task that launchd shows in a state goetia does
+  not know fails (exit `4`, naming the state) until goetia learns that state;
+  `kill` and `uninstall` still work. `restart --timeout 0` of a task whose run
+  is still alive is refused with exit `4`, saying that no start was issued:
+  launchd starts no new run of a task while one is in flight, and `start`
+  after it exits, or a `restart` without `--timeout 0`, does the job.
+- **Windows:** `stop` reaches the host as the console close event, and the host
+  ends the program's whole tree at once; goetia gives the program no time to
+  end itself. The run reports `0xC000013A`. `kill` terminates the host, and its
+  Job Object takes the program's tree with it; a waiting `run` then reports
+  that the run ended without recording its exit (exit `4`), as it does for a
+  shutdown or a host failure. When a stop could not end everything the program
+  started, the command that stopped it says so, and so do the host's log and
+  the Windows Event Log; `status` then shows the run as stopped (exit code
+  `0xC000013A`), as a service shows stopped. `restart --timeout 0` is refused as
+  on launchd.
+
+### The schedule, per platform
+
+A schedule is read in the machine's local time zone. `H` is resolved when the
+task is installed, from the host name as the OS returns it (`gethostname()`), the
+id and the field's position. A changed host name therefore shows as drift
+(`diff` exits `3`), and the next `install` moves the run. On macOS `gethostname()`
+returns `HostName` when it is set, and otherwise `LocalHostName` followed by
+`.local`; `ComputerName` has no effect (measured on macOS 26). Whether a name
+the network supplies replaces `LocalHostName` when `HostName` is unset was not
+measured: if one does, an `H` schedule would read as drift after a network
+change.
+
+Platforms differ in what they can hold. One that cannot hold a schedule
+refuses it at `install`, naming the limit, and nothing is written. A schedule
+that names only dates that never exist (`0 0 30 2 *`) is accepted and never runs,
+as in cron, and has no `next-run`.
+
+#### systemd timers
+
+- A time the clock skips (the clocks jump forward) is not run that day; a time
+  that happens twice (they go back) is run once.
+- Cron's either-or day rule needs two `OnCalendar=` lines, which goetia writes:
+  systemd's own rule for a day and a weekday is both must match.
+- A run starts within a second of its time.
+- **A changed schedule on an armed task.** `install` disarms the timer, writes
+  the new schedule, reloads and arms it again. A run that came due in that
+  window is not made up; `goetia daemon start <id>` runs it.
+
+#### launchd calendar entries
+
+launchd takes `StartCalendarInterval` entries and reports no next run, so goetia
+computes `next-run` from the entries it gave launchd.
+
+- **Time zone.** Entries are computed in the zone launchd booted in. After a
+  zone change launchd keeps the old zone until `UserEventAgent` restarts (measured
+  on a CI runner), while `next-run` reads the new `/etc/localtime`, so they differ
+  until then. Whether launchd recomputes after a zone change on a Mac with SIP on
+  was not measured.
+- **A time the clock skips or repeats** is read per entry. A schedule that names
+  its hour runs once, at the end of the gap; an hourly or every-minute
+  schedule skips the missing hour. A repeated time: an entry that names a date (a
+  day, or a month and a day) runs at the first pass only, and one that names no
+  date, or a weekday, runs at both. So `30 1 * * *` runs twice, and `30 1 15 * *`
+  or `30 1 * 11 *` (which names each day of November) once. This was measured in
+  `America/New_York`; a zone whose change is not one hour (Lord Howe's 30
+  minutes) or falls at midnight was not.
+- **launchd refuses** a schedule whose two day fields are both restricted and
+  must both match (one starts with `*`, as in `0 0 */2 * 1`); any schedule that
+  must name 29 February (`0 0 29 * *`, `0 0 29 2 *`, every day of February as
+  in `0 3 * 2 *`, and every other day, `0 0 */2 * *`): launchd has no year, so
+  it cannot run on 29 February only in leap years; and a weekday under a
+  restricted month (`0 0 * 6 1`). A schedule whose day of the month and day of
+  the week are either-or is held.
+- **Missed runs.** macOS: a run due while the Mac is off or starting up, or while
+  `goetia daemon install` replaces an enabled task's plists, is missed;
+  `goetia daemon start <id>` runs it. A run due while the Mac sleeps runs when it
+  wakes, which launchd does not let goetia turn off.
+- **Timing.** On macOS a scheduled run starts up to a few seconds after its
+  minute, and never less than a second after the previous run's start.
+- **Many entries.** On macOS, a schedule with many entries (tens of thousands:
+  every minute of restricted days or months) makes `enable` take longer, and
+  launchd needs minutes after it returns to register every entry; a run due
+  before then may be missed. `goetia daemon start <id>` runs it.
+- **`last-run`** is always empty.
+- A launchd task with `logs` starts through `/bin/sh`, as a systemd task does,
+  and an `env` that sets `PWD`, `IFS`, `OLDPWD` or `_` is refused.
+
+#### Task Scheduler triggers
+
+Task Scheduler holds at most 48 triggers per task. goetia compiles a schedule to
+triggers by a fixed rule: the minute `:00`, if the schedule names it, is a lone
+trigger in each hour it names; the other minutes are grouped greedily, each
+group the longest progression that starts at the smallest minute left, and a
+group is one trigger per hour it names (a repetition inside the hour, or a lone
+trigger for one minute). A schedule that compiles to more than 48 is refused:
+
+```console
+error: daemon `backup`: schedule `0-10,30 * * * *` compiles to 72 Task Scheduler triggers, and a task holds at most 48
+```
+
+`*/15 * * * *` and `* * * * *` are 48 each. The grouping is greedy and does not
+always find the fewest triggers, so a schedule that a cleverer grouping could fit
+in 48 can be refused. The way out is to split the schedule across two tasks.
+
+- A schedule whose day of the month and day of the week are both restricted
+  (cron's either-or, where a date both name would start the task from two
+  triggers at one instant, which `IgnoreNew` does not reliably make one run) is
+  refused, as is one where both must match, which Task Scheduler's day forms
+  cannot hold. Use `*` for one of the two. The exception is an either-or
+  schedule whose days of the month fall in no month of its month set: it is
+  accepted, and only its weekdays count. `0 0 30 2 1` runs on Mondays in
+  February, never on the 30th.
+- **Clock changes.** A skipped hour runs nothing that day, and a repeated hour
+  runs in both passes. A trigger due at the instant of the change does not run
+  (the first minute after a skipped hour, and the start of the second pass of a
+  repeated hour), so the `:00` run is the one a change at the hour costs. No
+  repetition crosses a local hour boundary, which is why every hour has its own
+  trigger. In spring, a task with an every-minute repetition (`* * * * *` or
+  any step-1 group) registered shortly before the change ran once a minute from
+  registration until the repetition's first start, at minutes the schedule does
+  not name (registered 8 minutes ahead, it ran 8 extra times); how that depends
+  on the time of registration is open ([#285](https://github.com/bindreams/goetia/issues/285)).
+  A change off the hour, at midnight or by other than one hour (Lord Howe's 30
+  minutes) was not measured (#285), and the above is not claimed for one.
+- **A changed schedule** to a lone time starts no run: a lone trigger moved to
+  a time between the last run and now started nothing in the 12 minutes
+  watched.
+
+### Task accounts on Windows
+
+A task runs as SYSTEM, LocalService or NetworkService, or as a real user. A real
+user's task logs on with a password read from `GOETIA_SERVICE_PASSWORD`, as a
+service's does, and `install` grants the account `SeBatchLogonRight`; a virtual
+account (`NT SERVICE\...`) is refused for a task (Task Scheduler cannot run one).
+`enable` and `disable` of such a task re-register it and need the password;
+`uninstall` never does, so a task whose account was deleted or whose password
+was lost can still be removed. A failed logon (no right, or a stale password)
+starts nothing and raises nothing.
+
+- A `%` in the path or arguments of the host (`goetia-shim`) is refused for a
+  task, because Task Scheduler expands `%VAR%` in a task's arguments. The task's
+  own `command` is not affected.
+- An account change registers the task again, so its last run and last result
+  start over. It is refused while a run of the task is alive (run
+  `goetia daemon stop <id>`, then install again) and while something else holds
+  its run records, such as a run that is starting or a `run` or `stop` of it
+  (wait for that to end, then install again). A scheduled run that comes due
+  while the change, or an `uninstall`, is under way does not run, even when the
+  change is then refused. If the change fails after the old task was removed,
+  nothing is installed at the id: install again, and `enable` it if it was
+  armed. A wrong `GOETIA_SERVICE_PASSWORD` fails that way: Task Scheduler
+  checks it only when it registers the new task.
+- An install or an `uninstall` that did not finish can leave the task switched
+  off and its run records closed: nothing starts it, and `start`, `run`,
+  `enable`, `disable`, and a `stop` that finds a run to wait for fail saying
+  so. Run the install again with `--force` (without it the switched-off task
+  reads as a hand edit), or run `uninstall` again. A run that outlived a failed
+  `uninstall` is not ended by a `stop` that waits, which is refused;
+  `stop --timeout 0`, `kill` or the next `uninstall` ends it.
+- A service `uninstall` while Task Scheduler is unusable cannot tell whether a
+  task still references the host's file, so it leaves the file and reports it;
+  the next sweep removes it.
+- A directory someone put by hand in a task's records directory (only SYSTEM or an
+  Administrator can) that cannot be removed fails `uninstall`, naming it, after
+  the task is deleted: remove the directory by hand and run `uninstall` again,
+  or install the task again.
+- A task whose run-records directory is missing or unusable starts no program;
+  the Event Log names the path. `install` of the task, an up-to-date one
+  included, makes a missing directory again.
+- A task that runs as a local account that has never logged on may never start on
+  that first start: Windows' logon of the account waits in the User Profile
+  Service, `Run` returns, no process starts, and `schtasks /query` of the task
+  does not return. Measured on Windows Server 2025, in about one of ten first
+  logons made back to back. Whether goetia's own `status` and `list` block on it,
+  whether it recovers without a reboot, whether an account that has logged on once
+  is affected, and whether a service's first start is ([#275](https://github.com/bindreams/goetia/issues/275))
+  were not measured.
+
 ## Machine-readable output
 
 `--json` is implemented by `goetia daemon list` and `goetia daemon status`.
@@ -777,7 +1218,26 @@ shown pretty-printed here for readability:
 ```json
 {
   "daemons": [
-    { "id": "frpc", "state": "running", "enabled": true, "pid": 1234 }
+    {
+      "id": "frpc",
+      "type": "service",
+      "state": "running",
+      "enabled": true,
+      "pid": 1234,
+      "last-result": null,
+      "last-run": null,
+      "next-run": null
+    },
+    {
+      "id": "backup",
+      "type": "task",
+      "state": "idle",
+      "enabled": true,
+      "pid": null,
+      "last-result": { "code": 0 },
+      "last-run": "2026-11-18T03:30:00+02:00",
+      "next-run": "2026-11-19T03:30:00+02:00"
+    }
   ],
   "errors": [],
   "undetermined": []
@@ -787,21 +1247,34 @@ shown pretty-printed here for readability:
 `daemons`, `errors` and `undetermined` are **always present**, as arrays,
 possibly empty.
 
-| Key                     | Type            | Notes                                                                                                                                                                                                                                                                             |
-| ----------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `daemons[].id`          | string          | The daemon id.                                                                                                                                                                                                                                                                    |
-| `daemons[].state`       | string          | One of `running`, `stopped`, `failed`, `unknown`.                                                                                                                                                                                                                                 |
-| `daemons[].enabled`     | bool            | Whether the service is enabled at boot.                                                                                                                                                                                                                                           |
-| `daemons[].pid`         | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                                                                                                                                                     |
-| `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for `unsupported`, and for an `unavailable` that belongs to no id.                                                                                                                                           |
-| `errors[].kind`         | string          | See below.                                                                                                                                                                                                                                                                        |
-| `errors[].message`      | string          | Human-readable detail.                                                                                                                                                                                                                                                            |
-| `undetermined[].name`   | string or null  | The id the entry stands for. **`null` is one entry standing for many ids** — see below.                                                                                                                                                                                           |
-| `undetermined[].reason` | string          | What did not complete, as facts: the operation, what it was on, and the failure. An aggregate's stands alone and names a count rather than an id. Whether it also carries a remedy is platform-specific — see [Which reads count, per platform](#which-reads-count-per-platform). |
+| Key                     | Type            | Notes                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemons[].id`          | string          | The daemon id.                                                                                                                                                                                                                                                                                                                                                   |
+| `daemons[].type`        | string          | `service` or `task`.                                                                                                                                                                                                                                                                                                                                             |
+| `daemons[].state`       | string          | One of `running`, `idle`, `stopped`, `failed`, `unknown`. A task is `running` or `idle`, or `unknown` where its manager cannot say, and never `stopped` or `failed`; a service is never `idle`.                                                                                                                                                                  |
+| `daemons[].enabled`     | bool            | Whether the service is enabled at boot; for a task, whether its schedule is armed (`false` for a task with no schedule).                                                                                                                                                                                                                                         |
+| `daemons[].pid`         | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                                                                                                                                                                                                                                    |
+| `daemons[].last-result` | object or null  | How a task's most recent finished run ended: `{"code": n}` or `{"signal": n}`, where `n` is the signed 32-bit value (a Windows run that was stopped reads `{"code": -1073741510}`, which is `0xC000013A`). `null` on a service, and on a task that has not run or whose run is in flight, where the platform says so: see [Status of a task](#status-of-a-task). |
+| `daemons[].last-run`    | string or null  | When a task's most recent run started, as RFC 3339 with the offset of the system time zone at that instant, to the second: `2026-11-18T03:30:00+02:00`. `null` on a service, on a task that has not run, and always on launchd.                                                                                                                                  |
+| `daemons[].next-run`    | string or null  | When a task's schedule will start it next, in the same form. `null` on a service, on a task whose schedule is not armed, on one with no run to come, and, on systemd, possibly while a run is in flight.                                                                                                                                                         |
+| `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for `unsupported`, and for an `unavailable` that belongs to no id.                                                                                                                                                                                                                          |
+| `errors[].kind`         | string          | See below.                                                                                                                                                                                                                                                                                                                                                       |
+| `errors[].message`      | string          | Human-readable detail.                                                                                                                                                                                                                                                                                                                                           |
+| `undetermined[].name`   | string or null  | The id the entry stands for. **`null` is one entry standing for many ids** — see below.                                                                                                                                                                                                                                                                          |
+| `undetermined[].reason` | string          | What did not complete, as facts: the operation, what it was on, and the failure. An aggregate's stands alone and names a count rather than an id. Whether it also carries a remedy is platform-specific — see [Which reads count, per platform](#which-reads-count-per-platform).                                                                                |
 
 A daemon's display `name` is deliberately absent: `status` has no spec to
 read it from, and one field differing between the two subcommands would be
 worse than sending you to `goetia daemon show`.
+
+`last-result`, `last-run` and `next-run` are keys of every entry: a service has
+them as `null`, never absent, so a consumer reads one shape. A time is in the
+system time zone as the process sees it, which honours the `TZ` variable, so
+the same task prints a different offset under a different `TZ`; the instant it
+names is the same. Where the system zone cannot be determined, a time is
+written in UTC with `Z`. A time outside the years 0 to 9999, which RFC 3339
+can write, is `null`. The text form of `status` prints a task's same fields,
+with `-` for a value that is `null`; a `list` row ends with the daemon's type.
 
 `errors[].kind` is one of eight values:
 
@@ -935,6 +1408,30 @@ it. If the plist is taken or removed after `install` has read launchd's state
 but before it has sent anything, `install` exits `1`: no plist was written and
 nothing was sent, and a rerun starts afresh.
 
+**A task.** For a task, running means a run is in flight. `install` never ends
+one, and never arms or disarms the schedule: a first install writes the task
+disarmed, and an install over an installed task leaves it as armed or disarmed
+as it was.
+
+- systemd and SCM: a changed task takes effect at its next run, and the one in
+  flight is not touched.
+- launchd updates an idle task, which launchd holds loaded without a process:
+  it boots the timer out where the timer renders differently, the schedule is
+  dropped, the job is booted out, or the timer is stray, writes the plists, and, if the task was
+  enabled, loads the job and then the timer again, so the schedule stays armed.
+  It refuses only when the job's rendering, apart from goetia's metadata
+  comment, changes, the job is loaded and a run is in flight (exit `1`, naming
+  the task and saying to `stop` it, which leaves it idle), with nothing
+  written. A schedule edit changes the job plist's metadata comment but not its
+  rendering, so it is applied while a run is in flight and does not touch the
+  run. A run due while
+  the plists are replaced is missed (see [launchd](#launchd-calendar-entries)).
+- Windows: an install that changes the account a task runs as registers the
+  task again; see [Task accounts on Windows](#task-accounts-on-windows).
+
+Installing a manifest of the other type over an installed daemon removes the old
+one first (see [Tasks](#ids-are-one-namespace)).
+
 ## The service host on Windows
 
 On Windows a `protocol: plain` daemon runs under a service host, goetia's shim
@@ -985,6 +1482,22 @@ a program's installer may place a file with a shim's name in its own folder.
 already stopped, or stopped before `uninstall` could take hold of its process (a
 daemon that fails at start), a shim still exiting keeps its file in use; that file
 is skipped without an error, and a later sweep removes it.
+
+A [task](#tasks) runs under the same host, as the action of a Task Scheduler
+task in the folder `\Goetia`, and the host is placed, verified and swept as above.
+Task Scheduler starts it with `--goetia-task <id> <token>` after the host's own
+arguments, which is task mode (the token is the task's registration token, which
+the host checks against Task Scheduler's own record of the task): the host reads its own task, applies the task's
+`env`, `cwd` and `logs`, runs the program in a Job Object as for a service, and
+does not talk to SCM. It writes one record of how each run ended
+to `%ProgramData%\Goetia\runs\<id>`, where `run` and `stop` read it (`status`
+reads Task Scheduler, not these), and a later run prunes the older records.
+`uninstall` reads them while it stops the runs, then removes them. An elevated
+`install` makes `%ProgramData%\Goetia`, `Goetia\logs` and `Goetia\runs` with the
+shim folder's permission check, and refuses one an account other than SYSTEM,
+Administrators or TrustedInstaller can change, never repairing it: a
+`%ProgramData%\Goetia` that an earlier goetia left to a non-administrator is
+deleted, or given to Administrators, by hand.
 
 ### Shipping the shim from a library
 
@@ -1090,6 +1603,12 @@ Scm::with_shim(
 )
 ```
 
+Tasks run under the same host, which Task Scheduler starts with `--goetia-task
+<id> <token>` after the host's own arguments. A program that calls
+`goetia::shim::main()` from its own `main` must let those three trailing
+arguments through its own argument parser, and leave them last. The last is a
+registration token that the host must pass on unchanged.
+
 Any other source of the shim implements `goetia::shim::ShimProvider`.
 
 ## Waiting for a start or stop
@@ -1104,7 +1623,9 @@ share one pair of flags:
 | `--no-timeout`         | Wait indefinitely.                                                                                                                    |
 
 On macOS, launchd keeps a job's label until the job's process has exited, and
-goetia does not load a job over one that is still going away. So on macOS:
+goetia does not load a job over one that is still going away. So on macOS, for a
+service (a task's `stop` never boots its job out: see [Stopping and killing a
+task](#stopping-and-killing-a-task)):
 
 - `daemon stop`, the stop leg of `daemon restart`, and `daemon uninstall` boot
   the job out and then wait until launchd no longer has it. `stop` and
@@ -1128,6 +1649,12 @@ The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,
 and the command line is refused at exit `2` having run nothing. Under
 `--dry-run` they are inert, exactly as `--start` itself is.
+
+**A task.** A task's `start` requests a run and returns once the manager has
+accepted it, so the two flags are refused for it, per id, at exit `1`; so are
+they on `install --start` of a task. What `start` returns says nothing of how the
+run went: `last-result` does. A task's `stop` and `restart` take both flags, and
+the budget bounds the wait for the run to end.
 
 **Durations** use the manifest's own grammar, the one `restart-delay`
 accepts: `10s`, `500ms`, `2m30s`. Write a compound duration **unspaced**, or
@@ -1446,6 +1973,11 @@ start launchd has accepted and not yet forked (`goetia daemon start`, then
 `kill` at once) is running by `status`: its `kill` waits for the process, with
 no time limit, and then ends it.
 
+A task has no restart policy: its `kill` ends the run in flight and leaves its
+schedule armed, and a task with no run in flight is "not running" like any
+other daemon with no process. What it sends on each platform is in
+[Stopping and killing a task](#stopping-and-killing-a-task).
+
 ## Exit codes
 
 Two rules come before the numbers:
@@ -1458,14 +1990,15 @@ Two rules come before the numbers:
    `grep` has distinguished "no match" from "could not read the file" since
    v7 Unix.
 
-| Code | Name          | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Anchored to                                                                                               |
-| ---- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `0`  | success       | The state is as asked, or the question was fully answered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright. `kill` of a daemon with no process is this: nothing was killed.                                                                                                                                                                                                                                                                                                                                                                                                                                       | —                                                                                                         |
-| `2`  | usage         | The command line was rejected before anything ran — by clap, or by one of `dispatch`'s refusals (`--json` on a subcommand that does not implement it; a wait flag on an `install` with no `--start`).                                                                                                                                                                                                                                                                                                                                                                 | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
-| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Nothing; app-specific.                                                                                    |
-| `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia did not wait out — it stopped waiting, never waited, or lost track of it — or whether a request reached the manager at all, when goetia lost the tool carrying it after it may have started; or whether a start the manager accepted took effect, when its state then read back as not established; or, on launchd, which definition a job loaded during `install` holds, or what took a plist's place after `install` booted out a job. | The LSB init-script convention's "service status unknown".                                                |
-| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                                                                                                                                                                                                                                                                                                                                                                                                                                         | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| Code  | Name          | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Anchored to                                                                                               |
+| ----- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `0`   | success       | The state is as asked, or the question was fully answered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | —                                                                                                         |
+| `1`   | error         | An operation was attempted and failed, or was refused outright. `kill` of a daemon with no process is this: nothing was killed.                                                                                                                                                                                                                                                                                                                                                                                                                                       | —                                                                                                         |
+| `2`   | usage         | The command line was rejected before anything ran — by clap, or by one of `dispatch`'s refusals (`--json` on a subcommand that does not implement it; a wait flag on an `install` with no `--start`).                                                                                                                                                                                                                                                                                                                                                                 | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
+| `3`   | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Nothing; app-specific.                                                                                    |
+| `4`   | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia did not wait out — it stopped waiting, never waited, or lost track of it — or whether a request reached the manager at all, when goetia lost the tool carrying it after it may have started; or whether a start the manager accepted took effect, when its state then read back as not established; or, on launchd, which definition a job loaded during `install` holds, or what took a plist's place after `install` booted out a job. | The LSB init-script convention's "service status unknown".                                                |
+| `5`   | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                                                                                                                                                                                                                                                                                                                                                                                                                                         | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| `run` | the run's own | `daemon run` of a task, once the run has ended: the program's exit code, or `128` plus the signal that ended it. A program's `1` and `4` and goetia's own are indistinguishable. When goetia could not run the task, or could not tell how the run ended, it exits `1` or `4` as above. Outside the precedence below.                                                                                                                                                                                                                                                 | The program's own status.                                                                                 |
 
 `2` and `4` are the two that must not be renumbered for tidiness: both are
 tied to a convention outside goetia.
@@ -1735,14 +2268,19 @@ Per platform:
   named, **with no fragment at all** — that read is what would have told
   goetia whether anything occupies the id, so `status` and `list` answer it
   identically instead of one saying "cannot determine" while the other
-  leaves the id out.
+  leaves the id out. A task's `<id>.timer` is read as part of its id: a `<id>.timer`
+  that is not goetia's makes the id foreign when goetia's own unit is a task, or
+  absent, and an unreadable one beside a task is a failed read of the id. Beside
+  a service, a timer that cannot be read or decoded is ignored, as before.
 - **launchd** — a plist whose bytes could not be **obtained** is reported as
   `undetermined`, named. Bytes that were obtained and are not UTF-8 XML are
   foreign and omitted, per the same rule — a binary plist (`bplist00`, what
   `plutil -convert binary1` and `defaults write` produce by default, so a
   `/Library/LaunchDaemons` full of them is the normal state of a macOS host),
   a UTF-16 plist, or one stray Latin-1 byte. systemd and launchd answer this
-  question identically.
+  question identically. A task's timer plist is read as its job's, never as an
+  id of its own; a timer plist whose job plist is missing is the job's id,
+  unusable.
 - **SCM** — an unelevated read of a service's `Parameters` is commonly denied, which goetia's Windows design assumes is the usual case rather than a measured one, so
   an unelevated `goetia daemon list` on Windows is **expected** to carry one
   `undetermined` entry standing for every service it could not inspect, and
@@ -1755,13 +2293,13 @@ Per platform:
   rule above exists at all. For exactly one it **names that service**, and
   its `reason` is about that service rather than about the host, so a
   `name == null` assertion written from the aggregate case is wrong on a
-  host where exactly one read was denied. A task is not a service, and its
-  running is read from its process: an unelevated `status` or `list` of a task
-  that runs as another account (SYSTEM, LocalService, or an administrator's own
-  elevated task) cannot open that process, so it cannot tell running from
-  idle. It reports the id as `unusable`, naming the denial, exit `4`, and
-  `run` of it refuses with the same denial. Re-running as Administrator
-  clears it.
+  host where exactly one read was denied. A task lives in Task Scheduler, not
+  in SCM, and is read there; see [Status of a task](#status-of-a-task) for what
+  an unelevated read of one reports. A Task Scheduler that cannot be read does
+  not change what goetia does for services, installing a new one included: a
+  listing then carries one unnamed `undetermined` entry for the task store,
+  installing a task fails, and an id with no service is undetermined, since a
+  task may have it.
 
 **Whether a `reason` also carries a remedy is platform-specific.** On systemd
 and launchd it is facts only, and any remedy belongs to the per-id
@@ -1817,7 +2355,8 @@ _established_ rather than by what went wrong.
 
 ## Running the tests
 
-Some tests change real system state: they install and remove real services, write the registry,
+Some tests change real system state: they install and remove real services and scheduled tasks (systemd timers, launchd
+timer plists, Windows Task Scheduler tasks), write the registry,
 `/etc/systemd/system` or `/Library/LaunchDaemons`, and create accounts. They run only in a sandbox
 (a container, a VM or CI), and they are gated by two environment variables per group (`SCM` on
 Windows, `SYSTEMD` on Linux, `LAUNCHD` on macOS):
