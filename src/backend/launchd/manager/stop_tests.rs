@@ -792,6 +792,30 @@ fn stop_under_immediate_ends_on_the_first_pid_that_repeats_whatever_came_before(
     }
 }
 
+/// A queued start between two readings of the same pid is a fork between them: the pid shown after it is a run
+/// to attempt, not a repeat of the one that could not be reached.
+#[skuld::test]
+fn stop_under_immediate_attempts_a_pid_again_when_a_queued_start_forked_since_it_could_not_reach_it() {
+    let mut run = Held::new(0);
+    let a = run.pid();
+    let fake = Fake::new([
+        print(&running(a)),
+        print(&running(a)),
+        procinfo_not_naming(a),
+        print(QUEUED),
+        print(&running(a)),
+        print(&running(a)),
+        print(&running(a)),
+        procinfo(a),
+    ]);
+
+    stopping(&fake, Budget::Immediate).expect("the run launchd names after the fork is signalled");
+
+    fake.assert_spent("the pid launchd did not name, the queued start and its fork, and the run read, confirmed");
+    assert_no_label_signal(&fake);
+    assert_eq!(ended_by(&mut run), Some(libc::SIGTERM), "the run was sent SIGTERM once");
+}
+
 /// A start that forks is waited for under `Immediate` too, and the pid shown after it is read like any other:
 /// one that cannot be reached is read for again, and the same pid ends the stop, unconfirmed.
 #[skuld::test]
