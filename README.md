@@ -273,8 +273,8 @@ records the end as it does.
 - **Windows** reads, checks and records the field, and does not apply it yet:
   the shim still ends the daemon at once on every stop, `stop`, `restart` and
   `uninstall` included, whatever `stop-action` says. A task is stopped by Task
-  Scheduler, which decides the signal and the wait, so a task refuses
-  `stop-action`; set it under `backend-specific` for systemd and launchd. A
+  Scheduler, which decides the signal and the wait, so a task refuses a
+  `send-signal` or `timeout` that is not the default; set it under `backend-specific` for systemd and launchd. A
   `protocol: native` service handles SCM's own stop itself, so it refuses
   `send-signal`; its `timeout` still sets the wait of `stop` and `restart`.
 
@@ -757,9 +757,10 @@ schedule: "30 3 * * *"
 logs: /var/log/backup/backup.log
 ```
 
-A task takes `name`, `command`, `cwd`, `env`, `user`, `logs` and `schedule`;
-`restart`, `restart-delay` and `protocol` are refused, naming the field (see
-[`type`, `protocol` and `schedule`](#type-protocol-and-schedule)). A task
+A task takes `name`, `command`, `cwd`, `env`, `user`, `logs`, `schedule` and
+[`stop-action`](#stop-action), which says how `stop` ends a run (a Windows task
+has its own rule there); `restart`, `restart-delay` and `protocol` are refused, naming the
+field (see [`type`, `protocol` and `schedule`](#type-protocol-and-schedule)). A task
 without a `schedule` runs only when you ask, which is what a program that
 triggers its own periodic work wants: it gets goetia's account and `env` set-up
 and no timer.
@@ -981,9 +982,11 @@ same.
   run but not the last run or its result; use `start`.
 - **Windows:** `last-result` is the exit code Task Scheduler recorded for the
   host, which is the program's own unless the host ends the run itself: `1003`
-  (it could not show that the program's tree ended), `1` (it refused to run: its
-  task is gone, is not goetia's, or its data would not decode) or a Windows
-  error number (it failed at something else). A program that exits with the same
+  (it could not show that the program's tree ended), `1` (it refused to run: the
+  id is not a goetia id, or the task has no goetia marker, is a service's, or has
+  data that would not decode) or a Windows error number (it failed at something
+  else; `31`, `ERROR_GEN_FAILURE`, when it has no number of its own: the task is
+  gone, another install registered it again, or a removal marker stands). A program that exits with the same
   number reads the same. After a stop it is `0xC000013A` whatever happened.
   An unelevated `status` or `list` of a task that runs as another account (SYSTEM,
   LocalService, or an administrator's own elevated task) cannot open the run's
@@ -1001,17 +1004,19 @@ with the request standing.
 
 - **systemd:** as for a service: `stop` stops the unit, and `kill` sends
   `SIGKILL` to its main process through a pidfd.
-- **launchd:** `stop` sends `SIGTERM` only, and waits (bounded by `--timeout`).
-  A task that ignores it keeps running; `kill` ends it: it reads the run's pid
-  from launchd, holds that process, confirms with `launchctl procinfo` that
-  it is the job's, and sends `SIGKILL` to the held process. goetia boots the
-  job out for neither `stop` nor `kill`. Only `stop` and `run` signal by label:
-  `run` sends `SIGCONT` to the launch that took its hold, its own or a
-  scheduled one that took the hold of an earlier interrupted `run`, and follows
-  that launch. A `stop` under any budget,
-  `--timeout 0` included, first waits for a start launchd has accepted to
-  begin, so that it can end it, and it also ends a run that begins while it
-  stops.
+- **launchd:** `stop` sends `SIGTERM`, then `SIGKILL` once the `stop-action`
+  `timeout` is over, and `SIGKILL` at once for `send-signal: kill`; it waits
+  (bounded by `--timeout`), and what a short budget leaves running is told in
+  [`stop-action`](#stop-action). `kill` sends `SIGKILL` at once: it reads the
+  run's pid from launchd, holds that process, confirms with `launchctl procinfo`
+  that it is the job's, and signals the held process. `stop` signals the held
+  process too, never by label, and goetia boots the job out for neither. Only
+  `run` signals by label: it sends `SIGCONT` to the launch that took its hold,
+  its own or a scheduled one that took the hold of an earlier interrupted `run`,
+  and follows that launch. A `stop` under any budget, `--timeout 0` included,
+  first waits for a start launchd has accepted to begin, so that it can end it.
+  A run that begins while a `stop` waits is ended too; under `--timeout 0`, or
+  once a bounded budget is spent, a run that begins later is sent nothing.
   A `stop` or `restart` of a task that launchd shows in a state goetia does
   not know fails (exit `4`, naming the state) until goetia learns that state;
   `kill` and `uninstall` still work. `restart --timeout 0` of a task whose run
@@ -1166,13 +1171,15 @@ starts nothing and raises nothing.
   `enable`, `disable`, and a `stop` that finds a run to wait for fail saying
   so. Run the install again with `--force` (without it the switched-off task
   reads as a hand edit), or run `uninstall` again. A run that outlived a failed
-  `uninstall` is stopped by the next `uninstall`, not by `stop`.
+  `uninstall` is not ended by a `stop` that waits, which is refused; `stop
+  --timeout 0`, `kill` or the next `uninstall` ends it.
 - A service `uninstall` while Task Scheduler is unusable cannot tell whether a
   task still references the host's file, so it leaves the file and reports it;
   the next sweep removes it.
 - A directory someone put by hand in a task's records directory (only SYSTEM or an
-  Administrator can) that cannot be removed fails `uninstall`, naming it; `run`
-  backs off, and `uninstall` again after the directory is removed finishes.
+  Administrator can) that cannot be removed fails `uninstall`, naming it, after
+  the task is deleted: remove the directory by hand and run `uninstall` again,
+  or install the task again.
 - A task whose run-records directory is missing or unusable starts no program;
   the Event Log names the path. `install` of the task, an up-to-date one
   included, makes a missing directory again.
@@ -1478,12 +1485,14 @@ is skipped without an error, and a later sweep removes it.
 
 A [task](#tasks) runs under the same host, as the action of a Task Scheduler
 task in the folder `\Goetia`, and the host is placed, verified and swept as above.
-Task Scheduler starts it with `--goetia-task <id>` after the host's own
-arguments, which is task mode: the host reads its own task, applies the task's
+Task Scheduler starts it with `--goetia-task <id> <token>` after the host's own
+arguments, which is task mode (the token is the task's registration token, which
+the host checks against Task Scheduler's own record of the task): the host reads its own task, applies the task's
 `env`, `cwd` and `logs`, runs the program in a Job Object as for a service, and
 does not talk to SCM. It writes one record of how each run ended
-to `%ProgramData%\Goetia\runs\<id>`, where `run` and `status` read it, and a
-later run prunes the older records. `uninstall` removes them. An elevated
+to `%ProgramData%\Goetia\runs\<id>`, where `run` and `stop` read it (`status`
+reads Task Scheduler, not these), and a later run prunes the older records.
+`uninstall` reads them while it stops the runs, then removes them. An elevated
 `install` makes `%ProgramData%\Goetia`, `Goetia\logs` and `Goetia\runs` with the
 shim folder's permission check, and refuses one an account other than SYSTEM,
 Administrators or TrustedInstaller can change, never repairing it: a
@@ -1595,9 +1604,10 @@ Scm::with_shim(
 ```
 
 Tasks run under the same host, which Task Scheduler starts with `--goetia-task
-<id>` after the host's own arguments. A program that calls `goetia::shim::main()`
-from its own `main` must let those two trailing arguments through its own
-argument parser, and leave them last.
+<id> <token>` after the host's own arguments. A program that calls
+`goetia::shim::main()` from its own `main` must let those three trailing
+arguments through its own argument parser, and leave them last. The last is a
+registration token that the host must pass on unchanged.
 
 Any other source of the shim implements `goetia::shim::ShimProvider`.
 
