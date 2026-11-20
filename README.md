@@ -1166,6 +1166,9 @@ starts nothing and raises nothing.
   nothing is installed at the id: install again, and `enable` it if it was
   armed. A wrong `GOETIA_SERVICE_PASSWORD` fails that way: Task Scheduler
   checks it only when it registers the new task.
+- A task whose user was deleted and created again keeps the old account's SID,
+  so `install` shows it as a conflict naming that SID; `install --force` (with
+  the password) registers it for the new account.
 - An install or an `uninstall` that did not finish can leave the task switched
   off and its run records closed: nothing starts it, and `start`, `run`,
   `enable`, `disable`, and a `stop` that finds a run to wait for fail saying

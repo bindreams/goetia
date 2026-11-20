@@ -66,9 +66,9 @@ fn task_verb_as(args: &[String]) -> ! {
     let id = Id::try_from(id.as_str()).expect("an id");
     let mgr = support::shim_manager_at(shim.into());
     match verb.as_str() {
-        "install" => {
+        "install" | "install-force" => {
             let spec = task_spec(&id, command.to_vec(), Some(SCHEDULE), User::Name(account.clone()), None);
-            finish(mgr.install(&spec, false))
+            finish(mgr.install(&spec, verb == "install-force"))
         }
         "enable" => finish(mgr.enable(&id)),
         "disable" => finish(mgr.disable(&id)),

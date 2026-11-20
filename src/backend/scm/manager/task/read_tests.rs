@@ -9,11 +9,12 @@ use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::manager::task::api::{Instance, Registered, TaskInfo};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::parameters::Parameters;
-use crate::backend::scm::test_support::{blob_of, registered_task, task_spec};
+use crate::backend::scm::test_support::{blob_of, registered_task, task_host, task_spec, task_spec_as};
 use crate::blob::Blob;
+use crate::decide::{self, ExternalConfig, Ownership};
 use crate::error::Error;
 use crate::manager::{Exit, Installed, State, Status};
-use crate::spec::{DaemonSpec, Protocol};
+use crate::spec::{DaemonSpec, Protocol, User};
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 fn id() -> Id {
@@ -180,6 +181,167 @@ fn a_task_whose_xml_cannot_be_read_is_unreadable_not_a_bad_spec() {
     assert!(scm.task_installed(&snapshot).is_err());
     let error = scm.task_regenerate(&spec, &snapshot).unwrap_err();
     assert!(error.wraps_unreadable_host(), "{error:?}");
+}
+
+// The account the installed definition shows --------------------------------------------------------------------------
+
+/// The SID text Task Scheduler stores for `alice`'s first account, and for the one created after it under the same
+/// name.
+const OLD_SID: &str = "S-1-5-21-1-2-3-1001";
+const NEW_SID: &str = "S-1-5-21-1-2-3-1002";
+
+fn sid_text(text: &str) -> Sid {
+    let parts: Vec<u32> = text.split('-').skip(3).map(|part| part.parse().unwrap()).collect();
+    crate::backend::scm::sid::sid_from_parts(5, &parts)
+}
+
+/// A lookup that answers from `known`, and says "no such account" for any other name.
+fn knowing(known: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Result<Sid> {
+    move |name| {
+        known
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, sid)| sid_text(sid))
+            .ok_or_else(|| Error::AccountLookup {
+                detail: format!("cannot resolve SID for account `{name}`"),
+                source: None,
+            })
+    }
+}
+
+fn denied(name: &str) -> Error {
+    Error::os(
+        format!("resolve SID for account `{name}`"),
+        io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32),
+    )
+}
+
+/// The task `nightly` of the user `alice`, as Task Scheduler stores it when its principal is the SID `stored`.
+fn alices(stored: &str) -> (DaemonSpec, TaskSnapshot) {
+    let spec = task_spec_as(User::Name("alice".to_owned()), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, false);
+    registered.xml = registered
+        .xml
+        .replace("<UserId>alice</UserId>", &format!("<UserId>{stored}</UserId>"));
+    assert!(registered.xml.contains(stored), "the principal is the stored SID");
+    let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+    (spec, snapshot)
+}
+
+/// What an install of `spec` over `snapshot` decides, the definition read with `lookup`.
+fn install_over(
+    spec: &DaemonSpec,
+    snapshot: &TaskSnapshot,
+    lookup: impl Fn(&str) -> Result<Sid>,
+) -> (String, decide::Outcome) {
+    let scm = Scm::new();
+    let on_disk = scm
+        .task_installed_with(snapshot, lookup)
+        .unwrap()
+        .definition
+        .to_string();
+    let regenerated = scm.task_regenerate(spec, snapshot).unwrap().to_string();
+    let desired = TaskXml::new(spec, task_host()).unwrap().to_string();
+    let outcome = decide::decide(
+        &Ownership::Ours {
+            blob: blob(spec),
+            regenerated,
+            on_disk: on_disk.clone(),
+        },
+        &desired,
+        spec,
+        crate::version(),
+        false,
+        &ExternalConfig::Absent,
+    );
+    (on_disk, outcome)
+}
+
+/// The registration names the account the blob's name names now, so the definition shows the blob's account and
+/// an install of it is up to date.
+#[skuld::test]
+fn a_registration_for_the_account_the_name_names_now_shows_the_blobs_account() {
+    let (spec, snapshot) = alices(OLD_SID);
+
+    let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", OLD_SID), (OLD_SID, OLD_SID)]));
+
+    assert!(shown.contains(r#"Account: user "alice""#), "{shown}");
+    assert!(matches!(outcome, decide::Outcome::UpToDate), "{outcome:?}");
+}
+
+/// The user was deleted and created again under the same name: the registration names the old account's SID, so
+/// the definition shows it, and an install of the same spec is a conflict that names it.
+#[skuld::test]
+fn a_registration_for_another_account_than_the_name_names_now_shows_its_sid_and_conflicts() {
+    let (spec, snapshot) = alices(OLD_SID);
+
+    let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID), (OLD_SID, OLD_SID)]));
+
+    assert!(shown.contains(&format!("Account: user {OLD_SID:?}")), "{shown}");
+    let decide::Outcome::Conflict { artifact_diff, .. } = outcome else {
+        panic!("a plain install is a conflict: {outcome:?}");
+    };
+    assert!(artifact_diff.contains(OLD_SID), "{artifact_diff}");
+}
+
+/// The user was deleted and not created again: the name names no account, and the registration's SID is shown.
+#[skuld::test]
+fn a_blob_name_that_names_no_account_shows_the_registrations_sid() {
+    let (spec, snapshot) = alices(OLD_SID);
+
+    let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[(OLD_SID, OLD_SID)]));
+
+    assert!(shown.contains(&format!("Account: user {OLD_SID:?}")), "{shown}");
+    assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
+}
+
+/// A lookup that fails for another reason than "no such account" (a domain controller outage) must not read as a
+/// conflict: the read is the error, whichever of the two accounts it could not look up.
+#[skuld::test]
+fn a_lookup_that_fails_otherwise_is_the_reads_error() {
+    let (_, snapshot) = alices(OLD_SID);
+    let scm = Scm::new();
+    let alice = |name: &str| match name {
+        "alice" => Err(denied(name)),
+        _ => Ok(sid_text(OLD_SID)),
+    };
+    let stored = |name: &str| match name {
+        "alice" => Ok(sid_text(NEW_SID)),
+        _ => Err(denied(name)),
+    };
+
+    for failed in [
+        scm.task_installed_with(&snapshot, alice),
+        scm.task_installed_with(&snapshot, stored),
+    ] {
+        let error = failed.err().expect("a failed lookup fails the read");
+        assert!(matches!(error, Error::InstalledUnreadable { .. }), "{error:?}");
+    }
+}
+
+/// A built-in account is never looked up: no re-created user is behind it.
+#[skuld::test]
+fn a_built_in_account_is_shown_as_the_blob_has_it_and_is_not_looked_up() {
+    let spec = task_spec_as(User::Name("LocalService".to_owned()), Some("30 3 * * *"));
+    let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_task(&spec, false));
+
+    let (shown, outcome) = install_over(&spec, &snapshot, |name| panic!("looked up `{name}`"));
+
+    assert!(shown.contains("Account: service LocalService"), "{shown}");
+    assert!(matches!(outcome, decide::Outcome::UpToDate), "{outcome:?}");
+}
+
+/// A registration whose XML names no principal has no SID to show: the blob's account stands, as it did before.
+#[skuld::test]
+fn a_registration_that_names_no_principal_shows_the_blobs_account() {
+    let spec = task_spec_as(User::Name("alice".to_owned()), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, false);
+    registered.xml = registered.xml.replace("<UserId>alice</UserId>", "");
+    let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+
+    let (shown, _) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID)]));
+
+    assert!(shown.contains(r#"Account: user "alice""#), "{shown}");
 }
 
 #[skuld::test]

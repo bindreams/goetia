@@ -237,6 +237,13 @@ impl TaskXml {
         self.account.clone()
     }
 
+    /// The definition as read of a task registered for `account`, which the blob's name no longer names when
+    /// the account was deleted and created again. [`TaskXml::parse`] reads the account from the blob alone; the
+    /// caller that has looked the registration's principal up says which to show.
+    pub(crate) fn shown_for(self, account: TaskAccount) -> TaskXml {
+        TaskXml { account, ..self }
+    }
+
     /// Whether the definition has a schedule, so a task made from it can be armed (`enable` refuses one with none).
     pub(crate) fn has_schedule(&self) -> bool {
         !self.triggers.is_empty()

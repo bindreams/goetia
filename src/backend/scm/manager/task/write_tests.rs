@@ -515,6 +515,61 @@ fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_sta
     }
 }
 
+/// The user a task runs as was deleted and created again under the same name: the registration names the old
+/// account's SID, `read` shows it, and the forced install over it is the account change, with the new account's
+/// password.
+#[skuld::test]
+fn a_task_whose_user_was_created_again_is_deleted_and_created_for_the_new_account() {
+    let (dir, runs) = made_records();
+    let spec = task_spec_as(User::Name("alice".to_owned()), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, true);
+    registered.xml = registered
+        .xml
+        .replace("<UserId>alice</UserId>", "<UserId>S-1-5-21-1-2-3-1001</UserId>");
+    let old = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+
+    let outcome = scm(&fake)
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            Some(&old),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), Some("secret")),
+        )
+        .unwrap();
+
+    assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
+    let token = registered_token(&fake);
+    assert_eq!(
+        fake.calls(),
+        [
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned()),
+            register_call(
+                &spec,
+                true,
+                TaskAccount::User("alice".to_owned()),
+                Some("secret"),
+                false,
+                &token
+            ),
+        ],
+        "disabled, checked, deleted, created for the new account"
+    );
+    assert!(
+        trustees_of(&records_dir(&dir)).contains(&users()),
+        "the directory names the new account"
+    );
+    fake.finish();
+}
+
 /// The old account's run is refused before anything is changed: its shim still writes its record, so the
 /// directory's permissions are not rewritten, and the task is not deleted.
 #[skuld::test]

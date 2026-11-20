@@ -7,7 +7,7 @@ use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
-use goetia::testing::sid_of;
+use goetia::testing::{shown_sid, sid_for_account_name, sid_of};
 
 use crate::fixture::FIXTURE;
 use crate::install_helper::TASK_AS;
@@ -108,6 +108,58 @@ fn a_real_user_task_installs_arms_and_runs(#[fixture(scm_group)] _group: &Group)
     mgr.uninstall(id).expect("uninstall without the password");
     assert!(!task_exists(id));
     assert!(!records_of(id).exists());
+}
+
+/// The user a task runs as is deleted and created again under the same name, which Task Scheduler does not follow:
+/// it keeps the old SID. A plain install of the unchanged manifest is a conflict naming that SID, not "up to
+/// date", and a forced install with the password registers the new account, whose task then runs.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_task_whose_user_was_created_again_conflicts_naming_the_old_sid_and_a_forced_install_registers_the_new_one(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let account = format!("gt{:08x}", rand::random::<u32>());
+    // The second guard deletes the account that exists at the end; the first then finds none, which it takes as
+    // done.
+    let _first = LocalUserGuard::create(&account, PASSWORD);
+    let old_sid = shown_sid(&sid_for_account_name(&account).expect("the SID of the first account"));
+    let id = &test_id();
+    let host = ServiceAccountHost::new(id);
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = host.manager();
+    let listener = ConnectBack::listen();
+    let command = vec![
+        host.exe.path_str(),
+        CONNECT_BACK.to_owned(),
+        listener.port().to_string(),
+    ];
+    assert_succeeded("install", &as_user("install", id, &account, &host, &command));
+
+    support::cmd::run("net.exe", &["user", &account, "/delete"]).expect_ok();
+    let _second = LocalUserGuard::create(&account, PASSWORD);
+    let new_sid = shown_sid(&sid_for_account_name(&account).expect("the SID of the second account"));
+    assert_ne!(old_sid, new_sid, "precondition: the account was created again");
+
+    let spec = task_spec(id, command.clone(), Some(SCHEDULE), User::Name(account.clone()), None);
+    let plain = mgr
+        .install(&spec, false)
+        .expect("a plain install of the unchanged manifest");
+    let Outcome::Conflict { artifact_diff, .. } = plain else {
+        panic!("a plain install is a conflict: {plain:?}");
+    };
+    assert!(
+        artifact_diff.contains(&old_sid),
+        "the conflict names the old SID: {artifact_diff}"
+    );
+
+    assert_succeeded(
+        "install --force",
+        &as_user("install-force", id, &account, &host, &command),
+    );
+    let exit = mgr
+        .run(id, &mut Vec::new())
+        .unwrap_or_else(|e| panic!("run as the new {account}: {}", e.report()));
+    assert_eq!(exit, Exit::Code(0), "the task of the new account ran");
+    listener.accept("the new user's program to have run");
 }
 
 /// An install that finds a real user's task up to date reads no password (the task is not registered again) and
