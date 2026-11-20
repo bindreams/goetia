@@ -667,10 +667,11 @@ What holds on every platform:
   every run alive.
 - **Catch-up is always on**, with no field to turn it off: a run missed while
   the machine was off or asleep is made up when it is back, except where
-  [launchd](#launchd-calendar-entries) cannot. Only that: on systemd and
-  launchd, a run that came due while the task was disarmed is never made up.
-  TODO(owner): on Windows, replace with the result of the systemd-fix PR's
-  measurement (goetia sets `StartWhenAvailable=true`).
+  [launchd](#launchd-calendar-entries) cannot. Only that: on every platform, a
+  run that came due while the task was disarmed is never made up. On Windows,
+  goetia sets `StartWhenAvailable`, which covers only a run missed while the
+  machine was off or asleep; an `enable` made up no run in the 20 minutes
+  watched after it.
 - **No retry.** A run that fails is not run again; a program that wants one
   retries itself. How it failed is its `last-result`.
 - **Times are local.** See [the schedule](#the-schedule-per-platform).
@@ -703,14 +704,17 @@ All under `goetia daemon`, as for a service:
   `install --enable` arms it, and is refused for a task with no schedule.
 - **`enable`** arms the schedule, now and across reboots. systemd enables and
   starts `<id>.timer`; launchd moves both plists into `/Library/LaunchDaemons`
-  and loads the timer; Windows enables the task's triggers. A task with no
+  and loads the timer; Windows writes the task's triggers back (the stored
+  ones, or the ones the schedule compiles to). A task with no
   schedule has nothing to arm: `enable` is refused, naming the missing
   schedule, and its `enabled` is always `false`. On Windows, `enable` and
   `disable` of a task that runs as a real user need `GOETIA_SERVICE_PASSWORD`
-  (see [Task accounts on Windows](#task-accounts-on-windows)). On systemd and
-  launchd, arming never makes up a run that came due while the task was
-  disarmed. TODO(owner): Windows, as stated under catch-up above.
-- **`disable`** disarms it. A run in flight carries on.
+  (see [Task accounts on Windows](#task-accounts-on-windows)). On every
+  platform, arming makes up no run that came due while the task was disarmed.
+- **`disable`** disarms it. A run in flight carries on. On Windows it removes
+  the task's triggers, which also stops a repetition in progress; a trigger
+  added to the task by hand goes with them, and other hand edits of the task
+  survive.
 - **`start`** requests a run now, armed or not, and returns once the manager
   has accepted the request. It says nothing of how the run went: `last-result`
   does. `--timeout` and `--no-timeout` are refused (see
@@ -825,8 +829,10 @@ the next one. A task that has never run is `idle` with `last-result` and
 `last-run` `null`, and `status` still exits `0`. Its `next-run` is `null` where
 the schedule is not armed: the task is disabled or has no `schedule`, its
 schedule never fires (`0 0 30 2 *`), or an `enable` or `install` was
-interrupted before the schedule was armed again (launchd). Otherwise an enabled
-task has its next run before it has had a first. A task's timer or triggers
+interrupted before the schedule was armed again (launchd). On systemd it is
+also `null` while a run is in flight: a timer whose service is active has no
+next elapse. Otherwise an enabled task has its next run before it has had a
+first. A task's timer or triggers
 changed by hand outside goetia may read otherwise.
 
 The three differ by platform where a run is in flight, or the manager failed
@@ -934,6 +940,9 @@ as in cron, and has no `next-run`.
 - Cron's either-or day rule needs two `OnCalendar=` lines, which goetia writes:
   systemd's own rule for a day and a weekday is both must match.
 - A run starts within a second of its time.
+- **A changed schedule on an armed task.** `install` disarms the timer, writes
+  the new schedule, reloads and arms it again. A run that came due in that
+  window is not made up; `goetia daemon start <id>` runs it.
 
 #### launchd calendar entries
 
@@ -1011,6 +1020,8 @@ in 48 can be refused. The way out is to split the schedule across two tasks.
   on the time of registration is open ([#285](https://github.com/bindreams/goetia/issues/285)).
   A change off the hour, at midnight or by other than one hour (Lord Howe's 30
   minutes) was not measured (#285), and the above is not claimed for one.
+- **A changed schedule** starts no run. A lone trigger moved to a time between
+  the last run and now started nothing in the 12 minutes watched.
 
 ### Task accounts on Windows
 
@@ -1027,16 +1038,23 @@ starts nothing and raises nothing.
   task, because Task Scheduler expands `%VAR%` in a task's arguments. The task's
   own `command` is not affected.
 - An account change registers the task again, so its last run and last result
-  start over, and is refused while the task runs. A failure between the delete
-  and the new registration leaves nothing at the id: install again, then
-  `enable`.
+  start over. It is refused while a run of the task is alive (run
+  `goetia daemon stop <id>`, then install again) and while something else holds
+  its run records, such as a run that is starting or a `run` or `stop` of it
+  (wait for that to end, then install again). A scheduled run that comes due
+  while the change, or an `uninstall`, is under way does not run, even when the
+  change is then refused. If the change fails after the old task was removed,
+  nothing is installed at the id: install again, and `enable` it if it was
+  armed.
 - A service `uninstall` while Task Scheduler is unusable cannot tell whether a
   task still references the host's file, so it leaves the file and reports it;
   the next sweep removes it.
 - A directory someone put by hand in a task's records directory (only SYSTEM or an
-  Administrator can) that cannot be removed fails `uninstall`, naming it; the
-  removal marker stays, `run` backs off, and `uninstall` again after the
-  directory is removed finishes.
+  Administrator can) that cannot be removed fails `uninstall`, naming it; `run`
+  backs off, and `uninstall` again after the directory is removed finishes.
+- A task whose run-records directory is missing or unusable starts no program;
+  the Event Log names the path. `install` of the task, an up-to-date one
+  included, makes a missing directory again.
 - A task that runs as a local account that has never logged on may never start on
   that first start: Windows' logon of the account waits in the User Profile
   Service, `Run` returns, no process starts, and `schtasks /query` of the task
