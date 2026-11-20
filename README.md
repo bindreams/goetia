@@ -1171,8 +1171,8 @@ starts nothing and raises nothing.
   `enable`, `disable`, and a `stop` that finds a run to wait for fail saying
   so. Run the install again with `--force` (without it the switched-off task
   reads as a hand edit), or run `uninstall` again. A run that outlived a failed
-  `uninstall` is not ended by a `stop` that waits, which is refused; `stop
-  --timeout 0`, `kill` or the next `uninstall` ends it.
+  `uninstall` is not ended by a `stop` that waits, which is refused;
+  `stop --timeout 0`, `kill` or the next `uninstall` ends it.
 - A service `uninstall` while Task Scheduler is unusable cannot tell whether a
   task still references the host's file, so it leaves the file and reports it;
   the next sweep removes it.
