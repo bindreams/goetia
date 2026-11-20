@@ -86,7 +86,7 @@ clap = { version = "4.6.6", features = ["derive"], optional = true }
 # `daemon start --timeout` waits on: `Child::wait_deadline` bounds the wait, `Child::kill` and
 # `Child::send_kill_tree` end the child and its tree on expiry, `Child::wait` reaps it, and dropping
 # the `Child` tears its contained tree down. 0.x with an explicitly unstable API.
-cosca = "0.8"
+cosca = "0.10"
 # `backend::bounded::collect`'s reader channel: `Receiver::len()` is a
 # race-free snapshot of what is already queued, which is what lets `collect`
 # stop exactly at the deadline instead of draining however long a reader
