@@ -15,6 +15,7 @@ use windows::core::HRESULT;
 
 use super::clock::local_to_system_in;
 use crate::backend::scm::instance::{InstanceId, TaskAccount, TaskPath};
+use crate::backend::scm::runs::unfinished_change;
 use crate::error::{Error, Result, find};
 
 /// One run of a task that Task Scheduler lists. A listing is not proof the run is alive: the entry
@@ -131,17 +132,13 @@ pub(crate) fn com_code(error: &Error) -> Option<HRESULT> {
 
 /// `error`, from the start of the task `id`, worded for a task whose own flag is false (`Run` refuses
 /// one with `SCHED_E_TASK_DISABLED`): goetia leaves a task so when an install or an uninstall of it did not
-/// finish. The message says so and names the two remedies that are always right, the install again with
-/// `--force` and the `uninstall`. Any other failure is as it was.
+/// finish; the message is [`unfinished_change`]'s. Any other failure is as it was.
 pub(crate) fn disabled_run(error: Error, id: &str) -> Error {
     if com_code(&error) != Some(SCHED_E_TASK_DISABLED) {
         return error;
     }
     Error::Step {
-        what: format!(
-            "`{id}` is disabled: an install or an uninstall of `{id}` did not finish. Run the install again with \
-             `--force` (without it the switched-off task reads as a hand edit), or run `goetia daemon uninstall {id}`"
-        ),
+        what: format!("`{id}` is disabled: {}", unfinished_change(id)),
         source: Box::new(error),
     }
 }

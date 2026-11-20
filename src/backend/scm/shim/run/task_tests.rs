@@ -595,7 +595,7 @@ fn refused_shim_opens_no_log() {
     assert_eq!(Run::default_log_holds(&calls), 0);
     assert!(
         matches!(calls.as_slice(), [ChannelCall::EventLog { severity: Severity::Error, line }]
-            if line.contains("being removed or handed to another account")),
+            if line.contains("is being, or did not finish being, installed or uninstalled")),
         "the refusal is told to the Event Log alone: {calls:?}"
     );
 }
@@ -630,7 +630,7 @@ fn shim_refused_by_the_marker_of_a_refused_change_logs_it() {
                 "goetia-shim[{ID}]: hold the run records {}: ",
                 run.records_dir().display()
             ))
-            && failures[0].contains("being removed or handed to another account")
+            && failures[0].contains("is being, or did not finish being, installed or uninstalled")
             && failures[0].ends_with(": no program was started"),
         "{failures:?}"
     );
