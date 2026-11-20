@@ -672,45 +672,57 @@ fn a_pid_shown_at_the_deadline_that_has_exited_is_a_run_that_ended_and_is_not_cl
     fake.assert_spent("the first pass, which could not watch the pid, and the one reading at the deadline");
 }
 
-/// What `Immediate` ends with when launchd shows a pid the stop cannot reach: [`Error::StopUnconfirmed`], in
-/// the words of someone who has not read the code. The stop sent nothing, and says to run it again.
-fn assert_unreached(e: &Error) {
+/// What `Immediate` ends with when launchd shows the same pid on two readings in a row and the stop could not
+/// reach it: [`Error::StopUnconfirmed`] naming it, in the words of someone who has not read the code. The stop
+/// sent nothing, and says to run it again.
+fn assert_unreached(e: &Error, pid: u32) {
     let Error::StopUnconfirmed { id, shown } = e else {
         panic!("expected an unconfirmed stop, got {e:?}")
     };
     assert_eq!(id, ID);
-    assert!(
-        shown.contains("shows a process ID") && shown.contains("could not reach") && shown.contains("nothing was sent"),
-        "{shown}"
-    );
-    assert!(shown.contains(&format!("`goetia daemon stop {ID}`")), "{shown}");
+    for said in [
+        format!("process {pid}"),
+        "two readings in a row".to_owned(),
+        "could not reach".to_owned(),
+        "nothing was sent".to_owned(),
+        format!("`goetia daemon stop {ID}`"),
+    ] {
+        assert!(shown.contains(&said), "{said:?} is not in {shown}");
+    }
     assert!(e.is_indeterminate(), "{e:?}");
 }
 
-/// `Immediate` waits for no exit, and not for launchd's view either: a pass that finds launchd showing a pid it
-/// cannot reach (gone, or one launchd does not name) ends the stop at once, on that one reading, with nothing
-/// sent. A reading the fake was not scripted for fails the test, so a reread does.
+/// A pid launchd shows that the stop cannot reach is read for again at once, under `Immediate`, and the same pid
+/// on the next reading ends the stop: launchd consistently gave the pid that could not be signalled. The second
+/// reading only asks launchd, and does not attempt the pid again. A reading the fake was not scripted for fails
+/// the test, so a third reading does.
 #[skuld::test]
-fn stop_under_immediate_ends_unconfirmed_on_a_pid_launchd_shows_and_it_cannot_reach() {
+fn stop_under_immediate_ends_unconfirmed_on_a_pid_launchd_shows_twice_and_it_cannot_reach() {
     let mut zombie = Held::new(0);
     let gone = zombie.pid();
     zombie.exit_unreaped();
     let mut stranger = Held::new(0);
     let other = stranger.pid();
-    for (what, fake) in [
-        ("a pid that is gone", Fake::new([print(&running(gone))])),
+    for (what, pid, fake) in [
+        (
+            "a pid that is gone",
+            gone,
+            Fake::new([print(&running(gone)), print(&running(gone))]),
+        ),
         (
             "a pid launchd does not name",
+            other,
             Fake::new([
                 print(&running(other)),
                 print(&running(other)),
                 procinfo_not_naming(other),
+                print(&running(other)),
             ]),
         ),
     ] {
         let e = stopping(&fake, Budget::Immediate).expect_err(what);
 
-        assert_unreached(&e);
+        assert_unreached(&e, pid);
         fake.assert_spent(what);
         assert_no_label_signal(&fake);
     }
@@ -721,19 +733,84 @@ fn stop_under_immediate_ends_unconfirmed_on_a_pid_launchd_shows_and_it_cannot_re
     );
 }
 
-/// A start that forks is waited for under `Immediate` too, and the pid shown after it is read like any other:
-/// one that cannot be reached ends the stop, unconfirmed, on that reading.
+/// A pid that cannot be reached and then no process on an idle job: the run ended and launchd has cleared it,
+/// so the stop is done.
 #[skuld::test]
-fn stop_under_immediate_ends_unconfirmed_on_an_unreachable_pid_shown_after_a_queued_start_forked() {
+fn stop_under_immediate_is_ok_when_the_pid_it_could_not_reach_is_cleared() {
     let mut zombie = Held::new(0);
     let a = zombie.pid();
     zombie.exit_unreaped();
-    let fake = Fake::new([print(QUEUED), print(QUEUED), print(&running(a)), print(&running(a))]);
+    let fake = Fake::new([print(&running(a)), print(IDLE)]);
+
+    stopping(&fake, Budget::Immediate).expect("the pid was cleared");
+
+    fake.assert_spent("the pid that could not be reached, and the reading that found no process");
+    assert_no_label_signal(&fake);
+}
+
+/// A pid that cannot be reached and then another that can: the second is attempted like the first, signalled once
+/// through its hold, and the stop returns without waiting for it to exit.
+#[skuld::test]
+fn stop_under_immediate_signals_the_run_that_replaced_the_pid_it_could_not_reach() {
+    let mut zombie = Held::new(0);
+    let a = zombie.pid();
+    zombie.exit_unreaped();
+    let mut run = Held::new(0);
+    let b = run.pid();
+    let fake = Fake::new([print(&running(a)), print(&running(b)), print(&running(b)), procinfo(b)]);
+
+    stopping(&fake, Budget::Immediate).expect("a stop that waits for nothing after the signal");
+
+    fake.assert_spent("the pid that could not be reached, and the run that replaced it, read, confirmed");
+    assert_no_label_signal(&fake);
+    assert_eq!(
+        ended_by(&mut run),
+        Some(libc::SIGTERM),
+        "the second run was sent SIGTERM once"
+    );
+}
+
+/// The loop has no cap and compares a reading only with the one before it: each pid launchd shows that differs
+/// from the last that failed is attempted, and the stop ends on the first that repeats, naming it.
+#[skuld::test]
+fn stop_under_immediate_ends_on_the_first_pid_that_repeats_whatever_came_before() {
+    let (mut z1, mut z2) = (Held::new(0), Held::new(0));
+    let (a, b) = (z1.pid(), z2.pid());
+    z1.exit_unreaped();
+    z2.exit_unreaped();
+    for (what, shown, ends_on) in [
+        ("a, b, b", vec![a, b, b], b),
+        ("a, b, a, a: a is not the pid that just failed", vec![a, b, a, a], a),
+    ] {
+        let fake = Fake::new(shown.iter().map(|pid| print(&running(*pid))).collect::<Vec<_>>());
+
+        let e = stopping(&fake, Budget::Immediate).expect_err(what);
+
+        assert_unreached(&e, ends_on);
+        fake.assert_spent(what);
+        assert_no_label_signal(&fake);
+    }
+}
+
+/// A start that forks is waited for under `Immediate` too, and the pid shown after it is read like any other:
+/// one that cannot be reached is read for again, and the same pid ends the stop, unconfirmed.
+#[skuld::test]
+fn stop_under_immediate_ends_unconfirmed_on_an_unreachable_pid_shown_twice_after_a_queued_start_forked() {
+    let mut zombie = Held::new(0);
+    let a = zombie.pid();
+    zombie.exit_unreaped();
+    let fake = Fake::new([
+        print(QUEUED),
+        print(QUEUED),
+        print(&running(a)),
+        print(&running(a)),
+        print(&running(a)),
+    ]);
 
     let e = stopping(&fake, Budget::Immediate).expect_err("a pid that cannot be reached");
 
-    assert_unreached(&e);
-    fake.assert_spent("the queued start and its fork, and the one reading of the pid after it");
+    assert_unreached(&e, a);
+    fake.assert_spent("the queued start and its fork, and the two readings of the pid after it");
 }
 
 /// A later pass can find the run that was sent SIGTERM again: here launchd's lookup did not name the process
