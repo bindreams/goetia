@@ -418,7 +418,7 @@ fn whose(accounts: &[Sid]) -> &'static str {
 }
 
 /// What a write of a task makes besides its registration, and what an up-to-date install makes again
-/// ([`task_beside_with`]): the record directory naming `principal`, and the default log naming `principal` and
+/// ([`Scm::task_beside_with`]): the record directory naming `principal`, and the default log naming `principal` and
 /// `kept_log`, the accounts a service that is being retyped to this task still runs as
 /// ([`Scm::retype_to_task_with`]). Nothing is read back.
 fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept_log: &[Sid]) -> Result<()> {

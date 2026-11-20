@@ -2033,7 +2033,7 @@ fn an_unchanged_install_names_the_account_alone_in_the_log() {
 
 // An install that finds the task up to date ---------------------------------------------------------------------------
 
-/// [`task_beside_with`] under the temporary `%ProgramData%` `dir`, whose folders are judged as `Disable` (goetia's
+/// [`Scm::task_beside_with`] under the temporary `%ProgramData%` `dir`, whose folders are judged as `Disable` (goetia's
 /// own check could not pass there).
 fn beside_of(
     dir: &TempDir,
