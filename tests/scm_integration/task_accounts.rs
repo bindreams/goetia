@@ -225,7 +225,7 @@ fn a_service_of_a_standard_account_leaves_no_folder_that_refuses_a_task_install(
             .unwrap_or_else(|e| panic!("start the service as {account}: {}", e.report()));
         started.accept("the program of a service run by a standard account");
         assert!(log.is_file(), "the shim of {account} opened {}", log.display());
-        mgr.stop(&service, Budget::DEFAULT)
+        mgr.stop(&service, Some(Budget::DEFAULT))
             .unwrap_or_else(|e| panic!("stop the service as {account}: {}", e.report()));
         mgr.uninstall(&service)
             .unwrap_or_else(|e| panic!("uninstall the service as {account}: {}", e.report()));
@@ -500,7 +500,7 @@ fn a_running_service_whose_account_changes_keeps_its_log_and_the_new_account_wri
     );
 
     // A restart runs it as the new account, which the log names.
-    mgr.stop(id, Budget::DEFAULT)
+    mgr.stop(id, Some(Budget::DEFAULT))
         .unwrap_or_else(|e| panic!("stop: {}", e.report()));
     mgr.start(id, Budget::Unbounded)
         .unwrap_or_else(|e| panic!("start as NetworkService: {}", e.report()));
@@ -568,7 +568,7 @@ fn a_log_made_under_a_running_service_whose_account_changes_names_both_accounts_
     assert_eq!(accounts_of_default_log(id), [network_service]);
 
     run.shutdown(Shutdown::Write).expect("release the program");
-    mgr.stop(id, Budget::DEFAULT)
+    mgr.stop(id, Some(Budget::DEFAULT))
         .unwrap_or_else(|e| panic!("stop: {}", e.report()));
 }
 
@@ -695,6 +695,6 @@ fn an_account_change_during_a_pending_start_leaves_both_accounts_in_the_log_unti
         "an install that finds the service up names the new account alone"
     );
 
-    mgr.stop(id, Budget::DEFAULT)
+    mgr.stop(id, Some(Budget::DEFAULT))
         .unwrap_or_else(|e| panic!("stop: {}", e.report()));
 }

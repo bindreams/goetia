@@ -101,6 +101,7 @@ mod interrupts;
 mod kill;
 mod proc;
 mod run;
+mod stop;
 mod task;
 mod verbs;
 mod watch;
@@ -392,7 +393,7 @@ impl Plist {
     /// act on a job's file return: its blob is that error.
     fn job(&self) -> Result<&Artifact> {
         self.job.as_ref().ok_or_else(|| match &self.blob {
-            Err(e) => Error::Kept(Arc::clone(e)),
+            Err(e) => Error::kept(e),
             Ok(_) => Error::blob("the job's plist is missing"),
         })
     }
@@ -1267,11 +1268,14 @@ const SERVICE_INSTALL_REQUESTS: usize = 1;
 const TASK_INSTALL_REQUESTS: usize = 4;
 const INSTALL_REQUESTS: usize = max(SERVICE_INSTALL_REQUESTS, TASK_INSTALL_REQUESTS);
 const START_REQUESTS: usize = 5;
-/// A service's `stop` is a `bootout`; a task's, one pass of its loop, is a SIGTERM.
-const STOP_REQUESTS: usize = 1;
+/// A service's `stop` is a `bootout`.
+const SERVICE_STOP_REQUESTS: usize = 1;
+/// A task's `stop` passes make no request: they signal through a hold.
+const TASK_STOP_REQUESTS: usize = 0;
+const STOP_REQUESTS: usize = max(SERVICE_STOP_REQUESTS, TASK_STOP_REQUESTS);
 /// A task's `uninstall`: the timer's `bootout` and the job's.
 const TASK_UNINSTALL_REQUESTS: usize = 2;
-const UNINSTALL_REQUESTS: usize = max(STOP_REQUESTS, TASK_UNINSTALL_REQUESTS);
+const UNINSTALL_REQUESTS: usize = max(SERVICE_STOP_REQUESTS, TASK_UNINSTALL_REQUESTS);
 /// `kill` sends no `launchctl` request: the process is signalled through a hold, and launchd is only read.
 const KILL_REQUESTS: usize = 0;
 /// A task's `enable` makes its own reservation: the `bootout` of a timer label launchd holds with no
@@ -1294,10 +1298,11 @@ const TASK_INSTALL_CALLS: usize = 2 + (1 + 1) + 1 + (1 + 1) + 2;
 const INSTALL_CALLS: usize = max(SERVICE_INSTALL_CALLS, TASK_INSTALL_CALLS);
 const START_CALLS: usize = START_REQUESTS + 6 + 2;
 /// A service's `stop`: the `bootout` and its wait.
-const SERVICE_STOP_CALLS: usize = STOP_REQUESTS + 1;
-/// One pass of a task's `stop`, the longest: the read of the job, the read that confirms the pid, and
-/// the SIGTERM. A pass that waits for a queued start's pid is shorter: the read, and the wait.
-const TASK_STOP_CALLS: usize = 3;
+const SERVICE_STOP_CALLS: usize = SERVICE_STOP_REQUESTS + 1;
+/// One pass of a task's `stop`, the longest: the read of the job, and the confirmation of the process held
+/// (its `procinfo`, with the reads that go with it, one call's files). A pass that waits for a queued
+/// start's pid is no longer: the read, and the wait.
+const TASK_STOP_CALLS: usize = 2;
 const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
 /// A task's `uninstall`: the two reads of which labels launchd holds, then both `bootout`s and their
 /// waits.
@@ -1322,7 +1327,8 @@ const fn max(a: usize, b: usize) -> usize {
 }
 
 /// The most `step` draws, as `(requests, calls)`: for `install`, `uninstall`, `stop` and `kill`, the larger of a
-/// service's and a task's (a task's `stop` is counted per pass: a later pass reserves again). A draw
+/// service's and a task's (a task's `stop` is counted per pass: the first draws on this, and each later pass
+/// makes its own reservation of [`TASK_STOP_REQUESTS`] and [`TASK_STOP_CALLS`]). A draw
 /// past it is a miscount, caught by the assertion in [`Reservation`] in every test that runs the verb.
 ///
 /// `request_start_after_stop` is `start` under a budget that does not wait: it draws no more than
@@ -1819,7 +1825,7 @@ impl backend::Backend for Launchd {
     /// `stop_task`). A service is booted out, whatever the label holds.
     fn stop(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
         if snapshot.kind() == DaemonKind::Task {
-            return self.stop_task(snapshot.id(), budget, reservation);
+            return self.stop_task(snapshot.id(), snapshot.stop_action().ok(), budget, reservation);
         }
         // First, so the wait is counted from the verb's entry. A budget that does not wait gets an
         // unbounded deadline (see `verb_deadline`); under a bounded one an expiry leaves the

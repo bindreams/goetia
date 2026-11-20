@@ -39,7 +39,7 @@ const ID: &str = "nightly";
 
 fn blob(spec: &DaemonSpec) -> Blob {
     Blob {
-        schema: 1,
+        schema: crate::blob::SCHEMA,
         version: crate::version().to_string(),
         spec: spec.clone(),
     }
@@ -2722,7 +2722,7 @@ impl Processes for Running {
         unreachable!("a retype stops nothing: pid {pid} was held")
     }
 
-    fn terminate(&mut self, _: &()) -> std::io::Result<()> {
+    fn force_end(&mut self, _: &()) -> std::io::Result<()> {
         unreachable!("a retype stops nothing")
     }
 

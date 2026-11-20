@@ -52,7 +52,7 @@ fn shim_runs_child_with_cwd_and_env(#[fixture(scm_group)] _group: &Group) {
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let line = reported.accept_line("the fixture to report its cwd and env");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     let (cwd_part, env_part) = line
         .split_once(';')
@@ -87,7 +87,7 @@ fn shim_captures_stdout_to_logs_path(#[fixture(scm_group)] _group: &Group) {
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the fixture to finish writing its log lines");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     let contents =
         std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read captured log {}: {e}", log_path.display()));
@@ -130,7 +130,7 @@ fn stop_kills_the_whole_process_tree(#[fixture(scm_group)] _group: &Group) {
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
     // `stop` returns once SCM confirms `STOPPED`, so the shim has reported and the record is final.
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
     // The stop reached the whole tree, not only the direct child.
     assert!(

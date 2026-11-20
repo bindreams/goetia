@@ -26,7 +26,7 @@ fn scm(fake: &Fake) -> Scm {
 
 fn blob(spec: &DaemonSpec) -> Blob {
     Blob {
-        schema: 1,
+        schema: crate::blob::SCHEMA,
         version: crate::version().to_string(),
         spec: spec.clone(),
     }

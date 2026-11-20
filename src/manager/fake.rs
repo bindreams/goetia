@@ -338,6 +338,7 @@ impl Fake {
             // Replaced with the out-of-range value below; present so the field is on the wire.
             restart_delay: Some(std::time::Duration::from_secs(1)),
             protocol: crate::spec::Protocol::Plain,
+            stop_action: Default::default(),
         })
         .expect("a valid spec")
         .into();

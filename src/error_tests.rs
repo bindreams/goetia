@@ -402,6 +402,31 @@ fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_
     );
 }
 
+/// The refusal of a stop for want of a readable stop action, as the stop builds it (over a kept failure), is as
+/// indeterminate as the failure under it. The kept error ends every walk, so the refusal is no wrapper: it is its
+/// own `cause`, and `map_cause` hands it whole to the mapper.
+#[skuld::test]
+fn an_unreadable_stop_action_is_as_indeterminate_as_the_kept_failure_and_is_its_own_cause() {
+    let over = |source: Error| Error::StopActionUnreadable {
+        id: "x".to_string(),
+        source: Box::new(Error::kept(&Arc::new(source))),
+    };
+    assert!(!over(Error::blob("bad")).is_indeterminate());
+    assert!(over(in_doubt()).is_indeterminate());
+
+    let refusal = over(not_installed());
+    assert!(
+        matches!(refusal.cause(), Error::StopActionUnreadable { .. }),
+        "{refusal:?}"
+    );
+    assert!(!refusal.wraps_unreadable_host());
+    let mapped = refusal.map_cause(|leaf| {
+        assert!(matches!(leaf, Error::StopActionUnreadable { .. }), "{leaf:?}");
+        in_doubt()
+    });
+    assert!(matches!(mapped, Error::WaitTimeout { .. }), "{mapped:?}");
+}
+
 #[cfg(unix)]
 pub(crate) fn exit_status(code: i32) -> std::process::ExitStatus {
     std::os::unix::process::ExitStatusExt::from_raw(code << 8)

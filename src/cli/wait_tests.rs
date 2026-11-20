@@ -60,3 +60,14 @@ fn was_given_is_false_only_when_neither_flag_appears() {
     assert!(args(Some(Duration::from_secs(30)), false).was_given());
     assert!(args(None, true).was_given());
 }
+
+#[skuld::test]
+fn given_is_the_budget_a_flag_names_and_none_when_no_flag_was_given() {
+    assert_eq!(args(None, false).given(), None);
+    assert_eq!(
+        args(Some(Duration::from_secs(3)), false).given(),
+        Some(Budget::Bounded(Duration::from_secs(3)))
+    );
+    assert_eq!(args(Some(Duration::ZERO), false).given(), Some(Budget::Immediate));
+    assert_eq!(args(None, true).given(), Some(Budget::Unbounded));
+}

@@ -53,7 +53,9 @@ use crate::backend::scm::task_xml::TaskXml;
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Id, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin};
+use crate::spec::{
+    BackendKind, DaemonKind, DaemonSpec, Id, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin,
+};
 
 // Metadata field names ================================================================================================
 
@@ -171,6 +173,9 @@ impl fmt::Display for WindowsDefinition {
 /// - a `protocol: native` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics;
+/// - a `stop-action` Windows cannot honour: a signal it has no equivalent of, a signal for a
+///   `protocol: native` service, which handles SCM's own stop itself, or, for a task, a leaf that differs from
+///   the default (Task Scheduler decides how a task is stopped);
 /// - for a task, a virtual service account, a `%` in the host's path or arguments (Task Scheduler
 ///   expands it), a schedule whose day-of-month and day-of-week fields are both restricted (an AND, or
 ///   an either-or whose two triggers would coincide: see `triggers::compile`), and a schedule that
@@ -199,7 +204,14 @@ fn definition(
             }
             build(spec, service, id, host.as_ref()).map(WindowsDefinition::Service)
         }
-        DaemonSpec::Task(_) => TaskXml::new(spec, host()?).map(WindowsDefinition::Task),
+        DaemonSpec::Task(task) => {
+            // Task Scheduler decides how a task is stopped, so a `stop-action` is a request Windows cannot
+            // honour. `resolve` refuses it in a manifest; a spec from a blob never passed `resolve`.
+            task.stop_action
+                .refuse(BackendKind::Scm, DaemonKind::Task, Protocol::Plain)
+                .into_result(&task.common.id)?;
+            TaskXml::new(spec, host()?).map(WindowsDefinition::Task)
+        }
     }
 }
 
@@ -228,6 +240,11 @@ fn build(
         s.protocol == Protocol::Plain,
         "a hosted service's host is resolved before it is built, and only a hosted service's"
     );
+    // `resolve` refuses what Windows cannot do with a stop action in a manifest; a spec from a blob arrives
+    // here. Until the shim asks for the stop, Windows still ends a service at once whatever it says (the README).
+    s.stop_action
+        .refuse(BackendKind::Scm, DaemonKind::Service, s.protocol)
+        .into_result(&s.common.id)?;
     // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
     // for a hosted one.
     let (executable, arguments, environment) = match host {
