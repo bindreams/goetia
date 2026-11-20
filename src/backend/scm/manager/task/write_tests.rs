@@ -735,44 +735,12 @@ fn a_raced_create_and_a_failed_delete_after_an_account_change() {
     fake.finish();
 }
 
-/// A failure after the disable puts the enabled flag back, whichever step before the delete failed: the check of
-/// the old account's runs (the refusal above), the delete itself. A failure after the delete (the record
-/// directory, the create) leaves no task, and is not followed by a request to enable one.
+/// A delete that fails leaves the old task there, so the enabled flag is put back, and the delete's error is the
+/// write's.
 #[skuld::test]
-fn a_failure_after_the_disable_puts_the_enabled_flag_back_and_is_the_writes_error() {
+fn a_failed_delete_after_the_disable_puts_the_enabled_flag_back() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
-    let enabled_again = Call::SetEnabled(PATH.to_owned(), true);
-    let disabled = Call::SetEnabled(PATH.to_owned(), false);
-    let instances = Call::Instances(PATH.to_owned());
-    let delete = Call::Delete(PATH.to_owned());
-
-    // The record directory cannot be made (its parents are not there), which is after the delete: no task is
-    // there to enable, and none is asked to.
-    let (_dir, runs) = records();
-    let fake = Fake::new();
-    fake.on_set_enabled(Ok(()))
-        .on_instances(Ok(Vec::new()))
-        .on_delete(Ok(true));
-    let failed = scm(&fake)
-        .task_write_with(
-            &new,
-            &definition(&new),
-            Some(&snapshot_of(&old, true)),
-            &runs,
-            &mut Running(vec![]),
-            prepared(users(), None),
-        )
-        .unwrap_err();
-    assert!(
-        failed.report().to_string().contains("run records"),
-        "{}",
-        failed.report()
-    );
-    assert_eq!(fake.calls(), [disabled.clone(), instances.clone(), delete.clone()]);
-    fake.finish();
-
-    // The delete fails: the task is there, enabled again.
     let (_dir, runs) = made_records();
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
@@ -793,41 +761,19 @@ fn a_failure_after_the_disable_puts_the_enabled_flag_back_and_is_the_writes_erro
     assert_eq!(
         fake.calls(),
         [
-            disabled.clone(),
-            instances.clone(),
-            delete.clone(),
-            enabled_again.clone()
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned()),
+            Call::SetEnabled(PATH.to_owned(), true),
         ]
     );
-    fake.finish();
-
-    // The create fails after the delete: no task is there to enable, none is asked to, and the create's error is
-    // the write's.
-    let (_dir, runs) = made_records();
-    let fake = Fake::new();
-    fake.on_set_enabled(Ok(()))
-        .on_instances(Ok(Vec::new()))
-        .on_delete(Ok(true))
-        .on_register(Err(Error::os("register", std::io::Error::other("denied"))));
-    let failed = scm(&fake)
-        .task_write_with(
-            &new,
-            &definition(&new),
-            Some(&snapshot_of(&old, true)),
-            &runs,
-            &mut Running(vec![]),
-            prepared(users(), None),
-        )
-        .unwrap_err();
-    assert!(failed.report().to_string().contains("register"), "{}", failed.report());
-    assert_eq!(fake.calls().first(), Some(&disabled));
-    assert!(matches!(fake.calls().last(), Some(Call::Register { .. })));
     fake.finish();
 }
 
 /// A failure after the delete is not a refusal that left the task: the old task is gone, nothing is installed at
-/// the id, and an install that runs again creates it disarmed. The error says so, and for a task that was armed
-/// says to arm it after; the failure itself stays under it.
+/// the id, and an install that runs again creates it disarmed. No flag is put back on a task that is not there.
+/// The error says to install again, and for a task that was armed says to arm it after; the failure itself stays
+/// under it. The create that fails and the record directory that cannot be made are the two failures there.
 #[skuld::test]
 fn a_failure_after_the_delete_says_what_it_left() {
     let old = as_service("LocalService");
@@ -856,7 +802,7 @@ fn a_failure_after_the_delete_says_what_it_left() {
         };
         assert!(what.contains("old task") && what.contains("already removed"), "{what}");
         assert!(what.contains("nothing is installed"), "{what}");
-        assert!(what.contains("install"), "{what}");
+        assert!(what.contains("re-run install"), "{what}");
         assert_eq!(
             what.contains("goetia daemon enable nightly"),
             armed,
@@ -864,10 +810,16 @@ fn a_failure_after_the_delete_says_what_it_left() {
         );
         assert!(matches!(**source, Error::Os { .. }), "{source:?}");
         assert!(failed.report().to_string().contains("denied"), "{}", failed.report());
+        assert_eq!(fake.calls().first(), Some(&Call::SetEnabled(PATH.to_owned(), false)));
+        assert!(
+            matches!(fake.calls().last(), Some(Call::Register { .. })),
+            "no flag is put back on a task that is not there: {:?}",
+            fake.calls()
+        );
         fake.finish();
     }
 
-    // The record directory cannot be made: the same, whatever it was that failed.
+    // The record directory cannot be made (its parents are not there): the same, and no create follows.
     let (_dir, runs) = records();
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
@@ -883,11 +835,64 @@ fn a_failure_after_the_delete_says_what_it_left() {
             prepared(users(), None),
         )
         .unwrap_err();
+    let Error::Step { what, .. } = &failed else {
+        panic!("a failure after the delete is told as what it left: {failed:?}")
+    };
+    assert!(what.contains("already removed") && what.contains("re-run install"), "{what}");
     assert!(
-        matches!(&failed, Error::Step { what, .. } if what.contains("already removed")),
-        "{failed:?}"
+        failed.report().to_string().contains("run records"),
+        "{}",
+        failed.report()
+    );
+    assert_eq!(
+        fake.calls(),
+        [
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned()),
+        ]
     );
     fake.finish();
+}
+
+/// The error after the delete names `enable` only where it can be run: the old task was armed and the new
+/// definition has a schedule to arm. A definition with none leaves a task that `enable` refuses.
+#[skuld::test]
+fn a_failure_after_the_delete_names_enable_only_where_there_is_a_schedule_to_arm() {
+    let old = as_service("LocalService");
+    let schedules = [
+        (as_service("NetworkService"), true),
+        (task_spec_as(User::Name("NetworkService".to_owned()), None), false),
+    ];
+    for (new, names_enable) in schedules {
+        let (_dir, runs) = made_records();
+        let fake = Fake::new();
+        fake.on_set_enabled(Ok(()))
+            .on_instances(Ok(Vec::new()))
+            .on_delete(Ok(true))
+            .on_register(Err(Error::os("register", std::io::Error::other("denied"))));
+
+        let failed = scm(&fake)
+            .task_write_with(
+                &new,
+                &definition(&new),
+                Some(&snapshot_of(&old, true)),
+                &runs,
+                &mut Running(vec![]),
+                prepared(users(), None),
+            )
+            .unwrap_err();
+
+        let Error::Step { what, .. } = &failed else {
+            panic!("a failure after the delete is told as what it left: {failed:?}")
+        };
+        assert_eq!(
+            what.contains("goetia daemon enable"),
+            names_enable,
+            "a schedule to arm: {names_enable}: {what}"
+        );
+        fake.finish();
+    }
 }
 
 /// A marker that cannot be placed leaves nothing to take away: the flag is put back, and the one cause is the

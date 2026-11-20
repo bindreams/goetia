@@ -5,10 +5,11 @@
 //! password and the logon right of a real user, the event source, and the record directory with its
 //! permissions. A failure of any is a failure with nothing sent.
 //!
-//! An account change deletes the old task, and before that it checks everything it can: what the records' and the
-//! log's creation would refuse ([`check_records`], which changes nothing), then the runs and the pins (the pin
-//! check sweeps the stale pins it finds). A failure after the delete is only what cannot be foreseen (a
-//! permissions write denied at that moment, the create), and leaves nothing at the id; the error says so.
+//! An account change deletes the old task, and before that it checks what it can: what the records' and the log's
+//! creation would refuse ([`check_records`], which sends nothing to Task Scheduler), then the runs and the pins
+//! (the pin check sweeps the stale pins it finds). What can still fail after the delete is a permissions write,
+//! a link made at `runs\<id>` by the old account during the change, and the create. That leaves nothing at the
+//! id, and the error says so.
 //!
 //! A task is armed when it has triggers; an install makes it disarmed and keeps what is installed. `disable`
 //! registers the stored XML with no `Triggers`, and `enable` the stored XML as it is when it has triggers,
@@ -228,21 +229,27 @@ impl Scm {
     }
 
     /// The account change of [`Self::task_write_with`]. First the records and the default log are checked for
-    /// what their creation would refuse ([`check_records`]), which depends on neither step below: a refusal
-    /// sends nothing to Task Scheduler, places no marker and changes nothing. Then the task is disabled (its own flag, as an
-    /// uninstall does it, which needs no password), whatever its flag was read as: a scheduled fire between the
-    /// check of its runs and the delete would start a run as the old account that nothing waits for. Then, in
-    /// order: the removal's marker is placed (no shim of the task pins the records from now on); the change is
-    /// refused while a run is alive ([`Error::AccountChangeRunning`]) or the records are held
-    /// ([`Error::AccountChangeHeld`]), the pin check sweeping the stale pins it finds; the registration is deleted; the records and the default log name the new
-    /// account alone; and the task is created, armed as the old one's triggers say.
+    /// what their creation would refuse ([`check_records`]), which depends on neither step below. A refusal
+    /// sends nothing to Task Scheduler and places no marker; [`prepare`] has already granted the logon right
+    /// and registered the event source. Then the task is disabled (its own flag, as an uninstall does it, which
+    /// needs no password), whatever its flag was read as: a scheduled fire between the check of its runs and
+    /// the delete would start a run as the old account that nothing waits for. Then, in order: the removal's
+    /// marker is placed (no shim of the task pins the records from now on); the change is refused while a run
+    /// is alive ([`Error::AccountChangeRunning`]) or the records are held ([`Error::AccountChangeHeld`]), the
+    /// pin check sweeping the stale pins it finds; the registration is deleted; the records and the default
+    /// log name the new account alone; and the task is created, armed as the old one's triggers say.
     ///
     /// A refusal before the delete leaves the old task: the task's own flag is put back true, the marker (if it
     /// was placed) is taken away, and a flag or a marker that cannot be put back is reported with the failure.
-    /// **After the delete** only what cannot be foreseen can fail (a permissions write denied at that moment, the
-    /// create). That leaves nothing at the id, which no flag is put back on: the error says the old task is
-    /// removed and to install again (and, for one that was armed, to enable it after, as an install makes it
-    /// disarmed). The install that runs again clears the marker with its narrowing.
+    /// **After the delete** these can fail:
+    /// - a permissions write;
+    /// - a link made at `runs\<id>` by the old account during the change fails it after the delete;
+    /// - the create, which is also where Task Scheduler checks a real user's password.
+    ///
+    /// That leaves nothing at the id, which no flag is put back on: the error says the old task is removed and
+    /// to install again (and, for one that was armed and whose new definition has a schedule, to enable it
+    /// after, as an install makes it disarmed). The install that runs again clears the marker with its
+    /// narrowing.
     ///
     /// **A scheduled run that falls in the window of the disable does not run**, even when the change is then
     /// refused after the marker: its shim finds the marker, logs it, and ends as a shim failure.
@@ -279,7 +286,7 @@ impl Scm {
             self.task_register(id, definition, prepared, registering)
         });
         created.map_err(|e| Error::Step {
-            what: removed_and_not_recreated(id, old.has_triggers()),
+            what: removed_and_not_recreated(id, old.has_triggers() && definition.has_schedule()),
             source: Box::new(e),
         })
     }
@@ -393,9 +400,10 @@ fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
 }
 
 /// What an account change tells when it fails after it deleted the old task of `id`: the task is gone, so the
-/// failure is no refusal that left it. An install creates a task disarmed, so one that was `armed` is enabled after.
-fn removed_and_not_recreated(id: &Id, armed: bool) -> String {
-    let enable = if armed {
+/// failure is no refusal that left it. An install creates a task disarmed, so one that was armed is enabled after
+/// (`enable_after`: the old task was armed and the new definition has a schedule, which `enable` needs).
+fn removed_and_not_recreated(id: &Id, enable_after: bool) -> String {
+    let enable = if enable_after {
         format!(", then run `goetia daemon enable {id}`, as the old task was armed")
     } else {
         String::new()

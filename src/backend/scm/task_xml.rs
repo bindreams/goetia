@@ -237,6 +237,11 @@ impl TaskXml {
         self.account.clone()
     }
 
+    /// Whether the definition has a schedule, so a task made from it can be armed (`enable` refuses one with none).
+    pub(crate) fn has_schedule(&self) -> bool {
+        !self.triggers.is_empty()
+    }
+
     /// The XML to register. The triggers are written only when `armed`, which is the installation's
     /// state and no part of the definition: an install over a disarmed task keeps it without any.
     /// `token` is the registration's, the action's last argument.

@@ -210,8 +210,9 @@ pub(crate) fn ensure(program_data: &Path, id: &Id, naming: &Naming) -> Result<En
 
 /// A deleted log whose handle something still holds (a daemon's output handle, or a program reading it) keeps its
 /// name where the delete is not POSIX, and an open answers access denied; the error says to end what holds it and
-/// install again. A directory at the name, and a link, are told as what they are. The status of an open of the name tells
-/// each of the three from a permission that refuses the install: the Win32 error is access denied for all four.
+/// install again. A directory at the name, and a link, are told as what they are. The status of an open of the
+/// name tells each of the three from a permission that refuses the install: the Win32 error is access denied for
+/// all four.
 fn make_error(path: &Path, e: io::Error) -> Error {
     if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
         && let Some(refusal) = refusal_at(path, what_is_at(path))
