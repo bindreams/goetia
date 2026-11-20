@@ -1,7 +1,9 @@
 use super::*;
 use crate::spec::test_support::abs;
 use crate::spec::test_support::program;
-use crate::spec::{Builtin, DaemonFields, DaemonSpec, MAX_SC_ACTION_DELAY, ServiceFields, ServiceSpec};
+use crate::spec::{
+    Builtin, DaemonFields, DaemonSpec, MAX_SC_ACTION_DELAY, ServiceFields, ServiceSpec, StopAction, StopSignal,
+};
 use crate::testing::{base_fields, service_fields};
 
 // Fixtures ============================================================================================================
@@ -132,7 +134,7 @@ fn registration_of_a_service_is_unchanged() {
          Arguments:\n  - \"--service-host\"\n\
          FailureActions:\n  Delay: 1s\n  ResetPeriod: 1day\n  OnNonCrashFailures: true\n\
          Environment:\n\
-         Parameters:\n  Marker: \"goetia\"\n  Schema: \"1\"\n  Spec: {spec_text:?}\n  Version: {version:?}\n",
+         Parameters:\n  Marker: \"goetia\"\n  Schema: \"2\"\n  Spec: {spec_text:?}\n  Version: {version:?}\n",
         exe = shim_path(),
         spec_text = blob::encode(&spec),
         version = crate::version(),
@@ -1480,5 +1482,88 @@ fn a_registration_displays_as_its_canonical_text() {
         format!("{reg}"),
         "Name: x\nDisplayName: \"X\"\nAccount: \"LocalSystem\"\nExecutable: \"a\"\nArguments:\n\
          FailureActions: none\nEnvironment:\nParameters:\n  k: \"v\"\n"
+    );
+}
+
+// Stop action =========================================================================================================
+
+fn with_stop_action(spec: DaemonSpec, stop_action: StopAction) -> DaemonSpec {
+    ServiceSpec::new(ServiceFields {
+        stop_action,
+        ..service_fields(spec)
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+fn written(signal: &str, timeout: Option<u64>) -> StopAction {
+    StopAction {
+        send_signal: signal.parse::<StopSignal>().unwrap(),
+        timeout: timeout.map(Duration::from_secs),
+    }
+}
+
+/// Until the shim asks, the registration is what it was: the stop action is carried in the
+/// blob, and nothing of it reaches SCM.
+#[skuld::test]
+fn a_stop_action_is_carried_in_the_blob_and_changes_nothing_else() {
+    for spec in [managed_spec(), simple_spec()] {
+        let plain = build(&spec);
+        let spec = with_stop_action(spec, written("terminate", Some(90)));
+        let with = build(&spec);
+
+        assert_eq!(with.executable, plain.executable);
+        assert_eq!(with.arguments, plain.arguments);
+        assert_eq!(with.failure_actions, plain.failure_actions);
+        let blob = crate::blob::decode(&with.parameters[FIELD_SPEC]).unwrap();
+        assert_eq!(blob.spec, spec);
+    }
+}
+
+#[skuld::test]
+fn a_hosted_service_takes_every_signal_windows_can_send() {
+    for signal in [
+        "terminate",
+        "interrupt",
+        "quit",
+        "kill",
+        "ctrl-c",
+        "ctrl-break",
+        "wm-close",
+    ] {
+        let send_signal = signal.parse::<StopSignal>().unwrap();
+        let spec = with_stop_action(
+            simple_spec(),
+            StopAction {
+                send_signal,
+                timeout: StopAction::default_timeout(send_signal),
+            },
+        );
+        registration(&spec, &identity(), &|| Ok(host())).unwrap_or_else(|e| panic!("{signal}: {e}"));
+    }
+}
+
+#[skuld::test]
+fn a_native_signal_is_refused_naming_windows() {
+    let spec = with_stop_action(simple_spec(), written("sigusr1", Some(30)));
+    let err = registration(&spec, &identity(), &|| Ok(host())).expect_err("a systemd signal");
+    assert!(
+        matches!(&err, Error::Invalid { daemon, message, .. }
+            if daemon.as_str() == "frpc" && message.contains("`send-signal: SIGUSR1` is refused on scm")),
+        "{err:?}"
+    );
+}
+
+#[skuld::test]
+fn a_native_service_handles_its_own_stop_so_a_signal_is_refused_and_a_timeout_is_not() {
+    let patient = with_stop_action(managed_spec(), written("terminate", Some(120)));
+    registration(&patient, &identity(), &no_host).expect("a timeout is the CLI's wait and the shutdown bound");
+
+    let quit = with_stop_action(managed_spec(), written("quit", Some(30)));
+    let err = registration(&quit, &identity(), &no_host).expect_err("a signal for a service that speaks SCM");
+    let text = err.to_string();
+    assert!(
+        text.contains("`stop-action.send-signal`") && text.contains("SCM's own stop"),
+        "{text}"
     );
 }

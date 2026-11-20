@@ -9,8 +9,7 @@ use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
 use crate::spec::test_support::{abs, assert_no_run_of_spaces};
-use crate::spec::{AccountId, Id, Protocol, Restart, User};
-use crate::spec::{DaemonFields, DaemonKind};
+use crate::spec::{AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, StopSignal, User};
 
 fn parse(yaml: &str) -> Result<BackendKind, yaml_serde::Error> {
     yaml_serde::from_str(yaml)
@@ -86,6 +85,8 @@ fn shaped_spec() -> ShapedSpec {
         daemon_type: Shaped::Absent,
         protocol: Shaped::Absent,
         schedule: Shaped::Absent,
+        stop_signal: Shaped::Absent,
+        stop_timeout: Shaped::Absent,
     }
 }
 
@@ -427,4 +428,251 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
             "{key:?}"
         );
     }
+}
+
+// `stop-action` =======================================================================================================
+
+fn with_stop(signal: Shaped<StopSignal>, timeout: Shaped<Option<Duration>>) -> ShapedSpec {
+    ShapedSpec {
+        stop_signal: signal,
+        stop_timeout: timeout,
+        ..shaped_spec()
+    }
+}
+
+fn supplies_signal() -> Supplied {
+    Supplied {
+        stop_signal: true,
+        ..Supplied::NONE
+    }
+}
+
+fn supplies_timeout() -> Supplied {
+    Supplied {
+        stop_timeout: true,
+        ..Supplied::NONE
+    }
+}
+
+#[skuld::test]
+fn the_native_backend_refuses_a_signal_it_cannot_send_wherever_the_manifest_wrote_it() {
+    let quit = with_stop(Shaped::Parsed(StopSignal::Quit), Shaped::Absent);
+    let refused = BackendKind::Launchd.refuse(&quit).unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopSignal));
+    assert!(
+        Error::from(refused)
+            .to_string()
+            .contains("`send-signal: quit` is refused on launchd")
+    );
+    assert!(BackendKind::Systemd.refuse(&quit).is_ok());
+    assert!(BackendKind::Scm.refuse(&quit).is_ok());
+
+    let ctrl_c = with_stop(Shaped::Parsed(StopSignal::CtrlC), Shaped::Absent);
+    assert!(BackendKind::Systemd.refuse(&ctrl_c).is_err());
+    assert!(BackendKind::Launchd.refuse(&ctrl_c).is_err());
+    assert!(BackendKind::Scm.refuse(&ctrl_c).is_ok());
+
+    let native = with_stop(Shaped::Parsed("sigusr1".parse::<StopSignal>().unwrap()), Shaped::Absent);
+    assert!(BackendKind::Systemd.refuse(&native).is_ok());
+    assert!(BackendKind::Launchd.refuse(&native).is_err());
+    assert!(BackendKind::Scm.refuse(&native).is_err());
+}
+
+#[skuld::test]
+fn an_override_is_judged_only_for_the_leaves_it_wrote() {
+    let quit = with_stop(Shaped::Parsed(StopSignal::Quit), Shaped::Absent);
+    assert!(
+        BackendKind::Launchd
+            .error(&quit, &supplies_signal(), Substitution::Pending)
+            .is_err()
+    );
+    assert!(
+        BackendKind::Launchd
+            .error(&quit, &Supplied::NONE, Substitution::Pending)
+            .is_ok(),
+        "a base value is nobody's override"
+    );
+}
+
+#[skuld::test]
+fn a_signal_still_holding_a_substitution_is_not_judged() {
+    for kind in [Shaped::Deferred, Shaped::Absent] {
+        let spec = with_stop(kind, Shaped::Absent);
+        for backend in BackendKind::ALL {
+            assert!(backend.refuse(&spec).is_ok(), "{backend}");
+        }
+    }
+}
+
+#[skuld::test]
+fn windows_refuses_a_stop_action_on_a_task() {
+    let task = |signal, timeout| ShapedSpec {
+        daemon_type: Shaped::Parsed(DaemonKind::Task),
+        ..with_stop(signal, timeout)
+    };
+    let timeout = Shaped::Parsed(Some(Duration::from_secs(5)));
+
+    let refused = BackendKind::Scm
+        .refuse(&task(Shaped::Parsed(StopSignal::Quit), Shaped::Absent))
+        .unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopSignal));
+    let message = Error::from(refused).to_string();
+    assert!(
+        message.contains("Task Scheduler") && message.contains("backend-specific"),
+        "{message}"
+    );
+
+    let refused = BackendKind::Scm.refuse(&task(Shaped::Absent, timeout)).unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopTimeout));
+
+    assert!(BackendKind::Scm.refuse(&task(Shaped::Absent, Shaped::Absent)).is_ok());
+    // A leaf written as the default is not a request.
+    let thirty = || Shaped::Parsed(Some(Duration::from_secs(30)));
+    assert!(
+        BackendKind::Scm
+            .refuse(&task(Shaped::Parsed(StopSignal::Terminate), thirty()))
+            .is_ok()
+    );
+    assert!(BackendKind::Scm.refuse(&task(Shaped::Absent, thirty())).is_ok());
+    // The default timeout of `kill` is none, so `null` beside it asks for nothing more.
+    let refused = BackendKind::Scm.refuse(&task(Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(None)));
+    assert_eq!(refused.unwrap_err().field, Some(Field::StopSignal));
+    // systemd and launchd stop a task as they stop a service.
+    for backend in [BackendKind::Systemd, BackendKind::Launchd] {
+        assert!(
+            backend
+                .refuse(&task(Shaped::Parsed(StopSignal::Terminate), thirty()))
+                .is_ok()
+        );
+    }
+}
+
+#[skuld::test]
+fn launchd_refuses_a_wait_over_its_cap_and_a_wait_without_a_limit() {
+    let seconds = |n| Shaped::Parsed(Some(Duration::from_secs(n)));
+    for timeout in [seconds(61), seconds(86_400), Shaped::Parsed(None)] {
+        let refused = BackendKind::Launchd
+            .refuse(&with_stop(Shaped::Parsed(StopSignal::Terminate), timeout))
+            .unwrap_err();
+        assert_eq!(refused.field, Some(Field::StopTimeout));
+        assert!(Error::from(refused).to_string().contains("60 s"));
+    }
+    // An absent signal is `terminate`, so `null` beside it is a wait without a limit too.
+    assert!(
+        BackendKind::Launchd
+            .refuse(&with_stop(Shaped::Absent, Shaped::Parsed(None)))
+            .is_err()
+    );
+    for (signal, timeout) in [
+        (Shaped::Parsed(StopSignal::Terminate), seconds(60)),
+        (Shaped::Parsed(StopSignal::Terminate), seconds(1)),
+        (Shaped::Absent, Shaped::Absent),
+        // `kill` waits for nothing: no timeout is its default.
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(None)),
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Absent),
+        // A signal a `$` still holds may be `kill`: a later pass judges the `null`.
+        (Shaped::Deferred, Shaped::Parsed(None)),
+        (Shaped::Parsed(StopSignal::Terminate), Shaped::Deferred),
+    ] {
+        assert!(BackendKind::Launchd.refuse(&with_stop(signal, timeout)).is_ok());
+    }
+    // The other backends have no such cap.
+    for backend in [BackendKind::Systemd, BackendKind::Scm] {
+        assert!(backend.refuse(&with_stop(Shaped::Absent, seconds(86_400))).is_ok());
+    }
+}
+
+/// A signal a `$` still holds is any signal, so only what holds for every signal is judged: a timeout a
+/// backend refuses whatever the signal is, not a `null` that `kill` takes.
+#[skuld::test]
+fn a_pending_signal_does_not_skip_the_refusals_every_signal_has() {
+    let ninety = || Shaped::Parsed(Some(Duration::from_secs(90)));
+    let refused = BackendKind::Launchd
+        .refuse(&with_stop(Shaped::Deferred, ninety()))
+        .unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopTimeout));
+    assert!(Error::from(refused).to_string().contains("60 s"));
+
+    // Task Scheduler decides how long a task waits, so any timeout is a request it cannot honour.
+    let task = |timeout| ShapedSpec {
+        daemon_type: Shaped::Parsed(DaemonKind::Task),
+        ..with_stop(Shaped::Deferred, timeout)
+    };
+    let refused = BackendKind::Scm
+        .refuse(&task(Shaped::Parsed(Some(Duration::from_secs(5)))))
+        .unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopTimeout));
+    // No timeout is the default of every signal; a signal is not judged.
+    assert!(BackendKind::Scm.refuse(&task(Shaped::Absent)).is_ok());
+
+    // What no backend refuses stays unjudged.
+    assert!(
+        BackendKind::Systemd
+            .refuse(&with_stop(Shaped::Deferred, ninety()))
+            .is_ok()
+    );
+    assert!(
+        BackendKind::Launchd
+            .refuse(&with_stop(
+                Shaped::Deferred,
+                Shaped::Parsed(Some(Duration::from_secs(60)))
+            ))
+            .is_ok()
+    );
+}
+
+#[skuld::test]
+fn launchd_judges_only_the_timeout_an_override_wrote() {
+    let long = with_stop(Shaped::Absent, Shaped::Parsed(Some(Duration::from_secs(90))));
+    assert!(
+        BackendKind::Launchd
+            .error(&long, &Supplied::NONE, Substitution::Pending)
+            .is_ok()
+    );
+    let refused = BackendKind::Launchd
+        .error(&long, &supplies_timeout(), Substitution::Pending)
+        .unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopTimeout));
+}
+
+#[skuld::test]
+fn windows_refuses_a_signal_for_a_native_service_and_keeps_its_timeout() {
+    let native = |signal, timeout| ShapedSpec {
+        protocol: Shaped::Parsed(Protocol::Native),
+        ..with_stop(signal, timeout)
+    };
+    assert!(
+        BackendKind::Scm
+            .refuse(&native(Shaped::Parsed(StopSignal::Quit), Shaped::Absent))
+            .is_err()
+    );
+    assert!(
+        BackendKind::Scm
+            .refuse(&native(Shaped::Parsed(StopSignal::Terminate), Shaped::Absent))
+            .is_ok()
+    );
+    assert!(
+        BackendKind::Scm
+            .refuse(&native(Shaped::Absent, Shaped::Parsed(Some(Duration::from_secs(5)))))
+            .is_ok()
+    );
+    let plain = ShapedSpec {
+        protocol: Shaped::Parsed(Protocol::Plain),
+        ..with_stop(Shaped::Parsed(StopSignal::CtrlC), Shaped::Parsed(None))
+    };
+    assert!(BackendKind::Scm.refuse(&plain).is_ok());
+}
+
+#[skuld::test]
+fn windows_waits_for_the_type_and_protocol_before_judging_them() {
+    let deferred_type = ShapedSpec {
+        daemon_type: Shaped::Deferred,
+        ..with_stop(Shaped::Parsed(StopSignal::Terminate), Shaped::Absent)
+    };
+    assert!(BackendKind::Scm.refuse(&deferred_type).is_ok());
+    let deferred_protocol = ShapedSpec {
+        protocol: Shaped::Deferred,
+        ..with_stop(Shaped::Parsed(StopSignal::Terminate), Shaped::Absent)
+    };
+    assert!(BackendKind::Scm.refuse(&deferred_protocol).is_ok());
 }

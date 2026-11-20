@@ -56,7 +56,7 @@ pub(super) fn scm(fake: &Fake) -> Scm {
 
 pub(super) fn snapshot_of(spec: &DaemonSpec, armed: bool) -> TaskSnapshot {
     let blob = Blob {
-        schema: 1,
+        schema: crate::blob::SCHEMA,
         version: crate::version().to_string(),
         spec: spec.clone(),
     };
@@ -157,7 +157,7 @@ impl Processes for Machine {
         Ok(self.holdable.contains(&pid).then_some(pid))
     }
 
-    fn terminate(&mut self, held: &u32) -> io::Result<()> {
+    fn force_end(&mut self, held: &u32) -> io::Result<()> {
         self.terminated.push((*held, self.fake.calls().len()));
         Ok(())
     }

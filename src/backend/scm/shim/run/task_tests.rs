@@ -57,6 +57,7 @@ fn spec_logging_to(logs: Option<&str>) -> DaemonSpec {
             ..base.common
         },
         schedule: None,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()

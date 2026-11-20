@@ -22,6 +22,10 @@ pub(super) enum Field {
     /// `protocol`: `plain` or `native`.
     Protocol,
     Schedule,
+    /// `stop-action`'s `send-signal`, whichever form was written.
+    StopSignal,
+    /// `stop-action`'s `timeout`.
+    StopTimeout,
 }
 
 impl Field {
@@ -42,6 +46,8 @@ impl Field {
             Field::Type => "type".to_string(),
             Field::Protocol => "protocol".to_string(),
             Field::Schedule => "schedule".to_string(),
+            Field::StopSignal => "stop-action.send-signal".to_string(),
+            Field::StopTimeout => "stop-action.timeout".to_string(),
         }
     }
 }

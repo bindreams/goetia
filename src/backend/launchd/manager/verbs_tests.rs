@@ -1,69 +1,61 @@
-//! A task's `start`, `stop` and `kill` over a scripted `launchctl` and real child processes: each child
-//! stands for a run (the pid `print` shows), and the scripted `kill` ends it, so the watch that `stop`
-//! waits on is a real kqueue's. Nothing here touches the system's own directories or services.
+//! A task's `start` and `kill` over a scripted `launchctl` and real child processes: each child stands for
+//! a run (the pid `print` shows). Nothing here touches the system's own directories or services. The fixtures are
+//! shared with `stop`'s tests.
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::super::manager_tests::launchd_over;
 use super::super::task::Shown;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
-use super::super::watch::{test_hook, watch_tests::Held};
+use super::super::watch::watch_tests::Held;
 use super::super::write::write_tests::bootstrap;
 use super::*;
 use crate::backend::Backend as _;
 use crate::backend::bounded::{self, Capture, Finished};
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::launchd::generate::timer_label;
-use crate::spec::DaemonKind;
+use crate::manager::Step;
+use crate::spec::{DaemonKind, DaemonSpec};
 
 // Fixtures ============================================================================================================
 
-const SCHEDULE: &str = "30 3 * * *";
+pub(in crate::backend::launchd::manager) const SCHEDULE: &str = "30 3 * * *";
 /// A `print` of a task's job with no process.
-const IDLE: &str = "\tstate = not running\n";
+pub(in crate::backend::launchd::manager) const IDLE: &str = "\tstate = not running\n";
 /// A `print` of a start launchd has accepted and not yet forked.
-const QUEUED: &str = "\tstate = spawn scheduled\n";
+pub(in crate::backend::launchd::manager) const QUEUED: &str = "\tstate = spawn scheduled\n";
 /// A job being torn down.
 const TEARING_DOWN: &str = "\tstate = SIGTERMed\n\tpid = 4242\n";
 
-fn target() -> String {
+pub(in crate::backend::launchd::manager) fn target() -> String {
     format!("system/{ID}")
 }
 
-fn running(pid: u32) -> String {
+pub(in crate::backend::launchd::manager) fn running(pid: u32) -> String {
     format!("\tstate = running\n\tpid = {pid}\n")
 }
 
-fn print(body: &str) -> Entry {
+pub(in crate::backend::launchd::manager) fn print(body: &str) -> Entry {
     reply(&["print", &target()], exited(0, body, ""))
 }
 
-fn not_loaded() -> Entry {
+pub(in crate::backend::launchd::manager) fn not_loaded() -> Entry {
     reply(&["print", &target()], exited(113, "", ""))
 }
 
-/// The SIGTERM `stop` sends, by label.
-fn sigterm() -> Entry {
-    reply(&["kill", "SIGTERM", &target()], exited(0, "", ""))
-}
-
-/// A SIGTERM that ends `run`, as the real one would.
-fn sigterm_ending(mut run: Held) -> Entry {
-    sigterm().then(move || {
-        run.finish();
-    })
-}
-
-fn kickstart() -> Entry {
+pub(in crate::backend::launchd::manager) fn kickstart() -> Entry {
     reply(&["kickstart", &target()], exited(0, "", ""))
 }
 
 /// The snapshot `read` makes of an installed task, its two plists in the enabled or the staging directory.
-fn task_snapshot(tree: &Tree, enabled: bool) -> Plist {
-    let plists = plists_of(&task_spec(Some(SCHEDULE)));
+pub(in crate::backend::launchd::manager) fn task_snapshot(tree: &Tree, enabled: bool) -> Plist {
+    task_snapshot_of(tree, enabled, &task_spec(Some(SCHEDULE)))
+}
+
+pub(in crate::backend::launchd::manager) fn task_snapshot_of(tree: &Tree, enabled: bool, spec: &DaemonSpec) -> Plist {
+    let plists = plists_of(spec);
     tree.put(enabled, ID, &plists.job);
     tree.put(
         enabled,
@@ -73,34 +65,64 @@ fn task_snapshot(tree: &Tree, enabled: bool) -> Plist {
     marked(tree.read())
 }
 
-fn reserved(mgr: &Launchd, step: Step) -> Reservation {
+pub(in crate::backend::launchd::manager) fn reserved(mgr: &Launchd, step: Step) -> Reservation {
     mgr.reserve(&[step], Budget::Unbounded).expect("reserve")
 }
 
-/// `stop` of a task over `fake`, drawing on a reservation made for [`Step::Stop`].
-fn stopping(fake: &Fake, budget: Budget) -> Result<()> {
-    let tree = Tree::new();
-    let mgr = launchd_over(fake.clone());
-    let mut held = reserved(&mgr, Step::Stop);
-    mgr.stop(task_snapshot(&tree, false), budget, &mut held)
-}
-
-fn calls_of(fake: &Fake, verb: &str) -> Vec<Vec<String>> {
+pub(in crate::backend::launchd::manager) fn calls_of(fake: &Fake, verb: &str) -> Vec<Vec<String>> {
     fake.calls().into_iter().filter(|call| call[0] == verb).collect()
 }
 
-fn assert_never_booted_out(fake: &Fake) {
+pub(in crate::backend::launchd::manager) fn assert_never_booted_out(fake: &Fake) {
     assert!(
         calls_of(fake, "bootout").is_empty(),
         "a task is never booted out by `stop`"
     );
 }
 
-fn assert_wait_timeout(e: &Error) {
-    assert!(
-        matches!(e, Error::WaitTimeout { awaited: "stopped", .. }),
-        "expected a wait timeout, got {e:?}"
-    );
+/// Every `print` with no pid that is neither idle nor a start launchd has accepted, as the read and as
+/// the words `StopUnconfirmed` says of it.
+pub(in crate::backend::launchd::manager) fn unconfirmed_reads() -> Vec<(&'static str, Entry, &'static str)> {
+    let cut = Finished::Exited {
+        status: ExitStatus::from_raw(0),
+        capture: Capture {
+            stdout: b"\tstate = not run".to_vec(),
+            stderr: Vec::new(),
+            complete: false,
+        },
+    };
+    let failed = "reading its job from launchd failed, so whether a process remains is not established";
+    vec![
+        (
+            "a state goetia does not know",
+            print("\tstate = someday-new-apple-state\n"),
+            "launchd shows its job in state `someday-new-apple-state` with no process, a state goetia does not know",
+        ),
+        (
+            "xpcproxy without a pid",
+            print("\tstate = xpcproxy\n"),
+            "launchd shows its job in state `xpcproxy` with no process, a state goetia does not know",
+        ),
+        (
+            "a state goetia knows, with no pid line",
+            print("\tstate = running\n"),
+            "launchd shows its job in state `running` with no process",
+        ),
+        (
+            "no state line",
+            print("system/x = {\n\tactive count = 1\n}\n"),
+            "launchd shows its job with no process and no state",
+        ),
+        (
+            "a print that failed",
+            reply(
+                &["print", &target()],
+                exited(5, "", "Could not print: 5: Input/output error\n"),
+            ),
+            failed,
+        ),
+        ("a print that was not whole", reply(&["print", &target()], cut), failed),
+    ]
 }
 
 // start ===============================================================================================================
@@ -333,423 +355,13 @@ fn a_start_after_an_unwaited_stop_is_not_sent_over_any_read_stop_calls_unconfirm
     }
 }
 
-// stop ================================================================================================================
-
-/// The pid `print` showed is watched, confirmed, signalled with SIGTERM by label, and waited for: the
-/// stop returns once the run is gone. The first pass draws exactly what a stop reserved.
-#[skuld::test]
-fn stop_signals_sigterm_and_waits_for_the_pid_it_saw() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(&running(pid)),
-        print(&running(pid)),
-        sigterm_ending(run),
-        print(IDLE),
-    ]);
-    let tree = Tree::new();
-    let mgr = launchd_over(fake.clone());
-    let mut held = reserved(&mgr, Step::Stop);
-
-    mgr.stop(task_snapshot(&tree, false), Budget::Unbounded, &mut held)
-        .expect("a stop");
-
-    fake.assert_spent("read, confirm, signal, and the read that finds no process");
-    assert_eq!(calls_of(&fake, "kill"), [["kill", "SIGTERM", target().as_str()]]);
-    assert_never_booted_out(&fake);
-    assert_eq!(
-        bounded::test_hook::left(&held),
-        (0, 0),
-        "the first pass spends the stop's reservation exactly"
-    );
-}
-
-#[skuld::test]
-fn stop_of_an_idle_task_is_ok() {
-    for read in [print(IDLE), print("\tstate = exited\n"), not_loaded()] {
-        let fake = Fake::new([read]);
-
-        stopping(&fake, Budget::DEFAULT).expect("a stop of an idle task");
-
-        fake.assert_spent("one read");
-        assert_never_booted_out(&fake);
-    }
-}
-
-/// Every `print` with no pid that is neither idle nor a start launchd has accepted, as the read and as
-/// the words `StopUnconfirmed` says of it.
-fn unconfirmed_reads() -> Vec<(&'static str, Entry, &'static str)> {
-    let cut = Finished::Exited {
-        status: ExitStatus::from_raw(0),
-        capture: Capture {
-            stdout: b"\tstate = not run".to_vec(),
-            stderr: Vec::new(),
-            complete: false,
-        },
-    };
-    let failed = "reading its job from launchd failed, so whether a process remains is not established";
-    vec![
-        (
-            "a state goetia does not know",
-            print("\tstate = someday-new-apple-state\n"),
-            "launchd shows its job in state `someday-new-apple-state` with no process, a state goetia does not know",
-        ),
-        (
-            "xpcproxy without a pid",
-            print("\tstate = xpcproxy\n"),
-            "launchd shows its job in state `xpcproxy` with no process, a state goetia does not know",
-        ),
-        (
-            "a state goetia knows, with no pid line",
-            print("\tstate = running\n"),
-            "launchd shows its job in state `running` with no process",
-        ),
-        (
-            "no state line",
-            print("system/x = {\n\tactive count = 1\n}\n"),
-            "launchd shows its job with no process and no state",
-        ),
-        (
-            "a print that failed",
-            reply(
-                &["print", &target()],
-                exited(5, "", "Could not print: 5: Input/output error\n"),
-            ),
-            failed,
-        ),
-        ("a print that was not whole", reply(&["print", &target()], cut), failed),
-    ]
-}
-
-/// No process and a state that is not idle, or a read that is not whole, do not establish that the job
-/// stopped: `StopUnconfirmed`, saying what launchd showed. `xpcproxy` without a pid has never been seen
-/// and is not taken for a start.
-#[skuld::test]
-fn stop_with_no_process_and_a_state_that_is_not_idle_is_unconfirmed() {
-    for (what, read, shown) in unconfirmed_reads() {
-        let fake = Fake::new([read]);
-
-        let e = stopping(&fake, Budget::DEFAULT).expect_err(what);
-
-        assert!(
-            matches!(&e, Error::StopUnconfirmed { id, .. } if id == ID),
-            "{what}: {e:?}"
-        );
-        assert_eq!(e.to_string(), format!("`{ID}` may not have stopped: {shown}"), "{what}");
-        assert!(e.is_indeterminate(), "{what}");
-        assert!(calls_of(&fake, "kill").is_empty(), "{what}");
-    }
-}
-
-/// A SIGTERM an earlier pass sent stands when a later pass cannot tell that no process is left.
-#[skuld::test]
-fn stop_unconfirmed_after_a_sigterm_leaves_the_sigterm() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(&running(pid)),
-        print(&running(pid)),
-        sigterm_ending(run),
-        print("\tstate = someday-new-apple-state\n"),
-    ]);
-
-    let e = stopping(&fake, Budget::Unbounded).expect_err("the next pass cannot tell");
-
-    assert!(matches!(e, Error::StopUnconfirmed { .. }), "{e:?}");
-    fake.assert_spent("the signal went out, and the next read was not conclusive");
-    assert_eq!(calls_of(&fake, "kill").len(), 1);
-}
-
-/// `kickstart` returns before the fork, so a `stop` straight after a `start` finds a start launchd has
-/// accepted and no pid. A signal then stops nothing (launchd answers "No process to signal" and the
-/// start goes on), so the stop waits for the pid, and then ends the run.
-#[skuld::test]
-fn stop_of_a_task_whose_start_is_still_queued_waits_for_the_pid_and_ends_the_run() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(QUEUED),
-        print(QUEUED),
-        print(QUEUED),
-        print(&running(pid)),
-        print(&running(pid)),
-        print(&running(pid)),
-        sigterm_ending(run),
-        print(IDLE),
-    ]);
-
-    stopping(&fake, Budget::Unbounded).expect("a stop of a queued start");
-
-    fake.assert_spent("reads until the pid showed, then the signal and the read that finds none");
-    assert_eq!(calls_of(&fake, "kill").len(), 1, "SIGTERM is sent once");
-    assert_never_booted_out(&fake);
-}
-
-/// A start that is accepted and then does not happen leaves `spawn scheduled` with no pid: the wait ends
-/// on the state, and there is nothing to end.
-#[skuld::test]
-fn stop_of_a_queued_start_that_never_forks_is_ok_when_the_state_leaves_spawn_scheduled() {
-    let fake = Fake::new([print(QUEUED), print(QUEUED), print(IDLE), print(IDLE)]);
-
-    stopping(&fake, Budget::Unbounded).expect("a stop");
-
-    fake.assert_spent("the wait ended on the state, and the next read found nothing");
-    assert!(calls_of(&fake, "kill").is_empty());
-}
-
-/// `kill` answers exit 3 for a job with no process: the run ended before the signal, which is the next
-/// pass, and which finds none.
-#[skuld::test]
-fn stop_with_signal_no_process_is_ok() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(&running(pid)),
-        print(&running(pid)),
-        reply(
-            &["kill", "SIGTERM", &target()],
-            exited(3, "", "No process to signal.\n"),
-        ),
-        print(IDLE),
-    ]);
-
-    stopping(&fake, Budget::Unbounded).expect("a stop");
-
-    fake.assert_spent("the signal found no process, and the next read none");
-}
-
-/// A run that began while `stop` waited for the one before is a real run, and is ended too; the loop
-/// ends only when `print` shows no process.
-#[skuld::test]
-fn stop_ends_a_run_that_begins_while_it_is_stopping() {
-    let (first, second) = (Held::new(0), Held::new(0));
-    let (a, b) = (first.pid(), second.pid());
-    let fake = Fake::new([
-        print(&running(a)),
-        print(&running(a)),
-        sigterm_ending(first),
-        print(&running(b)),
-        print(&running(b)),
-        sigterm_ending(second),
-        print(IDLE),
-    ]);
-
-    stopping(&fake, Budget::Unbounded).expect("a stop");
-
-    fake.assert_spent("both runs were ended");
-    assert_eq!(calls_of(&fake, "kill").len(), 2);
-}
-
-/// The pid that was read may be reused by the time it is watched: only a job that `print` still shows
-/// with that pid is signalled.
-#[skuld::test]
-fn stop_with_a_pid_that_is_not_the_jobs_any_more_is_ok_and_sends_nothing() {
-    let other = Held::new(0);
-    let fake = Fake::new([print(&running(other.pid())), print(IDLE), print(IDLE)]);
-
-    stopping(&fake, Budget::Unbounded).expect("a stop");
-
-    fake.assert_spent("the confirming read showed another job, and the next pass found none");
-    assert!(
-        calls_of(&fake, "kill").is_empty(),
-        "nothing is sent to a job that is not the one watched"
-    );
-}
-
-/// `stop` waits for the run to be over and reads no status, so an exit the kernel reported without one
-/// ends the wait like any other: the stop goes on to read again, and succeeds.
-#[skuld::test]
-fn stop_takes_an_exit_the_kernel_reported_without_a_status() {
-    let _unreported = test_hook::statuses(0);
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(&running(pid)),
-        print(&running(pid)),
-        sigterm_ending(run),
-        print(IDLE),
-    ]);
-
-    stopping(&fake, Budget::Unbounded).expect("a stop");
-
-    fake.assert_spent("the run ended without a status, and the next read found none");
-}
-
-/// A pid that has exited by the time it is watched cannot be watched: the next pass reads again.
-#[skuld::test]
-fn stop_with_a_pid_that_has_exited_reads_again() {
-    let mut ended = Held::new(0);
-    let pid = ended.pid();
-    ended.finish();
-    let fake = Fake::new([print(&running(pid)), print(IDLE)]);
-
-    stopping(&fake, Budget::Unbounded).expect("a stop");
-
-    fake.assert_spent("a gone pid is not confirmed, and the next read found none");
-    assert!(calls_of(&fake, "kill").is_empty());
-}
-
-/// A run that ignores SIGTERM keeps the stop waiting until the budget ends: the budget the user gave is
-/// the failure bound, and the signal stands.
-#[skuld::test]
-fn stop_under_a_bounded_budget_expires_into_wait_timeout_and_leaves_the_signal() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), sigterm()]);
-
-    let e = stopping(&fake, Budget::Bounded(Duration::from_millis(100))).expect_err("a run that ignores SIGTERM");
-
-    assert_wait_timeout(&e);
-    fake.assert_spent("the signal was sent, and nothing after it");
-}
-
-/// `Immediate` waits for no exit: the signal is sent and the stop returns.
-#[skuld::test]
-fn stop_under_immediate_of_a_running_job_sends_and_returns_ok() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), sigterm()]);
-
-    stopping(&fake, Budget::Immediate).expect("a stop that waits for nothing");
-
-    fake.assert_spent("read, confirm, signal");
-}
-
-/// A queued start has no pid, and a signal sent then stops nothing: even under `Immediate` the stop waits
-/// for the pid, and only then signals. It does not wait for the process.
-#[skuld::test]
-fn stop_under_immediate_of_a_queued_start_waits_for_the_pid_then_signals() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(QUEUED),
-        print(QUEUED),
-        print(&running(pid)),
-        print(&running(pid)),
-        print(&running(pid)),
-        sigterm(),
-    ]);
-
-    stopping(&fake, Budget::Immediate).expect("a stop that waits for nothing after the signal");
-
-    fake.assert_spent("the pid showed, then one SIGTERM, and nothing after it");
-    let calls = fake.calls();
-    let first_signal = calls.iter().position(|call| call[0] == "kill").unwrap();
-    assert!(
-        calls[..first_signal].iter().all(|call| call[0] == "print"),
-        "no signal is sent before the pid shows: {calls:?}"
-    );
-    assert_eq!(calls_of(&fake, "kill").len(), 1);
-}
-
-/// A zero bound is a bound that has run out: the same wait for the pid and the same signal, and then the
-/// wait for the process is an expiry.
-#[skuld::test]
-fn stop_under_a_zero_bound_of_a_queued_start_waits_for_the_pid_signals_and_expires() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(QUEUED),
-        print(QUEUED),
-        print(&running(pid)),
-        print(&running(pid)),
-        print(&running(pid)),
-        sigterm(),
-    ]);
-
-    let e = stopping(&fake, Budget::Bounded(Duration::ZERO)).expect_err("a zero bound expires");
-
-    assert_wait_timeout(&e);
-    fake.assert_spent("the pid showed and the SIGTERM stands");
-    assert_eq!(calls_of(&fake, "kill").len(), 1);
-}
-
-/// The first pass uses the reservation it was handed, and a later pass makes its own: the first spends
-/// the stop's count exactly, so a second pass that drew on it would trip the reservation's assertion.
-#[skuld::test]
-fn a_later_stop_pass_makes_its_own_reservation() {
-    let (first, second) = (Held::new(0), Held::new(0));
-    let (a, b) = (first.pid(), second.pid());
-    let fake = Fake::new([
-        print(&running(a)),
-        print(&running(a)),
-        sigterm_ending(first),
-        print(&running(b)),
-        print(&running(b)),
-        sigterm_ending(second),
-        print(IDLE),
-    ]);
-    let tree = Tree::new();
-    let mgr = launchd_over(fake.clone());
-    let mut handed = reserved(&mgr, Step::Stop);
-
-    mgr.stop(task_snapshot(&tree, false), Budget::Unbounded, &mut handed)
-        .expect("a stop of two runs");
-
-    assert_eq!(bounded::test_hook::left(&handed), (0, 0));
-}
-
-/// A pass after the first that cannot reserve returns that error, and the SIGTERM it follows stands.
-#[skuld::test]
-fn a_later_stop_pass_that_cannot_reserve_returns_the_reservation_error() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), sigterm_ending(run)]);
-    let tree = Tree::new();
-    let mgr = launchd_over(fake.clone());
-    let mut handed = reserved(&mgr, Step::Stop);
-    let _short = bounded::test_hook::temp_files(0);
-
-    let e = mgr
-        .stop(task_snapshot(&tree, false), Budget::Unbounded, &mut handed)
-        .expect_err("the second pass cannot reserve");
-
-    assert!(
-        matches!(&e, Error::Reservation { id: Some(id), .. } if id == ID),
-        "{e:?}"
-    );
-    fake.assert_spent("the signal went out before the reservation failed");
-}
-
-/// A task is never booted out by `stop`, in any path: the label stays loaded, and a start loads nothing.
-#[skuld::test]
-fn stop_never_boots_a_task_out() {
-    let run = Held::new(0);
-    let pid = run.pid();
-    let fake = Fake::new([
-        print(QUEUED),
-        print(&running(pid)),
-        print(&running(pid)),
-        print(&running(pid)),
-        sigterm_ending(run),
-        print(IDLE),
-    ]);
-
-    stopping(&fake, Budget::DEFAULT).expect("a stop");
-
-    assert_never_booted_out(&fake);
-}
-
-/// A watch that cannot be made fails the stop before any request: no signal goes out that nothing could
-/// follow.
-#[skuld::test]
-fn a_watch_that_cannot_be_made_is_an_error_before_any_request() {
-    let fake = Fake::new([]);
-    let _none = test_hook::queues(0);
-
-    let e = stopping(&fake, Budget::DEFAULT).expect_err("no kqueue");
-
-    assert!(e.to_string().contains("kqueue"), "{e}");
-    assert_eq!(fake.calls(), Vec::<Vec<String>>::new(), "nothing may be sent");
-}
-
 // kill ================================================================================================================
 
 /// A `print` of a job whose process was killed and whose restart launchd has not yet made.
 const KILLED: &str = "\tstate = spawn scheduled\n";
 
 /// `launchctl procinfo` naming `pid` as a launch of the job.
-fn procinfo(pid: u32) -> Entry {
+pub(in crate::backend::launchd::manager) fn procinfo(pid: u32) -> Entry {
     let block = format!("program path = /bin/sh\n\nsystem/{ID} = {{\n\tstate = running\n\tpid = {pid}\n}}\n");
     reply(&["procinfo", &pid.to_string()], exited(0, &block, ""))
 }

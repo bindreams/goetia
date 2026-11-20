@@ -38,17 +38,27 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::spec::{
     AccountId, CronField, DaemonFields, DaemonSpec, Id, Protocol, Restart, Schedule, ServiceFields, ServiceSpec,
-    TaskFields, TaskSpec, User, invalid,
+    StopAction, StopSignal, TaskFields, TaskSpec, User, invalid,
 };
 
 // Constants ===========================================================================================================
 
-/// The envelope shape `encode`/`decode` agree on. Bumped only when the
-/// JSON structure itself changes for blobs already written, never for a
-/// change in generator output — that is what `version` is for. Adding a
-/// member to an existing variant bumps it; adding a variant that leaves
-/// existing blobs unchanged does not, so installed blobs stay readable.
-pub const SCHEMA: u32 = 1;
+/// The envelope shape `encode` writes, bumped when the JSON structure changes for blobs already
+/// written, never for a change in generator output (that is what `version` is for). Adding a member to
+/// an existing variant bumps it, even where a blob without the member reads as its default: the wire
+/// structs refuse unknown fields, so an older goetia must meet the schema first and say "unsupported",
+/// not "unknown field". Adding a variant that leaves existing blobs unchanged does not bump it.
+///
+/// - 2: `stop_action`.
+pub const SCHEMA: u32 = 2;
+
+/// The oldest schema `decode` still reads. A blob of schema 1 has no `stop_action`, which reads as
+/// the default.
+pub const OLDEST_SCHEMA: u32 = 1;
+
+/// The first schema whose blobs carry `stop_action`: one of that schema without it is malformed, and
+/// only an older blob reads as the default.
+const STOP_ACTION_SCHEMA: u32 = 2;
 
 /// The literal value every generated artifact's marker carries, byte-exact
 /// per the Global Constraints (`Marker`, `Schema`, `Version`, `Spec`).
@@ -91,13 +101,15 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
     // The schema is read before the rest: a later schema may reshape or add to any other member.
-    if let Some(found) = value.get("schema").and_then(Value::as_u64)
-        && found != u64::from(SCHEMA)
-    {
-        return Err(Error::blob(format!(
-            "unsupported blob schema {found} (this build of goetia understands schema {supported})",
-            supported = SCHEMA,
-        )));
+    if let Some(found) = value.get("schema").and_then(Value::as_u64) {
+        if !(u64::from(OLDEST_SCHEMA)..=u64::from(SCHEMA)).contains(&found) {
+            return Err(Error::blob(format!(
+                "unsupported blob schema {found} (this build of goetia understands schemas {OLDEST_SCHEMA} to {SCHEMA})",
+            )));
+        }
+        if found >= u64::from(STOP_ACTION_SCHEMA) && value.pointer("/spec/stop_action").is_none() {
+            return Err(Error::blob(format!("a blob of schema {found} has no `stop_action`")));
+        }
     }
     let envelope: WireEnvelope =
         serde_json::from_value(value).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
@@ -256,6 +268,8 @@ struct WireTask {
     #[serde(rename = "schedule")]
     // Boxed: keeps `WireDaemon`'s variants close in size.
     schedule: Option<Box<WireSchedule>>,
+    #[serde(rename = "stop_action", default)]
+    stop_action: WireStopAction,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -316,6 +330,25 @@ struct WireService {
     logs: Option<String>,
     #[serde(rename = "kind")]
     kind: WireKind,
+    #[serde(rename = "stop_action", default)]
+    stop_action: WireStopAction,
+}
+
+/// What a stop asks of the daemon: the signal as the manifest spells it, and whole seconds (`null`: no
+/// timeout). A blob written before the field existed has no such member and reads as the default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireStopAction {
+    #[serde(rename = "send_signal")]
+    send_signal: String,
+    #[serde(rename = "timeout_secs")]
+    timeout_secs: Option<u64>,
+}
+
+impl Default for WireStopAction {
+    fn default() -> Self {
+        WireStopAction::from(&StopAction::default())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +428,7 @@ impl From<&TaskSpec> for WireTask {
                 .schedule
                 .as_ref()
                 .map(|schedule| Box::new(WireSchedule::from(schedule))),
+            stop_action: WireStopAction::from(&t.stop_action),
         }
     }
 }
@@ -445,7 +479,31 @@ impl From<&ServiceSpec> for WireService {
             }),
             logs: s.common.logs.as_ref().map(|p| p.to_string_lossy().into_owned()),
             kind: WireKind::from(s.protocol),
+            stop_action: WireStopAction::from(&s.stop_action),
         }
+    }
+}
+
+impl From<&StopAction> for WireStopAction {
+    fn from(action: &StopAction) -> Self {
+        WireStopAction {
+            send_signal: action.send_signal.to_string(),
+            timeout_secs: action.timeout.map(|timeout| timeout.as_secs()),
+        }
+    }
+}
+
+impl WireStopAction {
+    /// The action, or why this blob's is not one a manifest could have written. A fraction of a second
+    /// cannot be written, and the field rules refuse the rest ([`ServiceSpec::new`]).
+    fn into_stop_action(self, id: &Id) -> Result<StopAction, Error> {
+        Ok(StopAction {
+            send_signal: self
+                .send_signal
+                .parse::<StopSignal>()
+                .map_err(|message| invalid(id, &format!("blob `stop_action`: {message}")))?,
+            timeout: self.timeout_secs.map(Duration::from_secs),
+        })
     }
 }
 
@@ -490,6 +548,7 @@ fn daemon_spec_from_wire(wire: WireDaemon) -> Result<DaemonSpec, Error> {
 
 fn service_from_wire(wire: WireService) -> Result<ServiceSpec, Error> {
     let id = Id::try_from(wire.id)?;
+    let stop_action = wire.stop_action.into_stop_action(&id)?;
 
     let restart = match wire.restart {
         WireRestart::Never => Restart::Never,
@@ -515,6 +574,7 @@ fn service_from_wire(wire: WireService) -> Result<ServiceSpec, Error> {
         restart,
         restart_delay: wire.restart_delay.as_ref().map(duration_from_wire),
         protocol,
+        stop_action,
     })?;
     // After the field rules: a blob with several defects reports the first in field order.
     if let Some(delay) = &wire.restart_delay {
@@ -527,6 +587,7 @@ fn service_from_wire(wire: WireService) -> Result<ServiceSpec, Error> {
 /// schedule's.
 fn task_from_wire(wire: WireTask) -> Result<TaskSpec, Error> {
     let id = Id::try_from(wire.id)?;
+    let stop_action = wire.stop_action.into_stop_action(&id)?;
     let schedule = wire
         .schedule
         .map(|schedule| {
@@ -553,6 +614,7 @@ fn task_from_wire(wire: WireTask) -> Result<TaskSpec, Error> {
             logs: wire.logs.map(PathBuf::from),
         },
         schedule,
+        stop_action,
     })
 }
 
