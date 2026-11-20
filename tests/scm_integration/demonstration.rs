@@ -148,27 +148,21 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     // `LastTaskResult` or `LastRunTime` under the reads below, and none can come between the end of the run
     // and the reads that follow it.
     cli.daemon(&["disable", id]);
-    let fires = task_run_times(&task_id, enabling_at, SystemTime::now())
-        .unwrap_or_else(|e| panic!("the run times of `{EVERY_MINUTE}`: {}", e.report()));
-    let (Some(&first), Some(&last)) = (fires.first(), fires.last()) else {
-        panic!("a run started and Task Scheduler lists no run time since {enabling_at:?}");
-    };
-    // A second before the first listed time: `LastRunTime` may precede the boundary by a few ms, which
-    // truncates to the second before.
-    let (first, last) = (
-        to_the_second(first) - Duration::from_secs(1),
-        last + Duration::from_secs(60),
-    );
-    let assert_fired_in_range = |form: &str, time: &str| {
-        let fired = instant(time);
-        assert!(
-            fired >= first && fired < last,
-            "{form}: last-run {fired:?} is not in [{first:?}, {last:?}) of {fires:?}"
-        );
-    };
     // The run is in flight and disarmed: `last-result` reads null (`LastTaskResult` says it is running),
     // `last-run` is the run's start, there is no next run, and the three forms show the same start.
     let running = read_in_the_zone(&in_zone, id);
+    let read_at = SystemTime::now();
+    // The run is the schedule's own: nothing else in this step starts the task, and it is armed only by
+    // `enable`. So its start lies between the call to `enable` and this read. Task Scheduler's listed times
+    // are no bound: a run starts about a second after its minute, so the minute can precede `enabling_at`
+    // while the run follows it, and then no listed time lies in the window.
+    let assert_fired_in_range = |form: &str, time: &str| {
+        let fired = instant(time);
+        assert!(
+            fired >= to_the_second(enabling_at) && fired <= read_at,
+            "{form}: last-run {fired:?} is not between `enable` at {enabling_at:?} and the read at {read_at:?}"
+        );
+    };
     assert_task_fields(
         &running.json,
         id,
