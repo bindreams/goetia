@@ -130,16 +130,17 @@ pub(crate) fn com_code(error: &Error) -> Option<HRESULT> {
 }
 
 /// `error`, from the start of the task `id`, worded for a task whose own flag is false (`Run` refuses
-/// one with `SCHED_E_TASK_DISABLED`): goetia leaves a task so only when an `uninstall` of it did not
-/// finish, and running that again finishes it. Any other failure is as it was.
+/// one with `SCHED_E_TASK_DISABLED`): goetia leaves a task so when an `uninstall` of it, or an install that
+/// changed its account, did not finish. `enable` switches it on again and `uninstall` removes it; the message
+/// names both. Any other failure is as it was.
 pub(crate) fn disabled_run(error: Error, id: &str) -> Error {
     if com_code(&error) != Some(SCHED_E_TASK_DISABLED) {
         return error;
     }
     Error::Step {
         what: format!(
-            "`{id}` is disabled: an `uninstall` of it did not finish. Run `goetia daemon uninstall {id}` again to \
-             remove it"
+            "`{id}` is disabled: an `uninstall` or an install that changed its account did not finish. \
+             `goetia daemon enable {id}` switches it on again, `goetia daemon uninstall {id}` removes it"
         ),
         source: Box::new(error),
     }

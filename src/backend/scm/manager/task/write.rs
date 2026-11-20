@@ -162,9 +162,11 @@ impl Scm {
 
     /// Writes the task `spec` is: a create when nothing is installed, otherwise an update of
     /// `snapshot`'s task, armed when it has triggers, whatever its own flag (a create is disarmed); every
-    /// registration writes the flag true. A task installed over
-    /// one of another account is registered again instead ([`Self::task_write_with`]). Write
-    /// [`Self::task_write_with`] over the machine's own record directory, processes and account.
+    /// registration writes the flag true. Only a forced install or one that finds the blob stale reaches an
+    /// update over a task whose own flag is off: the flag is one of the compared settings, so a plain install
+    /// of it is a conflict. A task installed over one of another account is registered again instead
+    /// ([`Self::task_write_with`]). Write [`Self::task_write_with`] over the machine's own record directory,
+    /// processes and account.
     ///
     /// **A limit, stated:** a task whose `runs\<id>` directory is gone or unusable starts no program: its
     /// shim cannot pin the records, logs their path and ends as a shim failure. Any install makes the
@@ -215,10 +217,10 @@ impl Scm {
         let prepared = prepare(&definition.account())?;
         let registering = match stored {
             Some((old, stored)) if stored.principal.as_ref() != Some(&prepared.principal) => {
-                return self.task_register_again(old, definition, runs, processes, &prepared);
+                return self.task_register_again(old, stored.has_triggers, definition, runs, processes, &prepared);
             }
-            Some((old, stored)) => Registering::Update {
-                armed: old.has_triggers(),
+            Some((_, stored)) => Registering::Update {
+                armed: stored.has_triggers,
                 token: stored.token,
             },
             None => Registering::Create { armed: false },
@@ -254,6 +256,7 @@ impl Scm {
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
+        had_triggers: bool,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -276,13 +279,11 @@ impl Scm {
         }
         // No run of the old account can be left (it held a pin or was listed).
         let created = task_records(id, runs, &prepared.principal, &[]).and_then(|()| {
-            let registering = Registering::Create {
-                armed: old.has_triggers(),
-            };
+            let registering = Registering::Create { armed: had_triggers };
             self.task_register(id, definition, prepared, registering)
         });
         created.map_err(|e| Error::Step {
-            what: removed_and_not_recreated(id, old.has_triggers() && definition.has_schedule()),
+            what: removed_and_not_recreated(id, had_triggers && definition.has_schedule()),
             source: Box::new(e),
         })
     }
@@ -418,7 +419,7 @@ fn whose(accounts: &[Sid]) -> &'static str {
 }
 
 /// What a write of a task makes besides its registration, and what an up-to-date install makes again
-/// ([`Scm::task_beside_with`]): the record directory naming `principal`, and the default log naming `principal` and
+/// ([`task_beside_with`]): the record directory naming `principal`, and the default log naming `principal` and
 /// `kept_log`, the accounts a service that is being retyped to this task still runs as
 /// ([`Scm::retype_to_task_with`]). Nothing is read back.
 fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept_log: &[Sid]) -> Result<()> {
@@ -462,63 +463,47 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
     }
 }
 
-impl Scm {
-    /// What an install that finds the task `installed` up to date makes again if it is gone
-    /// ([`Self::task_beside_with`]), under the machine's `%ProgramData%`: the folders above the record directory
-    /// are always judged, as a write does ([`runs_for_write`]).
-    pub(in crate::backend::scm) fn task_beside(
-        &self,
-        spec: &DaemonSpec,
-        definition: &TaskXml,
-        installed: &TaskSnapshot,
-    ) -> Result<()> {
-        self.task_beside_with(
-            &program_data()?,
-            &FolderCheck::new(CheckPermissions::Enable),
-            spec,
-            definition,
-            installed,
-            prepare,
-        )
-    }
+/// What an install that finds the task `installed` up to date makes again if it is gone ([`task_beside_with`]),
+/// under the machine's `%ProgramData%`: the folders above the record directory are always judged, as a write
+/// does ([`runs_for_write`]).
+pub(in crate::backend::scm) fn task_beside(
+    spec: &DaemonSpec,
+    definition: &TaskXml,
+    installed: &TaskSnapshot,
+) -> Result<()> {
+    task_beside_with(
+        &program_data()?,
+        &FolderCheck::new(CheckPermissions::Enable),
+        spec,
+        definition,
+        installed,
+        prepare,
+    )
+}
 
-    /// What a write of the task `installed` makes besides its registration, made again: the folders above the
-    /// record directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for
-    /// the account `definition` registers (`prepare`, with [`Password::Unneeded`]: the event source and a real
-    /// user's logon right, but no password, for the task is not registered again), the record directory with the
-    /// marker a dead uninstall left cleared ([`Runs::ensure`]), the default log ([`task_records`]), and the task's
-    /// own flag ([`Self::own_flag_back`]). They name the account `prepare` found alone. The record directory is
-    /// not made by `runs_in`, but the folders above it may be; a refusal there comes before anything the account
-    /// needs (the logon right, the event source, the records, the log). Moving the task to another account is a
-    /// write's job, which finds the task registered as another.
-    pub(super) fn task_beside_with(
-        &self,
-        program_data: &Path,
-        folders: &FolderCheck,
-        spec: &DaemonSpec,
-        definition: &TaskXml,
-        installed: &TaskSnapshot,
-        prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
-    ) -> Result<()> {
-        let runs = runs_in(program_data, installed.id(), folders)?;
-        let prepared = prepare(
-            &definition.account(),
-            written_user(&spec.common().user),
-            Password::Unneeded,
-        )?;
-        task_records(installed.id(), &runs, &prepared.principal, &[])?;
-        self.own_flag_back(installed)
-    }
-
-    /// Sets the own flag of `installed` on when it has triggers and the flag is off (an account change or an
-    /// uninstall that was cut short disabled it). One with no triggers is disarmed, and one whose flag is on is
-    /// left as it is.
-    fn own_flag_back(&self, installed: &TaskSnapshot) -> Result<()> {
-        if installed.has_triggers() && !installed.armed() {
-            self.tasks.set_enabled(&TaskPath::of(installed.id()), true)?;
-        }
-        Ok(())
-    }
+/// What a write of the task `installed` makes besides its registration, made again: the folders above the record
+/// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for the account
+/// `definition` registers (`prepare`, with [`Password::Unneeded`]: the event source and a real user's logon right,
+/// but no password, for the task is not registered again), the record directory with the marker a dead uninstall
+/// left cleared ([`Runs::ensure`]), and the default log ([`task_records`]). They name the account `prepare` found
+/// alone. The record directory is not made by `runs_in`, but the folders above it may be; a refusal there comes
+/// before anything the account needs (the logon right, the event source, the records, the log). Moving the task to
+/// another account is a write's job, which finds the task registered as another.
+fn task_beside_with(
+    program_data: &Path,
+    folders: &FolderCheck,
+    spec: &DaemonSpec,
+    definition: &TaskXml,
+    installed: &TaskSnapshot,
+    prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
+) -> Result<()> {
+    let runs = runs_in(program_data, installed.id(), folders)?;
+    let prepared = prepare(
+        &definition.account(),
+        written_user(&spec.common().user),
+        Password::Unneeded,
+    )?;
+    task_records(installed.id(), &runs, &prepared.principal, &[])
 }
 
 // Enable and disable ==================================================================================================

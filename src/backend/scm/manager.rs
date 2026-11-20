@@ -116,7 +116,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, which};
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_beside, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
@@ -739,7 +739,7 @@ impl Backend for Scm {
     }
 
     /// A service: the event source, a real user's logon right ([`service_gate`], no password) and, if it runs
-    /// the shim host, its default log. A task: [`Scm::task_beside`]. The account is the one the definition registers.
+    /// the shim host, its default log. A task: [`task_beside`]. The account is the one the definition registers.
     fn ensure_beside(
         &self,
         spec: &DaemonSpec,
@@ -752,7 +752,7 @@ impl Backend for Scm {
                 make_default_log(spec, definition, gated.checked.as_ref(), &[], default_log::Step::Narrow).map(drop)
             }
             (WindowsDefinition::Task(definition), WindowsSnapshot::Task(installed)) => {
-                self.task_beside(spec, definition, installed)
+                task_beside(spec, definition, installed)
             }
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
             | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),

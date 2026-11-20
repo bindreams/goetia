@@ -82,6 +82,8 @@ pub(crate) fn ending<S: AsRef<str>>(args: &[S]) -> Option<(&str, Option<Token>)>
 pub(crate) struct Stored {
     /// The account its principal names ([`TaskXml::principal`]).
     pub principal: Option<TaskAccount>,
+    /// Whether it holds a trigger that is switched on, whatever the task's own flag ([`TaskXml::has_triggers`]).
+    pub has_triggers: bool,
     /// The token its arguments end with, `None` when they end with no goetia ending for the task
     /// ([`TaskXml::token_of`]).
     pub token: Option<Token>,

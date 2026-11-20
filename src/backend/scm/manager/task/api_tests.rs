@@ -54,9 +54,10 @@ fn ole_dates_keep_their_order() {
     assert!(apart(later, earlier) >= Duration::from_secs(23 * 3600));
 }
 
-// A task is left with its own flag false only by an `uninstall` that did not finish, so a `Run` of one says so.
+// A task is left with its own flag false by an `uninstall` or an install that changed its account and did not
+// finish, so a `Run` of one names both causes and both remedies: `enable` moves it on, `uninstall` removes it.
 #[skuld::test]
-fn a_run_refused_for_a_disabled_task_says_an_uninstall_did_not_finish() {
+fn a_run_refused_for_a_disabled_task_names_both_causes_and_both_remedies() {
     use windows::Win32::Foundation::{E_ACCESSDENIED, SCHED_E_TASK_DISABLED};
 
     let disabled = Error::os("start `\\Goetia\\x`", windows::core::Error::from(SCHED_E_TASK_DISABLED));
@@ -64,12 +65,14 @@ fn a_run_refused_for_a_disabled_task_says_an_uninstall_did_not_finish() {
 
     let text = said.to_string();
     assert!(
-        text.contains("`x` is disabled") && text.contains("of it did not finish"),
-        "{text}"
+        text.contains("`x` is disabled")
+            && text.contains("an `uninstall` or an install that changed its account did not finish"),
+        "both causes are named: {text}"
     );
     assert!(
-        text.contains("goetia daemon uninstall x"),
-        "the remedy is named: {text}"
+        text.contains("`goetia daemon enable x` switches it on again")
+            && text.contains("`goetia daemon uninstall x` removes it"),
+        "both remedies are named: {text}"
     );
     assert!(com_code(&said) == Some(SCHED_E_TASK_DISABLED), "the cause is kept");
 

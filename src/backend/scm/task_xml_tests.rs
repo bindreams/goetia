@@ -249,11 +249,13 @@ fn token_of_reads_the_token_the_xml_carries() {
 }
 
 #[skuld::test]
-fn stored_agrees_with_principal_and_token_of() {
+fn stored_agrees_with_principal_has_triggers_and_token_of() {
     let spec = spec();
     for armed in [true, false] {
         let xml = built(&spec).to_xml(armed, &token());
         let stored = TaskXml::stored(&xml, ID).unwrap();
+        assert_eq!(stored.has_triggers, TaskXml::has_triggers(&xml));
+        assert_eq!(stored.has_triggers, armed);
         assert_eq!(stored.principal, TaskXml::principal(&xml).unwrap());
         assert_eq!(stored.principal, Some(TaskAccount::Service("S-1-5-18".to_owned())));
         assert_eq!(stored.token, Some(token()));

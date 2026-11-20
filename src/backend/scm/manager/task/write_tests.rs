@@ -1198,14 +1198,7 @@ fn the_own_flag_is_true_after_every_outcome() {
 fn account_change_takes_armed_from_the_triggers_alone() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
-    let with_flag_off = |armed: bool| {
-        let registered = registered_task(&old, armed);
-        Registered {
-            xml: TaskXml::with_own_flag(&registered.xml, false).unwrap(),
-            enabled: Some(false),
-            ..registered
-        }
-    };
+    let with_flag_off = |armed: bool| registered_flag_off(&old, armed);
     let unread = |armed: bool| Registered {
         enabled: None,
         ..registered_task(&old, armed)
@@ -1255,9 +1248,10 @@ fn registered_flag_off(spec: &DaemonSpec, triggers: bool) -> Registered {
     }
 }
 
-/// An install over a task of the same account whose own flag is off (a change that was cut short disabled it)
-/// is armed as its triggers say, as an account change is, and writes the flag true: a task with triggers is not
-/// silently disarmed, and one with none stays so.
+/// A forced install, or one that finds the blob stale (a plain one is a conflict, the flag being compared), over a
+/// task of the same account whose own flag is off (a change that was cut short disabled it) is armed as its
+/// triggers say, as an account change is, and writes the flag true: a task with triggers is not silently
+/// disarmed, and one with none stays so.
 #[skuld::test]
 fn an_update_of_a_task_with_its_flag_off_is_armed_by_its_triggers_alone() {
     let spec = task_spec(Some("30 3 * * *"));
@@ -1288,74 +1282,7 @@ fn an_update_of_a_task_with_its_flag_off_is_armed_by_its_triggers_alone() {
     }
 }
 
-/// An install that finds a task up to date sets the own flag of one that has triggers and is itself disabled,
-/// which is armed in every way but that; one that has none stays disarmed, and one whose flag is on is not
-/// written to.
-#[skuld::test]
-fn an_up_to_date_install_sets_the_own_flag_of_a_task_that_has_triggers() {
-    let spec = task_spec(Some("30 3 * * *"));
-    for (found, sets) in [
-        (registered_flag_off(&spec, true), true),
-        (registered_flag_off(&spec, false), false),
-        (registered_task(&spec, true), false),
-        (registered_task(&spec, false), false),
-    ] {
-        let fake = Fake::new();
-        if sets {
-            fake.on_set_enabled(Ok(()));
-        }
-        let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), found);
-
-        scm(&fake).own_flag_back(&installed).unwrap();
-
-        let expected: Vec<Call> = sets
-            .then(|| Call::SetEnabled(PATH.to_owned(), true))
-            .into_iter()
-            .collect();
-        assert_eq!(fake.calls(), expected, "sets={sets}");
-        fake.finish();
-    }
-}
-
-/// ... and a flag that cannot be set fails the install.
-#[skuld::test]
-fn an_up_to_date_install_fails_when_the_own_flag_cannot_be_set() {
-    let spec = task_spec(Some("30 3 * * *"));
-    let fake = Fake::new();
-    fake.on_set_enabled(Err(Error::os("enable", std::io::Error::other("busy"))));
-    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_flag_off(&spec, true));
-
-    let failed = scm(&fake).own_flag_back(&installed).unwrap_err();
-
-    assert!(failed.report().to_string().contains("busy"), "{}", failed.report());
-    fake.finish();
-}
-
-/// An install that finds the task up to date calls it, once the records are made.
-#[skuld::test]
-fn an_up_to_date_install_sets_the_own_flag_after_the_records(#[fixture(scm_group)] _group: &Group) {
-    let spec = users_spec();
-    let (dir, _runs) = records();
-    let fake = Fake::new();
-    fake.on_set_enabled(Ok(()));
-    let installed = TaskSnapshot::new(id(), Ok(blob(&spec)), registered_flag_off(&spec, true));
-
-    beside_over(&fake, &dir, &spec, &installed, prepared_beside(users())).unwrap();
-
-    assert_eq!(fake.calls(), [Call::SetEnabled(PATH.to_owned(), true)]);
-    assert!(records_dir(&dir).is_dir());
-    fake.finish();
-}
-
-/// What the machine holds for a task up to date that runs as `principal`.
-fn prepared_beside(principal: Sid) -> impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared> {
-    move |_, _, _| {
-        Ok(Prepared {
-            principal,
-            password: None,
-        })
-    }
-}
+// The order of an account change --------------------------------------------------------------------------------------
 
 /// What the world looks like to one call of the fake, noted as the call is made: `at`, whether the removal's
 /// marker stands, and whether the record directory names the new account ([`users`]).
@@ -2033,7 +1960,7 @@ fn an_unchanged_install_names_the_account_alone_in_the_log() {
 
 // An install that finds the task up to date ---------------------------------------------------------------------------
 
-/// [`Scm::task_beside_with`] under the temporary `%ProgramData%` `dir`, whose folders are judged as `Disable` (goetia's
+/// [`task_beside_with`] under the temporary `%ProgramData%` `dir`, whose folders are judged as `Disable` (goetia's
 /// own check could not pass there).
 fn beside_of(
     dir: &TempDir,
@@ -2041,18 +1968,7 @@ fn beside_of(
     snapshot: &TaskSnapshot,
     prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
 ) -> Result<()> {
-    beside_over(&Fake::new(), dir, spec, snapshot, prepare)
-}
-
-/// [`beside_of`] over `fake`, which answers what the install sends to Task Scheduler.
-fn beside_over(
-    fake: &Fake,
-    dir: &TempDir,
-    spec: &DaemonSpec,
-    snapshot: &TaskSnapshot,
-    prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
-) -> Result<()> {
-    scm(fake).task_beside_with(
+    task_beside_with(
         dir.path(),
         &FolderCheck::new(CheckPermissions::Disable),
         spec,
