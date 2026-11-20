@@ -16,6 +16,8 @@ use crate::backend::kill::Waited;
 use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::manager::Scm;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
+use crate::backend::scm::shim::acl::Descriptor;
+use crate::backend::scm::sid::try_sid_display;
 use crate::backend::scm::test_support::registered_task;
 use crate::blob::Blob;
 use crate::elevation::test_support::process_user_sid;
@@ -74,6 +76,43 @@ pub(super) fn records() -> (TempDir, PathBuf, Runs) {
     std::fs::create_dir_all(&path).unwrap();
     runs.ensure(&[process_user_sid()]).unwrap();
     (dir, path, runs)
+}
+
+/// The record directory with no right for the account this test runs as but to read and change its own
+/// permissions, until it is dropped: nothing can be created in it, as for a caller who is not an
+/// Administrator. Dropping restores the entry the directory is made with, so the test's directory can
+/// be removed.
+pub(super) struct Denied<'a>(&'a std::path::Path);
+
+impl<'a> Denied<'a> {
+    pub(super) fn new(path: &'a std::path::Path) -> Self {
+        let me = try_sid_display(&process_user_sid()).unwrap();
+        // READ_CONTROL, WRITE_DAC and SYNCHRONIZE (which `CreateFile` adds to every open).
+        let denied = Descriptor::from_sddl(&format!("D:P(A;;FA;;;SY)(A;;0x160000;;;{me})")).unwrap();
+        crate::backend::scm::test_support::set_dacl(&denied, path).unwrap();
+        Denied(path)
+    }
+}
+
+impl Drop for Denied<'_> {
+    fn drop(&mut self) {
+        let restored = Descriptor::for_runs(&[process_user_sid()])
+            .map(|wanted| crate::backend::scm::test_support::set_dacl(&wanted, self.0));
+        if !matches!(restored, Ok(Ok(()))) {
+            eprintln!(
+                "warning: could not restore the permissions of {}: {restored:?}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+/// How many pins the directory `path` holds.
+pub(super) fn pins_in(path: &std::path::Path) -> usize {
+    std::fs::read_dir(path)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
+        .count()
 }
 
 /// [`records`] where the task's directory is a junction, as its account can make it (adding a file is all

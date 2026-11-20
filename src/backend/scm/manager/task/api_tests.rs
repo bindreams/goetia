@@ -67,11 +67,12 @@ fn a_run_refused_for_a_disabled_task_names_the_cause_and_both_remedies() {
 
     let text = said.to_string();
     assert!(
-        text.contains("`x` is disabled") && text.contains("an install or an uninstall of `x` did not finish"),
+        text.contains("`x` is disabled")
+            && text.contains("`x` is being, or did not finish being, installed or uninstalled"),
         "the cause is named: {text}"
     );
     assert!(
-        text.contains("Run the install again with `--force`") && text.contains("`goetia daemon uninstall x`"),
+        text.contains("run the install again with `--force`") && text.contains("`goetia daemon uninstall x`"),
         "both remedies are named: {text}"
     );
     assert!(!text.contains("enable"), "no `enable`: {text}");
