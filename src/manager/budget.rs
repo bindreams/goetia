@@ -45,9 +45,9 @@ impl Budget {
     /// under every budget it waits for a queued start's pid and sends the run its
     /// first signal, as every backend's stop is issued. Under `Immediate` it
     /// returns `Ok` once it has sent the run its signal, without waiting for the
-    /// exit; where launchd shows a pid the stop cannot reach, it sends nothing
-    /// and returns [`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed),
-    /// reading nothing again. A zero bound is a bound that has run out, so after
+    /// exit; where launchd shows a pid the stop cannot reach, it reads again at
+    /// once, and the same pid twice in a row ends it with nothing sent, as
+    /// [`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed). A zero bound is a bound that has run out, so after
     /// that signal it sends nothing more, does one reading (`read_up`), and
     /// returns `Ok` if the job is idle, else
     /// [`Error::WaitTimeout`](crate::Error::WaitTimeout), a pid launchd has

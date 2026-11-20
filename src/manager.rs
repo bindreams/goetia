@@ -229,9 +229,10 @@ pub trait ServiceManager {
     /// the budget keeps running, and `kill` ends it. The deadline is decided right before each send, not
     /// atomically with it. `stop` also ends a run that begins while it is stopping. If launchd shows the job
     /// with no process in a state that does not say it is idle, or the read fails, the result is
-    /// [`Error::StopUnconfirmed`]. Under `Immediate` it is the same where launchd shows a pid that the stop
-    /// cannot reach (it has ended, or it is not the job's): nothing is sent, nothing is read again, and the
-    /// error says to run the stop again.
+    /// [`Error::StopUnconfirmed`]. Under `Immediate`, a pid launchd shows that the stop cannot reach (it has
+    /// ended, or it is not the job's) is followed at once by another reading: another pid is attempted like the
+    /// first, and the same pid twice in a row is the same error, with nothing sent and a word to run the stop
+    /// again.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

@@ -28,11 +28,12 @@ enum Pass {
     /// Read again: a start launchd had accepted has forked, after a wait of this long under no budget.
     /// That wait is not the caller's to spend, so the caller's budget is extended by it.
     Queued(Duration),
-    /// Launchd shows a pid that is no run of the job's that the stop can reach: the run ended and launchd has
-    /// not cleared it, or launchd has moved on to another run. Read again, paced by [`UNLOAD_POLL`], as for a
-    /// wait on `print`: it spaces the reads and decides nothing, and never runs past the deadline. `Immediate`
-    /// waits for no exit, so it does not read again: [`unreached`].
-    Behind,
+    /// Launchd shows the pid `.0`, which is no run of the job's that the stop can reach: the run ended and
+    /// launchd has not cleared it, or launchd has moved on to another run. Under a budget that waits: read
+    /// again, paced by [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing, and
+    /// never runs past the deadline. Under `Immediate`, which waits for nothing: read again at once, and the
+    /// same pid on that reading ends the stop ([`unreached`]).
+    Behind(u32),
 }
 
 /// A run this stop has signalled, and when its grace ends. The grace is the process's own, by identity: it
@@ -65,6 +66,9 @@ struct Course {
     /// The first pass is over: a pass that was not the wait for a queued start has ended. That pass always
     /// runs, and the wait for a queued start and the signal to the run found after it are part of it.
     first_over: bool,
+    /// Under `Immediate`: the pid the last reading showed that the stop could not reach. A reading that shows
+    /// it again ends the stop, and is not attempted.
+    unreached: Option<u32>,
 }
 
 impl Course {
@@ -76,6 +80,7 @@ impl Course {
             counted: budget,
             termed: None,
             first_over: false,
+            unreached: None,
         }
     }
 
@@ -235,14 +240,15 @@ fn timed_out_stopping(id: &str, budget: Budget, sent: Escalation) -> Error {
     }
 }
 
-/// What an `Immediate` stop ends with when launchd shows a pid it could not reach: it sent nothing, and cannot
-/// tell that no run is left. Indeterminate, like any [`Error::StopUnconfirmed`].
-fn unreached(id: &Id) -> Error {
+/// What an `Immediate` stop ends with when launchd showed the same pid `pid` on two readings in a row and the
+/// stop could not reach it: it sent nothing, and cannot tell that no run is left. Indeterminate, like any
+/// [`Error::StopUnconfirmed`].
+fn unreached(id: &Id, pid: u32) -> Error {
     Error::StopUnconfirmed {
         id: id.to_string(),
         shown: format!(
-            "launchd shows a process ID for the job that this stop could not reach (it has ended, or it is not \
-             the job's), and nothing was sent; run `goetia daemon stop {id}` again"
+            "launchd showed process {pid} for the job on two readings in a row, and this stop could not reach it \
+             (it has ended, or it is not the job's), and nothing was sent; run `goetia daemon stop {id}` again"
         ),
     }
 }
@@ -253,10 +259,11 @@ enum Up<'a> {
     Idle,
     /// A start launchd has accepted and not yet forked: [`Quiet::Queued`].
     Queued,
-    /// Launchd shows a pid, and it is no run of the job's that the stop can reach: the process is gone, or
-    /// is held and launchd does not name it (the run ended and is not cleared, or launchd has moved on to
-    /// another run, which this reading did not hold). Nothing is signalled.
-    Behind,
+    /// Launchd shows the pid `.0`, and it is no run of the job's that the stop can reach: the process is gone,
+    /// or is held and launchd does not name it (the run ended and is not cleared, or launchd has moved on to
+    /// another run, which this reading did not hold), or it is the pid the stop's last reading could not
+    /// reach, which is not attempted again. Nothing is signalled.
+    Behind(u32),
     /// A process held and confirmed by launchd as the job's, with its exit registered.
     Run {
         pid: u32,
@@ -271,8 +278,11 @@ impl Launchd {
     /// backend's is, whatever the budget: the first pass always runs, and the wait for a queued start and the
     /// signal to the run found after it are part of it. A spent deadline ends it ([`Course::spent`]).
     /// `Immediate` waits for no exit, and not for launchd's view either: it signals the run it finds and returns
-    /// `Ok`; a pid launchd shows that it cannot reach is [`Error::StopUnconfirmed`] ([`unreached`]), on that
-    /// reading. Otherwise the pass reads `print`:
+    /// `Ok`. A pid launchd shows that it cannot reach is followed at once by another reading, with no pause. The
+    /// same pid again is [`Error::StopUnconfirmed`] ([`unreached`]): launchd consistently gave the pid the stop
+    /// could not signal, and that second reading only asks launchd. Another pid is attempted like the first,
+    /// and no process on an idle job is `Ok`. There is no cap: the loop ends on a repeated pid, an idle job, or
+    /// a run it signals. Otherwise the pass reads `print`:
     ///
     /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
     ///   No process and any other state, or a `print` that failed or was not whole, is
@@ -298,8 +308,8 @@ impl Launchd {
     /// The deadline is decided before a send, not atomically with it: one that passes between the check and
     /// the send does not stop that send. A pid that exited before it was watched, or is not the job's any
     /// more, is the next pass, paced by [`UNLOAD_POLL`] while launchd's view catches up, or by what is left of
-    /// the deadline when that is less. The first pass draws
-    /// on `reservation`, and each later one on one of its own: an uncapped loop would draw what was never
+    /// the deadline when that is less (`Immediate` does not pause: the reading is its only wait). The first pass
+    /// draws on `reservation`, and each later one on one of its own: an uncapped loop would draw what was never
     /// reserved. A pass that cannot reserve returns that error, the SIGTERM standing. The one [`Watch`] is
     /// made first, so that failing to make it sends nothing.
     pub(super) fn stop_task(
@@ -316,12 +326,21 @@ impl Launchd {
             if course.spent() {
                 return self.done_or(id, &course, pass);
             }
-            match self.stop_pass(id, &mut course, pass)? {
+            let reading = self.stop_pass(id, &mut course, pass)?;
+            // Only a reading right after the one that failed can repeat its pid.
+            let failed = std::mem::take(&mut course.unreached);
+            match reading {
                 Pass::Done => return Ok(()),
                 Pass::Again => course.first_pass_over(),
                 Pass::Queued(waited) => course.extend(waited),
-                Pass::Behind if course.counted == Budget::Immediate => return Err(unreached(id)),
-                Pass::Behind => {
+                Pass::Behind(pid) if course.counted == Budget::Immediate => {
+                    if failed == Some(pid) {
+                        return Err(unreached(id, pid));
+                    }
+                    // Nothing is waited for, so there is no pause: the next reading is the wait.
+                    course.unreached = Some(pid);
+                }
+                Pass::Behind(_) => {
                     course.first_pass_over();
                     // The pause never crosses a bounded deadline.
                     let pause = match (course.counted, course.deadline().remaining()) {
@@ -346,10 +365,10 @@ impl Launchd {
     /// contract's error: no process and a state that is not idle is [`Error::StopUnconfirmed`] ([`quiet`]),
     /// and a read that failed returns its error.
     fn done_or(&self, id: &Id, course: &Course, reservation: &mut Reservation) -> Result<()> {
-        let said = match self.read_up(id, &course.watch, reservation)? {
+        let said = match self.read_up(id, &course.watch, None, reservation)? {
             Up::Idle => return Ok(()),
             Up::Queued => Some(Escalation::Unsent),
-            Up::Behind => Some(Escalation::Uncleared),
+            Up::Behind(_) => Some(Escalation::Uncleared),
             Up::Run { held, .. } => course.escalation(held.id()),
         };
         Err(match said {
@@ -363,8 +382,16 @@ impl Launchd {
     /// process held, and launchd asked whether it is the job's ([`hold_pid`], as `kill` does). The
     /// registration is dropped on any way out of the caller, which deletes it and drains the queue: a pid that
     /// is reused later cannot be handed this process's exit. Launchd's record of a run that has gone is not
-    /// waited for here: [`Up::Behind`], and the caller reads again, paced, or ends.
-    fn read_up<'a>(&'a self, id: &'a Id, watch: &Watch, reservation: &mut Reservation) -> Result<Up<'a>> {
+    /// waited for here: [`Up::Behind`], and the caller reads again (paced, or at once under `Immediate`), or ends.
+    /// A pid that is `unreached`, the one a reading just failed to reach, is not attempted again: it is
+    /// [`Up::Behind`] on `print` alone.
+    fn read_up<'a>(
+        &'a self,
+        id: &'a Id,
+        watch: &Watch,
+        unreached: Option<u32>,
+        reservation: &mut Reservation,
+    ) -> Result<Up<'a>> {
         let name = id.as_str();
         // Unbounded: `print` answers at once, and its body is whole.
         let issuing = Budget::Unbounded.start();
@@ -377,15 +404,18 @@ impl Launchd {
                 Quiet::Idle => Up::Idle,
             });
         };
+        if unreached == Some(pid) {
+            return Ok(Up::Behind(pid));
+        }
         let Added::Watching(registered) = watch.add(pid)? else {
-            return Ok(Up::Behind);
+            return Ok(Up::Behind(pid));
         };
         // The process is held, and only then does launchd confirm that it is the job's: a pid that was
         // read and then reused is a process launchd does not name, and is left alone.
         let mut target = JobKill::new(&self.launchctl, name, reservation)?;
         let held = match hold_pid(&mut target, pid) {
             Ok(Hold::Held { process, .. }) => process,
-            Ok(Hold::Ended { .. }) => return Ok(Up::Behind),
+            Ok(Hold::Ended { .. }) => return Ok(Up::Behind(pid)),
             Err(error) => return Err(stop_failed(name, "holding the process", error.into())),
         };
         Ok(Up::Run {
@@ -400,21 +430,22 @@ impl Launchd {
     /// and reports having waited, and what it has sent: the waits for queued starts are in its budget.
     fn stop_pass(&self, id: &Id, course: &mut Course, reservation: &mut Reservation) -> Result<Pass> {
         let name = id.as_str();
-        let (pid, registered, mut target, held) = match self.read_up(id, &course.watch, reservation)? {
-            Up::Idle => return Ok(Pass::Done),
-            Up::Queued => {
-                let began = Instant::now();
-                self.await_queued_start(name, reservation)?;
-                return Ok(Pass::Queued(began.elapsed()));
-            }
-            Up::Behind => return Ok(Pass::Behind),
-            Up::Run {
-                pid,
-                registered,
-                target,
-                held,
-            } => (pid, registered, target, held),
-        };
+        let (pid, registered, mut target, held) =
+            match self.read_up(id, &course.watch, course.unreached, reservation)? {
+                Up::Idle => return Ok(Pass::Done),
+                Up::Queued => {
+                    let began = Instant::now();
+                    self.await_queued_start(name, reservation)?;
+                    return Ok(Pass::Queued(began.elapsed()));
+                }
+                Up::Behind(pid) => return Ok(Pass::Behind(pid)),
+                Up::Run {
+                    pid,
+                    registered,
+                    target,
+                    held,
+                } => (pid, registered, target, held),
+            };
         let run = held.id();
         if let Some(signal) = course.due(run)
             && !send(&held, course, name, signal)?
@@ -438,7 +469,7 @@ impl Launchd {
             .confirm(pid, &held)
             .map_err(|e| stop_failed(name, "confirming the process", e))?
         {
-            return Ok(Pass::Behind);
+            return Ok(Pass::Behind(pid));
         }
         if send(&held, course, name, Signal::Kill)? {
             // The wait for the exit is on the hold too: the watch is spent by the wait that ran out. Whether it
