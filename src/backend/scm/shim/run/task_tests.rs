@@ -713,7 +713,7 @@ fn a_pin_in_a_directory_that_is_a_link_starts_no_program() {
 fn shim_rechecks_the_marker_after_its_listing() {
     let run = Run::of(&spec_logging_to(Some(LOGS)));
     let removal = run.hand();
-    run.api.on_instances_during(Ok(listed()), move || {
+    run.api.on_instances(Ok(listed())).during(move || {
         removal.close().unwrap();
     });
 
@@ -743,7 +743,7 @@ fn a_marker_look_that_fails_starts_no_program() {
     let marker = run.records_dir().with_file_name(format!("{ID}~removing"));
     let held = Arc::new(std::sync::Mutex::new(None));
     let slot = Arc::clone(&held);
-    run.api.on_instances_during(Ok(listed()), move || {
+    run.api.on_instances(Ok(listed())).during(move || {
         *slot.lock().unwrap() = Some(delete_pending(&marker));
     });
 
@@ -781,7 +781,7 @@ fn a_run_records_under_its_own_pin_and_drops_it_after_the_rename() {
     };
     let (first, second) = (earlier(5), earlier(6));
     let seen = (first.clone(), second.clone());
-    run.api.on_instances_during(Ok(listed()), move || {
+    run.api.on_instances(Ok(listed())).during(move || {
         other.write(&seen.0, None).unwrap();
         other.write(&seen.1, None).unwrap();
         assert!(
