@@ -3,13 +3,16 @@
 //! program is this binary in a shim fixture mode (`fixture.rs`). The tasks of a service account run a
 //! copy of the shim and of this binary that the account can execute (`WorldReadableExe`).
 
+use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
+
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{Id, User};
+use goetia::testing::RemovalMarker;
 
 use crate::common::{UNIT_DIR_EXCLUSIVE, fixture_command, fixture_command_with_exe, manager};
 use crate::supervisor_integration::pid_is_alive;
-use crate::support::windows_tasks::{EndsTheRunOnPanic, ServiceAccountHost, task_spec};
-use crate::support::{self, ConnectBack, Group, ServiceGuard, kill, scm_group};
+use crate::support::windows_tasks::{EndsTheRunOnPanic, ServiceAccountHost, status_once_ended, task_spec};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
 
 /// What a run that `Stop` ended exits as: Windows' code for a console process ended by its close event.
 const STOPPED: Exit = Exit::Code(0xC000_013A_u32 as i32);
@@ -97,7 +100,7 @@ fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_
         assert_eq!(exit, STOPPED, "one record, `Stopped`");
         // Gone is a state the kernel reaches as the shim's job closes, so it is waited for.
         for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
-            kill::until(|| !pid_is_alive(&pid));
+            wait::until(|| !pid_is_alive(&pid));
             assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
         }
     });
@@ -113,8 +116,8 @@ fn the_programs_run_as_the_tasks_principal(#[fixture(scm_group)] _group: &Group)
 }
 
 /// The shim runs as an account that is no administrator, and reads its own task through Task Scheduler's
-/// COM to find its instance: a read that is refused starts the program all the same and writes no
-/// record, so `run` would report the run unrecorded.
+/// COM to find its instance: a read that is refused starts no program, so `run` would report the run
+/// unrecorded.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_task_reads_its_own_task_unelevated(#[fixture(scm_group)] _group: &Group) {
     let (exit, _) = run_as_local_service("exit", &["3"]);
@@ -178,5 +181,47 @@ fn a_task_runs_at_normal_priority(#[fixture(scm_group)] _group: &Group) {
         "0x20",
         "NORMAL_PRIORITY_CLASS"
     );
+    mgr.uninstall(&id).expect("uninstall");
+}
+
+/// The shim obeys the removal's marker: its pin is refused, no program starts, and the task's last result
+/// is the shim failure. Started through Task Scheduler's `Run`, since a goetia verb is refused by the marker
+/// first.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
+    let id = task_id();
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = manager();
+    let reported = ConnectBack::listen();
+    let command = fixture_command("exit", &[&reported.port().to_string(), "7"]);
+    mgr.install(&task_spec(&id, command, None, User::Root, None), false)
+        .expect("install");
+    // The install makes the default log, empty: the refused shim appends nothing to it.
+    let default_log = support::program_data()
+        .join("Goetia")
+        .join("logs")
+        .join(format!("{id}.log"));
+    assert_eq!(
+        std::fs::metadata(&default_log).expect("the install made the log").len(),
+        0
+    );
+    let marker = RemovalMarker::place(&id).unwrap_or_else(|e| panic!("place the marker: {}", e.report()));
+
+    goetia::testing::run_task(&id).unwrap_or_else(|e| panic!("run: {}", e.report()));
+
+    let status = status_once_ended(&mgr, &id);
+    assert!(status.last_run.is_some(), "the task has not run");
+    assert_eq!(
+        status.last_result,
+        Some(Exit::Code(ERROR_GEN_FAILURE as i32)),
+        "the shim's failure, not the program's 7"
+    );
+    assert_eq!(
+        std::fs::metadata(&default_log).expect("the log is still there").len(),
+        0,
+        "the refused shim wrote to the default log"
+    );
+    assert!(!reported.connected_yet(), "the program ran under a marker");
+    drop(marker);
     mgr.uninstall(&id).expect("uninstall");
 }

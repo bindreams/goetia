@@ -4,6 +4,7 @@ use std::sync::Arc;
 use super::*;
 use crate::error::Reason;
 use crate::error::error_tests::{exit_status, id, os, undetermined};
+use crate::error::{Composite, carried_composite, carry};
 
 /// A remedy is its own sentence: it follows a period the words before it already ended with, and
 /// supplies one when they did not.
@@ -28,7 +29,9 @@ fn an_embedded_errors_remedy_prints_last_not_inside_the_sentence() {
             read_failed: Box::new(undetermined("re-run as root")),
             restore_failed: Some(Box::new(os("write", "/q", "disk full"))),
         },
-        Error::StartAsManaged {
+        Error::StartJudgedWithoutBlob {
+            id: "x".to_string(),
+            judged_as: crate::spec::Protocol::Native,
             blob: Arc::new(undetermined("re-run as root")),
             source: Box::new(os("start", "/q", "stopped")),
         },
@@ -45,7 +48,9 @@ fn an_embedded_errors_remedy_prints_last_not_inside_the_sentence() {
 
 #[skuld::test]
 fn a_remedy_met_both_embedded_and_down_the_chain_prints_once() {
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(undetermined("re-run as root")),
         source: Box::new(undetermined("re-run as root")),
     };
@@ -202,6 +207,25 @@ fn a_commands_stderr_keeps_a_carriage_return_that_ends_a_line() {
     assert!(text.ends_with(concat!(": one\r\ntwo", r"\u{d}", "three")), "{text:?}");
 }
 
+/// An `io::Error` that carries an error of ours is written as that error: its remedy is printed last
+/// and its child's stderr is kept, as for an error that is not carried.
+#[skuld::test]
+fn an_error_carried_by_an_io_error_is_written_with_its_remedy_and_stderr() {
+    let carried = Error::Undetermined {
+        id: id(),
+        reason: Box::new(command(
+            "no such
+service",
+        )),
+        recovery: "re-run as root".to_string(),
+    };
+    let expected = carried.report().to_string();
+
+    let e = Error::os("read", std::io::Error::other(carried));
+
+    assert_eq!(e.report().to_string(), format!("failed to read: {expected}"));
+}
+
 /// A [`Reason`] prints as the report does, a child's stderr included.
 #[skuld::test]
 fn a_reason_wrapping_a_command_error_prints_its_stderr_as_the_report_does() {
@@ -216,7 +240,9 @@ fn a_reason_wrapping_a_command_error_prints_its_stderr_as_the_report_does() {
 #[skuld::test]
 fn an_embedded_errors_stderr_keeps_its_layout() {
     let status = exit_status(1);
-    let e = Error::StartAsManaged {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(command("a\nerror: forged")),
         source: Box::new(os("start", "/q", "stopped")),
     };
@@ -248,7 +274,9 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
 #[skuld::test]
 fn display_of_a_sentence_variant_leaves_out_the_embedded_errors_stderr() {
     let status = exit_status(1);
-    let blob = Error::StartAsManaged {
+    let blob = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(command("secret\ndiagnostic")),
         source: Box::new(os("start", "/q", "stopped")),
     };
@@ -289,7 +317,9 @@ fn a_kept_both_prints_both_halves_and_its_remedies() {
 /// error's stderr, which only the report writes.
 #[skuld::test]
 fn display_of_a_sentence_variant_and_its_report_agree_on_the_words() {
-    let blob = Error::StartAsManaged {
+    let blob = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
         blob: Arc::new(os("read", "/p", "denied")),
         source: Box::new(os("start", "/q", "stopped")),
     };
@@ -330,6 +360,100 @@ fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
     let text = Error::spawn("tool", cosca_error()).report().to_string();
 
     assert_eq!(text, format!("failed to run `tool`: {expected}"));
+}
+
+// The rule ------------------------------------------------------------------------------------------------------------
+
+/// What a standard printer shows of `e`: its `Display`, then each error down its `source()` chain.
+fn standard_print(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = e.to_string();
+    let mut next = e.source();
+    while let Some(source) = next {
+        text.push_str(": ");
+        text.push_str(&source.to_string());
+        next = source.source();
+    }
+    text
+}
+
+/// A composite renders the errors it holds in its own `Display` and returns none of them from
+/// `source()`, so a walker that follows `source()` and prints each `Display` shows every failure
+/// once.
+#[skuld::test]
+fn a_standard_printer_shows_each_failure_of_a_composite_once() {
+    let both = Error::Both {
+        first: Box::new(os("read", "/p", "first failure")),
+        then: Box::new(os("write", "/q", "then failure")),
+    };
+    let nested = Error::Both {
+        first: Box::new(Error::Both {
+            first: Box::new(os("read", "/p", "first failure")),
+            then: Box::new(os("write", "/q", "then failure")),
+        }),
+        then: Box::new(os("stat", "/r", "last failure")),
+    };
+    #[cfg(windows)]
+    let pair = crate::error::debug_privilege_also_failed(
+        std::io::Error::other("primary failure"),
+        std::io::Error::other("second failure"),
+    );
+    let blob = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
+        blob: Arc::new(Error::blob_from("unreadable", std::io::Error::other("blob failure"))),
+        source: Box::new(os("start", "/s", "start failure")),
+    };
+    let loaded = Error::LoadedStateInDoubt {
+        id: id(),
+        read_failed: Box::new(os("read", "/t", "read failure")),
+        restore_failed: Some(Box::new(os("write", "/u", "restore failure"))),
+    };
+    let shown: &[(&(dyn std::error::Error + 'static), &[&str])] = &[
+        (&both, &["first failure", "then failure"]),
+        (&nested, &["first failure", "then failure", "last failure"]),
+        #[cfg(windows)]
+        (&pair, &["primary failure", "second failure"]),
+        (&blob, &["blob failure", "start failure"]),
+        (&loaded, &["read failure", "restore failure"]),
+    ];
+    for &(e, failures) in shown {
+        let text = standard_print(e);
+        for failure in failures {
+            assert_eq!(text.matches(failure).count(), 1, "`{failure}` in {text}");
+        }
+    }
+}
+
+/// `Both` renders both its halves, first first, and has no `source()` of its own.
+#[skuld::test]
+fn a_boths_display_is_its_two_halves() {
+    let both = Error::Both {
+        first: Box::new(os("read", "/p", "first failure")),
+        then: Box::new(undetermined("re-run as root")),
+    };
+    assert_eq!(
+        both.to_string(),
+        "failed to read /p: first failure; then: cannot determine whether daemon `x` is installed: failed to read /p: denied"
+    );
+    assert!(std::error::Error::source(&both).is_none());
+}
+
+/// A sentence variant's source is another error than the one in its sentence: both are written, the
+/// sentence first.
+#[skuld::test]
+fn a_sentence_with_a_source_prints_the_sentence_then_the_source() {
+    let e = Error::StartJudgedWithoutBlob {
+        id: "x".to_string(),
+        judged_as: crate::spec::Protocol::Native,
+        blob: Arc::new(os("read", "/p", "blob failure")),
+        source: Box::new(os("start", "/q", "start failure")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        format!("{e}: failed to start /q: start failure")
+    );
+    assert!(e.to_string().contains("blob failure"));
+    assert!(!e.to_string().contains("start failure"));
 }
 
 // os_error_in ---------------------------------------------------------------------------------------------------------
@@ -432,4 +556,50 @@ fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
     );
     // A chain with no code anywhere has none.
     assert_eq!(os_error_in(&unassessable(containment(code_less()))), None);
+}
+
+/// A composite the walks do not name is told, searched and looked up through its carrier like the two there
+/// are: a new payload needs nothing but its [`Composite`] impl.
+#[skuld::test]
+fn a_composite_no_walk_names_is_told_and_searched_through_its_carrier() {
+    #[derive(Debug)]
+    struct Probe {
+        cause: std::io::Error,
+        aside: std::io::Error,
+    }
+    impl Composite for Probe {
+        fn pieces(&self) -> Pieces<'_> {
+            Pieces::new()
+                .text("probe: ")
+                .cause(&self.cause)
+                .text(" next to ")
+                .mentioned(&self.aside)
+        }
+    }
+    impl std::fmt::Display for Probe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.pieces().fmt(f)
+        }
+    }
+    impl std::error::Error for Probe {}
+
+    let carried = carry(
+        std::io::ErrorKind::Other,
+        Probe {
+            cause: std::io::Error::from_raw_os_error(5),
+            aside: std::io::Error::from_raw_os_error(8),
+        },
+    );
+    let (cause, aside) = (
+        std::io::Error::from_raw_os_error(5).to_string(),
+        std::io::Error::from_raw_os_error(8).to_string(),
+    );
+    assert!(carried_composite::<Probe>(&carried).is_some());
+    let e = Error::os("probe it", carried);
+
+    assert_eq!(
+        e.report().to_string(),
+        format!("failed to probe it: probe: {cause} next to {aside}")
+    );
+    assert_eq!(e.raw_os_error(), Some(5), "the cause's code, never the mentioned one's");
 }

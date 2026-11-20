@@ -99,6 +99,8 @@ pub(in crate::backend::scm) mod registry;
 pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use registry::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -114,13 +116,14 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, which};
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_beside, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
-    carried, end_on_incomplete_stop, end_process,
+    end_on_incomplete_stop, end_process,
 };
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
+use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{make_goetia_folders, program_data};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::kill::system::Held;
@@ -134,6 +137,7 @@ use crate::backend::scm::shim::provider::{ShimProvider, require_absolute};
 use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
+use crate::backend::scm::sid::Sid;
 use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
 use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
@@ -142,7 +146,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Chain, Error, Reason, Result, terminating_failed};
+use crate::error::{Error, Reason, Result, carried_composite, os_error_in, target_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
@@ -341,22 +345,29 @@ impl Scm {
         if !generate::hosted(spec) {
             return Ok(None);
         }
-        self.begin_hosted_install(HostCommand {
-            exe: desired.executable.clone(),
-            args: desired.arguments.clone(),
-        })
+        self.begin_hosted_install(
+            HostCommand {
+                exe: desired.executable.clone(),
+                args: desired.arguments.clone(),
+            },
+            spec,
+        )
         .map(Some)
     }
 
     /// What an install of a daemon that runs under the shim host does first, for a service and a task
-    /// alike: see [`Self::service_begin_install`]. `rendered` is the host the definition names.
-    fn begin_hosted_install(&self, rendered: HostCommand) -> Result<InstallLock> {
+    /// alike: see [`Self::service_begin_install`]. `rendered` is the host the definition names. A `logs:` of
+    /// `spec` in goetia's logs folder is refused here, for every install, up to date or not: see
+    /// [`default_log::refuse_logs_in_folder`].
+    fn begin_hosted_install(&self, rendered: HostCommand, spec: &DaemonSpec) -> Result<InstallLock> {
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
         // Made here, by an elevated process, for the shim to write in: it runs as the daemon's account
         // and makes no folder. Always judged, whatever `folders` is: no caller guarantees them.
         let judge = FolderCheck::new(CheckPermissions::Enable);
-        make_goetia_folders(&program_data()?, |path| judge.check(path))?;
+        let program_data = program_data()?;
+        make_goetia_folders(&program_data, |path| judge.check(path))?;
+        default_log::refuse_logs_in_folder(&program_data, &spec.common().id, spec.common().logs.as_deref())?;
         self.sweep_before_install(shim);
         let provided = shim.provide(&self.folders)?;
         let provided = confirm_provided(rendered, provided)?;
@@ -429,7 +440,7 @@ impl Scm {
         definition: &ScmRegistration,
         snapshot: Option<&ScmSnapshot>,
     ) -> Result<WriteOutcome> {
-        apply(definition, written_user(&spec.common().user), snapshot.is_none())?;
+        apply(spec, definition, written_user(&spec.common().user), snapshot)?;
         Ok(WriteOutcome::Done)
     }
 
@@ -576,7 +587,7 @@ impl Scm {
     /// tree may still be running) is a failed stop, once the process is ended; `uninstall` fails the
     /// same way, and leaves the service stopped, disabled and not deleted (see [`uninstall_stop_on`]).
     ///
-    /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
+    /// A process that cannot be held is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
     ///
     /// The gap: if the held process crashes and Windows' recovery restarts the service before the
@@ -645,7 +656,7 @@ impl Backend for Scm {
     ) -> Result<Option<InstallLock>> {
         match desired {
             WindowsDefinition::Service(desired) => self.service_begin_install(spec, desired),
-            WindowsDefinition::Task(desired) => self.begin_hosted_install(desired.host()).map(Some),
+            WindowsDefinition::Task(desired) => self.begin_hosted_install(desired.host(), spec).map(Some),
         }
     }
 
@@ -724,6 +735,27 @@ impl Backend for Scm {
             (WindowsDefinition::Task(definition), Some(WindowsSnapshot::Service(old))) => {
                 self.retype_to_task(spec, definition, old, scope)
             }
+        }
+    }
+
+    /// A service: the event source, a real user's logon right ([`service_gate`], no password) and, if it runs
+    /// the shim host, its default log. A task: [`task_beside`]. The account is the one the definition registers.
+    fn ensure_beside(
+        &self,
+        spec: &DaemonSpec,
+        definition: &WindowsDefinition,
+        snapshot: &WindowsSnapshot,
+    ) -> Result<()> {
+        match (definition, snapshot) {
+            (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
+                let gated = service_gate(definition, written_user(&spec.common().user), Password::Unneeded)?;
+                make_default_log(spec, definition, gated.checked.as_ref(), &[], default_log::Step::Narrow).map(drop)
+            }
+            (WindowsDefinition::Task(definition), WindowsSnapshot::Task(installed)) => {
+                task_beside(spec, definition, installed)
+            }
+            (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
+            | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
         }
     }
 
@@ -966,7 +998,7 @@ pub(super) fn stop_on<A: super::wait::ScmActor, P: HeldProcess>(
                 Err(process_wait_failed(id, format!("stop `{id}`"), failure))
             }
         });
-    // A process that cannot be opened is not waited for (see `stop_and_await_exit`), and a `stop`
+    // A process that cannot be held is not waited for (see `stop_and_await_exit`), and a `stop`
     // that succeeds has no channel to say so: the reason leads the error of one that fails.
     stopped.map_err(|error| match held {
         HoldOutcome::Refused(reason) => unwaited(id, reason, error),
@@ -990,18 +1022,12 @@ fn start_kind(answer: &ShimAnswer) -> (Protocol, Option<Arc<Error>>) {
 /// the start was judged without it, as `kind` says, and the error says why: neither is what a service
 /// whose blob reads would have been told.
 fn failed_start(id: &Id, failed: Error, kind: Protocol, unreadable: Option<Arc<Error>>) -> Error {
-    match (kind, unreadable) {
-        (_, None) => failed,
-        (Protocol::Native, Some(blob)) => Error::StartAsManaged {
+    match unreadable {
+        None => failed,
+        Some(blob) => Error::StartJudgedWithoutBlob {
+            id: id.to_string(),
+            judged_as: kind,
             blob,
-            source: Box::new(failed),
-        },
-        (Protocol::Plain, Some(blob)) => Error::Step {
-            what: format!(
-                "`{id}`'s spec blob could not be read, so the start was judged as a goetia shim's, by the \
-                 registered image ({})",
-                Chain(&*blob)
-            ),
             source: Box::new(failed),
         },
     }
@@ -1019,19 +1045,7 @@ fn read_live_registration(
 ) -> Result<ScmRegistration> {
     let cmdline = cfg.executable_path.to_string_lossy().into_owned();
     let (executable, arguments) = split_command_line(&cmdline);
-    let account = cfg
-        .account_name
-        .as_ref()
-        .map(|a| a.to_string_lossy().into_owned())
-        // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
-        // doc comment) forces a live `LocalSystem` account to be written back
-        // as some spelling of it, not `None` — canonicalise it through the
-        // same table `generate::registration` uses so a `LocalSystem`
-        // service (whatever spelling SCM's own readback happens to use)
-        // reads as up-to-date rather than a permanent phantom diff. This is
-        // the `LocalSystem` row of that same table, folded in rather than a
-        // one-off `LocalSystem`-only filter.
-        .and_then(|a| generate::canonical_account(&a));
+    let account = registered_account(cfg);
     let failure_actions = read_failure_actions(service, name)?;
     let environment = held_service(name, registry::read_environment(name)?)?;
 
@@ -1046,6 +1060,27 @@ fn read_live_registration(
         parameters: live_params.fields.clone(),
         stray_parameters: live_params.strays.clone(),
     })
+}
+
+/// The account `cfg` says a service runs as, as the registration spells it: `None` is LocalSystem.
+fn registered_account(cfg: &ServiceConfig) -> Option<String> {
+    cfg.account_name
+        .as_ref()
+        .map(|a| a.to_string_lossy().into_owned())
+        // A live LocalSystem account is written back as a spelling of it, not `None` (ChangeServiceConfigW reads
+        // NULL as "unchanged"), canonicalised through `generate::registration`'s table so it never reads as a
+        // phantom diff.
+        .and_then(|a| generate::canonical_account(&a))
+}
+
+/// The SID of the account the service `cfg` describes is registered as. `None` when no account has that
+/// name (a deleted account): nothing runs as it, so there is no one to name. Any other failure is an error.
+fn registered_account_sid(cfg: &ServiceConfig) -> Result<Option<Sid>> {
+    match identity::service_account_sid(registered_account(cfg).as_deref(), None) {
+        Ok(sid) => Ok(Some(sid)),
+        Err(Error::AccountLookup { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailureActions>> {
@@ -1142,21 +1177,86 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// then `Parameters`, `Environment` and the failure actions. A precondition
 /// that fails fails the install before any service write, leaving no new
 /// service and an existing one unchanged, so the next `install` retries as a
-/// create or an update, as systemd and launchd do. `Parameters` follows
-/// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
-/// the two writes after it leaves a registration the next `install` reads as
-/// hand-edited (`Conflict`, cleared by `--force`). An update restates the
-/// start type the service has, rather than resetting it; see `service_info`. `written` is what
-/// [`written_user`] says of the account's spec value.
-fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
-    let password = service_gate(reg, written)?;
-    apply_gated(reg, password, create)
+/// create or an update, as systemd and launchd do. The daemon's default log
+/// ([`make_default_log`]) is not a precondition: an update makes it for the new account before the
+/// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
+/// service exists, since a virtual account's SID resolves only then, before any start. An update that
+/// changes the account names the registered account and the new one before the configuration changes, and the
+/// new one alone once it has landed, unless a start is in progress or this install made the log under a live run
+/// ([`default_log::naming`]), so that a change that fails leaves the account the service still runs as its
+/// log, and the next install corrects what a failure left. The names come from what install knows (the snapshot's account, the new account), never from the file.
+/// A failure of the log after a create leaves the new service, and the next `install` finds it up to date and
+/// makes the log ([`Backend::ensure_beside`]).
+/// `Parameters` follows create/update immediately, minimizing the window in which a crash leaves a service
+/// with no marker; a failure in the two writes after it leaves a registration the next `install` reads as
+/// hand-edited (`Conflict`, cleared by `--force`). An update restates the start type the service has, rather
+/// than resetting it; see `service_info`. `written` is what [`written_user`] says of the account's spec value.
+fn apply(
+    spec: &DaemonSpec,
+    reg: &ScmRegistration,
+    written: Option<identity::Written>,
+    installed: Option<&ScmSnapshot>,
+) -> Result<()> {
+    let gated = service_gate(reg, written, Password::Read)?;
+    let mut before = None;
+    let mut after = default_log::Step::Narrow;
+    if let Some(installed) = installed {
+        let config = installed.config()?;
+        before = accounts_kept_before_change(
+            generate::hosted(spec),
+            &registered_account(config),
+            &reg.account,
+            || registered_account_sid(config),
+        )?;
+        let step = if before.is_some() {
+            default_log::Step::Widen
+        } else {
+            default_log::Step::Narrow
+        };
+        let change = make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
+        after = change.map_or(default_log::Step::Narrow, |change| change.step_after());
+    }
+    apply_gated(reg, gated.password, installed.is_none())?;
+    make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
+}
+
+/// The registered account of a service, which its default log names beside the new account until a change of
+/// account lands: `lookup` is asked for it only where a log names it, a hosted service (`hosted`) whose
+/// account `new` differs from the `registered` one. Any other install names the new account alone, and asks the
+/// system nothing of the old one.
+fn accounts_kept_before_change(
+    hosted: bool,
+    registered: &Option<String>,
+    new: &Option<String>,
+    lookup: impl FnOnce() -> Result<Option<Sid>>,
+) -> Result<Option<Sid>> {
+    if hosted && registered != new {
+        lookup()
+    } else {
+        Ok(None)
+    }
+}
+
+struct Gated {
+    /// What `CreateServiceW` and `ChangeServiceConfigW` log on with: a real user's password.
+    password: Option<String>,
+    /// The SID of the real user the gate checked and granted the logon right to, which the daemon's
+    /// default log names too. `None` for the accounts that need no check.
+    checked: Option<Sid>,
+}
+
+/// Whether `prepare`/`service_gate` read a real user's password: `Read` before a registration, `Unneeded` when
+/// the daemon is already registered.
+#[derive(Clone, Copy)]
+enum Password {
+    Read,
+    Unneeded,
 }
 
 /// What a service of `reg` needs before it is written, which a change of a task into a service sees to
 /// before it removes the task: the account is a user and its right is granted, the password is read,
-/// and the event source is registered. Returns the password to register with. See [`apply`].
-fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Result<Option<String>> {
+/// and the event source is registered. See [`apply`].
+fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads: Password) -> Result<Gated> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -1178,7 +1278,7 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
     // Win32 failure being the only way it would ever surface. "Needs no
     // password" must mean "is never given one", not merely "is not
     // required to have one".
-    let password = if generate::account_needs_password(reg.account.as_deref()) {
+    let (password, checked) = if generate::account_needs_password(reg.account.as_deref()) {
         let account = reg.account.as_deref().expect(
             "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
         );
@@ -1187,20 +1287,61 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>) -> Re
         // success and every start would fail with error 1069 (`ERROR_LOGON_FAILURE`), so a missing
         // one is refused.
         let user = identity::require_user_account(account, written)?;
-        let pw = identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
-            account: account.to_string(),
-            kind: DaemonKind::Service,
-        })?;
+        let pw = match reads {
+            Password::Read => Some(identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
+                account: account.to_string(),
+                kind: DaemonKind::Service,
+            })?),
+            Password::Unneeded => None,
+        };
         identity::grant_logon_right(&user, identity::Right::Service)?;
-        Some(pw)
+        (pw, Some(user.sid().clone()))
     } else {
-        None
+        (None, None)
     };
 
     // Here rather than in the shim: it writes under HKLM, and the shim may run as an unprivileged
     // account.
     registry::register_event_source()?;
-    Ok(password)
+    Ok(Gated { password, checked })
+}
+
+/// The default log of the service `reg` registers, for the account it runs as, made or set to name it:
+/// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
+/// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
+/// account up again), else the one the spec gave as a SID, else the registered name's. `kept` is the account
+/// it names beside it, the one this install changes the service from, at `step` ([`default_log::naming`]), by how
+/// far the service's run is ([`default_log::Run`]), which SCM is asked once: a shim holds its log from before its
+/// first status report, and reopens by path one that was deleted. Call it once the service exists (a virtual
+/// account's SID resolves only then) and before it starts, or for the account an update is about to give a
+/// service that exists. The change it returns says what the install's
+/// next step does with the file ([`default_log::LogChange::step_after`]); `None` for a service with no default log.
+fn make_default_log(
+    spec: &DaemonSpec,
+    reg: &ScmRegistration,
+    checked: Option<&Sid>,
+    kept: &[Sid],
+    step: default_log::Step,
+) -> Result<Option<default_log::LogChange>> {
+    if !generate::hosted(spec) {
+        return Ok(None);
+    }
+    let id = &spec.common().id;
+    let account = match checked {
+        Some(sid) => sid.clone(),
+        None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
+    };
+    let program_data = program_data()?;
+    default_log::make(&program_data, id, step, service_run(id)?, kept, &account).map(Some)
+}
+
+/// How far the run of the service `id` is, from the state SCM reports for it.
+fn service_run(id: &Id) -> Result<default_log::Run> {
+    let (_scm, service) = open_existing(id, "query", ServiceAccess::QUERY_STATUS)?;
+    service
+        .query_status()
+        .map(|status| default_log::Run::of(status.current_state))
+        .map_err(|e| to_error(&format!("query status for `{id}`"), e))
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it
@@ -1375,7 +1516,7 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
 /// before the process exits, and reports no pid after it. It may be running an older file than the
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
-/// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
+/// process that cannot be held is none (see [`hold_if_possible`]). The service handle each hold
 /// uses is closed before it returns, or the service could not be deleted.
 fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
@@ -1489,7 +1630,7 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
         Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
-            let state = match (carried::<IncompleteStop>(&e).is_some(), marked) {
+            let state = match (carried_composite::<IncompleteStop>(&e).is_some(), marked) {
                 (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
@@ -1661,7 +1802,7 @@ fn is_gone_or_marked(error: &Error) -> bool {
 /// before the process exits, and reports no pid after it. For an uninstall it may be running an
 /// older file than the one registered (an `Update` it has not restarted into), which no read of the
 /// registry shows. [`HoldOutcome::NoProcess`] when SCM reports none, and [`HoldOutcome::Refused`],
-/// with why, when the process cannot be opened (see [`hold_if_possible`]): the caller goes on, and
+/// with why, when the process cannot be held (see [`hold_if_possible`]): the caller goes on, and
 /// what that process runs stays referenced by its image until it exits. A failure to read SCM is an
 /// error, led by `not_done`, what the caller did not do. The wait for SCM to let go of a pid whose
 /// process is gone ends at `deadline`, and is [`HoldOutcome::Expired`]: a `stop` sends its STOP all
@@ -1679,8 +1820,13 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
         Err(e) => return Err(not_done(e)),
     };
     let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
-    hold_if_possible(&mut target, deadline)
-        .map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
+    hold_if_possible(&mut target, deadline).map_err(|e| not_done(hold_failed(id, e)))
+}
+
+/// The failure `e` to hold `id`'s process, as `hold_process` reports it: a [`Step`](Error::Step) around
+/// the goetia error that `e` carries, with its class, or else an OS failure of the hold.
+fn hold_failed(id: &Id, e: std::io::Error) -> Error {
+    target_failed(format!("hold `{id}`'s process to wait for its exit"), e)
 }
 
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
@@ -1704,7 +1850,7 @@ fn end_held(
 
 /// The error of a wait for `id`'s process to exit that failed: `what` failed with the wait's own error,
 /// its OS code intact. When goetia's attempt to end the process had failed too, the error leads with
-/// that, worded as every report of a failed terminate words it (see [`terminating_failed`]).
+/// that ([`Error::ProcessExitUnconfirmed`]).
 fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Error {
     let ProcessWaitFailure {
         wait_failed,
@@ -1714,25 +1860,19 @@ fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Er
     let Some(terminate_failed) = terminate_failed else {
         return error;
     };
-    Error::Step {
-        what: terminating_failed(
-            format!("`{id}` is stopped, but goetia could not tell that its process exited"),
-            Some(&*terminate_failed),
-            ". The wait for it failed",
-        )
-        .to_string(),
+    Error::ProcessExitUnconfirmed {
+        id: id.to_string(),
+        terminate_failed,
         source: Box::new(error),
     }
 }
 
-/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not open, for
+/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not hold, for
 /// `reason`: led by what that left undone, with the class of `error`.
 fn unwaited(id: &Id, reason: std::io::Error, error: Error) -> Error {
-    Error::Step {
-        what: format!(
-            "goetia could not open `{id}`'s process ({}), so it could not wait for the process to exit",
-            Chain(&reason)
-        ),
+    Error::ProcessNotHeld {
+        id: id.to_string(),
+        hold_failed: reason,
         source: Box::new(error),
     }
 }
@@ -1796,7 +1936,9 @@ impl Scm {
     /// allows once `SERVICE_STOPPED` is reported, and waits, with no bound, for it to exit (SCM
     /// recorded `STOPPED` before it exits, and a `stop` that waited has left none to hold), and for
     /// no other: a process it did not hold cannot be tied to the service it is uninstalling, and
-    /// waiting for another service's stuck process would hold the install lock. Then sweeps the
+    /// waiting for another service's stuck process would hold the install lock. With no process held
+    /// ([`HoldOutcome::NoProcess`], e.g. the service was stopped before the uninstall could take hold of it),
+    /// nothing is ended or waited for; a shim file a still-exiting shim runs is in use to the sweep below. Then sweeps the
     /// provider's folder and, when `host` was in the default folder and that is another, that one
     /// too (see [`second_folder`]): the service may have been installed by another goetia version or
     /// provider. A host in any other folder is not swept, since that folder is not goetia's.
@@ -1868,7 +2010,7 @@ impl Scm {
             // Not waited for, and said so: the file it runs stays until it exits, and the sweep below
             // keeps it by its image.
             HoldOutcome::Refused(reason) => {
-                failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
+                failures.push(Error::os(format!("hold `{id}`'s process to wait for its exit"), reason).into())
             }
             HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
         }
@@ -2239,7 +2381,7 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
 /// `context` is the open, as [`to_error`] takes it, and `e` its failure: a process's, for a task's run
 /// that a caller who is not an Administrator may not open (see `task::read`).
 fn open_refused(operation: &str, target: &str, context: &str, e: std::io::Error) -> Error {
-    let access_denied = e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    let access_denied = os_error_in(&e) == Some(ERROR_ACCESS_DENIED as i32);
     let failed = Error::os(context, e);
     if !access_denied {
         return failed;

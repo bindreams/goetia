@@ -271,6 +271,23 @@ pub enum DaemonKind {
     Task,
 }
 
+impl DaemonKind {
+    /// How the kind is written in `--json` and in the text forms of `status` and `list`.
+    /// [`Serialize`](serde::Serialize) goes through here, so the two cannot drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DaemonKind::Service => "service",
+            DaemonKind::Task => "task",
+        }
+    }
+}
+
+impl serde::Serialize for DaemonKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// Restart policy. Corresponds to systemd's `Restart=`, launchd's
 /// `KeepAlive`, and SCM recovery actions.
 ///

@@ -3,11 +3,19 @@
 //! One compact JSON object, newline-terminated, on stdout:
 //!
 //! ```json
-//! {"daemons":[{"id":"frpc","state":"running","enabled":true,"pid":1234}],"errors":[],"undetermined":[]}
+//! {"daemons":[{"id":"frpc","type":"service","state":"running","enabled":true,"pid":1234,"last-result":null,
+//! "last-run":null,"next-run":null},{"id":"backup","type":"task","state":"idle","enabled":true,"pid":null,
+//! "last-result":{"code":0},"last-run":"2026-11-18T03:30:00+02:00","next-run":"2026-11-19T03:30:00+02:00"}],
+//! "errors":[],"undetermined":[]}
 //! ```
 //!
-//! `daemons`, `errors` and `undetermined` are always present, as arrays,
-//! possibly empty. A `daemons` entry carries no `name`:
+//! `daemons`, `errors` and `undetermined` are always arrays. `last-result`, `last-run` and `next-run` are
+//! `null` on a service, and on a task where its manager does not know them (no run yet, run in flight, no armed
+//! schedule). `last-result` is `{"code": n}` or `{"signal": n}`. A time is RFC 3339 to the second, with the
+//! system time zone's offset at that instant, to the minute. It is `null` when the instant is outside `jiff`'s
+//! `Timestamp` range or its civil year in that offset is outside 0 to 9999. Where `jiff` cannot determine the
+//! system zone, a time is written in UTC with `Z`, which RFC 9557 uses for an unknown local offset. A `daemons`
+//! entry carries no `name`:
 //! [`crate::manager::ServiceManager::status`] returns a [`Status`] with no
 //! spec, so only `list` could supply it, and the two subcommands must not
 //! differ in fields. `pid` is an integer or `null`; `null` means the manager
@@ -27,11 +35,16 @@
 
 use std::fmt::{self, Write as _};
 use std::io::Write;
+use std::time::SystemTime;
+
+use jiff::tz::{OffsetRound, TimeZone};
+use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 
 use super::ExitCode;
 use super::support::{InstalledIndex, print_line, state_str};
 use crate::error::{Chain, Error, Reason, Sink};
-use crate::manager::Status;
+use crate::manager::{Exit, Status};
+use crate::spec::DaemonKind;
 
 // Wire format =========================================================================================================
 
@@ -54,12 +67,24 @@ pub(crate) struct UndeterminedReport {
     pub reason: String,
 }
 
+/// The three task keys are `null` on a service, never absent.
 #[derive(serde::Serialize)]
 pub(crate) struct DaemonReport {
     pub id: String,
+    #[serde(rename = "type")]
+    pub kind: DaemonKind,
     pub state: &'static str,
     pub enabled: bool,
     pub pid: Option<u32>,
+    /// How the most recent finished run ended: `{"code": n}` or `{"signal": n}`.
+    #[serde(rename = "last-result")]
+    pub last_result: Option<Exit>,
+    /// When the most recent run started.
+    #[serde(rename = "last-run")]
+    pub last_run: Option<String>,
+    /// When the manager will start the task next.
+    #[serde(rename = "next-run")]
+    pub next_run: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -224,9 +249,13 @@ impl serde::Serialize for Kind {
 /// so the ordering is by id.
 ///
 /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
-pub(crate) fn from_index(index: &InstalledIndex) -> Report {
+pub(crate) fn from_index(index: &InstalledIndex, zone: &TimeZone) -> Report {
     Report {
-        daemons: index.ours.iter().map(|(id, (_, status))| daemon(id, status)).collect(),
+        daemons: index
+            .ours
+            .iter()
+            .map(|(id, (_, status))| daemon(id, status, zone))
+            .collect(),
         errors: index
             .unusable
             .iter()
@@ -254,14 +283,55 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
     }
 }
 
-/// One daemon, from a successful `ServiceManager::status(&id)`.
-pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
+/// The zone a document's times are written in, which a caller resolves once per document so every entry carries
+/// the same offset rule. It is `jiff`'s system zone on every platform, which honours `TZ`; a printed time is an
+/// exact instant whatever offset it carries. Where `jiff` cannot determine the system zone it returns the unknown
+/// zone, and a time is written in UTC with `Z` (RFC 9557's unknown local offset).
+pub(crate) fn display_zone() -> TimeZone {
+    TimeZone::system()
+}
+
+/// One daemon, from a successful `ServiceManager::status(&id)`, with its times in `zone`.
+pub(crate) fn daemon(id: &str, status: &Status, zone: &TimeZone) -> DaemonReport {
+    let common = status.common();
+    let (last_result, last_run, next_run) = match status {
+        Status::Service(_) => (None, None, None),
+        Status::Task(task) => (task.last_result, task.last_run, task.next_run),
+    };
     DaemonReport {
         id: id.to_string(),
-        state: state_str(status.common().state),
-        enabled: status.common().enabled,
-        pid: status.common().pid,
+        kind: status.kind(),
+        state: state_str(common.state),
+        enabled: common.enabled,
+        pid: common.pid,
+        last_result,
+        last_run: last_run.and_then(|time| format_time(time, zone)),
+        next_run: next_run.and_then(|time| format_time(time, zone)),
     }
+}
+
+/// `time` as RFC 3339 with `zone`'s offset at that instant, to the second (`2026-11-18T03:30:00+02:00`).
+/// A fraction is dropped toward the earlier second, before the epoch as after it. The offset is cut to the
+/// minute, which is all RFC 3339 prints, and the civil time is computed from that offset, so it names the instant
+/// it was given (an offset with seconds, as Africa/Monrovia had until 1972, would otherwise print 30 s late). It
+/// is truncated, not rounded: rounding can leave `Offset`'s range at its edge, truncating cannot. `None`, unknown and never a bound that reads as a time, when `time` is outside `jiff`'s
+/// `Timestamp` range or its civil year there is outside 0 to 9999, which RFC 3339 can write.
+fn format_time(time: SystemTime, zone: &TimeZone) -> Option<String> {
+    let whole = Timestamp::try_from(time)
+        .ok()?
+        .round(TimestampRound::new().smallest(Unit::Second).mode(RoundMode::Floor))
+        .ok()?;
+    let offset = zone
+        .to_offset(whole)
+        .round(OffsetRound::new().smallest(Unit::Minute).mode(RoundMode::Trunc))
+        .expect("truncating an offset to the minute keeps it in range");
+    if !(0..=9999).contains(&offset.to_datetime(whole).year()) {
+        return None;
+    }
+    Some(match zone.is_unknown() {
+        true => whole.to_string(),
+        false => whole.display_with_offset(offset).to_string(),
+    })
 }
 
 /// Classify a failure of `ServiceManager::status(&id)` — and of nothing

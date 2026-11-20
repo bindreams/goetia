@@ -31,7 +31,7 @@ use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::manager::{Scm, open_refused};
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::error::{Error, Result, carried};
+use crate::error::{Error, Result, target_failed, within};
 use crate::manager::Budget;
 use crate::manager::budget::{self, Deadline};
 use crate::spec::Id;
@@ -87,6 +87,8 @@ struct RunTarget<'a, P: Processes> {
     tasks: &'a dyn TaskApi,
     path: &'a TaskPath,
     instance: InstanceId,
+    /// The pid the listing gave the run when the verb began, which only names the run in a failed read.
+    pid: u32,
     processes: &'a mut P,
     /// The run's process, when a caller opened it beforehand ([`hold_all`]): the machine takes it in
     /// place of an open, and confirms it as it confirms any.
@@ -94,11 +96,12 @@ struct RunTarget<'a, P: Processes> {
 }
 
 impl<'a, P: Processes> RunTarget<'a, P> {
-    fn new(tasks: &'a dyn TaskApi, path: &'a TaskPath, instance: InstanceId, processes: &'a mut P) -> Self {
+    fn new(tasks: &'a dyn TaskApi, path: &'a TaskPath, instance: &Instance, processes: &'a mut P) -> Self {
         Self {
             tasks,
             path,
-            instance,
+            instance: instance.id,
+            pid: instance.pid,
             processes,
             held: None,
         }
@@ -118,6 +121,12 @@ impl<P: Processes> KillTarget for RunTarget<'_, P> {
             Err(e) if gone(&e) => Ok(None),
             Err(e) => Err(io::Error::other(e)),
         }
+    }
+
+    /// The first read of a hold is made before the listing names a process, so its failure says which run
+    /// it was for; the failures of later reads follow a pid the hold's own words name.
+    fn unread(&self, e: io::Error) -> io::Error {
+        within(format!("reading the run with process {}", self.pid), e)
     }
 
     fn open(&mut self, pid: u32) -> io::Result<Option<P::Held>> {
@@ -158,19 +167,21 @@ pub(super) fn hold_run<P: Processes>(
     instance: &Instance,
     processes: &mut P,
 ) -> Result<Option<P::Held>> {
-    let pid = instance.pid;
-    let mut target = RunTarget::new(tasks, path, instance.id, processes);
+    let mut target = RunTarget::new(tasks, path, instance, processes);
     match hold_once(&mut target, Budget::Unbounded.start()) {
         Ok(Some(Hold::Held { process, .. })) => Ok(Some(process)),
         Ok(None | Some(Hold::Ended { .. })) => Ok(None),
         Err(HoldError::Refused(e)) => Err(open_refused(
             operation,
-            &format!("the process of `{id}`'s run (pid {pid})"),
-            &format!("open the process of `{id}`'s run (pid {pid}) to wait for its exit"),
+            &format!("the process of `{id}`'s run"),
+            &format!("hold the process of `{id}`'s run to wait for its exit"),
             e,
         )),
-        Err(e) => Err(carried(io::Error::from(e))
-            .unwrap_or_else(|e| Error::os(format!("hold the process of `{id}`'s run (pid {pid})"), e))),
+        // The first read of the run says which run it was for, and the other errors of a hold name the pid.
+        Err(e) => Err(target_failed(
+            format!("hold the process of `{id}`'s run"),
+            io::Error::from(e),
+        )),
     }
 }
 
@@ -214,7 +225,7 @@ fn send_stops<'a>(
 
 /// The process of every run in `live`, held, each confirmed by a second read of the listing. A run
 /// with no process any more (see [`hold_run`]) is left out. Held before anything is done to any of them,
-/// so a run whose process cannot be opened fails the call with nothing sent.
+/// so a run whose process cannot be held fails the call with nothing sent.
 fn hold_all<P: Processes>(
     tasks: &dyn TaskApi,
     operation: &str,
@@ -262,7 +273,7 @@ fn await_run<P: Processes>(
 /// process is waited for until `budget` runs out. Returns the runs whose process was waited for, which
 /// is none under a budget that does not wait.
 ///
-/// Every process is held before the first `Stop` is sent, so a run whose process cannot be opened
+/// Every process is held before the first `Stop` is sent, so a run whose process cannot be held
 /// fails the call with nothing sent. A run that ended on its own, or that no longer has a process, is
 /// not touched: the listing is no proof of a run, and a pid it no longer names may be a stranger's. A
 /// task that is gone has no runs.
@@ -297,7 +308,7 @@ pub(super) fn stop_runs<P: Processes>(
     }
     send_stops(tasks, &path, held.iter().map(|(instance, _)| instance))?;
     for (instance, process) in &held {
-        let mut target = RunTarget::new(tasks, &path, instance.id, &mut *processes);
+        let mut target = RunTarget::new(tasks, &path, instance, &mut *processes);
         await_run(&mut target, id, instance.pid, process, budget, deadline)?;
     }
     Ok(held.into_iter().map(|(instance, _)| instance.id).collect())
@@ -412,7 +423,7 @@ impl Scm {
     }
 
     /// Ends every run of the task that is alive through its held process ([`kill_service`] over each).
-    /// Every process is held before the first is terminated, so a run whose process cannot be opened
+    /// Every process is held before the first is terminated, so a run whose process cannot be held
     /// fails the call with nothing killed; once they are, a run that cannot be ended is an error beside
     /// the ones that were. None alive is [`Error::NotRunning`]; a run with no process any more has
     /// ended.
@@ -429,7 +440,7 @@ impl Scm {
         let held = hold_all(&*self.tasks, "kill", id, &path, live, processes)?;
         let mut failures = Vec::new();
         for (instance, process) in held {
-            let mut target = RunTarget::new(&*self.tasks, &path, instance.id, &mut *processes);
+            let mut target = RunTarget::new(&*self.tasks, &path, &instance, &mut *processes);
             target.held = Some(process);
             // `NotRunning` is a run the listing dropped since: it is over.
             if let Err(e) = kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e)) {

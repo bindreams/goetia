@@ -21,10 +21,11 @@ use goetia::spec::{
     AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
 };
 use goetia::testing::service_fields;
+use serde_json::Value;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::tasks::{mkfifo, task_status};
-use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group};
+use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group, wait};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
 /// every test that runs `daemon list` over it. While `list_does_not_hang_on_a_fifo_in_the_unit_directory`
@@ -1041,7 +1042,7 @@ fn this_hosts_systemd_is_supported(#[fixture(systemd_group)] _group: &Group) {
 
     let outcome = Systemd::new()
         .install(&mk(guard.id()), false)
-        .expect("the host running the tests runs systemd 242+");
+        .expect("the host running the tests runs systemd 243+");
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
 }
 
@@ -1083,10 +1084,10 @@ fn goetia_on_systemd(manager: u32, client: u32, args: &[&str]) -> std::process::
         .expect("spawn goetia")
 }
 
-/// Below systemd 242 goetia refuses before it writes a unit or runs a start or stop — rather than
-/// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, or fail every start
-/// and stop on an unrecognized option. The running systemd and the client each count: an old one
-/// is refused next to a new other, and named.
+/// Below systemd 243 goetia refuses before it writes a unit or runs a start or stop — rather than
+/// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, fail every start
+/// and stop on an unrecognized option, or fail a task's `disable` for want of `clean` on a timer. The
+/// running systemd and the client each count: an old one is refused next to a new other, and named.
 #[skuld::test]
 fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1096,13 +1097,15 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(syste
     let versions = [
         (241, 257, "The running systemd is 241"),
         (257, 241, "The `systemctl` client is 241"),
+        (242, 257, "The running systemd is 242"),
+        (257, 242, "The `systemctl` client is 242"),
     ];
     let refused = |args: &[&str]| {
         for (manager, client, named) in versions {
             let output = goetia_on_systemd(manager, client, args);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
-            assert!(stderr.contains("requires systemd 242 or newer"), "{args:?}: {stderr}");
+            assert!(stderr.contains("requires systemd 243 or newer"), "{args:?}: {stderr}");
             assert!(stderr.contains(named), "{args:?}: {stderr}");
         }
     };
@@ -1155,7 +1158,7 @@ fn a_running_systemd_that_cannot_be_asked_is_refused(#[fixture(systemd_group)] _
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("cannot tell whether the running systemd is 242+"),
+        stderr.contains("cannot tell whether the running systemd is 243+"),
         "{stderr}"
     );
     // systemctl's own words, up to where versions and hosts differ: 257 says "Failed to connect to
@@ -2814,6 +2817,83 @@ pub(crate) fn timer_wants_symlink(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR)
         .join("timers.target.wants")
         .join(format!("{id}.timer"))
+}
+
+/// "Starting `<unit>`...": the manager began a run.
+pub(crate) const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
+
+/// What the manager's entries are all written by, as `goetia` asks for them: a unit's own process can
+/// write an entry with any `MESSAGE_ID` and `UNIT`.
+pub(crate) const FROM_PID_1: &str = "_PID=1";
+
+pub(crate) fn unit_of(id: &str) -> String {
+    format!("{id}.service")
+}
+
+/// The entries `journalctl` holds for `args`, after a `--sync`, as JSON objects.
+fn journalctl_entries(args: &[&str]) -> Vec<Value> {
+    cmd::run("journalctl", &["--sync"]).expect_ok();
+    let mut all = vec!["-a", "-o", "json", "--no-pager"];
+    all.extend_from_slice(args);
+    cmd::run("journalctl", &all)
+        .expect_ok()
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("journalctl JSON `{line}`: {e}")))
+        .collect()
+}
+
+/// The manager's own entries holding `matches`, oldest first: `goetia`'s `Scope::Manager`, which reads
+/// the system journal (`--system`) and only what PID 1 wrote ([`FROM_PID_1`]).
+///
+/// `matches` hold no `+`: `_PID=1` is added once, and a `+` would split the query into halves of which
+/// only the last has it. A query of two scopes is two calls.
+pub(crate) fn manager_entries<S: AsRef<str>>(matches: &[S]) -> Vec<Value> {
+    let mut args = vec!["--system"];
+    args.extend(matches.iter().map(AsRef::as_ref));
+    assert!(
+        !args.contains(&"+"),
+        "a `+` in a manager query ({args:?}) would leave `_PID=1` out of a half"
+    );
+    args.push(FROM_PID_1);
+    journalctl_entries(&args)
+}
+
+/// The entries holding `matches` in every journal file the reader may open, oldest first: `goetia`'s
+/// `Scope::Output`. A unit's own output is in the journal of the uid it runs as, which `--system` would
+/// hide, and `matches` select it (`_SYSTEMD_UNIT=`, `_TRANSPORT=`).
+pub(crate) fn output_entries<S: AsRef<str>>(matches: &[S]) -> Vec<Value> {
+    let args: Vec<&str> = matches.iter().map(AsRef::as_ref).collect();
+    journalctl_entries(&args)
+}
+
+pub(crate) fn field<'a>(entry: &'a Value, name: &str) -> Option<&'a str> {
+    entry.get(name)?.as_str()
+}
+
+/// The matches of the manager's `Starting` entries of `id`'s unit, which `goetia` reads `last-run` from;
+/// read with [`manager_entries`], which adds `_PID=1`.
+pub(crate) fn starting_matches(id: &str) -> [String; 2] {
+    [format!("UNIT={}", unit_of(id)), format!("MESSAGE_ID={STARTING}")]
+}
+
+/// The invocation of every run of `id`'s unit the manager started, oldest first: [`starting_matches`],
+/// read from the manager's entries.
+pub(crate) fn started_invocations(id: &str) -> Vec<String> {
+    manager_entries(&starting_matches(id))
+        .iter()
+        .map(|entry| {
+            field(entry, "INVOCATION_ID")
+                .expect("a Starting entry has an invocation")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Blocks until the journal holds a `Starting` entry for a run of `id`'s unit. Each turn syncs journald
+/// and reads [`started_invocations`] (one query); the wait ends on the entry itself and has no cap.
+pub(crate) fn wait_for_started(id: &str) {
+    wait::until_paced(Duration::from_millis(100), || !started_invocations(id).is_empty());
 }
 
 /// A task that exits with `code` the moment it starts, and runs daily at 03:30.

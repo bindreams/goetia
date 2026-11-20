@@ -27,5 +27,8 @@ pub(crate) use com::Com;
 pub(crate) use read::TaskSnapshot;
 pub(in crate::backend::scm) use read::combined;
 pub(crate) use run::TaskRun;
+pub(in crate::backend::scm) use write::task_beside;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use write::{registration_password, stored_account};
 
 use crate::backend::scm::instance::TaskPath;

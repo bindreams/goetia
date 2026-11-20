@@ -63,7 +63,7 @@ impl InstanceId {
     /// The GUID's 32 digits, lowercase, with no braces or dashes: how a run's record and log marker
     /// name it.
     pub(crate) fn hex(&self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+        hex_of(&self.0)
     }
 
     /// The first line a task's shim writes to the log of this run, so that a reader knows where the
@@ -89,19 +89,30 @@ impl InstanceId {
         } else {
             unbraced.to_owned()
         };
-        if digits.len() != 32 {
+        bytes_of_hex(&digits).map(Self)
+    }
+}
+
+/// The lower-case hex digits of `bytes`: 32 for the 16 bytes that [`InstanceId::hex`] and a task registration's token
+/// write, 64 for a SHA-256.
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The 16 bytes that exactly 32 hex digits of either case spell; `None` for anything else.
+pub(crate) fn bytes_of_hex(digits: &str) -> Option<[u8; 16]> {
+    if digits.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (byte, pair) in bytes.iter_mut().zip(digits.as_bytes().chunks(2)) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        if !pair.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        let mut bytes = [0u8; 16];
-        for (byte, pair) in bytes.iter_mut().zip(digits.as_bytes().chunks(2)) {
-            let pair = std::str::from_utf8(pair).ok()?;
-            if !pair.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return None;
-            }
-            *byte = u8::from_str_radix(pair, 16).ok()?;
-        }
-        Some(Self(bytes))
+        *byte = u8::from_str_radix(pair, 16).ok()?;
     }
+    Some(bytes)
 }
 
 #[cfg(test)]

@@ -72,7 +72,7 @@ pub(super) fn records() -> (TempDir, PathBuf, Runs) {
     let runs = Runs::of(dir.path(), &id());
     let path = dir.path().join("Goetia").join("runs").join("nightly");
     std::fs::create_dir_all(&path).unwrap();
-    runs.ensure(&process_user_sid()).unwrap();
+    runs.ensure(&[process_user_sid()]).unwrap();
     (dir, path, runs)
 }
 
@@ -94,7 +94,7 @@ pub(super) fn linked_records() -> (TempDir, PathBuf, Runs, TempDir) {
 
 /// What a shim does as its run ends: it writes the run's record, and its prune has nothing to say.
 pub(super) fn shim_writes(shim: &Runs, record: &RunRecord) {
-    assert_eq!(shim.write(record).unwrap(), Vec::<String>::new());
+    assert_eq!(shim.write(record, None).unwrap(), Vec::<String>::new());
 }
 
 pub(super) fn record(n: u8, outcome: RunOutcome) -> RunRecord {

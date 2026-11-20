@@ -31,7 +31,7 @@ use crate::support::cron_oracle::assert_next_run_strict;
 use crate::support::tasks::{
     Held, Lines, assert_same_text, id_of, run_task, sh, status_with_result, task_status, with_logs,
 };
-use crate::support::{self, Group, cmd, kill, launchd_group, may_account_for};
+use crate::support::{self, Group, cmd, launchd_group, may_account_for, wait};
 
 // Fixtures ============================================================================================================
 
@@ -383,7 +383,7 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(launchd_group)] _group: &Group) 
     let pid = task_status(&mgr, &task_id).common.pid;
     let fires = runs_of(&timer);
 
-    kill::until(|| {
+    wait::until(|| {
         let printed = print_job(&timer).stdout;
         runs_of(&timer) > fires
             && print_field(&printed, "pid = ").is_none()
@@ -544,7 +544,7 @@ fn stop_with_no_budget_straight_after_start_ends_the_run(#[fixture(launchd_group
 
     mgr.stop(&task_id, Some(Budget::Immediate)).expect("stop");
 
-    kill::until(|| task_status(&mgr, &task_id).common.state == State::Idle);
+    wait::until(|| task_status(&mgr, &task_id).common.state == State::Idle);
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.last_result, Some(Exit::Signal(15)), "{status:?}");
 }

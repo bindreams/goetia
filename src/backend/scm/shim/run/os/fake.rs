@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 
 use cosca::Containment;
 
-use super::{Channels, Os, Parents, Severity, Spawned};
+use super::{Channels, LogKind, Os, Severity, Spawned};
 use crate::backend::scm::shim::run::logging::Log;
 
 /// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
@@ -33,6 +33,9 @@ const WAIT_FAILED: &str = "the wait failed (fake)";
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
+
+pub(crate) const HOLD_FAILED: &str = "the log could not be held (fake)";
+
 /// A refused [`Spawned::kill`].
 pub(crate) fn kill_refused() -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
@@ -55,8 +58,9 @@ pub(crate) fn wait_failed_with_code(code: i32) -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::from_raw_os_error(code))
 }
 
-/// The default log directory of [`Fake::log`]. The `Fake` writes no file there.
-const FAKE_LOGS: &str = "fake-logs";
+/// The default log directory of [`Fake::log`], absolute as a spec's `logs:` must be. The `Fake` writes no
+/// file there.
+pub(crate) const FAKE_LOGS: &str = r"C:\goetia-shim-test\fake-logs";
 
 /// Poison is recovered from: a panicking thread must not make every later call on the `Fake` panic.
 /// Nothing here panics with a lock held.
@@ -109,12 +113,15 @@ pub(crate) enum ChannelCall {
     Append {
         path: PathBuf,
         line: String,
-        parents: Parents,
+        kind: LogKind,
         ok: bool,
     },
     EventLog {
         severity: Severity,
         line: String,
+    },
+    HoldDefault {
+        path: PathBuf,
     },
 }
 
@@ -328,10 +335,16 @@ struct State {
     spawns: VecDeque<SpawnReply>,
     threads: VecDeque<ThreadReply>,
     open_log_failures: Vec<PathBuf>,
-    /// Every log opened, in order: the path asked for, whether its parents were to be made, and a
+    /// Every log opened, in order: the path asked for, which kind of log it was, and a
     /// handle to what was opened, which is what the code under test writes into.
-    opened_logs: Vec<(PathBuf, Parents, File)>,
+    opened_logs: Vec<(PathBuf, LogKind, File)>,
     append_failures: Vec<PathBuf>,
+    hold_failures: Vec<PathBuf>,
+    /// The default logs held, by path: by a successful `hold_default`, or by an `append` that opened one,
+    /// as the real channels hold what they open.
+    held_defaults: Vec<PathBuf>,
+    /// The `append`s to a default log that was not held, which the real channels open and hold.
+    default_log_opens: usize,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
     processes: Vec<Arc<Proc>>,
@@ -412,6 +425,11 @@ impl Fake {
         Arc::new(Log::new(self.channels(), PathBuf::from(FAKE_LOGS)))
     }
 
+    /// A task-mode `Log` over this `Fake`'s channels: closed to the default log until it is held.
+    pub(crate) fn task_log(&self) -> Arc<Log> {
+        Arc::new(Log::new(self.channels(), PathBuf::from(FAKE_LOGS)).closed_until_held())
+    }
+
     // Tables ----------------------------------------------------------------------------------------------------------
 
     /// The next `spawn` succeeds with `process`.
@@ -447,6 +465,11 @@ impl Fake {
         lock(&self.shared.state).append_failures.push(path.to_path_buf());
     }
 
+    /// The next `hold_default` of `path` fails with [`HOLD_FAILED`].
+    pub(crate) fn will_fail_hold(&self, path: &Path) {
+        lock(&self.shared.state).hold_failures.push(path.to_path_buf());
+    }
+
     // Records ---------------------------------------------------------------------------------------------------------
 
     /// How many times `op` was called, replied to or not. Readable from inside a callback of the
@@ -460,8 +483,7 @@ impl Fake {
         lock(&self.shared.state).opened_logs[n].0.clone()
     }
 
-    /// Whether the parents of the `n`th log opened were to be made.
-    pub(crate) fn opened_log_parents(&self, n: usize) -> Parents {
+    pub(crate) fn opened_log_kind(&self, n: usize) -> LogKind {
         lock(&self.shared.state).opened_logs[n].1
     }
 
@@ -541,6 +563,11 @@ impl Fake {
         taken
     }
 
+    /// How many `append`s to a default log found it not held: the opens the real channels would have made.
+    pub(crate) fn default_log_opens(&self) -> usize {
+        lock(&self.shared.state).default_log_opens
+    }
+
     /// Every call on the channels, in the order made, removed.
     pub(crate) fn take_channel_calls(&self) -> Vec<ChannelCall> {
         std::mem::take(&mut lock(&self.shared.state).channel_calls)
@@ -564,6 +591,9 @@ impl Fake {
                     "stated append failures never used: {:?}",
                     state.append_failures
                 ));
+            }
+            if !state.hold_failures.is_empty() {
+                problems.push(format!("stated hold failures never used: {:?}", state.hold_failures));
             }
             if !state.open_log_failures.is_empty() {
                 problems.push(format!(
@@ -656,7 +686,7 @@ impl Os for Fake {
         spawned
     }
 
-    fn open_log(&self, path: &Path, parents: Parents) -> io::Result<File> {
+    fn open_log(&self, path: &Path, kind: LogKind) -> io::Result<File> {
         let mut state = lock(&self.shared.state);
         *state.calls.entry(Op::OpenLog).or_default() += 1;
         match state.open_log_failures.iter().position(|failing| failing == path) {
@@ -669,7 +699,7 @@ impl Os for Fake {
                 let file = tempfile::tempfile()?;
                 lock(&self.shared.state)
                     .opened_logs
-                    .push((path.to_path_buf(), parents, file.try_clone()?));
+                    .push((path.to_path_buf(), kind, file.try_clone()?));
                 Ok(file)
             }
         }
@@ -696,7 +726,7 @@ impl Drop for ThreadExit {
 }
 
 impl Channels for Fake {
-    fn append(&self, path: &Path, line: &str, parents: Parents) -> io::Result<()> {
+    fn append(&self, path: &Path, line: &str, kind: LogKind) -> io::Result<()> {
         let mut state = lock(&self.shared.state);
         let failing = match state.append_failures.iter().position(|failing| failing == path) {
             Some(i) => {
@@ -705,16 +735,43 @@ impl Channels for Fake {
             }
             None => false,
         };
+        // As the real channels: each append that finds the default log not held tries to open it, and only an
+        // open that succeeds holds it.
+        if kind == LogKind::Default && !state.held_defaults.iter().any(|held| held == path) {
+            state.default_log_opens += 1;
+            if !failing {
+                state.held_defaults.push(path.to_path_buf());
+            }
+        }
         state.channel_calls.push(ChannelCall::Append {
             path: path.to_path_buf(),
             line: line.to_string(),
-            parents,
+            kind,
             ok: !failing,
         });
         if failing {
             Err(io::Error::other(APPEND_FAILED))
         } else {
             Ok(())
+        }
+    }
+
+    fn hold_default(&self, path: &Path) -> io::Result<()> {
+        let mut state = lock(&self.shared.state);
+        state.channel_calls.push(ChannelCall::HoldDefault {
+            path: path.to_path_buf(),
+        });
+        match state.hold_failures.iter().position(|failing| failing == path) {
+            Some(i) => {
+                state.hold_failures.remove(i);
+                Err(io::Error::other(HOLD_FAILED))
+            }
+            None => {
+                if !state.held_defaults.iter().any(|held| held == path) {
+                    state.held_defaults.push(path.to_path_buf());
+                }
+                Ok(())
+            }
         }
     }
 

@@ -73,7 +73,7 @@ fn a_unit_systemd_has_not_loaded_is_an_error_and_never_no_process() {
     let e = kill_failed("x", target(&systemctl).service_pid().unwrap_err());
 
     assert!(
-        matches!(&e, Error::UnitNotLoaded { unit } if unit == "x.service"),
+        matches!(e.cause(), Error::UnitNotLoaded { unit } if unit == "x.service"),
         "{e:?}"
     );
 }
@@ -88,7 +88,7 @@ fn a_show_that_fails_is_an_error_and_never_no_process() {
     let e = target(&systemctl).service_pid().unwrap_err();
 
     let e = kill_failed("x", e);
-    assert!(matches!(e, Error::Command { .. }), "{e:?}");
+    assert!(matches!(e.cause(), Error::Command { .. }), "{e:?}");
 }
 
 // The wait for the record ---------------------------------------------------------------------------------------------
@@ -177,7 +177,7 @@ fn an_unloaded_unit_in_the_wait_is_an_error_and_not_the_record() {
             .unwrap_err(),
     );
 
-    assert!(matches!(&e, Error::UnitNotLoaded { .. }), "{e:?}");
+    assert!(matches!(e.cause(), Error::UnitNotLoaded { .. }), "{e:?}");
 }
 
 #[skuld::test]
@@ -252,7 +252,7 @@ fn kill_of_a_unit_systemd_has_not_loaded_is_the_error_status_gives() {
     let e = Backend::kill(&mgr, fragment(&service_spec("x")), &mut held).expect_err("not loaded");
 
     assert!(
-        matches!(&e, Error::UnitNotLoaded { unit } if unit == "x.service"),
+        matches!(e.cause(), Error::UnitNotLoaded { unit } if unit == "x.service"),
         "{e:?}"
     );
 }

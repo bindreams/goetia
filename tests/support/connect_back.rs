@@ -74,9 +74,10 @@ impl ConnectBack {
     /// Blocks until the daemon reports in, with no bound of its own: for an event the service manager
     /// causes at a time it chooses (a schedule's next minute, a first logon that builds a profile), where
     /// any number picked here would be a guess. A daemon that never connects is the CI watchdog's to
-    /// report.
-    pub fn accept_unbounded(&self) {
-        self.listener.accept().expect("accept a daemon's report");
+    /// report. The connection comes back unread: dropping it is how a test releases a daemon that
+    /// waits on it (`RUN_UNTIL_RELEASED`).
+    pub fn accept_unbounded(&self) -> TcpStream {
+        self.listener.accept().expect("accept a daemon's report").0
     }
 
     /// Like [`Self::accept`], but hands back the connection itself, unread.

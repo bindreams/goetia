@@ -429,6 +429,24 @@ fn only_eperm_is_a_refusal_a_child_on_its_way_out_gives() {
     }));
 }
 
+/// The `EPERM` is found wherever the `Io` error holds it: as the payload of its `io::Error`, which
+/// that error's own `source()` skips. A different cosca error that carries one is not a child on its way
+/// out: only `Io` waits.
+#[skuld::test]
+fn an_eperm_is_found_in_the_payload_of_an_io_error_and_only_in_an_io_error() {
+    let payload = cosca::error::Error::Io(io::Error::new(
+        ErrorKind::PermissionDenied,
+        io::Error::from_raw_os_error(libc::EPERM),
+    ));
+    assert!(is_eperm(&payload));
+    let other_payload = cosca::error::Error::Io(io::Error::other(io::Error::from_raw_os_error(libc::EACCES)));
+    assert!(!is_eperm(&other_payload));
+    assert!(!is_eperm(&cosca::error::Error::Unassessable {
+        detail: "pid 1 cannot be signalled".into(),
+        source: Some(std::sync::Arc::new(eperm())),
+    }));
+}
+
 /// A refused kill's error says what was last read of the child, with the refusal as its source. A
 /// child read `Dead` is no error, and is reported as having exited after the refusal.
 #[skuld::test]

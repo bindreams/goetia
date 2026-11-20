@@ -18,7 +18,7 @@ use goetia::manager::{Budget, ServiceManager as _, State};
 use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
-use goetia::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, User};
+use goetia::spec::{DaemonFields, DaemonSpec, Protocol, ServiceFields, ServiceSpec, User};
 use goetia::testing::{Ace, FakeProvider, command, service_fields, units_until_nul, wide_null};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -580,6 +580,11 @@ fn disable_skips_the_folder_check(#[fixture(scm_group)] _group: &Group) {
 /// executable, and the port the daemon reports in on; starts it, waits for the daemon's report,
 /// and stops it. `label` names the account in a failure.
 fn runs_as(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16)) {
+    runs_as_then(label, mgr, install, |_| {});
+}
+
+/// [`runs_as`], then `after_stop` with the id, while the service's guard still holds what it left.
+fn runs_as_then(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16), after_stop: impl FnOnce(&str)) {
     let id = support::random_test_id();
     let _guard = ShimGuard::new(&id);
     // Held until the service has stopped: the daemon's account cannot run the build tree's binary.
@@ -600,6 +605,48 @@ fn runs_as(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16)) {
     );
     mgr.stop(&id, Some(Budget::DEFAULT))
         .unwrap_or_else(|e| panic!("{label}: stop: {}", e.report()));
+    after_stop(id.as_str());
+}
+
+/// A virtual account's SID resolves only once its service exists, which is when the install makes the
+/// default log it appends to: the daemon's output of a service with no `logs:` lands in `<id>.log`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn the_output_of_a_virtual_account_service_lands_in_its_default_log(#[fixture(scm_group)] _group: &Group) {
+    const MARKER: &str = "goetia-virtual-account-log-probe";
+    let (_folder, _folder_guard) = default_folder();
+    let mgr = embedded_manager(None, CheckPermissions::Enable);
+
+    runs_as_then(
+        r"NT SERVICE\<id>",
+        &mgr,
+        |id, exe, port| {
+            let base = support::base_fields(
+                id,
+                fixture_command_with_exe(exe, "write-log", &[&port.to_string(), MARKER]),
+            );
+            let spec = ServiceSpec::new(ServiceFields {
+                common: DaemonFields {
+                    user: User::Name(format!(r"NT SERVICE\{id}")),
+                    ..base.common
+                },
+                protocol: Protocol::Plain,
+                ..base
+            })
+            .map(DaemonSpec::from)
+            .unwrap();
+            mgr.install(&spec, false)
+                .unwrap_or_else(|e| panic!("install as a virtual account: {}", e.report()));
+        },
+        |id| {
+            let log = support::shim_default_log(&support::program_data(), id);
+            let written = std::fs::read_to_string(&log).unwrap_or_else(|e| panic!("read {}: {e}", log.display()));
+            assert!(
+                written.matches(MARKER).count() >= 2,
+                "the daemon's stdout and stderr are in {}:\n{written}",
+                log.display()
+            );
+        },
+    );
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]

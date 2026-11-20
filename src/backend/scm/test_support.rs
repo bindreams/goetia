@@ -70,16 +70,35 @@ pub(crate) fn task_host() -> crate::shim::HostCommand {
     }
 }
 
-/// What Task Scheduler holds for `spec` run through [`task_host`]: the XML goetia registers, its
-/// triggers enabled or not, and the blob as its `Data`.
+/// The token of every registration [`registered_task`] makes.
+#[cfg(windows)]
+pub(crate) const TASK_TOKEN: &str = "feedfeedfeedfeedfeedfeedfeedfeed";
+
+#[cfg(windows)]
+pub(crate) fn task_token() -> crate::backend::scm::task_xml::Token {
+    crate::backend::scm::task_xml::Token::parse(TASK_TOKEN).expect("a fixture token is 32 lower-case hex digits")
+}
+
+/// What Task Scheduler holds for `spec` run through [`task_host`]: the XML goetia registers with the
+/// token [`TASK_TOKEN`], its triggers or none, and the blob as its `Data`.
 #[cfg(windows)]
 pub(crate) fn registered_task(
     spec: &crate::spec::DaemonSpec,
     armed: bool,
 ) -> crate::backend::scm::manager::task::api::Registered {
+    registered_task_with(spec, armed, &task_token())
+}
+
+/// [`registered_task`] under the registration `token`.
+#[cfg(windows)]
+pub(crate) fn registered_task_with(
+    spec: &crate::spec::DaemonSpec,
+    armed: bool,
+    token: &crate::backend::scm::task_xml::Token,
+) -> crate::backend::scm::manager::task::api::Registered {
     let definition = crate::backend::scm::task_xml::TaskXml::new(spec, task_host()).unwrap();
     crate::backend::scm::manager::task::api::Registered {
-        xml: definition.to_xml(armed),
+        xml: definition.to_xml(armed, token),
         data: crate::blob::metadata_text(spec),
         enabled: Some(true),
     }
@@ -102,6 +121,43 @@ pub(crate) fn set_dacl(
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     descriptor.set_dacl_of(&object)
+}
+
+/// An account no test runs as.
+#[cfg(windows)]
+pub(crate) const A_STRANGER: &str = "S-1-5-21-1-2-3-1000";
+
+/// Makes the permissions of the existing file `path` one entry, full access for the account `sid` (SDDL
+/// text), and nothing else, administrators included. The file's owner may still change them.
+#[cfg(windows)]
+pub(crate) fn permit_only(path: &std::path::Path, sid: &str) {
+    set_entries(path, &[("FA", sid)]);
+}
+
+/// [`permit_only`] for an account no test runs as, with the account `sid` left only the rights to read the
+/// attributes and the permissions and to change them: it may not append, which is what a log's account loses
+/// when an install takes its entry out, and a test may still put the permissions back.
+#[cfg(windows)]
+pub(crate) fn withdraw_append(path: &std::path::Path, sid: &str) {
+    // Read the attributes and the permissions, change the permissions, and wait on the handle (every open asks
+    // for the last).
+    set_entries(path, &[("FA", A_STRANGER), ("0x160080", sid)]);
+}
+
+/// Makes the permissions of the existing file `path` `entries`, each rights in SDDL and the account's SID,
+/// set on a handle opened as an install opens a log to set them.
+#[cfg(windows)]
+fn set_entries(path: &std::path::Path, entries: &[(&str, &str)]) {
+    let sddl: String = entries
+        .iter()
+        .map(|(rights, sid)| format!("(A;;{rights};;;{sid})"))
+        .collect();
+    let descriptor = crate::backend::scm::shim::acl::Descriptor::from_sddl(&format!("D:P{sddl}")).unwrap();
+    let (file, made) = descriptor
+        .open_always_for_dacl(path, false)
+        .unwrap_or_else(|e| panic!("open {} to set {sddl}: {e}", path.display()));
+    assert!(!made, "{} was not there", path.display());
+    descriptor.set_dacl_of(&file).unwrap();
 }
 
 /// Makes a directory with a file in it at `path`. Where a file is expected, deleting it as a file fails
@@ -194,6 +250,24 @@ pub(crate) fn set_reparse_point(dir: &std::path::Path, tag: u32, payload: &[u8])
     assert_ne!(ok, 0, "set the reparse point: {}", std::io::Error::last_os_error());
 }
 
+/// `path` by its 8.3 names where the volume keeps them, and unchanged where it does not.
+#[cfg(windows)]
+pub(crate) fn short(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide = crate::backend::scm::wide::wide_null(path).unwrap();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buf` is `buf.len()` writable units.
+    let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    assert!(
+        0 < len && len < buf.len(),
+        "GetShortPathNameW: {}",
+        std::io::Error::last_os_error()
+    );
+    std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]))
+}
+
 /// Makes the existing empty directory `dir` a mount point (a junction) to the existing `target`, in place:
 /// see [`set_reparse_point`]. `mklink /J` cannot, since it makes the directory.
 #[cfg(windows)]
@@ -218,4 +292,225 @@ pub(crate) fn make_mount_point(dir: &std::path::Path, target: &std::path::Path) 
     payload.extend_from_slice(&print);
     payload.extend_from_slice(&[0, 0]);
     set_reparse_point(dir, IO_REPARSE_TAG_MOUNT_POINT, &payload);
+}
+
+/// The rights the account `sid` has on the file `path` from its permissions alone, as
+/// `GetEffectiveRightsFromAclW` says: what an open for exactly those rights would be granted. The owner's implicit
+/// rights are not counted, which is why a test of them reads the owner.
+#[cfg(windows)]
+pub(crate) fn effective_rights(path: &std::path::Path, sid: &mut [u8]) -> u32 {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let wide = crate::backend::scm::wide::wide_null(path).unwrap();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out-pointers are locals; the descriptor is freed below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS, "read the permissions of {}", path.display());
+    // SAFETY: a zeroed `TRUSTEE_W` is filled by the call below; `sid` outlives the use of the trustee.
+    let mut trustee: TRUSTEE_W = unsafe { std::mem::zeroed() };
+    // SAFETY: `trustee` is a valid out-pointer and `sid` a whole SID.
+    unsafe { BuildTrusteeWithSidW(&mut trustee, sid.as_mut_ptr().cast()) };
+    let mut rights = 0u32;
+    // SAFETY: `dacl` points into `descriptor`, which is live; `trustee` and `rights` are locals.
+    let status = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+    // SAFETY: `descriptor` was allocated by `GetNamedSecurityInfoW`, and is freed once.
+    unsafe { LocalFree(descriptor) };
+    assert_eq!(status, ERROR_SUCCESS, "the rights of the account on {}", path.display());
+    rights
+}
+
+/// What happened to the names in one directory, in the order Windows reported it, from the moment of
+/// [`DirWatch::new`]: a test of the order of two changes reads it after the fact, with no timing in it.
+#[cfg(windows)]
+pub(crate) struct DirWatch {
+    dir: std::fs::File,
+    event: std::os::windows::io::OwnedHandle,
+    /// `u64`s, so the buffer is aligned for `FILE_NOTIFY_INFORMATION`.
+    buffer: Box<[u64; 2048]>,
+    overlapped: Box<windows_sys::Win32::System::IO::OVERLAPPED>,
+}
+
+/// One change of a name in a watched directory.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameChange {
+    Added(String),
+    Removed(String),
+    /// A rename to this name.
+    RenamedTo(String),
+    /// A rename from this name.
+    RenamedFrom(String),
+}
+
+#[cfg(windows)]
+impl DirWatch {
+    /// Starts watching the names in `dir`: every change from now on is kept for [`DirWatch::until_added`].
+    pub(crate) fn new(dir: &std::path::Path) -> DirWatch {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED)
+            .open(dir)
+            .unwrap();
+        // SAFETY: an unnamed manual-reset event with default security; a null handle is the failure.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!event.is_null(), "CreateEventW: {}", std::io::Error::last_os_error());
+        // SAFETY: `event` is a handle this call owns.
+        let event = unsafe { OwnedHandle::from_raw_handle(event.cast()) };
+        let mut watch = DirWatch {
+            dir,
+            event,
+            buffer: Box::new([0; 2048]),
+            // SAFETY: an all-zero `OVERLAPPED` is the documented initial state.
+            overlapped: Box::new(unsafe { std::mem::zeroed() }),
+        };
+        watch.issue();
+        watch
+    }
+
+    /// Asks for the next batch of changes. The buffer and the `OVERLAPPED` are boxed, so they stay where the
+    /// request left them until it completes or is cancelled ([`Drop`]).
+    fn issue(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_NOTIFY_CHANGE_FILE_NAME, ReadDirectoryChangesW};
+
+        // SAFETY: an all-zero `OVERLAPPED` is the documented initial state.
+        *self.overlapped = unsafe { std::mem::zeroed() };
+        self.overlapped.hEvent = self.event.as_raw_handle() as HANDLE;
+        // SAFETY: the handle is live and overlapped; the buffer and the `OVERLAPPED` outlive the request.
+        let ok = unsafe {
+            ReadDirectoryChangesW(
+                self.dir.as_raw_handle() as HANDLE,
+                self.buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&*self.buffer) as u32,
+                0,
+                FILE_NOTIFY_CHANGE_FILE_NAME,
+                std::ptr::null_mut(),
+                &mut *self.overlapped,
+                None,
+            )
+        };
+        assert!(ok != 0, "ReadDirectoryChangesW: {}", std::io::Error::last_os_error());
+    }
+
+    /// Every change since the watch began, in order, up to and including the addition of the name `last`.
+    /// The test makes `last` itself once the changes it wants are made, so the wait is for a change that
+    /// is bound to come. Windows keeps what happens between two requests for the next one.
+    pub(crate) fn until_added(&mut self, last: &str) -> Vec<NameChange> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
+        };
+        use windows_sys::Win32::System::IO::GetOverlappedResult;
+
+        let mut changes = Vec::new();
+        loop {
+            let mut returned = 0u32;
+            // The kernel writes to the `OVERLAPPED`, so it is passed as a mutable pointer, not a shared reference.
+            let overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED = &raw mut *self.overlapped;
+            // SAFETY: the handle and the `OVERLAPPED` of a request in flight; `1` waits for it.
+            let ok = unsafe { GetOverlappedResult(self.dir.as_raw_handle() as HANDLE, overlapped, &mut returned, 1) };
+            assert!(
+                ok != 0,
+                "the watch of the directory failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert!(returned > 0, "the watch's buffer overflowed: changes were lost");
+            let bytes: Vec<u8> = self
+                .buffer
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .take(returned as usize)
+                .collect();
+            self.issue();
+            let mut at = 0usize;
+            loop {
+                let word = |offset: usize| u32::from_ne_bytes(bytes[at + offset..at + offset + 4].try_into().unwrap());
+                let (next, action, length) = (word(0) as usize, word(4), word(8) as usize);
+                let name: Vec<u16> = bytes[at + 12..at + 12 + length]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                    .collect();
+                let name = String::from_utf16(&name).unwrap();
+                changes.push(match action {
+                    FILE_ACTION_ADDED => NameChange::Added(name),
+                    FILE_ACTION_REMOVED => NameChange::Removed(name),
+                    FILE_ACTION_RENAMED_NEW_NAME => NameChange::RenamedTo(name),
+                    FILE_ACTION_RENAMED_OLD_NAME => NameChange::RenamedFrom(name),
+                    other => panic!("an action no one asked for: {other}"),
+                });
+                if next == 0 {
+                    break;
+                }
+                at += next;
+            }
+            if changes.contains(&NameChange::Added(last.to_owned())) {
+                return changes;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DirWatch {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
+
+        // The request in flight is cancelled and waited out, since the kernel still writes to the buffer.
+        let handle = self.dir.as_raw_handle() as HANDLE;
+        let mut returned = 0u32;
+        // The kernel writes to the `OVERLAPPED`, so it is passed as a mutable pointer, not a shared reference.
+        let overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED = &raw mut *self.overlapped;
+        // SAFETY: the handle and `OVERLAPPED` are those of the request in flight.
+        unsafe {
+            CancelIoEx(handle, overlapped);
+            GetOverlappedResult(handle, overlapped, &mut returned, 1);
+        }
+    }
+}
+
+/// Makes the account `sid` (SDDL text) the owner of the existing file `path`, as `icacls /setowner` does, which
+/// takes the privilege an administrator needs for it. The test is elevated.
+#[cfg(windows)]
+pub(crate) fn set_owner(path: &std::path::Path, sid: &str) {
+    let output = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(["/setowner", &format!("*{sid}")])
+        .output()
+        .expect("run icacls.exe");
+    assert!(
+        output.status.success(),
+        "icacls /setowner *{sid} on {}: {}{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

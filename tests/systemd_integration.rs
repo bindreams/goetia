@@ -9,6 +9,10 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[cfg(all(target_os = "linux", feature = "cli"))]
+#[path = "systemd_integration/demonstration.rs"]
+mod demonstration;
+
 #[cfg(target_os = "linux")]
 #[path = "systemd_integration/linux.rs"]
 mod linux;

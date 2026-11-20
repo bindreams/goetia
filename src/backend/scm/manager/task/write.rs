@@ -5,29 +5,41 @@
 //! password and the logon right of a real user, the event source, and the record directory with its
 //! permissions. A failure of any is a failure with nothing sent.
 //!
-//! A task is armed when its triggers are enabled; an install makes it disarmed and keeps what is
-//! installed, and `enable` and `disable` change the flags of the stored XML and nothing else, so a hand
-//! edit survives them. Re-registering a task that logs on with a password takes the password (M3): `enable`
-//! and `disable` of a real user's task read `GOETIA_SERVICE_PASSWORD` as an install does.
+//! A task is armed when it has triggers; an install makes it disarmed and keeps what is installed. `disable`
+//! registers the stored XML with no `Triggers`, and `enable` the stored XML as it is when it has triggers,
+//! and with the ones the blob's schedule compiles to when it has none; everything outside `<Triggers>` is
+//! the stored XML's, so a hand edit of it survives, and a hand-added trigger goes at `disable`.
+//! Re-registering a task that logs on with a
+//! password takes the password (M3): `enable` and `disable` of a real user's task read
+//! `GOETIA_SERVICE_PASSWORD` as an install does.
+
+use std::sync::Arc;
+
+use std::path::Path;
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
+use super::read::StoredRegistration;
 use super::verbs::{Processes, System, gone};
-use super::{TaskApi, TaskPath, TaskSnapshot};
+use super::{TaskPath, TaskSnapshot};
+use crate::backend::scm::default_log::{self, Naming, Step};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::{self, Right, Written};
-use crate::backend::scm::manager::{Scm, ScmSnapshot, apply_gated, registry, service_gate, written_user};
+use crate::backend::scm::manager::{
+    Password, Scm, ScmSnapshot, accounts_kept_before_change, apply_gated, make_default_log, registered_account,
+    registered_account_sid, registry, service_gate, written_user,
+};
 use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::lock::InstallLock;
-use crate::backend::scm::sid::{Sid, sid_from_parts};
-use crate::backend::scm::task_xml::TaskXml;
+use crate::backend::scm::sid::{Sid, distinct, sid_from_parts};
+use crate::backend::scm::task_xml::{TaskXml, Token, builtin_sid};
 use crate::backend::{Identity, InstalledService, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::manager::State;
-use crate::spec::{DaemonKind, DaemonSpec, Id};
+use crate::spec::{Builtin, DaemonKind, DaemonSpec, Id};
 
 /// What the machine holds for a task's account once an install has seen to it.
 pub(super) struct Prepared {
@@ -72,27 +84,41 @@ pub(super) fn password_of(
     }
 }
 
-/// The record directory of task `id` under the machine's `%ProgramData%`, with the folders above it
-/// seen to ([`Runs::ensure_roots`]). The folders are always judged: whatever the manager's check of the
-/// shim's folder is, a standard user can make them first, and no caller has said another way keeps
-/// them safe.
-fn runs_for_write(id: &Id) -> Result<Runs> {
-    let runs = Runs::of(&program_data()?, id);
-    runs.ensure_roots(&FolderCheck::new(CheckPermissions::Enable))?;
+/// As above, for the test helper.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn registration_password(account: &TaskAccount) -> Result<Option<String>> {
+    password_of(account, identity::service_password)
+}
+
+/// The record directory of task `id` under `program_data`, with the folders above it seen to
+/// ([`Runs::ensure_roots`], which `folders` judges).
+fn runs_in(program_data: &Path, id: &Id, folders: &FolderCheck) -> Result<Runs> {
+    let runs = Runs::of(program_data, id);
+    runs.ensure_roots(folders)?;
     Ok(runs)
+}
+
+/// [`runs_in`] under the machine's `%ProgramData%`, with the folders always judged: whatever the manager's
+/// check of the shim's folder is, a standard user can make them first, and no caller has said another way
+/// keeps them safe.
+fn runs_for_write(id: &Id) -> Result<Runs> {
+    runs_in(&program_data()?, id, &FolderCheck::new(CheckPermissions::Enable))
 }
 
 /// What an install of a task needs of the machine before it writes anything. For a real user: the
 /// account is refused unless it is a user (the right would reach every account in a group), the
-/// password is read, and `SeBatchLogonRight` is granted to the SID that check found (without it a
-/// first start starts nothing and raises nothing). For every account, the `Goetia` event source, which
+/// password is read, and `SeBatchLogonRight` is granted to the SID that check found (without
+/// it a first start starts nothing and raises nothing). For every account, the `Goetia` event source, which
 /// the shim logs to and which only an elevated process can register.
-pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>) -> Result<Prepared> {
+pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>, reads: Password) -> Result<Prepared> {
     let (principal, password) = match account {
         TaskAccount::Service(sid) => (well_known_sid(sid)?, None),
         TaskAccount::User(name) => {
             let user = identity::require_user_account(name, written)?;
-            let password = password_of(account, identity::service_password)?;
+            let password = match reads {
+                Password::Read => password_of(account, identity::service_password)?,
+                Password::Unneeded => None,
+            };
             identity::grant_logon_right(&user, Right::Batch)?;
             (user.sid().clone(), password)
         }
@@ -104,25 +130,11 @@ pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>) -> Re
 /// The account a stored task is registered as: the blob's when it reads, which is what the install
 /// registered, and otherwise its principal's, so that a task whose blob will not decode can still be
 /// enabled and disabled.
-pub(super) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
+pub(crate) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
     match TaskXml::parse(&registered.xml, &registered.data) {
         Ok(definition) => Ok(definition.account()),
-        Err(_) => TaskXml::principal(&registered.xml),
+        Err(_) => TaskXml::principal(&registered.xml)?.ok_or_else(|| Error::blob("the task's XML names no principal")),
     }
-}
-
-/// `registered` registered again as `account`, with its triggers armed or not and nothing else changed.
-/// `password` is the real user's, which Task Scheduler needs to register a password-logon task again.
-pub(super) fn set_armed(
-    tasks: &dyn TaskApi,
-    path: &TaskPath,
-    registered: &Registered,
-    armed: bool,
-    account: &TaskAccount,
-    password: Option<&str>,
-) -> Result<Registration> {
-    let xml = TaskXml::with_armed(&registered.xml, armed)?;
-    tasks.register(path, &xml, account, password, true)
 }
 
 /// Refuses a retype of a daemon that runs: `old` is what is installed, `state` its state.
@@ -149,6 +161,10 @@ impl Scm {
     /// `snapshot`'s task that keeps whether it is armed (a create is disarmed). A task installed over
     /// one of another account is registered again instead ([`Self::task_write_with`]). Write
     /// [`Self::task_write_with`] over the machine's own record directory, processes and account.
+    ///
+    /// **A limit, stated:** a task whose `runs\<id>` directory is gone or unusable starts no program: its
+    /// shim cannot pin the records, logs their path and ends as a shim failure. Any install makes the
+    /// directory again.
     pub(in crate::backend::scm) fn task_write(
         &self,
         spec: &DaemonSpec,
@@ -157,7 +173,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let runs = runs_for_write(&spec.common().id)?;
         self.task_write_with(spec, definition, snapshot, &runs, &mut System, |account| {
-            prepare(account, written_user(&spec.common().user))
+            prepare(account, written_user(&spec.common().user), Password::Read)
         })
     }
 
@@ -166,16 +182,19 @@ impl Scm {
     /// before the first request to Task Scheduler. [`WriteOutcome::Raced`] when the task existed for a
     /// create or was gone for an update.
     ///
-    /// An account is the same when the stored principal's SID is the new account's, and then the task
-    /// is updated in place. Otherwise (a stored principal that cannot be told is a change) Task
-    /// Scheduler would keep the security descriptor the task was registered with, which names the old
-    /// account only and so leaves the task unreadable by the new account's shim. So the task is
-    /// registered again ([`Self::task_register_again`]): disabled, refused while the old one runs (its
-    /// shim still writes its record, and the permissions of the record directory are for the new
-    /// account only), then, with the record directory made, the registration alone is deleted (its
-    /// records stay) and created with the armed state it had. A failure between the delete and the
-    /// create leaves nothing at the id, which an install that runs again creates (disarmed: `enable`
-    /// arms it).
+    /// An account is the same when the stored principal's SID is the new account's, and then the task is
+    /// updated in place under the registration's own token (see [`Self::task_register`]). When the account
+    /// differs, or the stored XML names no principal or one that names no account (which is a change), an
+    /// update in place would keep the security descriptor the task was registered with, which names the old
+    /// account only and so leaves the task unreadable by the new account's shim. So the task is registered
+    /// again ([`Self::task_register_again`]): disabled, refused while the old one runs (its shim still writes
+    /// its record), then, with the record directory made to name the old account and the new one, the
+    /// registration alone is deleted (its records stay) and created, under a fresh token, with the armed
+    /// state it had.
+    ///
+    /// A stored registration whose XML cannot be read at all, or whose account lookup failed for a reason other
+    /// than "no such account", fails the write before anything is sent to Task Scheduler: that is not a change of
+    /// account.
     pub(super) fn task_write_with<P: Processes>(
         &self,
         spec: &DaemonSpec,
@@ -186,21 +205,23 @@ impl Scm {
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
+        // Read before `prepare` touches the machine.
+        let stored = snapshot
+            .map(|old| old.stored().map(|stored| (old, stored)))
+            .transpose()?;
         let prepared = prepare(&definition.account())?;
-        let changed = snapshot.filter(|old| stored_principal(old.registered()).as_ref() != Some(&prepared.principal));
-        match changed {
-            None => {
-                task_records(id, runs, &prepared)?;
-                self.task_register(
-                    id,
-                    definition,
-                    snapshot.is_some_and(TaskSnapshot::armed),
-                    snapshot.is_some(),
-                    &prepared,
-                )
+        let registering = match stored {
+            Some((old, stored)) if stored.principal.as_ref() != Some(&prepared.principal) => {
+                return self.task_register_again(old, &stored, definition, runs, processes, &prepared);
             }
-            Some(old) => self.task_register_again(old, definition, runs, processes, &prepared),
-        }
+            Some((_, stored)) => Registering::Update {
+                armed: stored.armed,
+                token: stored.token,
+            },
+            None => Registering::Create { armed: false },
+        };
+        task_records(id, runs, &prepared.principal, &Kept::default())?;
+        self.task_register(id, definition, &prepared, registering)
     }
 
     /// The account change of [`Self::task_write_with`]. The task is disabled first (its own flag, as an
@@ -209,10 +230,12 @@ impl Scm {
     /// ([`Error::AccountChangeRunning`]), the record directory is made, the task is deleted, and created
     /// with the armed state it had. A failure after the disable puts the flag back as it was found (a task
     /// found disabled, or whose flag was not read, is not touched), and a flag that cannot be put back is
-    /// reported with the failure.
+    /// reported with the failure. A failure between the delete and the create leaves nothing at the id,
+    /// which an install that runs again creates (disarmed: `enable` arms it).
     fn task_register_again<P: Processes>(
         &self,
         old: &TaskSnapshot,
+        stored: &StoredRegistration,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -229,7 +252,7 @@ impl Scm {
                 Err(e) if gone(&e) => false,
                 Err(e) => return Err(e),
             };
-        match self.replace_task(old, definition, runs, processes, prepared) {
+        match self.replace_task(old, stored, definition, runs, processes, prepared) {
             Err(failed) if disabled => Err(match self.tasks.set_enabled(&path, true) {
                 Ok(()) => failed,
                 Err(e) if gone(&e) => failed,
@@ -250,6 +273,7 @@ impl Scm {
     fn replace_task<P: Processes>(
         &self,
         old: &TaskSnapshot,
+        stored: &StoredRegistration,
         definition: &TaskXml,
         runs: &Runs,
         processes: &mut P,
@@ -257,13 +281,18 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = old.id();
         self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
-        task_records(id, runs, prepared)?;
+        // The task is registered as the old account until the create lands, so its records and its log name it
+        // too.
+        let kept = Kept::both(stored.principal.as_slice());
+        task_records(id, runs, &prepared.principal, &kept)?;
         match self.tasks.delete(&TaskPath::of(id)) {
             // The task is gone; a folder that stays is still there for the create.
             Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
             Err(e) => return Err(e),
         }
-        self.task_register(id, definition, old.armed(), false, prepared)
+        let registering = Registering::Create { armed: stored.armed };
+        let wrote = self.task_register(id, definition, prepared, registering)?;
+        landed(id, runs, prepared, &kept, wrote)
     }
 
     /// Refuses installing `old`, a task, as another account while it runs:
@@ -281,19 +310,21 @@ impl Scm {
         }
     }
 
-    /// The registration itself, once what it needs is acquired: the task as `armed` says, an update of
-    /// the one there is or a create.
+    /// The registration itself, once what it needs is acquired. The one place a token is chosen.
     fn task_register(
         &self,
         id: &Id,
         definition: &TaskXml,
-        armed: bool,
-        update: bool,
         prepared: &Prepared,
+        registering: Registering,
     ) -> Result<WriteOutcome> {
+        let (armed, token, update) = match registering {
+            Registering::Create { armed } => (armed, Token::fresh(), false),
+            Registering::Update { armed, token } => (armed, token.unwrap_or_else(Token::fresh), true),
+        };
         let registered = self.tasks.register(
             &TaskPath::of(id),
-            &definition.to_xml(armed),
+            &definition.to_xml(armed, &token),
             &definition.account(),
             prepared.password.as_deref(),
             update,
@@ -305,32 +336,143 @@ impl Scm {
     }
 }
 
-/// The SID of the account a stored task runs as: its principal's, as Task Scheduler stores it. `None`
-/// when it cannot be told (no principal, or a name that names no account), which is not known to be
-/// the account being installed.
-fn stored_principal(registered: &Registered) -> Option<Sid> {
-    let (TaskAccount::Service(text) | TaskAccount::User(text)) = TaskXml::principal(&registered.xml).ok()?;
-    identity::sid_of_principal(&text).ok()
+/// What [`Scm::task_register`] registers.
+enum Registering {
+    /// A new registration of the task, armed or not, under a fresh token.
+    Create { armed: bool },
+    /// The stored task written again in place: as armed as it is (`armed`), under its own `token`; or, where
+    /// it has none (a hand edit), a fresh one.
+    Update { armed: bool, token: Option<Token> },
 }
 
-/// Everything a registration of `definition` needs, before any request: what the machine holds for the
-/// account (`prepare`), and the record directory with permissions that name it. Every write makes it, so
-/// a reinstall as another user can still write its records.
-fn task_acquire(
-    id: &Id,
+/// The record directory of `id` with permissions that name `accounts`. Nothing is read back.
+fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
+    runs.ensure(accounts).map_err(|e| {
+        Error::os(
+            format!("make the run records of `{id}` writable by {}", whose(accounts)),
+            e,
+        )
+    })
+}
+
+/// "its account" or "its accounts", counting duplicates once.
+fn whose(accounts: &[Sid]) -> &'static str {
+    if distinct(accounts).len() == 1 {
+        "its account"
+    } else {
+        "its accounts"
+    }
+}
+
+/// The accounts besides the task's own that the record directory and the default log name until a write that
+/// changes the account lands ([`landed`]): the old task keeps writing both until the create replaces it.
+#[derive(Default)]
+struct Kept<'a> {
+    /// Those the record directory names.
+    runs: &'a [Sid],
+    /// Those the default log names.
+    log: &'a [Sid],
+}
+
+impl<'a> Kept<'a> {
+    /// `accounts` named in the record directory and the default log alike.
+    fn both(accounts: &'a [Sid]) -> Self {
+        Kept {
+            runs: accounts,
+            log: accounts,
+        }
+    }
+}
+
+/// What a write of a task makes besides its registration, and what an up-to-date install makes again
+/// ([`task_beside_with`]): the record directory and the default log, naming `principal` and `kept`. Nothing is
+/// read back.
+fn task_records(id: &Id, runs: &Runs, principal: &Sid, kept: &Kept<'_>) -> Result<()> {
+    run_records(id, runs, &[kept.runs, std::slice::from_ref(principal)].concat())?;
+    let accounts = [kept.log, std::slice::from_ref(principal)].concat();
+    default_log::ensure(runs.program_data(), id, &Naming::alike(&accounts)).map(drop)
+}
+
+/// Once a registration that changed the account, or a service into a task, has landed ([`WriteOutcome::Done`]),
+/// the record directory (if `kept` widened it) and the default log name the new account alone. Any other end leaves
+/// both named; the next install corrects it ([`task_beside_with`]).
+fn landed(id: &Id, runs: &Runs, prepared: &Prepared, kept: &Kept<'_>, wrote: WriteOutcome) -> Result<WriteOutcome> {
+    if matches!(wrote, WriteOutcome::Done) {
+        let alone = std::slice::from_ref(&prepared.principal);
+        if !kept.runs.is_empty() {
+            run_records(id, runs, alone)?;
+        }
+        default_log::ensure(runs.program_data(), id, &Naming::alike(alone))?;
+    }
+    Ok(wrote)
+}
+
+/// The SID of the account of the service `old` that its default log names beside the task's, `task`, until the
+/// retype lands: the one rule of a service's account change ([`accounts_kept_before_change`]). A native service has
+/// no default log, a service whose account is gone has no one to name, and one that runs as the task's account has
+/// no other; the system is asked of the account only for a hosted service that runs as another one.
+fn kept_service_account(old: &ScmSnapshot, task: &TaskAccount) -> Result<Option<Sid>> {
+    if old.blob().is_ok_and(|blob| !generate::hosted(&blob.spec)) {
+        return Ok(None);
+    }
+    let config = old.config()?;
+    accounts_kept_before_change(true, &registered_account(config), &service_account_name(task), || {
+        registered_account_sid(config)
+    })
+}
+
+/// The account `task` runs as, as the registration of a service that runs as it spells it: `None` is LocalSystem.
+fn service_account_name(task: &TaskAccount) -> Option<String> {
+    match task {
+        TaskAccount::User(name) => generate::canonical_account(name),
+        TaskAccount::Service(sid) => [Builtin::LocalSystem, Builtin::LocalService, Builtin::NetworkService]
+            .into_iter()
+            .find(|builtin| builtin_sid(*builtin).eq_ignore_ascii_case(sid))
+            .map_or_else(|| Some(sid.clone()), |builtin| builtin.canonical().map(str::to_string)),
+    }
+}
+
+/// What an install that finds the task `installed` up to date makes again if it is gone ([`task_beside_with`]),
+/// under the machine's `%ProgramData%`: the folders above the record directory are always judged, as a write
+/// does ([`runs_for_write`]).
+pub(in crate::backend::scm) fn task_beside(
+    spec: &DaemonSpec,
     definition: &TaskXml,
-    runs: &Runs,
-    prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
-) -> Result<Prepared> {
-    let prepared = prepare(&definition.account())?;
-    task_records(id, runs, &prepared)?;
-    Ok(prepared)
+    installed: &TaskSnapshot,
+) -> Result<()> {
+    task_beside_with(
+        &program_data()?,
+        &FolderCheck::new(CheckPermissions::Enable),
+        spec,
+        definition,
+        installed,
+        prepare,
+    )
 }
 
-/// The record directory of `id` with permissions that name the account `prepared` holds.
-fn task_records(id: &Id, runs: &Runs, prepared: &Prepared) -> Result<()> {
-    runs.ensure(&prepared.principal)
-        .map_err(|e| Error::os(format!("make the run records of `{id}` writable by its account"), e))
+/// What a write of the task `installed` makes besides its registration, made again: the folders above the record
+/// directory under `program_data` (`folders` judges them: [`runs_in`]), what the machine must hold for the account
+/// `definition` registers (`prepare`, with [`Password::Unneeded`]: the event source and a real user's logon right,
+/// but no password, for the task is not registered again), the record directory with the marker a dead uninstall
+/// left cleared ([`Runs::ensure`]), and the default log ([`task_records`]). They name the account `prepare` found
+/// alone. The record directory is not made by `runs_in`, but the folders above it may be; a refusal there comes
+/// before anything the account needs (the logon right, the event source, the records, the log). Moving the task to
+/// another account is a write's job, which finds the task registered as another.
+fn task_beside_with(
+    program_data: &Path,
+    folders: &FolderCheck,
+    spec: &DaemonSpec,
+    definition: &TaskXml,
+    installed: &TaskSnapshot,
+    prepare: impl FnOnce(&TaskAccount, Option<Written<'_>>, Password) -> Result<Prepared>,
+) -> Result<()> {
+    let runs = runs_in(program_data, installed.id(), folders)?;
+    let prepared = prepare(
+        &definition.account(),
+        written_user(&spec.common().user),
+        Password::Unneeded,
+    )?;
+    task_records(installed.id(), &runs, &prepared.principal, &Kept::default())
 }
 
 // Enable and disable ==================================================================================================
@@ -344,7 +486,10 @@ impl Scm {
         self.task_set_armed_with(snapshot, false, identity::service_password)
     }
 
-    /// Registers `snapshot`'s task again with its triggers armed or not, and nothing else changed.
+    /// Registers `snapshot`'s task again armed or not, and nothing else changed. `disable` removes the
+    /// triggers. `enable`, when at least one stored trigger is switched on, keeps the stored triggers as
+    /// they are and sets the task's own flag; when there is none, it compiles them from the blob (a blob
+    /// that will not decode is the error). Either way the task's own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
     pub(super) fn task_set_armed_with(
         &self,
@@ -353,10 +498,18 @@ impl Scm {
         password: impl FnOnce() -> Result<Option<String>>,
     ) -> Result<()> {
         let registered = snapshot.registered();
+        let xml = if !armed {
+            TaskXml::without_triggers(&registered.xml)?
+        } else if TaskXml::has_triggers(&registered.xml) {
+            TaskXml::with_own_flag(&registered.xml, true)?
+        } else {
+            let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+            TaskXml::with_triggers(&registered.xml, &blob.spec)?
+        };
         let account = stored_account(registered)?;
         let password = password_of(&account, password)?;
         let path = TaskPath::of(snapshot.id());
-        match set_armed(&*self.tasks, &path, registered, armed, &account, password.as_deref())? {
+        match self.tasks.register(&path, &xml, &account, password.as_deref(), true)? {
             Registration::Created => Ok(()),
             Registration::Raced => Err(Error::NotInstalled {
                 id: snapshot.id().to_string(),
@@ -392,9 +545,10 @@ impl Scm {
             old,
             &runs,
             &mut System,
-            || service_gate(definition, written),
-            |password| {
-                apply_gated(definition, password, true)?;
+            || service_gate(definition, written, Password::Read),
+            |gated| {
+                apply_gated(definition, gated.password, true)?;
+                make_default_log(spec, definition, gated.checked.as_ref(), &[], Step::Narrow)?;
                 Ok(WriteOutcome::Done)
             },
         )?;
@@ -431,9 +585,8 @@ impl Scm {
         refuse_running(old.id(), DaemonKind::Task, self.task_state_with(old, alive)?)
     }
 
-    /// An install that changes a service into a task: the service is refused while it runs; everything
-    /// the task needs is acquired; the service is stopped and deleted; the task is registered. The task's
-    /// install holds the lock already. See [`Self::retype_to_service`].
+    /// See [`Self::retype_to_service`]; the steps are [`Self::retype_to_task_with`]'s. The task's install holds the
+    /// lock already.
     pub(in crate::backend::scm) fn retype_to_task(
         &self,
         spec: &DaemonSpec,
@@ -447,13 +600,14 @@ impl Scm {
             spec,
             definition,
             &runs,
-            |account| prepare(account, written_user(&spec.common().user)),
+            |account| prepare(account, written_user(&spec.common().user), Password::Read),
             || {
                 refuse_running(
                     old.id(),
                     DaemonKind::Service,
                     self.service_live_status(old)?.common().state,
-                )
+                )?;
+                kept_service_account(old, &definition.account())
             },
             || self.service_retire(old),
         )?;
@@ -461,24 +615,40 @@ impl Scm {
         Ok(wrote)
     }
 
-    /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare`, `refuse` (the service
-    /// runs: [`Error::RetypeRunning`]) and `retire` (the service is removed). The order is the contract:
-    /// `refuse`, then everything the task needs ([`task_acquire`]), then `retire`, then the
-    /// registration; a refusal or a failed acquisition leaves the service untouched.
+    /// [`Self::retype_to_task`] over the record directory `runs`, with `prepare` (what the machine must hold for
+    /// the task's account), `inspect` (refuses a service that runs, [`Error::RetypeRunning`], and gives the SID of
+    /// the account it runs as, if a default log names it) and `retire` (the service is removed).
+    ///
+    /// The default log names the service's account and the task's before the service is retired, and the task's
+    /// alone once the task is registered ([`landed`]): the service runs as its account until it is retired, so
+    /// neither a failed retirement nor a failed or raced registration leaves the log unusable by what is
+    /// registered, and the next install corrects what a failure left. `retire` returns once the service is
+    /// stopped, a start in progress waited out first (the service is disabled, so none follows), so no shim of it
+    /// can still be before opening its log when the log is narrowed. The order is the contract: the service is
+    /// refused while it runs and its account is looked up (`inspect`; the lookup is skipped when it is the task's),
+    /// then `prepare` and the record directory, then the log for both accounts, then `retire`, then the
+    /// registration, then the log for the task's account alone. A refusal, a failed lookup, a failed preparation
+    /// or a failed log leaves the service as it was.
     pub(super) fn retype_to_task_with(
         &self,
         spec: &DaemonSpec,
         definition: &TaskXml,
         runs: &Runs,
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
-        refuse: impl FnOnce() -> Result<()>,
+        inspect: impl FnOnce() -> Result<Option<Sid>>,
         retire: impl FnOnce() -> Result<()>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
-        refuse()?;
-        let prepared = task_acquire(id, definition, runs, prepare)?;
+        let service = inspect()?;
+        let prepared = prepare(&definition.account())?;
+        let kept = Kept {
+            runs: &[],
+            log: service.as_slice(),
+        };
+        task_records(id, runs, &prepared.principal, &kept)?;
         retire()?;
-        self.task_register(id, definition, false, false, &prepared)
+        let wrote = self.task_register(id, definition, &prepared, Registering::Create { armed: false })?;
+        landed(id, runs, &prepared, &kept, wrote)
     }
 
     /// The sweep of what the removal left: the file a removed service's or task's host named, which

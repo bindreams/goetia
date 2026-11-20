@@ -100,6 +100,20 @@ pub fn timer_for(spec: &DaemonSpec) -> Option<String> {
     Some(with_goetia_section(timer_unit(task, schedule), spec))
 }
 
+/// The part of `spec`'s timer text a reload acts on (`None` where [`timer_for`] is): the `[Timer]` and
+/// `[Install]` sections. `Description=` and `[X-Goetia]` change without the schedule changing and are
+/// excluded.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the systemd manager, which is Linux-only, compares timers")
+)]
+pub(crate) fn timer_schedule(spec: &DaemonSpec) -> Option<String> {
+    let DaemonSpec::Task(task) = spec else {
+        return None;
+    };
+    Some(schedule_part(task.schedule.as_ref()?))
+}
+
 /// `body`, a blank line, and the `[X-Goetia]` section of `spec`.
 fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
     body.push('\n');
@@ -188,13 +202,22 @@ fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
 /// service of the same name.
 ///
 /// `AccuracySec=1s` makes the run start within the cron second; the default of one minute fired
-/// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up.
+/// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up;
+/// arming clears its stamp (see `Systemctl::arm_timer`).
 fn timer_unit(task: &TaskSpec, schedule: &Schedule) -> String {
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
     out.push_str(&format!("Description={}\n", raw_value(&task.common.name)));
     out.push('\n');
+    out.push_str(&schedule_part(schedule));
+
+    out
+}
+
+/// A timer's `[Timer]` and `[Install]` sections: everything in [`timer_unit`] that schedules.
+fn schedule_part(schedule: &Schedule) -> String {
+    let mut out = String::new();
 
     out.push_str("[Timer]\n");
     for line in on_calendar_lines(schedule) {

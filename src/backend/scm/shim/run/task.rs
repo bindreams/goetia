@@ -4,8 +4,8 @@
 //! ([`Runs`]), which `goetia daemon run` and status read.
 //!
 //! The arguments say which mode the shim is in: a task's action ends in
-//! [`TASK_MODE_ARG`] and the task's id ([`requested`]), and anything else is service mode. Task
-//! mode never reports to SCM.
+//! `--goetia-task`, the task's id and the registration's token ([`requested`]), and anything else
+//! is service mode. Task mode never reports to SCM.
 //!
 //! **A stop** reaches the shim as `CTRL_CLOSE_EVENT` on its console, from `IRunningTask::Stop`.
 //! The handler is registered before anything is read, so a stop at any point is held by the bus. It
@@ -30,11 +30,12 @@ use super::stop_bus::{StopBus, Supervisor};
 use crate::backend::scm::exit_status::Reported;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
+use crate::backend::scm::manager::task::api::Registered;
 use crate::backend::scm::manager::task::clock::file_time_of;
 use crate::backend::scm::manager::task::{Com, TaskApi};
-use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
-use crate::backend::scm::task_xml::{TASK_MODE_ARG, extract_from_data};
-use crate::error::Chain;
+use crate::backend::scm::runs::{Pin, RunOutcome, RunRecord, Runs};
+use crate::backend::scm::task_xml::{TaskXml, Token, ending, extract_from_data};
+use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Id};
 
 /// What a task ends with when a stop ended it: `STATUS_CONTROL_C_EXIT`, which a console program
@@ -46,96 +47,182 @@ const NOT_A_TASK: &str = "this is a service's blob; task mode runs only tasks";
 
 // Entry ===============================================================================================================
 
-/// The task's id, when `args` (the process's arguments after the program) end with
-/// [`TASK_MODE_ARG`] and an id: task mode. Anything else is service mode.
-pub(super) fn requested(args: &[OsString]) -> Option<&str> {
-    match args {
-        [.., flag, id] if *flag == *TASK_MODE_ARG => id.to_str(),
-        _ => None,
-    }
+/// The task's id and the token of the registration the shim was started under, when `args` (the
+/// process's arguments after the program) have an [`ending`]: task mode. The token is `None` for an
+/// ending that has no well-formed one, which [`run_in`] reports. Anything else is service mode.
+pub(super) fn requested(args: &[OsString]) -> Option<(String, Option<Token>)> {
+    let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+    ending(&args).map(|(id, token)| (id.to_owned(), token))
 }
 
-/// Runs the task `id` and ends the process with the run's code. Never returns.
-pub(super) fn run(id: &str) -> ! {
-    let log = Arc::new(Log::real());
-    let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
+/// Runs the task `id` started under the registration `token` and ends the process with the run's code.
+/// Never returns.
+pub(super) fn run(id: &str, token: Option<Token>) -> ! {
+    let real = Arc::new(Real::default());
+    let program_data = program_data();
+    // Closed to the default log until the pin is taken: a line before then tells the Event Log alone.
+    let log = Arc::new(Log::from_program_data(real.clone(), &program_data).closed_until_held());
+    exit::keep_log(Arc::clone(&log));
+    exit::name_run(id);
+    let supervisor = Supervisor::new(real, Arc::clone(&log));
     // Before anything is read: from here on a stop is held by the bus until the run reaches it.
     if let Err(e) = register_close_handler(&supervisor.bus) {
         log.failure(id, &format!("register the console control handler: {}", Chain(&e)));
         exit::end_process(Reported::shim_failure(e.raw_os_error()).process_exit_code());
     }
-    let runs = match (program_data(), Id::try_from(id)) {
-        (Ok(program_data), Ok(id)) => Some(Runs::of(&program_data, &id)),
-        (Err(e), _) => {
-            log.failure(
-                id,
-                &format!(
-                    "the run is not recorded: the machine's %ProgramData% could not be located: {}",
-                    e.report()
-                ),
-            );
-            None
-        }
-        // A task that is not an id is refused by `run_in`.
-        (Ok(_), Err(_)) => None,
-    };
-    let code = run_in(id, &supervisor, &Com, runs.as_ref(), std::process::id());
+    let code = run_in(
+        id,
+        token,
+        &supervisor,
+        &Com,
+        program_data.as_deref(),
+        std::process::id(),
+    );
     exit::end_process(code as i32)
 }
 
-/// Runs the task `id` as the process `own_pid` and returns the code the process is to end with: the
-/// program's own, or the stop's ([`STOPPED_EXIT`]), or the incomplete stop's, or a shim failure's.
+/// Runs the task `id` as the process `own_pid`, started under the registration `token`, and returns the
+/// code the process is to end with: the program's own, or the stop's ([`STOPPED_EXIT`]), or the
+/// incomplete stop's, or a shim failure's.
 ///
-/// In order, every failure before the program starts logged: reads the task through `api` (a service's
-/// blob is refused), waits for its own instance by `own_pid` to be listed ([`own_instance`]), sets the
-/// diagnostics log, writes the run's marker as the first line of `logs` when there is one, runs the
-/// program, and writes the one record into `runs`. A listing that cannot be read, and a record that
-/// cannot be written, are logged and do not stop the program or change its code. A stop during the
-/// wait starts no program: the run is recorded stopped, or logged unrecorded, and ends with the stop's
-/// code.
-pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs: Option<&Runs>, own_pid: u32) -> u32 {
+/// The program starts only when every step below passed, in this order; a step that fails logs the case
+/// (the default log when it is held, the Event Log always), releases what the shim holds and ends the
+/// process with a shim failure, carrying the OS error the step met or none. A task that is not an id is
+/// refused first, and reads nothing. The shim's log is closed to the default file until the pin is taken
+/// ([`Log::closed_until_held`]), so a step before it tells the Event Log alone.
+///
+/// 1. Takes a pin on the run records ([`Runs::hold`]), first: an uninstall or an account change places the
+///    marker and then reads every pin, so it reads this pin or this shim sees its marker. **Any** failure
+///    ends the shim (the marker stands, the directory is denied, gone or a link, or `%ProgramData%` could
+///    not be located).
+/// 2. Holds the default log ([`Log::hold_default`]); a failure of that is told and the shim goes on.
+/// 3. Reads the task through `api`: a task that is gone, a read that fails, and a registration that is not
+///    the one this shim was started under (by `token`) end the shim; a blob that is foreign, undecodable or a
+///    service's is refused.
+/// 4. Waits for its own instance by `own_pid` to be listed ([`own_instance`]); a listing that cannot be
+///    read, and a registration that went while it waited, end the shim. A stop during the wait starts no
+///    program: the run is recorded stopped and ends with the stop's code. A stop after the wait is held by
+///    the bus, and the program is spawned and then killed.
+/// 5. Looks for the removal's marker again ([`Runs::is_closed`]), before anything opens a log or spawns:
+///    a marker that stands, or a look that cannot be made, ends the shim.
+/// 6. Sets the diagnostics log, writes the run's marker as the first line of `logs` when there is one, runs
+///    the program and writes the one record, under the pin, which is released as the record is renamed in
+///    place ([`Runs::write`]). A record that cannot be written is logged and does not change the code.
+pub(super) fn run_in(
+    id: &str,
+    token: Option<Token>,
+    supervisor: &Supervisor,
+    api: &dyn TaskApi,
+    program_data: Result<&Path, &Error>,
+    own_pid: u32,
+) -> u32 {
     let log = &*supervisor.log;
-    let (spec, path) = match own_spec(id, api) {
-        Ok(read) => read,
-        Err(stop) => {
-            log.failure(id, &stop.message);
-            return stop.reported.process_exit_code() as u32;
+    let end = |stop: SpecStop| {
+        log.failure(id, &stop.message);
+        stop.reported.process_exit_code() as u32
+    };
+    let task = match Id::try_from(id) {
+        Ok(task) => task,
+        Err(e) => {
+            return end(SpecStop {
+                message: format!("`{id}` is not a goetia id: {}", e.report()),
+                reported: Reported::Refused,
+            });
         }
     };
-    let instance = match own_instance(id, api, &path, own_pid, supervisor) {
-        OwnInstanceOutcome::Listed(instance) => Some(instance),
-        OwnInstanceOutcome::Unread => None,
+    let program_data = match program_data {
+        Ok(program_data) => program_data,
+        Err(e) => {
+            return end(SpecStop {
+                message: format!(
+                    "no program was started: the run records cannot be held, since the machine's %ProgramData% \
+                     could not be located: {}",
+                    e.report()
+                ),
+                reported: Reported::shim_failure(e.raw_os_error()),
+            });
+        }
+    };
+    let runs = &Runs::of(program_data, &task);
+    let pin = match runs.hold() {
+        Ok(pin) => pin,
+        Err(e) => {
+            return end(SpecStop {
+                message: format!(
+                    "hold the run records {}: {}: no program was started",
+                    runs.dir().display(),
+                    Chain(&e)
+                ),
+                reported: Reported::shim_failure(e.raw_os_error()),
+            });
+        }
+    };
+    log.hold_default(id);
+    let (spec, path) = match own_spec(&task, id, token, api) {
+        Ok(read) => read,
+        Err(stop) => return end(stop),
+    };
+    let instance = match own_instance(id, token, api, &path, own_pid, supervisor) {
+        OwnInstanceOutcome::Listed(instance) => instance,
+        OwnInstanceOutcome::Ended(stop) => return end(stop),
         OwnInstanceOutcome::Stopped(instance) => {
-            record_run(log, id, runs, instance, file_time_now(), Some(RunOutcome::Stopped));
+            record_run(log, id, runs, pin, instance, file_time_now(), Some(RunOutcome::Stopped));
             return STOPPED_EXIT;
         }
     };
+    match runs.is_closed() {
+        Ok(false) => {}
+        Ok(true) => {
+            return end(SpecStop {
+                message: format!(
+                    "the run records {} are being removed or handed to another account: no program was started",
+                    runs.dir().display()
+                ),
+                reported: Reported::shim_failure(None),
+            });
+        }
+        Err(e) => {
+            return end(SpecStop {
+                message: format!(
+                    "look for the removal's marker of the run records {}: {}: no program was started",
+                    runs.dir().display(),
+                    Chain(&e)
+                ),
+                reported: Reported::shim_failure(e.raw_os_error()),
+            });
+        }
+    }
     set_daemon_log(log, id, &spec);
-    if let (Some(logs), Some(instance)) = (spec.common().logs.as_deref(), &instance) {
-        write_marker(supervisor, id, logs, instance);
+    if let Some(logs) = spec.common().logs.as_deref() {
+        write_marker(supervisor, id, logs, &instance);
     }
 
     let started = file_time_now();
     let (record, code) = ended_as(run_pass(&spec, supervisor, id, || {}, || {}));
-    record_run(log, id, runs, instance, started, record);
+    record_run(log, id, runs, pin, Some(instance), started, record);
     code
 }
 
-/// Writes the run's record when it has everything one needs; a write that fails is logged.
+/// Writes the run's record, under its own pin, when it has everything one needs; a write that fails is
+/// logged. The pin is released either way, as the function ends.
 fn record_run(
     log: &Log,
     id: &str,
-    runs: Option<&Runs>,
+    runs: &Runs,
+    pin: Pin,
     instance: Option<InstanceId>,
     started: u64,
     outcome: Option<RunOutcome>,
 ) {
-    if let (Some(runs), Some(instance), Some(outcome)) = (runs, instance, outcome) {
-        match runs.write(&RunRecord {
-            instance,
-            started,
-            outcome,
-        }) {
+    if let (Some(instance), Some(outcome)) = (instance, outcome) {
+        match runs.write(
+            &RunRecord {
+                instance,
+                started,
+                outcome,
+            },
+            Some(pin),
+        ) {
             Ok(problems) => {
                 for problem in problems {
                     log.warning(id, &format!("prune the run records: {problem}"));
@@ -148,37 +235,80 @@ fn record_run(
 
 // The task ------------------------------------------------------------------------------------------------------------
 
-/// The task's own spec, and its path. A task that is gone, not goetia's, undecodable or a service's is
-/// refused; a read that did not complete is a shim failure carrying the OS error it met.
-fn own_spec(id: &str, api: &dyn TaskApi) -> Result<(DaemonSpec, TaskPath), SpecStop> {
+/// The task's own spec, and its path. A task that is not goetia's, undecodable or a service's is refused;
+/// the failures of [`registration`] and [`started_under`] are shim failures.
+fn own_spec(task: &Id, id: &str, token: Option<Token>, api: &dyn TaskApi) -> Result<(DaemonSpec, TaskPath), SpecStop> {
     let refused = |message: String| SpecStop {
         message,
         reported: Reported::Refused,
     };
-    let task = Id::try_from(id).map_err(|e| refused(format!("`{id}` is not a goetia id: {}", e.report())))?;
-    let path = TaskPath::of(&task);
-    let registered = match api.get(&path) {
-        Ok(Some(registered)) => registered,
+    let path = TaskPath::of(task);
+    let registered = registration(&path, api)?;
+    let spec = match extract_from_data(&registered.data) {
+        Ok(Some(blob)) if matches!(blob.spec, DaemonSpec::Task(_)) => blob.spec,
+        Ok(Some(_)) => return Err(refused(NOT_A_TASK.to_string())),
         Ok(None) => {
-            return Err(refused(format!(
-                "the task {} is gone: no program was started",
-                path.as_str()
-            )));
+            return Err(refused(
+                "the task's Data holds no Goetia marker: this task was not created by `goetia daemon install`"
+                    .to_string(),
+            ));
         }
-        Err(e) => {
-            return Err(SpecStop {
-                message: format!("read the task {}: {}", path.as_str(), e.report()),
-                reported: Reported::shim_failure(Some(e.raw_os_error().unwrap_or(ERROR_INVALID_DATA as i32))),
-            });
-        }
+        Err(e) => return Err(refused(format!("decode the task's Data: {}", e.report()))),
     };
-    match extract_from_data(&registered.data) {
-        Ok(Some(blob)) if matches!(blob.spec, DaemonSpec::Task(_)) => Ok((blob.spec, path)),
-        Ok(Some(_)) => Err(refused(NOT_A_TASK.to_string())),
-        Ok(None) => Err(refused(
-            "the task's Data holds no Goetia marker: this task was not created by `goetia daemon install`".to_string(),
-        )),
-        Err(e) => Err(refused(format!("decode the task's Data: {}", e.report()))),
+    started_under(&path, id, token, &registered.xml)?;
+    Ok((spec, path))
+}
+
+/// The task's registration as Task Scheduler holds it now. A task that is gone is a shim failure, as is a
+/// read that did not complete, which carries the OS error it met.
+fn registration(path: &TaskPath, api: &dyn TaskApi) -> Result<Registered, SpecStop> {
+    match api.get(path) {
+        Ok(Some(registered)) => Ok(registered),
+        Ok(None) => Err(SpecStop {
+            message: format!("the task {} is gone: no program was started", path.as_str()),
+            reported: Reported::shim_failure(None),
+        }),
+        Err(e) => Err(SpecStop {
+            message: format!(
+                "read the task {}: {}: no program was started",
+                path.as_str(),
+                e.report()
+            ),
+            reported: read_failed(&e),
+        }),
+    }
+}
+
+/// The shim failure of a read of Task Scheduler that did not complete: the OS error it met, or a stand-in
+/// for one that carries none.
+fn read_failed(e: &Error) -> Reported {
+    Reported::shim_failure(Some(e.raw_os_error().unwrap_or(ERROR_INVALID_DATA as i32)))
+}
+
+/// Whether the registration with the stored `xml` is the one the shim was started under (`token`). It is
+/// not when its token differs, either has none, or its XML cannot be read: a shim failure.
+fn started_under(path: &TaskPath, id: &str, token: Option<Token>, xml: &str) -> Result<(), SpecStop> {
+    let not_started_under = |message: String| SpecStop {
+        message,
+        reported: Reported::shim_failure(None),
+    };
+    match (TaskXml::token_of(xml, id), token) {
+        (Ok(Some(registered)), Some(token)) if registered == token => Ok(()),
+        (Ok(Some(_)), _) => Err(not_started_under(format!(
+            "the task {}'s registration is not the one this shim was started under (another install registered it \
+             again, or the shim was started by hand): no program was started",
+            path.as_str()
+        ))),
+        (Ok(None), _) => Err(not_started_under(format!(
+            "the task {}'s registration carries no goetia ending for this task, so it is not the one this shim was \
+             started under; `goetia daemon install {id}` registers it again: no program was started",
+            path.as_str()
+        ))),
+        (Err(e), _) => Err(not_started_under(format!(
+            "read the registration of the task {}: {}: no program was started",
+            path.as_str(),
+            e.report()
+        ))),
     }
 }
 
@@ -186,12 +316,11 @@ fn own_spec(id: &str, api: &dyn TaskApi) -> Result<(DaemonSpec, TaskPath), SpecS
 enum OwnInstanceOutcome {
     /// Task Scheduler lists an instance with the shim's pid.
     Listed(InstanceId),
-    /// The listing could not be read; said in the log. The run has no name to record under, and the
-    /// program runs anyway.
-    Unread,
     /// A stop arrived while no such instance was listed, so no program is to start. Holds the
     /// instance when the read the stop woke found it; when it did not, that is said in the log.
     Stopped(Option<InstanceId>),
+    /// The listing could not be read, or the registration was replaced or is gone: no program is to start.
+    Ended(SpecStop),
 }
 
 /// The pace of the re-reads of Task Scheduler's listing while it does not hold the shim yet. Each
@@ -202,9 +331,13 @@ const LISTING_PACE: Duration = Duration::from_millis(100);
 /// lists a run once it has started the action's process, which can be after that process reads the
 /// listing, so a listing without the shim is read again, paced and without a cap: the shim is the
 /// instance's process, and a task that was stopped or deleted meanwhile ends it. A failed read ends
-/// the wait ([`OwnInstanceOutcome::Unread`]); a stop does too, after one more read.
+/// the wait ([`OwnInstanceOutcome::Ended`]), and the registration is read once to word why; a stop ends
+/// it too, after one more read. Each listing that misses the shim has the registration read again: one
+/// that is gone, or no longer the shim's (an account change registered the task again), never lists it,
+/// so it ends the wait ([`OwnInstanceOutcome::Ended`]).
 fn own_instance(
     id: &str,
+    token: Option<Token>,
     api: &dyn TaskApi,
     path: &TaskPath,
     own_pid: u32,
@@ -222,16 +355,21 @@ fn own_instance(
     loop {
         match read() {
             Ok(Some(own)) => return OwnInstanceOutcome::Listed(own),
-            Ok(None) => {}
+            Ok(None) => {
+                if let Err(stop) = registration(path, api).and_then(|now| started_under(path, id, token, &now.xml)) {
+                    return OwnInstanceOutcome::Ended(stop);
+                }
+            }
             Err(e) => {
-                log.failure(
-                    id,
-                    &format!(
-                        "list the task's instances: {}: the run is not recorded; the program is run anyway",
-                        e.report()
-                    ),
-                );
-                return OwnInstanceOutcome::Unread;
+                // The read says only how the line is worded: the shim ends with the listing's error either way.
+                let why = match registration(path, api).and_then(|now| started_under(path, id, token, &now.xml)) {
+                    Ok(()) => "no program was started".to_string(),
+                    Err(stop) => stop.message,
+                };
+                return OwnInstanceOutcome::Ended(SpecStop {
+                    message: format!("list the task's instances: {}: {why}", e.report()),
+                    reported: read_failed(&e),
+                });
             }
         }
         if supervisor.bus.stopped_within(LISTING_PACE) {
@@ -259,20 +397,26 @@ fn own_instance(
 // The run -------------------------------------------------------------------------------------------------------------
 
 /// Writes the run's marker as a line of its own into the log, before the program is spawned: the
-/// program's output is appended after it. A failed write is logged and the program runs. A log that
-/// cannot be opened is not said here: the program's own open of the same file, which follows, reports
-/// it, so one fault is one line.
+/// program's output is appended after it. The log is the one the program's output goes to ([`Log::daemon_log`]):
+/// the default log, through the handle the shim holds on it, when `logs` is that. A log that cannot be opened,
+/// and a write that fails, are logged (an open fault is told once in a launch, [`Log::marker_open_failed`]) and
+/// the program runs.
 fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &InstanceId) {
-    let line = format!("{}\n", instance.marker());
-    let Ok(mut file) = supervisor.os.open_log(logs, supervisor.log.parents_of(id, logs)) else {
-        return;
+    let log = &*supervisor.log;
+    let (path, kind) = log
+        .daemon_log(id, Some(logs))
+        .expect("a `logs` path is the daemon's own log or the default log");
+    let mut file = match supervisor.os.open_log(&path, kind) {
+        Ok(file) => file,
+        Err(e) => return log.marker_open_failed(id, &path, &e),
     };
+    let line = format!("{}\n", instance.marker());
     if let Err(e) = file.write_all(line.as_bytes()) {
-        supervisor.log.failure(
+        log.failure(
             id,
             &format!(
                 "write the run's marker to {}: {}; a reader cannot find this run's output in it",
-                logs.display(),
+                path.display(),
                 Chain(&e)
             ),
         );

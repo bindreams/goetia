@@ -3181,7 +3181,7 @@ fn is_judged(ended: io::Result<Waited>) -> bool {
             false
         }
         Err(e) => {
-            assert!(carried::<IncompleteStop>(&e).is_some(), "{e}");
+            assert!(carried_composite::<IncompleteStop>(&e).is_some(), "{e}");
             true
         }
     }
@@ -3266,7 +3266,7 @@ fn stop_and_await_exit_fails_over_a_shims_incomplete_stop_record() {
     let err =
         stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::<u32>::NoProcess, true, no_end).unwrap_err();
 
-    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
+    assert!(carried_composite::<IncompleteStop>(&err).is_some(), "{err}");
 }
 
 /// The shim process goetia holds is ended before the incomplete stop is returned: its KILL_ON_JOB_CLOSE
@@ -3294,7 +3294,7 @@ fn stop_and_await_exit_ends_the_held_process_of_an_incomplete_stop_before_failin
     )
     .unwrap_err();
 
-    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
+    assert!(carried_composite::<IncompleteStop>(&err).is_some(), "{err}");
     assert_eq!(*calls.borrow(), vec![("terminate", 7), ("wait", 7)]);
 }
 
@@ -3321,7 +3321,7 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
             ending(|_| terminate, |_, _, _| exit),
         )
         .unwrap_err();
-        assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
+        assert!(carried_composite::<IncompleteStop>(&err).is_some(), "{err}");
         err.to_string()
     };
 
@@ -3360,6 +3360,75 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
             && both.contains("denied"),
         "{both}"
     );
+}
+
+/// The words of an incomplete stop that ended the held process, as `end` left it, and the errors in
+/// them: a failed wait is a cause the one search reaches, a failed terminate is only mentioned.
+#[skuld::test]
+fn an_incomplete_stops_held_process_is_told_in_words_and_its_errors_are_searched() {
+    use crate::error::Error;
+    use crate::error::error_tests::finds_os_code;
+
+    let ran = |terminate: io::Result<()>, exit: io::Result<Waited>| {
+        let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
+        stop_and_await_exit(
+            &mut fake,
+            spent(),
+            &mut HoldOutcome::Held(7u32),
+            true,
+            ending(|_| terminate, |_, _, _| exit),
+        )
+        .unwrap_err()
+    };
+    let plain = ran(Ok(()), Ok(Waited::Confirmed)).to_string();
+    let held = format!("{plain}; goetia held the shim's process to end it, and ");
+
+    let lingers = ran(Ok(()), Ok(Waited::Expired));
+    assert_eq!(
+        lingers.to_string(),
+        format!("{held}it had not exited when the wait for it ended")
+    );
+    let refused = ran(Err(io::Error::other("denied")), Ok(Waited::Expired));
+    assert_eq!(
+        refused.to_string(),
+        format!("{held}it had not exited when the wait for it ended, and terminating it failed: denied")
+    );
+    let failed = ran(Ok(()), Err(io::Error::other("wait failed")));
+    assert_eq!(
+        failed.to_string(),
+        format!("{held}waiting for it to exit failed: wait failed")
+    );
+    let both = ran(Err(io::Error::other("denied")), Err(io::Error::other("wait failed")));
+    assert_eq!(
+        both.to_string(),
+        format!("{held}waiting for it to exit failed: wait failed, and terminating it failed: denied")
+    );
+
+    let reported = Error::os("stop `frpc`", both).report().to_string();
+    assert_eq!(
+        reported,
+        format!(
+            "failed to stop `frpc`: {held}waiting for it to exit failed: wait failed, and terminating it failed: denied"
+        )
+    );
+
+    let coded = Error::os(
+        "stop `frpc`",
+        ran(
+            Err(io::Error::from_raw_os_error(32)),
+            Err(io::Error::from_raw_os_error(31)),
+        ),
+    );
+    assert!(finds_os_code(&coded, 31), "the failed wait is a cause: {coded:?}");
+    assert!(
+        !finds_os_code(&coded, 32),
+        "the failed terminate is only mentioned: {coded:?}"
+    );
+    let lingered = Error::os(
+        "stop `frpc`",
+        ran(Err(io::Error::from_raw_os_error(32)), Ok(Waited::Expired)),
+    );
+    assert!(!finds_os_code(&lingered, 32), "{lingered:?}");
 }
 
 // the process held across an incomplete stop --------------------------------------------------------------------------
@@ -3409,7 +3478,7 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
 
         let (waited, ended) = ended_by_incomplete_stop(waited, &mut held);
 
-        assert!(carried::<IncompleteStop>(&waited.unwrap_err()).is_some());
+        assert!(carried_composite::<IncompleteStop>(&waited.unwrap_err()).is_some());
         assert!(ended.is_empty());
         assert!(
             matches!(held, HoldOutcome::NoProcess | HoldOutcome::Refused(_)),

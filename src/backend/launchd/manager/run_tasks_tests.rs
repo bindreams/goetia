@@ -389,7 +389,7 @@ fn assert_vanished(e: &Error, pid: u32) {
 /// found it gone, never the stranded hold, and exit 4.
 fn assert_ended_unfollowed(e: &Error) {
     assert!(
-        matches!(e, Error::RunUnrecorded { id, reason }
+        matches!(e, Error::RunUnrecorded { id, reason, .. }
             if id == ID && reason.starts_with("its launch ended before goetia could follow it")),
         "expected the launch that ended before goetia could follow it, got {e:?}"
     );
@@ -402,7 +402,7 @@ fn assert_ended_unfollowed(e: &Error) {
 
 fn assert_unfollowed(e: &Error, pid: u32) {
     assert!(
-        matches!(e, Error::RunUnrecorded { id, reason }
+        matches!(e, Error::RunUnrecorded { id, reason, .. }
         if id == ID
             && *reason == format!(
                 "the `launchctl kickstart` goetia made for it launched process {pid} with no hold on it, \
@@ -456,7 +456,7 @@ fn a_run_whose_exit_came_without_a_status_is_unrecorded() {
     let e = run.wait().expect_err("an exit with no status");
 
     assert!(
-        matches!(&e, Error::RunUnrecorded { id, reason } if id == ID && !reason.contains("may")),
+        matches!(&e, Error::RunUnrecorded { id, reason, .. } if id == ID && !reason.contains("may")),
         "{e:?}"
     );
     assert!(e.is_indeterminate(), "exit 4, as `RunUnrecorded` is");

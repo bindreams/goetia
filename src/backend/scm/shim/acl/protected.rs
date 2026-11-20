@@ -6,6 +6,8 @@
 //! inherited by what is made in it. `Descriptor` holds them as SDDL, the one place the spec's
 //! permissions are written down, and [`is_as_wanted`] compares what a file has with them.
 //! `Descriptor` also makes the folders, never adopting one that exists (`Descriptor::create_each`).
+//! The folder of the default logs and the logs in it are protected too: SYSTEM and Administrators alone,
+//! and on a log an entry for the account the shim runs as that lets it append and nothing else.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use super::{Ace, ObjectSecurity};
@@ -28,7 +30,7 @@ fn sorted(aces: &[Ace]) -> Vec<&Ace> {
 }
 
 #[cfg(windows)]
-pub(crate) use system::{Descriptor, missing_components};
+pub(crate) use system::{DEFAULT_LOG_ACCESS, Descriptor, missing_components};
 
 #[cfg(windows)]
 mod system {
@@ -38,16 +40,21 @@ mod system {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::path::{Path, PathBuf};
 
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SetKernelObjectSecurity,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
+        SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_ALWAYS, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
 
     use super::super::{ObjectSecurity, system::describe};
@@ -70,6 +77,17 @@ mod system {
     /// What names only the owner: Administrators own it, and the DACL is left for what it is made in to
     /// inherit. Naming `BA` needs it enabled in the creator's token, like [`LOCK`].
     const INHERITING: &str = "O:BA";
+
+    /// The folder of the shims' default logs: Administrators own it; SYSTEM and Administrators have full
+    /// control of it and of what is made in it, and nobody else any right, so nobody else can list it,
+    /// make a file in it or plant a link in it. Nothing is inherited from `%ProgramData%`. Naming `BA`
+    /// needs it enabled in the creator's token, like [`LOCK`].
+    const LOGS: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    /// What the shim's default log is opened for, and all an account is granted on it: append data, read
+    /// attributes and synchronize. `std`'s own append open asks for write attributes as well, which this
+    /// denies.
+    pub(crate) const DEFAULT_LOG_ACCESS: u32 = FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
     /// A security descriptor that a file or folder is created with.
     pub(crate) struct Descriptor {
@@ -100,7 +118,7 @@ mod system {
         }
 
         /// The permissions of a task's run-record directory: Administrators own it; SYSTEM and
-        /// Administrators have full control of it and of what is made in it; `principal`, the account the
+        /// Administrators have full control of it and of what is made in it; each of `principals`, the accounts the
         /// task runs as, may read, write, run and delete the files made in it (`0x1300af`: not change
         /// permissions or take ownership, and not set attributes or extended attributes, `0x110`; an
         /// entry only files inherit) and has, on the directory itself, the same without adding a
@@ -114,17 +132,69 @@ mod system {
         /// directory and the files the account did not create.** A file the account creates is granted
         /// what its creating open asks for, whatever the masks say (there is no entry to check yet), so
         /// the handle of that open is as capable as the open asked it to be; goetia's own creating opens
-        /// ask for what they use. A SID that is not whole is an error.
-        pub(crate) fn for_runs(principal: &Sid) -> Result<Self> {
-            let principal = try_sid_display(principal).ok_or_else(|| {
-                Error::os(
-                    "build the permissions of a run-record directory",
-                    io::Error::other("the account is not a whole SID"),
+        /// ask for what they use. A SID that is not whole is an error. `principals` is not empty: no account could
+        /// write the records.
+        pub(crate) fn for_runs(principals: &[Sid]) -> Result<Self> {
+            debug_assert!(
+                !principals.is_empty(),
+                "a record directory names the account that writes to it"
+            );
+            let mut sddl = String::from("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+            for principal in principals {
+                let principal = sid_text(principal, "a run-record directory")?;
+                sddl.push_str(&format!("(A;OIIO;0x1300af;;;{principal})(A;;0x1200eb;;;{principal})"));
+            }
+            Self::from_sddl(&sddl)
+        }
+
+        /// The permissions of `Goetia\logs`: see [`LOGS`].
+        pub(crate) fn for_logs() -> Result<Self> {
+            Self::from_sddl(LOGS)
+        }
+
+        /// The permissions of a daemon's default log file: Administrators own it; SYSTEM and Administrators
+        /// have full control; each of `accounts`, the accounts the daemon's shim runs as (more than one only
+        /// while it changes from one to another), may append to it ([`DEFAULT_LOG_ACCESS`]) and do nothing
+        /// else, so it cannot read, truncate, delete or re-permission what it wrote. The DACL is protected.
+        /// A SID that is not whole is an error.
+        pub(crate) fn for_default_log(accounts: &[Sid]) -> Result<Self> {
+            let mut sddl = String::from("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            for account in accounts {
+                let account = sid_text(account, "a default log")?;
+                sddl.push_str(&format!("(A;;{DEFAULT_LOG_ACCESS:#x};;;{account})"));
+            }
+            Self::from_sddl(&sddl)
+        }
+
+        /// Opens the file `path` for `READ_CONTROL`, `WRITE_DAC`, attribute reads and, with `owner`, `WRITE_OWNER`,
+        /// without following a link at it, making it empty with this descriptor when it is not there
+        /// (`OPEN_ALWAYS`); the flag says it was made, and so has the descriptor's owner and permissions already.
+        /// What is there is not changed: [`Descriptor::set_dacl_of`] on the handle sets its permissions, and with
+        /// `owner`, [`Descriptor::set_owner_and_dacl_of`] its owner too. The file is shared for everything,
+        /// so a shim that holds it open does not stop this.
+        pub(crate) fn open_always_for_dacl(&self, path: &Path, owner: bool) -> io::Result<(File, bool)> {
+            let wide = wide_null(path)?;
+            let attributes = self.attributes();
+            // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live for the
+            // call; no template file.
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    READ_CONTROL | WRITE_DAC | if owner { WRITE_OWNER } else { 0 } | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    &attributes,
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
                 )
-            })?;
-            Self::from_sddl(&format!(
-                "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OIIO;0x1300af;;;{principal})(A;;0x1200eb;;;{principal})"
-            ))
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            // `OPEN_ALWAYS` succeeds with `ERROR_ALREADY_EXISTS` as the last error when the file was there.
+            let made = io::Error::last_os_error().raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32);
+            // SAFETY: `handle` is a valid file handle that nothing else owns.
+            Ok((unsafe { File::from_raw_handle(handle) }, made))
         }
 
         /// A descriptor written as SDDL.
@@ -223,14 +293,22 @@ mod system {
         /// which reaches through a hard link in the folder to its target wherever that is; the kernel's
         /// call does not.
         pub(crate) fn set_dacl_of(&self, file: &File) -> io::Result<()> {
-            // SAFETY: `file` is open with `WRITE_DAC`, and `self.raw` is a live descriptor.
-            let set = unsafe {
-                SetKernelObjectSecurity(
-                    file.as_raw_handle() as HANDLE,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    self.raw,
-                )
-            };
+            self.set_of(file, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION)
+        }
+
+        /// [`Descriptor::set_dacl_of`], and the owner this descriptor names. `file` must have been opened with
+        /// `WRITE_DAC` and `WRITE_OWNER`; the token must be able to assign the owner (an elevated administrator's can
+        /// assign Administrators).
+        pub(crate) fn set_owner_and_dacl_of(&self, file: &File) -> io::Result<()> {
+            self.set_of(
+                file,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            )
+        }
+
+        fn set_of(&self, file: &File, information: u32) -> io::Result<()> {
+            // SAFETY: `file` is open with the access `information` needs, and `self.raw` is a live descriptor.
+            let set = unsafe { SetKernelObjectSecurity(file.as_raw_handle() as HANDLE, information, self.raw) };
             if set == 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -245,6 +323,16 @@ mod system {
                 bInheritHandle: 0,
             }
         }
+    }
+
+    /// `sid` as SDDL spells it, or an error naming what the permissions were being built for.
+    fn sid_text(sid: &Sid, what: &str) -> Result<String> {
+        try_sid_display(sid).ok_or_else(|| {
+            Error::os(
+                format!("build the permissions of {what}"),
+                io::Error::other("the account is not a whole SID"),
+            )
+        })
     }
 
     /// The folders of `dir` that do not exist, outermost first: those below its first existing

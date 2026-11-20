@@ -12,8 +12,8 @@ use super::watch::{Added, Registered, Watch};
 use super::{Launchd, TASK_STOP_CALLS, TASK_STOP_REQUESTS, UNLOAD_POLL, own_reservation};
 use crate::backend::bounded::{Reservation, Role};
 use crate::backend::kill::process::{Signal, Signalling, send_signal};
-use crate::backend::kill::{Hold, KillTarget as _, failed_as, hold_pid};
-use crate::error::{Error, Result};
+use crate::backend::kill::{Hold, KillTarget as _, hold_pid};
+use crate::error::{Error, Result, target_failed};
 use crate::manager::Budget;
 use crate::manager::budget::{self, Deadline};
 use crate::spec::{Id, StopAction, StopSignal};
@@ -464,7 +464,7 @@ fn send(held: &Process, course: &mut Course, id: &str, which: Signal) -> Result<
 
 /// `e`, a failure of `doing` during a stop of `id`: the stop's own, in its words.
 fn stop_failed(id: &str, doing: &str, e: io::Error) -> Error {
-    failed_as(format!("stop `{id}`: {doing}"), e)
+    target_failed(format!("stop `{id}`: {doing}"), e)
 }
 
 #[cfg(test)]

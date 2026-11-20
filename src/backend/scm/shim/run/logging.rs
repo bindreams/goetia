@@ -6,22 +6,34 @@
 //! fails to decode `Spec` before it learns the daemon's `logs:` path, so the path derivable from
 //! the service id alone is the only file destination a decode failure can target.
 //!
-//! **The default file's folder is an install's.** `%ProgramData%\Goetia\logs` is made, and judged, by
-//! the elevated install that registers the shim ([`make_goetia_folders`](crate::backend::scm::folder::make_goetia_folders)); the shim, which runs as the
-//! daemon's account, makes no folder for its default log ([`Parents::Never`]). Where the folder is not
-//! there, or the account cannot write in it, the append fails and the Event Log still gets the line.
+//! **The default file is an install's.** `%ProgramData%\Goetia\logs` and `<id>.log` in it are made, and
+//! judged, by the elevated install that registers the shim ([`default_log::ensure`]); the shim, which runs
+//! as the daemon's account, makes neither and opens the file for appending alone ([`LogKind::Default`]) when it
+//! starts ([`Log::hold_default`]), and again only when the file it holds was deleted or it holds none: an install
+//! may take the account out of the file's permissions (an account change, which SCM does not apply to a running
+//! service), and a handle keeps what it was opened with.
+//! Where the file is not there, or is a link, or the account cannot append to it, the append fails and the
+//! Event Log still gets the line.
+//!
+//! **The default log is told by its text.** A daemon writes the default log when its `logs:` is unset, or is
+//! the default path as written ([`Log::daemon_log`]): an install refuses a `logs:` in the folder of the
+//! default logs ([`default_log::refuse_logs_in_folder`]). No other path is compared, and none is looked up.
 //!
 //! **Event Log.** Every failure also goes to the Windows Event Log, whose default ACL is far more
 //! permissive than a folder's, so it is the more likely of the two to still work exactly when the
 //! file does not.
 
+use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use super::os::{Channels, Parents, Real, Severity};
+use super::os::{Channels, LogKind, Real, Severity};
 use super::service::TABLE_NAME;
+use crate::backend::scm::default_log;
 use crate::backend::scm::folder::{logs_folder, program_data};
-use crate::error::Result;
+use crate::error::{Chain, Result};
 
 /// The shim's failure log: composes the two channels for one service run. One shim serves one
 /// service, so one daemon log path.
@@ -30,6 +42,12 @@ pub(crate) struct Log {
     /// `None` when the machine's `%ProgramData%` could not be located: there is then no default file.
     default_dir: Option<PathBuf>,
     daemon_log: OnceLock<PathBuf>,
+    /// Whether a line may be appended to the default log. Task mode starts it closed ([`Log::closed_until_held`]);
+    /// [`Log::hold_default`] opens it.
+    default_open: AtomicBool,
+    /// The open faults told, by file, kind of error and what the failed open costs, so that one fault is told once
+    /// however often it is met. A shim process makes one launch of its daemon, so what is told is told for it.
+    told: Mutex<HashSet<(PathBuf, ErrorKind, &'static str)>>,
 }
 
 impl Log {
@@ -39,27 +57,40 @@ impl Log {
             channels,
             default_dir: Some(default_dir),
             daemon_log: OnceLock::new(),
+            default_open: AtomicBool::new(true),
+            told: Mutex::default(),
         }
     }
 
-    /// The production log: the real channels, defaulting to `%ProgramData%\Goetia\logs\`
-    /// ([`program_data`]).
-    pub(crate) fn real() -> Log {
-        Log::from_program_data(Arc::new(Real), program_data())
+    /// The default log stays closed to lines until [`Log::hold_default`] runs; before then a line goes to the
+    /// Event Log and stderr only. Task mode needs this: its pin precedes any log, and a refused shim must hold
+    /// none.
+    pub(crate) fn closed_until_held(self) -> Log {
+        self.default_open.store(false, Ordering::Release);
+        self
+    }
+
+    /// The production log over `real`, defaulting to `%ProgramData%\Goetia\logs\` ([`program_data`]). `real` is
+    /// the shim's one [`Real`], which is also its [`Os`](super::os::Os): the daemon's output and this log's lines
+    /// share the handle it holds on the default log.
+    pub(crate) fn real(real: Arc<Real>) -> Log {
+        Log::from_program_data(real, &program_data())
     }
 
     /// A log over `channels` for the `%ProgramData%` that `found` says. When it was not found there
     /// is no default file, since no other place is the machine's: failures go to the daemon's own log
     /// once [`Log::set_daemon_log`] names one, and to the Event Log. The first Event Log line says
     /// why there is no default file.
-    pub(crate) fn from_program_data(channels: Arc<dyn Channels>, found: Result<PathBuf>) -> Log {
+    pub(crate) fn from_program_data(channels: Arc<dyn Channels>, found: &Result<PathBuf>) -> Log {
         match found {
-            Ok(program_data) => Log::new(channels, logs_folder(&program_data)),
+            Ok(program_data) => Log::new(channels, logs_folder(program_data)),
             Err(e) => {
                 let log = Log {
                     channels,
                     default_dir: None,
                     daemon_log: OnceLock::new(),
+                    default_open: AtomicBool::new(true),
+                    told: Mutex::default(),
                 };
                 log.failure(
                     TABLE_NAME,
@@ -75,29 +106,75 @@ impl Log {
 
     /// `<default dir>\<id>.log` — derivable from `id` alone. This is where a failure goes before
     /// the spec is decoded or when the daemon's log cannot be opened, and the daemon's own log when
-    /// `goetia.yaml` sets no `logs:` ([`Log::daemon_log_path`]). `None` when the machine's
+    /// `goetia.yaml` sets no `logs:` ([`Log::daemon_log`]). `None` when the machine's
     /// `%ProgramData%` could not be located.
     pub(crate) fn default_log_path(&self, id: &str) -> Option<PathBuf> {
-        self.default_dir.as_ref().map(|dir| dir.join(format!("{id}.log")))
+        self.default_dir.as_ref().map(|dir| default_log::path_in(dir, id))
     }
 
-    /// The daemon's log: `logs` from its spec, or [`Log::default_log_path`] when unset.
-    pub(crate) fn daemon_log_path(&self, id: &str, logs: Option<&Path>) -> Option<PathBuf> {
-        logs.map(Path::to_path_buf).or_else(|| self.default_log_path(id))
+    /// Opens the default log of daemon `id` and holds it for the rest of the shim's run
+    /// ([`Channels::hold_default`]). Call it once, when the shim knows its `id`, before anything an install
+    /// can change; task mode calls it after its pin on the run records, so a refused shim holds none, and its
+    /// log is closed to the default file until then ([`Log::closed_until_held`]). A log that cannot be held is told to the Event
+    /// Log, once, with the error: the shim goes on. What the opens that follow meet is theirs to tell.
+    pub(crate) fn hold_default(&self, id: &str) {
+        if let Some(path) = self.default_log_path(id)
+            && let Err(e) = self.channels.hold_default(&path)
+        {
+            self.event_log_only(
+                Severity::Error,
+                &failure_line(id, &format!("hold the default log {}: {}", path.display(), Chain(&e))),
+            );
+        }
+        self.default_open.store(true, Ordering::Release);
     }
 
-    /// Whether the folders above the log `path` of daemon `id` are made when it is opened: not for the
-    /// default log, whose folder an install made, and yes for any other, which is the user's own.
-    pub(crate) fn parents_of(&self, id: &str, path: &Path) -> Parents {
-        match self.default_log_path(id) {
-            Some(default) if default == path => Parents::Never,
-            Some(_) | None => Parents::Create,
+    /// Tells that the log file `path` could not be opened for the daemon's output, with `e`, unless that was told
+    /// already (the same file, the same kind of error, the same open): the marker's open of the same file failing
+    /// alike is another fact, with its own cost ([`Log::marker_open_failed`]).
+    pub(crate) fn open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
+        self.tell_open_failure(
+            id,
+            path,
+            e,
+            "this daemon's output will not be captured; it is still being run",
+        );
+    }
+
+    pub(crate) fn marker_open_failed(&self, id: &str, path: &Path, e: &std::io::Error) {
+        self.tell_open_failure(
+            id,
+            path,
+            e,
+            "the run marker could not be written; the program is still run",
+        );
+    }
+
+    fn tell_open_failure(&self, id: &str, path: &Path, e: &std::io::Error, consequence: &'static str) {
+        let first = self.told.lock().unwrap_or_else(PoisonError::into_inner).insert((
+            path.to_path_buf(),
+            e.kind(),
+            consequence,
+        ));
+        if first {
+            self.failure(id, &log_open_failed(path, e, consequence));
         }
     }
 
-    /// From now on, failures go to `path` (see [`Log::daemon_log_path`]) instead of the default.
-    /// Call right after the spec decodes. A second call must carry the same path; a different one
-    /// is a caller bug, debug-asserted.
+    /// The daemon's log and its kind: `logs` from its spec, which is the user's own, unless it is the default
+    /// log's path as written; and, when unset, [`Log::default_log_path`], the default log (see the module).
+    pub(crate) fn daemon_log(&self, id: &str, logs: Option<&Path>) -> Option<(PathBuf, LogKind)> {
+        let default = self.default_log_path(id);
+        match logs {
+            Some(path) if default.as_deref() != Some(path) => Some((path.to_path_buf(), LogKind::Own)),
+            _ => default.map(|path| (path, LogKind::Default)),
+        }
+    }
+
+    /// From now on, failures go to `path`, the daemon's own log ([`Log::daemon_log`] says `Own`), before the
+    /// default. Call right after the spec decodes, and only for an own log: with none, the default log is the
+    /// daemon's and is always tried. A second call must carry the same path; a different one is a caller bug,
+    /// debug-asserted.
     pub(crate) fn set_daemon_log(&self, path: PathBuf) {
         if let Err(second) = self.daemon_log.set(path) {
             debug_assert_eq!(
@@ -123,19 +200,28 @@ impl Log {
 
     fn report(&self, id: &str, severity: Severity, message: &str) {
         let line = failure_line(id, message);
-        eprintln!("{line}");
         let daemon_log = self.daemon_log.get().map(PathBuf::as_path);
-        let files = match self.default_log_path(id) {
+        // A default log not held yet is not appended to: the append would open it.
+        let default = self
+            .default_log_path(id)
+            .filter(|_| self.default_open.load(Ordering::Acquire));
+        let files = match default {
             Some(default) => log_destinations(daemon_log, default),
             None => daemon_log
-                .map(|path| (path.to_path_buf(), Parents::Create))
+                .map(|path| (path.to_path_buf(), LogKind::Own))
                 .into_iter()
                 .collect(),
         };
         let _ = files
             .iter()
-            .any(|(path, parents)| self.channels.append(path, &line, *parents).is_ok());
-        self.channels.event_log(severity, &line);
+            .any(|(path, kind)| self.channels.append(path, &line, *kind).is_ok());
+        self.event_log_only(severity, &line);
+    }
+
+    /// `line` to stderr and the Event Log, the one place a line is sent to them.
+    fn event_log_only(&self, severity: Severity, line: &str) {
+        eprintln!("{line}");
+        self.channels.event_log(severity, line);
     }
 }
 
@@ -143,13 +229,17 @@ fn failure_line(id: &str, message: &str) -> String {
     format!("goetia-shim[{id}]: {message}")
 }
 
-/// The files to try for a line, in order, with whether each one's folders are made: the daemon's log,
-/// then the default, which has none made for it. When they are the same path, it is tried once, as the
-/// default.
-fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<(PathBuf, Parents)> {
+/// An open of the log file `path` that failed with `e`, and what `consequence` says it costs.
+fn log_open_failed(path: &Path, e: &std::io::Error, consequence: &str) -> String {
+    format!("open log file {}: {} ({consequence})", path.display(), Chain(e))
+}
+
+/// The files to try for a line, in order, with the kind of each: the daemon's own log when its spec sets
+/// `logs:`, then the default.
+fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<(PathBuf, LogKind)> {
     match daemon_log {
-        Some(path) if path != default => vec![(path.to_path_buf(), Parents::Create), (default, Parents::Never)],
-        Some(_) | None => vec![(default, Parents::Never)],
+        Some(path) => vec![(path.to_path_buf(), LogKind::Own), (default, LogKind::Default)],
+        None => vec![(default, LogKind::Default)],
     }
 }
 

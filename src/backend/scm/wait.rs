@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
 use crate::backend::scm::kill::HoldOutcome;
-use crate::error::{Chain, terminating_failed};
+use crate::error::{Composite, Pieces, carried_composite, carry, terminating_failed};
 use crate::manager::budget::Deadline;
 use crate::spec::Protocol;
 
@@ -299,7 +299,7 @@ fn take_held<P>(held: &mut HoldOutcome<P>) -> Option<P> {
 /// process held before the STOP, ended by `end`, and `held` is left empty: the shim's `KILL_ON_JOB_CLOSE`
 /// job is the last thing that can still kill the daemon's tree. How that went does not change that the
 /// stop failed, but an `end` whose wait for the exit failed, or that left the process running, is
-/// told in the error, with the failed terminate worded as [`terminating_failed`] words it. Any other
+/// told in the error (see [`Unexited`]). Any other
 /// result, or no process held, is returned as it is.
 pub(crate) fn end_on_incomplete_stop<P, T>(
     waited: io::Result<T>,
@@ -309,7 +309,7 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
     let Err(e) = waited else {
         return waited;
     };
-    let Some(incomplete) = carried::<IncompleteStop>(&e) else {
+    let Some(incomplete) = carried_composite::<IncompleteStop>(&e) else {
         return Err(e);
     };
     let Some(process) = take_held(held) else {
@@ -317,26 +317,16 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
     };
     let process = match end(process) {
         Ok(EndProcessOutcome::Exited) => return Err(e),
-        Ok(EndProcessOutcome::Lingers { terminate_failed, .. }) => terminating_failed(
-            "it had not exited when the wait for it ended".to_string(),
-            terminate_failed.as_deref(),
-            "",
-        )
-        .to_string(),
-        Err(ProcessWaitFailure {
-            wait_failed,
-            terminate_failed,
-        }) => terminating_failed(
-            format!("waiting for it to exit failed: {}", Chain(&wait_failed)),
-            terminate_failed.as_deref(),
-            "",
-        )
-        .to_string(),
+        Ok(EndProcessOutcome::Lingers { terminate_failed, .. }) => Unexited::Lingers { terminate_failed },
+        Err(failure) => Unexited::WaitFailed(failure),
     };
-    Err(io::Error::other(IncompleteStop {
-        failed_start: incomplete.failed_start,
-        process: Some(process),
-    }))
+    Err(carry(
+        io::ErrorKind::Other,
+        IncompleteStop {
+            failed_start: incomplete.failed_start,
+            process: Some(process),
+        },
+    ))
 }
 
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
@@ -681,11 +671,6 @@ impl<E> From<io::Error> for SettleError<E> {
     }
 }
 
-/// The `T` that `e` carries as its source, if it does.
-pub(crate) fn carried<T: std::error::Error + 'static>(e: &io::Error) -> Option<&T> {
-    e.get_ref().and_then(|source| source.downcast_ref::<T>())
-}
-
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
 enum Seen {
     /// With the status that showed it, whose record is the stop's.
@@ -776,20 +761,48 @@ pub(crate) struct IncompleteStop {
     /// Whether it was met reaching `RUNNING`: the start's wording says so.
     failed_start: bool,
     /// What became of the shim's process goetia held, when it was not seen to exit.
-    process: Option<String>,
+    process: Option<Unexited>,
+}
+
+/// Why a process goetia held and ended is not known to be gone.
+#[derive(Debug)]
+enum Unexited {
+    /// It had not exited when the wait for it ended. `terminate_failed` is why the attempt to end it
+    /// failed, if it did.
+    Lingers { terminate_failed: Option<Arc<io::Error>> },
+    /// The wait for its exit failed.
+    WaitFailed(ProcessWaitFailure),
+}
+
+impl Composite for IncompleteStop {
+    /// The failed wait is a cause of the failure, the failed terminate is only mentioned.
+    fn pieces(&self) -> Pieces<'_> {
+        let start = if self.failed_start { " (failed start)" } else { "" };
+        let record = Pieces::new().text(format!(
+            "service stopped{start}: SCM recorded `(0, 1003)`, the code goetia-shim records when it could not end the daemon's process tree, so the daemon may still be running"
+        ));
+        let (lead, terminate_failed) = match &self.process {
+            None => return record,
+            Some(Unexited::Lingers { terminate_failed }) => (
+                Pieces::new().text("it had not exited when the wait for it ended"),
+                terminate_failed,
+            ),
+            Some(Unexited::WaitFailed(failure)) => (
+                Pieces::new()
+                    .text("waiting for it to exit failed: ")
+                    .cause(&failure.wait_failed),
+                &failure.terminate_failed,
+            ),
+        };
+        record
+            .text("; goetia held the shim's process to end it, and ")
+            .then(terminating_failed(lead, terminate_failed.as_deref(), ""))
+    }
 }
 
 impl std::fmt::Display for IncompleteStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let start = if self.failed_start { " (failed start)" } else { "" };
-        write!(
-            f,
-            "service stopped{start}: SCM recorded `(0, 1003)`, the code goetia-shim records when it could not end the daemon's process tree, so the daemon may still be running"
-        )?;
-        match &self.process {
-            Some(process) => write!(f, "; goetia held the shim's process to end it, and {process}"),
-            None => Ok(()),
-        }
+        std::fmt::Display::fmt(&self.pieces(), f)
     }
 }
 
@@ -804,10 +817,13 @@ fn judged(end: WaitEnd, shim: bool) -> io::Result<Waited> {
         WaitEnd {
             waited: Waited::Confirmed,
             exit: Some(exit),
-        } if shim && exit.is_incomplete_stop() => Err(io::Error::other(IncompleteStop {
-            failed_start: false,
-            process: None,
-        })),
+        } if shim && exit.is_incomplete_stop() => Err(carry(
+            io::ErrorKind::Other,
+            IncompleteStop {
+                failed_start: false,
+                process: None,
+            },
+        )),
         end => Ok(end.waited),
     }
 }
@@ -1075,10 +1091,13 @@ fn stopped_before_running(
             // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
             // to confirm. The notification may follow a `RUNNING` the wait never saw.
             if exit.is_incomplete_stop() {
-                return Err(io::Error::other(IncompleteStop {
-                    failed_start: true,
-                    process: None,
-                }));
+                return Err(carry(
+                    io::ErrorKind::Other,
+                    IncompleteStop {
+                        failed_start: true,
+                        process: None,
+                    },
+                ));
             }
             // `daemon_ran` is safe here: a host that exits before it connects also records `(0, 0)`
             // with a wait hint (P25 c/d); that is either our own start failing with `StartServiceW`
