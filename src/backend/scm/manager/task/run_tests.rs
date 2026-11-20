@@ -5,7 +5,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, shim_writes, snapshot_of};
+use super::super::support::{
+    Machine, PATH, id, instance, instance_id, pins_in, record, records, scm, shim_writes, snapshot_of,
+};
 use super::*;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::runs::RunOutcome;
@@ -267,11 +269,7 @@ fn begin_run_takes_the_pin_and_lists_before_run_is_called() {
     let shim = Runs::of(dir.path(), &id());
     fake.on_run(Ok(unnamed(1)))
         .during(move || {
-            let pins = fs::read_dir(&path)
-                .unwrap()
-                .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
-                .count();
-            assert_eq!(pins, 1, "the pin is held when Run is called");
+            assert_eq!(pins_in(&path), 1, "the pin is held when Run is called");
             shim.write(&written(1, 5, RunOutcome::Exited(0)), None).unwrap();
         })
         .on_instances(Ok(Vec::new()));
