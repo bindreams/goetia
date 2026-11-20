@@ -298,7 +298,7 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
         "protocol: native reports the daemon's own pid, not a shim's"
     );
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP");
     let status = mgr.status(&spec.common().id).expect("status after stop");
     assert_eq!(status.common().state, State::Stopped);
@@ -386,7 +386,7 @@ fn killing_a_stopped_service_is_not_running(#[fixture(scm_group)] _group: &Group
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP");
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 }
@@ -539,7 +539,7 @@ fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting(#[fixture(scm_
 
     for (what, budget) in [("stop", Budget::Unbounded), ("stop --timeout 0", Budget::Immediate)] {
         let text = mgr
-            .stop(&spec.common().id, budget)
+            .stop(&spec.common().id, Some(budget))
             .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped")
             .report()
             .to_string();
@@ -796,6 +796,7 @@ fn install_twice_is_up_to_date_for_both_kinds(#[fixture(scm_group)] _group: &Gro
                 protocol: kind,
                 restart: Restart::OnFailure,
                 restart_delay: Some(Duration::from_secs(3)),
+                stop_action: Default::default(),
             }
         })
         .map(DaemonSpec::from)
@@ -1318,7 +1319,7 @@ fn real_account_gets_service_logon_right(#[fixture(scm_group)] _group: &Group) {
     });
     let status = mgr.status(&target).expect("status");
     assert_eq!(status.common().state, State::Running);
-    let _ = mgr.stop(&target, Budget::DEFAULT);
+    let _ = mgr.stop(&target, Some(Budget::DEFAULT));
 }
 
 /// An install that finds a real user's service up to date reads no password and still grants the account
@@ -1470,7 +1471,7 @@ fn a_local_service_daemon_actually_runs(#[fixture(scm_group)] _group: &Group) {
     let status = mgr.status(&spec.common().id).expect("status while running");
     assert_eq!(status.common().state, State::Running);
 
-    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP under LocalService");
 }
 
@@ -1555,7 +1556,7 @@ fn a_builtin_account_is_never_given_a_stale_password(#[fixture(scm_group)] _grou
     });
     let status = mgr.status(&target).expect("status");
     assert_eq!(status.common().state, State::Running);
-    let _ = mgr.stop(&target, Budget::DEFAULT);
+    let _ = mgr.stop(&target, Some(Budget::DEFAULT));
 }
 
 // A precondition that fails fails the install before any service write ================================================

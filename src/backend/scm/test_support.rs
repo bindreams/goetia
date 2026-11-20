@@ -30,7 +30,7 @@ pub(crate) fn blob_of(protocol: crate::spec::Protocol) -> crate::blob::Blob {
     use crate::testing::base_fields;
 
     crate::blob::Blob {
-        schema: 1,
+        schema: crate::blob::SCHEMA,
         version: "0.1.0".to_string(),
         spec: DaemonSpec::from(
             ServiceSpec::new(ServiceFields {

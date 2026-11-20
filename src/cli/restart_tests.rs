@@ -59,7 +59,8 @@ fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
 /// long the run takes.
 fn restart_with_a_spent_deadline(fake: &Fake) -> String {
     let id = Id::try_from("frpc").unwrap();
-    let e = restart_until(fake, &id, THIRTY, Budget::Immediate.start()).expect_err("a spent budget is a timeout");
+    let e =
+        restart_until(fake, &id, Some((THIRTY, Budget::Immediate.start()))).expect_err("a spent budget is a timeout");
     assert!(e.is_indeterminate(), "{}", e.report());
     e.report().to_string()
 }
@@ -128,8 +129,8 @@ fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
     let id = Id::try_from("frpc").unwrap();
     for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
         for e in [
-            after_start_failed(&id, budget, in_doubt()),
-            abandoned_before_start(&id, in_doubt(), budget),
+            after_start_failed(&id, Some(budget), in_doubt()),
+            abandoned_before_start(&id, in_doubt(), Some(budget)),
         ] {
             assert!(
                 matches!(e, Error::RequestInDoubt { reached: true, .. }),
@@ -146,7 +147,7 @@ fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
 fn a_stop_leg_whose_process_outlasted_the_budget_abandons_the_restart_under_the_given_timeout() {
     let id = Id::try_from("frpc").unwrap();
     let leg_budget = Budget::Bounded(Duration::from_secs(5));
-    let e = abandoned_before_start(&id, process_timed_out("frpc", 4242, leg_budget, None), THIRTY);
+    let e = abandoned_before_start(&id, process_timed_out("frpc", 4242, leg_budget, None), Some(THIRTY));
 
     assert!(e.is_indeterminate(), "{e:?}");
     let Error::ProcessWaitTimeout {
@@ -176,7 +177,7 @@ fn an_abandoned_restart_keeps_the_failed_terminate_of_the_process() {
     let failed = Arc::new(std::io::Error::other("The handle is invalid. (os error 6)"));
     let timed_out = process_timed_out("frpc", 4242, leg_budget, Some(failed));
 
-    let e = abandoned_before_start(&id, timed_out, THIRTY);
+    let e = abandoned_before_start(&id, timed_out, Some(THIRTY));
 
     let report = e.report().to_string();
     assert!(
@@ -198,7 +199,7 @@ fn an_abandoned_restart_keeps_the_failed_terminate_of_the_process() {
 fn a_start_leg_in_doubt_says_what_the_stop_established_and_keeps_its_cause() {
     let id = Id::try_from("frpc").unwrap();
 
-    let e = after_start_failed(&id, Budget::DEFAULT, in_doubt());
+    let e = after_start_failed(&id, Some(Budget::DEFAULT), in_doubt());
 
     assert!(
         e.report()
@@ -221,7 +222,7 @@ fn an_undetermined_start_leg_keeps_its_read_under_the_stop_clause() {
         recovery: "re-run as root".to_string(),
     };
 
-    let e = after_start_failed(&id, Budget::DEFAULT, undetermined);
+    let e = after_start_failed(&id, Some(Budget::DEFAULT), undetermined);
 
     assert!(matches!(e, Error::Undetermined { .. }), "{e:?}");
     assert_eq!(
@@ -242,7 +243,7 @@ fn an_undetermined_start_leg_after_an_unwaited_stop_says_so_before_the_read_and_
         recovery: "re-run as root".to_string(),
     };
 
-    let e = after_start_failed(&id, Budget::Immediate, undetermined);
+    let e = after_start_failed(&id, Some(Budget::Immediate), undetermined);
 
     assert_eq!(
         e.report().to_string(),
@@ -257,7 +258,7 @@ fn a_refused_start_after_an_unwaited_stop_is_unestablished_with_the_refusal_as_i
     let id = Id::try_from("frpc").unwrap();
     let refused = Error::os("start `frpc`", std::io::Error::other("refused"));
 
-    let e = after_start_failed(&id, Budget::Immediate, refused);
+    let e = after_start_failed(&id, Some(Budget::Immediate), refused);
 
     assert!(matches!(e, Error::Unestablished { .. }), "{e:?}");
     assert!(e.is_indeterminate());
@@ -279,7 +280,7 @@ fn a_step_over_a_leg_in_doubt_is_reworded_under_the_step() {
     };
 
     for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
-        let started = after_start_failed(&id, budget, step());
+        let started = after_start_failed(&id, Some(budget), step());
         assert!(matches!(started, Error::Step { .. }), "{budget:?}: {started:?}");
         assert!(
             matches!(started.cause(), Error::RequestInDoubt { .. }),
@@ -289,7 +290,7 @@ fn a_step_over_a_leg_in_doubt_is_reworded_under_the_step() {
         assert!(text.starts_with("start: `systemctl start x.service` reached"), "{text}");
         assert!(text.contains("this start was attempted after it"), "{text}");
 
-        let stopped = abandoned_before_start(&id, step(), budget);
+        let stopped = abandoned_before_start(&id, step(), Some(budget));
         assert!(
             matches!(stopped.cause(), Error::RequestInDoubt { .. }),
             "{budget:?}: {stopped:?}"
@@ -315,7 +316,7 @@ fn a_start_judged_as_managed_over_a_leg_in_doubt_is_reworded_under_it() {
     };
 
     for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
-        let started = after_start_failed(&id, budget, judged());
+        let started = after_start_failed(&id, Some(budget), judged());
         assert!(
             matches!(started, Error::StartJudgedWithoutBlob { .. }),
             "{budget:?}: {started:?}"

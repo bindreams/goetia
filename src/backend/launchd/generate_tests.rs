@@ -5,7 +5,8 @@ use std::time::Duration;
 use super::*;
 use crate::spec::test_support::program;
 use crate::spec::{
-    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Schedule, ServiceFields, ServiceSpec, TaskFields, TaskSpec, User,
+    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Schedule, ServiceFields, ServiceSpec, StopAction, StopSignal,
+    TaskFields, TaskSpec, User,
 };
 use crate::testing::{base_fields, service_fields};
 
@@ -31,6 +32,7 @@ fn full_spec() -> DaemonSpec {
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
         protocol: Protocol::Native,
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -89,7 +91,7 @@ fn plist_snapshot_minimal() {
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <!-- goetia:begin\n\
          Marker: goetia\n\
-         Schema: 1\n\
+         Schema: 2\n\
          Version: {version}\n\
          Spec: {blob}\n\
          goetia:end -->\n\
@@ -103,6 +105,8 @@ fn plist_snapshot_minimal() {
          \t</array>\n\
          \t<key>UserName</key>\n\
          \t<string>root</string>\n\
+         \t<key>ExitTimeOut</key>\n\
+         \t<integer>30</integer>\n\
          </dict>\n\
          </plist>\n",
         version = crate::version(),
@@ -123,7 +127,7 @@ fn plist_snapshot_full() {
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <!-- goetia:begin\n\
          Marker: goetia\n\
-         Schema: 1\n\
+         Schema: 2\n\
          Version: {version}\n\
          Spec: {blob}\n\
          goetia:end -->\n\
@@ -154,6 +158,8 @@ fn plist_snapshot_full() {
          \t<true/>\n\
          \t<key>ThrottleInterval</key>\n\
          \t<integer>3</integer>\n\
+         \t<key>ExitTimeOut</key>\n\
+         \t<integer>30</integer>\n\
          \t<key>StandardOutPath</key>\n\
          \t<string>{logs}</string>\n\
          \t<key>StandardErrorPath</key>\n\
@@ -688,6 +694,7 @@ fn full_task(schedule_text: Option<&str>) -> DaemonSpec {
     TaskSpec::new(TaskFields {
         common: service_fields(full_spec()).common,
         schedule: schedule_text.map(schedule),
+        stop_action: Default::default(),
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -698,6 +705,7 @@ fn task_with(change: impl FnOnce(&mut TaskFields)) -> DaemonSpec {
     let mut fields = TaskFields {
         common: service_fields(minimal_spec()).common,
         schedule: Some(schedule("30 3 * * *")),
+        stop_action: Default::default(),
     };
     change(&mut fields);
     TaskSpec::new(fields).map(DaemonSpec::from).unwrap()
@@ -710,7 +718,7 @@ fn document(spec: &DaemonSpec, body: &str) -> String {
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <!-- goetia:begin\n\
          Marker: goetia\n\
-         Schema: 1\n\
+         Schema: 2\n\
          Version: {version}\n\
          Spec: {blob}\n\
          goetia:end -->\n\
@@ -779,6 +787,8 @@ fn task_job_text_is_exact() {
              \t<string>svc-frpc</string>\n\
              \t<key>ThrottleInterval</key>\n\
              \t<integer>1</integer>\n\
+             \t<key>ExitTimeOut</key>\n\
+             \t<integer>30</integer>\n\
              \t<key>StandardOutPath</key>\n\
              \t<string>{logs}</string>\n\
              \t<key>StandardErrorPath</key>\n\
@@ -804,7 +814,9 @@ fn task_job_text_is_exact() {
              \t<key>UserName</key>\n\
              \t<string>svc-frpc</string>\n\
              \t<key>ThrottleInterval</key>\n\
-             \t<integer>1</integer>\n",
+             \t<integer>1</integer>\n\
+             \t<key>ExitTimeOut</key>\n\
+             \t<integer>30</integer>\n",
             program = program("frpc"),
         ),
     );
@@ -1194,4 +1206,143 @@ fn the_marker_command_words_survive_xml_escaping() {
     for raw in ["a&b", "<c>"] {
         assert!(!text.contains(raw), "{raw}:\n{text}");
     }
+}
+
+// ExitTimeOut =========================================================================================================
+
+fn with_stop_action(stop_action: StopAction) -> DaemonSpec {
+    ServiceSpec::new(ServiceFields {
+        stop_action,
+        ..service_fields(minimal_spec())
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+fn terminate_after(seconds: Option<u64>) -> DaemonSpec {
+    with_stop_action(StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: seconds.map(Duration::from_secs),
+    })
+}
+
+/// The integer written for `ExitTimeOut`, which must be written exactly once.
+fn exit_time_out(spec: &DaemonSpec) -> u64 {
+    let text = plist(spec, &minimal_identity()).unwrap();
+    assert_eq!(text.matches("<key>ExitTimeOut</key>").count(), 1, "{text}");
+    let (_, rest) = text
+        .split_once("<key>ExitTimeOut</key>\n\t<integer>")
+        .expect("an integer follows the key");
+    rest.split_once("</integer>").unwrap().0.parse().unwrap()
+}
+
+#[skuld::test]
+fn exit_time_out_is_the_timeout_in_whole_seconds() {
+    for seconds in [1, 5, 30, 59, 60] {
+        assert_eq!(exit_time_out(&terminate_after(Some(seconds))), seconds);
+    }
+}
+
+/// A spec from a blob reaches the generator without `resolve`: launchd's cap is refused here too.
+#[skuld::test]
+fn a_timeout_over_launchds_cap_and_no_timeout_are_refused_naming_the_cap() {
+    for (seconds, said) in [(Some(61), "61s"), (Some(86_400), "86400s"), (None, "timeout: null")] {
+        let err = plist(&terminate_after(seconds), &minimal_identity()).unwrap_err();
+        let Error::Invalid { message, .. } = &err else {
+            panic!("expected Error::Invalid, got {err:?}");
+        };
+        assert!(
+            message.contains("60 s") && message.contains(said),
+            "{seconds:?}: {message}"
+        );
+    }
+}
+
+#[skuld::test]
+fn the_default_is_thirty_seconds_not_launchds_five() {
+    assert_eq!(exit_time_out(&minimal_spec()), 30);
+}
+
+/// `kill` is an `ExitTimeOut` of one second (see `KILL_EXIT_TIMEOUT`).
+#[skuld::test]
+fn kill_is_an_exit_time_out_of_one_second() {
+    let spec = with_stop_action(StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    });
+    assert_eq!(exit_time_out(&spec), 1);
+}
+
+#[skuld::test]
+fn a_task_has_the_same_exit_time_out_as_a_service() {
+    for (stop_action, expected) in [
+        (StopAction::default(), 30),
+        (
+            StopAction {
+                send_signal: StopSignal::Terminate,
+                timeout: Some(Duration::from_secs(60)),
+            },
+            60,
+        ),
+        (
+            StopAction {
+                send_signal: StopSignal::Kill,
+                timeout: None,
+            },
+            1,
+        ),
+    ] {
+        let task = TaskSpec::new(TaskFields {
+            common: service_fields(minimal_spec()).common,
+            schedule: None,
+            stop_action,
+        })
+        .map(DaemonSpec::from)
+        .unwrap();
+        assert_eq!(exit_time_out(&task), expected, "{stop_action:?}");
+    }
+}
+
+#[skuld::test]
+fn the_timer_job_has_no_exit_time_out() {
+    let id = Id::try_from("frpc").unwrap();
+    let task = TaskSpec::new(TaskFields {
+        common: service_fields(minimal_spec()).common,
+        schedule: Some(Schedule::parse("30 3 * * *", &HashSeed { hostname: "h", id: &id }).unwrap()),
+        stop_action: StopAction::default(),
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    assert!(
+        !plists(&task, &minimal_identity())
+            .unwrap()
+            .timer
+            .unwrap()
+            .contains("ExitTimeOut")
+    );
+}
+
+#[skuld::test]
+fn a_signal_launchd_does_not_send_is_refused_and_never_turned_into_sigterm() {
+    for signal in ["interrupt", "quit", "sigusr1", "ctrl-c", "ctrl-break", "wm-close"] {
+        let send_signal = signal.parse::<StopSignal>().unwrap();
+        let spec = with_stop_action(StopAction {
+            send_signal,
+            timeout: StopAction::default_timeout(send_signal),
+        });
+        let err = plist(&spec, &minimal_identity()).unwrap_err();
+        assert!(
+            matches!(&err, Error::Invalid { message, .. } if message.contains("is refused on launchd")),
+            "{signal}: {err:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_stop_action_survives_the_blob_and_the_plist_regenerates_byte_for_byte() {
+    let spec = terminate_after(Some(45));
+    let text = plist(&spec, &minimal_identity()).unwrap();
+    let decoded = extract(&text).unwrap().unwrap();
+    assert_eq!(decoded.spec, spec);
+    assert_eq!(plist(&decoded.spec, &minimal_identity()).unwrap(), text);
 }
