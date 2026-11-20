@@ -1222,8 +1222,9 @@ If you delete `<id>.log` while the service runs, the daemon of a service with no
 deleted file until you restart it, as with any file a running program holds. The shim's own lines go to the Event
 Log; those it writes to `<id>.log` go to the new file once `goetia daemon install` makes one, except for a run
 started before an earlier install changed the account, until that run restarts. Windows frees the name at once on
-current NTFS. Where the delete is deferred until every handle on the file closes, the shim's included, the name
-stays and `goetia daemon install` fails saying so: stop the daemon, then install again.
+current NTFS. Where the delete is deferred until every handle on the file closes, the name stays and
+`goetia daemon install` fails saying that something still has the log open (a run of the daemon, or a program
+reading the log): end that, then install again.
 
 A `logs:` that is inside `%ProgramData%\Goetia\logs` is refused at install, whichever file it
 names (the folder is the shim's default logs, which a daemon's own account cannot make a file in).

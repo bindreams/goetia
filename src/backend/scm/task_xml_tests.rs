@@ -249,14 +249,15 @@ fn token_of_reads_the_token_the_xml_carries() {
 }
 
 #[skuld::test]
-fn stored_agrees_with_principal_armed_and_token_of() {
+fn stored_agrees_with_principal_has_triggers_and_token_of() {
     let spec = spec();
     for armed in [true, false] {
         let xml = built(&spec).to_xml(armed, &token());
         let stored = TaskXml::stored(&xml, ID).unwrap();
+        assert_eq!(stored.has_triggers, TaskXml::has_triggers(&xml));
+        assert_eq!(stored.has_triggers, armed);
         assert_eq!(stored.principal, TaskXml::principal(&xml).unwrap());
         assert_eq!(stored.principal, Some(TaskAccount::Service("S-1-5-18".to_owned())));
-        assert_eq!(stored.armed, armed);
         assert_eq!(stored.token, Some(token()));
     }
     let tokenless = readback(&spec, &host(), DAILY_AT_0330).replace(TOKEN, "0123");
@@ -676,6 +677,9 @@ fn a_hand_edit_of_a_setting_trigger_or_action_is_a_difference() {
             ),
         ),
         ("the action's arguments", base.replace(TASK_MODE_ARG, "--other")),
+        // An install or an uninstall that did not finish leaves it: `task_write` relies on this to make a
+        // plain install of such a task a conflict, so that only `--force` writes over it.
+        ("the task's own flag", with_own_flag(&base, false)),
         (
             "a working directory",
             base.replace("</Exec>", "<WorkingDirectory>C:\\x</WorkingDirectory></Exec>"),
@@ -916,8 +920,8 @@ fn with_own_flag(xml: &str, flag: bool) -> String {
 }
 
 /// A task is armed when its own flag is true and it has a trigger. A task whose own flag is false is
-/// started by nothing, whatever its triggers say (an `uninstall` that did not finish leaves one), and one with
-/// no trigger has nothing to start it.
+/// started by nothing, whatever its triggers say (an install or an uninstall that did not finish leaves one),
+/// and one with no trigger has nothing to start it.
 #[skuld::test]
 fn armed_is_the_own_flag_true_and_a_trigger_present() {
     let spec = spec();

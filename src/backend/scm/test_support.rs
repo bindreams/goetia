@@ -123,6 +123,43 @@ pub(crate) fn set_dacl(
     descriptor.set_dacl_of(&object)
 }
 
+/// The files `names` of the records directory `dir`, whose delete is refused for no handle and no pending
+/// delete, to every account and an elevated token too: they carry SYSTEM's entry alone, and the directory grants
+/// no right to delete entries. Dropping restores the directory, so that the test's own can be removed.
+#[cfg(windows)]
+pub(crate) struct Undeletable<'a>(&'a std::path::Path);
+
+#[cfg(windows)]
+impl<'a> Undeletable<'a> {
+    pub(crate) fn new(dir: &'a std::path::Path, names: &[&str]) -> Self {
+        use crate::backend::scm::shim::acl::Descriptor;
+
+        let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
+        for name in names {
+            set_dacl(&system_only, &dir.join(name)).unwrap();
+        }
+        // Read, list and add a file, which `Dir::open` asks for; not `DELETE_CHILD`.
+        let listable = Descriptor::from_sddl("D:P(A;;0x1200a3;;;WD)").unwrap();
+        set_dacl(&listable, dir).unwrap();
+        Undeletable(dir)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Undeletable<'_> {
+    fn drop(&mut self) {
+        let restored =
+            crate::backend::scm::shim::acl::Descriptor::for_runs(&[crate::elevation::test_support::process_user_sid()])
+                .map(|wanted| set_dacl(&wanted, self.0));
+        if !matches!(restored, Ok(Ok(()))) {
+            eprintln!(
+                "warning: could not restore the permissions of {}: {restored:?}",
+                self.0.display()
+            );
+        }
+    }
+}
+
 /// An account no test runs as.
 #[cfg(windows)]
 pub(crate) const A_STRANGER: &str = "S-1-5-21-1-2-3-1000";
