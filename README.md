@@ -32,6 +32,16 @@ arming a task's timer runs `systemctl clean` on it (243+) to clear its stamp,
 which is how arming a task again makes up no run missed while goetia's
 `disable` had disarmed it.
 
+On Linux and macOS goetia finds `systemctl` and `launchctl` by searching the
+caller's `PATH`, and nowhere else. Every `PATH` entry before the one that holds
+the tool must be one the calling account can search: an entry it cannot search
+stops the search with an error that names the entry, even when a later entry
+holds the tool (for example after switching user while keeping the old
+`PATH`). A `PATH` must be set: with none the tool is not found, and there is no
+default search path. The first file of that name on `PATH` is the one run,
+executable or not. To recover, remove or fix the entry, or run with a system
+`PATH` such as `/usr/bin:/bin:/usr/sbin:/sbin`.
+
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
 `SYSTEMD_OFFLINE` set to a true value; a `/` of goetia's own rather than the
@@ -262,7 +272,7 @@ records the end as it does.
   writes an `ExitTimeOut` of `1`: launchd
   sends `SIGTERM`, and `SIGKILL` a second later. `0`, which `launchd.plist(5)`
   documents as no limit, ends the job at once on macOS 15.7 (Intel) and 26
-  (measured). `1` does not depend on what `0` does.
+  (measured), against that documentation. `1` does not depend on what `0` does.
   `ExitTimeOut` applies only when launchd itself boots a job out, which a task's
   `stop` never does: goetia ends a task's run itself, with `SIGKILL` at once for
   `kill` and otherwise `SIGTERM`, then `SIGKILL` if the run is still going when
