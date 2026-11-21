@@ -17,13 +17,11 @@
 //! password takes the password (M3): `enable` and `disable` of a real user's task read
 //! `GOETIA_SERVICE_PASSWORD` as an install does.
 
-use std::sync::Arc;
-
 use std::path::Path;
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
-use super::read::StoredRegistration;
+use super::read::{StoredRegistration, sid_of_account};
 use super::verbs::{Processes, System, gone};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::scm::default_log::{self, Naming, Step};
@@ -131,13 +129,26 @@ pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>, reads
     Ok(Prepared { principal, password })
 }
 
-/// The account a stored task is registered as: the blob's when it reads, which is what the install
-/// registered, and otherwise its principal's, so that a task whose blob will not decode can still be
-/// enabled and disabled.
-pub(crate) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
+/// The account a stored task is registered as, and which of its two sources said so.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StoredAccount {
+    /// The blob's, which is what the install registered: the registration may be for another account, so a verb
+    /// that registers the task again compares ([`TaskSnapshot::other_account`]).
+    Blob(TaskAccount),
+    /// The principal's, since the stored XML does not read as a definition (the blob will not decode, a hand edit
+    /// left no action): the task is registered again under it as it stands, so there is nothing to compare.
+    Principal(TaskAccount),
+}
+
+/// The account a stored task is registered as: the blob's when the XML reads as a definition, and otherwise its
+/// principal's, so that a task whose blob will not decode can still be enabled and disabled. An error when
+/// the XML cannot be read at all, or names no principal.
+pub(crate) fn stored_account(registered: &Registered) -> Result<StoredAccount> {
     match TaskXml::parse(&registered.xml, &registered.data) {
-        Ok(definition) => Ok(definition.account()),
-        Err(_) => TaskXml::principal(&registered.xml)?.ok_or_else(|| Error::blob("the task's XML names no principal")),
+        Ok(definition) => Ok(StoredAccount::Blob(definition.account())),
+        Err(_) => TaskXml::principal(&registered.xml)?
+            .map(StoredAccount::Principal)
+            .ok_or_else(|| Error::blob("the task's XML names no principal")),
     }
 }
 
@@ -398,6 +409,16 @@ fn run_records(id: &Id, runs: &Runs, accounts: &[Sid]) -> Result<()> {
     })
 }
 
+/// What `enable` and `disable` say of a task whose registration is for `registered`, which is not the account
+/// the blob's user names now.
+fn registered_for_another_account(id: &Id, registered: &str) -> String {
+    format!(
+        "`{id}` is registered for `{registered}`, which is not the account its user names now (a user deleted and \
+         created again, or renamed, keeps the old account's SID); run `goetia daemon install --force` with a `user:` \
+         that exists to register it for that account"
+    )
+}
+
 /// The error of an account change that fails after deleting the old task: it is gone, install again.
 /// `enable_after`: the old task was armed and the new definition has a schedule, so say to `enable` it (an install
 /// creates it disarmed).
@@ -529,7 +550,11 @@ impl Scm {
     /// that will not decode is the error). Either way the task's own flag is true.
     /// `password` reads the real user's password, which is asked before anything is sent.
     ///
-    /// Refused first under the removal's marker ([`unfinished_change`]), before the password is asked for.
+    /// Refused first under the removal's marker ([`unfinished_change`]), before the password is asked for. Then
+    /// refused when the registration is for another account than the blob's user names now
+    /// ([`TaskSnapshot::other_account`]): registering it in place would move the principal and keep the old
+    /// account's security descriptor, so its shim could not read the task. A lookup that cannot answer is no
+    /// refusal.
     pub(super) fn task_set_armed_with(
         &self,
         snapshot: &TaskSnapshot,
@@ -553,10 +578,22 @@ impl Scm {
         } else if TaskXml::has_triggers(&registered.xml) {
             TaskXml::with_own_flag(&registered.xml, true)?
         } else {
-            let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+            let blob = snapshot.blob().map_err(Error::kept)?;
             TaskXml::with_triggers(&registered.xml, &blob.spec)?
         };
-        let account = stored_account(registered)?;
+        let account = match stored_account(registered)? {
+            StoredAccount::Blob(account) => {
+                if let Some(shown) = snapshot.other_account(sid_of_account)? {
+                    return Err(Error::os(
+                        format!("{verb} `{id}`"),
+                        std::io::Error::other(registered_for_another_account(id, &shown)),
+                    ));
+                }
+                account
+            }
+            // Registered again under its own principal, as it stands: no other account to move it to.
+            StoredAccount::Principal(account) => account,
+        };
         let password = password_of(&account, password)?;
         let path = TaskPath::of(snapshot.id());
         match self.tasks.register(&path, &xml, &account, password.as_deref(), true)? {
