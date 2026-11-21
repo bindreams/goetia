@@ -161,8 +161,6 @@ pub(crate) enum KillReply {
 pub(crate) enum AskReply {
     /// `Ok`: the event was sent. The daemon decides what it does with it.
     Sent,
-    /// `Ok`, and the daemon honours the event: it exits with this code.
-    SentAndExits(i32),
     /// `Error::Io`: nothing was sent.
     Io,
     /// `Error::Unsupported`: nothing was sent (no console yet, or none ever).
@@ -177,7 +175,9 @@ pub(crate) enum AskReply {
     /// `Error::Io`.
     Hangs,
     /// `Error::Unassessable`, and the daemon has exited with this code: cosca's answer for a root that has
-    /// exited, when nothing was sent.
+    /// exited, when nothing was sent. The waiter's report of the exit lags: it is held until the supervisor
+    /// reads the process itself ([`Spawned::try_wait`]), which is what the lag of the real report makes that read
+    /// for.
     UnassessableAndExited(i32),
 }
 
@@ -251,6 +251,10 @@ struct ProcState {
     try_wait_fails: bool,
     /// Whether the asks that [`AskReply::Hangs`] are held in have been let go.
     asks_released: bool,
+    /// Whether the waiter's report of the exit is held until [`Spawned::try_wait`] reads it.
+    report_held: bool,
+    /// What a `wait_tree_timeout` answers once `tree_waits` is spent.
+    tree_waiting_always: Option<TreeWaitReply>,
     tree_waits: VecDeque<TreeWaitReply>,
     calls: Vec<ProcessCall>,
     exit: Option<ExitStatus>,
@@ -271,9 +275,13 @@ impl Proc {
         first
     }
 
-    /// Let go of every ask that never answers, now and later.
+    /// Let go of every ask that never answers, now and later, and of a report that is held.
     fn release_asks(&self) {
-        lock(&self.state).asks_released = true;
+        {
+            let mut state = lock(&self.state);
+            state.asks_released = true;
+            state.report_held = false;
+        }
         self.ended.notify_all();
     }
 
@@ -286,11 +294,11 @@ impl Proc {
         );
     }
 
-    /// Block until the process is ended; its status.
+    /// Block until the process is ended and its report is not held; its status.
     fn wait_ended(&self) -> ExitStatus {
         let state = self
             .ended
-            .wait_while(lock(&self.state), |state| state.exit.is_none())
+            .wait_while(lock(&self.state), |state| state.exit.is_none() || state.report_held)
             .unwrap_or_else(PoisonError::into_inner);
         state.exit.expect("`wait_while` returned with the process not ended")
     }
@@ -309,6 +317,8 @@ impl FakeProcess {
                 asking_always: None,
                 try_wait_fails: false,
                 asks_released: false,
+                report_held: false,
+                tree_waiting_always: None,
                 tree_waits: VecDeque::new(),
                 calls: Vec::new(),
                 exit: None,
@@ -368,6 +378,12 @@ impl FakeProcess {
     /// Every read of whether the process has exited fails.
     pub(crate) fn try_wait_fails(self) -> FakeProcess {
         self.with(|state| state.try_wait_fails = true)
+    }
+
+    /// The answer to every `wait_tree_timeout` after the stated ones: for a test that cannot know whether the
+    /// supervisor waits for the tree.
+    pub(crate) fn tree_waiting_always(self, reply: TreeWaitReply) -> FakeProcess {
+        self.with(|state| state.tree_waiting_always = Some(reply))
     }
 
     /// The reply to the next `wait_tree_timeout` not yet stated for.
@@ -478,11 +494,16 @@ impl Spawned for Instance {
     }
 
     fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error> {
-        let state = lock(&self.proc.state);
+        let mut state = lock(&self.proc.state);
         if state.try_wait_fails {
             return Err(try_wait_failed());
         }
-        Ok(state.exit)
+        let exit = state.exit;
+        if exit.is_some() && state.report_held {
+            state.report_held = false;
+            self.proc.ended.notify_all();
+        }
+        Ok(exit)
     }
 
     fn kill(&self) -> Result<(), cosca::error::Error> {
@@ -510,10 +531,6 @@ impl Spawned for Instance {
         };
         match reply {
             AskReply::Sent => Ok(()),
-            AskReply::SentAndExits(code) => {
-                self.proc.end(status(code));
-                Ok(())
-            }
             AskReply::Io => Err(ask_io()),
             AskReply::Unsupported => Err(ask_unsupported()),
             AskReply::UnsupportedAndExits(code) => {
@@ -527,6 +544,7 @@ impl Spawned for Instance {
             AskReply::MayHaveStarted => Err(ask_may_have_started()),
             AskReply::Unassessable => Err(ask_unassessable()),
             AskReply::UnassessableAndExited(code) => {
+                lock(&self.proc.state).report_held = true;
                 self.proc.end(status(code));
                 Err(ask_unassessable())
             }
@@ -536,7 +554,10 @@ impl Spawned for Instance {
     fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error> {
         self.fake.count(Op::WaitTree);
         self.record(ProcessCall::WaitTree(timeout));
-        let reply = lock(&self.proc.state).tree_waits.pop_front();
+        let reply = {
+            let mut state = lock(&self.proc.state);
+            state.tree_waits.pop_front().or(state.tree_waiting_always)
+        };
         match reply {
             None => self.unstated("wait_tree_timeout"),
             Some(TreeWaitReply::Drained) => {

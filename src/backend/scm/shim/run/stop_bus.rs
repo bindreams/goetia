@@ -205,8 +205,9 @@ pub struct Waiter {
 /// `STOP_PENDING` with no control accepted, must not. Made with the [`Waiter`], before the daemon, and handed
 /// the daemon the same way; it answers each ask the supervisor makes on the bus ([`StopBus::ask`]).
 ///
-/// **When the ask does not answer** before the `timeout` ends or the daemon exits, the supervisor goes on to
-/// the teardown and leaves this thread detached, as it leaves the waiter on its one non-joining arm
+/// **When the ask does not answer** before the `timeout` ends, the supervisor goes on to the teardown, and
+/// before the daemon exits, to the wait for what it left (the ask may have been sent), and leaves this thread
+/// detached, as it leaves the waiter on its one non-joining arm
 /// ([`Supervisor::wait_for_child_or_stop`]): the thread holds its `Arc<dyn Spawned>`, so the child is not
 /// dropped under a call in progress. It ends when the proxy does answer. An ask that answered has its thread
 /// ended and joined.
@@ -411,10 +412,12 @@ impl StopBus {
     }
 
     /// The asker thread's wait for its next ask: whether there is one, `false` once the run is done with the
-    /// asker. Closing wins over an ask not yet taken.
+    /// asker. An ask made is sent even if the supervisor has given up on it meanwhile (a `timeout` of zero): the
+    /// thread is detached then, and the ask is best effort.
     fn next_ask(&self) -> bool {
         self.wait_until(None, |g| g.asker_closed || matches!(g.asking, Asking::Pending));
-        !self.state.lock().unwrap_or_else(PoisonError::into_inner).asker_closed
+        let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        matches!(g.asking, Asking::Pending) || !g.asker_closed
     }
 
     /// The asker thread's answer to the ask it was asked.
@@ -511,8 +514,9 @@ impl Supervisor {
     /// before the plan is neither asked nor waited for, and the tree it left is ended as after any exit.
     /// The ask's answers are mapped in one place ([`judge_ask`]). The ask is made on the waiter's [`Asker`]
     /// thread, so an ask the proxy never answers does not hold the stop: it is waited for with the daemon's exit
-    /// and the `timeout`, and when either comes first it is logged and the teardown follows, with the asker
-    /// detached. The waiter stays in `child.wait()` throughout, which cosca supports beside `terminate_tree`
+    /// and the `timeout`. When the `timeout` comes first it is logged and the teardown follows; when the exit
+    /// does, it is logged and what the daemon left is waited for within the `timeout` as after an ask that may have
+    /// been sent. The asker is detached either way. The waiter stays in `child.wait()` throughout, which cosca supports beside `terminate_tree`
     /// and `wait_tree_timeout`.
     ///
     /// **Which teardown** is chosen by the waiter's report once the plan is over: after an exit,
@@ -768,8 +772,14 @@ impl Supervisor {
         loop {
             let answer = match self.bus.ask(left()) {
                 AskEnd::Answered(answer) => answer,
+                // The daemon exited while its ask was in flight: the event may have been sent and the answer be
+                // on its way, and what the daemon left is then owed its wait, like the worker of a launcher.
+                // Nothing waits for the proxy: the tree is waited for within the `timeout`.
+                AskEnd::Exited => {
+                    self.log.warning(id, &ask_unanswered_at_exit());
+                    break;
+                }
                 // Nothing makes the proxy answer, and nothing waits for it: the teardown follows.
-                AskEnd::Exited => return self.log.warning(id, &ask_unanswered_at_exit()),
                 AskEnd::TimedOut => return self.log.failure(id, &ask_unanswered_at_timeout()),
             };
             match judge_ask(answer) {
@@ -987,7 +997,7 @@ fn ask_unanswered_at_timeout() -> String {
 }
 
 fn ask_unanswered_at_exit() -> String {
-    "the daemon exited while its ask was not answered: whether it was sent is unknown; the tree it left is ended"
+    "the daemon exited while its ask was not answered: whether it was sent is unknown; waiting for what it left as if it had been asked"
         .to_owned()
 }
 
