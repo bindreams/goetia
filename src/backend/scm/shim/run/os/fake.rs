@@ -20,6 +20,8 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
+use cosca::Containment;
+
 use super::{Channels, LogKind, Os, Severity, Spawned};
 use crate::backend::scm::shim::run::logging::Log;
 
@@ -136,6 +138,7 @@ struct Proc {
 }
 
 struct ProcState {
+    containment: Containment,
     waits: VecDeque<WaitReply>,
     kills: VecDeque<KillReply>,
     send_kill_tree_replies: VecDeque<KillReply>,
@@ -168,10 +171,11 @@ impl Proc {
 }
 
 impl FakeProcess {
-    /// A process with no replies stated.
+    /// A job-contained process with no replies stated.
     pub(crate) fn new() -> FakeProcess {
         FakeProcess(Arc::new(Proc {
             state: Mutex::new(ProcState {
+                containment: Containment::JobObject,
                 waits: VecDeque::new(),
                 kills: VecDeque::new(),
                 send_kill_tree_replies: VecDeque::new(),
@@ -193,6 +197,10 @@ impl FakeProcess {
     fn with(self, change: impl FnOnce(&mut ProcState)) -> FakeProcess {
         change(&mut lock(&self.0.state));
         self
+    }
+
+    pub(crate) fn containment(self, containment: Containment) -> FakeProcess {
+        self.with(|state| state.containment = containment)
     }
 
     /// The reply to the next `wait` not yet stated for.
@@ -268,6 +276,10 @@ impl Instance {
 }
 
 impl Spawned for Instance {
+    fn containment(&self) -> Containment {
+        lock(&self.proc.state).containment
+    }
+
     fn wait(&self) -> Result<ExitStatus, cosca::error::Error> {
         let reply = lock(&self.proc.state).waits.pop_front();
         match reply {

@@ -1808,10 +1808,12 @@ code `1003` is the record that the command may still be running.
 
 The shim runs a `protocol: plain` command inside a Windows Job Object and requires
 one. The command is created suspended and assigned to the job before it runs;
-if the job cannot be made or the assignment fails, the command is ended before
-it runs, and the start fails with the Job Object error in the shim log, as any
-spawn the OS refuses does. Nothing of the command ever ran, so the failed start is
-one SCM may retry under its restart policy.
+if the assignment fails, it is resumed anyway and runs outside any job until the
+shim notices and kills it, and anything it started in that time sits outside any
+job too. The shim then logs why and reports `0`, `1003`, as for a `stop` it
+could not complete, because no kill of a tree outside a job shows its
+descendants gone and SCM must not restart over a possible survivor. A `start`
+that sees the service stop with that record is a failed start.
 
 Before the shim reports the service stopped for any reason (the command exiting,
 cleanly or not, or the shim's own wait on it failing), it has the job terminated.
@@ -1885,10 +1887,9 @@ confirms differs:
   first. A `start` that lands as SCM is restarting the command, and that
   restart fails (a missing `goetia-shim` or a broken account), is a failed start,
   as is one where `start` sees the service stop with the shim's `0`, `1003`
-  record before it sees it running. A command that cannot be put in a Job Object
-  is a failed start too: it never runs and the shim never reports running for
-  it; for a command that did run, the shim reports running first, so `start`
-  succeeds if it sees that.
+  record before it sees it running. A command no Job Object contains is always
+  seen that way, as the shim never reports running for it; for a command that
+  did run, the shim reports running first, so `start` succeeds if it sees that.
   For a `protocol: native` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports

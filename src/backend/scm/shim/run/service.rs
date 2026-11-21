@@ -18,7 +18,7 @@ use crate::blob::Blob;
 use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Restart};
 use cosca::error::ChildFate;
-use cosca::{Fd, Stdio};
+use cosca::{ContainMode, Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
@@ -30,7 +30,7 @@ use windows_sys::Win32::System::Services::{
 use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
-use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, terminate_exited_tree};
+use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
 
@@ -373,7 +373,8 @@ impl PassOutcome {
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
-/// non-zero Win32 code or, when cosca cannot say a failed spawn ended it, the incomplete stop. `start_via_notify` reads both as a failed start under every restart
+/// non-zero Win32 code or, when no Job Object contains it or cosca cannot say a failed spawn ended
+/// it, the incomplete stop. `start_via_notify` reads both as a failed start under every restart
 /// policy.
 ///
 /// An exited daemon is an outcome only once the tree it left is terminated: a `start` that lands
@@ -457,8 +458,7 @@ fn exit_report(code: Option<i32>) -> Reported {
 /// nothing to wait on it. `build_command` sits between them but never launches anything.
 ///
 /// The `Err` is what the service reports: the OS error of the failure, `ERROR_GEN_FAILURE`, or the
-/// incomplete stop for a failed spawn that may have left the daemon running. A daemon that cannot be put in
-/// a Job Object is a failed spawn that ran nothing.
+/// incomplete stop for a daemon no Job Object contains or a failed spawn may have left running.
 fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
     let log = &*supervisor.log;
     let waiter = match supervisor.waiter(id) {
@@ -470,7 +470,13 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
     };
     // A waiter that is not handed the daemon is stood down, not dropped: see `Waiter::stand_down`.
     match supervisor.os.spawn(build_command(spec, &*supervisor.os, log, id)) {
-        Ok(child) => Ok((Arc::from(child), waiter)),
+        Ok(child) => match require_job_object(child, spec, log, id) {
+            Ok(child) => Ok((Arc::from(child), waiter)),
+            Err(reported) => {
+                waiter.stand_down();
+                Err(reported)
+            }
+        },
         Err(e) if may_still_run(&e) => {
             log.failure(id, &spawn_failed_daemon_may_run(&spec.common().command, &e));
             waiter.stand_down();
@@ -491,6 +497,28 @@ fn may_still_run(e: &cosca::error::Error) -> bool {
         .is_some_and(|fate| !matches!(fate, ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone))
 }
 
+/// The daemon, if a Job Object contains it. `protocol: plain` is stopped, and restarted after a
+/// failure, only by terminating its whole tree, which `cosca` can guarantee only with a job: when
+/// assigning the job fails it falls back to a process-tree walk that cannot say whether a
+/// descendant was killed. Any other containment is a start failure: the daemon is killed, but
+/// that kill proves nothing about its descendants, so the record is the incomplete stop whatever
+/// the kill returned. SCM never restarts over it, and `start` reads it as a failed start.
+fn require_job_object(
+    child: Box<dyn Spawned>,
+    spec: &DaemonSpec,
+    log: &Log,
+    id: &str,
+) -> Result<Box<dyn Spawned>, Reported> {
+    let containment = child.containment();
+    if containment == Containment::JobObject {
+        return Ok(child);
+    }
+    log.failure(id, &not_job_contained(&spec.common().command, containment));
+    // Dropping the child tries the kill again, and a refusal is not waited on.
+    kill_for_stop(child.as_ref(), log, id);
+    Err(Reported::incomplete_stop())
+}
+
 // Failure reports -----------------------------------------------------------------------------------------------------
 
 const NO_EXIT_CODE: &str = "child exited with no reportable exit code";
@@ -503,6 +531,12 @@ fn thread_refused(command: &[String], e: &std::io::Error) -> String {
     format!(
         "make the thread that waits on {command:?}: {}; it was not spawned, so nothing of this daemon is running",
         Chain(e)
+    )
+}
+
+fn not_job_contained(command: &[String], containment: Containment) -> String {
+    format!(
+        "the daemon {command:?} was contained by {containment}, not a job object: `protocol: plain` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"
     )
 }
 
@@ -581,8 +615,9 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
         cmd.current_dir(cwd.clone());
     }
     cmd.envs(spec.common().env.clone());
-    // A failed Job Object assignment fails the spawn before the daemon runs.
-    cmd.contain();
+    // Best effort, so a daemon no Job Object contains is spawned and then refused by `require_job_object`,
+    // which records the incomplete stop. The strongest request would fail the spawn instead.
+    cmd.contain_with(ContainMode::BestEffort);
 
     let logs = spec.common().logs.as_deref();
     // `Err(None)`: no file, by design, or a failed open that `Log::open_failed` has told.

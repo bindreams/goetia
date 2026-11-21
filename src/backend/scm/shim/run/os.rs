@@ -10,6 +10,7 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
+use cosca::Containment;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
 use crate::backend::scm::default_log;
@@ -47,6 +48,9 @@ pub(crate) enum LogKind {
 /// A spawned daemon. Dropping it kills its tree, as `cosca::Child` does; a kill the OS refuses is
 /// looked at once and never waited on.
 pub(crate) trait Spawned: Send + Sync {
+    /// How the daemon's tree is contained.
+    fn containment(&self) -> Containment;
+
     /// Block until the daemon exits. May be called again once it has, with the same status.
     fn wait(&self) -> Result<ExitStatus, cosca::error::Error>;
 
@@ -132,6 +136,10 @@ impl Os for Real {
 }
 
 impl Spawned for cosca::Child {
+    fn containment(&self) -> Containment {
+        cosca::Child::containment(self)
+    }
+
     fn wait(&self) -> Result<ExitStatus, cosca::error::Error> {
         cosca::Child::wait(self)
     }
