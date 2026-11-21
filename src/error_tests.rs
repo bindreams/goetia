@@ -1693,7 +1693,7 @@ fn error_messages_and_exit_class() {
                 pin: PathBuf::from(r"C:\ProgramData\Goetia\runs\nightly\pin-1.pin"),
             },
             "`nightly` cannot change its account now: its run records are held (`C:\\ProgramData\\Goetia\\runs\\nightly\\pin-1.pin`) \
-             by a run that is starting, a `run` or `stop` of it, or another program, and installing it as another \
+             by a run that is starting, a `run` or `stop` of the task, or another program, and installing it as another \
              account registers it again, which hands them to the new account: wait for that to end, then re-run \
              install",
             false,

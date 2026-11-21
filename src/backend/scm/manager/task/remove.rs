@@ -1,28 +1,35 @@
-//! Removing a task: disable it so that nothing starts another run, stop every run, delete the task and its
-//! run records, and sweep the shim file nothing references any more. None of it needs the account's
-//! password.
+//! Removing a task: disable it so that nothing starts another run, close its run records to any new shim,
+//! stop every run, delete the task and then its run records, and sweep the shim file nothing references
+//! any more. None of it needs the account's password.
 //!
 //! A re-run finishes what a failure left. The steps run in an order whose every prefix is a state the
 //! next `uninstall` reads and completes: a task that is registered and disabled, a task that is gone
 //! with its records left (`uninstall` of an id that is absent removes them), or nothing.
+//!
+//! The task is disabled first, so a trigger that comes due after that does not fire; only a run launched
+//! just before the disable can reach the marker and be refused by its shim. The marker stands from the
+//! step that places it until the re-run (or an install run again with `--force`) finishes: a failure
+//! before it leaves the task disabled with `enable` and `disable` working, and the verbs refuse after it
+//! with the message of [`unfinished_change`](crate::backend::scm::runs::unfinished_change).
 
 use std::path::{Path, PathBuf};
 
 use super::api::Registered;
-use super::verbs::{Processes, System, gone};
+use super::verbs::{Processes, StopPin, System, gone, pin_records};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::InstalledService;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::kill::HoldOutcome;
 use crate::backend::scm::manager::{Scm, Uninstalled, shim_exe};
-use crate::backend::scm::runs::{PauseKind, Runs};
+use crate::backend::scm::runs::{MarkerCheck, PauseKind, Runs};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
-use crate::error::{Error, Result};
+use crate::error::{Error, RECORD_HOLDERS, Result};
 use crate::manager::Budget;
 use crate::spec::Id;
 
 /// Where a failed removal left the task, which is what its message may promise.
+#[derive(Clone, Copy)]
 enum Left {
     /// Disabling it failed: whether it is still enabled is not known.
     Unknown,
@@ -67,10 +74,7 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
 /// holder.
 fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
     match kind {
-        PauseKind::Held => eprintln!(
-            "waiting for {} to be released by a `run` or another program that has it open",
-            waits_for.display()
-        ),
+        PauseKind::Held => eprintln!("waiting for {} to be released by {RECORD_HOLDERS}", waits_for.display()),
         PauseKind::Emptying => eprintln!("waiting for {} to empty", waits_for.display()),
     }
 }
@@ -86,7 +90,7 @@ fn task_shim_host(registered: &Registered) -> Result<Option<PathBuf>> {
 impl Scm {
     /// `uninstall` of a task: under the install lock, the task and its records are removed
     /// ([`Self::task_remove`]), and the shim file nothing references is swept as a service's uninstall
-    /// sweeps it. The runs have exited by then, so no process is left to wait for.
+    /// sweeps it.
     pub(in crate::backend::scm) fn task_uninstall(&self, snapshot: TaskSnapshot) -> Result<()> {
         let _lock = InstallLock::acquire()?;
         let host = task_shim_host(snapshot.registered());
@@ -147,13 +151,22 @@ impl Scm {
     /// 1. The task is disabled (its own flag, `TaskApi::set_enabled`), whether or not it is armed, so
     ///    that nothing starts another run. That is no registration, so it needs no password and works
     ///    for an account whose password changed or that is gone: an uninstall never needs the password.
-    /// 2. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
+    /// 2. The removal's marker is placed ([`Runs::close`]): no shim of the task pins the records from
+    ///    now on, and a shim that is listed has passed its own check of the marker before this, or is
+    ///    stopped by the next step.
+    /// 3. The uninstall's own pin is taken past that marker, which would refuse any other
+    ///    ([`MarkerCheck::Ignore`]): it keeps the shims' prune from deleting a record before it is read.
+    /// 4. Every run that is alive is stopped and its process waited for, with no bound: the exit is the
     ///    event. A run whose shim recorded an incomplete stop, or whose record cannot be read, keeps the
-    ///    task, disabled.
-    /// 3. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder,
-    ///    with no bound, and says on stderr what it waits for. The install lock is held throughout.
+    ///    task, disabled, and the marker: the re-run takes its own pin past it and finishes. The pin is
+    ///    let go once the records are read.
+    /// 5. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder
+    ///    (a shim that pinned before the marker leaves once it reads the task gone).
     ///
-    /// A task that is gone has nothing to disable or stop; the rest finds nothing.
+    /// A task that is gone has nothing to disable or stop; a failure after that says it is not installed
+    /// and records are what is left. A task with no directory of records has no pin to take; its marker
+    /// is placed all the same, unless the `runs` folder is gone too
+    /// ([`Closed::NoRecords`](crate::backend::scm::runs::Closed::NoRecords)).
     pub(super) fn task_remove_with<P: Processes>(
         &self,
         snapshot: &TaskSnapshot,
@@ -163,21 +176,31 @@ impl Scm {
         let id = snapshot.id();
         let path = TaskPath::of(id);
 
-        match self.tasks.set_enabled(&path, false) {
-            Ok(()) => {}
-            Err(e) if gone(&e) => {}
+        // What a failure from here on leaves of the task, as the disable found it.
+        let left = match self.tasks.set_enabled(&path, false) {
+            Ok(()) => Left::Disabled,
+            Err(e) if gone(&e) => Left::LeftoverRecords,
             Err(e) => return Err(uninstall_failed(id, Left::Unknown, e)),
-        }
+        };
 
-        self.task_stop_with("uninstall", id, Budget::Unbounded, runs, processes)
-            .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
+        runs.close().map_err(|e| uninstall_failed(id, left, e))?;
+        let pin = pin_records("uninstall", id, runs, MarkerCheck::Ignore).map_err(|e| uninstall_failed(id, left, e))?;
+        self.task_stop_with(
+            "uninstall",
+            id,
+            Budget::Unbounded,
+            runs,
+            StopPin::Caller(pin),
+            processes,
+        )
+        .map_err(|e| uninstall_failed(id, left, e))?;
 
         match self.tasks.delete(&path) {
             Ok(_) => {}
             // The task is gone, and an empty folder is the scheduler's own: the uninstall is done. The
             // manager has no channel for a warning, so it is said on stderr as its other warnings are.
             Err(e @ Error::TaskFolderKept { .. }) => eprintln!("warning: {}", e.report()),
-            Err(e) => return Err(uninstall_failed(id, Left::Disabled, e)),
+            Err(e) => return Err(uninstall_failed(id, left, e)),
         }
         runs.remove_all(waiting_for_records)
             .map_err(|e| uninstall_failed(id, Left::Records, e))

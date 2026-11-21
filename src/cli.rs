@@ -93,7 +93,7 @@ where
 #[command(
     name = "goetia",
     version,
-    about = "Install system daemons described in goetia.yaml as native services."
+    about = "Install the services and scheduled tasks described in goetia.yaml as native daemons."
 )]
 pub struct Cli {
     /// Emit one machine-readable JSON document on stdout instead of text
@@ -129,8 +129,8 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonCommand {
-    /// Register the service in goetia.yaml. Neither starts nor enables
-    /// it at boot; see --start/--enable.
+    /// Register the service or task in goetia.yaml. Neither starts it nor
+    /// enables it (a task: arms its schedule); see --start/--enable.
     Install(install::Args),
     /// Stop, remove, and reload — for daemon ids no longer present in any
     /// manifest, so this needs no file.
@@ -152,13 +152,14 @@ pub enum DaemonCommand {
     Restart(restart::Args),
     /// Run an idle task once, now: show its output as it is written and exit with the run's own code.
     Run(run::Args),
-    /// Enable a daemon at boot. Does not start it.
+    /// Enable a daemon at boot; a task: arm its schedule. Does not start it.
     Enable(enable::Args),
-    /// Disable a daemon at boot. Does not stop it if running.
+    /// Disable a daemon at boot; a task: disarm its schedule. Does not stop it if running.
     Disable(disable::Args),
-    /// Report the live state of one or more installed daemons.
+    /// Report the live state of one or more installed daemons. A task also reports how its last run ended,
+    /// when it started, and when its schedule starts the next.
     Status(status::Args),
-    /// List every Goetia-managed daemon installed on this host.
+    /// List every Goetia-managed daemon installed on this host, each with its type (service or task).
     List,
     /// Render a daemon's resolved spec as YAML.
     Show(show::Args),
