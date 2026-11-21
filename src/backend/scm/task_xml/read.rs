@@ -24,7 +24,7 @@ impl TaskXml {
     /// The definition of the installed task whose XML is `xml` and whose `Data` is `data`
     /// (`ITaskDefinition.Data`, LF only; the CRLF of the `Xml` form reads the same).
     ///
-    /// The blob decides the id, the name and the account. The principal is not read: Task Scheduler
+    /// The blob decides the id, the name and the account. The principal is not read here: Task Scheduler
     /// rewrites a name to a SID. The settings are read, an element Task Scheduler dropped as its
     /// default read as that default, so a hand edit of one shows as a difference. A trigger or an
     /// action goetia does not write is kept as text in the definition, so that it shows as a
@@ -81,6 +81,7 @@ impl TaskXml {
             name: common.name.clone(),
             host,
             account,
+            registered_for: None,
             triggers,
             data,
             settings,
