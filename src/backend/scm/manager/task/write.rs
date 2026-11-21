@@ -541,10 +541,9 @@ impl Scm {
     ///
     /// Refused first under the removal's marker ([`unfinished_change`]), before the password is asked for. Then
     /// refused when the registration is for another account than the blob's user names now
-    /// ([`TaskSnapshot::other_account`], the comparison `read` shows): registering it in place under the blob's
-    /// name would move the principal to that account and keep the old account's security descriptor, so its shim
-    /// could not read the task, and nothing would show it. An install with `--force` registers it again. A lookup
-    /// that cannot answer is no refusal.
+    /// ([`TaskSnapshot::other_account`]): registering it in place would move the principal and keep the old
+    /// account's security descriptor, so its shim could not read the task. A lookup that cannot answer is no
+    /// refusal.
     pub(super) fn task_set_armed_with(
         &self,
         snapshot: &TaskSnapshot,
@@ -572,8 +571,9 @@ impl Scm {
             TaskXml::with_triggers(&registered.xml, &blob.spec)?
         };
         let account = stored_account(registered)?;
-        if let TaskAccount::User(name) = &account
-            && let Some(shown) = snapshot.other_account(name, sid_of_account)?
+        // A blob that will not decode leaves the account to the principal: the task is registered again under it.
+        if snapshot.blob().is_ok()
+            && let Some(shown) = snapshot.other_account(sid_of_account)?
         {
             return Err(Error::os(
                 format!("{verb} `{id}`"),

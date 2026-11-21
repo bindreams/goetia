@@ -18,7 +18,7 @@ use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
 use crate::backend::scm::shim::acl::read_object;
-use crate::backend::scm::sid::{Sid, sid_from_parts, system};
+use crate::backend::scm::sid::{Sid, sid_display, sid_from_parts, system};
 use crate::backend::scm::test_support::{
     TASK_TOKEN, Undeletable, delete_pending, make_mount_point, registered_task, registered_task_with, task_host,
     task_spec, task_spec_as, task_token,
@@ -2671,25 +2671,28 @@ fn enable_of_a_real_user_task_registers_it_again_with_its_password() {
     assert!(update);
 }
 
-/// Registering the task again in place under the name the blob has would keep the security descriptor of the
-/// registration (the old account's alone), so the new account's shim could not read its task, and nothing would
-/// show it any more: `enable` and `disable` of a task registered for another account than its user names refuse,
-/// naming the registered SID and the remedy, before the password is asked for and with nothing sent.
+/// `enable` and `disable` of a task registered for another account than its user names refuse (see
+/// `task_set_armed_with`).
 fn arming_a_task_registered_for_another_account_is_refused(armed: bool) {
     let (_, snapshot) = user_task(BOB, ALICE, !armed);
+    arming_is_refused_naming(&snapshot, armed, ALICE);
+}
+
+/// `enable` or `disable` of `snapshot` is refused naming `registered` and the remedy, with nothing sent.
+fn arming_is_refused_naming(snapshot: &TaskSnapshot, armed: bool, registered: &str) {
     let fake = Fake::new();
     let (_dir, runs) = records();
 
     let refused = scm(&fake)
-        .task_set_armed_with(&snapshot, armed, &runs, || {
+        .task_set_armed_with(snapshot, armed, &runs, || {
             panic!("the refusal comes before the password is asked for")
         })
         .unwrap_err();
 
     let text = refused.report().to_string();
     assert!(
-        text.contains(ALICE) && text.contains("install --force"),
-        "names the registered SID and the remedy: {text}"
+        text.contains(registered) && text.contains("install --force"),
+        "names the registered account and the remedy: {text}"
     );
     assert_eq!(fake.calls(), [], "nothing was sent to Task Scheduler");
 }
@@ -2702,6 +2705,112 @@ fn enable_of_a_task_registered_for_another_account_is_refused() {
 #[skuld::test]
 fn disable_of_a_task_registered_for_another_account_is_refused() {
     arming_a_task_registered_for_another_account_is_refused(false);
+}
+
+/// A registration with no principal, and one whose principal names no account (a SID text that is no SID, so no
+/// lookup is made), are for no account the blob's user names: refused, with the principal as stated.
+#[skuld::test]
+fn arming_a_task_whose_principal_is_none_or_names_no_account_is_refused() {
+    let principal = format!("<UserId>{BOB}</UserId>");
+    for armed in [true, false] {
+        let (_, bobs) = user_task(BOB, BOB, !armed);
+
+        let none = edited(&bobs, |registered| {
+            registered.xml = registered.xml.replace(&principal, "")
+        });
+        arming_is_refused_naming(&none, armed, "<none>");
+
+        let garbage = edited(&bobs, |registered| {
+            registered.xml = registered.xml.replace(&principal, "<UserId>S-1-5-garbage</UserId>");
+        });
+        arming_is_refused_naming(&garbage, armed, "S-1-5-garbage (no such account)");
+    }
+}
+
+/// `snapshot` with its stored registration edited by `edit`.
+fn edited(snapshot: &TaskSnapshot, edit: impl FnOnce(&mut Registered)) -> TaskSnapshot {
+    let mut registered = snapshot.registered().clone();
+    edit(&mut registered);
+    TaskSnapshot::new(
+        snapshot.id().clone(),
+        snapshot.blob().cloned().map_err(Arc::clone),
+        registered,
+    )
+}
+
+/// The task of the user this test runs as, by the name its blob has, registered for the SID the production lookup
+/// gives that name (read-only).
+fn own_task(armed: bool) -> TaskSnapshot {
+    let name = std::env::var("USERNAME").expect("USERNAME names the user this test runs as");
+    let sid = sid_display(&sid_of_account(&name, Some(Written::Name(&name))).unwrap());
+    let spec = task_spec_as(User::Name(name.clone()), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, armed);
+    registered.xml = registered
+        .xml
+        .replace(&format!("<UserId>{name}</UserId>"), &format!("<UserId>{sid}</UserId>"));
+    assert!(registered.xml.contains(&sid), "the principal is the SID of `{name}`");
+    TaskSnapshot::new(id(), Ok(blob(&spec)), registered)
+}
+
+fn registers_again(calls: &[Call]) -> bool {
+    matches!(calls, [Call::Register { update: true, .. }])
+}
+
+/// A blob whose user is a name goes through: the registration's SID is that name's.
+#[skuld::test]
+fn enable_of_a_task_registered_for_the_sid_its_blobs_name_names_goes_through() {
+    let snapshot = own_task(false);
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
+
+    scm(&fake)
+        .task_set_armed_with(&snapshot, true, &runs, || Ok(Some("secret".to_owned())))
+        .unwrap();
+
+    assert!(registers_again(&fake.calls()), "{:?}", fake.calls());
+}
+
+/// A task whose XML has no action reads from its principal, as a hand edit leaves it: the task is registered again
+/// as it stands, so there is nothing to refuse, though the blob's user is a name and the principal a SID.
+#[skuld::test]
+fn disable_of_a_task_whose_xml_has_no_action_goes_through() {
+    let snapshot = edited(&own_task(true), |registered| {
+        let xml = &mut registered.xml;
+        let (start, end) = (xml.find("<Actions").unwrap(), xml.find("</Actions>").unwrap());
+        xml.replace_range(start..end + "</Actions>".len(), "");
+    });
+    assert!(
+        TaskXml::parse(&snapshot.registered().xml, &snapshot.registered().data).is_err(),
+        "precondition: the XML does not parse"
+    );
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
+
+    scm(&fake)
+        .task_set_armed_with(&snapshot, false, &runs, || Ok(Some("secret".to_owned())))
+        .unwrap();
+
+    assert!(registers_again(&fake.calls()), "{:?}", fake.calls());
+}
+
+/// A blob that will not decode leaves the account to the principal too: `disable` still works on it.
+#[skuld::test]
+fn disable_of_a_task_whose_blob_will_not_decode_goes_through() {
+    let (_, alices) = user_task(ALICE, BOB, true);
+    let mut registered = alices.registered().clone();
+    registered.data = registered.data.replace("Spec: ", "Spec: !");
+    let snapshot = TaskSnapshot::new(id(), Err(Arc::new(Error::blob("test"))), registered);
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
+
+    scm(&fake)
+        .task_set_armed_with(&snapshot, false, &runs, || Ok(Some("secret".to_owned())))
+        .unwrap();
+
+    assert!(registers_again(&fake.calls()), "{:?}", fake.calls());
 }
 
 #[skuld::test]

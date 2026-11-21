@@ -185,8 +185,7 @@ fn a_task_whose_xml_cannot_be_read_is_unreadable_not_a_bad_spec() {
 
 // The account the installed definition shows --------------------------------------------------------------------------
 
-/// The SID text Task Scheduler stores for `alice`'s first account, and for the one created after it under the same
-/// name.
+/// `alice`'s SID before and after the account is created again.
 const OLD_SID: &str = "S-1-5-21-1-2-3-1001";
 const NEW_SID: &str = "S-1-5-21-1-2-3-1002";
 
@@ -344,10 +343,10 @@ fn a_registration_that_names_no_principal_shows_that_it_names_none() {
     assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
 }
 
-/// A principal that names no account (a name nothing maps, a SID text that is no SID) is shown as it stands, and
-/// an install over it is a conflict: the registration is for no account the blob's name names.
+/// A principal that names no account (a name nothing maps, a SID text that is no SID) is shown as it stands, marked
+/// as naming none, and an install over it is a conflict: the registration is for no account the blob's name names.
 #[skuld::test]
-fn a_principal_that_names_no_account_is_shown_as_it_stands() {
+fn a_principal_that_names_no_account_is_shown_marked() {
     for principal in ["ghost", "S-1-5-garbage"] {
         let spec = task_spec_as(User::Name("alice".to_owned()), Some("30 3 * * *"));
         let mut registered = registered_task(&spec, false);
@@ -358,8 +357,52 @@ fn a_principal_that_names_no_account_is_shown_as_it_stands() {
 
         let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID)]));
 
-        assert!(shown.contains(&format!("Account: user {principal:?}")), "{shown}");
+        assert!(
+            shown.contains(&format!("Account: user \"{principal} (no such account)\"")),
+            "{shown}"
+        );
         assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
+    }
+}
+
+/// A principal whose text is the blob's own name, for a name that names no account (the user was deleted), is not
+/// the blob's account: the read shows a difference, so an install is a conflict, as `enable` and `disable` refuse.
+#[skuld::test]
+fn a_principal_that_is_the_blobs_name_and_names_no_account_is_a_conflict() {
+    let (spec, snapshot) = alices("alice");
+
+    let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[]));
+
+    assert!(!shown.contains(r#"Account: user "alice""#), "{shown}");
+    assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
+}
+
+/// A blob that did not decode has no account to compare: that is the error, not "the blob's account".
+#[skuld::test]
+fn the_account_of_a_task_whose_blob_will_not_decode_is_not_compared() {
+    let (_, mut snapshot) = alices(OLD_SID);
+    snapshot.blob = Err(Arc::new(Error::blob("test")));
+
+    let compared = snapshot.other_account(knowing(&[("alice", NEW_SID), (OLD_SID, OLD_SID)]));
+
+    assert!(compared.is_err(), "{compared:?}");
+}
+
+/// A lookup that cannot answer, of either account, is no difference: the blob's account stands.
+#[skuld::test]
+fn a_lookup_that_cannot_answer_leaves_the_account_to_the_blob() {
+    let (_, snapshot) = alices(OLD_SID);
+    let alice = |name: &str, _: Option<Written<'_>>| match name {
+        "alice" => Err(denied(name)),
+        _ => Ok(sid_text(OLD_SID)),
+    };
+    let stored = |name: &str, _: Option<Written<'_>>| match name {
+        "alice" => Ok(sid_text(NEW_SID)),
+        _ => Err(denied(name)),
+    };
+
+    for lookup in [&alice as &dyn Fn(&str, Option<Written<'_>>) -> Result<Sid>, &stored] {
+        assert_eq!(snapshot.other_account(lookup).unwrap(), None);
     }
 }
 

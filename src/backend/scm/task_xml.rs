@@ -529,8 +529,7 @@ pub(crate) fn extract_from_data(data: &str) -> Result<Option<Blob>, Error> {
 
 /// The definition's canonical text, for diffing: the same for a generated definition and a readback
 /// of it, with no armed state and no token. Every value goetia owns is shown, a default Task Scheduler dropped
-/// included; the account is a well-known account's name or the user's, or what the task is registered for when
-/// that is another account ([`TaskXml::shown_for`]).
+/// included; the account is a well-known account's name or the user's.
 impl fmt::Display for TaskXml {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(out, "Name: {}", self.id)?;

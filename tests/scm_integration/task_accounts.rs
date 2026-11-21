@@ -110,9 +110,7 @@ fn a_real_user_task_installs_arms_and_runs(#[fixture(scm_group)] _group: &Group)
     assert!(!records_of(id).exists());
 }
 
-/// The user a task runs as is deleted and created again under the same name, which Task Scheduler does not follow:
-/// it keeps the old SID. A plain install of the unchanged manifest is a conflict naming that SID, not "up to
-/// date", and a forced install with the password registers the new account, whose task then runs.
+/// Task Scheduler keeps the old SID when a user is deleted and created again under the same name.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_task_whose_user_was_created_again_conflicts_naming_the_old_sid_and_a_forced_install_registers_the_new_one(
     #[fixture(scm_group)] _group: &Group,
@@ -134,12 +132,32 @@ fn a_task_whose_user_was_created_again_conflicts_naming_the_old_sid_and_a_forced
     ];
     assert_succeeded("install", &as_user("install", id, &account, &host, &command));
 
+    let spec = task_spec(id, command.clone(), Some(SCHEDULE), User::Name(account.clone()), None);
+
+    // The name names no account now: the registration is still for the old SID, so a plain install is a conflict
+    // naming it and `enable` refuses.
     support::cmd::run("net.exe", &["user", &account, "/delete"]).expect_ok();
+    let gone = mgr
+        .install(&spec, false)
+        .expect("a plain install while the user is gone");
+    let Outcome::Conflict { artifact_diff, .. } = gone else {
+        panic!("a plain install while the user is gone is a conflict: {gone:?}");
+    };
+    assert!(
+        artifact_diff.contains(&old_sid),
+        "the conflict names the old SID: {artifact_diff}"
+    );
+    let refused = mgr.enable(id).expect_err("enable while the user is gone");
+    assert!(
+        refused.report().to_string().contains(&old_sid),
+        "the refusal names the old SID: {}",
+        refused.report()
+    );
+
     support::cmd::run("net.exe", &["user", &account, PASSWORD, "/add"]).expect_ok();
     let new_sid = shown_sid(&sid_for_account_name(&account).expect("the SID of the second account"));
     assert_ne!(old_sid, new_sid, "precondition: the account was created again");
 
-    let spec = task_spec(id, command.clone(), Some(SCHEDULE), User::Name(account.clone()), None);
     let plain = mgr
         .install(&spec, false)
         .expect("a plain install of the unchanged manifest");
