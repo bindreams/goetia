@@ -610,13 +610,27 @@ impl Supervisor {
 
     /// Ask the daemon's tree to exit, then wait for the whole tree to exit within what is left of `timeout`.
     ///
-    /// What the ask answered decides the rest ([`judge_ask`]); a wait that cannot be made is logged and the
-    /// teardown follows at once.
+    /// A daemon that has already exited, read from the process itself, is neither asked nor waited for. What the
+    /// ask answered decides the rest ([`judge_ask`]); a wait that cannot be made is logged and the teardown follows
+    /// at once.
+    ///
+    /// **A tree is waited for after any answer that may mean the event was sent, whether or not the root has
+    /// exited since**: cosca answers `Unassessable` both for a root that had exited when it looked (nothing sent)
+    /// and for an event the proxy generated and could not confirm (sent), and a launcher that was sent the event
+    /// and exited at once has a worker that needs its `timeout`. The one case this waits for that was never asked
+    /// is a root that exits by itself between the read before the ask and the ask: waiting is the safe side, as
+    /// ending a tree that may be shutting down is the worse mistake.
+    ///
+    /// **Delete that window when bindreams/cosca#1054 ships**, which tells the two answers apart.
     ///
     /// **Delete the re-ask loop when bindreams/cosca#1053 ships**, and this whole composition when
     /// bindreams/cosca#1055 does: cosca then answers "no console yet" apart from "never", and has a graceful
     /// stop that does not drain.
     fn ask_and_wait(&self, child: &dyn Spawned, id: &str, timeout: Option<Duration>, seen: Instant) {
+        if self.has_exited(child, id) {
+            // Its report is on its way.
+            return self.bus.await_exit_report();
+        }
         let left = || timeout.map(|t| t.saturating_sub(seen.elapsed()));
         let mut told = false;
         let mut pace = REASK_PACE_FIRST;
@@ -625,15 +639,6 @@ impl Supervisor {
             // with no cap under cosca 0.10.
             match judge_ask(child.terminate_tree()) {
                 Ask::Sent => break,
-                Ask::Unknown(e) => {
-                    // cosca answers this for a root that has exited too, with nothing sent: the root is asked.
-                    if self.has_exited(child, id) {
-                        // Its report is on its way.
-                        return self.bus.await_exit_report();
-                    }
-                    self.log.warning(id, &may_have_asked(&e));
-                    break;
-                }
                 Ask::MaySent(e) => {
                     self.log.warning(id, &may_have_asked(&e));
                     break;
@@ -682,12 +687,10 @@ impl Supervisor {
 enum Ask {
     /// The event was sent.
     Sent,
-    /// It may have been sent: the proxy started and something failed after. Ending a daemon that may be
+    /// It may have been sent: the proxy started and something failed after, or cosca could not tell a root that
+    /// had exited (nothing sent) from an event the proxy could not confirm (sent). Ending a daemon that may be
     /// shutting down is the worse mistake, so the wait is made.
     MaySent(cosca::error::Error),
-    /// Whether it was sent is unknown, and cosca's answer for a root that has exited, with nothing sent, is this
-    /// one too: the daemon is asked whether it has exited, and one that has is not waited for.
-    Unknown(cosca::error::Error),
     /// Nothing was sent, and asking again cannot help: the proxy could not be started.
     NothingSent(cosca::error::Error),
     /// Nothing was sent: the daemon has no console to send it on, yet or ever.
@@ -695,13 +698,12 @@ enum Ask {
 }
 
 /// The one mapping of an ask's answer. `Error` is non-exhaustive and cosca's contract names no other
-/// answer, so one it does not name is read as "may have been sent".
+/// answer, so one it does not name, `Unassessable` included, is read as "may have been sent".
 fn judge_ask(answer: Result<(), cosca::error::Error>) -> Ask {
     match answer {
         Ok(()) => Ask::Sent,
         Err(e @ cosca::error::Error::Io(_)) => Ask::NothingSent(e),
         Err(e @ cosca::error::Error::Unsupported { .. }) => Ask::NotYet(e),
-        Err(e @ cosca::error::Error::Unassessable { .. }) => Ask::Unknown(e),
         Err(e) => Ask::MaySent(e),
     }
 }

@@ -177,9 +177,7 @@ pub(crate) enum AskReply {
     /// the daemon is asked. The waiter's report of it is not seen by the supervisor at a fixed moment.
     UnsupportedAndWaitFails,
     /// `Error::Unassessable`, and the daemon has exited with this code: cosca's answer for a root that has
-    /// exited, when nothing was sent. The waiter's report of the exit lags: it is held until the supervisor
-    /// reads the process itself ([`Spawned::try_wait`]), which is what the lag of the real report makes that read
-    /// for.
+    /// exited by the time the proxy ran, whether or not the proxy sent anything.
     UnassessableAndExited(i32),
 }
 
@@ -367,6 +365,15 @@ impl FakeProcess {
         self.with(|state| state.asking_always = Some(reply))
     }
 
+    /// A process that has exited with `code`, whose report by the waiter lags: it is held until the supervisor reads
+    /// the process itself ([`Spawned::try_wait`]), as the real report can lag the exit.
+    pub(crate) fn exited_unreported(self, code: i32) -> FakeProcess {
+        self.with(|state| {
+            state.report_held = true;
+            state.exit = Some(status(code));
+        })
+    }
+
     /// Every read of whether the process has exited fails.
     pub(crate) fn try_wait_fails(self) -> FakeProcess {
         self.with(|state| state.try_wait_fails = true)
@@ -490,6 +497,8 @@ impl Spawned for Instance {
     fn terminate_tree(&self) -> Result<(), cosca::error::Error> {
         self.fake.count(Op::Ask);
         self.record(ProcessCall::Ask);
+        // The proxy takes long enough for the waiter's report to have come in.
+        self.proc.release_report();
         let reply = {
             let mut state = lock(&self.proc.state);
             state.asks.pop_front().or(state.asking_always)
@@ -517,7 +526,6 @@ impl Spawned for Instance {
             AskReply::MayHaveStarted => Err(ask_may_have_started()),
             AskReply::Unassessable => Err(ask_unassessable()),
             AskReply::UnassessableAndExited(code) => {
-                lock(&self.proc.state).report_held = true;
                 self.proc.end(status(code));
                 Err(ask_unassessable())
             }

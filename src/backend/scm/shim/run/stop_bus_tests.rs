@@ -689,7 +689,7 @@ fn ask_and_wait_asks_once_and_waits_for_the_timeout() {
         panic!("asked, waited, then ended: {:?}", daemon.calls());
     };
     assert!(
-        left <= HOUR && left > HOUR - Duration::from_secs(60),
+        left <= HOUR && left > HOUR / 2,
         "the wait was given {left:?} of {HOUR:?}, which counts from the moment the stop was seen"
     );
     assert_eq!(
@@ -940,26 +940,51 @@ fn an_ask_that_is_unsupported_stops_when_the_daemon_exits() {
     assert_eq!(fake.take_warnings(), [unsupported_warning()]);
 }
 
-/// cosca answers `Unassessable` for a root that has exited too, with nothing sent: the daemon is asked
-/// about itself, and one that has exited is not waited for. The tree it left is ended as after any exit.
+/// A daemon that has exited, whose report has not come in yet, is neither asked nor waited for: the supervisor
+/// reads the process itself, not only the waiter's report. The tree it left is ended as after any exit.
 #[skuld::test]
-fn an_ask_answered_unassessable_by_an_exited_daemon_is_not_waited_for() {
+fn a_daemon_that_has_exited_unreported_is_neither_asked_nor_waited_for() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .exited_unreported(3)
+        .send_kill_tree(KillReply::Ends);
+
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert_eq!(daemon.calls(), [ProcessCall::SendKillTree]);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    assert_eq!(fake.take_warnings(), Vec::<String>::new());
+}
+
+/// cosca answers `Unassessable` for a root that had exited when it looked (nothing sent) and for an event the proxy
+/// generated and could not confirm (sent), and the two cannot be told apart: a daemon that exited after the ask is
+/// still waited for, so that a launcher that was sent the event and exited at once has its tree given the `timeout`.
+#[skuld::test]
+fn an_ask_answered_unassessable_is_waited_for_though_the_daemon_has_exited() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Blocks)
         .ask(AskReply::UnassessableAndExited(3))
-        .send_kill_tree(KillReply::Refuses);
+        .wait_tree(TreeWaitReply::Drained)
+        .send_kill_tree(KillReply::Ends);
 
     let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
 
-    assert!(
-        matches!(outcome, WaitOutcome::TreeMayRun),
-        "the exited-tree teardown is the one that cannot fall back to a direct kill"
-    );
-    assert_eq!(daemon.calls(), [ProcessCall::Ask, ProcessCall::SendKillTree]);
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    let [ProcessCall::Ask, ProcessCall::WaitTree(_), ProcessCall::SendKillTree] = daemon.calls()[..] else {
+        panic!("asked, waited, then ended: {:?}", daemon.calls());
+    };
     assert_eq!(daemon.exit_code(), Some(3));
-    assert_eq!(fake.take_warnings(), Vec::<String>::new());
-    assert_eq!(fake.take_failures().len(), 1, "only the tree that could not be ended");
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    assert_eq!(
+        fake.take_warnings(),
+        [format!(
+            "goetia-shim[{ID}]: the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
+            Chain(&ask_unassessable())
+        )]
+    );
 }
 
 /// A read of the exit that fails says nothing: the daemon is waited for as before, and the read's failure is
@@ -1064,7 +1089,10 @@ fn a_wait_that_fails_while_the_daemon_is_asked_again_ends_the_asking_and_is_not_
         failures[0].ends_with(&format!("background wait on child: {}", Chain(&wait_failed()))),
         "{failures:?}"
     );
-    assert!(failures.iter().all(|f| !f.contains("exited")), "{failures:?}");
+    assert!(
+        failures.iter().all(|f| !f.contains("after the daemon ended")),
+        "the failed wait was read as an exit, and the tree it left was ended as one: {failures:?}"
+    );
     let _ = fake.take_warnings();
 }
 
@@ -1088,6 +1116,38 @@ fn an_ask_that_is_unsupported_with_the_timeout_spent_is_not_asked_again() {
         )),
     );
     assert_eq!(fake.take_warnings(), Vec::<String>::new());
+}
+
+/// A `timeout` that runs out while the daemon is being asked again ends the asking, and the teardown follows. The
+/// `timeout` is short enough to run out at any of the checks, so how many asks were made is not what is asserted:
+/// the daemon is asked at least once, every ask precedes the teardown, and the tree is not waited for.
+#[skuld::test]
+fn a_timeout_that_runs_out_while_the_daemon_is_asked_again_is_followed_by_the_teardown() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .asking_always(AskReply::Unsupported)
+        .send_kill_tree(KillReply::Ends);
+
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(Duration::from_millis(1))));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    let calls = daemon.calls();
+    assert_eq!(calls.first(), Some(&ProcessCall::Ask));
+    assert_eq!(calls.last(), Some(&ProcessCall::SendKillTree));
+    assert!(
+        calls[..calls.len() - 1].iter().all(|call| *call == ProcessCall::Ask),
+        "every ask precedes the teardown, and nothing is waited for: {calls:?}"
+    );
+    assert_failures(
+        &fake.take_failures(),
+        ID,
+        &failure_line(format!(
+            "the daemon was never asked to exit: {}; its timeout is over, so it is ended without being asked",
+            Chain(&ask_unsupported())
+        )),
+    );
+    let _ = fake.take_warnings();
 }
 
 /// The wait that cannot be made is a failed wait of the tree: logged, and the daemon is ended now.
