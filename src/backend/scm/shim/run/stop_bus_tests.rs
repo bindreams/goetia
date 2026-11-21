@@ -839,7 +839,7 @@ fn a_second_stop_does_not_ask_again() {
     assert_ends(&fake, ask_and_wait(Some(HOUR)));
 }
 
-// The thread that asks ----------------------------------------------------------------------------------------------
+// The thread that asks ------------------------------------------------------------------------------------------------
 
 /// A stop that asks nothing makes no thread to ask with.
 #[skuld::test]
