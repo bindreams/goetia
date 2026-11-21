@@ -1051,7 +1051,10 @@ fn a_wait_that_fails_while_the_daemon_is_asked_again_ends_the_asking_and_is_not_
     );
     let calls = daemon.calls();
     assert_eq!(calls.first(), Some(&ProcessCall::Ask));
-    assert_eq!(&calls[calls.len() - 2..], [ProcessCall::SendKillTree, ProcessCall::Kill]);
+    assert_eq!(
+        &calls[calls.len() - 2..],
+        [ProcessCall::SendKillTree, ProcessCall::Kill]
+    );
     assert!(
         calls[..calls.len() - 2].iter().all(|call| *call == ProcessCall::Ask),
         "the tree of a daemon whose wait failed was waited for: {calls:?}"
