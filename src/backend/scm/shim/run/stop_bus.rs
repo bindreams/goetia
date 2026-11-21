@@ -577,7 +577,7 @@ impl Supervisor {
     }
 }
 
-// Stop plans ----------------------------------------------------------------------------------------------------------------
+// Stop plans ----------------------------------------------------------------------------------------------------------
 
 /// How long the asking pauses between two answers of `Unsupported`, which says the daemon has no console to be
 /// sent the event on yet. The pause only spaces the re-asks of a question each answer decides; a daemon's exit ends it

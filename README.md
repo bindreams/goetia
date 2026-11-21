@@ -226,14 +226,14 @@ entry that writes only `timeout` keeps the base's `send-signal`.
 
 `send-signal` is one of:
 
-| Value                              | systemd                | launchd            | Windows                                  |
-| ---------------------------------- | ---------------------- | ------------------ | ---------------------------------------- |
-| `terminate` (default)              | `SIGTERM`              | SIGTERM            | Ctrl+C                                   |
-| `interrupt`                        | `SIGINT`               | refused            | Ctrl+C                                   |
-| `quit`                             | `SIGQUIT`              | refused            | Ctrl+Break                               |
-| `kill`                             | `SIGKILL`              | `ExitTimeOut` of 1 | ends the daemon at once                  |
-| `sigusr1`, `SIGRTMIN+3`, ...       | that signal (any case) | refused            | refused                                  |
-| `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close`: see below)       |
+| Value                              | systemd                | launchd            | Windows                            |
+| ---------------------------------- | ---------------------- | ------------------ | ---------------------------------- |
+| `terminate` (default)              | `SIGTERM`              | SIGTERM            | Ctrl+C                             |
+| `interrupt`                        | `SIGINT`               | refused            | Ctrl+C                             |
+| `quit`                             | `SIGQUIT`              | refused            | Ctrl+Break                         |
+| `kill`                             | `SIGKILL`              | `ExitTimeOut` of 1 | ends the daemon at once            |
+| `sigusr1`, `SIGRTMIN+3`, ...       | that signal (any case) | refused            | refused                            |
+| `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close`: see below) |
 
 A value a platform cannot send is refused, naming the platform, and never turned
 into another signal: `sigterrm` is an error, not a `SIGTERM`. `SIGTERM`, `SIGINT`,

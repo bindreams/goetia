@@ -731,7 +731,7 @@ fn append_line_reports_a_failed_write() {
     assert!(append_line(&mut out, "the line").is_err());
 }
 
-// The supervisor over a real daemon ----------------------------------------------------------------------------------
+// The supervisor over a real daemon -----------------------------------------------------------------------------------
 
 /// Ends the daemon's tree when dropped, so a failing test leaves no sleeper behind.
 struct EndTree(Arc<dyn Spawned>);
