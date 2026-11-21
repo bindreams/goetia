@@ -1,6 +1,6 @@
 [package]
 name = "goetia"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 # `skuld` 0.7 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
 rust-version = "1.89"
