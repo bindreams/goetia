@@ -2,7 +2,7 @@
 name = "goetia"
 version = "0.3.0"
 edition = "2024"
-# `skuld` 0.6 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
+# `skuld` 0.7 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
 rust-version = "1.89"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
