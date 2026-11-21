@@ -87,13 +87,23 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
     assert_reaped(pid);
 }
 
-/// `pid` is gone, not a zombie: a zombie still answers `kill(pid, 0)` successfully, so `ESRCH` is
-/// what proves the reap, not merely the kill or an exit status seen.
+/// This process has no child `pid` left to wait for: it was reaped. Asked with a `waitid` that consumes
+/// nothing, which answers `ECHILD` for a pid that is no child of ours, and so stays true if another
+/// process takes the number once the reap has freed it (`kill(pid, 0)` would find that process). A
+/// zombie, or a child still running, answers with success instead.
 fn assert_reaped(pid: u32) {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
     let err = io::Error::last_os_error();
-    assert_eq!(rc, -1, "pid {pid} is still there: a zombie, never reaped");
-    assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+    assert_eq!(rc, -1, "child {pid} is still ours to wait for: never reaped");
+    assert_eq!(err.raw_os_error(), Some(libc::ECHILD));
 }
 
 #[skuld::test]
@@ -197,7 +207,7 @@ fn descendant_on_fd3(child: &mut cosca::Child) -> KillOnDrop {
 /// stream is read only until the deadline, and comes back marked not whole — never waited on for
 /// an EOF that descendant would give in 68 years.
 ///
-/// Deterministic, with no timing bet: the test reaps the child itself before the wait, so the wait
+/// Deterministic, with no timing bet: the test waits for the child's exit itself before the wait, so the wait
 /// finds it exited whatever the deadline, and the deadline is spent before the wait begins, so the
 /// read ends at once. A spent deadline alone marks the capture not whole
 /// ([`a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end`]), so what this test adds
@@ -876,7 +886,7 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
 /// The child exits `7` at EOF on its stdin, and the test's write end reaches the reaper along with
 /// the child: the reaper's `wait` drops it, so the child can exit only once it is the reaper's and
 /// the reaper is waiting. Whatever killed it before then — the expiry, or the reaper itself — shows
-/// as a signal instead of `7`, with no race. A child nobody reaps reports nothing: the reaper's
+/// as a signal instead of `7`, with no race. A child no reaper waits on reports nothing: the reaper's
 /// sender is dropped unsent, which `recv` returns as an error.
 #[skuld::test]
 fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
@@ -942,7 +952,7 @@ fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> Exit
 fn reaped_status(pid: u32, reaped: &mpsc::Receiver<Result<ExitStatus, cosca::error::Error>>) -> ExitStatus {
     let status = reaped
         .recv()
-        .expect("a request left running must be reaped once it exits")
+        .expect("the reaper of a request left running reports once it exits")
         .expect("waiting on the child");
     assert_reaped(pid);
     status

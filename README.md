@@ -41,11 +41,10 @@ one that holds the tool must be one the calling account can search: an entry it
 cannot search stops the search with an error that names the entry, even when a
 later entry holds the tool (for example after switching user while keeping the
 old `PATH`). A `PATH` must be set: with none the tool is not found, and there is
-no default search path. The first file of that name on `PATH` is the one run,
-executable or not. To recover, remove or fix the entry, or run with a system
-`PATH` such as `/usr/bin:/bin:/usr/sbin:/sbin`. (`plutil`, which `install` runs
-on macOS to check a plist, is not found this way: the operating system finds
-it.)
+no default search path. The search takes the first file of that name on
+`PATH`, whatever its mode: one that cannot be executed fails the call, and the
+search does not go on. To recover, remove or fix the entry, or run with a
+system `PATH` such as `/usr/bin:/bin:/usr/sbin:/sbin`.
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds

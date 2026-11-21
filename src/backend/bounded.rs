@@ -38,12 +38,12 @@ use cosca::identity::Liveness;
 /// [`wait_bounded`] tears the contained tree down with `send_kill_tree` on expiry, and by dropping the
 /// child on every path. Where its output goes is [`spawn`]'s to decide, by [`Role`].
 ///
-/// The containment is best effort ([`cosca::ContainMode::BestEffort`]): where the strongest mechanism
-/// fails to set up, the child gets a process group instead, which cosca logs at `warn`, and the
-/// `systemctl` or `launchctl` call still runs. `Strongest` would fail the spawn for some of those
-/// failures: on Linux a cgroup limit such as `cgroup.max.depth`, a failed inotify watch or a failed
-/// placement write of the child, on macOS a failed install of the inherited-fd marker. A cgroup the
-/// process may not use is not one of them: both modes give a process group for it.
+/// The containment is best effort ([`cosca::ContainMode::BestEffort`]), as cosca 0.8's was: some failures
+/// to set up the strongest mechanism give the child a process group instead, which cosca logs at `warn`,
+/// where `Strongest` would fail the spawn. On Linux those are a cgroup limit such as `cgroup.max.depth`, a
+/// failed inotify watch and a failed placement write of the child; on macOS, a failed install of the
+/// inherited-fd marker. Neither mode changes the rest: a cgroup the process may not use gives a process
+/// group in both, and a child whose placement cannot be proven fails the spawn in both.
 pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
     let mut cmd = cosca::run(std::iter::once(program).chain(args.iter().copied()));
     cmd.stdin(cosca::Stdio::null())?;
