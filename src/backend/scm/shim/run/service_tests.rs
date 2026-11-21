@@ -11,7 +11,10 @@ use std::sync::Arc;
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
-use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
+use crate::spec::{
+    DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, TaskFields,
+    TaskSpec,
+};
 use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
 use cosca::error::ChildFate;
@@ -36,7 +39,7 @@ const ID: &str = "goetia-shim-launch-test";
 
 /// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report.
 fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnce()) -> Reported {
-    super::run_daemon(spec, supervisor, ID, on_running, || {})
+    super::run_daemon(spec, supervisor, ID, on_running, |_| {})
 }
 
 /// Where [`spec`]'s daemon logs. The `Fake` opens nothing there.
@@ -50,6 +53,28 @@ const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.
 /// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
     spec_logging_to(Some(PathBuf::from(DAEMON_LOG)))
+}
+
+/// [`spec`] that a stop ends at once (`send-signal: kill`): no ask, no wait, which is what the tests of the
+/// teardown and of the reports state replies for.
+fn kill_spec() -> DaemonSpec {
+    stopping_by(StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    })
+}
+
+/// [`spec`] whose stop is `action`.
+fn stopping_by(action: StopAction) -> DaemonSpec {
+    let DaemonSpec::Service(service) = spec() else {
+        unreachable!("`spec` is a service")
+    };
+    ServiceSpec::new(ServiceFields {
+        stop_action: action,
+        ..service.into_fields()
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
 }
 
 /// [`spec`], with the `logs:` that is given.
@@ -471,7 +496,7 @@ fn running_is_reported_once_and_after_the_spawn() {
     let mut running_reports = Vec::new();
 
     // The stop ends the pass once the report is made; the daemon runs until then.
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         running_reports.push(fake.calls(Op::Spawn));
         supervisor.bus.request_stop();
     });
@@ -535,7 +560,7 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         supervisor.bus.request_stop();
     });
 
@@ -764,10 +789,10 @@ fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) 
 fn run_daemon_is_run_pass_then_reported() {
     for ending in endings() {
         let outcome = pass_of(&ending, |supervisor, on_running| {
-            run_pass(&spec(), supervisor, ID, on_running, || {})
+            run_pass(&kill_spec(), supervisor, ID, on_running, |_| {})
         });
         let reported = pass_of(&ending, |supervisor, on_running| {
-            super::run_daemon(&spec(), supervisor, ID, on_running, || {})
+            super::run_daemon(&kill_spec(), supervisor, ID, on_running, |_| {})
         });
 
         assert_eq!(outcome, ending.outcome);
@@ -787,7 +812,7 @@ fn run_recording_stopping(
     on_running: impl FnOnce(),
 ) -> (Reported, Vec<usize>) {
     let mut stopping = Vec::new();
-    let reported = super::run_daemon(daemon, supervisor, ID, on_running, || {
+    let reported = super::run_daemon(daemon, supervisor, ID, on_running, |_| {
         stopping.push(fake.calls(Op::SendKillTree));
     });
     (reported, stopping)
@@ -797,12 +822,97 @@ fn run_recording_stopping(
 /// while a host holds it (measured), which is what keeps `start` from reading the service as up.
 #[skuld::test]
 fn the_stopping_status_accepts_no_control_and_records_no_exit() {
-    let status = stopping_status();
+    let status = stopping_status(Duration::from_secs(10));
 
     assert_eq!(status.dwCurrentState, SERVICE_STOP_PENDING);
     assert_eq!(status.dwControlsAccepted, 0);
     assert_eq!((status.dwWin32ExitCode, status.dwServiceSpecificExitCode), (0, 0));
     assert_eq!((status.dwCheckPoint, status.dwWaitHint), (1, 10_000));
+}
+
+/// The hint covers what the stop can take: the `timeout` and the teardown, in milliseconds, and for no
+/// `timeout` the largest value the field holds. The longest `timeout` and the margin fit the field.
+#[skuld::test]
+fn the_stopping_hint_is_the_stops_longest_wait_in_milliseconds() {
+    let longest = StopAction::MAX_TIMEOUT + StopAction::TEARDOWN_MARGIN;
+
+    assert_eq!(stopping_status(Duration::from_secs(40)).dwWaitHint, 40_000);
+    assert_eq!(stopping_status(longest).dwWaitHint, 86_410_000);
+    assert_eq!(stopping_status(Duration::MAX).dwWaitHint, u32::MAX);
+    assert_eq!(
+        stopping_status(Duration::from_secs(u64::from(u32::MAX))).dwWaitHint,
+        u32::MAX
+    );
+}
+
+/// The hint a run reports follows its plan and what ended the wait.
+#[skuld::test]
+fn the_service_reports_the_hint_of_its_plan() {
+    let spec = spec();
+    let plan = StopPlan::of(&spec);
+
+    assert_eq!(plan.wait_hint(WaitEnd::Stop), Duration::from_secs(40));
+    assert_eq!(plan.wait_hint(WaitEnd::Exit), Duration::from_secs(10));
+}
+
+/// Ctrl+C for the signals Windows maps to it, Ctrl+Break for the two it maps to that, and nothing to send for
+/// `kill` and, until unit 3c, `wm-close`.
+#[skuld::test]
+fn each_signal_is_the_console_event_it_is_on_windows() {
+    use cosca::CtrlEvent::{CtrlBreak, CtrlC};
+    let events = [
+        (StopSignal::Terminate, Some(CtrlC)),
+        (StopSignal::Interrupt, Some(CtrlC)),
+        (StopSignal::CtrlC, Some(CtrlC)),
+        (StopSignal::Quit, Some(CtrlBreak)),
+        (StopSignal::CtrlBreak, Some(CtrlBreak)),
+        (StopSignal::Kill, None),
+        (StopSignal::WmClose, None),
+    ];
+    for (signal, event) in events {
+        assert_eq!(console_event(signal), event, "{signal}");
+    }
+}
+
+// The host that can ask -----------------------------------------------------------------------------------------------
+
+/// A stop that asks goes through a copy of the host (cosca's proxy), which runs the host's `main`: a host
+/// that did not call `init_helpers` first is refused, with the error naming the call, and not restarted.
+#[skuld::test]
+fn a_host_that_did_not_initialise_is_refused_when_the_stop_asks() {
+    let stop = refuse_unready_host(&spec(), false).expect_err("a stop that asks needs the proxy");
+
+    assert_eq!(stop.reported, Reported::Refused);
+    assert!(
+        stop.message.contains("goetia::shim::init_host()") && stop.message.contains("first"),
+        "the refusal does not name the call: {}",
+        stop.message
+    );
+}
+
+#[skuld::test]
+fn a_host_that_initialised_is_not_refused() {
+    refuse_unready_host(&spec(), true).expect("a host that called `init_helpers`");
+}
+
+/// A stop that asks nothing needs no proxy: `kill` and `wm-close` (until 3c) are not refused, and neither
+/// is a task, which asks nothing in part 1.
+#[skuld::test]
+fn a_host_that_did_not_initialise_is_not_refused_when_the_stop_asks_nothing() {
+    refuse_unready_host(&kill_spec(), false).expect("`send-signal: kill` asks nothing");
+    refuse_unready_host(
+        &stopping_by(StopAction {
+            send_signal: StopSignal::WmClose,
+            timeout: Some(Duration::from_secs(5)),
+        }),
+        false,
+    )
+    .expect("`send-signal: wm-close` asks nothing for now");
+    refuse_unready_host(
+        &crate::testing::task(ID, vec!["C:/daemon.exe".to_string()], None),
+        false,
+    )
+    .expect("a task asks nothing");
 }
 
 #[skuld::test]
@@ -815,13 +925,13 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
     let mut alive_when_stopping = Vec::new();
 
     let reported = super::run_daemon(
-        &spec(),
+        &kill_spec(),
         &supervisor,
         ID,
         || {
             supervisor.bus.request_stop();
         },
-        || {
+        |_| {
             alive_when_stopping.push((fake.calls(Op::SendKillTree), !daemon.ended()));
         },
     );
@@ -1103,7 +1213,7 @@ fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
             .send_kill_tree(KillReply::Ends),
     );
 
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_STOP), NO_ERROR)
     });
 

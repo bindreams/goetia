@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use cosca::Containment;
+use cosca::containment::TreeDrain;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
 use crate::backend::scm::default_log;
@@ -60,6 +62,15 @@ pub(crate) trait Spawned: Send + Sync {
     /// Send the kill to the daemon's whole tree. `Ok` means every member was reached, not that any has
     /// exited.
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error>;
+
+    /// Ask the daemon's whole tree to exit, with the stop the command was built with
+    /// (`Command::graceful_stop`), and return once the ask is made: it waits for nothing the daemon
+    /// does. Answers as `cosca::Child::terminate_tree` does.
+    fn terminate_tree(&self) -> Result<(), cosca::error::Error>;
+
+    /// Wait up to `timeout` for every member of the daemon's Job Object to exit. `Duration::MAX` is
+    /// no bound.
+    fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error>;
 }
 
 /// How a line is reported to the Event Log.
@@ -150,6 +161,14 @@ impl Spawned for cosca::Child {
 
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
         cosca::Child::send_kill_tree(self)
+    }
+
+    fn terminate_tree(&self) -> Result<(), cosca::error::Error> {
+        cosca::Child::terminate_tree(self)
+    }
+
+    fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error> {
+        cosca::Child::wait_tree_timeout(self, timeout)
     }
 }
 

@@ -233,7 +233,7 @@ entry that writes only `timeout` keeps the base's `send-signal`.
 | `quit`                             | `SIGQUIT`              | refused            | Ctrl+Break                               |
 | `kill`                             | `SIGKILL`              | `ExitTimeOut` of 1 | ends the daemon at once                  |
 | `sigusr1`, `SIGRTMIN+3`, ...       | that signal (any case) | refused            | refused                                  |
-| `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close` posts `WM_CLOSE`) |
+| `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close`: see below)       |
 
 A value a platform cannot send is refused, naming the platform, and never turned
 into another signal: `sigterrm` is an error, not a `SIGTERM`. `SIGTERM`, `SIGINT`,
@@ -279,9 +279,30 @@ records the end as it does.
   when the wait is spent just as the `timeout` ends, and the error says whether
   a `SIGKILL` had gone out. The wait does not count the time a queued start took
   to fork.
-- **Windows** reads, checks and records the field, and does not apply it yet:
-  the shim still ends the daemon at once on every stop, `stop`, `restart` and
-  `uninstall` included, whatever `stop-action` says. A task is stopped by Task
+- **Windows** applies it to a `protocol: plain` service. A stop, from `stop`, `restart`, `uninstall` or SCM
+  itself (`sc stop`), sends the daemon the console event `send-signal` names (Ctrl+C for `terminate`,
+  `interrupt` and `ctrl-c`; Ctrl+Break for `quit` and `ctrl-break`), through a copy of the shim host that
+  attaches to the daemon's console, and then waits for the daemon's whole process tree to exit for up to
+  `timeout` (as long as it takes for `null`) before it ends what is left. A launcher whose worker needs time
+  to exit, and whatever a daemon that honoured the event left running, have the `timeout` too; a daemon that
+  has already exited is not asked, and what it left in the job is ended at once. `kill` sends nothing and ends
+  the daemon at once. `wm-close` still does too: it sends nothing yet. The limits:
+  - The event reaches every process that shares the daemon's console, not only the daemon.
+  - A program with no console (a GUI program) cannot be sent the event, so it is ended only when its
+    `timeout` is over; write `send-signal: kill` for one. A stop right after a `start` finds the daemon
+    without its console for a few milliseconds: the shim asks again until the daemon has it, exits, or the
+    `timeout` is over.
+  - `stop` and `restart` wait the `timeout` plus 10 s, as above. `uninstall` waits up to the `timeout`
+    too, holding the machine-wide install lock as it does for any stop, so an `install` or `uninstall` of
+    another daemon waits behind it. For `timeout: null` and a tree that never exits it waits until
+    `goetia daemon kill` ends the daemon; a `stop --timeout` ends only goetia's own wait.
+  - The service reports `STOP_PENDING` with a wait hint that covers the `timeout` and the teardown (the
+    largest value the field holds for `null`); SCM does nothing when a hint runs out.
+  - A program that hosts the shim itself calls `goetia::shim::init_host()` first in its `main` (see
+    [Shipping the shim from a library](#shipping-the-shim-from-a-library)); a host that does not is refused when the service starts, with an error that names the
+    call. `send-signal: kill` and `wm-close` need no such host.
+
+  A task is stopped by Task
   Scheduler, which decides the signal and the wait, so a task refuses a
   `send-signal` or `timeout` that is not the default; set it under `backend-specific` for systemd and launchd. A
   `protocol: native` service handles SCM's own stop itself, so it refuses
@@ -1607,6 +1628,8 @@ when it is started as the host:
 
 ```rust
 fn main() {
+    // First, before anything else, whether or not this run is the host.
+    goetia::shim::init_host();
     if std::env::args().nth(1).as_deref() == Some("--service-host") {
         goetia::shim::main()
     }
@@ -1618,6 +1641,12 @@ Scm::with_shim(
     CheckPermissions::Enable,
 )
 ```
+
+`goetia::shim::init_host()` first in `main` is what lets a stop ask a daemon to exit on Windows (see
+[`stop-action`](#stop-action)): the console event is sent by a copy of the host program that cosca starts, which
+runs `main` from the top, and `init_host` is what turns that copy into the sender and ends it. Anything `main`
+does before the call runs in every copy too. A host that did not call it is refused when a service whose stop
+asks starts. The stock shim (`goetia::stock_shim!()`) makes the call itself.
 
 Tasks run under the same host, which Task Scheduler starts with `--goetia-task
 <id> <token>` after the host's own arguments. A program that calls
@@ -1817,7 +1846,8 @@ that sees the service stop with that record is a failed start.
 
 Before the shim reports the service stopped for any reason (the command exiting,
 cleanly or not, or the shim's own wait on it failing), it has the job terminated.
-A `stop` does the same before it reports. If the job cannot
+A `stop` first asks the command to exit and waits for the job to drain, as
+[`stop-action`](#stop-action) says, and then does the same before it reports. If the job cannot
 be terminated, the shim reports `0`, `1003` as for a `stop` it could not
 complete, whatever `stop` follows.
 
@@ -1935,8 +1965,8 @@ going down, or may never have moved.
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is
 refused — for a `protocol: plain` daemon almost always, since its service reads
-`RUNNING` until the shim has taken the stop, then `STOP_PENDING` until its
-child is gone — which leaves the daemon stopped, at exit `4`. To restart a
+`RUNNING` until the shim has taken the stop, then `STOP_PENDING` until the
+daemon's tree has exited or its `timeout` is over — which leaves the daemon stopped, at exit `4`. To restart a
 daemon on Windows, let `restart` wait for the stop: leave `--timeout` at its
 default, or give it a duration other than `0`.
 

@@ -47,7 +47,7 @@ use crate::support::{self, ConnectBack, Group, LocalUserGuard, WorldReadableExe,
 
 /// `%ProgramFiles%\Goetia`, emptied of an earlier run's leftovers, and removed when the guard drops.
 /// Made before anything is written into it.
-fn default_folder() -> (PathBuf, DirGuard) {
+pub(crate) fn default_folder() -> (PathBuf, DirGuard) {
     let exe = embedded_shim(None).preview().expect("locate the default folder").exe;
     let folder = exe.parent().expect("the shim has a folder").to_path_buf();
     cleanup::remove_or_warn(&folder, true);
