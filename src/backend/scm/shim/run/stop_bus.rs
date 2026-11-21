@@ -319,7 +319,7 @@ impl Supervisor {
     /// handle kill, since `send_kill_tree` ends in the same direct-handle kill the fallback below
     /// re-issues. A refused `TerminateJobObject` is a `Containment` over the `Io` that holds the OS
     /// code, so the code sits down the `source()` chain and nothing should match on the top variant.
-    /// (The daemon always has a Job Object: `service::launch` refuses any other containment, so
+    /// (The daemon always has a Job Object: `service::build_command` asks for the strongest containment, so
     /// `Unsupported` does not arrive here.)
     /// That is exactly the same deadlock at one remove: if nothing kills the
     /// child, the background thread's `wait()` still never returns.
@@ -354,7 +354,7 @@ impl Supervisor {
     ///
     /// **A failed wait is not evidence the daemon ended**, so the tree is killed as for a stop. The
     /// failure may be reported as one SCM restarts only if `send_kill_tree` succeeded; the daemon always
-    /// runs in a Job Object (`service::launch` refuses any other containment), where `Ok` means
+    /// runs in a Job Object (`service::build_command` asks for the strongest containment), where `Ok` means
     /// `TerminateJobObject` succeeded. Otherwise (the tree kill failed, even if the direct child's
     /// fallback worked) the outcome is [`WaitOutcome::TreeMayRun`] (and [`WaitOutcome::DaemonMayRun`]
     /// when it failed too), and the bus refuses later

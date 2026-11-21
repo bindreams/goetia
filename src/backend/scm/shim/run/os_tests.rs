@@ -226,15 +226,14 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     let fake = FakeGuard::new();
     let mut reap = Reap::default();
 
-    let daemon = reap.hold(
-        Real::default()
-            .spawn(build_command(&spec, &Real::default(), &fake.log(), ID))
-            .expect("spawn the daemon"),
-    );
-    let contained = daemon.containment();
+    let child = build_command(&spec, &Real::default(), &fake.log(), ID)
+        .spawn()
+        .expect("spawn the daemon");
+    let contained = child.containment();
+    let daemon = reap.hold(Box::new(child));
     daemon.wait().expect("the daemon exits");
 
-    assert_eq!(contained, Containment::JobObject);
+    assert_eq!(contained, cosca::Containment::JobObject);
     let log = std::fs::read_to_string(&logs).expect("the daemon's log");
     let lines: Vec<&str> = log.lines().map(str::trim).collect();
     assert_eq!(

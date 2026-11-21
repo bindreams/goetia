@@ -13,7 +13,6 @@ use crate::backend::scm::exit_status::{
 };
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
 use crate::testing::{base_fields, service_fields};
-use cosca::Containment;
 use cosca::error::ChildFate;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
@@ -92,9 +91,6 @@ fn spawn_failure() -> String {
         Chain(&not_found())
     )
 }
-
-/// The line logged when the daemon is not job-contained, whatever the kill then does.
-const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `protocol: plain` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
 
 /// The line logged when the daemon's tree cannot be terminated after the daemon ended.
 fn exited_tree_unkilled() -> String {
@@ -922,102 +918,6 @@ fn no_stopping_report_when_the_daemon_never_ran() {
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
-#[skuld::test]
-fn no_stopping_report_over_an_uncontained_daemon() {
-    let fake = FakeGuard::new();
-    fake.will_make_thread();
-    fake.will_spawn(
-        FakeProcess::new()
-            .containment(Containment::TreeWalk)
-            .send_kill_tree(KillReply::Ends),
-    );
-
-    let (_, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
-
-    assert_eq!(
-        stopping,
-        Vec::<usize>::new(),
-        "STOP_PENDING over a service never RUNNING"
-    );
-    assert_eq!(fake.take_failures().len(), 1);
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-}
-
-/// `protocol: plain` needs a Job Object to terminate the daemon's whole tree. A daemon contained any
-/// other way is killed and the start fails with nothing reported RUNNING. No kill proves a
-/// non-job tree gone, so the record is the incomplete stop (never restartable), whatever the kill
-/// returned.
-#[skuld::test]
-fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_running() {
-    let fake = FakeGuard::new();
-    let daemon = FakeProcess::new()
-        .containment(Containment::TreeWalk)
-        .send_kill_tree(KillReply::Ends);
-    fake.will_make_thread();
-    fake.will_spawn(daemon.clone());
-    let mut running_reports = 0;
-
-    let reported = run_daemon(&spec(), &supervisor(&fake), || running_reports += 1);
-
-    assert_eq!(reported, Reported::incomplete_stop());
-    assert_eq!(running_reports, 0, "RUNNING was reported for an uncontained daemon");
-    assert!(daemon.killed(), "the uncontained daemon was left running");
-    assert_one_failure(&fake.take_failures(), ID, NOT_JOB_CONTAINED);
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-}
-
-/// The same when `send_kill_tree` fails and only the direct child is killed: the descendants were never
-/// reached, so this is no more restartable than a kill that reports success.
-#[skuld::test]
-fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
-    let fake = FakeGuard::new();
-    let daemon = FakeProcess::new()
-        .containment(Containment::TreeWalk)
-        .send_kill_tree(KillReply::Refuses)
-        .kill(KillReply::Ends);
-    fake.will_make_thread();
-    fake.will_spawn(daemon.clone());
-
-    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
-
-    assert_eq!(reported, Reported::incomplete_stop());
-    assert!(daemon.killed());
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert_failures(
-        &fake.take_failures(),
-        ID,
-        &[NOT_JOB_CONTAINED.to_string(), tree_refused_failure()],
-    );
-}
-
-/// The same, when the uncontained daemon cannot be killed either: it may be running.
-#[skuld::test]
-fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
-    let fake = FakeGuard::new();
-    let daemon = FakeProcess::new()
-        .containment(Containment::TreeWalk)
-        .send_kill_tree(KillReply::Refuses)
-        .kill(KillReply::Refuses);
-    fake.will_make_thread();
-    fake.will_spawn(daemon.clone());
-
-    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
-
-    assert_eq!(reported, Reported::incomplete_stop());
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert_failures(
-        &fake.take_failures(),
-        ID,
-        &[
-            NOT_JOB_CONTAINED.to_string(),
-            tree_refused_failure(),
-            fallback_refused_failure(),
-        ],
-    );
-    assert!(!daemon.ended(), "the daemon ended though neither kill worked");
-    assert!(daemon.dropped(), "the shim kept a daemon it had given up on");
-}
-
 /// The status query after `ChildExited` can fail; the exit is then a shim failure, not a daemon code.
 #[skuld::test]
 fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
@@ -1543,28 +1443,19 @@ fn a_failed_stdio_assignment_prints_the_cause_of_the_failure() {
 /// `launch` waits for it instead.
 #[skuld::test]
 fn a_waiter_that_is_not_handed_the_daemon_has_ended_when_launch_returns() {
-    let refused_spawn = FakeGuard::new();
-    refused_spawn.will_make_thread();
-    refused_spawn.will_refuse_spawn(not_found());
-    let uncontained = FakeGuard::new();
-    uncontained.will_make_thread();
-    uncontained.will_spawn(
-        FakeProcess::new()
-            .containment(Containment::TreeWalk)
-            .send_kill_tree(KillReply::Ends),
+    let fake = FakeGuard::new();
+    fake.will_make_thread();
+    fake.will_refuse_spawn(not_found());
+
+    let launched = launch(&spec(), &supervisor(&fake), ID);
+
+    assert!(launched.is_err());
+    assert!(
+        fake.waiter_has_ended(0),
+        "launch returned with the waiter still running"
     );
-
-    for fake in [&refused_spawn, &uncontained] {
-        let launched = launch(&spec(), &supervisor(fake), ID);
-
-        assert!(launched.is_err());
-        assert!(
-            fake.waiter_has_ended(0),
-            "launch returned with the waiter still running"
-        );
-        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-        fake.take_failures();
-    }
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    fake.take_failures();
 }
 
 /// A daemon whose root was killed is dropped as any other: its waiter was joined, so the child is

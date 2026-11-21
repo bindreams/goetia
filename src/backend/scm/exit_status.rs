@@ -42,8 +42,8 @@ pub enum Reported {
     DaemonExit(u32),
     /// The shim failed; holds a Win32 code that is neither 0 nor [`ERROR_SERVICE_SPECIFIC_ERROR`].
     ShimFailure(u32),
-    /// The shim could not show that the daemon's tree was terminated, after a stop or a failure,
-    /// or because no Job Object contained it; it may still be running.
+    /// The shim could not show that the daemon's tree was terminated, after a stop or a failure;
+    /// it may still be running.
     IncompleteStop,
     /// The shim refused before it started any daemon, on a definite answer: its service record is
     /// gone, it holds no goetia marker, or its spec cannot be decoded. A read that did not complete
