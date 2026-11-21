@@ -173,6 +173,9 @@ pub(crate) enum AskReply {
     MayHaveStarted,
     /// `Error::Unassessable`: whether the event was sent is unknown.
     Unassessable,
+    /// Never answers, until [`FakeProcess::release_asks`] (the proxy that does not come back). Then it answers
+    /// `Error::Io`.
+    Hangs,
     /// `Error::Unassessable`, and the daemon has exited with this code: cosca's answer for a root that has
     /// exited, when nothing was sent.
     UnassessableAndExited(i32),
@@ -246,6 +249,8 @@ struct ProcState {
     asking_always: Option<AskReply>,
     /// Whether [`Spawned::try_wait`] fails.
     try_wait_fails: bool,
+    /// Whether the asks that [`AskReply::Hangs`] are held in have been let go.
+    asks_released: bool,
     tree_waits: VecDeque<TreeWaitReply>,
     calls: Vec<ProcessCall>,
     exit: Option<ExitStatus>,
@@ -264,6 +269,21 @@ impl Proc {
         let first = *lock(&self.state).exit.get_or_insert(status);
         self.ended.notify_all();
         first
+    }
+
+    /// Let go of every ask that never answers, now and later.
+    fn release_asks(&self) {
+        lock(&self.state).asks_released = true;
+        self.ended.notify_all();
+    }
+
+    /// Block until the asks that never answer are let go.
+    fn wait_asks_released(&self) {
+        drop(
+            self.ended
+                .wait_while(lock(&self.state), |state| !state.asks_released)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 
     /// Block until the process is ended; its status.
@@ -288,6 +308,7 @@ impl FakeProcess {
                 asks: VecDeque::new(),
                 asking_always: None,
                 try_wait_fails: false,
+                asks_released: false,
                 tree_waits: VecDeque::new(),
                 calls: Vec::new(),
                 exit: None,
@@ -354,6 +375,23 @@ impl FakeProcess {
         self.with(|state| state.tree_waits.push_back(reply))
     }
 
+    /// Let go of every ask that never answers (the guard does it too, at the end of the test).
+    pub(crate) fn release_asks(&self) {
+        self.0.release_asks();
+    }
+
+    /// Block until `n` asks have been made on the process, answered or not.
+    pub(crate) fn await_asks(&self, n: usize) {
+        drop(
+            self.0
+                .ended
+                .wait_while(lock(&self.0.state), |state| {
+                    state.calls.iter().filter(|call| **call == ProcessCall::Ask).count() < n
+                })
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+
     /// Every ask, tree wait and kill made on the process, in order.
     pub(crate) fn calls(&self) -> Vec<ProcessCall> {
         lock(&self.0.state).calls.clone()
@@ -400,6 +438,7 @@ impl Instance {
 
     fn record(&self, call: ProcessCall) {
         lock(&self.proc.state).calls.push(call);
+        self.proc.ended.notify_all();
     }
 
     fn kill_with(
@@ -480,6 +519,10 @@ impl Spawned for Instance {
             AskReply::UnsupportedAndExits(code) => {
                 self.proc.end(status(code));
                 Err(ask_unsupported())
+            }
+            AskReply::Hangs => {
+                self.proc.wait_asks_released();
+                Err(ask_io())
             }
             AskReply::MayHaveStarted => Err(ask_may_have_started()),
             AskReply::Unassessable => Err(ask_unassessable()),
@@ -605,6 +648,7 @@ impl Drop for FakeGuard {
     fn drop(&mut self) {
         let processes = lock(&self.fake.shared.state).processes.clone();
         for process in &processes {
+            process.release_asks();
             process.end(status(1));
         }
         if !std::thread::panicking() {
@@ -678,6 +722,11 @@ impl Fake {
     /// code under test.
     pub(crate) fn calls(&self, op: Op) -> usize {
         lock(&self.shared.state).calls.get(&op).copied().unwrap_or(0)
+    }
+
+    /// How many threads were made through [`Os::thread`].
+    pub(crate) fn threads_made(&self) -> usize {
+        lock(&self.shared.state).thread_ends.len()
     }
 
     /// The path the `n`th log opened (counting from 0) was asked for.

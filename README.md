@@ -288,6 +288,9 @@ records the end as it does.
   has already exited is not asked, and what it left in the job is ended at once. `kill` sends nothing and ends
   the daemon at once. `wm-close` still does too: it sends nothing yet. The limits:
   - The event reaches every process that shares the daemon's console, not only the daemon.
+  - The ask is made on a thread of its own, so a console-event proxy that never answers cannot hold the stop:
+    when the `timeout` is over, or the daemon exits, the ask is given up, with a line in the daemon's log, and
+    the daemon is ended. With `timeout: null` such a stop waits for the daemon's own exit.
   - A program with no console (a GUI program) cannot be sent the event, so it is ended only when its
     `timeout` is over; write `send-signal: kill` for one. A stop right after a `start` finds the daemon
     without its console for a few milliseconds: the shim asks again until the daemon has it, exits, or the

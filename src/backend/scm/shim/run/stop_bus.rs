@@ -52,6 +52,23 @@ struct Gate {
     /// Set by the waiter when its `child.wait()` failed: the OS error code, if the failure has one.
     /// `Some` means the daemon's fate is unknown and nothing else is watching it.
     wait_failure: Option<Option<i32>>,
+    /// The one question the asker thread is asked, and what became of it. Delete with the asker when
+    /// bindreams/cosca#1057 ships (cosca 0.11 bounds the ask's wait for the proxy).
+    asking: Asking,
+    /// Set when the run no longer needs the asker: a thread parked for the next ask ends.
+    asker_closed: bool,
+}
+
+/// What the asker thread is asked, and has answered. The supervisor asks only when it is `Idle`, so there is
+/// never a second ask while one is unanswered.
+#[derive(Default)]
+enum Asking {
+    #[default]
+    Idle,
+    /// The supervisor wants the daemon asked: the asker thread has not answered.
+    Pending,
+    /// The asker thread's answer, for the supervisor to take.
+    Answered(Result<(), cosca::error::Error>),
 }
 
 /// The gate between the SCM control handler, the service thread and the waiter thread. It holds
@@ -164,6 +181,8 @@ pub enum WaitOutcome {
 /// enforces the order.
 ///
 /// A [`Standby`] of the daemon the thread waits on.
+///
+/// A stop that asks has a second thread made with it, before the daemon: the [`Asker`].
 pub struct Waiter {
     standby: Standby<Arc<dyn Spawned>>,
     thread: std::thread::JoinHandle<()>,
@@ -177,6 +196,45 @@ pub struct Waiter {
     bus: Arc<StopBus>,
     /// What the stop does, which is what this waiter's run is supervised for.
     plan: StopPlan,
+    /// The thread the ask is made on, when the plan asks.
+    asker: Option<Asker>,
+}
+
+/// The thread a stop's ask is made on, so that a proxy that never answers cannot hold the stop: cosca's
+/// `terminate_tree` waits for the proxy with no deadline, and the supervisor, which has the service in
+/// `STOP_PENDING` with no control accepted, must not. Made with the [`Waiter`], before the daemon, and handed
+/// the daemon the same way; it answers each ask the supervisor makes on the bus ([`StopBus::ask`]).
+///
+/// **When the ask does not answer** before the `timeout` ends or the daemon exits, the supervisor goes on to
+/// the teardown and leaves this thread detached, as it leaves the waiter on its one non-joining arm
+/// ([`Supervisor::wait_for_child_or_stop`]): the thread holds its `Arc<dyn Spawned>`, so the child is not
+/// dropped under a call in progress. It ends when the proxy does answer. An ask that answered has its thread
+/// ended and joined.
+///
+/// **Delete with bindreams/cosca#1057** (cosca 0.11 bounds that wait): the thread, [`Asking`], and the bus's
+/// ask methods.
+struct Asker {
+    standby: Standby<Arc<dyn Spawned>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Asker {
+    fn new(os: &dyn Os, bus: &Arc<StopBus>) -> io::Result<Asker> {
+        let bus = Arc::clone(bus);
+        let (standby, thread) = Standby::with(
+            "goetia-shim-asker",
+            |name, run| os.thread(name, run),
+            move |child: Arc<dyn Spawned>| {
+                while bus.next_ask() {
+                    // A panic of the ask reports as an answer, or the supervisor would wait for one.
+                    let mut report = AnswerOnPanic { bus: &bus, armed: true };
+                    bus.report_answer(child.terminate_tree());
+                    report.armed = false;
+                }
+            },
+        )?;
+        Ok(Asker { standby, thread })
+    }
 }
 
 impl Waiter {
@@ -200,12 +258,27 @@ impl Waiter {
                 report.armed = false;
             },
         )?;
-        Ok(Waiter {
+        let waiter = Waiter {
             standby,
             thread,
             bus: reporting_to,
             plan,
-        })
+            asker: None,
+        };
+        if !plan.asks() {
+            return Ok(waiter);
+        }
+        // Before the daemon, like the waiter: a refusal is a start that launched nothing.
+        match Asker::new(os, &waiter.bus) {
+            Ok(asker) => Ok(Waiter {
+                asker: Some(asker),
+                ..waiter
+            }),
+            Err(e) => {
+                waiter.stand_down();
+                Err(e)
+            }
+        }
     }
 
     /// End a waiter that is never handed a daemon, and wait for its thread, so that nothing of
@@ -214,17 +287,27 @@ impl Waiter {
         drop(self.standby);
         // A panic of the thread is of nothing it was handed: it was handed nothing.
         let _ = self.thread.join();
+        if let Some(asker) = self.asker {
+            drop(asker.standby);
+            let _ = asker.thread.join();
+        }
     }
 
-    /// Hand the thread the daemon to wait on, and give back its handle to join once that wait can
-    /// return — see [`Supervisor::wait_for_child_or_stop`], which is the only place that joins it.
-    fn watch(self, child: Arc<dyn Spawned>) -> std::thread::JoinHandle<()> {
+    /// Hand the threads the daemon, and give back the handle of the waiter's to join once its wait can
+    /// return — see [`Supervisor::wait_for_child_or_stop`], which is the only place that joins it — and
+    /// the asker's.
+    fn watch(self, child: Arc<dyn Spawned>) -> (std::thread::JoinHandle<()>, Option<std::thread::JoinHandle<()>>) {
+        let asker = self.asker.map(|asker| {
+            let handed = asker.standby.hand(Arc::clone(&child));
+            debug_assert!(handed.is_ok(), "the asker thread ended before it was handed the daemon");
+            asker.thread
+        });
         let handed = self.standby.hand(child);
         debug_assert!(
             handed.is_ok(),
             "the waiter thread ended before it was handed the daemon"
         );
-        self.thread
+        (self.thread, asker)
     }
 }
 
@@ -327,6 +410,49 @@ impl StopBus {
         self.wait_until(None, |g| g.child_done);
     }
 
+    /// The asker thread's wait for its next ask: whether there is one, `false` once the run is done with the
+    /// asker. Closing wins over an ask not yet taken.
+    fn next_ask(&self) -> bool {
+        self.wait_until(None, |g| g.asker_closed || matches!(g.asking, Asking::Pending));
+        !self.state.lock().unwrap_or_else(PoisonError::into_inner).asker_closed
+    }
+
+    /// The asker thread's answer to the ask it was asked.
+    fn report_answer(&self, answer: Result<(), cosca::error::Error>) {
+        let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        g.asking = Asking::Answered(answer);
+        self.cvar.notify_all();
+    }
+
+    /// Ask the daemon through the asker thread, and wait for the first of its answer, the daemon's exit report
+    /// and the end of `within` (`None`: no end). Only ever called with no ask unanswered.
+    fn ask(&self, within: Option<Duration>) -> AskEnd {
+        {
+            let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            debug_assert!(matches!(g.asking, Asking::Idle), "an ask while one is unanswered");
+            g.asking = Asking::Pending;
+            self.cvar.notify_all();
+        }
+        self.wait_until(within, |g| matches!(g.asking, Asking::Answered(_)) || g.child_done);
+        let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match std::mem::take(&mut g.asking) {
+            Asking::Answered(answer) => AskEnd::Answered(answer),
+            unanswered => {
+                g.asking = unanswered;
+                if g.child_done { AskEnd::Exited } else { AskEnd::TimedOut }
+            }
+        }
+    }
+
+    /// The run is done with the asker: close it. Says whether an ask is still unanswered, in which case its
+    /// thread is in `terminate_tree` and must not be joined.
+    fn close_asker(&self) -> bool {
+        let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        g.asker_closed = true;
+        self.cvar.notify_all();
+        matches!(g.asking, Asking::Pending)
+    }
+
     /// The waiter's report that its wait is over, with the failure it ended in, if any.
     fn report_done(&self, failure: Option<Option<i32>>) {
         let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -383,8 +509,11 @@ impl Supervisor {
     /// **The plan** runs only for a stop accepted with the daemon not yet reported ended. The
     /// `timeout` of an ask-and-wait is counted from when this call saw the stop. A daemon that exited
     /// before the plan is neither asked nor waited for, and the tree it left is ended as after any exit.
-    /// The ask's answers are mapped in one place ([`judge_ask`]). The waiter stays in `child.wait()`
-    /// throughout, which cosca supports beside `terminate_tree` and `wait_tree_timeout`.
+    /// The ask's answers are mapped in one place ([`judge_ask`]). The ask is made on the waiter's [`Asker`]
+    /// thread, so an ask the proxy never answers does not hold the stop: it is waited for with the daemon's exit
+    /// and the `timeout`, and when either comes first it is logged and the teardown follows, with the asker
+    /// detached. The waiter stays in `child.wait()` throughout, which cosca supports beside `terminate_tree`
+    /// and `wait_tree_timeout`.
     ///
     /// **Which teardown** is chosen by the waiter's report once the plan is over: after an exit,
     /// `terminate_exited_tree` (no direct-child fallback; its failure is [`WaitOutcome::TreeMayRun`]),
@@ -506,7 +635,7 @@ impl Supervisor {
         // After the reset, never before it: the waiter is parked until this
         // call, so nothing can report *this* child done until it is handed
         // one, and a reset afterwards could erase that report.
-        let waiting = waiter.watch(Arc::clone(child));
+        let (waiting, asker) = waiter.watch(Arc::clone(child));
         let g = self.bus.state.lock().expect("StopBus mutex poisoned");
         let g = self
             .bus
@@ -523,12 +652,14 @@ impl Supervisor {
         drop(g);
         on_stopping(if stopping { WaitEnd::Stop } else { WaitEnd::Exit });
         let outcome = if !stopping && wait_failure.is_none() {
+            self.release_asker(asker, id);
             WaitOutcome::ChildExited
         } else {
             // A failed wait says nothing of the daemon, and nothing is watching it: no ask, no wait.
             if stopping && wait_failure.is_none() {
                 self.run_plan(plan, child.as_ref(), id, seen);
             }
+            self.release_asker(asker, id);
             // By the waiter's report now: a daemon that exited, during the plan or before it, is a
             // tree to end, not a process to kill.
             let (exited, wait_failure) = self.bus.exit_report();
@@ -595,6 +726,16 @@ fn grown_pace(pace: Duration) -> Duration {
 }
 
 impl Supervisor {
+    /// Be done with the asker thread, if the stop has one: close it, and join it unless its ask is unanswered. The
+    /// thread of an unanswered ask is left detached, as the waiter's is on its one non-joining arm: it holds an
+    /// `Arc` to the child, and ends when the proxy answers.
+    fn release_asker(&self, asker: Option<std::thread::JoinHandle<()>>, id: &str) {
+        let Some(thread) = asker else { return };
+        if !self.bus.close_asker() && thread.join().is_err() {
+            self.log.failure(id, ASKER_PANICKED);
+        }
+    }
+
     /// What an accepted stop does before the teardown, for a daemon that has not been reported exited when the
     /// stop is seen. `seen` is when the supervisor saw the stop.
     fn run_plan(&self, plan: StopPlan, child: &dyn Spawned, id: &str, seen: Instant) {
@@ -613,7 +754,9 @@ impl Supervisor {
     /// Ask the daemon's tree to exit, then wait for the whole tree to exit within what is left of `timeout`.
     ///
     /// What the ask answered decides the rest ([`judge_ask`]); a wait that cannot be made is logged and the
-    /// teardown follows at once.
+    /// teardown follows at once. The ask is made on the asker thread ([`Asker`]), and waited for with the
+    /// daemon's exit and the `timeout` ([`StopBus::ask`]): an ask the proxy does not answer is logged once and
+    /// the teardown follows.
     ///
     /// **Delete the re-ask loop when bindreams/cosca#1053 ships**, and this whole composition when
     /// bindreams/cosca#1055 does: cosca then answers "no console yet" apart from "never", and has a graceful
@@ -623,7 +766,13 @@ impl Supervisor {
         let mut told = false;
         let mut pace = REASK_PACE_FIRST;
         loop {
-            match judge_ask(child.terminate_tree()) {
+            let answer = match self.bus.ask(left()) {
+                AskEnd::Answered(answer) => answer,
+                // Nothing makes the proxy answer, and nothing waits for it: the teardown follows.
+                AskEnd::Exited => return self.log.warning(id, &ask_unanswered_at_exit()),
+                AskEnd::TimedOut => return self.log.failure(id, &ask_unanswered_at_timeout()),
+            };
+            match judge_ask(answer) {
                 Ask::Sent => break,
                 Ask::Unknown(e) => {
                     // cosca answers this for a root that has exited too, with nothing sent: the root is asked.
@@ -651,6 +800,9 @@ impl Supervisor {
                         return;
                     }
                     pace = grown_pace(pace);
+                    if timeout.is_some_and(|t| seen.elapsed() >= t) {
+                        return self.log.failure(id, &never_asked(&e));
+                    }
                 }
             }
         }
@@ -706,6 +858,32 @@ fn judge_ask(answer: Result<(), cosca::error::Error>) -> Ask {
 }
 
 // Waiter panic --------------------------------------------------------------------------------------------------------
+
+/// How [`StopBus::ask`] ended.
+enum AskEnd {
+    Answered(Result<(), cosca::error::Error>),
+    /// The daemon exited with the ask unanswered.
+    Exited,
+    /// The end of the wait came with the ask unanswered.
+    TimedOut,
+}
+
+/// Reports a panic in the asker's ask as an answer: whether the event was sent is unknown.
+struct AnswerOnPanic<'a> {
+    bus: &'a StopBus,
+    armed: bool,
+}
+
+impl Drop for AnswerOnPanic<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.bus.report_answer(Err(cosca::error::Error::Unassessable {
+                detail: ASKER_PANICKED.to_owned(),
+                source: None,
+            }));
+        }
+    }
+}
 
 /// Reports a panic in the waiter's closure as a failed wait. Without it the panic ends the thread
 /// with `child_done` unset, and in the no-stop case nothing else would wake `wait_while`.
@@ -799,6 +977,18 @@ fn may_have_asked(e: &cosca::error::Error) -> String {
         "the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
         Chain(e)
     )
+}
+
+const ASKER_PANICKED: &str = "the thread asking the daemon to exit panicked";
+
+fn ask_unanswered_at_timeout() -> String {
+    "the stop's ask was not answered within the daemon's timeout, so the daemon is ended without knowing whether it was asked"
+        .to_owned()
+}
+
+fn ask_unanswered_at_exit() -> String {
+    "the daemon exited while its ask was not answered: whether it was sent is unknown; the tree it left is ended"
+        .to_owned()
 }
 
 fn exit_unreadable(e: &cosca::error::Error) -> String {
