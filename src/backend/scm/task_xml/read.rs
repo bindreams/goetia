@@ -81,6 +81,7 @@ impl TaskXml {
             name: common.name.clone(),
             host,
             account,
+            registered_for: None,
             triggers,
             data,
             settings,

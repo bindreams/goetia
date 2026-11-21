@@ -5,7 +5,7 @@
 //! may not decode, and the marker alone is proof of ownership.
 
 use std::cell::Cell;
-use std::io;
+use std::io::{self, Write as _};
 use std::sync::Arc;
 
 use super::api::{Instance, Registered};
@@ -17,7 +17,7 @@ use crate::backend::scm::instance::TaskAccount;
 use crate::backend::scm::manager::identity::Written;
 use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, identity, open_refused, written_user};
 use crate::backend::scm::sid::{Sid, sid_display};
-use crate::backend::scm::task_xml::{TaskXml, Token, extract_from_data};
+use crate::backend::scm::task_xml::{TaskXml, Token, account_of, extract_from_data};
 use crate::backend::{Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed};
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
@@ -78,23 +78,21 @@ impl TaskSnapshot {
 
     /// What the registration is for, when that is not the account the blob's user names now: the registered
     /// SID's text, the principal's text marked as naming no account ([`unmapped`]), or [`NO_PRINCIPAL`] when
-    /// there is none, so what it says is never the blob's account. `None` when it is for that account, when the
-    /// account is built in, when the stored XML does not read as a definition (the task is then registered again
-    /// under its own principal), and when a lookup fails for any other reason than "no such account": such a
-    /// difference is not known, so the blob's account stands until a lookup answers, and a line on stderr says
-    /// the check was skipped.
+    /// there is none. `None` when it is for that account, when the account is built in, and when a lookup fails
+    /// for any other reason than "no such account": such a difference is not known, so the blob's account stands
+    /// until a lookup answers, and a line on stderr says the check was skipped.
     ///
-    /// The one comparison `read` shows and `enable` and `disable` refuse by. An error when the blob did not
-    /// decode, and when the XML is not well-formed.
+    /// The one comparison `read` shows and `enable` and `disable` refuse by, the latter only for a registration
+    /// that stays under the blob's account ([`StoredAccount::Blob`](super::write::StoredAccount)). Compares the
+    /// blob's account with the principal of the stored XML, which is read once. An error when the blob did not
+    /// decode, when its user names no task account, and when the XML's principal cannot be read.
     pub(super) fn other_account(
         &self,
         lookup: impl Fn(&str, Option<Written<'_>>) -> Result<Sid>,
     ) -> Result<Option<String>> {
-        let blob = self.blob.as_ref().map_err(|e| Error::Kept(Arc::clone(e)))?;
-        let Ok(definition) = self.definition() else {
-            return Ok(None);
-        };
-        let TaskAccount::User(name) = definition.account() else {
+        let blob = self.blob.as_ref().map_err(Error::kept)?;
+        let common = blob.spec.common();
+        let TaskAccount::User(name) = account_of(&common.id, &common.user)? else {
             return Ok(None);
         };
         let principal = TaskXml::principal(&self.registered.xml).map_err(|e| Error::Step {
@@ -104,31 +102,12 @@ impl TaskSnapshot {
         let Some(text) = principal_text(principal) else {
             return Ok(Some(NO_PRINCIPAL.to_owned()));
         };
-        let written = written_user(&blob.spec.common().user);
-        self.compared(&text, &name, written, lookup).or_else(|e| {
-            eprintln!(
-                "warning: the account `{}` is registered for could not be checked, so it is taken to be the one its \
-                 user names: {}",
-                self.id,
-                e.report()
-            );
+        let written = written_user(&common.user);
+        compared(&text, &name, written, lookup).or_else(|e| {
+            // Not `eprintln!`, which panics when the write fails: this is a fallback that fails nothing.
+            let _ = writeln!(io::stderr(), "{}", unchecked_warning(&self.id, &e));
             Ok(None)
         })
-    }
-
-    /// [`Self::other_account`] of the principal `text` and the blob's account `name`, written as `written`.
-    fn compared(
-        &self,
-        text: &str,
-        name: &str,
-        written: Option<Written<'_>>,
-        lookup: impl Fn(&str, Option<Written<'_>>) -> Result<Sid>,
-    ) -> Result<Option<String>> {
-        let Some(registered) = known_account(lookup(text, None))? else {
-            return Ok(Some(unmapped(text)));
-        };
-        let named = known_account(lookup(name, written))?;
-        Ok((named.as_ref() != Some(&registered)).then(|| sid_display(&registered)))
     }
 
     /// Whether the task has triggers and is itself enabled.
@@ -171,6 +150,29 @@ pub(super) fn known_account(lookup: Result<Sid>) -> Result<Option<Sid>> {
         Err(Error::AccountLookup { .. }) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// [`TaskSnapshot::other_account`] of the principal `text` and the blob's account `name`, written as `written`.
+fn compared(
+    text: &str,
+    name: &str,
+    written: Option<Written<'_>>,
+    lookup: impl Fn(&str, Option<Written<'_>>) -> Result<Sid>,
+) -> Result<Option<String>> {
+    let Some(registered) = known_account(lookup(text, None))? else {
+        return Ok(Some(unmapped(text)));
+    };
+    let named = known_account(lookup(name, written))?;
+    Ok((named.as_ref() != Some(&registered)).then(|| sid_display(&registered)))
+}
+
+/// The line that says the account the task `id` is registered for could not be checked, `failed` being why.
+fn unchecked_warning(id: &Id, failed: &Error) -> String {
+    format!(
+        "warning: the account the task `{id}` is registered for could not be checked, so it is taken to be the one \
+         its user names: {}",
+        failed.report()
+    )
 }
 
 /// What [`TaskSnapshot::other_account`] says of a registration with no principal.
@@ -243,7 +245,7 @@ impl Scm {
             source: Box::new(e),
         })?;
         if let Some(shown) = registered {
-            definition = definition.shown_for(TaskAccount::User(shown));
+            definition = definition.shown_for(shown);
         }
         Ok(InstalledDefinition {
             definition: WindowsDefinition::Task(definition),

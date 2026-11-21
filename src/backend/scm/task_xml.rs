@@ -7,8 +7,8 @@
 //! was written: it reorders elements, drops values equal to its defaults, adds `URI` and
 //! `UseUnifiedSchedulingEngine`, and rewrites the principal's account to a SID. So a readback is a
 //! [`TaskXml`] built from the elements goetia owns, with a dropped one read as its default, and the
-//! account is the blob's, unless the caller that looked the principal up shows the registered one in its
-//! place ([`TaskXml::shown_for`]). [`Display`](fmt::Display) is the definition's
+//! account is the blob's, unless the caller that looked the principal up shows what the registration is for
+//! in its place, under its own label ([`TaskXml::shown_for`]). [`Display`](fmt::Display) is the definition's
 //! canonical text: the same for what is generated and what is read back, with no registration
 //! [`Token`] ([`TaskXml::token_of`]).
 //!
@@ -193,6 +193,9 @@ pub struct TaskXml {
     /// The action without the task-mode arguments.
     host: HostCommand,
     account: TaskAccount,
+    /// What a readback's registration is for, when that is not `account` ([`TaskXml::shown_for`]): shown under its
+    /// own label, so that no account, whatever it is named, has the text of it.
+    registered_for: Option<String>,
     triggers: Vec<Trigger>,
     /// The blob's text, [`blob::metadata_text`].
     data: String,
@@ -221,6 +224,7 @@ impl TaskXml {
             name: common.name.clone(),
             host,
             account,
+            registered_for: None,
             triggers,
             data: blob::metadata_text(spec),
             settings: SETTINGS.iter().map(|setting| setting.value.to_owned()).collect(),
@@ -238,11 +242,15 @@ impl TaskXml {
         self.account.clone()
     }
 
-    /// The definition as read of a task registered for `account`, which the blob's name no longer names when
-    /// the account was deleted and created again. [`TaskXml::parse`] reads the account from the blob alone; the
-    /// caller that has looked the registration's principal up says which to show.
-    pub(crate) fn shown_for(self, account: TaskAccount) -> TaskXml {
-        TaskXml { account, ..self }
+    /// The definition as read of a task registered for `registered`, which is not the blob's account (the account
+    /// was deleted and created again, say). [`TaskXml::parse`] reads the account from the blob alone; the caller
+    /// that has looked the registration's principal up says what it is for, and [`Display`](fmt::Display) shows
+    /// that under its own label in place of the account. The account stays the blob's.
+    pub(crate) fn shown_for(self, registered: String) -> TaskXml {
+        TaskXml {
+            registered_for: Some(registered),
+            ..self
+        }
     }
 
     /// Whether the definition has a schedule, so a task made from it can be armed (`enable` refuses one with none).
@@ -352,7 +360,7 @@ pub(in crate::backend::scm) fn builtin_sid(builtin: Builtin) -> &'static str {
 
 /// The account a task runs as, from the spec's user. Well-known accounts are named by SID, as Task
 /// Scheduler reads them back.
-fn account_of(id: &Id, user: &User) -> Result<TaskAccount, Error> {
+pub(in crate::backend::scm) fn account_of(id: &Id, user: &User) -> Result<TaskAccount, Error> {
     let name = match user {
         User::Root => return Ok(TaskAccount::Service(SYSTEM.to_owned())),
         User::Name(name) | User::Id(AccountId::Sid(name)) => name,
@@ -533,9 +541,10 @@ pub(crate) fn extract_from_data(data: &str) -> Result<Option<Blob>, Error> {
 impl fmt::Display for TaskXml {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(out, "Name: {}", self.id)?;
-        match &self.account {
-            TaskAccount::Service(sid) => writeln!(out, "Account: service {}", service_label(sid))?,
-            TaskAccount::User(name) => writeln!(out, "Account: user {name:?}")?,
+        match (&self.registered_for, &self.account) {
+            (Some(registered), _) => writeln!(out, "Registered for: {registered:?}")?,
+            (None, TaskAccount::Service(sid)) => writeln!(out, "Account: service {}", service_label(sid))?,
+            (None, TaskAccount::User(name)) => writeln!(out, "Account: user {name:?}")?,
         }
         writeln!(out, "Host: {:?}", self.host.exe)?;
         writeln!(out, "Arguments:")?;

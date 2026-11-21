@@ -5,7 +5,7 @@
 use std::fs::OpenOptions;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -14,6 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::*;
 use crate::backend::scm::instance::InstanceId;
+use crate::backend::scm::manager::identity::account_name_of_sid;
 use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
@@ -2504,16 +2505,15 @@ fn enable_keeps_the_triggers_that_are_there_and_needs_no_blob_for_them() {
         data: armed.data.clone(),
         enabled: Some(false),
     };
-    for blob in [
-        Ok(blob(&spec)),
-        Err(std::sync::Arc::new(Error::blob("the blob will not decode"))),
+    for snapshot in [
+        TaskSnapshot::new(id(), Ok(blob(&spec)), off.clone()),
+        undecodable(off.clone()),
     ] {
         let fake = Fake::new();
         fake.on_register(Ok(Registration::Created));
         let scm = scm(&fake);
         let (_dir, runs) = records();
-        scm.task_set_armed_with(&TaskSnapshot::new(id(), blob, off.clone()), true, &runs, || Ok(None))
-            .unwrap();
+        scm.task_set_armed_with(&snapshot, true, &runs, || Ok(None)).unwrap();
         let calls = fake.calls();
         let Call::Register { xml, .. } = &calls[0] else {
             panic!("enable registers: {calls:?}");
@@ -2529,13 +2529,6 @@ fn enable_keeps_the_triggers_that_are_there_and_needs_no_blob_for_them() {
 fn enable_of_a_task_whose_blob_will_not_decode_is_refused_before_a_write_and_disable_works() {
     let spec = task_spec(Some("30 3 * * *"));
     let armed = registered_task(&spec, true);
-    let undecodable = |registered: Registered| {
-        TaskSnapshot::new(
-            id(),
-            Err(std::sync::Arc::new(Error::blob("the blob will not decode"))),
-            registered,
-        )
-    };
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let scm = scm(&fake);
@@ -2738,28 +2731,36 @@ fn edited(snapshot: &TaskSnapshot, edit: impl FnOnce(&mut Registered)) -> TaskSn
     )
 }
 
-/// The task of the user this test runs as, by the name its blob has, registered for the SID the production lookup
-/// gives that name (read-only).
-fn own_task(armed: bool) -> TaskSnapshot {
-    let name = std::env::var("USERNAME").expect("USERNAME names the user this test runs as");
-    let sid = sid_display(&sid_of_account(&name, Some(Written::Name(&name))).unwrap());
-    let spec = task_spec_as(User::Name(name.clone()), Some("30 3 * * *"));
-    let mut registered = registered_task(&spec, armed);
-    registered.xml = registered
-        .xml
-        .replace(&format!("<UserId>{name}</UserId>"), &format!("<UserId>{sid}</UserId>"));
-    assert!(registered.xml.contains(&sid), "the principal is the SID of `{name}`");
-    TaskSnapshot::new(id(), Ok(blob(&spec)), registered)
+/// The snapshot `read` makes of a task whose blob will not decode: its `Data` and the blob it kept agree.
+fn undecodable(mut registered: Registered) -> TaskSnapshot {
+    registered.data = registered.data.replace("Spec: ", "Spec: !");
+    TaskSnapshot::new(id(), Err(Arc::new(Error::blob("the blob will not decode"))), registered)
 }
 
-fn registers_again(calls: &[Call]) -> bool {
-    matches!(calls, [Call::Register { update: true, .. }])
+/// The task of the account this test runs as, by the name its blob has, registered for the SID that is the
+/// account's own (read-only); the account it registers again as is the second value.
+fn own_task(armed: bool) -> (TaskAccount, TaskSnapshot) {
+    let sid = process_user_sid();
+    let name = account_name_of_sid(&sid).expect("the account this test runs as has a name");
+    let spec = task_spec_as(User::Name(name.clone()), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, armed);
+    let text = sid_display(&sid);
+    registered.xml = registered
+        .xml
+        .replace(&format!("<UserId>{name}</UserId>"), &format!("<UserId>{text}</UserId>"));
+    assert!(registered.xml.contains(&text), "the principal is the SID of `{name}`");
+    (definition(&spec).account(), TaskSnapshot::new(id(), Ok(blob(&spec)), registered))
+}
+
+/// Whether `calls` is the one registration again of the task, as `account`.
+fn registers_again_as(calls: &[Call], account: &TaskAccount) -> bool {
+    matches!(calls, [Call::Register { who, update: true, .. }] if who == account)
 }
 
 /// A blob whose user is a name goes through: the registration's SID is that name's.
 #[skuld::test]
 fn enable_of_a_task_registered_for_the_sid_its_blobs_name_names_goes_through() {
-    let snapshot = own_task(false);
+    let (account, snapshot) = own_task(false);
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let (_dir, runs) = records();
@@ -2768,14 +2769,16 @@ fn enable_of_a_task_registered_for_the_sid_its_blobs_name_names_goes_through() {
         .task_set_armed_with(&snapshot, true, &runs, || Ok(Some("secret".to_owned())))
         .unwrap();
 
-    assert!(registers_again(&fake.calls()), "{:?}", fake.calls());
+    assert!(registers_again_as(&fake.calls(), &account), "{:?}", fake.calls());
 }
 
 /// A task whose XML has no action reads from its principal, as a hand edit leaves it: the task is registered again
-/// as it stands, so there is nothing to refuse, though the blob's user is a name and the principal a SID.
+/// as it stands, under that principal, so nothing is compared (the principal is not the blob's account, and a
+/// comparison would refuse).
 #[skuld::test]
 fn disable_of_a_task_whose_xml_has_no_action_goes_through() {
-    let snapshot = edited(&own_task(true), |registered| {
+    let (_, alices) = user_task(ALICE, BOB, true);
+    let snapshot = edited(&alices, |registered| {
         let xml = &mut registered.xml;
         let (start, end) = (xml.find("<Actions").unwrap(), xml.find("</Actions>").unwrap());
         xml.replace_range(start..end + "</Actions>".len(), "");
@@ -2792,16 +2795,18 @@ fn disable_of_a_task_whose_xml_has_no_action_goes_through() {
         .task_set_armed_with(&snapshot, false, &runs, || Ok(Some("secret".to_owned())))
         .unwrap();
 
-    assert!(registers_again(&fake.calls()), "{:?}", fake.calls());
+    assert!(
+        registers_again_as(&fake.calls(), &TaskAccount::User(BOB.to_owned())),
+        "{:?}",
+        fake.calls()
+    );
 }
 
 /// A blob that will not decode leaves the account to the principal too: `disable` still works on it.
 #[skuld::test]
 fn disable_of_a_task_whose_blob_will_not_decode_goes_through() {
     let (_, alices) = user_task(ALICE, BOB, true);
-    let mut registered = alices.registered().clone();
-    registered.data = registered.data.replace("Spec: ", "Spec: !");
-    let snapshot = TaskSnapshot::new(id(), Err(Arc::new(Error::blob("test"))), registered);
+    let snapshot = undecodable(alices.registered().clone());
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let (_dir, runs) = records();
@@ -2810,7 +2815,11 @@ fn disable_of_a_task_whose_blob_will_not_decode_goes_through() {
         .task_set_armed_with(&snapshot, false, &runs, || Ok(Some("secret".to_owned())))
         .unwrap();
 
-    assert!(registers_again(&fake.calls()), "{:?}", fake.calls());
+    assert!(
+        registers_again_as(&fake.calls(), &TaskAccount::User(BOB.to_owned())),
+        "{:?}",
+        fake.calls()
+    );
 }
 
 #[skuld::test]
@@ -2899,7 +2908,7 @@ fn the_account_of_a_task_whose_blob_will_not_decode_is_its_stored_principal() {
     let registered = registered_task(&spec, false);
     assert_eq!(
         stored_account(&registered).unwrap(),
-        TaskAccount::User("alice".to_owned())
+        StoredAccount::Blob(TaskAccount::User("alice".to_owned()))
     );
 
     let broken = Registered {
@@ -2909,8 +2918,8 @@ fn the_account_of_a_task_whose_blob_will_not_decode_is_its_stored_principal() {
     };
     assert_eq!(
         stored_account(&broken).unwrap(),
-        TaskAccount::User("alice".to_owned()),
-        "the principal says it as the blob did"
+        StoredAccount::Principal(TaskAccount::User("alice".to_owned())),
+        "the principal says it as the blob did, and is said to be the principal's"
     );
 }
 

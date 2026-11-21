@@ -276,7 +276,8 @@ fn a_registration_for_another_account_than_the_name_names_now_shows_its_sid_and_
 
     let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID), (OLD_SID, OLD_SID)]));
 
-    assert!(shown.contains(&format!("Account: user {OLD_SID:?}")), "{shown}");
+    assert!(shown.contains(&format!("Registered for: {OLD_SID:?}")), "{shown}");
+    assert!(!shown.contains("Account:"), "{shown}");
     let decide::Outcome::Conflict { artifact_diff, .. } = outcome else {
         panic!("a plain install is a conflict: {outcome:?}");
     };
@@ -290,7 +291,7 @@ fn a_blob_name_that_names_no_account_shows_the_registrations_sid() {
 
     let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[(OLD_SID, OLD_SID)]));
 
-    assert!(shown.contains(&format!("Account: user {OLD_SID:?}")), "{shown}");
+    assert!(shown.contains(&format!("Registered for: {OLD_SID:?}")), "{shown}");
     assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
 }
 
@@ -339,7 +340,7 @@ fn a_registration_that_names_no_principal_shows_that_it_names_none() {
 
     let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID)]));
 
-    assert!(shown.contains(r#"Account: user "<none>""#), "{shown}");
+    assert!(shown.contains(r#"Registered for: "<none>""#), "{shown}");
     assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
 }
 
@@ -358,7 +359,7 @@ fn a_principal_that_names_no_account_is_shown_marked() {
         let (shown, outcome) = install_over(&spec, &snapshot, knowing(&[("alice", NEW_SID)]));
 
         assert!(
-            shown.contains(&format!("Account: user \"{principal} (no such account)\"")),
+            shown.contains(&format!("Registered for: \"{principal} (no such account)\"")),
             "{shown}"
         );
         assert!(matches!(outcome, decide::Outcome::Conflict { .. }), "{outcome:?}");
@@ -388,22 +389,68 @@ fn the_account_of_a_task_whose_blob_will_not_decode_is_not_compared() {
     assert!(compared.is_err(), "{compared:?}");
 }
 
-/// A lookup that cannot answer, of either account, is no difference: the blob's account stands.
+/// What is registered is shown under its own label, so no blob account, whatever its name, reads as it: a user
+/// named as the mark of a principal that names no account is not that principal.
 #[skuld::test]
-fn a_lookup_that_cannot_answer_leaves_the_account_to_the_blob() {
-    let (_, snapshot) = alices(OLD_SID);
-    let alice = |name: &str, _: Option<Written<'_>>| match name {
-        "alice" => Err(denied(name)),
-        _ => Ok(sid_text(OLD_SID)),
+fn a_registration_shown_is_never_the_text_of_a_blob_account_named_like_the_mark() {
+    const MARKED: &str = "ghost (no such account)";
+    let spec = task_spec_as(User::Name(MARKED.to_owned()), Some("30 3 * * *"));
+    let snapshot_of = |principal: &str| {
+        let mut registered = registered_task(&spec, false);
+        registered.xml = registered
+            .xml
+            .replace(&format!("<UserId>{MARKED}</UserId>"), &format!("<UserId>{principal}</UserId>"));
+        assert!(registered.xml.contains(principal), "the principal is {principal}");
+        TaskSnapshot::new(id(), Ok(blob(&spec)), registered)
     };
-    let stored = |name: &str, _: Option<Written<'_>>| match name {
-        "alice" => Ok(sid_text(NEW_SID)),
-        _ => Err(denied(name)),
-    };
+    let scm = Scm::new();
 
-    for lookup in [&alice as &dyn Fn(&str, Option<Written<'_>>) -> Result<Sid>, &stored] {
-        assert_eq!(snapshot.other_account(lookup).unwrap(), None);
-    }
+    // The registration is for the blob's own account: the blob's account is shown.
+    let own = scm
+        .task_installed_with(&snapshot_of(MARKED), knowing(&[(MARKED, OLD_SID)]))
+        .unwrap()
+        .definition
+        .to_string();
+    // The principal `ghost` names no account: the definition says so, and it is another text.
+    let other = scm
+        .task_installed_with(&snapshot_of("ghost"), knowing(&[(MARKED, OLD_SID)]))
+        .unwrap()
+        .definition
+        .to_string();
+
+    assert!(own.contains(&format!("Account: user {MARKED:?}")), "{own}");
+    assert!(other.contains(&format!("Registered for: {MARKED:?}")), "{other}");
+    assert_ne!(own, other);
+}
+
+/// The comparison does not depend on the stored XML reading as a definition: a verb that registers the task
+/// again under its principal decides that before it asks (see `stored_account`), and what is asked says what
+/// the registration is for.
+#[skuld::test]
+fn the_account_a_registration_is_for_is_compared_whatever_the_xml_reads_as() {
+    let (_, mut snapshot) = alices(OLD_SID);
+    let xml = &mut snapshot.registered.xml;
+    let (start, end) = (xml.find("<Actions").unwrap(), xml.find("</Actions>").unwrap());
+    xml.replace_range(start..end + "</Actions>".len(), "");
+
+    let compared = snapshot.other_account(knowing(&[("alice", NEW_SID), (OLD_SID, OLD_SID)]));
+
+    assert_eq!(compared.unwrap(), Some(OLD_SID.to_owned()));
+}
+
+/// The line on stderr that says a lookup could not answer names the task and the failure.
+#[skuld::test]
+fn the_warning_of_an_account_that_could_not_be_checked_names_the_task_and_the_failure() {
+    let line = unchecked_warning(&id(), &denied("alice"));
+
+    assert_eq!(
+        line,
+        format!(
+            "warning: the account the task `nightly` is registered for could not be checked, so it is taken to be \
+             the one its user names: {}",
+            denied("alice").report()
+        )
+    );
 }
 
 /// A `user.id` the install resolves as a SID string is resolved so by the read, whatever its case: the same

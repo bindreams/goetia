@@ -178,7 +178,7 @@ fn open_policy(access: u32) -> isize {
 #[cfg(windows)]
 pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
     use crate::backend::scm::instance::TaskPath;
-    use crate::backend::scm::manager::task::{Com, TaskApi as _, registration_password, stored_account};
+    use crate::backend::scm::manager::task::{Com, StoredAccount, TaskApi as _, registration_password, stored_account};
     use crate::backend::scm::task_xml::{TaskXml, extract_from_data, triggers_of};
     use crate::error::Error;
 
@@ -193,7 +193,8 @@ pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<S
     if triggers_of(&blob.spec)?.is_empty() {
         return Ok(Vec::new());
     }
-    let account = stored_account(&registered)?;
+    // Registered again as it stands, under whichever account the registration is for.
+    let (StoredAccount::Blob(account) | StoredAccount::Principal(account)) = stored_account(&registered)?;
     let password = registration_password(&account)?;
     let held = TaskXml::with_own_flag(&TaskXml::with_triggers(&registered.xml, &blob.spec)?, false)?;
     Com.register(&path, &held, &account, password.as_deref(), true)?;
