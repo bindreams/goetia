@@ -283,10 +283,10 @@ fn assert_asked_and_answered(stopped: &Stopped, exit_on: &str) {
 ///
 /// The shim's log lines this reads are written by `ask_and_wait` in `stop_bus.rs`, beside the functions that make
 /// their text (`asking`, `may_have_sent`, `could_not_ask`, `never_asked`):
-/// - "asking the daemon to exit with <event>" is written before the first ask, so it is no proof that anything was
+/// - "asking the daemon to exit with `event`" is written before the first ask, so it is no proof that anything was
 ///   sent. It is the evidence of an ask when no line says the ask failed: "the stop could not ask" and "without being
 ///   asked" are the two failures that end the daemon unasked (`could_not_ask`, `never_asked`);
-/// - "the stop may have sent <event>" is the warning of an ask whose answer left it unknown whether the event was
+/// - "the stop may have sent `event`" is the warning of an ask whose answer left it unknown whether the event was
 ///   sent, which a correct stop of a daemon right after its start can get. It names the event, so it is evidence of
 ///   an ask by itself;
 /// - a line of the two failures is never allowed, whichever of the others is there.
