@@ -17,8 +17,8 @@ Everything documented below — the manifest's interpolation syntax, the
 codes — is **pre-1.0 and may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
-On macOS goetia requires **14.4+**: `kill` holds the daemon's process by its
-identity, which the OS offers from 14.4. On Linux it requires **kernel 5.6+**,
+On macOS goetia requires **15+**: nothing older can be tested, since GitHub
+offers no runner for it. On Linux it requires **kernel 5.6+**,
 with `pidfd_open` and `openat2` not blocked by a seccomp profile or an LSM: the
 process library goetia runs `systemctl` with, and holds a daemon's process with
 for `kill`, needs both. It also requires **systemd 243+**
@@ -33,6 +33,17 @@ that. Every `start` and `stop` runs `systemctl --show-transaction` (242+), and
 arming a task's timer runs `systemctl clean` on it (243+) to clear its stamp,
 which is how arming a task again makes up no run missed while goetia's
 `disable` had disarmed it.
+
+On Linux goetia finds `systemctl`, `journalctl` and `busctl`, and on macOS
+`launchctl`, by searching the caller's `PATH`. Every `PATH` entry before the
+one that holds the tool must be one the calling account can search: an entry it
+cannot search stops the search with an error that names the entry, even when a
+later entry holds the tool (for example after switching user while keeping the
+old `PATH`). A `PATH` must be set: with none the tool is not found, and there is
+no default search path. The search takes the first file of that name on
+`PATH`, whatever its mode: one that cannot be executed fails the call, and the
+search does not go on. To recover, remove or fix the entry, or run with a
+system `PATH` such as `/usr/bin:/bin:/usr/sbin:/sbin`.
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
@@ -252,9 +263,7 @@ records the end as it does.
   writes an `ExitTimeOut` of `1`: launchd
   sends `SIGTERM`, and `SIGKILL` a second later. `0`, which `launchd.plist(5)`
   documents as no limit, ends the job at once on macOS 15.7 (Intel) and 26
-  (measured), but macOS 14, which goetia supports, could not be measured:
-  GitHub no longer offers a runner for it. `1` does not depend on what `0` does
-  there.
+  (measured), against that documentation. `1` does not depend on what `0` does.
   `ExitTimeOut` applies only when launchd itself boots a job out, which a task's
   `stop` never does: goetia ends a task's run itself, with `SIGKILL` at once for
   `kill` and otherwise `SIGTERM`, then `SIGKILL` if the run is still going when

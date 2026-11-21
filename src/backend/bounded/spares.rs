@@ -19,10 +19,10 @@ use crate::backend::standby::Standby;
 /// running: it still exits, and a caller that outlives it must not collect one zombie per expiry.
 /// See [`Reservation`].
 ///
-/// The thread never kills the child, not even after the reap: an expired request is left running.
-/// It [`cosca::Child::detach`]es the reaped child rather than dropping it, because `Drop` tears the
-/// contained tree down, and the request's descendants may still be in it. With nothing to reap, the
-/// request having exited inside its budget, the thread ends.
+/// The thread never kills the child, not even after the exit: an expired request is left running.
+/// It [`cosca::Child::detach`]es the exited child, which reaps it, rather than dropping it, because
+/// `Drop` tears the contained tree down, and the request's descendants may still be in it. With
+/// nothing to reap, the request having exited inside its budget, the thread ends.
 #[derive(Debug)]
 pub(crate) struct Reaper(Standby<cosca::Child>);
 

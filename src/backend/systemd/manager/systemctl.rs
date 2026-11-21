@@ -34,13 +34,12 @@ pub(crate) struct Held {
 impl Held {
     /// What `steps` draw under `budget`, all or none: see [`listeners`].
     ///
-    /// cosca 0.7.0, as measured: every Linux `spawn` runs a helper thread (`cosca-pidfd-handshake`)
-    /// that is joined before `spawn` returns. goetia cannot reserve it. A host short by exactly that
-    /// thread fails the spawn as [`Error::Spawn`], before the fork, which sent nothing. goetia reads
-    /// no other thread of cosca's: the drain pump of a contained child (`cosca-cgrp-pump`) starts
-    /// only on a blocking wait for the tree to drain, which is `Child::wait_tree`,
-    /// `Child::wait_tree_timeout`, `Child::graceful_shutdown_tree` and a leaf's teardown on drop,
-    /// and of those goetia never calls the first three. Re-measure both on a cosca upgrade.
+    /// A spawn needs a task of its own, the child's, which goetia cannot reserve. A host short by
+    /// exactly that fails the spawn as [`Error::Spawn`], with no child made, which sent nothing. cosca
+    /// 0.10's spawn starts no thread. Its drain pump of a contained child (`cosca-cgrp-pump`) was
+    /// measured on cosca 0.7.0, and not since, to start only on a blocking wait for the tree to drain:
+    /// `Child::wait_tree`, `Child::wait_tree_timeout`, `Child::graceful_shutdown_tree` and a leaf's
+    /// teardown on drop, of which goetia never calls the first three.
     ///
     /// None of cosca's threads is reserved, and a thread joined, like a listener detached, may still
     /// hold its `TasksMax` slot until the kernel releases it. At a limit the `stop` leg exactly fits,
