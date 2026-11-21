@@ -461,7 +461,7 @@ pub(super) fn run_pass(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
-    match supervisor.wait_for_child_or_stop(waiter, &child, id, StopPlan::of(spec), on_stopping) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, on_stopping) {
         WaitOutcome::ChildExited => {
             let code = match child.wait() {
                 Ok(status) => {
@@ -524,7 +524,7 @@ fn exit_report(code: Option<i32>) -> Reported {
 /// incomplete stop for a daemon no Job Object contains or a failed spawn may have left running.
 fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
     let log = &*supervisor.log;
-    let waiter = match supervisor.waiter(id) {
+    let waiter = match supervisor.waiter(id, StopPlan::of(spec)) {
         Ok(waiter) => waiter,
         Err(e) => {
             log.failure(id, &thread_refused(&spec.common().command, &e));

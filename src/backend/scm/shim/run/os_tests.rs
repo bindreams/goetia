@@ -795,7 +795,9 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
 
     let fake = FakeGuard::new();
     let supervisor = Arc::new(Supervisor::new(Arc::new(Real::default()), fake.log()));
-    let waiter = supervisor.waiter(ID).expect("make the waiter thread");
+    let waiter = supervisor
+        .waiter(ID, StopPlan::AskAndWait { timeout: None })
+        .expect("make the waiter thread");
     let child: Arc<dyn Spawned> = Arc::from(Real::default().spawn(cmd).expect("spawn the daemon"));
     let _end = EndTree(Arc::clone(&child));
     let (tx, rx) = mpsc::channel();
@@ -803,8 +805,7 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome =
-                supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AskAndWait { timeout: None }, |_| {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
             let _ = tx.send(outcome);
         });
     }

@@ -24,10 +24,15 @@ fn spawn_child(fake: &Fake) -> Arc<dyn Spawned> {
 /// A supervisor, then the waiter, then the daemon: the order `service::launch` makes them in. See
 /// [`Waiter`].
 fn launched(fake: &FakeGuard, daemon: &FakeProcess) -> (Arc<Supervisor>, Waiter, Arc<dyn Spawned>) {
+    launched_for(fake, daemon, StopPlan::AtOnce)
+}
+
+/// [`launched`], for a stop that runs `plan`.
+fn launched_for(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (Arc<Supervisor>, Waiter, Arc<dyn Spawned>) {
     let supervisor = supervisor(fake);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
-    let waiter = supervisor.waiter(ID).expect("make the waiter thread");
+    let waiter = supervisor.waiter(ID, plan).expect("make the waiter thread");
     (supervisor, waiter, spawn_child(fake))
 }
 
@@ -48,7 +53,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
             let _ = tx.send(outcome);
         });
     }
@@ -99,7 +104,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
             let _ = tx.send(outcome);
         });
     }
@@ -168,7 +173,7 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+                supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
             }))
             .is_err();
             // Dropped before the send, so the reference count asserted below is not a race against
@@ -219,7 +224,7 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // No stop requested: the child exiting on its own is the only wakeup source.
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(
@@ -240,15 +245,11 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
     fake.will_make_thread();
-    let waiter = supervisor.waiter(ID).expect("make the waiter thread");
+    let waiter = supervisor.waiter(ID, StopPlan::AtOnce).expect("make the waiter thread");
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
     // which returns `Err` and returns.
-    let Waiter {
-        standby,
-        thread,
-        bus: _,
-    } = waiter;
+    let Waiter { standby, thread, .. } = waiter;
     drop(standby);
 
     thread.join().expect("the waiter thread panicked instead of ending");
@@ -267,7 +268,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -293,7 +294,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(!daemon.ended(), "the daemon ended though neither kill worked");
@@ -311,7 +312,7 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping),
@@ -333,7 +334,7 @@ fn a_stop_whose_send_kill_tree_fails_kills_the_child_and_reports_the_daemon_poss
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::TreeMayRun),
@@ -359,7 +360,7 @@ fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -379,7 +380,7 @@ fn a_failed_background_wait_carries_its_os_error() {
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: Some(5) }),
@@ -404,7 +405,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::Stopping));
     assert!(daemon.killed());
@@ -427,7 +428,7 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(daemon.killed());
@@ -446,7 +447,7 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(
@@ -467,7 +468,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(
@@ -565,10 +566,10 @@ const HOUR: Duration = Duration::from_secs(60 * 60);
 /// One accepted stop over the `Fake`, in the order `service::launch` makes the pieces: the stop is accepted
 /// before the wait, so it is seen at once. What `on_stopping` was told, and the outcome.
 fn stopped_by(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOutcome, Vec<WaitEnd>) {
-    let (supervisor, waiter, child) = launched(fake, daemon);
+    let (supervisor, waiter, child) = launched_for(fake, daemon, plan);
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end));
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |end| told.push(end));
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, told)
 }
@@ -576,11 +577,11 @@ fn stopped_by(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOu
 /// [`stopped_by`], where the daemon has exited, and its exit is reported, by the time the stop is seen
 /// (`on_stopping` runs between the wait's end and the plan, and the daemon ends there).
 fn stopped_after_exit(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOutcome, Vec<WaitEnd>) {
-    let (supervisor, waiter, child) = launched(fake, daemon);
+    let (supervisor, waiter, child) = launched_for(fake, daemon, plan);
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
     let bus = Arc::clone(&supervisor.bus);
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| {
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |end| {
         told.push(end);
         daemon.end(0);
         bus.await_exit_report();
@@ -609,9 +610,9 @@ fn on_stopping_is_told_a_stop_from_an_exit() {
 
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new().wait(WaitReply::Exits(0));
-    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched_for(&fake, &daemon, ask_and_wait(Some(HOUR)));
     let mut told = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |end| told.push(end));
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |end| told.push(end));
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(told, [WaitEnd::Exit], "the program's own exit was told as a stop");
@@ -774,7 +775,7 @@ fn wait_only_sends_nothing_and_waits_for_the_daemons_own_exit() {
     let daemon = FakeProcess::new()
         .wait(WaitReply::Blocks)
         .send_kill_tree(KillReply::Ends);
-    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched_for(&fake, &daemon, StopPlan::WaitOnly);
     assert!(supervisor.bus.request_stop());
     let (stopping_tx, stopping_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
@@ -782,7 +783,7 @@ fn wait_only_sends_nothing_and_waits_for_the_daemons_own_exit() {
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |_| {
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {
                 let _ = stopping_tx.send(());
             });
             let _ = tx.send(outcome);
@@ -815,11 +816,11 @@ fn wait_only_sends_nothing_and_waits_for_the_daemons_own_exit() {
 fn a_second_stop_does_not_ask_again() {
     let fake = FakeGuard::new();
     let daemon = asked(AskReply::SentAndExits(0)).wait_tree(TreeWaitReply::Drained);
-    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched_for(&fake, &daemon, ask_and_wait(Some(HOUR)));
     assert!(supervisor.bus.request_stop());
     assert!(supervisor.bus.request_stop());
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::Stopping));
     assert_eq!(fake.calls(Op::Ask), 1);

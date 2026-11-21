@@ -175,10 +175,12 @@ pub struct Waiter {
     /// involved. One `Arc` clone per waiter is what makes that checkable
     /// rather than conventional.
     bus: Arc<StopBus>,
+    /// What the stop does, which is what this waiter's run is supervised for.
+    plan: StopPlan,
 }
 
 impl Waiter {
-    fn new(os: &dyn Os, log: &Arc<Log>, bus: &Arc<StopBus>, id: &str) -> io::Result<Waiter> {
+    fn new(os: &dyn Os, log: &Arc<Log>, bus: &Arc<StopBus>, id: &str, plan: StopPlan) -> io::Result<Waiter> {
         let reporting_to = Arc::clone(bus);
         let bus = Arc::clone(bus);
         let log = Arc::clone(log);
@@ -202,6 +204,7 @@ impl Waiter {
             standby,
             thread,
             bus: reporting_to,
+            plan,
         })
     }
 
@@ -360,11 +363,11 @@ impl Supervisor {
     /// daemon it will wait on is spawned. (The supervisor's own wait blocks on the gate's condvar;
     /// the [`Waiter`]'s thread is what blocks on the child.) See [`Waiter`] for why that order is
     /// the whole point, and `io::Result` rather than a panic the whole mechanism.
-    pub fn waiter(&self, id: &str) -> io::Result<Waiter> {
-        Waiter::new(&*self.os, &self.log, &self.bus, id)
+    pub fn waiter(&self, id: &str, plan: StopPlan) -> io::Result<Waiter> {
+        Waiter::new(&*self.os, &self.log, &self.bus, id, plan)
     }
 
-    /// Block until `child` exits or a stop is requested, returning which. On a stop, first runs `plan`
+    /// Block until `child` exits or a stop is requested, returning which. On a stop, first runs the `waiter`'s plan
     /// (the ask and the wait of [`StopPlan::AskAndWait`], the wait of [`StopPlan::WaitOnly`], or
     /// nothing), then tears the whole contained tree down (`send_kill_tree`, with a
     /// fallback to killing just the direct child — see below) before
@@ -487,9 +490,9 @@ impl Supervisor {
         waiter: Waiter,
         child: &Arc<dyn Spawned>,
         id: &str,
-        plan: StopPlan,
         on_stopping: impl FnOnce(WaitEnd),
     ) -> WaitOutcome {
+        let plan = waiter.plan;
         debug_assert!(
             Arc::ptr_eq(&waiter.bus, &self.bus),
             "this waiter was made for a different StopBus: it would report the child's exit to that one, \
