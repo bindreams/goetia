@@ -2749,7 +2749,10 @@ fn own_task(armed: bool) -> (TaskAccount, TaskSnapshot) {
         .xml
         .replace(&format!("<UserId>{name}</UserId>"), &format!("<UserId>{text}</UserId>"));
     assert!(registered.xml.contains(&text), "the principal is the SID of `{name}`");
-    (definition(&spec).account(), TaskSnapshot::new(id(), Ok(blob(&spec)), registered))
+    (
+        definition(&spec).account(),
+        TaskSnapshot::new(id(), Ok(blob(&spec)), registered),
+    )
 }
 
 /// Whether `calls` is the one registration again of the task, as `account`.

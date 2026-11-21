@@ -397,9 +397,10 @@ fn a_registration_shown_is_never_the_text_of_a_blob_account_named_like_the_mark(
     let spec = task_spec_as(User::Name(MARKED.to_owned()), Some("30 3 * * *"));
     let snapshot_of = |principal: &str| {
         let mut registered = registered_task(&spec, false);
-        registered.xml = registered
-            .xml
-            .replace(&format!("<UserId>{MARKED}</UserId>"), &format!("<UserId>{principal}</UserId>"));
+        registered.xml = registered.xml.replace(
+            &format!("<UserId>{MARKED}</UserId>"),
+            &format!("<UserId>{principal}</UserId>"),
+        );
         assert!(registered.xml.contains(principal), "the principal is {principal}");
         TaskSnapshot::new(id(), Ok(blob(&spec)), registered)
     };
