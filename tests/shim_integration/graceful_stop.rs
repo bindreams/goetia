@@ -265,6 +265,30 @@ fn assert_asked_and_answered(stopped: &Stopped, exit_on: &str) {
     );
 }
 
+/// [`assert_asked_and_answered`] for a stop that may reach the daemon before its `main` has installed the handler,
+/// which Windows' own handler then ends with no record. Either way the daemon was asked and not ended by the
+/// teardown, and nothing here depends on which side of the installation the event lands:
+/// - a record with lines in it shows the event and the daemon's exit by it;
+/// - an empty record is a daemon ended by Windows' handler, or by the teardown unasked, and only the shim's own
+///   log tells them apart: the teardown's kill of a daemon that was never asked is logged as ended unasked.
+fn assert_asked_not_killed(stopped: &Stopped, exit_on: &str) {
+    if !stopped.record().is_empty() {
+        assert_asked_and_answered(stopped, exit_on);
+    }
+    let log_path = stopped.logs.path_for(&stopped.id);
+    let log = match std::fs::read_to_string(&log_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => panic!("read the daemon's log {}: {e}", log_path.display()),
+    };
+    let prefix = format!("goetia-shim[{}]: ", stopped.id);
+    assert!(
+        !log.lines()
+            .any(|line| line.starts_with(&prefix) && line.contains("ended without being asked")),
+        "the teardown ended the daemon without asking it:\n{log}"
+    );
+}
+
 // The signals ---------------------------------------------------------------------------------------------------------
 
 /// `goetia daemon stop` asks the daemon with the event its `send-signal` names: Ctrl+C for `terminate`,
@@ -362,7 +386,8 @@ fn send_signal_kill_ends_the_daemon_at_once(#[fixture(scm_group)] _group: &Group
 
 /// A stop issued as soon as `start` returns reaches a daemon that has no console yet, so the first ask is
 /// refused (nothing sent) and asked again: the daemon is still asked, and ends by itself, and not at its
-/// `timeout`, which is what a stop that asked once would wait for.
+/// `timeout`, which is what a stop that asked once would wait for. The event can reach the daemon before its
+/// handler is installed, so the record is read by [`assert_asked_not_killed`].
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_stop_right_after_the_start_still_asks_the_daemon(#[fixture(scm_group)] _group: &Group) {
     let timeout = Duration::from_secs(20);
@@ -374,9 +399,7 @@ fn a_stop_right_after_the_start_still_asks_the_daemon(#[fixture(scm_group)] _gro
 
     let stopped = stop_the_catcher(StopBy::Goetia, setup);
 
-    // The record is what says it was asked: a daemon ended at once leaves none. An event that reached the daemon
-    // before its handler was installed would end it by Windows' own handler, with no record: not measured.
-    assert_asked_and_answered(&stopped, setup.exit_on);
+    assert_asked_not_killed(&stopped, setup.exit_on);
     assert!(
         stopped.stop_took < timeout,
         "the stop took {:?}, which is its timeout: the daemon was never asked",
