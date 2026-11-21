@@ -1213,6 +1213,8 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
 
     Command::new(&copy_path)
         .args(args)
+        // The runner's `PATH` holds an entry `nobody` cannot search, which stops goetia's search for `launchctl`.
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .uid(uid)
         .gid(gid)
         .output()

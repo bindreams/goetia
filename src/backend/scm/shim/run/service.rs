@@ -18,7 +18,7 @@ use crate::blob::Blob;
 use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Restart};
 use cosca::error::ChildFate;
-use cosca::{Containment, Fd, Stdio};
+use cosca::{ContainMode, Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
@@ -615,7 +615,9 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
         cmd.current_dir(cwd.clone());
     }
     cmd.envs(spec.common().env.clone());
-    cmd.contain();
+    // Best effort, so a daemon no Job Object contains is spawned and then refused by `require_job_object`,
+    // which records the incomplete stop. The strongest request would fail the spawn instead.
+    cmd.contain_with(ContainMode::BestEffort);
 
     let logs = spec.common().logs.as_deref();
     // `Err(None)`: no file, by design, or a failed open that `Log::open_failed` has told.

@@ -84,12 +84,26 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
     let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
-    // A zombie would still answer `kill(pid, 0)` successfully; `ESRCH` is
-    // what proves the reap, not merely the kill.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    assert_reaped(pid);
+}
+
+/// `pid` was reaped. A non-consuming `waitid` answers `ECHILD` once it is no child of ours, even if another
+/// process has since taken the number (`kill(pid, 0)` would find that one); a zombie or a running child
+/// answers success. A child of this process that takes the number would too: none is spawned between the
+/// reap and this check in a test that runs in a process of its own, as nextest runs each.
+fn assert_reaped(pid: u32) {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
     let err = io::Error::last_os_error();
-    assert_eq!(rc, -1);
-    assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+    assert_eq!(rc, -1, "child {pid} is still ours to wait for: never reaped");
+    assert_eq!(err.raw_os_error(), Some(libc::ECHILD));
 }
 
 #[skuld::test]
@@ -193,7 +207,7 @@ fn descendant_on_fd3(child: &mut cosca::Child) -> KillOnDrop {
 /// stream is read only until the deadline, and comes back marked not whole — never waited on for
 /// an EOF that descendant would give in 68 years.
 ///
-/// Deterministic, with no timing bet: the test reaps the child itself before the wait, so the wait
+/// Deterministic, with no timing bet: the test observes the child's exit before the call, so the call
 /// finds it exited whatever the deadline, and the deadline is spent before the wait begins, so the
 /// read ends at once. A spent deadline alone marks the capture not whole
 /// ([`a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end`]), so what this test adds
@@ -499,7 +513,7 @@ fn a_left_request_the_caller_kills_takes_its_descendant_with_it() {
         other => panic!("expected Left, got {other:?}"),
     }
 
-    let status = request.reaped.recv().unwrap().unwrap();
+    let status = reaped_status(request.pid, &request.reaped);
     assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
     descendant.0.wait().unwrap();
@@ -758,7 +772,7 @@ mod refused_kill {
         let mut cmd = sh("trap 'exit 7' TERM; sleep 2147483647 & echo $! >&3; wait");
         cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
         cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
-        let Requested { mut child, reaped } = requested(cmd);
+        let Requested { mut child, pid, reaped } = requested(cmd);
         let descendant = descendant_on_fd3(&mut child.child);
         let _refused = test_hook::kill_fails(term_then_eperm);
         let Spawned {
@@ -783,7 +797,7 @@ mod refused_kill {
 
         left.kill();
 
-        let status = reaped.recv().unwrap().unwrap();
+        let status = reaped_status(pid, &reaped);
         assert_eq!(status.code(), Some(7), "{status:?}");
         // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
         descendant.0.wait().unwrap();
@@ -793,7 +807,7 @@ mod refused_kill {
     /// which reaps it once it exits. The bound is `waited_out`'s argument, as above.
     #[skuld::test]
     fn a_left_request_that_cannot_be_ended_is_still_reaped() {
-        let Requested { child, reaped } = requested(released_at_eof("exit 7"));
+        let Requested { child, pid, reaped } = requested(released_at_eof("exit 7"));
         let Spawned {
             child,
             role,
@@ -817,7 +831,7 @@ mod refused_kill {
 
         left.kill();
 
-        let status = reaped.recv().unwrap().unwrap();
+        let status = reaped_status(pid, &reaped);
         assert_eq!(status.code(), Some(7), "{status:?}");
     }
 
@@ -872,7 +886,7 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
 /// The child exits `7` at EOF on its stdin, and the test's write end reaches the reaper along with
 /// the child: the reaper's `wait` drops it, so the child can exit only once it is the reaper's and
 /// the reaper is waiting. Whatever killed it before then — the expiry, or the reaper itself — shows
-/// as a signal instead of `7`, with no race. A child nobody reaps reports nothing: the reaper's
+/// as a signal instead of `7`, with no race. A child no reaper waits on reports nothing: the reaper's
 /// sender is dropped unsent, which `recv` returns as an error.
 #[skuld::test]
 fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
@@ -928,16 +942,26 @@ fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> Exit
     let finished = wait_bounded(request.child, Budget::Immediate.start()).unwrap();
 
     settle(finished);
-    request
-        .reaped
-        .recv()
-        .expect("a request left running must be reaped once it exits")
-        .expect("waiting on the child")
+    reaped_status(request.pid, &request.reaped)
 }
 
-/// A [`Role::Request`] spawned from `cmd`, whose stdin is a pipe, and what its reaper reports.
+/// How the child `pid` ended, as its reaper reports it, and that the reaper then reaped it.
+/// [`cosca::Child::wait`] only observes an exit, so a status arriving proves no reap: a reaper that
+/// forgot the child instead would report all the same, and leave a zombie.
+fn reaped_status(pid: u32, reaped: &mpsc::Receiver<Result<ExitStatus, cosca::error::Error>>) -> ExitStatus {
+    let status = reaped
+        .recv()
+        .expect("the reaper of a request left running reports once it exits")
+        .expect("waiting on the child");
+    assert_reaped(pid);
+    status
+}
+
+/// A [`Role::Request`] spawned from `cmd`, whose stdin is a pipe, its pid, and what its reaper
+/// reports.
 struct Requested {
     child: Spawned,
+    pid: u32,
     reaped: mpsc::Receiver<Result<ExitStatus, cosca::error::Error>>,
 }
 
@@ -955,8 +979,9 @@ fn requested(cmd: cosca::Command) -> Requested {
     )
     .unwrap();
     let mut child = spawned(cmd, Role::Request(reaper));
+    let pid = child.child.pid();
     writer_tx.send(child.child.stdin().expect("stdin is piped")).unwrap();
-    Requested { child, reaped }
+    Requested { child, pid, reaped }
 }
 
 /// The child the reaper tests hand their reaper: runs `then` at EOF on its stdin, a pipe the test
