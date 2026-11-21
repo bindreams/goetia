@@ -37,10 +37,14 @@ use cosca::identity::Liveness;
 /// descendant that inherited a pipe dies with the child instead of holding its write end open:
 /// [`wait_bounded`] tears the contained tree down with `send_kill_tree` on expiry, and by dropping the
 /// child on every path. Where its output goes is [`spawn`]'s to decide, by [`Role`].
+///
+/// The containment is best effort ([`cosca::ContainMode::BestEffort`]): for some failures to set up the
+/// strongest mechanism the child gets a process group instead (cosca logs it at `warn`), where
+/// `Strongest` would fail the spawn. Which failures is cosca's to say: see [`cosca::ContainMode`].
 pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
     let mut cmd = cosca::run(std::iter::once(program).chain(args.iter().copied()));
     cmd.stdin(cosca::Stdio::null())?;
-    cmd.contain();
+    cmd.contain_with(cosca::ContainMode::BestEffort);
     Ok(cmd)
 }
 
@@ -67,8 +71,9 @@ pub(crate) struct Capture {
 pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
-    /// The deadline expired first. The child was killed and reaped; a child seen exited only after its
-    /// kill was refused is `Expired` too.
+    /// The deadline expired first. The child was killed and its exit seen; it is reaped as the call
+    /// returns, when its handle drops. A child seen exited only after its kill was refused is `Expired`
+    /// too.
     ///
     /// Carries no capture. Whatever the child had written by then is a
     /// prefix no consumer may treat as whole, and the one thing every
@@ -341,7 +346,7 @@ pub(crate) struct Lost {
 }
 
 /// Block until the child exits or `deadline` expires, under its [`Role`]'s rule for what an expiry
-/// does: kill the child, tear its tree down and reap it ([`Finished::Expired`]) — or, for
+/// does: kill the child and its tree, and see it exit ([`Finished::Expired`]) — or, for
 /// [`Role::Request`], leave it running and hand it back as [`Finished::Left`], which releases it to
 /// its [`Reaper`] unless the caller kills it. Nothing here makes a thread or a file: [`spawn`] made
 /// them all.
@@ -408,14 +413,14 @@ fn waited_out(
             })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
-            // `Ok`: the root was sent SIGKILL, or has exited; either way the reap below waits for it.
+            // `Ok`: the root was sent SIGKILL, or has exited; either way the wait below sees it exit.
             let ended = end(&child, refused_for)?;
-            let reaped = child.wait()?;
-            match (ended, expiry_disposition(reaped)) {
+            let exited = child.wait()?;
+            match (ended, expiry_disposition(exited)) {
                 (KillRootOutcome::ExitedAfterRefusal, _) | (_, Disposition::WeKilledIt) => {
                     return Ok(Finished::Expired);
                 }
-                (KillRootOutcome::Sent, Disposition::ItExitedOnItsOwn) => reaped,
+                (KillRootOutcome::Sent, Disposition::ItExitedOnItsOwn) => exited,
             }
         }
     };
@@ -439,15 +444,16 @@ fn waited_out(
 /// What runs a bounded call ([`wait_bounded`], [`Left::kill`]) past its deadline:
 /// - each kill refused with `EPERM` (macOS), by up to this plus one re-read. launchd's `end_if_held`
 ///   can meet two, a `print` query's and its [`Left::kill`];
-/// - the reap after a kill, sent or refused, which is not bounded: it waits for as long as the root
-///   takes to die once signalled (a root in uninterruptible sleep) or to be released (a tracer that
-///   is not goetia holding its zombie).
+/// - the wait for the root after a kill, sent or refused, and the drop that reaps it: unbounded. They
+///   wait for the root to die once signalled (a root in uninterruptible sleep) or to be released (a
+///   tracer that is not goetia holding its zombie); the drop also waits for a cgroup leaf to drain.
 pub(crate) const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
 /// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
-/// caller: the tree is ended BEFORE the root is reaped, while the killed root is still a zombie
-/// pinning its pid and pgid, so a kill that names the tree by the root's number cannot hit another
-/// process on any platform. `Drop` runs after the reap, where cosca may skip such a kill.
+/// caller. Nothing here reaps the root: [`cosca::Child::wait`] only observes an exit, so the killed
+/// root stays a zombie pinning its pid and pgid until its handle drops (or is detached by a
+/// [`Reaper`]), and a kill that names the tree by the root's number cannot hit another process on
+/// any platform.
 ///
 /// An uncontained child (the descendant test spawns one) reports `Unsupported` for the tree, and a
 /// contained tree whose member refused SIGKILL reports `Containment`; the `Result` is discarded
@@ -518,10 +524,9 @@ const REREAD: Duration = Duration::from_millis(20);
 /// What `alive` reads once it is `Dead`, or once `bound` has passed and it has been read once more
 /// since: `Alive` and `Unknown` both mean "not yet".
 ///
-/// It polls because cosca 0.8's non-reaping `Process::wait_timeout` needs a `Process`, opened through
-/// an identity read that macOS refuses in the window where the kill is refused. A public non-reaping
-/// wait on `Child` would replace the polling. The reads are of the real condition and the clock only
-/// says when to give up, so the time spent sleeping never decides the outcome.
+/// It polls because `alive` also serves a held `cosca::Process`, whose wait needs an identity read that
+/// macOS refuses while the kill is refused. Each read is of the real condition; the clock only says when
+/// to give up.
 fn last_read(alive: impl Fn() -> Liveness, bound: Duration) -> Liveness {
     let deadline = Budget::Bounded(bound).start();
     loop {
@@ -741,10 +746,10 @@ enum Disposition {
     ItExitedOnItsOwn,
 }
 
-/// Which outcome a reaped status represents on the expiry path: `SIGKILL` is
+/// Which outcome an exit status seen on the expiry path represents: `SIGKILL` is
 /// ours, anything else means the child beat us to it.
-fn expiry_disposition(reaped: ExitStatus) -> Disposition {
-    if reaped.signal() == Some(libc::SIGKILL) {
+fn expiry_disposition(exited: ExitStatus) -> Disposition {
+    if exited.signal() == Some(libc::SIGKILL) {
         Disposition::WeKilledIt
     } else {
         Disposition::ItExitedOnItsOwn

@@ -1347,8 +1347,8 @@ fn cap_evidence(unit: &str) -> String {
 /// the daemon untouched (a `start`'s stays inactive with no job queued), at every limit: below what
 /// goetia reserves (its listener threads, refused before anything is sent: see
 /// `a_verb_short_of_threads_is_refused_before_it_sends_anything`) and at the one that leaves that
-/// whole and fails only cosca's own spawn thread, which cosca 0.7.0 makes inside `spawn` and goetia
-/// cannot reserve, where the spawn fails before the fork and is a clean "not sent". A no-wait
+/// whole and fails only the spawn of the child itself, which goetia cannot reserve, where no child
+/// is made and the failure is a clean "not sent". A no-wait
 /// restart reserves nothing, so it meets only that last case at every limit. Exit `4` (in doubt) is
 /// never accepted, and each exit `1` must be one of the two refusals above. Each sweep rises until
 /// the verb succeeds; the cutoff is not asserted.

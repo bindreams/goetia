@@ -185,9 +185,9 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "cosca"
-version = "0.8.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4d2c4461691fd01588b090727897609c09d970114dd5f0825554756c891bf20"
+checksum = "3b34e7e2056ca0fa73f570bf1e3706929ac97faaf9a6e79e27cd60d59509f57a"
 dependencies = [
  "backon",
  "event-listener",

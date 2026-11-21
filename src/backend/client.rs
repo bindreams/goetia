@@ -93,9 +93,8 @@ impl Real {
     }
 
     /// Spawn, then read both streams to their end on the calling thread: goetia makes no thread and
-    /// no temp file. cosca's spawn does make one thread (cosca 0.7.0, on Linux: the pidfd handshake
-    /// helper, joined before `output` reads anything), which nothing here can reserve and whose
-    /// `TasksMax` slot may outlive its join: see `systemd::manager::systemctl::Held::of`.
+    /// no temp file, and cosca 0.10's spawn makes no thread. The child's own `TasksMax` slot is what
+    /// nothing here can reserve: see `systemd::manager::systemctl::Held::of`.
     fn to_completion(&self, args: &[&str]) -> Result<Finished, ClientError> {
         let mut cmd = cosca::run(self.argv(args));
         (self.environment)(&mut cmd);
