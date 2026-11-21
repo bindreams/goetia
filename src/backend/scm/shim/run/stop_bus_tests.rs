@@ -597,20 +597,60 @@ fn ask_and_wait_with(event: cosca::CtrlEvent, timeout: Option<Duration>) -> Stop
     StopPlan::AskAndWait { event, timeout }
 }
 
-/// The line an asked stop logs when the ask was sent, for a `timeout` of an hour.
-fn asked_line(event: &str) -> String {
+/// The start of the line a stop logs before it asks, for the event named; what follows is how long the daemon is given.
+fn asking_prefix(event: &str) -> String {
+    format!("goetia-shim[{ID}]: asking the daemon to exit with {event}; the daemon and what it started have ")
+}
+
+/// The line an asked stop with no `timeout` logs before it asks.
+fn asking_without_a_limit_line(event: &str) -> String {
     format!(
-        "goetia-shim[{ID}]: asked the daemon to exit with {event}; waiting up to {HOUR:?} for it and what it started"
+        "goetia-shim[{ID}]: asking the daemon to exit with {event}; the daemon and what it started are waited for with no time limit"
     )
+}
+
+/// What a stop with a `timeout` logged: the line before the first ask, which says how long the daemon is given (what
+/// is left of the `timeout`, counted from when the stop was seen), and the lines after it. Both are returned.
+fn told_asking(mut infos: Vec<String>, event: &str) -> (Duration, Vec<String>) {
+    assert!(!infos.is_empty(), "no line told the ask of {event}");
+    let first = infos.remove(0);
+    let prefix = asking_prefix(event);
+    let given = first
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(" to exit"))
+        .unwrap_or_else(|| panic!("not the line before an ask of {event}: {first:?}"));
+    let given = humantime::parse_duration(given).unwrap_or_else(|e| panic!("{given:?} is no duration: {e}"));
+    (given, infos)
+}
+
+/// [`told_asking`] for a `timeout` of an hour: what is left of it is a time a little under it.
+fn told_asking_within_the_hour(infos: Vec<String>, event: &str) -> Vec<String> {
+    let (given, rest) = told_asking(infos, event);
+    assert!(
+        given <= HOUR && given > HOUR / 2,
+        "the line says {given:?} are given of {HOUR:?}, which counts from the moment the stop was seen"
+    );
+    rest
 }
 
 fn exited_line() -> String {
     format!("goetia-shim[{ID}]: the daemon and what it started exited within the wait")
 }
 
-/// The warning of an asked stop that had to end the daemon at the end of its `timeout` of an hour.
+/// The warning of an asked stop whose daemon's tree had not been seen to exit by the end of its `timeout` of an hour.
 fn did_not_exit_line() -> String {
-    format!("goetia-shim[{ID}]: the daemon did not exit within its timeout of {HOUR:?} and is ended")
+    format!(
+        "goetia-shim[{ID}]: the daemon's process tree had not been seen to exit when its timeout of {} was over; it is being ended",
+        humantime::format_duration(HOUR)
+    )
+}
+
+/// The warning of an ask that may have sent `event`, whose answer was `error`.
+fn may_have_sent_line(event: &str, error: &cosca::error::Error) -> String {
+    format!(
+        "goetia-shim[{ID}]: the stop may have sent {event} to ask the daemon to exit: {}; waiting for it as if it had been asked",
+        Chain(error)
+    )
 }
 
 /// A daemon that runs until its tree is killed, and that the ask `reply`s to.
@@ -719,7 +759,10 @@ fn ask_and_wait_asks_once_and_waits_for_the_timeout() {
     );
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(fake.take_warnings(), Vec::<String>::new());
-    assert_eq!(fake.take_infos(), [asked_line("Ctrl+C"), exited_line()]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        [exited_line()]
+    );
 }
 
 #[skuld::test]
@@ -754,7 +797,10 @@ fn a_daemon_that_ignores_the_ask_is_killed_when_the_wait_expires() {
         panic!("asked, waited, then ended: {:?}", daemon.calls());
     };
     assert_eq!(fake.take_failures(), Vec::<String>::new());
-    assert_eq!(fake.take_infos(), [asked_line("Ctrl+C")]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new()
+    );
     assert_eq!(fake.take_warnings(), [did_not_exit_line()]);
 }
 
@@ -771,7 +817,11 @@ fn an_asked_stop_tells_the_event_it_sent_and_that_the_daemon_exited_within_the_w
 
         stopped_by(&fake, &daemon, ask_and_wait_with(event, Some(HOUR)));
 
-        assert_eq!(fake.take_infos(), [asked_line(named), exited_line()], "{named}");
+        assert_eq!(
+            told_asking_within_the_hour(fake.take_infos(), named),
+            [exited_line()],
+            "{named}"
+        );
         assert_eq!(fake.take_warnings(), Vec::<String>::new(), "{named}");
         assert_eq!(fake.take_failures(), Vec::<String>::new(), "{named}");
     }
@@ -784,12 +834,7 @@ fn an_asked_stop_with_no_timeout_says_it_waits_without_a_limit() {
 
     stopped_by(&fake, &daemon, ask_and_wait(None));
 
-    assert_eq!(
-        fake.take_infos()[0],
-        format!(
-            "goetia-shim[{ID}]: asked the daemon to exit with Ctrl+C; waiting for it and what it started, with no limit"
-        )
-    );
+    assert_eq!(fake.take_infos()[0], asking_without_a_limit_line("Ctrl+C"));
 }
 
 /// What the wait left is ended, and the log says the daemon did not exit by itself: one warning, no line that
@@ -801,8 +846,55 @@ fn an_asked_stop_that_ends_the_daemon_at_the_end_of_the_wait_says_so_in_one_warn
 
     stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
 
-    assert_eq!(fake.take_infos(), [asked_line("Ctrl+C")]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new()
+    );
     assert_eq!(fake.take_warnings(), [did_not_exit_line()]);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+}
+
+/// A stop with no `timeout` that ends its wait with members left names no time it was given.
+#[skuld::test]
+fn the_end_of_a_wait_with_no_limit_names_no_timeout() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
+
+    stopped_by(&fake, &daemon, ask_and_wait(None));
+
+    assert_eq!(
+        fake.take_warnings(),
+        [format!(
+            "goetia-shim[{ID}]: the daemon's process tree had not been seen to exit when the wait for it returned; it is being ended"
+        )]
+    );
+    let _ = fake.take_infos();
+}
+
+/// `AllMarkersClosed` is advisory (no proof that a process is gone) and is no `AllMembersExited`: no line says the daemon
+/// exited, the exit is not taken as reported, and the line claims only the closing of the marker. The daemon is
+/// ended by the teardown that kills (a Job Object never answers this; the arm is the honest one for a verdict that
+/// is not the one asked for).
+#[skuld::test]
+fn a_wait_that_ends_on_a_closed_marker_does_not_say_the_daemon_exited() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::MarkersClosed);
+
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert!(daemon.killed(), "the daemon was left running");
+    assert_eq!(
+        fake.take_warnings(),
+        [format!(
+            "goetia-shim[{ID}]: the wait for the daemon's process tree ended when the last copy of its marker was closed, which is no proof that every process in it exited; it is being ended"
+        )]
+    );
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new(),
+        "no line says the daemon exited"
+    );
     assert_eq!(fake.take_failures(), Vec::<String>::new());
 }
 
@@ -843,7 +935,10 @@ fn a_drained_tree_gets_the_exited_tree_teardown() {
         "the direct child was killed"
     );
     assert_eq!(fake.take_failures().len(), 1);
-    assert_eq!(fake.take_infos(), [asked_line("Ctrl+C"), exited_line()]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        [exited_line()]
+    );
 }
 
 #[skuld::test]
@@ -916,8 +1011,8 @@ fn a_second_stop_does_not_ask_again() {
     assert_eq!(fake.calls(Op::Ask), 1);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(
-        fake.take_infos(),
-        [asked_line("Ctrl+C"), exited_line()],
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        [exited_line()],
         "the ask is told once, as it is made once"
     );
 }
@@ -946,21 +1041,30 @@ fn an_ask_that_sent_nothing_is_logged_and_the_daemon_is_ended_at_once() {
             Chain(&ask_io())
         )),
     );
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new(),
+        "the line comes before the ask, so an ask that sent nothing has it too"
+    );
 }
 
 /// The proxy may have run: ending a daemon that may be shutting down is the worse mistake, so the wait
-/// is made, and the answer is a warning, not a failure.
+/// is made, and the answer is a warning, not a failure. The warning says which event may have been sent.
 #[skuld::test]
 fn an_ask_that_may_have_been_sent_is_waited_for() {
-    let answers: [(AskReply, cosca::error::Error); 2] = [
-        (AskReply::MayHaveStarted, ask_may_have_started()),
-        (AskReply::Unassessable, ask_unassessable()),
+    let answers: [(AskReply, fn() -> cosca::error::Error); 2] = [
+        (AskReply::MayHaveStarted, ask_may_have_started),
+        (AskReply::Unassessable, ask_unassessable),
     ];
-    for (reply, error) in answers {
+    let events = [
+        (cosca::CtrlEvent::CtrlC, "Ctrl+C"),
+        (cosca::CtrlEvent::CtrlBreak, "Ctrl+Break"),
+    ];
+    for ((reply, error), (event, named)) in answers.into_iter().flat_map(|a| events.map(|e| (a, e))) {
         let fake = FakeGuard::new();
         let daemon = asked(reply).wait_tree(TreeWaitReply::Remain);
 
-        let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+        let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait_with(event, Some(HOUR)));
 
         assert!(matches!(outcome, WaitOutcome::Stopping), "{reply:?}");
         let [ProcessCall::Ask, ProcessCall::WaitTree(_), ProcessCall::SendKillTree] = daemon.calls()[..] else {
@@ -969,19 +1073,13 @@ fn an_ask_that_may_have_been_sent_is_waited_for() {
         assert_eq!(fake.take_failures(), Vec::<String>::new(), "{reply:?}");
         assert_eq!(
             fake.take_warnings(),
-            [
-                format!(
-                    "goetia-shim[{ID}]: the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
-                    Chain(&error)
-                ),
-                did_not_exit_line()
-            ],
-            "{reply:?}"
+            [may_have_sent_line(named, &error()), did_not_exit_line()],
+            "{reply:?} {named}"
         );
         assert_eq!(
-            fake.take_infos(),
+            told_asking_within_the_hour(fake.take_infos(), named),
             Vec::<String>::new(),
-            "{reply:?}: an ask that may not have been sent is not told as sent"
+            "{reply:?} {named}"
         );
     }
 }
@@ -1009,7 +1107,10 @@ fn an_ask_that_is_unsupported_is_asked_again_until_it_is_sent() {
     };
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(fake.take_warnings(), [unsupported_warning()]);
-    assert_eq!(fake.take_infos(), [asked_line("Ctrl+C"), exited_line()]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        [exited_line()]
+    );
 }
 
 fn unsupported_warning() -> String {
@@ -1043,6 +1144,10 @@ fn an_ask_that_is_unsupported_stops_when_the_daemon_exits() {
     );
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(fake.take_warnings(), [unsupported_warning()]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new()
+    );
 }
 
 /// A daemon that has exited, whose report has not come in yet, is neither asked nor waited for: the supervisor
@@ -1085,12 +1190,56 @@ fn an_ask_answered_unassessable_is_waited_for_though_the_daemon_has_exited() {
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(
         fake.take_warnings(),
-        [format!(
-            "goetia-shim[{ID}]: the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
-            Chain(&ask_unassessable())
-        )]
+        [may_have_sent_line("Ctrl+C", &ask_unassessable())]
     );
-    assert_eq!(fake.take_infos(), [exited_line()]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        [exited_line()]
+    );
+}
+
+/// The read of the process before an ask is made before every ask: a daemon that exited while it was being asked
+/// again (and whose report lags) is not asked again, nor waited for. The fake has no reply for a second ask, so one
+/// fails the test.
+#[skuld::test]
+fn a_daemon_that_exited_while_it_was_asked_again_is_not_asked_a_third_time() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .ask(AskReply::UnsupportedAndExitedUnreported(3))
+        .send_kill_tree(KillReply::Ends);
+
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert_eq!(daemon.calls(), [ProcessCall::Ask, ProcessCall::SendKillTree]);
+    assert_eq!(fake.take_warnings(), [unsupported_warning()]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new()
+    );
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+}
+
+/// An exit that cannot be read is told once for the stop, not once for every ask.
+#[skuld::test]
+fn an_exit_that_cannot_be_read_is_told_once_however_often_the_daemon_is_asked() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Unsupported)
+        .ask(AskReply::Unsupported)
+        .ask(AskReply::Sent)
+        .try_wait_fails()
+        .wait_tree(TreeWaitReply::Drained);
+
+    stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert_eq!(fake.calls(Op::Ask), 3);
+    let unreadable = format!(
+        "goetia-shim[{ID}]: could not read whether the daemon has exited: {}",
+        Chain(&try_wait_failed())
+    );
+    assert_eq!(fake.take_warnings(), [unreadable, unsupported_warning()]);
+    let _ = fake.take_infos();
 }
 
 /// A read of the exit that fails says nothing: the daemon is waited for as before, and the read's failure is
@@ -1115,12 +1264,13 @@ fn an_exit_that_cannot_be_read_leaves_an_unassessable_ask_waited_for() {
                 "goetia-shim[{ID}]: could not read whether the daemon has exited: {}",
                 Chain(&try_wait_failed())
             ),
-            format!(
-                "goetia-shim[{ID}]: the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
-                Chain(&ask_unassessable())
-            ),
+            may_have_sent_line("Ctrl+C", &ask_unassessable()),
             did_not_exit_line(),
         ]
+    );
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new()
     );
 }
 
@@ -1202,6 +1352,10 @@ fn a_wait_that_fails_while_the_daemon_is_asked_again_ends_the_asking_and_is_not_
         "the failed wait was read as an exit, and the tree it left was ended as one: {failures:?}"
     );
     let _ = fake.take_warnings();
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new()
+    );
 }
 
 /// A `timeout` already over ends the asking at its first check: no clock is read but the one the spec's
@@ -1224,6 +1378,11 @@ fn an_ask_that_is_unsupported_with_the_timeout_spent_is_not_asked_again() {
         )),
     );
     assert_eq!(fake.take_warnings(), Vec::<String>::new());
+    assert_eq!(
+        fake.take_infos(),
+        [format!("{}0s to exit", asking_prefix("Ctrl+C"))],
+        "a timeout that is spent leaves nothing to give"
+    );
 }
 
 /// A `timeout` that runs out while the daemon is being asked again ends the asking, and the teardown follows. The
@@ -1256,6 +1415,9 @@ fn a_timeout_that_runs_out_while_the_daemon_is_asked_again_is_followed_by_the_te
         )),
     );
     let _ = fake.take_warnings();
+    let (given, rest) = told_asking(fake.take_infos(), "Ctrl+C");
+    assert!(given <= Duration::from_millis(1), "{given:?} of 1ms");
+    assert_eq!(rest, Vec::<String>::new());
 }
 
 /// The wait that cannot be made is a failed wait of the tree: logged, and the daemon is ended now.
@@ -1278,7 +1440,10 @@ fn a_failed_wait_for_the_tree_is_logged_and_the_daemon_is_ended() {
             Chain(&wait_tree_failed())
         )),
     );
-    assert_eq!(fake.take_infos(), [asked_line("Ctrl+C")]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        Vec::<String>::new()
+    );
 }
 
 // The plans -----------------------------------------------------------------------------------------------------------

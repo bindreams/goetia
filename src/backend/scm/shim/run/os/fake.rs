@@ -169,6 +169,9 @@ pub(crate) enum AskReply {
     Unsupported,
     /// `Error::Unsupported`, and the daemon exits meanwhile with this code.
     UnsupportedAndExits(i32),
+    /// `Error::Unsupported`, and the daemon has exited with this code while the waiter's report of it lags: only a read
+    /// of the process itself ([`Spawned::try_wait`]) shows it.
+    UnsupportedAndExitedUnreported(i32),
     /// `Error::MayHaveStarted`: the proxy may have run.
     MayHaveStarted,
     /// `Error::Unassessable`: whether the event was sent is unknown.
@@ -189,6 +192,8 @@ pub(crate) enum TreeWaitReply {
     Drained,
     /// `MembersRemain`: the bound passed.
     Remain,
+    /// `AllMarkersClosed`: advisory evidence only, which does not end the process.
+    MarkersClosed,
     /// Fail with [`wait_tree_failed`].
     Fails,
 }
@@ -518,6 +523,12 @@ impl Spawned for Instance {
                 self.proc.end(status(code));
                 Err(ask_unsupported())
             }
+            AskReply::UnsupportedAndExitedUnreported(code) => {
+                let mut state = lock(&self.proc.state);
+                state.report_held = true;
+                state.exit = Some(status(code));
+                Err(ask_unsupported())
+            }
             AskReply::UnsupportedAndWaitFails => {
                 lock(&self.proc.state).wait_fails = true;
                 self.proc.ended.notify_all();
@@ -543,6 +554,7 @@ impl Spawned for Instance {
                 Ok(TreeDrain::AllMembersExited)
             }
             Some(TreeWaitReply::Remain) => Ok(TreeDrain::MembersRemain),
+            Some(TreeWaitReply::MarkersClosed) => Ok(TreeDrain::AllMarkersClosed),
             Some(TreeWaitReply::Fails) => Err(wait_tree_failed()),
         }
     }

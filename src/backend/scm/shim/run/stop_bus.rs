@@ -615,15 +615,16 @@ impl Supervisor {
 
     /// Ask the daemon's tree to exit, then wait for the whole tree to exit within what is left of `timeout`.
     ///
-    /// A daemon that has already exited, read from the process itself, is neither asked nor waited for. What the
-    /// ask answered decides the rest ([`judge_ask`]); a wait that cannot be made is logged and the teardown follows
-    /// at once.
+    /// The daemon's exit is read from the process itself before every ask: one that has exited is neither asked
+    /// (again) nor waited for. The first ask is told in the log before it is made, so that the line comes before
+    /// whatever the daemon does in answer. What the ask answered decides the rest ([`judge_ask`]); a wait that cannot
+    /// be made is logged and the teardown follows at once.
     ///
     /// **A tree is waited for after any answer that may mean the event was sent, whether or not the root has
     /// exited since**: cosca answers `Unassessable` both for a root that had exited when it looked (nothing sent)
     /// and for an event the proxy generated and could not confirm (sent), and a launcher that was sent the event
     /// and exited at once has a worker that needs its `timeout`. The one case this waits for that was never asked
-    /// is a root that exits by itself between the read before the ask and the ask: waiting is the safe side, as
+    /// is a root that exits by itself between the read before an ask and that ask: waiting is the safe side, as
     /// ending a tree that may be shutting down is the worse mistake.
     ///
     /// **Delete that window when bindreams/cosca#1054 ships**, which tells the two answers apart.
@@ -632,23 +633,26 @@ impl Supervisor {
     /// bindreams/cosca#1055 does: cosca then answers "no console yet" apart from "never", and has a graceful
     /// stop that does not drain.
     fn ask_and_wait(&self, child: &dyn Spawned, id: &str, event: CtrlEvent, timeout: Option<Duration>, seen: Instant) {
-        if self.has_exited(child, id) {
-            // Its report is on its way.
-            return self.bus.await_exit_report();
-        }
         let left = || timeout.map(|t| t.saturating_sub(seen.elapsed()));
+        let mut unreadable_told = false;
+        let mut asking_told = false;
         let mut told = false;
         let mut pace = REASK_PACE_FIRST;
         loop {
+            if self.has_exited(child, id, &mut unreadable_told) {
+                // Its report is on its way.
+                return self.bus.await_exit_report();
+            }
+            if !asking_told {
+                asking_told = true;
+                self.log.info(id, &asking(event, left()));
+            }
             // Bound at the cosca 0.11 bump, bindreams/cosca#1057, unit 3c: `terminate_tree` waits for its proxy
             // with no cap under cosca 0.10.
             match judge_ask(child.terminate_tree()) {
-                Ask::Sent => {
-                    self.log.info(id, &asked(event, timeout));
-                    break;
-                }
+                Ask::Sent => break,
                 Ask::MaySent(e) => {
-                    self.log.warning(id, &may_have_asked(&e));
+                    self.log.warning(id, &may_have_sent(event, &e));
                     break;
                 }
                 Ask::NothingSent(e) => return self.log.failure(id, &could_not_ask(&e)),
@@ -676,18 +680,21 @@ impl Supervisor {
                 self.log.info(id, EXITED_WITHIN_THE_WAIT);
                 self.bus.await_exit_report();
             }
-            Ok(_) => self.log.warning(id, &not_exited_within(timeout)),
+            Ok(TreeDrain::AllMarkersClosed) => self.log.warning(id, MARKERS_CLOSED),
+            Ok(TreeDrain::MembersRemain) => self.log.warning(id, &tree_not_seen_to_exit(timeout)),
             Err(e) => self.log.failure(id, &wait_tree_failed(&e)),
         }
     }
 
     /// Whether the daemon's root has exited, read from the process itself: the waiter's report can lag the exit.
-    /// A read that fails says nothing, and is logged.
-    fn has_exited(&self, child: &dyn Spawned, id: &str) -> bool {
+    /// A read that fails says nothing, and is logged the first time it fails (`told` says it was).
+    fn has_exited(&self, child: &dyn Spawned, id: &str, told: &mut bool) -> bool {
         match child.try_wait() {
             Ok(status) => status.is_some(),
             Err(e) => {
-                self.log.warning(id, &exit_unreadable(&e));
+                if !std::mem::replace(told, true) {
+                    self.log.warning(id, &exit_unreadable(&e));
+                }
                 false
             }
         }
@@ -808,9 +815,10 @@ fn could_not_ask(e: &cosca::error::Error) -> String {
     )
 }
 
-fn may_have_asked(e: &cosca::error::Error) -> String {
+fn may_have_sent(event: CtrlEvent, e: &cosca::error::Error) -> String {
     format!(
-        "the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
+        "the stop may have sent {} to ask the daemon to exit: {}; waiting for it as if it had been asked",
+        event_name(event),
         Chain(e)
     )
 }
@@ -833,26 +841,49 @@ fn never_asked(e: &cosca::error::Error) -> String {
     )
 }
 
-fn asked(event: CtrlEvent, timeout: Option<Duration>) -> String {
-    let event = match event {
+fn event_name(event: CtrlEvent) -> &'static str {
+    match event {
         CtrlEvent::CtrlC => "Ctrl+C",
         CtrlEvent::CtrlBreak => "Ctrl+Break",
-    };
-    match timeout {
-        Some(t) => format!("asked the daemon to exit with {event}; waiting up to {t:?} for it and what it started"),
-        None => format!("asked the daemon to exit with {event}; waiting for it and what it started, with no limit"),
+    }
+}
+
+/// The line before the first ask. `left` is what is left of the spec's `timeout`, which counts from when the stop was
+/// seen, to the millisecond: the wait ends at the end of it.
+fn asking(event: CtrlEvent, left: Option<Duration>) -> String {
+    let event = event_name(event);
+    match left {
+        Some(left) => {
+            let left = Duration::new(left.as_secs(), left.subsec_millis() * 1_000_000);
+            format!(
+                "asking the daemon to exit with {event}; the daemon and what it started have {} to exit",
+                humantime::format_duration(left)
+            )
+        }
+        None => format!(
+            "asking the daemon to exit with {event}; the daemon and what it started are waited for with no time limit"
+        ),
     }
 }
 
 const EXITED_WITHIN_THE_WAIT: &str = "the daemon and what it started exited within the wait";
 
-fn not_exited_within(timeout: Option<Duration>) -> String {
+/// What a wait that ended with members left says: its process tree had not been seen to exit, and the teardown that
+/// follows is told by its own lines. The root may have exited, and a member may be finishing its exit.
+fn tree_not_seen_to_exit(timeout: Option<Duration>) -> String {
     match timeout {
-        Some(t) => format!("the daemon did not exit within its timeout of {t:?} and is ended"),
+        Some(t) => format!(
+            "the daemon's process tree had not been seen to exit when its timeout of {} was over; it is being ended",
+            humantime::format_duration(t)
+        ),
         // Reached only if cosca's wait returns before the end of a `Duration::MAX` bound.
-        None => "the daemon did not exit while it was waited for and is ended".to_string(),
+        None => "the daemon's process tree had not been seen to exit when the wait for it returned; it is being ended"
+            .to_string(),
     }
 }
+
+/// `TreeDrain::AllMarkersClosed` is advisory: no member is known to have exited. (A Job Object does not answer it.)
+const MARKERS_CLOSED: &str = "the wait for the daemon's process tree ended when the last copy of its marker was closed, which is no proof that every process in it exited; it is being ended";
 
 fn wait_tree_failed(e: &cosca::error::Error) -> String {
     format!(

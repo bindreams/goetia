@@ -836,7 +836,7 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
         fake.take_infos(),
         [
             format!(
-                "goetia-shim[{ID}]: asked the daemon to exit with Ctrl+C; waiting for it and what it started, with no limit"
+                "goetia-shim[{ID}]: asking the daemon to exit with Ctrl+C; the daemon and what it started are waited for with no time limit"
             ),
             format!("goetia-shim[{ID}]: the daemon and what it started exited within the wait"),
         ]

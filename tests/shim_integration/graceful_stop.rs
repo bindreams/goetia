@@ -279,10 +279,17 @@ fn assert_asked_and_answered(stopped: &Stopped, exit_on: &str) {
 /// teardown, and nothing here depends on which side of the installation the event lands:
 /// - a record with lines in it shows the event and the daemon's exit by it;
 /// - an empty record is a daemon ended by Windows' handler, or by the teardown unasked, and only the shim's own
-///   log tells them apart: the teardown's kill of a daemon that was never asked is logged as ended unasked.
+///   log tells them apart.
 ///
-/// In both, the shim's log has the line it writes when the ask was sent, so a daemon that was asked is shown by
-/// that line and not by the absence of another.
+/// The shim's log lines this reads are written by `ask_and_wait` in `stop_bus.rs`, beside the functions that make
+/// their text (`asking`, `may_have_sent`, `could_not_ask`, `never_asked`):
+/// - "asking the daemon to exit with <event>" is written before the first ask, so it is no proof that anything was
+///   sent. It is the evidence of an ask when no line says the ask failed: "the stop could not ask" and "without being
+///   asked" are the two failures that end the daemon unasked (`could_not_ask`, `never_asked`);
+/// - "the stop may have sent <event>" is the warning of an ask whose answer left it unknown whether the event was
+///   sent, which a correct stop of a daemon right after its start can get. It names the event, so it is evidence of
+///   an ask by itself;
+/// - a line of the two failures is never allowed, whichever of the others is there.
 fn assert_asked_not_killed(stopped: &Stopped, exit_on: &str) {
     if !stopped.record().is_empty() {
         assert_asked_and_answered(stopped, exit_on);
@@ -291,15 +298,20 @@ fn assert_asked_not_killed(stopped: &Stopped, exit_on: &str) {
     let log = std::fs::read_to_string(&log_path)
         .unwrap_or_else(|e| panic!("read the daemon's log {}: {e}", log_path.display()));
     let prefix = format!("goetia-shim[{}]: ", stopped.id);
-    let sent = format!("{prefix}asked the daemon to exit with {}", event_name(exit_on));
+    let event = event_name(exit_on);
+    let ours = || log.lines().filter(|line| line.starts_with(&prefix));
+    let unasked = ours().any(|line| line.contains("the stop could not ask") || line.contains("without being asked"));
     assert!(
-        log.lines().any(|line| line.starts_with(&sent)),
-        "the shim's log has no line for the ask:\n{log}"
+        !unasked,
+        "the teardown ended the daemon without asking it:
+{log}"
     );
+    let asking = ours().any(|line| line.starts_with(&format!("{prefix}asking the daemon to exit with {event}")));
+    let may_have_sent = ours().any(|line| line.starts_with(&format!("{prefix}the stop may have sent {event} ")));
     assert!(
-        !log.lines()
-            .any(|line| line.starts_with(&prefix) && line.contains("ended without being asked")),
-        "the teardown ended the daemon without asking it:\n{log}"
+        asking || may_have_sent,
+        "the shim's log has no line for the ask of {event}:
+{log}"
     );
 }
 

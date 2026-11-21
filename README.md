@@ -284,11 +284,14 @@ records the end as it does.
   `interrupt` and `ctrl-c`; Ctrl+Break for `quit` and `ctrl-break`), through a copy of the shim host that
   attaches to the daemon's console, and then waits for the daemon's whole process tree to exit for up to
   `timeout` (as long as it takes for `null`) before it ends what is left. A launcher whose worker needs time
-  to exit, and whatever a daemon that honoured the event left running, have the `timeout` too; a daemon that
-  has already exited is not asked, and what it left in the job is ended at once. `kill` sends nothing and ends
-  the daemon at once. `wm-close` still does too: it sends nothing yet. The daemon's log gets a line when the
-  daemon is asked, naming the event, and one saying how the stop ended: that the daemon and what it started
-  exited within the wait, or (a warning) that they did not exit within the `timeout` and were ended. The limits:
+  to exit, and whatever a daemon that honoured the event left running, have the `timeout` too. A daemon that
+  had exited when the stop looked is not asked, and what it left in the job is ended at once; one that exits
+  as it is being asked is waited for like one that was asked. `kill` sends nothing and ends
+  the daemon at once. `wm-close` still does too: it sends nothing yet. A stop that asks writes its lines to the
+  daemon's log (the file `logs` names, or the default log when it has none) and to the Windows Event Log: one
+  before the first ask, naming the event and how long the daemon and what it started are given, and one saying
+  how the stop ended: that they exited within the wait, or (a warning) that the daemon's process tree had not
+  been seen to exit when the `timeout` was over and is being ended. The limits:
   - The event reaches every process that shares the daemon's console, not only the daemon.
   - A program with no console (a GUI program) cannot be sent the event, so it is ended only when its
     `timeout` is over; write `send-signal: kill` for one. A stop right after a `start` finds the daemon
@@ -947,7 +950,7 @@ Where a task's output goes:
   it shows no output. This is deliberate: a task with no `logs` may have none
   for a reason, such as privacy.
 - **Windows, the shim's own diagnostics** (a program that did not start, a stop
-  that could not end everything, and what an asked stop did) go to `%ProgramData%\Goetia\logs\<id>.log`
+  that could not end everything) go to `%ProgramData%\Goetia\logs\<id>.log`
   and the Windows Event Log.
 
 Two daemons that share one `logs` path are not refused. On systemd, a task's
