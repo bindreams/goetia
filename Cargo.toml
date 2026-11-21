@@ -2,7 +2,7 @@
 name = "goetia"
 version = "0.3.0"
 edition = "2024"
-# `skuld` 0.6 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
+# `skuld` 0.7 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
 rust-version = "1.89"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
@@ -112,7 +112,7 @@ serde_json = "1"
 sha2 = "0.11.1"
 similar = "3"
 # `skuld` is for the `ELEVATED` label and `testing::run_all`.
-skuld = { version = "0.6", optional = true }
+skuld = { version = "0.7", optional = true }
 tempfile = "3"
 thiserror = "2"
 yaml_serde = "0.10.7"
@@ -213,7 +213,7 @@ libsearch-guard.workspace = true
 # Turns on `testing` for the integration tests, which reach the library only through its public API.
 # Without `default-features = false` it would also turn on `cli` in a `--no-default-features` build.
 goetia = { path = ".", default-features = false, features = ["testing"] }
-skuld = "0.6"
+skuld = "0.7"
 # The tests' `jiff`: `backend::launchd::next`'s unit tests off macOS, and the integration tests, which cannot see
 # the library's optional `jiff`. Default features bundle a zone database where the host has none (Windows).
 jiff = "0.2.43"
