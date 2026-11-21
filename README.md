@@ -291,7 +291,8 @@ records the end as it does.
   - A program with no console (a GUI program) cannot be sent the event, so it is ended only when its
     `timeout` is over; write `send-signal: kill` for one. A stop right after a `start` finds the daemon
     without its console for a few milliseconds: the shim asks again until the daemon has it, exits, or the
-    `timeout` is over.
+    `timeout` is over. The pause between asks doubles from 25 ms to 1 s, so with `timeout: null` a program
+    that never has a console is asked again, about once a second, until `goetia daemon kill`.
   - `stop` and `restart` wait the `timeout` plus 10 s, as above. `uninstall` waits up to the `timeout`
     too, holding the machine-wide install lock as it does for any stop, so an `install` or `uninstall` of
     another daemon waits behind it. For `timeout: null` and a tree that never exits it waits until

@@ -32,6 +32,7 @@ use crate::backend::scm::shim::run::logging::Log;
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
 const KILL_REFUSED: &str = "the kill was refused (fake)";
 const WAIT_FAILED: &str = "the wait failed (fake)";
+const TRY_WAIT_FAILED: &str = "the read of the exit failed (fake)";
 const WAIT_TREE_FAILED: &str = "the wait for the tree failed (fake)";
 /// The messages the answers of an ask carry, each one's own, so a log line shows which was read.
 const ASK_IO: &str = "the proxy could not be started (fake)";
@@ -57,6 +58,11 @@ pub(crate) fn tree_kill_refused() -> cosca::error::Error {
         detail: "TerminateJobObject could not terminate the job".to_owned(),
         source: Some(Arc::new(kill_refused())),
     }
+}
+
+/// A failed [`Spawned::try_wait`].
+pub(crate) fn try_wait_failed() -> cosca::error::Error {
+    cosca::error::Error::Io(io::Error::other(TRY_WAIT_FAILED))
 }
 
 /// A failed [`Spawned::wait_tree_timeout`].
@@ -167,6 +173,9 @@ pub(crate) enum AskReply {
     MayHaveStarted,
     /// `Error::Unassessable`: whether the event was sent is unknown.
     Unassessable,
+    /// `Error::Unassessable`, and the daemon has exited with this code: cosca's answer for a root that has
+    /// exited, when nothing was sent.
+    UnassessableAndExited(i32),
 }
 
 /// What a [`Spawned::wait_tree_timeout`] answers.
@@ -235,6 +244,8 @@ struct ProcState {
     asks: VecDeque<AskReply>,
     /// What an ask answers once `asks` is spent.
     asking_always: Option<AskReply>,
+    /// Whether [`Spawned::try_wait`] fails.
+    try_wait_fails: bool,
     tree_waits: VecDeque<TreeWaitReply>,
     calls: Vec<ProcessCall>,
     exit: Option<ExitStatus>,
@@ -276,6 +287,7 @@ impl FakeProcess {
                 send_kill_tree_replies: VecDeque::new(),
                 asks: VecDeque::new(),
                 asking_always: None,
+                try_wait_fails: false,
                 tree_waits: VecDeque::new(),
                 calls: Vec::new(),
                 exit: None,
@@ -330,6 +342,11 @@ impl FakeProcess {
     /// supervisor makes before something else happens.
     pub(crate) fn asking_always(self, reply: AskReply) -> FakeProcess {
         self.with(|state| state.asking_always = Some(reply))
+    }
+
+    /// Every read of whether the process has exited fails.
+    pub(crate) fn try_wait_fails(self) -> FakeProcess {
+        self.with(|state| state.try_wait_fails = true)
     }
 
     /// The reply to the next `wait_tree_timeout` not yet stated for.
@@ -421,6 +438,14 @@ impl Spawned for Instance {
         }
     }
 
+    fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error> {
+        let state = lock(&self.proc.state);
+        if state.try_wait_fails {
+            return Err(try_wait_failed());
+        }
+        Ok(state.exit)
+    }
+
     fn kill(&self) -> Result<(), cosca::error::Error> {
         self.record(ProcessCall::Kill);
         let reply = lock(&self.proc.state).kills.pop_front();
@@ -458,6 +483,10 @@ impl Spawned for Instance {
             }
             AskReply::MayHaveStarted => Err(ask_may_have_started()),
             AskReply::Unassessable => Err(ask_unassessable()),
+            AskReply::UnassessableAndExited(code) => {
+                self.proc.end(status(code));
+                Err(ask_unassessable())
+            }
         }
     }
 

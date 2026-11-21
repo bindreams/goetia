@@ -224,9 +224,12 @@ fn wait_hint_millis(hint: Duration) -> u32 {
 
 /// The `STOP_PENDING` status held while the shim stops the daemon, accepting no control. SCM
 /// then refuses a second `STOP` (1061) and a `START` (1056) itself, and a `STOPPED` that follows
-/// restarts or not exactly as one that follows `RUNNING` (P18). The hint and checkpoint are those
-/// P18 measured. SCM does nothing when the hint expires or the checkpoint stalls: the status, a refused
-/// STOP (1061) and a refused START (1056) held for 10 s past a 1 s hint (P26).
+/// restarts or not exactly as one that follows `RUNNING` (P18). The hint is the stop's longest wait
+/// ([`StopPlan::wait_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is a constant 1.
+/// Measured: P18 (a `STOPPED` after this status restarts or not as one after `RUNNING`) and P26 (SCM does nothing
+/// when the hint expires: the status, a refused STOP (1061) and a refused START (1056) held for 10 s past a 1 s
+/// hint). Not measured: a `STOP_PENDING` held for longer than that with a checkpoint that does not move (unit 3b
+/// measures it).
 fn stopping_status(hint: Duration) -> SERVICE_STATUS {
     SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,

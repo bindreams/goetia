@@ -56,6 +56,10 @@ pub(crate) trait Spawned: Send + Sync {
     /// Block until the daemon exits. May be called again once it has, with the same status.
     fn wait(&self) -> Result<ExitStatus, cosca::error::Error>;
 
+    /// The exit status if the daemon has exited, read from the process itself at this moment: the
+    /// waiter's report can lag the exit, this cannot.
+    fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error>;
+
     /// Kill the daemon alone, not its descendants.
     fn kill(&self) -> Result<(), cosca::error::Error>;
 
@@ -153,6 +157,10 @@ impl Spawned for cosca::Child {
 
     fn wait(&self) -> Result<ExitStatus, cosca::error::Error> {
         cosca::Child::wait(self)
+    }
+
+    fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error> {
+        cosca::Child::try_wait(self)
     }
 
     fn kill(&self) -> Result<(), cosca::error::Error> {

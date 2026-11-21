@@ -24,9 +24,10 @@ use crate::backend::scm::exit_status::Reported;
 
 use super::logging::Log;
 use super::os::{Os, Spawned};
+use super::service::console_event;
 use crate::backend::standby::Standby;
 use crate::error::{Chain, os_error_in};
-use crate::spec::{DaemonSpec, StopAction, StopSignal};
+use crate::spec::{DaemonSpec, StopAction};
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
 /// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM
@@ -95,16 +96,13 @@ impl StopPlan {
         match spec {
             // Part 2 gives a task the wait-only plan.
             DaemonSpec::Task(_) => StopPlan::AtOnce,
-            DaemonSpec::Service(service) => match service.stop_action.send_signal {
-                StopSignal::Terminate
-                | StopSignal::Interrupt
-                | StopSignal::CtrlC
-                | StopSignal::Quit
-                | StopSignal::CtrlBreak => StopPlan::AskAndWait {
+            // A stop asks exactly where `console_event` has an event to send, which is what `build_command`
+            // sends: one source for which signals ask.
+            DaemonSpec::Service(service) => match console_event(service.stop_action.send_signal) {
+                Some(_) => StopPlan::AskAndWait {
                     timeout: service.stop_action.timeout,
                 },
-                // `wm-close` has no send until unit 3c. A native signal is refused on Windows at install.
-                StopSignal::Kill | StopSignal::WmClose | StopSignal::Native(_) => StopPlan::AtOnce,
+                None => StopPlan::AtOnce,
             },
         }
     }
@@ -256,16 +254,29 @@ impl StopBus {
         true
     }
 
-    /// Waits until a stop has been accepted or `pace` has passed, and says whether one has. The wait
-    /// only paces a loop that re-reads the real condition it waits for between calls; its expiry
-    /// proves nothing.
+    /// The one wait on the gate: until `until` holds of it, or, given a `pace`, until that has passed. Says whether
+    /// `until` holds. A `pace` only spaces a loop that re-reads the real condition it waits for between calls: its
+    /// expiry proves nothing.
+    fn wait_until(&self, pace: Option<Duration>, until: impl Fn(&Gate) -> bool) -> bool {
+        let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let g = match pace {
+            None => self
+                .cvar
+                .wait_while(g, |g| !until(g))
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(pace) => {
+                self.cvar
+                    .wait_timeout_while(g, pace, |g| !until(g))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+        };
+        until(&g)
+    }
+
+    /// Waits until a stop has been accepted or `pace` has passed, and says whether one has.
     pub(super) fn stopped_within(&self, pace: Duration) -> bool {
-        let g = self.state.lock().expect("StopBus mutex poisoned");
-        let (g, _) = self
-            .cvar
-            .wait_timeout_while(g, pace, |g| g.fate != Fate::Stopped)
-            .expect("StopBus mutex poisoned");
-        g.fate == Fate::Stopped
+        self.wait_until(Some(pace), |g| g.fate == Fate::Stopped)
     }
 
     /// Decide how the run ends when `candidate` is what the daemon's end amounts to. An accepted
@@ -302,27 +313,15 @@ impl StopBus {
         (g.child_done, g.wait_failure)
     }
 
-    /// Waits until the waiter has reported its wait over or `pace` has passed, and says whether it has. The
-    /// wait only paces a loop that re-reads the real condition it waits for between calls; its expiry proves
-    /// nothing.
+    /// Waits until the waiter has reported its wait over or `pace` has passed, and says whether it has.
     fn exited_within(&self, pace: Duration) -> bool {
-        let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let (g, _) = self
-            .cvar
-            .wait_timeout_while(g, pace, |g| !g.child_done)
-            .unwrap_or_else(PoisonError::into_inner);
-        g.child_done
+        self.wait_until(Some(pace), |g| g.child_done)
     }
 
     /// Blocks until the waiter has reported that its wait is over, whatever it ended in. For a caller that
     /// knows the root has exited, so the report is on its way.
     pub(super) fn await_exit_report(&self) {
-        let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        drop(
-            self.cvar
-                .wait_while(g, |g| !g.child_done)
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+        self.wait_until(None, |g| g.child_done);
     }
 
     /// The waiter's report that its wait is over, with the failure it ended in, if any.
@@ -579,10 +578,18 @@ impl Supervisor {
 
 // Stop plans ----------------------------------------------------------------------------------------------------------
 
-/// How long the asking pauses between two answers of `Unsupported`, which says the daemon has no console to be
-/// sent the event on yet. The pause only spaces the re-asks of a question each answer decides; a daemon's exit ends it
-/// at once.
-const REASK_PACE: Duration = Duration::from_millis(25);
+/// How long the asking pauses after the first answer of `Unsupported`, which says the daemon has no console to be
+/// sent the event on yet. Each such pass starts a proxy process, so the pause doubles ([`grown_pace`]) up to
+/// [`REASK_PACE_CEILING`]: the first re-ask is fast, which is the case that matters (a daemon right after its
+/// start), and a program that never has a console is asked about once a second. A pause only spaces the re-asks of a
+/// question each answer decides; a daemon's exit ends it at once.
+const REASK_PACE_FIRST: Duration = Duration::from_millis(25);
+const REASK_PACE_CEILING: Duration = Duration::from_secs(1);
+
+/// The pause after `pace`: twice as long, up to the ceiling.
+fn grown_pace(pace: Duration) -> Duration {
+    pace.saturating_mul(2).min(REASK_PACE_CEILING)
+}
 
 impl Supervisor {
     /// What an accepted stop does before the teardown, for a daemon that has not been reported exited when the
@@ -611,9 +618,19 @@ impl Supervisor {
     fn ask_and_wait(&self, child: &dyn Spawned, id: &str, timeout: Option<Duration>, seen: Instant) {
         let left = || timeout.map(|t| t.saturating_sub(seen.elapsed()));
         let mut told = false;
+        let mut pace = REASK_PACE_FIRST;
         loop {
             match judge_ask(child.terminate_tree()) {
                 Ask::Sent => break,
+                Ask::Unknown(e) => {
+                    // cosca answers this for a root that has exited too, with nothing sent: the root is asked.
+                    if self.has_exited(child, id) {
+                        // Its report is on its way.
+                        return self.bus.await_exit_report();
+                    }
+                    self.log.warning(id, &may_have_asked(&e));
+                    break;
+                }
                 Ask::MaySent(e) => {
                     self.log.warning(id, &may_have_asked(&e));
                     break;
@@ -627,10 +644,10 @@ impl Supervisor {
                         told = true;
                         self.log.warning(id, &not_asked_yet(&e));
                     }
-                    let pace = left().map_or(REASK_PACE, |left| left.min(REASK_PACE));
-                    if self.bus.exited_within(pace) {
+                    if self.bus.exited_within(left().map_or(pace, |left| left.min(pace))) {
                         return;
                     }
+                    pace = grown_pace(pace);
                 }
             }
         }
@@ -643,13 +660,30 @@ impl Supervisor {
     }
 }
 
+impl Supervisor {
+    /// Whether the daemon's root has exited, read from the process itself: the waiter's report can lag the exit.
+    /// A read that fails says nothing, and is logged.
+    fn has_exited(&self, child: &dyn Spawned, id: &str) -> bool {
+        match child.try_wait() {
+            Ok(status) => status.is_some(),
+            Err(e) => {
+                self.log.warning(id, &exit_unreadable(&e));
+                false
+            }
+        }
+    }
+}
+
 /// What an ask answered, by the contract of `terminate_tree` with a proxy send.
 enum Ask {
     /// The event was sent.
     Sent,
-    /// It may have been sent: the proxy started and something failed after, or whether it was sent is
-    /// unknown. Ending a daemon that may be shutting down is the worse mistake, so the wait is made.
+    /// It may have been sent: the proxy started and something failed after. Ending a daemon that may be
+    /// shutting down is the worse mistake, so the wait is made.
     MaySent(cosca::error::Error),
+    /// Whether it was sent is unknown, and cosca's answer for a root that has exited, with nothing sent, is this
+    /// one too: the daemon is asked whether it has exited, and one that has is not waited for.
+    Unknown(cosca::error::Error),
     /// Nothing was sent, and asking again cannot help: the proxy could not be started.
     NothingSent(cosca::error::Error),
     /// Nothing was sent: the daemon has no console to send it on, yet or ever.
@@ -663,6 +697,7 @@ fn judge_ask(answer: Result<(), cosca::error::Error>) -> Ask {
         Ok(()) => Ask::Sent,
         Err(e @ cosca::error::Error::Io(_)) => Ask::NothingSent(e),
         Err(e @ cosca::error::Error::Unsupported { .. }) => Ask::NotYet(e),
+        Err(e @ cosca::error::Error::Unassessable { .. }) => Ask::Unknown(e),
         Err(e) => Ask::MaySent(e),
     }
 }
@@ -761,6 +796,10 @@ fn may_have_asked(e: &cosca::error::Error) -> String {
         "the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
         Chain(e)
     )
+}
+
+fn exit_unreadable(e: &cosca::error::Error) -> String {
+    format!("could not read whether the daemon has exited: {}", Chain(e))
 }
 
 fn not_asked_yet(e: &cosca::error::Error) -> String {

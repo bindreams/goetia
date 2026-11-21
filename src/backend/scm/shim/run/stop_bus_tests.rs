@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use super::*;
 use crate::backend::scm::shim::run::os::fake::{
     AskReply, Fake, FakeGuard, FakeProcess, KillReply, Op, ProcessCall, TreeWaitReply, WaitReply, WaiterEnd, ask_io,
-    ask_may_have_started, ask_unassessable, ask_unsupported, tree_kill_refused, wait_failed, wait_failed_with_code,
-    wait_tree_failed,
+    ask_may_have_started, ask_unassessable, ask_unsupported, tree_kill_refused, try_wait_failed, wait_failed,
+    wait_failed_with_code, wait_tree_failed,
 };
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, supervisor, tree_refused_failure,
@@ -938,6 +938,96 @@ fn an_ask_that_is_unsupported_stops_when_the_daemon_exits() {
     );
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(fake.take_warnings(), [unsupported_warning()]);
+}
+
+/// cosca answers `Unassessable` for a root that has exited too, with nothing sent: the daemon is asked
+/// about itself, and one that has exited is not waited for. The tree it left is ended as after any exit.
+#[skuld::test]
+fn an_ask_answered_unassessable_by_an_exited_daemon_is_not_waited_for() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .ask(AskReply::UnassessableAndExited(3))
+        .send_kill_tree(KillReply::Refuses);
+
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(
+        matches!(outcome, WaitOutcome::TreeMayRun),
+        "the exited-tree teardown is the one that cannot fall back to a direct kill"
+    );
+    assert_eq!(daemon.calls(), [ProcessCall::Ask, ProcessCall::SendKillTree]);
+    assert_eq!(daemon.exit_code(), Some(3));
+    assert_eq!(fake.take_warnings(), Vec::<String>::new());
+    assert_eq!(fake.take_failures().len(), 1, "only the tree that could not be ended");
+}
+
+/// A read of the exit that fails says nothing: the daemon is waited for as before, and the read's failure is
+/// told beside the warning of the ask.
+#[skuld::test]
+fn an_exit_that_cannot_be_read_leaves_an_unassessable_ask_waited_for() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Unassessable)
+        .try_wait_fails()
+        .wait_tree(TreeWaitReply::Remain);
+
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    let [ProcessCall::Ask, ProcessCall::WaitTree(_), ProcessCall::SendKillTree] = daemon.calls()[..] else {
+        panic!("asked, waited, then ended: {:?}", daemon.calls());
+    };
+    assert_eq!(
+        fake.take_warnings(),
+        [
+            format!(
+                "goetia-shim[{ID}]: could not read whether the daemon has exited: {}",
+                Chain(&try_wait_failed())
+            ),
+            format!(
+                "goetia-shim[{ID}]: the stop may have asked the daemon to exit: {}; waiting for it as if it had been asked",
+                Chain(&ask_unassessable())
+            ),
+        ]
+    );
+}
+
+/// Every pass of `Unsupported` starts a proxy, so the pauses between passes grow: the first re-ask is fast, and
+/// the pauses stop growing at the ceiling.
+#[skuld::test]
+fn the_pauses_between_reasks_grow_and_stop_growing_at_the_ceiling() {
+    let mut pace = REASK_PACE_FIRST;
+    let mut paces = vec![pace];
+    for _ in 0..8 {
+        pace = grown_pace(pace);
+        paces.push(pace);
+    }
+    let ms: Vec<u128> = paces.iter().map(Duration::as_millis).collect();
+    assert_eq!(ms, [25, 50, 100, 200, 400, 800, 1000, 1000, 1000]);
+}
+
+/// The loop takes the growing pauses: three `Unsupported` answers are followed by pauses of at least
+/// 25, 50 and 100 ms. A lower bound only: a pause never ends before it is over, so a slow host cannot fail it.
+#[skuld::test]
+fn the_loop_pauses_longer_between_each_unsupported_answer() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Unsupported)
+        .ask(AskReply::Unsupported)
+        .ask(AskReply::Unsupported)
+        .ask(AskReply::SentAndExits(0))
+        .wait_tree(TreeWaitReply::Drained);
+    let started = Instant::now();
+
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert_eq!(fake.calls(Op::Ask), 4);
+    assert!(
+        started.elapsed() >= Duration::from_millis(25 + 50 + 100),
+        "the pauses did not grow: {:?}",
+        started.elapsed()
+    );
+    let _ = fake.take_warnings();
 }
 
 /// A `timeout` already over ends the asking at its first check: no clock is read but the one the spec's

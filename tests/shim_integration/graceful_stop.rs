@@ -374,8 +374,9 @@ fn a_stop_right_after_the_start_still_asks_the_daemon(#[fixture(scm_group)] _gro
 
     let stopped = stop_the_catcher(StopBy::Goetia, setup);
 
-    // The daemon may not have installed its handler when the event reached it: then Windows' own handler ended
-    // it, which is also asking. Either way it ended by the event, long before its `timeout`.
+    // The record is what says it was asked: a daemon ended at once leaves none. An event that reached the daemon
+    // before its handler was installed would end it by Windows' own handler, with no record: not measured.
+    assert_asked_and_answered(&stopped, setup.exit_on);
     assert!(
         stopped.stop_took < timeout,
         "the stop took {:?}, which is its timeout: the daemon was never asked",
