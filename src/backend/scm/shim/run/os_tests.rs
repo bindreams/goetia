@@ -803,8 +803,16 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome =
-                supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AskAndWait { timeout: None }, |_| {});
+            let outcome = supervisor.wait_for_child_or_stop(
+                waiter,
+                &child,
+                ID,
+                StopPlan::AskAndWait {
+                    event: cosca::CtrlEvent::CtrlC,
+                    timeout: None,
+                },
+                |_| {},
+            );
             let _ = tx.send(outcome);
         });
     }
@@ -824,4 +832,13 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
         "the worker was ended before it finished its own shutdown"
     );
     assert_eq!(fake.take_failures(), Vec::<String>::new());
+    assert_eq!(
+        fake.take_infos(),
+        [
+            format!(
+                "goetia-shim[{ID}]: asked the daemon to exit with Ctrl+C; waiting for it and what it started, with no limit"
+            ),
+            format!("goetia-shim[{ID}]: the daemon and what it started exited within the wait"),
+        ]
+    );
 }

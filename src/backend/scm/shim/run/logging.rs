@@ -198,6 +198,12 @@ impl Log {
         self.report(id, Severity::Warning, message);
     }
 
+    /// [`Log::failure`] for a line that says what the shim did, with nothing wrong: the Event Log entry is
+    /// information.
+    pub(crate) fn info(&self, id: &str, message: &str) {
+        self.report(id, Severity::Information, message);
+    }
+
     fn report(&self, id: &str, severity: Severity, message: &str) {
         let line = failure_line(id, message);
         let daemon_log = self.daemon_log.get().map(PathBuf::as_path);

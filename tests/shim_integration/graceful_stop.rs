@@ -83,6 +83,15 @@ fn event_line(exit_on: &str) -> &'static str {
     }
 }
 
+/// The shim's log's name for `exit_on`'s event.
+fn event_name(exit_on: &str) -> &'static str {
+    match exit_on {
+        "ctrl-c" => "Ctrl+C",
+        "ctrl-break" => "Ctrl+Break",
+        other => panic!("`{other}` is not an event"),
+    }
+}
+
 /// One service to install, start and stop.
 struct Run<'a> {
     mgr: &'a Scm,
@@ -271,17 +280,22 @@ fn assert_asked_and_answered(stopped: &Stopped, exit_on: &str) {
 /// - a record with lines in it shows the event and the daemon's exit by it;
 /// - an empty record is a daemon ended by Windows' handler, or by the teardown unasked, and only the shim's own
 ///   log tells them apart: the teardown's kill of a daemon that was never asked is logged as ended unasked.
+///
+/// In both, the shim's log has the line it writes when the ask was sent, so a daemon that was asked is shown by
+/// that line and not by the absence of another.
 fn assert_asked_not_killed(stopped: &Stopped, exit_on: &str) {
     if !stopped.record().is_empty() {
         assert_asked_and_answered(stopped, exit_on);
     }
     let log_path = stopped.logs.path_for(&stopped.id);
-    let log = match std::fs::read_to_string(&log_path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => panic!("read the daemon's log {}: {e}", log_path.display()),
-    };
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("read the daemon's log {}: {e}", log_path.display()));
     let prefix = format!("goetia-shim[{}]: ", stopped.id);
+    let sent = format!("{prefix}asked the daemon to exit with {}", event_name(exit_on));
+    assert!(
+        log.lines().any(|line| line.starts_with(&sent)),
+        "the shim's log has no line for the ask:\n{log}"
+    );
     assert!(
         !log.lines()
             .any(|line| line.starts_with(&prefix) && line.contains("ended without being asked")),

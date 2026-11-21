@@ -796,6 +796,11 @@ impl Fake {
         self.take_event_log(Severity::Warning)
     }
 
+    /// The information lines reported to the Event Log, oldest first, removed.
+    pub(crate) fn take_infos(&self) -> Vec<String> {
+        self.take_event_log(Severity::Information)
+    }
+
     fn take_event_log(&self, wanted: Severity) -> Vec<String> {
         let mut taken = Vec::new();
         lock(&self.shared.state).channel_calls.retain(|call| match call {

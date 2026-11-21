@@ -83,9 +83,11 @@ pub(crate) enum Severity {
     Error,
     /// The daemon runs, but something about its registration needs the administrator.
     Warning,
+    /// Nothing is wrong: the shim says what it did.
+    Information,
 }
 
-/// Where the shim's failure and warning lines go.
+/// Where the shim's failure, warning and information lines go.
 pub(crate) trait Channels: Send + Sync {
     /// Opens the default log at `path` as [`LogKind::Default`] and holds it for the run, so later appends and
     /// `open_log` of that path share one handle that survives an install taking the account out of the file's

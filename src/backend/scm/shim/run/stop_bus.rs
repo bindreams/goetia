@@ -18,6 +18,7 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use cosca::CtrlEvent;
 use cosca::containment::TreeDrain;
 
 use crate::backend::scm::exit_status::Reported;
@@ -76,9 +77,12 @@ pub enum WaitEnd {
 /// ([`Supervisor::wait_for_child_or_stop`]); a plan only says how much of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopPlan {
-    /// Ask the daemon to exit, then wait for its whole tree for `timeout` (`None`: as long as it
+    /// Ask the daemon to exit with `event`, then wait for its whole tree for `timeout` (`None`: as long as it
     /// takes), counted from when the supervisor saw the stop. A service whose `send-signal` asks.
-    AskAndWait { timeout: Option<Duration> },
+    AskAndWait {
+        event: CtrlEvent,
+        timeout: Option<Duration>,
+    },
     /// Ask nothing; wait for the daemon's own exit with no cap. Task mode takes it in part 2.
     #[allow(
         dead_code,
@@ -99,7 +103,8 @@ impl StopPlan {
             // A stop asks exactly where `console_event` has an event to send, which is what `build_command`
             // sends: one source for which signals ask.
             DaemonSpec::Service(service) => match console_event(service.stop_action.send_signal) {
-                Some(_) => StopPlan::AskAndWait {
+                Some(event) => StopPlan::AskAndWait {
+                    event,
                     timeout: service.stop_action.timeout,
                 },
                 None => StopPlan::AtOnce,
@@ -116,7 +121,7 @@ impl StopPlan {
     /// teardown, and the `timeout` when a stop asks (the largest the hint's field holds for none).
     pub(super) fn wait_hint(self, end: WaitEnd) -> Duration {
         match (self, end) {
-            (StopPlan::AskAndWait { timeout }, WaitEnd::Stop) => {
+            (StopPlan::AskAndWait { timeout, .. }, WaitEnd::Stop) => {
                 timeout.map_or(Duration::MAX, |t| t.saturating_add(StopAction::TEARDOWN_MARGIN))
             }
             _ => StopAction::TEARDOWN_MARGIN,
@@ -604,7 +609,7 @@ impl Supervisor {
         match plan {
             StopPlan::AtOnce => {}
             StopPlan::WaitOnly => self.bus.await_exit_report(),
-            StopPlan::AskAndWait { timeout } => self.ask_and_wait(child, id, timeout, seen),
+            StopPlan::AskAndWait { event, timeout } => self.ask_and_wait(child, id, event, timeout, seen),
         }
     }
 
@@ -626,7 +631,7 @@ impl Supervisor {
     /// **Delete the re-ask loop when bindreams/cosca#1053 ships**, and this whole composition when
     /// bindreams/cosca#1055 does: cosca then answers "no console yet" apart from "never", and has a graceful
     /// stop that does not drain.
-    fn ask_and_wait(&self, child: &dyn Spawned, id: &str, timeout: Option<Duration>, seen: Instant) {
+    fn ask_and_wait(&self, child: &dyn Spawned, id: &str, event: CtrlEvent, timeout: Option<Duration>, seen: Instant) {
         if self.has_exited(child, id) {
             // Its report is on its way.
             return self.bus.await_exit_report();
@@ -638,7 +643,10 @@ impl Supervisor {
             // Bound at the cosca 0.11 bump, bindreams/cosca#1057, unit 3c: `terminate_tree` waits for its proxy
             // with no cap under cosca 0.10.
             match judge_ask(child.terminate_tree()) {
-                Ask::Sent => break,
+                Ask::Sent => {
+                    self.log.info(id, &asked(event, timeout));
+                    break;
+                }
                 Ask::MaySent(e) => {
                     self.log.warning(id, &may_have_asked(&e));
                     break;
@@ -664,8 +672,11 @@ impl Supervisor {
         }
         match child.wait_tree_timeout(left().unwrap_or(Duration::MAX)) {
             // The job is empty, so the root has exited and its report is on its way.
-            Ok(TreeDrain::AllMembersExited) => self.bus.await_exit_report(),
-            Ok(_) => {}
+            Ok(TreeDrain::AllMembersExited) => {
+                self.log.info(id, EXITED_WITHIN_THE_WAIT);
+                self.bus.await_exit_report();
+            }
+            Ok(_) => self.log.warning(id, &not_exited_within(timeout)),
             Err(e) => self.log.failure(id, &wait_tree_failed(&e)),
         }
     }
@@ -820,6 +831,27 @@ fn never_asked(e: &cosca::error::Error) -> String {
         "the daemon was never asked to exit: {}; its timeout is over, so it is ended without being asked",
         Chain(e)
     )
+}
+
+fn asked(event: CtrlEvent, timeout: Option<Duration>) -> String {
+    let event = match event {
+        CtrlEvent::CtrlC => "Ctrl+C",
+        CtrlEvent::CtrlBreak => "Ctrl+Break",
+    };
+    match timeout {
+        Some(t) => format!("asked the daemon to exit with {event}; waiting up to {t:?} for it and what it started"),
+        None => format!("asked the daemon to exit with {event}; waiting for it and what it started, with no limit"),
+    }
+}
+
+const EXITED_WITHIN_THE_WAIT: &str = "the daemon and what it started exited within the wait";
+
+fn not_exited_within(timeout: Option<Duration>) -> String {
+    match timeout {
+        Some(t) => format!("the daemon did not exit within its timeout of {t:?} and is ended"),
+        // Reached only if cosca's wait returns before the end of a `Duration::MAX` bound.
+        None => "the daemon did not exit while it was waited for and is ended".to_string(),
+    }
 }
 
 fn wait_tree_failed(e: &cosca::error::Error) -> String {
