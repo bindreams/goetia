@@ -17,9 +17,8 @@ Everything documented below — the manifest's interpolation syntax, the
 codes — is **pre-1.0 and may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
-On macOS goetia requires **15+**, the oldest version GitHub still offers a runner
-for, so the oldest that can be measured. (`kill` holds the daemon's process by its
-identity, which the OS offers from 14.4.) On Linux it requires **kernel 5.6+**,
+On macOS goetia requires **15+**: nothing older can be tested, since GitHub
+offers no runner for it. On Linux it requires **kernel 5.6+**,
 with `pidfd_open` and `openat2` not blocked by a seccomp profile or an LSM: the
 process library goetia runs `systemctl` with, and holds a daemon's process with
 for `kill`, needs both. It also requires **systemd 243+**

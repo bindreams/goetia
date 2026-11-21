@@ -38,12 +38,9 @@ use cosca::identity::Liveness;
 /// [`wait_bounded`] tears the contained tree down with `send_kill_tree` on expiry, and by dropping the
 /// child on every path. Where its output goes is [`spawn`]'s to decide, by [`Role`].
 ///
-/// The containment is best effort ([`cosca::ContainMode::BestEffort`]), as cosca 0.8's was: some failures
-/// to set up the strongest mechanism give the child a process group instead, which cosca logs at `warn`,
-/// where `Strongest` would fail the spawn. On Linux those are a cgroup limit such as `cgroup.max.depth`, a
-/// failed inotify watch and a failed placement write of the child; on macOS, a failed install of the
-/// inherited-fd marker. Neither mode changes the rest: a cgroup the process may not use gives a process
-/// group in both, and a child whose placement cannot be proven fails the spawn in both.
+/// The containment is best effort ([`cosca::ContainMode::BestEffort`]): for some failures to set up the
+/// strongest mechanism the child gets a process group instead (cosca logs it at `warn`), where
+/// `Strongest` would fail the spawn. Which failures is cosca's to say: see [`cosca::ContainMode`].
 pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
     let mut cmd = cosca::run(std::iter::once(program).chain(args.iter().copied()));
     cmd.stdin(cosca::Stdio::null())?;
@@ -447,17 +444,16 @@ fn waited_out(
 /// What runs a bounded call ([`wait_bounded`], [`Left::kill`]) past its deadline:
 /// - each kill refused with `EPERM` (macOS), by up to this plus one re-read. launchd's `end_if_held`
 ///   can meet two, a `print` query's and its [`Left::kill`];
-/// - the wait for the root after a kill, sent or refused, and the drop that reaps it, neither of which
-///   is bounded: they wait for as long as the root takes to die once signalled (a root in
-///   uninterruptible sleep) or to be released (a tracer that is not goetia holding its zombie). The
-///   drop also waits for a cgroup leaf to drain.
+/// - the wait for the root after a kill, sent or refused, and the drop that reaps it: unbounded. They
+///   wait for the root to die once signalled (a root in uninterruptible sleep) or to be released (a
+///   tracer that is not goetia holding its zombie); the drop also waits for a cgroup leaf to drain.
 pub(crate) const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
 /// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
 /// caller. Nothing here reaps the root: [`cosca::Child::wait`] only observes an exit, so the killed
 /// root stays a zombie pinning its pid and pgid until its handle drops (or is detached by a
 /// [`Reaper`]), and a kill that names the tree by the root's number cannot hit another process on
-/// any platform. The drop's own tree kill is exact for the same reason.
+/// any platform.
 ///
 /// An uncontained child (the descendant test spawns one) reports `Unsupported` for the tree, and a
 /// contained tree whose member refused SIGKILL reports `Containment`; the `Result` is discarded
@@ -528,9 +524,9 @@ const REREAD: Duration = Duration::from_millis(20);
 /// What `alive` reads once it is `Dead`, or once `bound` has passed and it has been read once more
 /// since: `Alive` and `Unknown` both mean "not yet".
 ///
-/// It polls because `alive` serves a held `cosca::Process` as well as a child, and a `Process`'s wait
-/// needs an identity read that macOS refuses in the window where the kill is refused. The reads are of the real condition and the clock only
-/// says when to give up, so the time spent sleeping never decides the outcome.
+/// It polls because `alive` also serves a held `cosca::Process`, whose wait needs an identity read that
+/// macOS refuses while the kill is refused. Each read is of the real condition; the clock only says when
+/// to give up.
 fn last_read(alive: impl Fn() -> Liveness, bound: Duration) -> Liveness {
     let deadline = Budget::Bounded(bound).start();
     loop {

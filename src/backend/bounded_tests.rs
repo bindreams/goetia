@@ -87,10 +87,10 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
     assert_reaped(pid);
 }
 
-/// This process has no child `pid` left to wait for: it was reaped. Asked with a `waitid` that consumes
-/// nothing, which answers `ECHILD` for a pid that is no child of ours, and so stays true if another
-/// process takes the number once the reap has freed it (`kill(pid, 0)` would find that process). A
-/// zombie, or a child still running, answers with success instead.
+/// `pid` was reaped. A non-consuming `waitid` answers `ECHILD` once it is no child of ours, even if another
+/// process has since taken the number (`kill(pid, 0)` would find that one); a zombie or a running child
+/// answers success. A child of this process that takes the number would too: none is spawned between the
+/// reap and this check in a test that runs in a process of its own, as nextest runs each.
 fn assert_reaped(pid: u32) {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
@@ -207,7 +207,7 @@ fn descendant_on_fd3(child: &mut cosca::Child) -> KillOnDrop {
 /// stream is read only until the deadline, and comes back marked not whole — never waited on for
 /// an EOF that descendant would give in 68 years.
 ///
-/// Deterministic, with no timing bet: the test waits for the child's exit itself before the wait, so the wait
+/// Deterministic, with no timing bet: the test observes the child's exit before the call, so the call
 /// finds it exited whatever the deadline, and the deadline is spent before the wait begins, so the
 /// read ends at once. A spent deadline alone marks the capture not whole
 /// ([`a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end`]), so what this test adds
@@ -945,10 +945,9 @@ fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> Exit
     reaped_status(request.pid, &request.reaped)
 }
 
-/// How the child `pid` ended, as its reaper reports it, and that the reaper then reaped it. The
-/// reaper reports once it has let the child go, so the wait is on the reaper's own end and the pid is
-/// checked after it. [`cosca::Child::wait`] only observes an exit, so a status arriving proves no
-/// reap: a reaper that forgot the child instead would report all the same, and leave a zombie.
+/// How the child `pid` ended, as its reaper reports it, and that the reaper then reaped it.
+/// [`cosca::Child::wait`] only observes an exit, so a status arriving proves no reap: a reaper that
+/// forgot the child instead would report all the same, and leave a zombie.
 fn reaped_status(pid: u32, reaped: &mpsc::Receiver<Result<ExitStatus, cosca::error::Error>>) -> ExitStatus {
     let status = reaped
         .recv()

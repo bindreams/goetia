@@ -316,9 +316,9 @@ pub(crate) fn id_of_timer_stem(stem: &str) -> Option<&str> {
 
 const TIMER_SUFFIX: &str = "@timer";
 
-/// The `ExitTimeOut` of `kill`: launchd sends SIGTERM, and SIGKILL one second later. Not `0`, which
-/// `launchd.plist(5)` documents as no limit. It ends the job at once on macOS 15 and 26 (measured), against
-/// that documentation, and a `kill` that never kills is worse than one that waits a second.
+/// The `ExitTimeOut` of `kill`: launchd sends SIGTERM, and SIGKILL one second later. Not `0`:
+/// `launchd.plist(5)` documents it as no limit, and though it ends the job at once on macOS 15 and 26
+/// (measured), a `kill` that never kills is worse than one that waits a second.
 const KILL_EXIT_TIMEOUT: u64 = 1;
 
 /// `ExitTimeOut` of `stop_action`: its timeout in whole seconds, and [`KILL_EXIT_TIMEOUT`] for `kill`.
