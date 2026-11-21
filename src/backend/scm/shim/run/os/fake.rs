@@ -161,6 +161,8 @@ pub(crate) enum KillReply {
 pub(crate) enum AskReply {
     /// `Ok`: the event was sent. The daemon decides what it does with it.
     Sent,
+    /// `Ok`, and the daemon honours the event: it exits with this code.
+    SentAndExits(i32),
     /// `Error::Io`: nothing was sent.
     Io,
     /// `Error::Unsupported`: nothing was sent (no console yet, or none ever).
@@ -171,9 +173,9 @@ pub(crate) enum AskReply {
     MayHaveStarted,
     /// `Error::Unassessable`: whether the event was sent is unknown.
     Unassessable,
-    /// Never answers, until [`FakeProcess::release_asks`] (the proxy that does not come back). Then it answers
-    /// `Error::Io`.
-    Hangs,
+    /// `Error::Unsupported`, and the wait on the process fails (the daemon is not ended): a wait that fails while
+    /// the daemon is asked. The waiter's report of it is not seen by the supervisor at a fixed moment.
+    UnsupportedAndWaitFails,
     /// `Error::Unassessable`, and the daemon has exited with this code: cosca's answer for a root that has
     /// exited, when nothing was sent. The waiter's report of the exit lags: it is held until the supervisor
     /// reads the process itself ([`Spawned::try_wait`]), which is what the lag of the real report makes that read
@@ -249,12 +251,10 @@ struct ProcState {
     asking_always: Option<AskReply>,
     /// Whether [`Spawned::try_wait`] fails.
     try_wait_fails: bool,
-    /// Whether the asks that [`AskReply::Hangs`] are held in have been let go.
-    asks_released: bool,
+    /// Whether a blocked [`Spawned::wait`] is made to fail.
+    wait_fails: bool,
     /// Whether the waiter's report of the exit is held until [`Spawned::try_wait`] reads it.
     report_held: bool,
-    /// What a `wait_tree_timeout` answers once `tree_waits` is spent.
-    tree_waiting_always: Option<TreeWaitReply>,
     tree_waits: VecDeque<TreeWaitReply>,
     calls: Vec<ProcessCall>,
     exit: Option<ExitStatus>,
@@ -275,32 +275,25 @@ impl Proc {
         first
     }
 
-    /// Let go of every ask that never answers, now and later, and of a report that is held.
-    fn release_asks(&self) {
-        {
-            let mut state = lock(&self.state);
-            state.asks_released = true;
-            state.report_held = false;
-        }
+    /// Let go of a report that is held, so that the waiter can return.
+    fn release_report(&self) {
+        lock(&self.state).report_held = false;
         self.ended.notify_all();
     }
 
-    /// Block until the asks that never answer are let go.
-    fn wait_asks_released(&self) {
-        drop(
-            self.ended
-                .wait_while(lock(&self.state), |state| !state.asks_released)
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-    }
-
-    /// Block until the process is ended and its report is not held; its status.
-    fn wait_ended(&self) -> ExitStatus {
+    /// Block until the process is ended and its report is not held, or the wait is made to fail
+    /// ([`AskReply::UnsupportedAndWaitFails`]); its status.
+    fn wait_ended(&self) -> Result<ExitStatus, cosca::error::Error> {
         let state = self
             .ended
-            .wait_while(lock(&self.state), |state| state.exit.is_none() || state.report_held)
+            .wait_while(lock(&self.state), |state| {
+                (state.exit.is_none() || state.report_held) && !state.wait_fails
+            })
             .unwrap_or_else(PoisonError::into_inner);
-        state.exit.expect("`wait_while` returned with the process not ended")
+        match state.exit {
+            Some(status) if !state.wait_fails => Ok(status),
+            _ => Err(wait_failed()),
+        }
     }
 }
 
@@ -316,9 +309,8 @@ impl FakeProcess {
                 asks: VecDeque::new(),
                 asking_always: None,
                 try_wait_fails: false,
-                asks_released: false,
+                wait_fails: false,
                 report_held: false,
-                tree_waiting_always: None,
                 tree_waits: VecDeque::new(),
                 calls: Vec::new(),
                 exit: None,
@@ -380,32 +372,9 @@ impl FakeProcess {
         self.with(|state| state.try_wait_fails = true)
     }
 
-    /// The answer to every `wait_tree_timeout` after the stated ones: for a test that cannot know whether the
-    /// supervisor waits for the tree.
-    pub(crate) fn tree_waiting_always(self, reply: TreeWaitReply) -> FakeProcess {
-        self.with(|state| state.tree_waiting_always = Some(reply))
-    }
-
     /// The reply to the next `wait_tree_timeout` not yet stated for.
     pub(crate) fn wait_tree(self, reply: TreeWaitReply) -> FakeProcess {
         self.with(|state| state.tree_waits.push_back(reply))
-    }
-
-    /// Let go of every ask that never answers (the guard does it too, at the end of the test).
-    pub(crate) fn release_asks(&self) {
-        self.0.release_asks();
-    }
-
-    /// Block until `n` asks have been made on the process, answered or not.
-    pub(crate) fn await_asks(&self, n: usize) {
-        drop(
-            self.0
-                .ended
-                .wait_while(lock(&self.0.state), |state| {
-                    state.calls.iter().filter(|call| **call == ProcessCall::Ask).count() < n
-                })
-                .unwrap_or_else(PoisonError::into_inner),
-        );
     }
 
     /// Every ask, tree wait and kill made on the process, in order.
@@ -454,7 +423,6 @@ impl Instance {
 
     fn record(&self, call: ProcessCall) {
         lock(&self.proc.state).calls.push(call);
-        self.proc.ended.notify_all();
     }
 
     fn kill_with(
@@ -486,7 +454,7 @@ impl Spawned for Instance {
         match reply {
             None => self.unstated("wait"),
             Some(WaitReply::Exits(code)) => Ok(self.proc.end(status(code))),
-            Some(WaitReply::Blocks) => Ok(self.proc.wait_ended()),
+            Some(WaitReply::Blocks) => self.proc.wait_ended(),
             Some(WaitReply::Fails(Some(code))) => Err(wait_failed_with_code(code)),
             Some(WaitReply::Fails(None)) => Err(wait_failed()),
             Some(WaitReply::Panics) => panic!("the wait panicked (fake)"),
@@ -531,15 +499,20 @@ impl Spawned for Instance {
         };
         match reply {
             AskReply::Sent => Ok(()),
+            AskReply::SentAndExits(code) => {
+                self.proc.end(status(code));
+                Ok(())
+            }
             AskReply::Io => Err(ask_io()),
             AskReply::Unsupported => Err(ask_unsupported()),
             AskReply::UnsupportedAndExits(code) => {
                 self.proc.end(status(code));
                 Err(ask_unsupported())
             }
-            AskReply::Hangs => {
-                self.proc.wait_asks_released();
-                Err(ask_io())
+            AskReply::UnsupportedAndWaitFails => {
+                lock(&self.proc.state).wait_fails = true;
+                self.proc.ended.notify_all();
+                Err(ask_unsupported())
             }
             AskReply::MayHaveStarted => Err(ask_may_have_started()),
             AskReply::Unassessable => Err(ask_unassessable()),
@@ -554,10 +527,7 @@ impl Spawned for Instance {
     fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error> {
         self.fake.count(Op::WaitTree);
         self.record(ProcessCall::WaitTree(timeout));
-        let reply = {
-            let mut state = lock(&self.proc.state);
-            state.tree_waits.pop_front().or(state.tree_waiting_always)
-        };
+        let reply = lock(&self.proc.state).tree_waits.pop_front();
         match reply {
             None => self.unstated("wait_tree_timeout"),
             Some(TreeWaitReply::Drained) => {
@@ -669,7 +639,7 @@ impl Drop for FakeGuard {
     fn drop(&mut self) {
         let processes = lock(&self.fake.shared.state).processes.clone();
         for process in &processes {
-            process.release_asks();
+            process.release_report();
             process.end(status(1));
         }
         if !std::thread::panicking() {
@@ -743,11 +713,6 @@ impl Fake {
     /// code under test.
     pub(crate) fn calls(&self, op: Op) -> usize {
         lock(&self.shared.state).calls.get(&op).copied().unwrap_or(0)
-    }
-
-    /// How many threads were made through [`Os::thread`].
-    pub(crate) fn threads_made(&self) -> usize {
-        lock(&self.shared.state).thread_ends.len()
     }
 
     /// The path the `n`th log opened (counting from 0) was asked for.

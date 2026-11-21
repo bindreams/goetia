@@ -49,12 +49,19 @@ const DAEMON_LOG: &str = r"C:\goetia-shim-test\daemon.log";
 /// `Debug` text of the command that the expected messages below spell out has no escapes.
 const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
 
-/// A `protocol: plain` daemon that a stop ends at once (`send-signal: kill`): no ask, no wait, no thread to ask
-/// with, which is what the tests of the launch, the teardown and the reports state replies for. Nothing runs it:
-/// the `Fake` states what happens to it, and opens its log, and takes the shim's failure lines, without touching
-/// the file system.
+/// A `protocol: plain` daemon. Nothing runs it: the `Fake` states what happens to it, and opens its
+/// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
     spec_logging_to(Some(PathBuf::from(DAEMON_LOG)))
+}
+
+/// [`spec`] that a stop ends at once (`send-signal: kill`): no ask, no wait, which is what the tests of the
+/// teardown and of the reports state replies for.
+fn kill_spec() -> DaemonSpec {
+    stopping_by(StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    })
 }
 
 /// [`spec`] whose stop is `action`.
@@ -89,10 +96,6 @@ fn spec_logging_to(logs: Option<PathBuf>) -> DaemonSpec {
             },
             restart: Restart::Always,
             protocol: Protocol::Plain,
-            stop_action: StopAction {
-                send_signal: StopSignal::Kill,
-                timeout: None,
-            },
             ..base
         }
     })
@@ -157,58 +160,6 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
         "the daemon's log was opened, so launch reached build_command — it was preparing to spawn \
          before the thread that would have waited on the daemon was made"
     );
-}
-
-/// [`spec`] whose stop asks the daemon to exit with Ctrl+C.
-fn asking_spec() -> DaemonSpec {
-    stopping_by(StopAction {
-        send_signal: StopSignal::CtrlC,
-        timeout: Some(std::time::Duration::from_secs(30)),
-    })
-}
-
-/// A stop that asks has a thread to ask with, made before the daemon like the waiter: a refusal of it is a start
-/// that launched nothing, reported as a refused waiter is.
-#[skuld::test]
-fn no_daemon_is_spawned_when_no_thread_can_be_made_to_ask_it() {
-    let fake = FakeGuard::new();
-    fake.will_make_thread();
-    fake.will_refuse_thread(std::io::Error::other(NO_THREAD));
-
-    let launched = launch(&asking_spec(), &supervisor(&fake), ID);
-
-    assert_eq!(launched.as_ref().err(), Some(&Reported::shim_failure(None)));
-    assert_one_failure(&fake.take_failures(), ID, &no_thread_failure());
-    assert_eq!(
-        fake.calls(Op::Spawn),
-        0,
-        "the daemon was spawned with nothing to ask it"
-    );
-    // The waiter that was made is stood down, not left parked.
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-}
-
-#[skuld::test]
-fn a_service_whose_stop_asks_has_two_threads_and_one_that_kills_has_one() {
-    let fake = FakeGuard::new();
-    fake.will_make_thread();
-    fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new());
-    let launched = launch(&asking_spec(), &supervisor(&fake), ID);
-    assert!(launched.is_ok());
-    assert_eq!(fake.threads_made(), 2, "the waiter's and the asker's");
-    drop(launched);
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert_eq!(fake.waiter_end(1), WaiterEnd::Returned);
-
-    let fake = FakeGuard::new();
-    fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new());
-    let launched = launch(&spec(), &supervisor(&fake), ID);
-    assert!(launched.is_ok());
-    assert_eq!(fake.threads_made(), 1, "a `kill` stop asks nothing");
-    drop(launched);
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
 #[skuld::test]
@@ -545,7 +496,7 @@ fn running_is_reported_once_and_after_the_spawn() {
     let mut running_reports = Vec::new();
 
     // The stop ends the pass once the report is made; the daemon runs until then.
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         running_reports.push(fake.calls(Op::Spawn));
         supervisor.bus.request_stop();
     });
@@ -609,7 +560,7 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         supervisor.bus.request_stop();
     });
 
@@ -838,10 +789,10 @@ fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) 
 fn run_daemon_is_run_pass_then_reported() {
     for ending in endings() {
         let outcome = pass_of(&ending, |supervisor, on_running| {
-            run_pass(&spec(), supervisor, ID, on_running, |_| {})
+            run_pass(&kill_spec(), supervisor, ID, on_running, |_| {})
         });
         let reported = pass_of(&ending, |supervisor, on_running| {
-            super::run_daemon(&spec(), supervisor, ID, on_running, |_| {})
+            super::run_daemon(&kill_spec(), supervisor, ID, on_running, |_| {})
         });
 
         assert_eq!(outcome, ending.outcome);
@@ -897,7 +848,7 @@ fn the_stopping_hint_is_the_stops_longest_wait_in_milliseconds() {
 /// The hint a run reports follows its plan and what ended the wait.
 #[skuld::test]
 fn the_service_reports_the_hint_of_its_plan() {
-    let spec = asking_spec();
+    let spec = spec();
     let plan = StopPlan::of(&spec);
 
     assert_eq!(plan.wait_hint(WaitEnd::Stop), Duration::from_secs(40));
@@ -929,7 +880,7 @@ fn each_signal_is_the_console_event_it_is_on_windows() {
 /// that did not call `init_helpers` first is refused, with the error naming the call, and not restarted.
 #[skuld::test]
 fn a_host_that_did_not_initialise_is_refused_when_the_stop_asks() {
-    let stop = refuse_unready_host(&asking_spec(), false).expect_err("a stop that asks needs the proxy");
+    let stop = refuse_unready_host(&spec(), false).expect_err("a stop that asks needs the proxy");
 
     assert_eq!(stop.reported, Reported::Refused);
     assert!(
@@ -941,14 +892,14 @@ fn a_host_that_did_not_initialise_is_refused_when_the_stop_asks() {
 
 #[skuld::test]
 fn a_host_that_initialised_is_not_refused() {
-    refuse_unready_host(&asking_spec(), true).expect("a host that called `init_helpers`");
+    refuse_unready_host(&spec(), true).expect("a host that called `init_helpers`");
 }
 
 /// A stop that asks nothing needs no proxy: `kill` and `wm-close` (until 3c) are not refused, and neither
 /// is a task, which asks nothing in part 1.
 #[skuld::test]
 fn a_host_that_did_not_initialise_is_not_refused_when_the_stop_asks_nothing() {
-    refuse_unready_host(&spec(), false).expect("`send-signal: kill` asks nothing");
+    refuse_unready_host(&kill_spec(), false).expect("`send-signal: kill` asks nothing");
     refuse_unready_host(
         &stopping_by(StopAction {
             send_signal: StopSignal::WmClose,
@@ -974,7 +925,7 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
     let mut alive_when_stopping = Vec::new();
 
     let reported = super::run_daemon(
-        &spec(),
+        &kill_spec(),
         &supervisor,
         ID,
         || {
@@ -1262,7 +1213,7 @@ fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
             .send_kill_tree(KillReply::Ends),
     );
 
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_STOP), NO_ERROR)
     });
 
