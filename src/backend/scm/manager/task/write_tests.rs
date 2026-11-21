@@ -5,7 +5,7 @@
 use std::fs::OpenOptions;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -14,11 +14,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::*;
 use crate::backend::scm::instance::InstanceId;
+use crate::backend::scm::manager::identity::account_name_of_sid;
 use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
 use crate::backend::scm::shim::acl::read_object;
-use crate::backend::scm::sid::{Sid, sid_from_parts, system};
+use crate::backend::scm::sid::{Sid, sid_display, sid_from_parts, system};
 use crate::backend::scm::test_support::{
     TASK_TOKEN, Undeletable, delete_pending, make_mount_point, registered_task, registered_task_with, task_host,
     task_spec, task_spec_as, task_token,
@@ -513,6 +514,84 @@ fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_sta
         );
         fake.finish();
     }
+}
+
+/// The user a task runs as was deleted and created again under the same name: the registration names the old
+/// account's SID, so the definition `read` shows differs from the spec, the forced install over it decides an
+/// update, and the write of that is the account change, with the new account's password.
+#[skuld::test]
+fn a_task_whose_user_was_created_again_is_deleted_and_created_for_the_new_account() {
+    let (dir, runs) = made_records();
+    let spec = task_spec_as(User::Name("alice".to_owned()), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, true);
+    registered.xml = registered
+        .xml
+        .replace("<UserId>alice</UserId>", "<UserId>S-1-5-21-1-2-3-1001</UserId>");
+    let old = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Ok(Registration::Created));
+    let scm = scm(&fake);
+    // `alice` names the new account now; the registration's text is the old account's SID.
+    let lookup = |name: &str, _: Option<Written<'_>>| match name {
+        "alice" => Ok(sid_from_parts(5, &[21, 1, 2, 3, 1002])),
+        "S-1-5-21-1-2-3-1001" => Ok(sid_from_parts(5, &[21, 1, 2, 3, 1001])),
+        _ => Err(Error::AccountLookup {
+            detail: format!("cannot resolve SID for account `{name}`"),
+            source: None,
+        }),
+    };
+    let decided = decide::decide(
+        &Ownership::Ours {
+            blob: blob(&spec),
+            regenerated: scm.task_regenerate(&spec, &old).unwrap().to_string(),
+            on_disk: scm.task_installed_with(&old, lookup).unwrap().definition.to_string(),
+        },
+        &definition(&spec).to_string(),
+        &spec,
+        crate::version(),
+        true,
+        &ExternalConfig::Absent,
+    );
+    assert!(matches!(decided, decide::Outcome::Update { .. }), "{decided:?}");
+
+    let outcome = scm
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            Some(&old),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), Some("secret")),
+        )
+        .unwrap();
+
+    assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
+    let token = registered_token(&fake);
+    assert_eq!(
+        fake.calls(),
+        [
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::Instances(PATH.to_owned()),
+            Call::Delete(PATH.to_owned()),
+            register_call(
+                &spec,
+                true,
+                TaskAccount::User("alice".to_owned()),
+                Some("secret"),
+                false,
+                &token
+            ),
+        ],
+        "disabled, checked, deleted, created for the new account"
+    );
+    assert!(
+        trustees_of(&records_dir(&dir)).contains(&users()),
+        "the directory names the new account"
+    );
+    fake.finish();
 }
 
 /// The old account's run is refused before anything is changed: its shim still writes its record, so the
@@ -2426,16 +2505,15 @@ fn enable_keeps_the_triggers_that_are_there_and_needs_no_blob_for_them() {
         data: armed.data.clone(),
         enabled: Some(false),
     };
-    for blob in [
-        Ok(blob(&spec)),
-        Err(std::sync::Arc::new(Error::blob("the blob will not decode"))),
+    for snapshot in [
+        TaskSnapshot::new(id(), Ok(blob(&spec)), off.clone()),
+        undecodable(off.clone()),
     ] {
         let fake = Fake::new();
         fake.on_register(Ok(Registration::Created));
         let scm = scm(&fake);
         let (_dir, runs) = records();
-        scm.task_set_armed_with(&TaskSnapshot::new(id(), blob, off.clone()), true, &runs, || Ok(None))
-            .unwrap();
+        scm.task_set_armed_with(&snapshot, true, &runs, || Ok(None)).unwrap();
         let calls = fake.calls();
         let Call::Register { xml, .. } = &calls[0] else {
             panic!("enable registers: {calls:?}");
@@ -2451,13 +2529,6 @@ fn enable_keeps_the_triggers_that_are_there_and_needs_no_blob_for_them() {
 fn enable_of_a_task_whose_blob_will_not_decode_is_refused_before_a_write_and_disable_works() {
     let spec = task_spec(Some("30 3 * * *"));
     let armed = registered_task(&spec, true);
-    let undecodable = |registered: Registered| {
-        TaskSnapshot::new(
-            id(),
-            Err(std::sync::Arc::new(Error::blob("the blob will not decode"))),
-            registered,
-        )
-    };
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let scm = scm(&fake);
@@ -2523,18 +2594,36 @@ fn enable_of_a_schedule_that_never_fires_arms_it() {
     assert!(TaskXml::armed(xml), "{xml}");
 }
 
+/// Two accounts' SIDs, as text: a `user.id` that spells one resolves to it without looking an account up, so a
+/// task of one registered for the same SID (or another) is stated with SID strings alone.
+const ALICE: &str = "S-1-5-21-1-2-3-1001";
+const BOB: &str = "S-1-5-21-1-2-3-1002";
+
+/// The task of the user `account` (a SID string), registered for the principal `principal` (a SID string).
+fn user_task(account: &str, principal: &str, armed: bool) -> (DaemonSpec, TaskSnapshot) {
+    let spec = task_spec_as(User::Id(AccountId::Sid(account.to_owned())), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, armed);
+    registered.xml = registered.xml.replace(
+        &format!("<UserId>{account}</UserId>"),
+        &format!("<UserId>{principal}</UserId>"),
+    );
+    assert!(registered.xml.contains(principal), "the principal is {principal}");
+    let snapshot = TaskSnapshot::new(id(), Ok(blob(&spec)), registered);
+    (spec, snapshot)
+}
+
 /// Re-registering a password-logon task takes its password (M3): without it `enable` and `disable`
 /// refuse, and the scheduler is not asked anything.
 #[skuld::test]
 fn enable_of_a_real_user_task_without_its_password_is_refused_before_any_write() {
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let (_, snapshot) = user_task(ALICE, ALICE, false);
     let fake = Fake::new();
     let (_dir, runs) = records();
 
-    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || Ok(None));
+    let refused = scm(&fake).task_set_armed_with(&snapshot, true, &runs, || Ok(None));
 
     assert!(
-        matches!(&refused, Err(Error::PasswordRequired { account, kind: DaemonKind::Task }) if account == "alice"),
+        matches!(&refused, Err(Error::PasswordRequired { account, kind: DaemonKind::Task }) if account == ALICE),
         "{refused:?}"
     );
     assert_eq!(fake.calls(), []);
@@ -2542,11 +2631,11 @@ fn enable_of_a_real_user_task_without_its_password_is_refused_before_any_write()
 
 #[skuld::test]
 fn disable_of_a_real_user_task_without_its_password_is_refused_before_any_write() {
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let (_, snapshot) = user_task(ALICE, ALICE, true);
     let fake = Fake::new();
     let (_dir, runs) = records();
 
-    let refused = scm(&fake).task_set_armed_with(&snapshot_of(&spec, true), false, &runs, || Ok(None));
+    let refused = scm(&fake).task_set_armed_with(&snapshot, false, &runs, || Ok(None));
 
     assert!(matches!(refused, Err(Error::PasswordRequired { .. })), "{refused:?}");
     assert_eq!(fake.calls(), []);
@@ -2554,15 +2643,13 @@ fn disable_of_a_real_user_task_without_its_password_is_refused_before_any_write(
 
 #[skuld::test]
 fn enable_of_a_real_user_task_registers_it_again_with_its_password() {
-    let spec = task_spec_as(User::Name("alice".into()), Some("30 3 * * *"));
+    let (_, snapshot) = user_task(ALICE, ALICE, false);
     let fake = Fake::new();
     fake.on_register(Ok(Registration::Created));
     let (_dir, runs) = records();
 
     scm(&fake)
-        .task_set_armed_with(&snapshot_of(&spec, false), true, &runs, || {
-            Ok(Some("secret".to_owned()))
-        })
+        .task_set_armed_with(&snapshot, true, &runs, || Ok(Some("secret".to_owned())))
         .unwrap();
 
     let calls = fake.calls();
@@ -2572,9 +2659,170 @@ fn enable_of_a_real_user_task_registers_it_again_with_its_password() {
     else {
         panic!("enable registers: {calls:?}");
     };
-    assert_eq!(who, &TaskAccount::User("alice".to_owned()));
+    assert_eq!(who, &TaskAccount::User(ALICE.to_owned()));
     assert_eq!(password.as_deref(), Some("secret"));
     assert!(update);
+}
+
+/// `enable` and `disable` of a task registered for another account than its user names refuse (see
+/// `task_set_armed_with`).
+fn arming_a_task_registered_for_another_account_is_refused(armed: bool) {
+    let (_, snapshot) = user_task(BOB, ALICE, !armed);
+    arming_is_refused_naming(&snapshot, armed, ALICE);
+}
+
+/// `enable` or `disable` of `snapshot` is refused naming `registered` and the remedy, with nothing sent.
+fn arming_is_refused_naming(snapshot: &TaskSnapshot, armed: bool, registered: &str) {
+    let fake = Fake::new();
+    let (_dir, runs) = records();
+
+    let refused = scm(&fake)
+        .task_set_armed_with(snapshot, armed, &runs, || {
+            panic!("the refusal comes before the password is asked for")
+        })
+        .unwrap_err();
+
+    let text = refused.report().to_string();
+    assert!(
+        text.contains(registered) && text.contains("install --force"),
+        "names the registered account and the remedy: {text}"
+    );
+    assert_eq!(fake.calls(), [], "nothing was sent to Task Scheduler");
+}
+
+#[skuld::test]
+fn enable_of_a_task_registered_for_another_account_is_refused() {
+    arming_a_task_registered_for_another_account_is_refused(true);
+}
+
+#[skuld::test]
+fn disable_of_a_task_registered_for_another_account_is_refused() {
+    arming_a_task_registered_for_another_account_is_refused(false);
+}
+
+/// A registration with no principal, and one whose principal names no account (a SID text that is no SID, so no
+/// lookup is made), are for no account the blob's user names: refused, with the principal as stated.
+#[skuld::test]
+fn arming_a_task_whose_principal_is_none_or_names_no_account_is_refused() {
+    let principal = format!("<UserId>{BOB}</UserId>");
+    for armed in [true, false] {
+        let (_, bobs) = user_task(BOB, BOB, !armed);
+
+        let none = edited(&bobs, |registered| {
+            registered.xml = registered.xml.replace(&principal, "")
+        });
+        arming_is_refused_naming(&none, armed, "<none>");
+
+        let garbage = edited(&bobs, |registered| {
+            registered.xml = registered.xml.replace(&principal, "<UserId>S-1-5-garbage</UserId>");
+        });
+        arming_is_refused_naming(&garbage, armed, "S-1-5-garbage (no such account)");
+    }
+}
+
+/// `snapshot` with its stored registration edited by `edit`.
+fn edited(snapshot: &TaskSnapshot, edit: impl FnOnce(&mut Registered)) -> TaskSnapshot {
+    let mut registered = snapshot.registered().clone();
+    edit(&mut registered);
+    TaskSnapshot::new(
+        snapshot.id().clone(),
+        snapshot.blob().cloned().map_err(Arc::clone),
+        registered,
+    )
+}
+
+/// The snapshot `read` makes of a task whose blob will not decode: its `Data` and the blob it kept agree.
+fn undecodable(mut registered: Registered) -> TaskSnapshot {
+    registered.data = registered.data.replace("Spec: ", "Spec: !");
+    TaskSnapshot::new(id(), Err(Arc::new(Error::blob("the blob will not decode"))), registered)
+}
+
+/// The task of the account this test runs as, by the name its blob has, registered for the SID that is the
+/// account's own (read-only); the account it registers again as is the second value.
+fn own_task(armed: bool) -> (TaskAccount, TaskSnapshot) {
+    let sid = process_user_sid();
+    let name = account_name_of_sid(&sid).expect("the account this test runs as has a name");
+    let spec = task_spec_as(User::Name(name.clone()), Some("30 3 * * *"));
+    let mut registered = registered_task(&spec, armed);
+    let text = sid_display(&sid);
+    registered.xml = registered
+        .xml
+        .replace(&format!("<UserId>{name}</UserId>"), &format!("<UserId>{text}</UserId>"));
+    assert!(registered.xml.contains(&text), "the principal is the SID of `{name}`");
+    (
+        definition(&spec).account(),
+        TaskSnapshot::new(id(), Ok(blob(&spec)), registered),
+    )
+}
+
+/// Whether `calls` is the one registration again of the task, as `account`.
+fn registers_again_as(calls: &[Call], account: &TaskAccount) -> bool {
+    matches!(calls, [Call::Register { who, update: true, .. }] if who == account)
+}
+
+/// A blob whose user is a name goes through: the registration's SID is that name's.
+#[skuld::test]
+fn enable_of_a_task_registered_for_the_sid_its_blobs_name_names_goes_through() {
+    let (account, snapshot) = own_task(false);
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
+
+    scm(&fake)
+        .task_set_armed_with(&snapshot, true, &runs, || Ok(Some("secret".to_owned())))
+        .unwrap();
+
+    assert!(registers_again_as(&fake.calls(), &account), "{:?}", fake.calls());
+}
+
+/// A task whose XML has no action reads from its principal, as a hand edit leaves it: the task is registered again
+/// as it stands, under that principal, so nothing is compared (the principal is not the blob's account, and a
+/// comparison would refuse).
+#[skuld::test]
+fn disable_of_a_task_whose_xml_has_no_action_goes_through() {
+    let (_, alices) = user_task(ALICE, BOB, true);
+    let snapshot = edited(&alices, |registered| {
+        let xml = &mut registered.xml;
+        let (start, end) = (xml.find("<Actions").unwrap(), xml.find("</Actions>").unwrap());
+        xml.replace_range(start..end + "</Actions>".len(), "");
+    });
+    assert!(
+        TaskXml::parse(&snapshot.registered().xml, &snapshot.registered().data).is_err(),
+        "precondition: the XML does not parse"
+    );
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
+
+    scm(&fake)
+        .task_set_armed_with(&snapshot, false, &runs, || Ok(Some("secret".to_owned())))
+        .unwrap();
+
+    assert!(
+        registers_again_as(&fake.calls(), &TaskAccount::User(BOB.to_owned())),
+        "{:?}",
+        fake.calls()
+    );
+}
+
+/// A blob that will not decode leaves the account to the principal too: `disable` still works on it.
+#[skuld::test]
+fn disable_of_a_task_whose_blob_will_not_decode_goes_through() {
+    let (_, alices) = user_task(ALICE, BOB, true);
+    let snapshot = undecodable(alices.registered().clone());
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+    let (_dir, runs) = records();
+
+    scm(&fake)
+        .task_set_armed_with(&snapshot, false, &runs, || Ok(Some("secret".to_owned())))
+        .unwrap();
+
+    assert!(
+        registers_again_as(&fake.calls(), &TaskAccount::User(BOB.to_owned())),
+        "{:?}",
+        fake.calls()
+    );
 }
 
 #[skuld::test]
@@ -2663,7 +2911,7 @@ fn the_account_of_a_task_whose_blob_will_not_decode_is_its_stored_principal() {
     let registered = registered_task(&spec, false);
     assert_eq!(
         stored_account(&registered).unwrap(),
-        TaskAccount::User("alice".to_owned())
+        StoredAccount::Blob(TaskAccount::User("alice".to_owned()))
     );
 
     let broken = Registered {
@@ -2673,8 +2921,8 @@ fn the_account_of_a_task_whose_blob_will_not_decode_is_its_stored_principal() {
     };
     assert_eq!(
         stored_account(&broken).unwrap(),
-        TaskAccount::User("alice".to_owned()),
-        "the principal says it as the blob did"
+        StoredAccount::Principal(TaskAccount::User("alice".to_owned())),
+        "the principal says it as the blob did, and is said to be the principal's"
     );
 }
 

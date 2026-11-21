@@ -5,7 +5,7 @@
 //! may not decode, and the marker alone is proof of ownership.
 
 use std::cell::Cell;
-use std::io;
+use std::io::{self, Write as _};
 use std::sync::Arc;
 
 use super::api::{Instance, Registered};
@@ -14,9 +14,10 @@ use super::status::{run_state, task_status};
 use super::{TaskApi, TaskPath};
 use crate::backend::scm::generate::{self, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
-use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, identity, open_refused};
-use crate::backend::scm::sid::Sid;
-use crate::backend::scm::task_xml::{TaskXml, Token, extract_from_data};
+use crate::backend::scm::manager::identity::Written;
+use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, identity, open_refused, written_user};
+use crate::backend::scm::sid::{Sid, sid_display};
+use crate::backend::scm::task_xml::{TaskXml, Token, account_of, extract_from_data};
 use crate::backend::{Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed};
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
@@ -61,19 +62,51 @@ impl TaskSnapshot {
     /// not known to be another account's.
     pub(super) fn stored(&self) -> Result<StoredRegistration> {
         let stored = TaskXml::stored(&self.registered.xml, self.id.as_str())?;
-        let principal = match stored.principal {
-            Some(TaskAccount::Service(text) | TaskAccount::User(text)) => {
-                known_account(identity::sid_of_principal(&text)).map_err(|e| Error::Step {
-                    what: format!("look up the account of the registration of `{}`", self.id),
-                    source: Box::new(e),
-                })?
-            }
+        let principal = match principal_text(stored.principal) {
+            Some(text) => known_account(identity::sid_of_principal(&text)).map_err(|e| Error::Step {
+                what: format!("look up the account of the registration of `{}`", self.id),
+                source: Box::new(e),
+            })?,
             None => None,
         };
         Ok(StoredRegistration {
             principal,
             has_triggers: stored.has_triggers,
             token: stored.token,
+        })
+    }
+
+    /// What the registration is for, when that is not the account the blob's user names now: the registered
+    /// SID's text, the principal's text marked as naming no account ([`unmapped`]), or [`NO_PRINCIPAL`] when
+    /// there is none. `None` when it is for that account, when the account is built in, and when a lookup fails
+    /// for any other reason than "no such account": such a difference is not known, so the blob's account stands
+    /// until a lookup answers, and a line on stderr says the check was skipped.
+    ///
+    /// The one comparison `read` shows and `enable` and `disable` refuse by, the latter only for a registration
+    /// that stays under the blob's account ([`StoredAccount::Blob`](super::write::StoredAccount)). Compares the
+    /// blob's account with the principal of the stored XML, which is read once. An error when the blob did not
+    /// decode, when its user names no task account, and when the XML's principal cannot be read.
+    pub(super) fn other_account(
+        &self,
+        lookup: impl Fn(&str, Option<Written<'_>>) -> Result<Sid>,
+    ) -> Result<Option<String>> {
+        let blob = self.blob.as_ref().map_err(Error::kept)?;
+        let common = blob.spec.common();
+        let TaskAccount::User(name) = account_of(&common.id, &common.user)? else {
+            return Ok(None);
+        };
+        let principal = TaskXml::principal(&self.registered.xml).map_err(|e| Error::Step {
+            what: format!("read the principal of the registration of `{}`", self.id),
+            source: Box::new(e),
+        })?;
+        let Some(text) = principal_text(principal) else {
+            return Ok(Some(NO_PRINCIPAL.to_owned()));
+        };
+        let written = written_user(&common.user);
+        compared(&text, &name, written, lookup).or_else(|e| {
+            // Not `eprintln!`, which panics when the write fails: this is a fallback that fails nothing.
+            let _ = writeln!(io::stderr(), "{}", unchecked_warning(&self.id, &e));
+            Ok(None)
         })
     }
 
@@ -119,6 +152,55 @@ pub(super) fn known_account(lookup: Result<Sid>) -> Result<Option<Sid>> {
     }
 }
 
+/// [`TaskSnapshot::other_account`] of the principal `text` and the blob's account `name`, written as `written`.
+fn compared(
+    text: &str,
+    name: &str,
+    written: Option<Written<'_>>,
+    lookup: impl Fn(&str, Option<Written<'_>>) -> Result<Sid>,
+) -> Result<Option<String>> {
+    let Some(registered) = known_account(lookup(text, None))? else {
+        return Ok(Some(unmapped(text)));
+    };
+    let named = known_account(lookup(name, written))?;
+    Ok((named.as_ref() != Some(&registered)).then(|| sid_display(&registered)))
+}
+
+/// The line that says the account the task `id` is registered for could not be checked, `failed` being why.
+fn unchecked_warning(id: &Id, failed: &Error) -> String {
+    format!(
+        "warning: the account the task `{id}` is registered for could not be checked, so it is taken to be the one \
+         its user names: {}",
+        failed.report()
+    )
+}
+
+/// What [`TaskSnapshot::other_account`] says of a registration with no principal.
+pub(super) const NO_PRINCIPAL: &str = "<none>";
+
+/// What [`TaskSnapshot::other_account`] says of a principal whose text `text` names no account.
+fn unmapped(text: &str) -> String {
+    format!("{text} (no such account)")
+}
+
+/// The system's account lookup for [`TaskSnapshot::other_account`]. With `written` (the blob's user as its spec
+/// wrote it) it resolves as an install does for each form: a `user.id` is the SID its string spells, with no
+/// account looked up, and a `user.name` is looked up by name. With none, `name` is a registration's principal,
+/// as Task Scheduler stores it ([`identity::sid_of_principal`]).
+pub(super) fn sid_of_account(name: &str, written: Option<Written<'_>>) -> Result<Sid> {
+    match written {
+        Some(_) => identity::service_account_sid(Some(name), written),
+        None => identity::sid_of_principal(name),
+    }
+}
+
+/// The name a registration's principal is looked up by, as Task Scheduler stores it.
+fn principal_text(principal: Option<TaskAccount>) -> Option<String> {
+    match principal? {
+        TaskAccount::Service(text) | TaskAccount::User(text) => Some(text),
+    }
+}
+
 fn snapshot_of(id: Id, blob: Decoded, registered: Registered) -> WindowsSnapshot {
     WindowsSnapshot::Task(TaskSnapshot::new(id, blob, registered))
 }
@@ -141,13 +223,32 @@ impl Scm {
         generate::registration(spec, &Identity { user: String::new() }, &|| self.provider()?.preview())
     }
 
-    /// The definition as installed: the stored XML read back. The armed state is no part of it.
+    /// The definition as installed: [`Self::task_installed_with`] over the system's account lookup.
     pub(in crate::backend::scm) fn task_installed(
         &self,
         snapshot: &TaskSnapshot,
     ) -> Result<InstalledDefinition<WindowsDefinition>> {
+        self.task_installed_with(snapshot, sid_of_account)
+    }
+
+    /// The definition as installed: the stored XML read back, showing the account the task is registered for
+    /// ([`TaskSnapshot::other_account`]) in place of the blob's when they differ. A lookup failure other than
+    /// "no such account" shows the blob's account. The armed state is no part of it.
+    pub(super) fn task_installed_with(
+        &self,
+        snapshot: &TaskSnapshot,
+        lookup: impl Fn(&str, Option<Written<'_>>) -> Result<Sid>,
+    ) -> Result<InstalledDefinition<WindowsDefinition>> {
+        let mut definition = snapshot.definition()?;
+        let registered = snapshot.other_account(lookup).map_err(|e| Error::InstalledUnreadable {
+            id: snapshot.id.as_str().to_string(),
+            source: Box::new(e),
+        })?;
+        if let Some(shown) = registered {
+            definition = definition.shown_for(shown);
+        }
         Ok(InstalledDefinition {
-            definition: WindowsDefinition::Task(snapshot.definition()?),
+            definition: WindowsDefinition::Task(definition),
             external: ExternalConfig::Absent,
         })
     }
