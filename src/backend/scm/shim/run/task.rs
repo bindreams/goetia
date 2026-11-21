@@ -198,7 +198,7 @@ pub(super) fn run_in(
     }
 
     let started = file_time_now();
-    let (record, code) = ended_as(run_pass(&spec, supervisor, id, || {}, || {}));
+    let (record, code) = ended_as(run_pass(&spec, supervisor, id, || {}, |_| {}));
     record_run(log, id, runs, pin, Some(instance), started, record);
     code
 }
