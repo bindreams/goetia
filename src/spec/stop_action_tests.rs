@@ -299,7 +299,15 @@ fn a_timeout_a_manifest_could_not_write_is_a_defect_wherever_it_came_from() {
 fn a_stops_longest_wait_is_its_timeout_and_the_teardown_margin() {
     let secs = Duration::from_secs;
     let day = StopAction::MAX_TIMEOUT.as_secs();
-    for signal in ["terminate", "interrupt", "quit", "ctrl-c", "ctrl-break", "wm-close", "sigusr1"] {
+    for signal in [
+        "terminate",
+        "interrupt",
+        "quit",
+        "ctrl-c",
+        "ctrl-break",
+        "wm-close",
+        "sigusr1",
+    ] {
         for (timeout, longest) in [
             (Some(30), Some(secs(40))),
             (Some(1), Some(secs(11))),

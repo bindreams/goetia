@@ -691,7 +691,14 @@ fn on_stopping_is_told_a_stop_from_an_exit() {
     let daemon = FakeProcess::new().wait(WaitReply::Exits(0));
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     let mut told = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |end| told.push(end), || {});
+    let outcome = supervisor.wait_for_child_or_stop(
+        waiter,
+        &child,
+        ID,
+        ask_and_wait(Some(HOUR)),
+        |end| told.push(end),
+        || {},
+    );
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(told, [WaitEnd::Exit], "the program's own exit was told as a stop");

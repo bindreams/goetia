@@ -25,9 +25,9 @@ use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, FALSE, NO_ERROR};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Services::{
-    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP,
-    SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
+    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
+    SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
 use super::exit;
@@ -302,13 +302,14 @@ unsafe extern "system" fn control_handler(
     handle_control(stop_bus, control)
 }
 
-/// The handler's answer to `control`. SCM acknowledges every `STOP` it delivers whatever the
+/// The handler's answer to `control`. A system shutdown's `PRESHUTDOWN` is a stop: one path, whichever control began it.
+/// SCM acknowledges every `STOP` it delivers whatever the
 /// handler answers, so a stop the bus does not accept (the exit is already decided) is answered
 /// `NO_ERROR` too. The decided exit is reported as it is; SCM restarts it if the restart policy
 /// covers it.
 fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
     match control {
-        SERVICE_CONTROL_STOP => {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_PRESHUTDOWN => {
             stop_bus.request_stop();
             NO_ERROR
         }
@@ -317,17 +318,25 @@ fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
     }
 }
 
-/// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
-fn report_running(log: &Log, id: &str, handle: StatusHandle) {
-    let status = SERVICE_STATUS {
+/// The `RUNNING` status. `PRESHUTDOWN` is accepted beside `STOP`: a service that accepts it is sent it when the system
+/// shuts down, and is waited for as long as its pre-shutdown time ([`crate::backend::scm::generate`] gives it);
+/// one that does not is sent nothing and ended within seconds (measured in Server Core containers of Windows
+/// Server 2025, build 26100).
+fn running_status() -> SERVICE_STATUS {
+    SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: SERVICE_RUNNING,
-        dwControlsAccepted: SERVICE_ACCEPT_STOP,
+        dwControlsAccepted: SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN,
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: 0,
         dwWaitHint: 0,
-    };
+    }
+}
+
+/// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
+fn report_running(log: &Log, id: &str, handle: StatusHandle) {
+    let status = running_status();
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
         let e = std::io::Error::last_os_error();

@@ -22,7 +22,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
 };
 use windows_sys::Win32::System::Services::{
-    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE,
+    SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
 use super::*;
@@ -800,10 +801,26 @@ fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) 
 fn run_daemon_is_run_pass_then_reported() {
     for ending in endings() {
         let outcome = pass_of(&ending, |supervisor, on_running| {
-            run_pass(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {}, || {})
+            run_pass(
+                &kill_spec(),
+                StopPlan::AtOnce,
+                supervisor,
+                ID,
+                on_running,
+                |_| {},
+                || {},
+            )
         });
         let reported = pass_of(&ending, |supervisor, on_running| {
-            super::run_daemon(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {}, || {})
+            super::run_daemon(
+                &kill_spec(),
+                StopPlan::AtOnce,
+                supervisor,
+                ID,
+                on_running,
+                |_| {},
+                || {},
+            )
         });
 
         assert_eq!(outcome, ending.outcome);
@@ -1080,7 +1097,15 @@ fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
-    super::run_daemon(&service, plan, &supervisor(&fake), ID, || {}, |hint| hints.push(hint), || {});
+    super::run_daemon(
+        &service,
+        plan,
+        &supervisor(&fake),
+        ID,
+        || {},
+        |hint| hints.push(hint),
+        || {},
+    );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(hints, [Duration::from_secs(10)], "the teardown alone");
 }
@@ -1408,6 +1433,35 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
         supervisor.bus.settle(Reported::DaemonExit(7)),
         Reported::Clean,
         "the stop did not reach the bus"
+    );
+}
+
+/// A system shutdown's `PRESHUTDOWN` is a stop: the bus accepts it as it accepts `STOP`, so the plan of the
+/// `stop-action` runs and the run ends clean, with no path of its own for a shutdown.
+#[skuld::test]
+fn a_preshutdown_is_a_stop() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+
+    assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_PRESHUTDOWN), NO_ERROR);
+
+    assert_eq!(
+        supervisor.bus.settle(Reported::DaemonExit(7)),
+        Reported::Clean,
+        "the preshutdown did not reach the bus as a stop"
+    );
+}
+
+/// A running service accepts `STOP` and `PRESHUTDOWN`: without the second, Windows sends a shutdown nothing and
+/// ends the service within a few seconds (measured in containers of Windows Server 2025, build 26100).
+#[skuld::test]
+fn a_running_service_accepts_stop_and_preshutdown() {
+    let status = running_status();
+
+    assert_eq!(status.dwCurrentState, SERVICE_RUNNING);
+    assert_eq!(
+        status.dwControlsAccepted,
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN
     );
 }
 
