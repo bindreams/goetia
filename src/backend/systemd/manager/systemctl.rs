@@ -1020,6 +1020,7 @@ impl Systemctl {
         };
         Ok(TaskJob {
             state,
+            failed: props.get("ActiveState").is_some_and(|s| s == "failed"),
             pid: main_pid(&props),
             invocation: props.get("InvocationID").filter(|id| !id.is_empty()).cloned(),
         })
@@ -1046,6 +1047,8 @@ impl Systemctl {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TaskJob {
     pub state: State,
+    /// `ActiveState` is `failed`: a run that failed, which `reset-failed` clears. `state` calls it idle.
+    pub failed: bool,
     pub pid: Option<u32>,
     /// The `InvocationID` of the run the unit is in, if it has one.
     pub invocation: Option<String>,

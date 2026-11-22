@@ -397,8 +397,8 @@ impl Systemd {
         if owns_timer {
             dropins = both(dropins, remove_dir_if_present(&dropin_dir(id, UnitKind::Timer)));
         }
-        if standin == Standin::Remove {
-            dropins = both(dropins, self.remove_standin(id, held));
+        if let Standin::Remove { failed } = standin {
+            dropins = both(dropins, self.remove_standin(id, failed, held));
         }
         match both(dropins, self.systemctl.daemon_reload(held)) {
             Err(e @ Error::Both { .. }) => Err(Error::Step {

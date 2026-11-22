@@ -4,7 +4,7 @@
 //! Its life: `uninstall` with [`RunInFlight::Leave`] writes it for a task's run that is in flight, before
 //! the unit files go and the manager reloads. Nothing removes it while its unit is active. The next
 //! `install` or `uninstall` of the id, the absent id included, removes it once its unit is not active,
-//! after a `reset-failed` that clears a left run that failed, and reloads. `uninstall` without `Leave`
+//! after a `reset-failed` for a left run that failed, and reloads. `uninstall` without `Leave`
 //! stops the run first. goetia reads `/etc/systemd/system` for fragments, so a stand-in never makes an id
 //! read as installed (see `discover`).
 
@@ -38,8 +38,15 @@ pub(super) enum Standin {
     Nothing,
     /// Write it for the run of the job whose text is this, before the files go and the manager reloads.
     Write(String),
-    /// Remove the one that is there, whose unit is not active.
-    Remove,
+    /// Remove the one that is there, whose unit is not active, after clearing its failed run if it has one
+    /// (`reset-failed` refuses a unit that is not in memory, as one that did not fail is not).
+    Remove { failed: bool },
+}
+
+/// What systemd says of the run of a job, in one read.
+struct Job {
+    running: bool,
+    failed: bool,
 }
 
 /// Whether the file at `id`'s stand-in path is a stand-in of `id`'s own. Anything else there is somebody's
@@ -65,28 +72,39 @@ impl Systemd {
         let present = is_ours(id)?;
         match in_flight {
             // The run is stopped, so a stand-in left by an earlier `Leave` has nothing to keep.
-            RunInFlight::Stop => Ok(if present { Standin::Remove } else { Standin::Nothing }),
+            RunInFlight::Stop if present => Ok(Standin::Remove {
+                failed: self.job(id)?.failed,
+            }),
+            RunInFlight::Stop => Ok(Standin::Nothing),
             RunInFlight::Leave => {
                 let task_like = snapshot.owns_timer_slot();
                 if !task_like && !present {
                     return Ok(Standin::Nothing);
                 }
                 self.systemctl.require_supported(held)?;
-                Ok(match (self.run_in_flight(id)?, snapshot.service_text()) {
-                    (true, Some(job)) if task_like => Standin::Write(job.to_string()),
+                let job = self.job(id)?;
+                Ok(match (job.running, snapshot.service_text()) {
+                    (true, Some(text)) if task_like => Standin::Write(text.to_string()),
                     (true, _) => Standin::Nothing,
-                    (false, _) if present => Standin::Remove,
+                    (false, _) if present => Standin::Remove { failed: job.failed },
                     (false, _) => Standin::Nothing,
                 })
             }
         }
     }
 
-    /// Whether `id`'s job is in its start job or running: a unit systemd has no file for is not.
-    fn run_in_flight(&self, id: &str) -> Result<bool> {
+    /// Whether `id`'s job is in its start job or running, and whether it failed: a unit systemd has no file
+    /// for is neither.
+    fn job(&self, id: &str) -> Result<Job> {
         match self.systemctl.task_state(&unit_name(id, UnitKind::Service)) {
-            Ok(job) => Ok(job.state == State::Running),
-            Err(Error::UnitNotLoaded { .. }) => Ok(false),
+            Ok(job) => Ok(Job {
+                running: job.state == State::Running,
+                failed: job.failed,
+            }),
+            Err(Error::UnitNotLoaded { .. }) => Ok(Job {
+                running: false,
+                failed: false,
+            }),
             Err(e) => Err(e),
         }
     }
@@ -111,10 +129,12 @@ impl Systemd {
         }
     }
 
-    /// The stand-in of `id` cleared of a failed left run and removed; the manager is reloaded by the caller.
-    /// `reset-failed` comes first: systemd refuses it for a unit it has no file for.
-    pub(super) fn remove_standin(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.systemctl.reset_failed(id, UnitKind::Service, held)?;
+    /// The stand-in of `id` removed, after a failed left run is cleared; the manager is reloaded by the
+    /// caller. `reset-failed` comes first: systemd refuses it for a unit it has no file for.
+    pub(super) fn remove_standin(&self, id: &str, failed: bool, held: &mut Held) -> Result<()> {
+        if failed {
+            self.systemctl.reset_failed(id, UnitKind::Service, held)?;
+        }
         remove_file_if_present(&standin_path(id))
     }
 
@@ -127,16 +147,16 @@ impl Systemd {
             return Ok(());
         }
         self.systemctl.require_supported(held)?;
-        match in_flight {
-            RunInFlight::Stop => {
-                // Unbounded, as `uninstall`'s own stop.
-                self.systemctl
-                    .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
-            }
-            RunInFlight::Leave if self.run_in_flight(id)? => return Ok(()),
-            RunInFlight::Leave => {}
+        if in_flight == RunInFlight::Stop {
+            // Unbounded, as `uninstall`'s own stop.
+            self.systemctl
+                .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
         }
-        self.remove_standin(id, held)?;
+        let job = self.job(id)?;
+        if in_flight == RunInFlight::Leave && job.running {
+            return Ok(());
+        }
+        self.remove_standin(id, job.failed, held)?;
         self.systemctl.daemon_reload(held)
     }
 }

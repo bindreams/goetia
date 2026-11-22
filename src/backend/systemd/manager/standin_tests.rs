@@ -25,11 +25,40 @@ const SCHEDULE: Option<&str> = Some("30 3 * * *");
 
 /// `systemctl show` of a job systemd has no unit file for.
 fn not_loaded() -> Entry {
-    reply(&["show"], exited(0, "ActiveState=inactive\nLoadState=not-found\n", ""))
+    reply(
+        &["show"],
+        exited(
+            0,
+            "ActiveState=inactive\nMainPID=0\nInvocationID=\nLoadState=not-found\n",
+            "",
+        ),
+    )
 }
 
 fn reset_failed() -> Entry {
     reply(&["reset-failed"], exited(0, "", ""))
+}
+
+/// The read of a left run that is not active, and the `reset-failed` that follows it only where the run
+/// failed: systemd refuses `reset-failed` of a unit that is not in memory, which one that did not fail is not.
+fn read_then_clear(failed: bool) -> Vec<Entry> {
+    if failed {
+        vec![show("failed", 0), reset_failed()]
+    } else {
+        vec![show("inactive", 0)]
+    }
+}
+
+/// `calls` end in the reload, and hold the `reset-failed` of `id` (before it) only if the run `failed`.
+fn clears_only_a_failed_run(id: &str, calls: &[Vec<String>], failed: bool) {
+    let reset = call(&["reset-failed", "--", &format!("{id}.service")]);
+    let reload = call(&["daemon-reload"]);
+    assert_eq!(calls.contains(&reset), failed, "{calls:?}");
+    if failed {
+        let at = |wanted: &Vec<String>| calls.iter().position(|seen| seen == wanted);
+        assert!(at(&reset) < at(&reload), "before the reload: {calls:?}");
+    }
+    assert_eq!(calls.last(), Some(&reload), "{calls:?}");
 }
 
 fn disabled() -> Entry {
@@ -267,40 +296,32 @@ fn a_foreign_file_at_the_standins_path_stops_the_uninstall_before_anything_is_re
 // The stand-in's life =================================================================================================
 
 /// A stand-in whose unit is not active goes with the next uninstall of the id, before its reload, after a
-/// `reset-failed` that clears a left run that failed (which an unloaded unit refuses).
+/// `reset-failed` where the left run failed.
 #[skuld::test]
 fn an_uninstall_removes_a_standin_whose_unit_is_not_active(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
-    for (in_flight, steps) in [
-        (
-            RunInFlight::Stop,
-            vec![disabled(), enqueued("stop", 3), reset_failed(), reload()],
-        ),
-        (
-            RunInFlight::Leave,
-            vec![disabled(), show("inactive", 0), reset_failed(), reload()],
-        ),
-    ] {
-        let spec = installed(&id, SCHEDULE);
-        seed_standin(&spec);
-        let fake = gate_then(steps);
-        let mgr = over(&fake);
-        let snapshot = marked(&mgr, &id);
+    for failed in [false, true] {
+        for in_flight in [RunInFlight::Stop, RunInFlight::Leave] {
+            let mut steps = vec![disabled()];
+            if in_flight == RunInFlight::Stop {
+                steps.push(enqueued("stop", 3));
+            }
+            steps.extend(read_then_clear(failed));
+            steps.push(reload());
+            let spec = installed(&id, SCHEDULE);
+            seed_standin(&spec);
+            let fake = gate_then(steps);
+            let mgr = over(&fake);
+            let snapshot = marked(&mgr, &id);
 
-        mgr.uninstall_units(snapshot, in_flight, &mut held(&mgr))
-            .expect("uninstall");
+            mgr.uninstall_units(snapshot, in_flight, &mut held(&mgr))
+                .expect("uninstall");
 
-        let calls = without_gate(&fake);
-        let at = |verb: &str| calls.iter().position(|c| c[0] == verb);
-        assert!(at("reset-failed") < at("daemon-reload"), "{in_flight:?}: {calls:?}");
-        assert_eq!(
-            calls.iter().find(|c| c[0] == "reset-failed"),
-            Some(&call(&["reset-failed", "--", &format!("{id}.service")])),
-            "{in_flight:?}"
-        );
-        assert_eq!(calls.last(), Some(&call(&["daemon-reload"])), "{in_flight:?}");
-        assert_eq!(standin_text(&id), None, "{in_flight:?}");
+            clears_only_a_failed_run(&id, &without_gate(&fake), failed);
+            assert_eq!(standin_text(&id), None, "{in_flight:?}, failed: {failed}");
+            assert!(paths(&id).iter().all(|p| !p.exists()));
+        }
     }
 }
 
@@ -330,36 +351,43 @@ fn an_uninstall_keeps_a_standin_whose_unit_is_active(#[fixture(systemd_group)] _
 /// An `install` of the id removes a stand-in whose unit is not active, reloads, and clears a failed run.
 #[skuld::test]
 fn an_install_removes_a_standin_whose_unit_is_not_active(#[fixture(systemd_group)] _group: &Group) {
-    let id = fresh_id("systemd");
-    let _left = Leftovers::new(&id);
-    let spec = task_spec(&id, "/bin/a", SCHEDULE);
-    seed_standin(&spec);
-    let fake = gate_then([show("inactive", 0), reset_failed(), reload(), reload()]);
-    let mgr = over(&fake);
+    for failed in [false, true] {
+        let id = fresh_id("systemd");
+        let _left = Leftovers::new(&id);
+        let spec = task_spec(&id, "/bin/a", SCHEDULE);
+        seed_standin(&spec);
+        let mut steps = read_then_clear(failed);
+        steps.extend([reload(), reload()]);
+        let fake = gate_then(steps);
+        let mgr = over(&fake);
 
-    let outcome = flow::install(
-        &mgr,
-        &spec,
-        false,
-        &mut Backend::reserve(
+        let outcome = flow::install(
             &mgr,
-            &[crate::manager::Step::Install],
-            crate::manager::Budget::Unbounded,
+            &spec,
+            false,
+            &mut Backend::reserve(
+                &mgr,
+                &[crate::manager::Step::Install],
+                crate::manager::Budget::Unbounded,
+            )
+            .expect("reserve"),
         )
-        .expect("reserve"),
-    )
-    .expect("install");
+        .expect("install");
 
-    assert_eq!(outcome, Outcome::Create);
-    let calls = without_gate(&fake);
-    assert_eq!(calls.len(), 4, "{calls:?}");
-    assert_eq!(calls[1], call(&["reset-failed", "--", &format!("{id}.service")]));
-    assert_eq!(standin_text(&id), None);
-    assert_eq!(
-        text_of(&id, UnitKind::Service),
-        Some(units_of(&spec).service),
-        "and the unit is written"
-    );
+        assert_eq!(outcome, Outcome::Create);
+        let calls = without_gate(&fake);
+        assert_eq!(calls.len(), 3 + usize::from(failed), "{calls:?}");
+        assert_eq!(
+            calls.contains(&call(&["reset-failed", "--", &format!("{id}.service")])),
+            failed
+        );
+        assert_eq!(standin_text(&id), None, "failed: {failed}");
+        assert_eq!(
+            text_of(&id, UnitKind::Service),
+            Some(units_of(&spec).service),
+            "and the unit is written"
+        );
+    }
 }
 
 /// An `install` of the id is not refused while the left run lives, and leaves the stand-in: systemd adopts
@@ -440,13 +468,30 @@ fn leaving_an_absent_id_whose_standin_is_not_active_removes_it(#[fixture(systemd
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     seed_standin(&task_spec(&id, "/bin/a", SCHEDULE));
-    let fake = gate_then([show("inactive", 0), reset_failed(), reload()]);
+    let fake = gate_then([show("failed", 0), reset_failed(), reload()]);
     let mgr = over(&fake);
 
     let e = uninstall_absent(&mgr, &id, RunInFlight::Leave).expect_err("absent");
 
     assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
-    assert_eq!(without_gate(&fake).len(), 3, "{:?}", fake.calls());
+    clears_only_a_failed_run(&id, &without_gate(&fake), true);
+    assert_eq!(standin_text(&id), None);
+}
+
+/// A run that did not fail has nothing to clear, and `reset-failed` of its unit would be refused.
+#[skuld::test]
+fn leaving_an_absent_id_whose_standin_run_did_not_fail_clears_nothing(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    seed_standin(&task_spec(&id, "/bin/a", SCHEDULE));
+    let fake = gate_then([show("inactive", 0), reload()]);
+    let mgr = over(&fake);
+
+    let e = uninstall_absent(&mgr, &id, RunInFlight::Leave).expect_err("absent");
+
+    assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
+    clears_only_a_failed_run(&id, &without_gate(&fake), false);
+    assert_eq!(without_gate(&fake).len(), 2, "{:?}", fake.calls());
     assert_eq!(standin_text(&id), None);
 }
 
@@ -456,20 +501,23 @@ fn stopping_an_absent_id_stops_the_run_of_its_standin_then_removes_it(#[fixture(
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     seed_standin(&task_spec(&id, "/bin/a", SCHEDULE));
-    let fake = gate_then([enqueued("stop", 3), reset_failed(), reload()]);
+    let fake = gate_then([enqueued("stop", 3), show("inactive", 0), reload()]);
     let mgr = over(&fake);
 
     let e = uninstall_absent(&mgr, &id, RunInFlight::Stop).expect_err("absent");
 
     assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
+    let calls = without_gate(&fake);
     assert_eq!(
-        without_gate(&fake),
-        [
-            call(&["stop", "--show-transaction", "--", &format!("{id}.service")]),
-            call(&["reset-failed", "--", &format!("{id}.service")]),
-            call(&["daemon-reload"]),
-        ]
+        calls[0],
+        call(&["stop", "--show-transaction", "--", &format!("{id}.service")])
     );
+    assert_eq!(
+        calls.len(),
+        3,
+        "the stop, the read of how it ended, the reload: {calls:?}"
+    );
+    clears_only_a_failed_run(&id, &calls, false);
     assert_eq!(standin_text(&id), None);
 }
 

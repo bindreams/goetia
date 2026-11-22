@@ -1419,6 +1419,7 @@ fn task_state_table() {
             showing(&answer).task_state("x.service").expect(active),
             TaskJob {
                 state,
+                failed: active == "failed",
                 pid: None,
                 invocation: None
             },
@@ -1430,6 +1431,7 @@ fn task_state_table() {
         showing(answer).task_state("x.service").expect("a pid"),
         TaskJob {
             state: State::Running,
+            failed: false,
             pid: Some(42),
             invocation: Some("0123abcd".to_string())
         }
