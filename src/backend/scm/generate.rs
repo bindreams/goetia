@@ -591,8 +591,12 @@ impl fmt::Display for ScmRegistration {
                 writeln!(out, "  OnNonCrashFailures: {}", fa.on_non_crash_failures)?;
             }
         }
-        if let Some(preshutdown) = self.preshutdown {
-            writeln!(out, "PreshutdownTimeout: {}", humantime::format_duration(preshutdown))?;
+        match self.preshutdown {
+            None => {}
+            Some(PRESHUTDOWN_NO_TIMEOUT) => {
+                writeln!(out, "PreshutdownTimeout: none (the largest value the field holds)")?;
+            }
+            Some(preshutdown) => writeln!(out, "PreshutdownTimeout: {}", humantime::format_duration(preshutdown))?,
         }
         writeln!(out, "Environment:")?;
         for line in &self.environment {

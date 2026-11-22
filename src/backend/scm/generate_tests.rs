@@ -1596,6 +1596,27 @@ fn a_preshutdown_time_that_differs_from_the_wanted_one_is_drift() {
     assert_eq!(unset.to_string(), kill.to_string());
 }
 
+/// A pre-shutdown time of the largest value the field holds is what `timeout: null` asks for, and the text a preview
+/// or a diff prints says so, not a duration of months; a value one millisecond short of it is a duration.
+#[skuld::test]
+fn a_pre_shutdown_time_of_the_largest_value_is_shown_as_none() {
+    let no_timeout = build(&with_stop_action(simple_spec(), written("terminate", None)));
+    assert_eq!(no_timeout.preshutdown, millis(u64::from(u32::MAX)));
+    assert!(
+        no_timeout
+            .to_string()
+            .contains("PreshutdownTimeout: none (the largest value the field holds)
+"),
+        "{no_timeout}"
+    );
+
+    let almost = ScmRegistration {
+        preshutdown: millis(u64::from(u32::MAX) - 1),
+        ..no_timeout
+    };
+    assert!(!almost.to_string().contains("none"), "{almost}");
+}
+
 /// What an install writes: the wanted value; for a service that goetia registered as plain and now registers as native,
 /// Windows' default once (goetia wrote the old value and leaves none of its own behind); else nothing.
 #[skuld::test]
