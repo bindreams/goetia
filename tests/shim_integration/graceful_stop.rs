@@ -14,8 +14,7 @@ use goetia::backend::scm::manager::Scm;
 use goetia::backend::scm::wait::StopSeen;
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::shim::{CheckPermissions, StandaloneShim};
-use goetia::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, StopAction, StopSignal, User};
-use goetia::testing::service_fields;
+use goetia::spec::{StopAction, StopSignal, User};
 use windows_service::service::ServiceState;
 
 use crate::common::{
@@ -192,19 +191,18 @@ fn run_to_stop(run: Run) -> Stopped {
         args.push("launcher".to_string());
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let spec = ServiceSpec::new({
-        let base = service_fields(simple_spec(&id, fixture_command_with_exe(&exe, "catch", &args), &logs));
-        ServiceFields {
-            common: DaemonFields { user, ..base.common },
-            stop_action: StopAction {
+    let command = fixture_command_with_exe(&exe, "catch", &args);
+    let spec = support::run_as(
+        support::stopping_by(
+            simple_spec(&id, command.clone(), &logs),
+            command,
+            StopAction {
                 send_signal: setup.signal,
                 timeout: setup.timeout,
             },
-            ..base
-        }
-    })
-    .map(DaemonSpec::from)
-    .unwrap_or_else(|e| panic!("the spec: {}", e.report()));
+        ),
+        user,
+    );
     mgr.install(&spec, false)
         .unwrap_or_else(|e| panic!("install: {}", e.report()));
     let goetia_id = spec.common().id.clone();

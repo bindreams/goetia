@@ -308,7 +308,9 @@ records the end as it does.
     reported while the ask itself is being made.
   - **At a system shutdown** a `protocol: plain` service is stopped as `stop` stops it: it accepts `PRESHUTDOWN`,
     and `install` sets its pre-shutdown time from the `stop-action`: the `timeout` plus 10 s, the largest value
-    for `null`, 10 s for `kill`. A `protocol: native` service's is its own, which `install` leaves alone. What
+    for `null`, 10 s for `kill`. A `protocol: native` service's is its own, which `install` leaves alone, with one
+    exception: an `install` that changes a service from `plain` to `native` puts its pre-shutdown time back to 10 s, the
+    Windows default since build 15063, once, and never touches it again for a native service. What
     goetia promises at a shutdown is that time: Windows waits for the service for at least that long (measured in
     Server Core containers of Windows Server 2025, build 26100.33828; a machine that is not a container is not
     measured). Windows ends a service whose checkpoint stays put for about 45 s, which is why the stop reports

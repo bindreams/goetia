@@ -710,14 +710,9 @@ fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
 
 /// A `protocol: plain` service of `user` whose stop is `stop_action`, never started.
 fn plain_stopping_by(id: &str, user: User, stop_action: StopAction, logs: &LogDir) -> DaemonSpec {
-    let base = service_fields(simple_spec(id, fixture_command("report", &["1"]), logs));
-    ServiceSpec::new(ServiceFields {
-        common: DaemonFields { user, ..base.common },
-        stop_action,
-        ..base
-    })
-    .map(DaemonSpec::from)
-    .unwrap()
+    let command = fixture_command("report", &["1"]);
+    let plain = simple_spec(id, command.clone(), logs);
+    support::run_as(support::stopping_by(plain, command, stop_action), user)
 }
 
 fn stopping(send_signal: StopSignal, timeout: Option<u64>) -> StopAction {
