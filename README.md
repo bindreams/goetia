@@ -1651,7 +1651,8 @@ Scm::with_shim(
 `goetia::shim::init_host()` first in `main` is what lets a stop ask a daemon to exit on Windows (see
 [`stop-action`](#stop-action)): the console event is sent by a copy of the host program that cosca starts, which
 runs `main` from the top, and `init_host` is what turns that copy into the sender and ends it. Anything `main`
-does before the call runs in every copy too. A host that did not call it is refused when a service whose stop
+does before the call runs in every copy too, so it must not block or wait for something the running host
+holds. A host that did not call it is refused when a service whose stop
 asks starts. The stock shim (`goetia::stock_shim!()`) makes the call itself.
 
 Tasks run under the same host, which Task Scheduler starts with `--goetia-task
