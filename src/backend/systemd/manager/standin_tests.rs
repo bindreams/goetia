@@ -1025,6 +1025,38 @@ fn a_failed_removal_of_the_job_removes_the_standin_this_call_wrote(#[fixture(sys
     );
 }
 
+/// A failed removal of the job that leaves its path empty (the file vanished since the read) leaves the stand-in this
+/// call wrote: it is then the unit's definition, and removing it would let the next reload end the run in its start
+/// job. The error is the removal's.
+#[skuld::test]
+fn a_failed_removal_of_the_job_leaves_the_standin_where_the_job_path_is_empty(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    seed(&id, UnitKind::Service, &units_of(&service_spec(&id)).service);
+    let job = unit_path(&id, UnitKind::Service);
+    let vanished = job.clone();
+    let fake = gate_then([
+        state(&id, "activating", "start").then(move || {
+            std::fs::remove_file(&vanished).expect("remove the job");
+        }),
+        disabled(),
+    ]);
+    let mgr = over(&fake);
+    let snapshot = marked(&mgr, &id);
+
+    let e = mgr
+        .uninstall_units(snapshot, RunInFlight::Leave, &mut held(&mgr))
+        .expect_err("the job vanished");
+
+    assert!(
+        matches!(&e, Error::ConcurrentChange { path: Some(path), .. } if *path == job),
+        "{e:?}"
+    );
+    let left = standin_text(&id).expect("the stand-in stays: it is the unit's definition");
+    assert_eq!(generate::standin_id(&left).as_deref(), Some(id.as_str()));
+    assert!(!job.exists());
+}
+
 /// `uninstall` of an absent id: `Stop` stops the stand-in's run and reads after the stop whether it failed,
 /// `Leave` sends nothing and goes by the one read; the first read is made before any request, so it needs no
 /// version gate.
