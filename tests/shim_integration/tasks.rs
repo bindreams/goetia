@@ -81,6 +81,7 @@ fn a_stop_ends_a_program_with_no_handler_and_the_run_records_its_death_by_the_ev
     let id = task_id();
     let _guard = ServiceGuard::new(id.as_str());
     let mgr = manager();
+    let records = support::task_records(id.as_str());
     let (child_reported, grandchild_reported) = (ConnectBack::listen(), ConnectBack::listen());
     let command = fixture_command(
         "spawn-grandchild",
@@ -102,10 +103,9 @@ fn a_stop_ends_a_program_with_no_handler_and_the_run_records_its_death_by_the_ev
         ends_the_run.defuse();
 
         let exit = run.join().expect("the run thread").expect("run");
-        assert_eq!(
-            exit, STOPPED,
-            "one record, `Exited(0xC000013A)`: the program's own death by the event"
-        );
+        assert_eq!(exit, STOPPED);
+        // `Stopped` reads as the same code, so the stored record says which it was.
+        assert_one_record(&files_in(&records), &records_left(&records), STOPPED_BY_THE_EVENT);
         // The kernel reaches Gone as the shim's job closes: wait for it.
         for (what, pid) in [("direct child", child), ("grandchild", grandchild)] {
             wait::until(|| !pid_is_alive(&pid));
@@ -165,14 +165,7 @@ fn stop_a_run(mode: &str, args: impl FnOnce(&std::path::Path, &std::path::Path) 
     });
     let said = std::fs::read_to_string(&record).unwrap_or_default();
     let left = what_the_run_left(&records, &shim_log, &record);
-    let files = std::fs::read_dir(&records)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    let files = files_in(&records);
     mgr.uninstall(&id).expect("uninstall");
     StoppedRun {
         exit,
@@ -242,9 +235,18 @@ fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exi
         "the program's own code or the stop's, not {exit:?}\n{left}"
     );
     if exit == STOPPED {
-        let ends = |suffix: &str| stopped.files.iter().filter(|name| name.ends_with(suffix)).count();
-        assert_eq!(ends(".stopping"), 1, "the run left its provisional file\n{left}");
-        assert_eq!(ends(".json"), 0, "the run left no record\n{left}");
+        assert_eq!(
+            count_ending(&stopped.files, ".stopping"),
+            1,
+            "the run left its provisional file\n{left}"
+        );
+        assert_eq!(
+            count_ending(&stopped.files, ".json"),
+            0,
+            "the run left no record\n{left}"
+        );
+    } else {
+        assert_one_record(&stopped.files, left, r#""outcome":{"exited":9}"#);
     }
     println!(
         "measured: {}",
@@ -322,13 +324,35 @@ fn a_console_program_that_never_leaves_its_handler_leaves_no_record_and_is_ended
     assert!(!pid_is_alive(&stopped.pid), "the program (pid {}) is gone", stopped.pid);
 }
 
-/// What a run left that says why it ended as it did: the records directory (each record's text), the shim's
-/// own log (the task's `logs`: the program's output and the shim's failures) and the program's record file.
-fn what_the_run_left(
-    records: &std::path::Path,
-    shim_log: &std::path::Path,
-    program_record: &std::path::Path,
-) -> String {
+/// The stored text of a record that is a program's death by the close event: `Exited(0xC000013A)`.
+const STOPPED_BY_THE_EVENT: &str = r#""outcome":{"exited":3221225786}"#;
+
+/// The names of the files in a run's records directory.
+fn files_in(records: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(records)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// How many of `files` end with `suffix`: `.json` is a record, `.stopping` a provisional file.
+fn count_ending(files: &[String], suffix: &str) -> usize {
+    files.iter().filter(|name| name.ends_with(suffix)).count()
+}
+
+/// Asserts the run left exactly one record and that its stored text holds `outcome`. `left` is what the run left
+/// ([`records_left`] or [`what_the_run_left`]): it holds each file's text.
+fn assert_one_record(files: &[String], left: &str, outcome: &str) {
+    assert_eq!(count_ending(files, ".json"), 1, "the run left one record\n{left}");
+    assert!(left.contains(outcome), "the record says {outcome}\n{left}");
+}
+
+/// The records directory of a run: each file's name and text.
+fn records_left(records: &std::path::Path) -> String {
     let mut said = format!("the records in {}:", records.display());
     match std::fs::read_dir(records) {
         Ok(entries) => {
@@ -339,6 +363,17 @@ fn what_the_run_left(
         }
         Err(e) => said.push_str(&format!(" cannot be listed: {e}")),
     }
+    said
+}
+
+/// What a run left that says why it ended as it did: the records directory (each record's text), the shim's
+/// own log (the task's `logs`: the program's output and the shim's failures) and the program's record file.
+fn what_the_run_left(
+    records: &std::path::Path,
+    shim_log: &std::path::Path,
+    program_record: &std::path::Path,
+) -> String {
+    let mut said = records_left(records);
     for (what, path) in [("the shim's log", shim_log), ("the program's record", program_record)] {
         said.push_str(&format!(
             "\n{what} {}:\n{}",

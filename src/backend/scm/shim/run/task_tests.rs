@@ -1004,8 +1004,6 @@ fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_t
             run.runs.held_pin().unwrap().is_some(),
             "the pin was let go when the stop was accepted: the run is alive"
         );
-        assert!(!process.ended(), "the program was ended before it exited by itself");
-        assert!(process.calls().is_empty(), "the program was touched before it exited");
         process.end(7);
     });
 
@@ -1016,6 +1014,11 @@ fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_t
             .join(format!("{}.stopping", instance().hex()))
             .exists(),
         "the provisional file was left"
+    );
+    assert_eq!(
+        process.ended_at_teardown(),
+        Some(true),
+        "the program was ended before it exited by itself"
     );
     assert_eq!(process.exit_code(), Some(7));
     assert_eq!(

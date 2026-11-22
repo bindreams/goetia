@@ -261,6 +261,8 @@ struct ProcState {
     calls: Vec<ProcessCall>,
     exit: Option<ExitStatus>,
     killed: bool,
+    /// Whether the process had already ended when the first kill or tree kill reached it, replied to or not.
+    ended_at_teardown: Option<bool>,
     dropped: bool,
     /// What happens in the world the first time the process performs an [`Op`] ([`FakeProcess::when`]).
     when: BTreeMap<Op, Box<dyn FnOnce() + Send>>,
@@ -327,6 +329,7 @@ impl FakeProcess {
                 calls: Vec::new(),
                 exit: None,
                 killed: false,
+                ended_at_teardown: None,
                 dropped: false,
                 when: BTreeMap::new(),
             }),
@@ -439,6 +442,12 @@ impl FakeProcess {
         lock(&self.0.state).exit.and_then(|status| status.code())
     }
 
+    /// Whether the process had already ended when the first kill or tree kill reached it: `None` if none has. A
+    /// teardown that came before the program's own exit says `Some(false)`.
+    pub(crate) fn ended_at_teardown(&self) -> Option<bool> {
+        lock(&self.0.state).ended_at_teardown
+    }
+
     /// Whether a kill or tree kill of it succeeded.
     pub(crate) fn killed(&self) -> bool {
         lock(&self.0.state).killed
@@ -480,6 +489,11 @@ impl Instance {
         refused: fn() -> cosca::error::Error,
         reply: Option<KillReply>,
     ) -> Result<(), cosca::error::Error> {
+        {
+            let mut state = lock(&self.proc.state);
+            let ended = state.exit.is_some();
+            state.ended_at_teardown.get_or_insert(ended);
+        }
         match reply {
             None => self.unstated(what),
             Some(KillReply::Ends) => {

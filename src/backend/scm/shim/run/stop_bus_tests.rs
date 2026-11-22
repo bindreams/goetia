@@ -1150,18 +1150,17 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
         });
         assert!(supervisor.bus.request_stop());
         assert_eq!(told.recv().expect("on_stopping was called"), WaitEnd::Stop);
-        // Past `on_stopping`, the supervisor waits for the program: it has asked nothing and ended nothing.
-        assert_eq!(daemon.calls(), Vec::<ProcessCall>::new());
         daemon.end(0);
         running.join().expect("the supervisor did not panic")
     });
 
-    assert!(matches!(outcome, WaitOutcome::Stopping { root_exited: true, .. }));
     assert_eq!(
-        daemon.exit_code(),
-        Some(0),
+        daemon.ended_at_teardown(),
+        Some(true),
         "the program was ended before it exited by itself"
     );
+    assert!(matches!(outcome, WaitOutcome::Stopping { root_exited: true, .. }));
+    assert_eq!(daemon.exit_code(), Some(0));
     assert_eq!(
         daemon.calls(),
         [ProcessCall::SendKillTree],
