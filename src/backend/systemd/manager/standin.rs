@@ -1,7 +1,7 @@
 //! The stand-in unit that keeps a left run alive: see [`crate::manager::ServiceManager::uninstall`] and
 //! [`generate::standin`] for what it is and why a run still in its start job needs one.
 //!
-//! The rules for what `uninstall` and `install` do about a run and a stand-in are in [`plan`]; `Systemd::settle` (in
+//! The rules for what `uninstall` and `install` do about a run and a stand-in are in [`mod@plan`]; `Systemd::settle` (in
 //! `task`) carries them out. goetia reads `/etc/systemd/system` for fragments, so a stand-in never makes an id
 //! read as installed (see `discover`).
 
@@ -144,7 +144,7 @@ impl Systemd {
         self.settle(id, RunInFlight::Leave, Target::Install, held)
     }
 
-    /// `uninstall` of an id nothing is installed at: see rule 6 of [`plan`]. A failed reload is the call's error,
+    /// `uninstall` of an id nothing is installed at: see rule 6 of [`mod@plan`]. A failed reload is the call's error,
     /// not "not installed".
     pub(super) fn uninstall_leftovers(&self, id: &str, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
         self.settle(id, in_flight, Target::Sweep, held)
