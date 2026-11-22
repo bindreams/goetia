@@ -591,7 +591,11 @@ impl Supervisor {
             } else if let Some(gone) = gone {
                 gone.status
             } else {
-                self.run_plan(plan, child.as_ref(), id, seen, unreadable_told, &mut on_progress)
+                let saw = SawStop {
+                    at: seen,
+                    unreadable_told,
+                };
+                self.run_plan(plan, child.as_ref(), id, saw, &mut on_progress)
             };
             // By the waiter's report when no read gave a status: a daemon that exited, during the plan or before
             // it, is a tree to end, not a process to kill.
@@ -668,18 +672,24 @@ fn grown_pace(pace: Duration) -> Duration {
     pace.saturating_mul(2).min(REASK_PACE_CEILING)
 }
 
+/// What the supervisor knew when it saw an accepted stop, which the plan goes on from: when it saw it (the `timeout` of
+/// an ask-and-wait counts from then), and whether a failed read of the process was told already.
+#[derive(Clone, Copy)]
+struct SawStop {
+    at: Instant,
+    unreadable_told: bool,
+}
+
 impl Supervisor {
     /// What an accepted stop does before the teardown, for a root that was not gone when the stop was seen
-    /// ([`Supervisor::wait_for_child_or_stop`]). `seen` is when the supervisor saw the stop; `unreadable_told` says that
-    /// a failed read of the process was told already. The status a read of the process gave, if one found the root
-    /// gone during the plan.
+    /// ([`Supervisor::wait_for_child_or_stop`]). `saw` is what the supervisor knew of the stop. The status a read of the
+    /// process gave, if one found the root gone during the plan.
     fn run_plan(
         &self,
         plan: StopPlan,
         child: &dyn Spawned,
         id: &str,
-        seen: Instant,
-        unreadable_told: bool,
+        saw: SawStop,
         on_progress: &mut impl FnMut(),
     ) -> Option<ExitStatus> {
         match plan {
@@ -690,9 +700,7 @@ impl Supervisor {
                 self.bus.await_exit_report();
                 None
             }
-            StopPlan::AskAndWait { event, timeout } => {
-                self.ask_and_wait(child, id, event, timeout, seen, unreadable_told, on_progress)
-            }
+            StopPlan::AskAndWait { event, timeout } => self.ask_and_wait(child, id, event, timeout, saw, on_progress),
         }
     }
 
@@ -716,10 +724,13 @@ impl Supervisor {
         id: &str,
         event: CtrlEvent,
         timeout: Option<Duration>,
-        seen: Instant,
-        mut unreadable_told: bool,
+        saw: SawStop,
         on_progress: &mut impl FnMut(),
     ) -> Option<ExitStatus> {
+        let SawStop {
+            at: seen,
+            mut unreadable_told,
+        } = saw;
         let left = || timeout.map(|t| t.saturating_sub(seen.elapsed()));
         let mut asking_told = false;
         let mut told = false;

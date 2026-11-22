@@ -1524,7 +1524,7 @@ fn a_stop_action_is_carried_in_the_blob_and_changes_nothing_else() {
     }
 }
 
-// Pre-shutdown time -------------------------------------------------------------------------------------------------------
+// Pre-shutdown time ---------------------------------------------------------------------------------------------------
 
 fn millis(n: u64) -> Option<Duration> {
     Some(Duration::from_millis(n))
