@@ -38,7 +38,14 @@ enum Run {
 const CHOICES: [RunInFlight; 2] = [RunInFlight::Stop, RunInFlight::Leave];
 const CALLS: [Call; 4] = [Call::Job, Call::NoJob, Call::Sweep, Call::Install];
 const FILES: [File; 3] = [File::Absent, File::Ours, File::Foreign];
-const RUNS: [Run; 6] = [Run::Unread, Run::Idle, Run::Failed, Run::Pending, Run::Start, Run::Running];
+const RUNS: [Run; 6] = [
+    Run::Unread,
+    Run::Idle,
+    Run::Failed,
+    Run::Pending,
+    Run::Start,
+    Run::Running,
+];
 
 #[derive(Debug, Clone, Copy)]
 struct Cell {
@@ -77,7 +84,9 @@ impl Cell {
 
     /// Whether a call of this shape reads the unit, as the table states it.
     fn reads(&self) -> bool {
-        (self.in_flight == RunInFlight::Leave && self.installed()) || self.file == File::Ours || self.call == Call::Sweep
+        (self.in_flight == RunInFlight::Leave && self.installed())
+            || self.file == File::Ours
+            || self.call == Call::Sweep
     }
 
     /// A cell a call can be in: `install` settles as `Leave` does, a held definition is looked for only by
@@ -446,7 +455,11 @@ fn every_reachable_cell_has_one_row_and_gets_its_plan() {
         assert_eq!(plan_of(&cell), (row.plan)(), "{cell:?}\nrule {}", row.rule);
     }
     for (row, count) in ROWS.iter().zip(&covered) {
-        assert!(*count > 0, "no reachable cell is covered by the row for rule {}", row.rule);
+        assert!(
+            *count > 0,
+            "no reachable cell is covered by the row for rule {}",
+            row.rule
+        );
     }
     assert!(reachable > 100, "the generator reached {reachable} cells");
 }

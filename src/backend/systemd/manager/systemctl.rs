@@ -851,8 +851,9 @@ impl Systemctl {
         self.enable_timer(id, held)
     }
 
-    /// `systemctl reset-failed` for `id`'s `kind` unit: a failed unit is inactive again. The unit must be
-    /// loadable: systemd refuses one it has no file for, loaded or not (measured on 255).
+    /// `systemctl reset-failed` for `id`'s `kind` unit: a unit that failed is inactive again, even when its
+    /// file is gone (`not-found failed`: it is in memory). A unit that is not in memory has nothing to clear,
+    /// so this is asked only for a unit read as failed.
     pub(super) fn reset_failed(&self, id: &str, kind: UnitKind, held: &mut Held) -> Result<()> {
         self.unit_file_verb(&["reset-failed"], id, kind, held)
     }
@@ -1030,11 +1031,16 @@ impl Systemctl {
     /// unit.
     pub(super) fn run_of(&self, unit: &str) -> Result<UnitRun> {
         let props = self.show_properties(unit, &UnitRun::PROPERTIES)?;
-        let (active, sub) = (props["ActiveState"].as_str(), props["SubState"].as_str());
+        let active = props["ActiveState"].as_str();
+        // A pid that does not read as a number is a process goetia cannot rule out.
+        let process = ["MainPID", "ControlPID"]
+            .iter()
+            .any(|pid| props[*pid].parse::<u32>().map_or(true, |pid| pid != 0));
         Ok(UnitRun {
-            phase: match (active, sub) {
-                ("inactive" | "failed", _) | ("activating", "auto-restart") => RunPhase::None,
-                ("activating", _) => RunPhase::InStartJob,
+            phase: match active {
+                "inactive" | "failed" => RunPhase::None,
+                "activating" if !process => RunPhase::PendingRestart,
+                "activating" => RunPhase::InStartJob,
                 // Every other state systemd reports, the ones goetia does not know included.
                 _ => RunPhase::Running,
             },
@@ -1072,15 +1078,17 @@ pub(super) struct TaskJob {
     pub invocation: Option<String>,
 }
 
-/// Whether a unit has a run, and which kind, as `ActiveState` and `SubState` say.
+/// Whether a unit has a run, and which kind, as `ActiveState`, `MainPID` and `ControlPID` say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RunPhase {
-    /// No process: `inactive`, `failed`, or `activating` with `SubState=auto-restart`, a restart waiting
-    /// for its delay (a stop of it cancels the restart and signals nothing).
+    /// `inactive` or `failed`.
     None,
+    /// `activating` with no process, `MainPID` and `ControlPID` both 0: a restart waiting for its delay
+    /// (`SubState` `auto-restart`, and `auto-restart-queued` of systemd 254 and later). A stop of it would
+    /// signal nothing, but one sent after this read could land on a process systemd restarted in between.
     PendingRestart,
-    /// A run still in its start job: `activating` with any other `SubState`. A reload that drops its unit
-    /// file ends it at the start timeout.
+    /// A run still in its start job: `activating` with a process. A reload that drops its unit file ends it
+    /// at the start timeout.
     InStartJob,
     /// Every other state systemd reports, the ones goetia does not know included.
     Running,
@@ -1105,9 +1113,11 @@ pub(super) struct UnitRun {
 
 impl UnitRun {
     /// What the read asks, in this order.
-    const PROPERTIES: [&'static str; 6] = [
+    const PROPERTIES: [&'static str; 8] = [
         "ActiveState",
         "SubState",
+        "MainPID",
+        "ControlPID",
         "KillSignal",
         "TimeoutStopUSec",
         "LoadState",

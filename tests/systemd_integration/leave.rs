@@ -240,13 +240,17 @@ fn no_stop_on_a_service_that_restarts_signals_nothing_and_is_not_restarted_again
         let [state] = show_properties(&unit_of(&id), ["ActiveState"]);
         matches!(state.as_str(), "inactive" | "failed")
     });
-    let [state, load, main_pid, restarts] = show_properties(
-        &unit_of(&id),
-        ["ActiveState", "LoadState", "MainPID", "NRestarts"],
+    let [state, load, main_pid, restarts] =
+        show_properties(&unit_of(&id), ["ActiveState", "LoadState", "MainPID", "NRestarts"]);
+    assert_eq!(
+        restarts, restarts_at_return,
+        "nothing restarted it after the uninstall returned"
     );
-    assert_eq!(restarts, restarts_at_return, "nothing restarted it after the uninstall returned");
     assert_eq!(main_pid, "0", "no process is left");
-    let listed = cmd::run("systemctl", &["list-units", "--all", "--plain", "--no-legend", &unit_of(&id)]);
+    let listed = cmd::run(
+        "systemctl",
+        &["list-units", "--all", "--plain", "--no-legend", &unit_of(&id)],
+    );
     // A process caught between its fork and its exec is still in its start job, which gets a stand-in.
     let loaded_from = if standin(&id).exists() { "loaded" } else { "not-found" };
     match state.as_str() {

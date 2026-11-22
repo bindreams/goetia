@@ -193,10 +193,12 @@ pub(crate) trait Backend {
     /// Never called for an id that is foreign or whose state is undetermined.
     ///
     /// `in_flight` is what `uninstall` was asked to do with a run in flight, for a backend whose leftover
-    /// has one: systemd's stand-in unit for a left run is stopped first under [`RunInFlight::Stop`] and
-    /// left, with its run, under [`RunInFlight::Leave`] while its run is in flight; and a definition systemd
-    /// still holds for a file that is gone is reloaded under either. A backend with no such leftover
-    /// ignores it.
+    /// has one. systemd's, where a manager can be asked: a stand-in unit for a left run is stopped first under
+    /// [`RunInFlight::Stop`] and left, with its run, under [`RunInFlight::Leave`] while its run has a process
+    /// (nothing else is stopped, since goetia cannot show that any other unit was its own); and a definition
+    /// systemd still holds from the id's own path whose file is gone is reloaded under either, and nothing else
+    /// is done for it. Where no manager can be asked nothing is read and the answer stays "not installed". A
+    /// backend with no such leftover ignores it.
     fn uninstall_absent(&self, _id: &Id, _in_flight: RunInFlight) -> Result<()> {
         Ok(())
     }

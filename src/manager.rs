@@ -86,14 +86,15 @@ pub trait ServiceManager {
     /// is never left for want of one. Which backends honour `Leave`, and what each leaves while the
     /// run lives, is the README's "Uninstalling a daemon".
     ///
-    /// **systemd** leaves the unit loaded with no file, which systemd never restarts. One read of the
-    /// unit decides: with no process (including a restart that is waiting) it is the plain uninstall; a
-    /// run still in its start job, which a reload would end at the default start timeout, gets a stand-in
-    /// unit of the same name under `/run/systemd/system`, written first (see `generate::standin`); a run
-    /// past its start job is left as it is. The next `install` or `uninstall` of the id removes the
-    /// stand-in once its run is over. A file at that path that is not goetia's is refused with
-    /// [`Error::StandinBlocked`], whether or not a run is in flight. A run somebody else starts between
-    /// the backend's read and the reload is that caller's own conflicting action, and nothing guards it.
+    /// **systemd** leaves the unit loaded with no file, which systemd never restarts, and sends it nothing in any
+    /// state. One read of the unit decides what else: a run still in its start job, which a reload would end at
+    /// the default start timeout, gets a stand-in unit of the same name under `/run/systemd/system`, written
+    /// first (see `generate::standin`), when it is the run of the definition being removed; a restart that is
+    /// waiting is cleared once the reload has failed it; a run past its start job is left as it is. The next
+    /// `install` or `uninstall` of the id removes the stand-in once its run has no process. A file at that path
+    /// that is not goetia's is refused with [`Error::StandinBlocked`], whether or not a run is in flight. A run
+    /// somebody else starts between the backend's read and the reload is that caller's own conflicting action,
+    /// and nothing guards it.
     ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other

@@ -55,8 +55,8 @@ use crate::manager::{Budget, DaemonStatus, RunInFlight, State, Status, TaskStatu
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
-use super::standin::{Standin, StandinFile, standin_file};
-use super::systemctl::{Held, RunPhase, TimerArming};
+use super::standin::{self, Holding, Known, Looked, Standin, standin_file, standin_path};
+use super::systemctl::{Held, TimerArming};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::{
     Systemd, UnitKind, dropin_dir, identity_for, journal, remove_dir_if_present, remove_file_if_present, unit_name,
@@ -351,37 +351,69 @@ fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
 // uninstall ===========================================================================================================
 
 impl Systemd {
-    /// The timer disarmed, the job stopped, then the timer and the job removed, each verified against
-    /// what `read` saw. A plain service keeps its order: stop, disable, remove, reload.
-    ///
-    /// With [`RunInFlight::Leave`] one read of the job's unit, after the timer is disarmed, decides (see
-    /// [`super::standin`]): no run is the plain uninstall, stop included (it cancels a restart that is
-    /// waiting); a run still in its start job gets the stand-in unit that keeps it alive through the reload;
-    /// a run past it is left with no stop and no stand-in.
+    /// A task or service removed, with the run it has: see [`Systemd::settle`].
     pub(super) fn uninstall_units(&self, snapshot: Fragment, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
-        let id = snapshot.id.as_str();
-        let owns_timer = snapshot.owns_timer_slot();
+        let id = snapshot.id.as_str().to_string();
+        self.settle(&id, in_flight, Some(snapshot), false, held)
+    }
 
-        // Before anything is changed: a file at the stand-in's path that is not goetia's refuses `Leave`.
+    /// The one executor of `uninstall` and `install` over a run and a stand-in. What is done is
+    /// [`standin::plan`]'s, from what is known before the one read of the job's unit ([`Known`]) and what the
+    /// read shows; this does it in one order, which each caller shares. `installed` is the snapshot of an id
+    /// whose files this removes, and `None` for `uninstall` of an id nothing is installed at (`asks_held`) and
+    /// for `install`.
+    ///
+    /// 1. Refuse: a file that is not goetia's at the stand-in's path refuses `Leave`, before anything is changed.
+    /// 2. Disarm the timer, so no run starts after the read.
+    /// 3. Read the job's unit once, when the plan needs it.
+    /// 4. Stop, when the plan says so; then disable a service.
+    /// 5. Write the stand-in, before any file is removed.
+    /// 6. Remove the timer and the job, each verified against what `read` saw, and their drop-ins; remove the
+    ///    stand-in (after `reset-failed` for a failed run); reload.
+    /// 7. When the plan says so, read the unit again and clear it if it failed.
+    ///
+    /// No `systemctl enable` or `disable` comes between the first removal and the reload, since both reload the
+    /// manager at once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
+    pub(super) fn settle(
+        &self,
+        id: &str,
+        in_flight: RunInFlight,
+        installed: Option<Fragment>,
+        asks_held: bool,
+        held: &mut Held,
+    ) -> Result<()> {
+        let holding = match &installed {
+            Some(snapshot) if snapshot.service_text().is_some() => Holding::Job,
+            Some(_) => Holding::NoJob,
+            None => Holding::Absent,
+        };
         let file = standin_file(id)?;
-        if in_flight == RunInFlight::Leave {
-            self.refuse_blocked(id, &file)?;
+        let known = Known {
+            in_flight,
+            holding,
+            file: &file,
+            asks_held,
+        };
+        if known.blocked() {
+            return Err(Error::StandinBlocked {
+                id: id.to_string(),
+                path: standin_path(id),
+            });
         }
 
-        if snapshot.timer().is_some() {
+        if let Some(snapshot) = &installed
+            && snapshot.timer().is_some()
+        {
             self.systemctl.disable_timer(id, held)?;
         }
-        let run = match in_flight {
-            RunInFlight::Leave => {
-                self.systemctl.require_supported(held)?;
-                Some(self.systemctl.run_of(&unit_name(id, UnitKind::Service))?)
-            }
-            RunInFlight::Stop => None,
+        let looked = match self.look(id, &known) {
+            // Nothing can be asked, so nothing is held: as before a held definition could be asked about.
+            Err(Error::NoManager { .. }) if asks_held => return Ok(()),
+            looked => looked?,
         };
-        // With a stand-in of ours at the id its run is stopped too, whatever the snapshot holds.
-        if run.as_ref().is_none_or(|run| run.phase == RunPhase::None)
-            && (snapshot.service_text().is_some() || matches!(file, StandinFile::Ours(_)))
-        {
+        let plan = standin::plan(&known, looked.as_ref().map(Looked::seen).as_ref());
+
+        if plan.stop {
             // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
             // means rather than an end, and bounding it would turn a slow-stopping service into a failed
             // uninstall where today it succeeds.
@@ -389,47 +421,59 @@ impl Systemd {
                 .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
         }
         // A task's job has no `[Install]`: there is nothing to disable.
-        if snapshot.service_text().is_some() && !snapshot.is_task() {
+        if let Some(snapshot) = &installed
+            && snapshot.service_text().is_some()
+            && !snapshot.is_task()
+        {
             self.systemctl.disable_impl(id, held)?;
         }
-
-        // The order from here: the stand-in is written before any file is removed, and no `systemctl enable`
-        // or `disable` comes between the first removal and the last reload, since both reload the manager at
-        // once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
-        let standin = self.plan_standin(id, in_flight, &file, run)?;
         if let Standin::Write {
             kill_signal,
             stop_timeout,
-        } = &standin
+        } = &plan.standin
         {
             self.write_standin(id, &file, kill_signal, stop_timeout)?;
         }
 
-        // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file
-        // spans `systemctl` round-trips, wide enough for something else to have replaced it.
-        if let Some(timer) = snapshot.timer() {
-            remove_verified(id, UnitKind::Timer, &timer.text)?;
+        // Both attempted regardless of whether the first failed, and every failure reported together: a
+        // partial failure here must not leave systemd's loaded view silently stale.
+        let mut removed = Ok(());
+        if let Some(snapshot) = &installed {
+            // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file spans
+            // `systemctl` round-trips, wide enough for something else to have replaced it.
+            if let Some(timer) = snapshot.timer() {
+                remove_verified(id, UnitKind::Timer, &timer.text)?;
+            }
+            if let Some(job) = snapshot.service_text() {
+                remove_verified(id, UnitKind::Service, job)?;
+            }
+            removed = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
+            if snapshot.owns_timer_slot() {
+                removed = both(removed, remove_dir_if_present(&dropin_dir(id, UnitKind::Timer)));
+            }
         }
-        if let Some(job) = snapshot.service_text() {
-            remove_verified(id, UnitKind::Service, job)?;
+        if let Standin::Remove { failed } = plan.standin {
+            removed = both(removed, self.remove_standin(id, failed, held));
         }
-
-        // Both attempted regardless of whether the first failed, and every failure reported
-        // together: a partial failure here must not leave systemd's loaded view silently stale.
-        let mut dropins = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
-        if owns_timer {
-            dropins = both(dropins, remove_dir_if_present(&dropin_dir(id, UnitKind::Timer)));
-        }
-        if let Standin::Remove { failed } = standin {
-            dropins = both(dropins, self.remove_standin(id, failed, held));
-        }
-        match both(dropins, self.systemctl.daemon_reload(held)) {
-            Err(e @ Error::Both { .. }) => Err(Error::Step {
+        let reloaded = if plan.reload {
+            self.systemctl.daemon_reload(held)
+        } else {
+            Ok(())
+        };
+        match both(removed, reloaded) {
+            Err(e @ Error::Both { .. }) if installed.is_some() => Err(Error::Step {
                 what: format!("uninstall for `{id}` partially failed, and the unit fragment is already gone"),
                 source: Box::new(e),
             }),
             settled => settled,
+        }?;
+
+        // A restart that was waiting failed on the missing unit when the manager reloaded, and no process
+        // started. One that has a process came first, and is left.
+        if plan.reread && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
+            self.systemctl.reset_failed(id, UnitKind::Service, held)?;
         }
+        Ok(())
     }
 }
 

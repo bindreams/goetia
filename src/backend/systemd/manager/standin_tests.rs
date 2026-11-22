@@ -47,8 +47,18 @@ fn state(id: &str, active: &str, sub: &str) -> Entry {
 }
 
 fn unit_state(active: &str, sub: &str, load: &str, fragment: &str, kill: &str, timeout: &str) -> Entry {
-    let process = !(matches!(active, "inactive" | "failed") || (active == "activating" && sub.starts_with("auto-restart")));
-    unit_state_of(active, sub, if process { 4242 } else { 0 }, 0, load, fragment, kill, timeout)
+    let process =
+        !(matches!(active, "inactive" | "failed") || (active == "activating" && sub.starts_with("auto-restart")));
+    unit_state_of(
+        active,
+        sub,
+        if process { 4242 } else { 0 },
+        0,
+        load,
+        fragment,
+        kill,
+        timeout,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -760,7 +770,12 @@ fn stopping_a_snapshot_with_a_timer_and_no_job_still_stops_the_run_of_its_standi
     let spec = task_spec(&id, "/bin/a", SCHEDULE);
     let snapshot = timer_alone(&id, &spec);
     seed_standin(&id, "15", "1min 30s");
-    let fake = gate_then([disabled(), state(&id, "active", "running"), enqueued("stop", 3), reload()]);
+    let fake = gate_then([
+        disabled(),
+        state(&id, "active", "running"),
+        enqueued("stop", 3),
+        reload(),
+    ]);
     let mgr = over(&fake);
 
     mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
@@ -768,12 +783,7 @@ fn stopping_a_snapshot_with_a_timer_and_no_job_still_stops_the_run_of_its_standi
 
     assert_eq!(
         calls_of(&fake),
-        [
-            disable_timer_call(&id),
-            read_call(&id),
-            stop_call(&id),
-            reload_call()
-        ]
+        [disable_timer_call(&id), read_call(&id), stop_call(&id), reload_call()]
     );
     assert_eq!(standin_text(&id), None);
     assert!(paths(&id).iter().all(|p| !p.exists()));
@@ -793,11 +803,7 @@ fn an_uninstall_leaves_a_standin_with_a_run_going(#[fixture(systemd_group)] _gro
     mgr.uninstall_units(snapshot, RunInFlight::Leave, &mut held(&mgr))
         .expect("uninstall");
 
-    assert!(
-        !calls_of(&fake)
-            .iter()
-            .any(|c| c[0] == "reset-failed" || c[0] == "stop")
-    );
+    assert!(!calls_of(&fake).iter().any(|c| c[0] == "reset-failed" || c[0] == "stop"));
     assert_eq!(standin_text(&id), Some(default_standin(&id)));
 }
 
@@ -895,11 +901,7 @@ fn an_install_over_a_left_run_leaves_the_standin_and_is_not_refused(#[fixture(sy
         let outcome = install(&mgr, &spec);
 
         assert_eq!(outcome, Outcome::Create);
-        assert!(
-            !calls_of(&fake)
-                .iter()
-                .any(|c| c[0] == "stop" || c[0] == "reset-failed")
-        );
+        assert!(!calls_of(&fake).iter().any(|c| c[0] == "stop" || c[0] == "reset-failed"));
         assert_eq!(standin_text(&id), Some(default_standin(&id)), "{active}");
     }
 }
@@ -953,7 +955,11 @@ fn uninstalling_an_absent_id_with_nothing_held_reads_once_and_changes_nothing(
 
         assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
         assert_eq!(calls_of(&fake), [read_call(&id)], "{in_flight:?}");
-        assert!(fake.calls().len() == 1, "no version gate for a read: {:?}", fake.calls());
+        assert!(
+            fake.calls().len() == 1,
+            "no version gate for a read: {:?}",
+            fake.calls()
+        );
     }
 }
 
@@ -1184,11 +1190,7 @@ fn an_absent_ids_foreign_runtime_unit_is_left_alone(#[fixture(systemd_group)] _g
         let e = uninstall_absent(&mgr, &id, in_flight).expect_err("absent");
 
         assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
-        assert_eq!(
-            calls_of(&fake),
-            [read_call(&id)],
-            "{in_flight:?}: no stop, no removal"
-        );
+        assert_eq!(calls_of(&fake), [read_call(&id)], "{in_flight:?}: no stop, no removal");
         assert_eq!(standin_text(&id).as_deref(), Some(seed_foreign()));
     }
 }

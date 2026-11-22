@@ -2048,30 +2048,40 @@ What is left while the run lives is the manager's to report, and goetia reports 
 **systemd.** The unit files are gone, so the id is not installed, and the process is the caller's. systemd keeps a
 loaded unit with no file (`LoadState=not-found`) while the process lives, and never restarts it.
 
+- `--no-stop` sends nothing in any state: no stop and no signal, a unit with no process included.
 - A run still in its start job is ended by a reload that drops its unit file, at systemd's default start timeout.
   For goetia's units that is a task's run (a service is past its start phase). So when systemd reports the run
-  still in its start job, `uninstall --no-stop` first writes a stand-in unit of the same name under
-  `/run/systemd/system/` (a tmpfs, so a reboot removes it) with no start timeout. It carries the `KillSignal=`
-  and `TimeoutStopSec=` systemd was applying to the job, a drop-in's included, and goetia's `[X-Goetia]` section
-  and the id, which is how goetia knows the file is its own. Any other stop setting a drop-in gave the job
-  (`KillMode=`, `ExecStop=`, `SendSIGKILL=` and the like) is not carried: a hand `systemctl stop` of the left run
-  uses systemd's defaults for those. A hand `systemctl start` of the stand-in fails. A run past its start phase
-  needs none and is left as it is.
-- A service that is waiting to be restarted has no process, so there is no run to leave: it is uninstalled as one
-  that is stopped, and the restart is cancelled.
-- Nothing removes the stand-in while its run is in flight. The next `install` or `uninstall` of the id, an id nobody
-  installed included, removes it once its run is over, reloads the manager, and clears a failed run of it with
-  `systemctl reset-failed`. `uninstall --no-stop` of an id whose run is in flight leaves the stand-in and the run;
-  `uninstall` without the flag stops the run, then removes the file.
-- A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an id refuses
-  with an error naming the path, whether or not a run is in flight, and before anything is changed, the timer
-  included. Remove the file, or uninstall without `--no-stop`.
-- `uninstall` of an id nothing is installed at reloads the manager when systemd still holds a definition loaded
-  from goetia's own unit path whose file is gone (a `--no-stop` uninstall whose last reload failed), so the retry
-  finishes it: the unit is not restarted from memory.
-- A left run that then fails stays listed as `not-found failed`, and the machine reads `degraded`, until
-  `systemctl reset-failed` or a reboot. goetia cannot tell that such a unit was its own, so it clears none, except
-  the one whose stand-in it removes.
+  of the definition goetia is removing still in its start job, `uninstall --no-stop` first writes a stand-in unit
+  of the same name under `/run/systemd/system/` (a tmpfs, so a reboot removes it) with no start timeout. It
+  carries the `KillSignal=` and `TimeoutStopSec=` systemd was applying to the job, a drop-in's included, and
+  goetia's `[X-Goetia]` section and the id, which is how goetia knows the file is its own. Any other stop setting
+  a drop-in gave the job (`KillMode=`, `ExecStop=`, `SendSIGKILL=` and the like) is not carried: a hand
+  `systemctl stop` of the left run uses systemd's defaults for those. A hand `systemctl start` of the stand-in
+  fails. A run past its start phase needs none and is left as it is. A task whose job is gone and whose timer
+  alone is installed gets none either: the unit under its name may be somebody else's.
+- A service that is waiting to be restarted is not restarted, and is cleared. It has no process to leave, and
+  nothing is sent to it; the reload fails its restart on the missing unit, which leaves the unit failed, and
+  goetia reads the unit once more and clears it with `systemctl reset-failed`. If systemd restarted it first, the
+  process is left like any other run and nothing restarts it again.
+- Nothing removes the stand-in while its run has a process. The next `install` or `uninstall` of the id, an id
+  nobody installed included, removes it once its run is over, reloads the manager, and clears a failed run of it
+  with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and
+  the run; `uninstall` without the flag stops the run, then removes the file.
+- A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an installed id
+  refuses with an error naming the path, whether or not a run is in flight, and before anything is changed, the
+  timer included. Remove the file, or uninstall without `--no-stop`. For an id nothing is installed at, or for
+  `uninstall` without the flag, the file is left alone and changes nothing.
+- `uninstall` of an id nothing is installed at stops nothing, with or without `--no-stop`, except the run a
+  stand-in of goetia's keeps, which `uninstall` without the flag stops. Whatever else is left running is the
+  caller's process, and `systemctl stop <id>` ends it. It reloads the manager when systemd still holds a
+  definition loaded from goetia's own unit path whose file is gone (a `--no-stop` uninstall whose last reload
+  failed), so the retry finishes it and the unit is not restarted from memory; it does no more for it, since
+  goetia cannot show that a definition whose file is gone was its own. Where no manager can be asked it reads
+  nothing and answers "not installed".
+- `systemctl reset-failed` clears a unit that failed, even when its file is gone: such a unit is in memory. A unit
+  that is not in memory has nothing to clear. goetia clears only what it can tell is its own: the failed run of a
+  stand-in it removes, and the restart its own reload failed. A left run that fails later stays listed as
+  `not-found failed`, and the machine reads `degraded`, until `systemctl reset-failed <id>` or a reboot.
 - An `install` of the same id while the left run lives is not refused: systemd adopts the process under the new
   definition until it exits.
 - A run somebody else starts between goetia's reading that a run is in flight and the reload is that caller's own
