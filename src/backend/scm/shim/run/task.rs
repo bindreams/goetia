@@ -56,7 +56,7 @@ use super::exit;
 use super::logging::Log;
 use super::os::Real;
 use super::service::{PassOutcome, SpecStop, run_pass, set_daemon_log};
-use super::stop_bus::{StopBus, StopPlan, Supervisor, WaitEnd};
+use super::stop_bus::{StopBus, StopEvent, StopPlan, Supervisor, WaitEnd};
 use crate::backend::scm::exit_status::Reported;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
@@ -245,10 +245,10 @@ pub(super) fn run_in(
         supervisor,
         id,
         || {},
-        |end| {
+        |event| {
             // Before the wait, which Windows may cut short by ending the shim; the pin stays held, since the run is
-            // alive.
-            if end == WaitEnd::Stop
+            // alive. Nothing reports a task's stop to SCM, and its plan waits for the program alone: no progress.
+            if event == StopEvent::Began(WaitEnd::Stop)
                 && let Err(e) = pin.write_stopping(&instance, started)
             {
                 log.failure(
@@ -262,8 +262,6 @@ pub(super) fn run_in(
                 );
             }
         },
-        // Nothing reports a task's stop to SCM, and its plan waits for the program alone.
-        || {},
     );
     let (record, code) = ended_as(outcome);
     record_run(log, id, runs, pin, Some(instance), started, record);

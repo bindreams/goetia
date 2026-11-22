@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::os::fake::{Fake, kill_refused, tree_kill_refused};
-use super::stop_bus::Supervisor;
+use super::stop_bus::{StopEvent, Supervisor, WaitEnd};
 use crate::error::Chain;
 
 /// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
@@ -16,6 +16,14 @@ pub(crate) fn not_found() -> cosca::error::Error {
 /// A cause that has a cause: `Chain` prints `context: cause`.
 pub(crate) fn chained() -> std::io::Error {
     crate::error::within("the context", std::io::Error::other("the cause"))
+}
+
+/// The [`WaitEnd`] a [`StopEvent::Began`] tells, and nothing for the other event.
+pub(crate) fn began(event: StopEvent) -> Option<WaitEnd> {
+    match event {
+        StopEvent::Began(end) => Some(end),
+        StopEvent::Progress => None,
+    }
 }
 
 /// A supervisor over `fake`'s `Os` and `Log`: the one under test.

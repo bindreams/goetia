@@ -64,13 +64,23 @@ pub(crate) struct StopBus {
     cvar: Condvar,
 }
 
-/// What ended [`Supervisor::wait_for_child_or_stop`]'s wait, as `on_stopping` is told.
+/// What ended [`Supervisor::wait_for_child_or_stop`]'s wait, as [`StopEvent::Began`] tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitEnd {
     /// A stop was accepted (even if the daemon exited as well: the stop wins).
     Stop,
     /// The daemon exited, or its wait failed, with no stop accepted.
     Exit,
+}
+
+/// What [`Supervisor::wait_for_child_or_stop`] tells its observer of the stop: `Began` once, then `Progress` any number
+/// of times, never before `Began`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopEvent {
+    /// The wait has ended, by `WaitEnd`, and nothing has been asked, waited for or torn down yet.
+    Began(WaitEnd),
+    /// The stop is going on: the plan has waited a slice of its time and is waiting further.
+    Progress,
 }
 
 /// What an accepted stop does before the teardown. One function runs it
@@ -408,20 +418,21 @@ impl Supervisor {
     /// returning, and says in its return value whether that teardown
     /// succeeded.
     ///
-    /// `on_stopping` is called exactly once, as soon as the wait has ended for any reason (a stop,
+    /// `observe` is told [`StopEvent::Began`] exactly once, as soon as the wait has ended for any reason (a stop,
     /// the child exiting, a failed wait) and before anything is asked, waited for or torn down, with no lock held,
-    /// told by a [`WaitEnd`] whether an accepted stop or the daemon's own end ended the wait. It is where the
+    /// with a [`WaitEnd`] saying whether an accepted stop or the daemon's own end ended the wait. It is where the
     /// service reports `STOP_PENDING`, so that SCM never reads it as running while the daemon is being stopped,
     /// and where a task records the stop before the wait that may outlast the shim.
     ///
-    /// `on_progress` is called, from the calling thread, while an ask-and-wait plan goes on: after each slice of
-    /// [`PROGRESS_PERIOD`] of the wait for the tree that left members and had a next one, and after each pause of the
-    /// re-ask loop that is followed by another ask. It is not called after the wait has ended, and never by a plan that
-    /// asks nothing or waits for the program alone. The service reports `STOP_PENDING` with a higher checkpoint in
-    /// it, which is what keeps Windows from ending a service whose stop takes long at a shutdown. Nothing is called
-    /// while the ask itself is being made: cosca 0.10's `terminate_tree` waits for its proxy with no bound.
+    /// It is told [`StopEvent::Progress`], from the calling thread and only after `Began`, while an ask-and-wait plan
+    /// goes on: after each slice of [`PROGRESS_PERIOD`] of the wait for the tree that left members and had a next
+    /// one, and after each pause of the re-ask loop that is followed by another ask. Never after the wait has ended,
+    /// and never for a plan that asks nothing or waits for the program alone. The service reports `STOP_PENDING` with
+    /// a higher checkpoint in it, which is what keeps Windows from ending a service whose stop takes long at a
+    /// shutdown. Nothing is told while the ask itself is being made: cosca 0.10's `terminate_tree` waits for its proxy
+    /// with no bound.
     ///
-    /// **The read** of the process, once, where the stop is seen and before `on_stopping` (a read that fails counts as
+    /// **The read** of the process, once, where the stop is seen and before `Began` (a read that fails counts as
     /// gone if the waiter has reported the exit): a root already gone is
     /// told as [`WaitEnd::Exit`], not [`WaitEnd::Stop`], and no plan runs for it. The status the read gives is the
     /// root's exit, whatever the waiter reports after it, and [`WaitOutcome::Stopping`] carries it.
@@ -502,7 +513,7 @@ impl Supervisor {
     /// waiter's `child.wait()` cannot return and joining it would block for
     /// as long as that child lives: `run_service` would never reach
     /// `report_stopped`, SCM's stop would never complete, and the service —
-    /// which reads `STOP_PENDING` throughout its own teardown (`on_stopping`),
+    /// which reads `STOP_PENDING` throughout its own teardown ([`StopEvent::Began`]),
     /// accepting no stop — could then be neither stopped nor
     /// uninstalled for the daemon's whole remaining life. Skipping the join
     /// on that one arm bounds nothing and races nothing, because the wait it
@@ -537,8 +548,7 @@ impl Supervisor {
         child: &Arc<dyn Spawned>,
         id: &str,
         plan: StopPlan,
-        on_stopping: impl FnOnce(WaitEnd),
-        mut on_progress: impl FnMut(),
+        mut observe: impl FnMut(StopEvent),
     ) -> WaitOutcome {
         debug_assert!(
             Arc::ptr_eq(&waiter.bus, &self.bus),
@@ -564,11 +574,11 @@ impl Supervisor {
         let wait_failure = g.wait_failure;
         // The `timeout` of an ask-and-wait is counted from here.
         let seen = Instant::now();
-        // Release the lock before calling out — `on_stopping` and `send_kill_tree`/`kill` need it
+        // Release the lock before calling out — `observe` and `send_kill_tree`/`kill` need it
         // not, and holding it across a kernel call would block `request_stop()`/`settle()`
         // callers (e.g. a second, redundant SCM stop control) for no reason.
         drop(g);
-        // The one read of the live process at the stop, before `on_stopping`. Gone is decided here, once
+        // The one read of the live process at the stop, before `Began`. Gone is decided here, once
         // ([`Supervisor::find_gone`]). A failed wait says nothing of the daemon: no read.
         let mut unreadable_told = false;
         let gone = if stopping && wait_failure.is_none() {
@@ -576,11 +586,11 @@ impl Supervisor {
         } else {
             None
         };
-        on_stopping(if stopping && gone.is_none() {
+        observe(StopEvent::Began(if stopping && gone.is_none() {
             WaitEnd::Stop
         } else {
             WaitEnd::Exit
-        });
+        }));
         let outcome = if !stopping && wait_failure.is_none() {
             WaitOutcome::ChildExited
         } else {
@@ -595,7 +605,7 @@ impl Supervisor {
                     at: seen,
                     unreadable_told,
                 };
-                self.run_plan(plan, child.as_ref(), id, saw, &mut on_progress)
+                self.run_plan(plan, child.as_ref(), id, saw, &mut || observe(StopEvent::Progress))
             };
             // By the waiter's report when no read gave a status: a daemon that exited, during the plan or before
             // it, is a tree to end, not a process to kill.

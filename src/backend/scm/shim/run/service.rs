@@ -5,7 +5,6 @@
 //! exits, once, with the code it reported; SCM's recovery actions (`backend::scm::generate`) start a
 //! new shim, which reads the installed spec afresh.
 
-use std::cell::RefCell;
 use std::ffi::{OsString, c_void};
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -35,7 +34,7 @@ use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{
-    NOT_RESTARTED, RootExit, StopBus, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop,
+    NOT_RESTARTED, RootExit, StopBus, StopEvent, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop,
     terminate_exited_tree,
 };
 
@@ -119,17 +118,22 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
     if plan.asks() {
         clear_ctrl_c_ignored(&log, id);
     }
-    let progress = RefCell::new(StopProgress::default());
+    let mut progress = StopProgress::default();
     let reported = run_daemon(
         &blob.spec,
         plan,
         &supervisor,
         id,
         || report_running(&log, id, status_handle),
-        |hint| report_stopping(&log, id, status_handle, &progress.borrow_mut().begin(hint)),
-        // Reported from this thread, between the slices of the stop's own waits: nothing is reported while the ask
-        // itself is being made, which cosca's `terminate_tree` bounds by nothing.
-        || report_stopping(&log, id, status_handle, &progress.borrow_mut().advance()),
+        // Progress is reported from this thread, between the slices of the stop's own waits: nothing is reported
+        // while the ask itself is being made, which cosca's `terminate_tree` bounds by nothing.
+        |event| {
+            let status = match event {
+                StopEvent::Began(end) => progress.begin(stop_hint(blob.spec.stop_action(), end)),
+                StopEvent::Progress => progress.advance(),
+            };
+            report_stopping(&log, id, status_handle, &status);
+        },
     );
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
@@ -432,19 +436,9 @@ pub(super) fn run_daemon(
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(Duration),
-    on_progress: impl FnMut(),
+    observe: impl FnMut(StopEvent),
 ) -> Reported {
-    run_pass(
-        spec,
-        plan,
-        supervisor,
-        id,
-        on_running,
-        |end| on_stopping(stop_hint(spec.stop_action(), end)),
-        on_progress,
-    )
-    .reported()
+    run_pass(spec, plan, supervisor, id, on_running, observe).reported()
 }
 
 /// How one pass ended, before it is read as anything: what the service tells SCM
@@ -486,10 +480,11 @@ impl PassOutcome {
 /// stop, and say how it ended. `plan` is the run's [`StopPlan`]: the daemon is spawned for it, and it is the stop the
 /// supervisor runs.
 ///
-/// `on_stopping` is called exactly once, after `on_running` and before anything is asked of the daemon or its tree
-/// is torn down, whatever ends the run; never when `on_running` was not. It is told by a [`WaitEnd`] whether an
-/// accepted stop or the daemon's own end ended the wait. The service reads `STOP_PENDING` through the teardown, so
-/// a `start` is refused rather than answered "running" for a service that is about to stop.
+/// `observe` is told [`StopEvent::Began`] exactly once, after `on_running` and before anything is asked of the daemon
+/// or its tree is torn down, whatever ends the run; never when `on_running` was not. It says by a [`WaitEnd`] whether
+/// an accepted stop or the daemon's own end ended the wait. The service reads `STOP_PENDING` through the teardown, so
+/// a `start` is refused rather than answered "running" for a service that is about to stop. Any
+/// [`StopEvent::Progress`] follows it ([`Supervisor::wait_for_child_or_stop`]).
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
@@ -508,8 +503,7 @@ pub(super) fn run_pass(
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(WaitEnd),
-    on_progress: impl FnMut(),
+    observe: impl FnMut(StopEvent),
 ) -> PassOutcome {
     let log = &*supervisor.log;
     let (child, waiter) = match launch(spec, plan, supervisor, id) {
@@ -520,7 +514,7 @@ pub(super) fn run_pass(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
-    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping, on_progress) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, observe) {
         WaitOutcome::ChildExited => {
             let code = exit_code(child.as_ref(), log, id);
             // A stop accepted before this decision wins over a failure: `settle` then says something

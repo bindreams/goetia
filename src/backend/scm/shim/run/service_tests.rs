@@ -32,16 +32,16 @@ use crate::backend::scm::shim::run::os::fake::{
     AskReply, ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, ProcessCall,
     TreeWaitReply, WaitReply, WaiterEnd, tree_kill_refused, wait_failed, wait_failed_with_code,
 };
-use crate::backend::scm::shim::run::stop_bus::WaitEnd;
+use crate::backend::scm::shim::run::stop_bus::{StopEvent, WaitEnd};
 use crate::backend::scm::shim::run::test_support::{
-    assert_failures, assert_one_failure, chained, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
+    assert_failures, assert_one_failure, began, chained, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
 
 /// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report, with the plan of `spec`.
 fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnce()) -> Reported {
-    super::run_daemon(spec, StopPlan::of(spec), supervisor, ID, on_running, |_| {}, || {})
+    super::run_daemon(spec, StopPlan::of(spec), supervisor, ID, on_running, |_| {})
 }
 
 /// [`super::launch`] with the plan of `spec`.
@@ -808,7 +808,6 @@ fn run_daemon_is_run_pass_then_reported() {
                 ID,
                 on_running,
                 |_| {},
-                || {},
             )
         });
         let reported = pass_of(&ending, |supervisor, on_running| {
@@ -819,7 +818,6 @@ fn run_daemon_is_run_pass_then_reported() {
                 ID,
                 on_running,
                 |_| {},
-                || {},
             )
         });
 
@@ -830,7 +828,7 @@ fn run_daemon_is_run_pass_then_reported() {
 }
 
 /// One pass whose stop is accepted as the daemon is running, with the process the `Fake` spawns, the plan the pass runs
-/// and the `WaitEnd` `on_stopping` was told.
+/// and the `WaitEnd` that `Began` told.
 fn stopped_pass(plan: StopPlan, process: FakeProcess) -> (PassOutcome, Vec<WaitEnd>) {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
@@ -844,8 +842,7 @@ fn stopped_pass(plan: StopPlan, process: FakeProcess) -> (PassOutcome, Vec<WaitE
         &supervisor,
         ID,
         || assert!(bus.request_stop()),
-        |end| told.push(end),
-        || {},
+        |event| told.extend(began(event)),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
@@ -912,7 +909,6 @@ fn a_stop_that_read_the_daemon_gone_carries_its_exit_code_when_the_waiter_then_f
             ID,
             || assert!(bus.request_stop()),
             |_| {},
-            || {},
         );
 
         assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "{plan:?}");
@@ -945,11 +941,10 @@ fn a_stop_accepted_after_the_exit_was_seen_carries_the_exit_code_and_is_clean() 
         &supervisor,
         ID,
         || {},
-        |end| {
-            assert_eq!(end, WaitEnd::Exit);
+        |event| {
+            assert_eq!(event, StopEvent::Began(WaitEnd::Exit));
             assert!(bus.request_stop());
         },
-        || {},
     );
 
     assert_eq!(outcome, PassOutcome::Stopped(Some(7)));
@@ -980,7 +975,6 @@ fn a_stop_over_a_daemon_the_shim_never_saw_exit_carries_no_code() {
         ID,
         || assert!(bus.request_stop()),
         |_| {},
-        || {},
     );
     assert_eq!(outcome, PassOutcome::Stopped(None), "a failed wait");
     assert_eq!(outcome.reported(), Reported::Clean);
@@ -1008,7 +1002,6 @@ fn run_recording_stopping(
         |_| {
             stopping.push(fake.calls(Op::SendKillTree));
         },
-        || {},
     );
     (reported, stopping)
 }
@@ -1045,9 +1038,9 @@ fn each_report_that_the_stop_is_going_on_has_the_checkpoint_one_higher() {
     assert_eq!([first.dwCheckPoint, second.dwCheckPoint, third.dwCheckPoint], [1, 2, 3]);
 }
 
-/// A run reports `STOP_PENDING` once through `on_stopping`, then calls `on_progress` while the stop's wait goes on:
-/// a daemon that is still there after two slices of a long `timeout` is reported on twice, once after each, and
-/// not after the slice that saw it exit.
+/// A run tells its observer that the stop began, once, and then that it goes on while the stop's wait does: a daemon
+/// that is still there after two slices of a long `timeout` is progress twice, once after each, and not after the
+/// slice that saw it exit.
 #[skuld::test]
 fn a_run_reports_progress_while_its_stop_waits() {
     let fake = FakeGuard::new();
@@ -1069,7 +1062,7 @@ fn a_run_reports_progress_while_its_stop_waits() {
             .send_kill_tree(KillReply::Ends),
     );
     let bus = Arc::clone(&supervisor.bus);
-    let reports = std::cell::RefCell::new(Vec::new());
+    let mut events = Vec::new();
 
     let reported = super::run_daemon(
         &service,
@@ -1077,15 +1070,14 @@ fn a_run_reports_progress_while_its_stop_waits() {
         &supervisor,
         ID,
         || assert!(bus.request_stop()),
-        |hint| reports.borrow_mut().push(format!("stopping {hint:?}")),
-        || reports.borrow_mut().push("progress".to_string()),
+        |event| events.push(event),
     );
 
     assert_eq!(reported, Reported::Clean);
     assert_eq!(
-        *reports.borrow(),
-        ["stopping 3610s", "progress", "progress"],
-        "the hint is the stop's longest wait, and a report follows each slice but the last"
+        events,
+        [StopEvent::Began(WaitEnd::Stop), StopEvent::Progress, StopEvent::Progress],
+        "began before any progress, and a progress after each slice but the last"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     let _ = (fake.take_warnings(), fake.take_infos());
@@ -1152,8 +1144,7 @@ fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
         &stopped,
         ID,
         || assert!(bus.request_stop()),
-        |hint| hints.push(hint),
-        || {},
+        |event| hints.extend(began(event).map(|end| stop_hint(service.stop_action(), end))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     let _ = fake.take_infos();
@@ -1169,8 +1160,7 @@ fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
         &supervisor(&fake),
         ID,
         || {},
-        |hint| hints.push(hint),
-        || {},
+        |event| hints.extend(began(event).map(|end| stop_hint(service.stop_action(), end))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(hints, [Duration::from_secs(10)], "the teardown alone");
@@ -1236,7 +1226,6 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
         |_| {
             alive_when_stopping.push((fake.calls(Op::SendKillTree), !daemon.ended()));
         },
-        || {},
     );
 
     assert_eq!(reported, Reported::Clean);

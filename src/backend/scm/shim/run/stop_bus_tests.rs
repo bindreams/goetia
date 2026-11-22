@@ -11,7 +11,7 @@ use crate::backend::scm::shim::run::os::fake::{
     wait_failed_with_code, wait_tree_failed,
 };
 use crate::backend::scm::shim::run::test_support::{
-    assert_failures, assert_one_failure, fallback_refused_failure, supervisor, tree_refused_failure,
+    assert_failures, assert_one_failure, began, fallback_refused_failure, supervisor, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-stop-bus-test";
@@ -53,7 +53,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
             let _ = tx.send(outcome);
         });
     }
@@ -104,7 +104,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
             let _ = tx.send(outcome);
         });
     }
@@ -173,7 +173,7 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+                supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
             }))
             .is_err();
             // Dropped before the send, so the reference count asserted below is not a race against
@@ -224,7 +224,7 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // No stop requested: the child exiting on its own is the only wakeup source.
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(
@@ -272,7 +272,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -298,7 +298,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(!daemon.ended(), "the daemon ended though neither kill worked");
@@ -316,7 +316,7 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping { .. }),
@@ -338,7 +338,7 @@ fn a_stop_whose_send_kill_tree_fails_kills_the_child_and_reports_the_daemon_poss
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::TreeMayRun),
@@ -364,7 +364,7 @@ fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -384,7 +384,7 @@ fn a_failed_background_wait_carries_its_os_error() {
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: Some(5) }),
@@ -409,7 +409,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping(RootExit::NotSeen)),
@@ -435,7 +435,7 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(daemon.killed());
@@ -454,7 +454,7 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(
@@ -475,7 +475,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(
@@ -574,18 +574,18 @@ const HOUR: Duration = Duration::from_secs(60 * 60);
 const BRIEF: Duration = Duration::from_secs(2);
 
 /// One accepted stop over the `Fake`, in the order `service::launch` makes the pieces: the stop is accepted
-/// before the wait, so it is seen at once. What `on_stopping` was told, and the outcome.
+/// before the wait, so it is seen at once. What `Began` told, and the outcome.
 fn stopped_by(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOutcome, Vec<WaitEnd>) {
     let (supervisor, waiter, child) = launched(fake, daemon);
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end), || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |event| told.extend(began(event)));
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, told)
 }
 
 /// [`stopped_by`], where the daemon has exited, and its exit is reported, by the time the stop is seen
-/// (`on_stopping` runs between the wait's end and the plan, and the daemon ends there).
+/// (`Began` is told between the wait's end and the plan, and the daemon ends there).
 fn stopped_after_exit(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOutcome, Vec<WaitEnd>) {
     let (supervisor, waiter, child) = launched(fake, daemon);
     assert!(supervisor.bus.request_stop());
@@ -596,12 +596,11 @@ fn stopped_after_exit(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) ->
         &child,
         ID,
         plan,
-        |end| {
-            told.push(end);
+        |event| {
+            told.extend(began(event));
             daemon.end(0);
             bus.await_exit_report();
         },
-        || {},
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, told)
@@ -690,7 +689,7 @@ fn asked(reply: AskReply) -> FakeProcess {
 }
 
 #[skuld::test]
-fn on_stopping_is_told_a_stop_from_an_exit() {
+fn began_is_told_a_stop_from_an_exit() {
     let fake = FakeGuard::new();
     let (_, told) = stopped_by(&fake, &FakeProcess::running(), StopPlan::AtOnce);
     assert_eq!(told, [WaitEnd::Stop]);
@@ -704,8 +703,7 @@ fn on_stopping_is_told_a_stop_from_an_exit() {
         &child,
         ID,
         ask_and_wait(Some(HOUR)),
-        |end| told.push(end),
-        || {},
+        |event| told.extend(began(event)),
     );
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
@@ -753,7 +751,7 @@ fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_go
         assert!(supervisor.bus.request_stop());
         let mut told = Vec::new();
 
-        let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end), || {});
+        let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |event| told.extend(began(event)));
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 
         assert!(root_exited(&outcome), "{plan:?}");
@@ -870,11 +868,10 @@ fn a_waiter_that_fails_while_a_wait_only_plan_waits_gets_the_daemon_killed() {
         &child,
         ID,
         StopPlan::WaitOnly,
-        |end| {
-            told.push(end);
+        |event| {
+            told.extend(began(event));
             daemon.fail_wait();
         },
-        || {},
     );
 
     assert_eq!(told, [WaitEnd::Stop]);
@@ -995,8 +992,11 @@ fn stopped_recording_progress(fake: &FakeGuard, daemon: &FakeProcess, plan: Stop
         &child,
         ID,
         plan,
-        |_| {},
-        || waits.push(fake.calls(Op::WaitTree)),
+        |event| {
+            if event == StopEvent::Progress {
+                waits.push(fake.calls(Op::WaitTree));
+            }
+        },
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, waits)
@@ -1263,7 +1263,7 @@ fn a_drained_tree_gets_the_exited_tree_teardown() {
 }
 
 /// A wait-only stop sends the program nothing and waits for its own exit, with no cap of goetia's; only then is
-/// the tree torn down. The program here is ended by the test, after the supervisor has passed `on_stopping`.
+/// the tree torn down. The program here is ended by the test, after the supervisor has passed `Began`.
 #[skuld::test]
 fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
     let fake = FakeGuard::new();
@@ -1281,16 +1281,16 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
                 &child,
                 ID,
                 StopPlan::WaitOnly,
-                |end| {
-                    stopping.send(end).expect("the test is listening");
-                },
-                || {
-                    progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                |event| match event {
+                    StopEvent::Began(end) => stopping.send(end).expect("the test is listening"),
+                    StopEvent::Progress => {
+                        progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 },
             )
         });
         assert!(supervisor.bus.request_stop());
-        assert_eq!(told.recv().expect("on_stopping was called"), WaitEnd::Stop);
+        assert_eq!(told.recv().expect("`Began` was told"), WaitEnd::Stop);
         daemon.end(0);
         running.join().expect("the supervisor did not panic")
     });
@@ -1363,7 +1363,7 @@ fn a_second_stop_does_not_ask_again() {
     assert!(supervisor.bus.request_stop());
     assert!(supervisor.bus.request_stop());
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |_| {}, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |_| {});
 
     assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
     assert_eq!(fake.calls(Op::Ask), 1);

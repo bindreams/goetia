@@ -825,7 +825,6 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
                     timeout: None,
                 },
                 |_| {},
-                || {},
             );
             let _ = tx.send(outcome);
         });
