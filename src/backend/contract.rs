@@ -192,13 +192,8 @@ pub(crate) trait Backend {
     /// the CLI renders as success, so that re-running `uninstall` is how a failed cleanup is retried.
     /// Never called for an id that is foreign or whose state is undetermined.
     ///
-    /// `in_flight` is what `uninstall` was asked to do with a run in flight, for a backend whose leftover
-    /// has one. systemd's, where a manager can be asked: a stand-in unit for a left run is stopped first under
-    /// [`RunInFlight::Stop`] and left, with its run, under [`RunInFlight::Leave`] while its run has a process
-    /// (nothing else is stopped, since goetia cannot show that any other unit was its own); and a definition
-    /// systemd still holds from the id's own path whose file is gone is reloaded under either, and nothing else
-    /// is done for it. Where no manager can be asked nothing is read and the answer stays "not installed". A
-    /// backend with no such leftover ignores it.
+    /// `in_flight` as for [`ServiceManager::uninstall`], for a backend whose leftover has a run (systemd's
+    /// stand-in: see its `standin` module); a backend with none ignores it.
     fn uninstall_absent(&self, _id: &Id, _in_flight: RunInFlight) -> Result<()> {
         Ok(())
     }
@@ -442,8 +437,7 @@ pub(crate) struct Scan<S> {
 // RunInFlight::Leave, until every backend honours it ==================================================================
 
 /// The refusal of [`RunInFlight::Leave`] by `manager`, a backend that does not honour it yet: nothing
-/// was read or changed, and `uninstall` without `--no-stop` still works. The caller's unit deletes each
-/// use of this as it builds `Leave`, and the last one deletes the function.
+/// was read or changed, and `uninstall` without `--no-stop` still works.
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) fn leave_not_built(id: &Id, manager: &str) -> Error {
     Error::Invalid {

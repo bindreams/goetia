@@ -1,20 +1,9 @@
 //! The stand-in unit that keeps a left run alive: see [`crate::manager::ServiceManager::uninstall`] and
 //! [`generate::standin`] for what it is and why a run still in its start job needs one.
 //!
-//! What `uninstall` and `install` do about a run and a stand-in is decided once, by [`plan::plan`], and carried out
-//! in one order by `Systemd::settle` (in `task`). The three callers, [`Systemd::uninstall_units`],
-//! [`Systemd::uninstall_leftovers`] and [`Systemd::release_standin`], only say what they are. The job's unit
-//! (see [`UnitRun`](super::systemctl::UnitRun)) is read before the plan for `Leave` over an installed id or a
-//! stand-in of ours, and for the sweep of an absent id (which also answers "no manager" and a held definition):
-//! the plan is made from that read. A `Stop` that removes a stand-in of ours reads once more, after the stop, to
-//! decide whether the stopped run is cleared; a `Stop` of a held job with no stand-in of ours reads nothing and
-//! clears nothing. Nothing is decided from the unit file's text or from what goetia reads the job to be.
-//!
-//! Its life: nothing removes it while its run has a process. The next `install` or `uninstall` of the id, the
-//! absent id included, removes it once there is none, after a `reset-failed` for a left run that failed, and
-//! reloads. With [`RunInFlight::Stop`] `uninstall` stops the run first, and clears the failed run of a stand-in it removes.
-//! goetia reads `/etc/systemd/system` for fragments, so a stand-in never makes an id read as installed (see
-//! `discover`).
+//! The rules for what `uninstall` and `install` do about a run and a stand-in are in [`plan`]; `Systemd::settle` (in
+//! `task`) carries them out. goetia reads `/etc/systemd/system` for fragments, so a stand-in never makes an id
+//! read as installed (see `discover`).
 
 mod plan;
 
@@ -28,8 +17,8 @@ use crate::manager::RunInFlight;
 use super::discover::{RawState, ReadFailure, classify_and_read};
 use super::systemctl::Held;
 use super::task::Fragment;
-use super::write::{CreateOutcome, ReplaceOutcome, create_unit_in, replace_unit_verified_in};
-use super::{Systemd, UnitKind, remove_file_if_present, unit_name, unit_path};
+use super::write::{CreateOutcome, ReplaceOutcome, create_unit_in, remove_verified, replace_unit_verified_in};
+use super::{Systemd, UnitKind, unit_name, unit_path};
 
 pub(super) use plan::{Call, Known, Seen, Standin, plan};
 
@@ -68,12 +57,11 @@ pub(super) fn standin_file(id: &str) -> Result<StandinFile> {
 
 /// What a call of [`Systemd::settle`] is about.
 pub(super) enum Target<'a> {
-    /// `uninstall` of an installed id, whose snapshot this call removes.
+    /// `uninstall` of an installed id, whose snapshot this call removes. See [`Call`].
     Installed(&'a Fragment),
-    /// `uninstall` of an id nothing is installed at: it looks for a definition systemd still holds whose file
-    /// is gone.
+    /// See [`Call`].
     Sweep,
-    /// `install`, which settles a stand-in it finds as [`RunInFlight::Leave`] does.
+    /// See [`Call`].
     Install,
 }
 
@@ -139,13 +127,14 @@ impl Systemd {
         Ok(())
     }
 
-    /// The stand-in of `id` removed, after a failed left run is cleared; the manager is reloaded by the
-    /// caller.
-    pub(super) fn remove_standin(&self, id: &str, failed: bool, held: &mut Held) -> Result<()> {
+    /// The stand-in of `id` removed, after a failed left run is cleared, if it is still the file read as ours
+    /// (`text`); the manager is reloaded by the caller. Another file at the path is
+    /// [`Error::ConcurrentChange`], and stays.
+    pub(super) fn remove_standin(&self, id: &str, text: &str, failed: bool, held: &mut Held) -> Result<()> {
         if failed {
             self.systemctl.reset_failed(id, UnitKind::Service, held)?;
         }
-        remove_file_if_present(&standin_path(id))
+        remove_verified(Path::new(RUNTIME_UNIT_DIR), id, UnitKind::Service, text)
     }
 
     /// `install`'s part: a stand-in of ours at the id whose run has no process is removed and the manager
@@ -155,11 +144,8 @@ impl Systemd {
         self.settle(id, RunInFlight::Leave, Target::Install, held)
     }
 
-    /// `uninstall` of an id nothing is installed at: a stand-in of ours is settled by the one plan, and a
-    /// definition systemd still holds from the id's own path whose file is gone (a `Leave` uninstall whose
-    /// last reload failed, which restarts a unit from memory when its process exits) is reloaded, under either
-    /// choice. Where no manager can be asked nothing is read and the answer stays "not installed". A reload
-    /// that fails is the call's error, not "not installed".
+    /// `uninstall` of an id nothing is installed at: see rule 6 of [`plan`]. A failed reload is the call's error,
+    /// not "not installed".
     pub(super) fn uninstall_leftovers(&self, id: &str, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
         self.settle(id, in_flight, Target::Sweep, held)
     }

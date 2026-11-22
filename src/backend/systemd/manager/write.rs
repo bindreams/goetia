@@ -197,6 +197,18 @@ fn quarantine_if_still_ours_in(dir: &Path, id: &str, kind: UnitKind, expected_te
     }
 }
 
+/// `id`'s `kind` unit in `dir` removed, if it is still the file with `expected_text`; anything else there is
+/// [`Error::ConcurrentChange`], and is left where it is.
+pub(super) fn remove_verified(dir: &Path, id: &str, kind: UnitKind, expected_text: &str) -> Result<()> {
+    match quarantine_if_still_ours_in(dir, id, kind, expected_text)? {
+        Some(backup) => remove_file_if_present(&backup),
+        None => Err(Error::ConcurrentChange {
+            id: id.to_string(),
+            path: Some(dir.join(unit_name(id, kind))),
+        }),
+    }
+}
+
 /// A quarantine name unique to this attempt, so two quarantines for the same id — a prior attempt
 /// left one behind, or a genuinely concurrent one — never collide. A monotonic per-process counter
 /// combined with the PID is unique across both this process's own repeated attempts and any other

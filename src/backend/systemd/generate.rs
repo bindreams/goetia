@@ -309,8 +309,7 @@ fn spec_section(spec: &DaemonSpec) -> String {
 
 /// What `uninstall --no-stop` writes under `/run/systemd/system` for the run of `id` it leaves. A run still
 /// in its start job (a task's run, for goetia's units) would be ended by a reload at systemd's default
-/// start timeout; a unit of the same name with no start timeout keeps it. It is a valid unit, and a hand
-/// `start` of it fails: its one command sits behind an assertion on a path that cannot exist. It carries
+/// start timeout; a unit of the same name with no start timeout keeps it. It carries
 /// `kill_signal` and `stop_timeout` as `systemctl show` printed them for the removed job (a signal number
 /// and systemd's own spelling of the span, a drop-in's override included), so a `stop` of the left run
 /// signals and waits as the job's would have; any other stop setting is not carried. And goetia's

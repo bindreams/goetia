@@ -16,9 +16,8 @@ pub struct Args {
     #[arg(required = true)]
     pub ids: Vec<String>,
 
-    /// Leave a run in flight alone: remove the daemon and everything that would start another run,
-    /// send the run nothing and wait for nothing of it. With nothing running, the same as without.
-    /// Applies to each id. For a program that uninstalls its own daemon from inside a run.
+    /// Leave a run in flight alone: remove the daemon and whatever would start another run, send the run
+    /// nothing. For a program that uninstalls its own daemon from inside a run.
     #[arg(long)]
     pub no_stop: bool,
 }

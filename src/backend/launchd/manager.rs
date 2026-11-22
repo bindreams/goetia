@@ -1629,7 +1629,6 @@ impl backend::Backend for Launchd {
 
     /// A task is uninstalled as two plists (see `write`); a service as one.
     fn uninstall(&self, snapshot: Plist, in_flight: RunInFlight, reservation: &mut Reservation) -> Result<()> {
-        // Removed by the launchd unit of `--no-stop`, which builds `Leave` here.
         if in_flight == RunInFlight::Leave {
             return Err(backend::leave_not_built(&snapshot.id, "launchd"));
         }
@@ -1649,7 +1648,6 @@ impl backend::Backend for Launchd {
 
     /// Nothing of launchd's outlives its id, so there is nothing to do, and no run to leave.
     fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
-        // Removed by the launchd unit of `--no-stop`, which builds `Leave` here.
         match in_flight {
             RunInFlight::Stop => Ok(()),
             RunInFlight::Leave => Err(backend::leave_not_built(id, "launchd")),

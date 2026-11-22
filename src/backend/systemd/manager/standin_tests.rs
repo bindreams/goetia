@@ -69,8 +69,8 @@ fn shown(active: &str, sub: &str, job: &str, load: &str, fragment: &str, kill: &
     )
 }
 
-/// The read of a left run with no process, and the `reset-failed` that follows only where the read says it failed:
-/// systemd refuses `reset-failed` of a unit that is not in memory, which one that did not fail is not.
+/// The read of a unit with no process, `failed` or `inactive`: `reset-failed` follows it only for `failed`, since
+/// systemd refuses it for a unit that is not in memory.
 fn read_of(id: &str, failed: bool) -> Entry {
     if failed {
         state(id, "failed", "failed")

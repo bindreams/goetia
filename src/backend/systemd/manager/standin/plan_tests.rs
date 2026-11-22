@@ -155,22 +155,12 @@ impl Row {
 }
 
 fn plan_with(stop: bool, standin: Standin, reload: bool) -> Plan {
-    Plan {
-        stop,
-        clear_after_stop: false,
-        standin,
-        reload,
-    }
+    Plan { stop, standin, reload }
 }
 
-/// A stop with a stand-in of ours to remove: what the stop left is read after it and cleared if it failed.
-fn stop_clearing() -> Plan {
-    Plan {
-        stop: true,
-        clear_after_stop: true,
-        standin: Standin::Remove { reset_failed: false },
-        reload: true,
-    }
+/// A stop with a stand-in of ours to remove (see [`Plan::clears_after_stop`] for which are followed by a read).
+fn stop_removing() -> Plan {
+    plan_with(true, Standin::Remove { reset_failed: false }, true)
 }
 
 fn written() -> Standin {
@@ -218,7 +208,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Unread],
         held_gone: NOT_HELD,
-        plan: || plan_with(true, Standin::Remove { reset_failed: false }, true),
+        plan: stop_removing,
     },
     Row {
         rule: "2, 4: Stop of a timer alone with a stand-in of ours (the unit's definition) stops, reads nothing before the stop, reads what it left after it and clears that, then removes the stand-in and reloads",
@@ -227,7 +217,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Unread],
         held_gone: NOT_HELD,
-        plan: stop_clearing,
+        plan: stop_removing,
     },
     Row {
         rule: "2, 4, 6: the sweep of an absent id reads for its own sake, and then stops the run of a stand-in of ours, clears what it left, removes it and reloads",
@@ -236,7 +226,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: READ,
         held_gone: EITHER,
-        plan: stop_clearing,
+        plan: stop_removing,
     },
     Row {
         rule: "6, 2: Stop of an id nothing is installed at, with no stand-in of ours, stops and changes nothing",
@@ -459,6 +449,18 @@ fn every_reachable_cell_has_one_row_and_gets_its_plan() {
         );
     }
     assert_eq!(reachable, reachable_cells(), "the generator reached {reachable} cells");
+}
+
+/// Rule 2: a stop that removes a stand-in is followed by the read and the clearing only where the stand-in is the
+/// unit's definition (a timer alone, the sweep); under a held job the run is the job's, and nothing is read.
+#[skuld::test]
+fn only_a_standin_that_is_the_definition_is_cleared_after_a_stop() {
+    for cell in cells().into_iter().filter(Cell::reachable) {
+        let expected = cell.in_flight == RunInFlight::Stop
+            && cell.file == File::Ours
+            && matches!(cell.call, Call::TimerAlone | Call::Sweep);
+        assert_eq!(plan_of(&cell).clears_after_stop(cell.call), expected, "{cell:?}");
+    }
 }
 
 /// Rule 5: only `Leave` over an id whose job goetia removes is refused, and only for a file that is not ours:

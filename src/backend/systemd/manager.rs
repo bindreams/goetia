@@ -216,8 +216,7 @@ impl Backend for Systemd {
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         dirs::ensure_parent_dirs(spec, scope)?;
-        // An install never stops a run: a stand-in with a run in flight stays, and systemd adopts the run
-        // under the new definition.
+        // A stand-in with a run in flight stays; systemd adopts the run under the new definition.
         self.release_standin(spec.common().id.as_str(), reservation)?;
         match outcome {
             Outcome::Create => self.create_units(spec.common().id.as_str(), definition, reservation),

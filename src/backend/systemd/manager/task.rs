@@ -43,6 +43,7 @@
 //! A timer without its job (a crash of an older goetia, or a hand removal) is ours and unusable: its
 //! blob is the error `read` gives it, and `uninstall` removes it.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::systemd::generate::{self, Units};
@@ -55,12 +56,14 @@ use crate::manager::{Budget, DaemonStatus, RunInFlight, State, Status, TaskStatu
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
-use super::standin::{self, Call, Known, Standin, Target, standin_file, standin_path};
+use super::standin::{self, Call, Known, Standin, StandinFile, Target, standin_file, standin_path};
 use super::systemctl::{Held, TimerArming};
-use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
+use super::write::{
+    CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, remove_verified, replace_unit_verified,
+};
 use super::{
-    Systemd, UnitKind, dropin_dir, identity_for, journal, remove_dir_if_present, remove_file_if_present, unit_name,
-    unit_path,
+    Systemd, UNIT_DIR, UnitKind, dropin_dir, identity_for, journal, remove_dir_if_present, remove_file_if_present,
+    unit_name, unit_path,
 };
 
 // Fragment ============================================================================================================
@@ -361,18 +364,9 @@ impl Systemd {
     /// read shows; this does it in one order, which each caller shares. `target` says which caller this is, and
     /// an installed id's snapshot is the files this removes.
     ///
-    /// 1. Refuse: a file that is not goetia's at the stand-in's path refuses `Leave` of a job goetia removes,
-    ///    before anything is changed.
-    /// 2. Pass the version gate before the first change: for an installed id, which always changes something,
-    ///    now; for the others, once the plan reloads, which every plan that changes anything does (a read asks
-    ///    no gate).
-    /// 3. Disarm the timer, so no run starts after the read.
-    /// 4. Read the job's unit once, when the plan needs a read before any stop.
-    /// 5. Stop, when the plan says so; where it comes with a stand-in of ours to remove, then read what the stop
-    ///    left once and `reset-failed` a run that failed. Then disable a service.
-    /// 6. Write the stand-in, before any file is removed.
-    /// 7. Remove the timer and the job, each verified against what `read` saw, and their drop-ins; remove the
-    ///    stand-in (after `reset-failed` for a run the read before any stop says failed, under `Leave`); reload.
+    /// The version gate is passed before the first change: for an installed id, which always changes something,
+    /// at the start; for the others, once the plan reloads, which every plan that changes anything does (a read
+    /// asks no gate).
     ///
     /// No `systemctl enable` or `disable` comes between the first removal and the reload, since both reload the
     /// manager at once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
@@ -417,14 +411,13 @@ impl Systemd {
         }
 
         if plan.stop {
-            // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
-            // means rather than an end, and bounding it would turn a slow-stopping service into a failed
-            // uninstall where today it succeeds.
+            // `Budget::Unbounded`: `uninstall` has no `--timeout`, and bounding the stop would fail the
+            // uninstall of a slow-stopping service.
             self.systemctl
                 .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
             // A stand-in of ours goes with the run it kept, which the stop leaves `failed` as a stopped oneshot
             // is: cleared, so the removal does not leave it listed `not-found failed`.
-            if plan.clear_after_stop && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
+            if plan.clears_after_stop(known.call) && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
                 self.systemctl.reset_failed(id, UnitKind::Service, held)?;
             }
         }
@@ -443,17 +436,18 @@ impl Systemd {
             self.write_standin(id, &file, kill_signal, stop_timeout)?;
         }
 
-        // Both attempted regardless of whether the first failed, and every failure reported together: a
-        // partial failure here must not leave systemd's loaded view silently stale.
+        // A verified removal of the timer or the job that fails aborts here: a stand-in written above stays,
+        // shadowed by the file still there and harmless, and the next call rewrites or removes it. Past them the
+        // removals are all attempted and every failure is reported together, so the reload still runs.
         let mut removed = Ok(());
         if let Some(snapshot) = installed {
             // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file spans
             // `systemctl` round-trips, wide enough for something else to have replaced it.
             if let Some(timer) = snapshot.timer() {
-                remove_verified(id, UnitKind::Timer, &timer.text)?;
+                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Timer, &timer.text)?;
             }
             if let Some(job) = snapshot.service_text() {
-                remove_verified(id, UnitKind::Service, job)?;
+                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Service, job)?;
             }
             removed = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
             if snapshot.owns_timer_slot() {
@@ -461,7 +455,10 @@ impl Systemd {
             }
         }
         if let Standin::Remove { reset_failed } = plan.standin {
-            removed = both(removed, self.remove_standin(id, reset_failed, held));
+            let StandinFile::Ours(text) = &file else {
+                unreachable!("a stand-in is removed only where one of ours was read");
+            };
+            removed = both(removed, self.remove_standin(id, text, reset_failed, held));
         }
         let reloaded = if plan.reload {
             self.systemctl.daemon_reload(held)
@@ -486,17 +483,6 @@ fn both(first: Result<()>, then: Result<()>) -> Result<()> {
         (Err(first), Err(then)) => Err(Error::Both {
             first: Box::new(first),
             then: Box::new(then),
-        }),
-    }
-}
-
-/// `id`'s `kind` unit removed, if it is still the file `read` saw.
-fn remove_verified(id: &str, kind: UnitKind, expected: &str) -> Result<()> {
-    match quarantine_if_still_ours(id, kind, expected)? {
-        Some(backup) => remove_file_if_present(&backup),
-        None => Err(Error::ConcurrentChange {
-            id: id.to_string(),
-            path: Some(unit_path(id, kind)),
         }),
     }
 }

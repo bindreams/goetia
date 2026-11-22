@@ -786,7 +786,6 @@ impl Backend for Scm {
     }
 
     fn uninstall(&self, snapshot: WindowsSnapshot, in_flight: RunInFlight, _reservation: &mut ()) -> Result<()> {
-        // Removed by the Windows units of `--no-stop` (the service's and the task's), which build `Leave` here.
         if in_flight == RunInFlight::Leave {
             return Err(leave_not_built(snapshot.id(), "Windows"));
         }
@@ -799,7 +798,6 @@ impl Backend for Scm {
     /// The id is in neither store, so what is left of it is a task's run records, which a task's
     /// uninstall that could not remove them leaves, and what a service's uninstall leaves to sweep.
     fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
-        // Removed by the Windows units of `--no-stop`, which build `Leave` here.
         if in_flight == RunInFlight::Leave {
             return Err(leave_not_built(id, "Windows"));
         }

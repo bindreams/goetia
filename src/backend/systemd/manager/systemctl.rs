@@ -1034,6 +1034,9 @@ impl Systemctl {
         let active = props["ActiveState"].as_str();
         Ok(UnitRun {
             phase: match active {
+                // A start job that is queued and not yet running reads `inactive`: a job pending is a run
+                // that has not forked.
+                "inactive" | "failed" if !props["Job"].is_empty() => RunPhase::InStartJob,
                 "inactive" | "failed" => RunPhase::None,
                 // Positive evidence: no process is not, since a start job has none before its first fork.
                 "activating" if props["SubState"].starts_with("auto-restart") => RunPhase::PendingRestart,
@@ -1075,18 +1078,17 @@ pub(super) struct TaskJob {
     pub invocation: Option<String>,
 }
 
-/// Whether a unit has a run, and which kind, as `ActiveState` and `SubState` say.
+/// Whether a unit has a run, and which kind, as `ActiveState`, `SubState` and `Job` say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RunPhase {
-    /// `inactive` or `failed`.
+    /// `inactive` or `failed`, with no job pending.
     None,
-    /// `activating` with a `SubState` that begins with `auto-restart` (`auto-restart`, and
-    /// `auto-restart-queued` of systemd 254 and later): a restart waiting for its delay. It is no run to keep
-    /// alive, so it gets no stand-in, and a stop of it would signal nothing but could land on a process systemd
-    /// restarted after the read: nothing is sent to it.
+    /// `activating` with a `SubState` that begins with `auto-restart` (`auto-restart`, `auto-restart-queued` from
+    /// systemd 254): a restart waiting for its delay. See rule 3 of the stand-in plan.
     PendingRestart,
-    /// Any other `activating`: a run in its start job, the unknown sub-states included, the safe side. A reload
-    /// that drops its unit file ends it at the start timeout.
+    /// Any other `activating`, the unknown sub-states included, the safe side; or `inactive` or `failed` with a job
+    /// pending, a start job queued and not yet running. A reload that drops its unit file ends it at the start
+    /// timeout.
     InStartJob,
     /// Every other state systemd reports, the ones goetia does not know included.
     Running,
@@ -1111,9 +1113,10 @@ pub(super) struct UnitRun {
 
 impl UnitRun {
     /// What the read asks, in this order.
-    const PROPERTIES: [&'static str; 6] = [
+    const PROPERTIES: [&'static str; 7] = [
         "ActiveState",
         "SubState",
+        "Job",
         "KillSignal",
         "TimeoutStopUSec",
         "LoadState",
