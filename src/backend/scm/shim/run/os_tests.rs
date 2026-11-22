@@ -23,6 +23,7 @@ use super::*;
 use crate::backend::scm::shim::run::logging::Log;
 use crate::backend::scm::shim::run::os::fake::FakeGuard;
 use crate::backend::scm::shim::run::service::build_command;
+use crate::backend::scm::shim::run::stop_bus::StopPlan;
 use crate::backend::scm::shim::run::test_support::not_found;
 use crate::backend::scm::sid::sid_display;
 use crate::backend::scm::test_support::{permit_only, withdraw_append};
@@ -228,7 +229,13 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
 
     let daemon = reap.hold(
         Real::default()
-            .spawn(build_command(&spec, &Real::default(), &fake.log(), ID))
+            .spawn(build_command(
+                &spec,
+                StopPlan::of(&spec),
+                &Real::default(),
+                &fake.log(),
+                ID,
+            ))
             .expect("spawn the daemon"),
     );
     let contained = daemon.containment();
@@ -303,7 +310,13 @@ fn a_task_programs_env_and_cwd_are_the_specs_over_the_inherited_ones(#[fixture(t
 
     let program = reap.hold(
         Real::default()
-            .spawn(build_command(&spec, &Real::default(), &fake.log(), ID))
+            .spawn(build_command(
+                &spec,
+                StopPlan::of(&spec),
+                &Real::default(),
+                &fake.log(),
+                ID,
+            ))
             .expect("spawn the program"),
     );
     program.wait().expect("the program exits");
@@ -330,7 +343,7 @@ fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] di
 
     let program = reap.hold(
         Real::default()
-            .spawn(build_command(&spec, &Real::default(), &log, ID))
+            .spawn(build_command(&spec, StopPlan::of(&spec), &Real::default(), &log, ID))
             .expect("spawn the program"),
     );
     program.wait().expect("the program exits");
@@ -729,4 +742,116 @@ fn append_line_reports_a_failed_write() {
     };
 
     assert!(append_line(&mut out, "the line").is_err());
+}
+
+// The supervisor over a real daemon -----------------------------------------------------------------------------------
+
+/// Ends the daemon's tree when dropped, so a failing test leaves no sleeper behind.
+struct EndTree(Arc<dyn Spawned>);
+
+impl Drop for EndTree {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.send_kill_tree() {
+            eprintln!("EndTree: left a daemon running: {}", cosca::error::Report::new(&e));
+        }
+    }
+}
+
+/// A descendant that outlives the root keeps the supervisor's wait going until it exits: the root exits at the
+/// ask, which here creates a file (an action of the test's own, so no proxy is involved), and its worker, which
+/// the ask never reaches, goes on until the test lets it end. The supervisor returns only after the worker
+/// has written its marker and exited, which a tree kill at the root's exit would have prevented.
+#[skuld::test]
+fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixture(temp_dir)] dir: &Path) {
+    use crate::backend::scm::shim::run::stop_bus::{StopPlan, Supervisor, WaitOutcome};
+    use std::sync::mpsc::{self, TryRecvError};
+
+    let script_path = |name: &str| dir.join(name).to_str().expect("a UTF-8 path").replace('\\', "/");
+    let wait_for = |file: &str| {
+        format!(
+            "while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 50 }}",
+            script_path(file)
+        )
+    };
+    let worker = dir.join("worker.ps1");
+    std::fs::write(
+        &worker,
+        format!(
+            "{}\nNew-Item -ItemType File -Path '{}' | Out-Null\n",
+            wait_for("release-worker"),
+            script_path("worker-done")
+        ),
+    )
+    .expect("the worker's script");
+    let root = dir.join("root.ps1");
+    std::fs::write(
+        &root,
+        format!(
+            "Start-Process powershell -NoNewWindow -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','{}'\n{}\nexit 0\n",
+            script_path("worker.ps1"),
+            wait_for("release")
+        ),
+    )
+    .expect("the root's script");
+    let mut cmd = cosca::run([
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        root.to_str().expect("a UTF-8 path"),
+    ]);
+    cmd.contain();
+    let release = dir.join("release");
+    cmd.graceful_stop(move |_| File::create(&release).map(drop).map_err(cosca::error::Error::Io));
+
+    let fake = FakeGuard::new();
+    let supervisor = Arc::new(Supervisor::new(Arc::new(Real::default()), fake.log()));
+    let waiter = supervisor.waiter(ID).expect("make the waiter thread");
+    let child: Arc<dyn Spawned> = Arc::from(Real::default().spawn(cmd).expect("spawn the daemon"));
+    let _end = EndTree(Arc::clone(&child));
+    let (tx, rx) = mpsc::channel();
+    {
+        let child = Arc::clone(&child);
+        let supervisor = Arc::clone(&supervisor);
+        std::thread::spawn(move || {
+            let outcome = supervisor.wait_for_child_or_stop(
+                waiter,
+                &child,
+                ID,
+                StopPlan::AskAndWait {
+                    event: cosca::CtrlEvent::CtrlC,
+                    timeout: None,
+                },
+                |_| {},
+            );
+            let _ = tx.send(outcome);
+        });
+    }
+
+    supervisor.bus.request_stop();
+    child.wait().expect("the root exits at the ask");
+    assert!(
+        matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+        "the supervisor ended with the root, though its worker was still running"
+    );
+    File::create(dir.join("release-worker")).expect("let the worker end");
+    let outcome = rx.recv().expect("the supervisor ended without an outcome");
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert!(
+        dir.join("worker-done").exists(),
+        "the worker was ended before it finished its own shutdown"
+    );
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    assert_eq!(
+        fake.take_infos(),
+        [
+            format!(
+                "goetia-shim[{ID}]: asking the daemon to exit with Ctrl+C; the daemon and what it started are waited for with no time limit"
+            ),
+            format!("goetia-shim[{ID}]: the daemon and what it started exited within the wait"),
+        ]
+    );
 }

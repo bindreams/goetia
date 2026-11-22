@@ -34,18 +34,53 @@
 //!   open until the test closes its end, then exit with `<code>`. The test
 //!   decides when the daemon exits, so it can inspect the running service
 //!   first. A failed connect exits 2.
+//! - `catch <port> <record> <exit-on> [launcher]` — records every console event it receives as a line of
+//!   `<record>` (`daemon: event=CTRL_C at_us=<unix microseconds>`), then, once its handler is in place,
+//!   connects to `<port>` and writes its pid, and blocks. On the event `<exit-on>` names (`ctrl-c`,
+//!   `ctrl-break`; `none` never) it records `daemon: exiting by the event` and exits 0; any other event is
+//!   handled and ignored. With `launcher` it starts a `catch-worker` of the same record first and reports
+//!   nothing itself: the worker does, so a report means both handlers are in place. Once its handler is in
+//!   place it also creates `<record>.started` ([`started_marker`]), so that a daemon that was never started
+//!   is told from one that was started and received nothing.
+//! - `catch-worker <record> <exit-on> <port>` — `catch` as the launcher's worker: on the event it takes 600 ms
+//!   to shut down (a slow shutdown, which the launcher's own exit must not cut short), then records
+//!   `worker: exiting by the event` and exits 0.
+//!
+//! `<exe> --goetia-shim-host <init|no-init>` is not a daemon but a host of the shim that a service runs
+//! (`goetia::shim::main()`), as a consumer's program would: `init` has called `goetia::shim::init_host()`
+//! first thing in `main` (as every invocation of this binary does), `no-init` has not.
 
 use std::io::{Read as _, Write as _};
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, mpsc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
 
 use crate::support::sentinel::{connect, open, send_line};
 
 pub const FIXTURE: &str = "--goetia-shim-fixture";
 
+/// The argument that makes this binary a host of the shim, followed by `init` or `no-init`.
+pub const HOST: &str = "--goetia-shim-host";
+
+/// What the `no-init` host does, which must come before anything of `main` that calls `init_host`: runs
+/// the shim and never returns; for any other invocation it returns at once.
+pub fn run_uninitialised_host_if_requested() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(HOST) && args.get(2).map(String::as_str) == Some("no-init") {
+        goetia::shim::main();
+    }
+}
+
 pub fn run_if_requested() -> bool {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(HOST) {
+        // `main` called `init_host` before this: the `init` host.
+        assert_eq!(args.get(2).map(String::as_str), Some("init"), "{args:?}");
+        goetia::shim::main();
+    }
     if args.get(1).map(String::as_str) != Some(FIXTURE) {
         return false;
     }
@@ -125,6 +160,45 @@ pub fn run_if_requested() -> bool {
             send_line(port, &format!("{class:#x}"));
             std::process::exit(0);
         }
+        "catch" => {
+            let port: u16 = args[3].parse().expect("port");
+            let record = PathBuf::from(&args[4]);
+            let exit_on = exit_on(&args[5]);
+            let launcher = args.get(6).map(String::as_str) == Some("launcher");
+            catch_events(Catch {
+                record: record.clone(),
+                exit_on,
+                role: if launcher { "launcher" } else { "daemon" },
+                linger: Duration::ZERO,
+            });
+            if launcher {
+                // Not waited on: it ends by the event, or with the job that holds this tree.
+                #[allow(clippy::zombie_processes)]
+                std::process::Command::new(std::env::current_exe().expect("current_exe"))
+                    .arg(FIXTURE)
+                    .arg("catch-worker")
+                    .arg(&record)
+                    .arg(&args[5])
+                    .arg(port.to_string())
+                    .spawn()
+                    .expect("spawn the worker");
+            } else {
+                send_line(port, &std::process::id().to_string());
+            }
+            block_forever();
+        }
+        "catch-worker" => {
+            let record = PathBuf::from(&args[3]);
+            let port: u16 = args[5].parse().expect("port");
+            catch_events(Catch {
+                record,
+                exit_on: exit_on(&args[4]),
+                role: "worker",
+                linger: Duration::from_millis(600),
+            });
+            send_line(port, &std::process::id().to_string());
+            block_forever();
+        }
         other => panic!("unknown shim fixture mode: {other}"),
     }
     // Every arm above diverges (`block_forever`/`process::exit`/`panic!`):
@@ -132,6 +206,80 @@ pub fn run_if_requested() -> bool {
     // never returns at all once a recognized mode matched — `main`'s own
     // `if fixture::run_if_requested() { return; }` never actually observes
     // the `true` and it would be dead code to write one.
+}
+
+// Console events ------------------------------------------------------------------------------------------------------
+
+/// What a `catch` process does with the events it receives.
+struct Catch {
+    record: PathBuf,
+    exit_on: Option<u32>,
+    role: &'static str,
+    /// How long it takes to end once the event it exits on arrives.
+    linger: Duration,
+}
+
+static CATCH: OnceLock<Catch> = OnceLock::new();
+
+fn exit_on(name: &str) -> Option<u32> {
+    match name {
+        "ctrl-c" => Some(CTRL_C_EVENT),
+        "ctrl-break" => Some(CTRL_BREAK_EVENT),
+        "none" => None,
+        other => panic!("`{other}` is not an event to exit on"),
+    }
+}
+
+/// Installs the handler. The process is not yet reported in: the caller does that once this has returned.
+fn catch_events(catch: Catch) {
+    let marker = started_marker(&catch.record);
+    assert!(CATCH.set(catch).is_ok(), "one `catch` per process");
+    // SAFETY: `on_event` is a function, so it lives for the whole process; `TRUE` adds it.
+    let added = unsafe { SetConsoleCtrlHandler(Some(on_event), 1) };
+    assert_ne!(added, 0, "SetConsoleCtrlHandler: {}", std::io::Error::last_os_error());
+    if let Err(e) = std::fs::write(&marker, std::process::id().to_string()) {
+        eprintln!("the start marker {} was not written: {e}", marker.display());
+    }
+}
+
+/// The file a `catch` process of `record` creates once it is running with its handler in place.
+pub fn started_marker(record: &Path) -> PathBuf {
+    let mut name = record.as_os_str().to_owned();
+    name.push(".started");
+    PathBuf::from(name)
+}
+
+/// One line of the record, appended in one write so that the two processes of a launcher's tree cannot split
+/// each other's.
+fn note(catch: &Catch, line: &str) {
+    let line = format!("{}: {line}\n", catch.role);
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&catch.record)
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+    if let Err(e) = written {
+        eprintln!("the record {} was not written: {e}", catch.record.display());
+    }
+}
+
+unsafe extern "system" fn on_event(event: u32) -> i32 {
+    let Some(catch) = CATCH.get() else { return 0 };
+    let name = match event {
+        CTRL_C_EVENT => "CTRL_C",
+        CTRL_BREAK_EVENT => "CTRL_BREAK",
+        _ => return 0,
+    };
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros());
+    note(catch, &format!("event={name} at_us={at}"));
+    if Some(event) == catch.exit_on {
+        std::thread::sleep(catch.linger);
+        note(catch, "exiting by the event");
+        std::process::exit(0);
+    }
+    1
 }
 
 /// The SID of the account this process runs as, from `whoami /user`: `"<name>","<sid>"` on one line.

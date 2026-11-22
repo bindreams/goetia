@@ -57,6 +57,25 @@ fn a_failure_goes_to_the_default_file_first_then_the_event_log_gets_the_same_lin
     );
 }
 
+/// An information line goes where a failure goes, the Event Log's as information.
+#[skuld::test]
+fn an_info_goes_to_the_file_then_to_the_event_log_as_information() {
+    let fake = FakeGuard::new();
+
+    log_over(&fake).info("svc", "the line");
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![
+            appended_default(&Path::new("logs").join("svc.log"), true),
+            ChannelCall::EventLog {
+                severity: Severity::Information,
+                line: LINE.to_string()
+            }
+        ]
+    );
+}
+
 #[skuld::test]
 fn a_failure_still_reaches_the_event_log_when_the_file_cannot_be_opened() {
     let fake = FakeGuard::new();

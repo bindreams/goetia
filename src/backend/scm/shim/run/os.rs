@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use cosca::Containment;
+use cosca::containment::TreeDrain;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
 use crate::backend::scm::default_log;
@@ -54,12 +56,25 @@ pub(crate) trait Spawned: Send + Sync {
     /// Block until the daemon exits. May be called again once it has, with the same status.
     fn wait(&self) -> Result<ExitStatus, cosca::error::Error>;
 
+    /// The exit status if the daemon has exited, read from the process itself at this moment: the
+    /// waiter's report can lag the exit, this cannot.
+    fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error>;
+
     /// Kill the daemon alone, not its descendants.
     fn kill(&self) -> Result<(), cosca::error::Error>;
 
     /// Send the kill to the daemon's whole tree. `Ok` means every member was reached, not that any has
     /// exited.
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error>;
+
+    /// Ask the daemon's whole tree to exit, with the stop the command was built with
+    /// (`Command::graceful_stop`), and return once the ask is made: it waits for nothing the daemon
+    /// does. Answers as `cosca::Child::terminate_tree` does.
+    fn terminate_tree(&self) -> Result<(), cosca::error::Error>;
+
+    /// Wait up to `timeout` for every member of the daemon's Job Object to exit. `Duration::MAX` is
+    /// no bound.
+    fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error>;
 }
 
 /// How a line is reported to the Event Log.
@@ -68,9 +83,11 @@ pub(crate) enum Severity {
     Error,
     /// The daemon runs, but something about its registration needs the administrator.
     Warning,
+    /// Nothing is wrong: the shim says what it did.
+    Information,
 }
 
-/// Where the shim's failure and warning lines go.
+/// Where the shim's failure, warning and information lines go.
 pub(crate) trait Channels: Send + Sync {
     /// Opens the default log at `path` as [`LogKind::Default`] and holds it for the run, so later appends and
     /// `open_log` of that path share one handle that survives an install taking the account out of the file's
@@ -144,12 +161,24 @@ impl Spawned for cosca::Child {
         cosca::Child::wait(self)
     }
 
+    fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error> {
+        cosca::Child::try_wait(self)
+    }
+
     fn kill(&self) -> Result<(), cosca::error::Error> {
         cosca::Child::kill(self)
     }
 
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
         cosca::Child::send_kill_tree(self)
+    }
+
+    fn terminate_tree(&self) -> Result<(), cosca::error::Error> {
+        cosca::Child::terminate_tree(self)
+    }
+
+    fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error> {
+        cosca::Child::wait_tree_timeout(self, timeout)
     }
 }
 

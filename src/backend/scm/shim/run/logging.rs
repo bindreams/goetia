@@ -1,6 +1,7 @@
-//! Where the shim writes a failure, and the two channels it reaches.
+//! Where the shim writes what it has to say (a failure, a warning, or what a stop did), and the two channels it
+//! reaches.
 //!
-//! **File.** Once the shim has decoded its spec ([`Log::set_daemon_log`]), a failure goes into the
+//! **File.** Once the shim has decoded its spec ([`Log::set_daemon_log`]), a line goes into the
 //! daemon's own log, interleaved with the daemon's output. Before that, and whenever that file
 //! cannot be opened, it goes to [`Log::default_log_path`]: an old shim running against a newer blob
 //! fails to decode `Spec` before it learns the daemon's `logs:` path, so the path derivable from
@@ -19,7 +20,7 @@
 //! the default path as written ([`Log::daemon_log`]): an install refuses a `logs:` in the folder of the
 //! default logs ([`default_log::refuse_logs_in_folder`]). No other path is compared, and none is looked up.
 //!
-//! **Event Log.** Every failure also goes to the Windows Event Log, whose default ACL is far more
+//! **Event Log.** Every line also goes to the Windows Event Log, whose default ACL is far more
 //! permissive than a folder's, so it is the more likely of the two to still work exactly when the
 //! file does not.
 
@@ -196,6 +197,12 @@ impl Log {
     /// entry is a warning.
     pub(crate) fn warning(&self, id: &str, message: &str) {
         self.report(id, Severity::Warning, message);
+    }
+
+    /// [`Log::failure`] for a line that says what the shim did, with nothing wrong: the Event Log entry is
+    /// information.
+    pub(crate) fn info(&self, id: &str, message: &str) {
+        self.report(id, Severity::Information, message);
     }
 
     fn report(&self, id: &str, severity: Severity, message: &str) {
