@@ -570,6 +570,9 @@ fn service_stopping_by(signal: crate::spec::StopSignal, timeout: Option<Duration
 /// read off the duration the tree wait was given.
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
+/// A `timeout` shorter than [`PROGRESS_PERIOD`]: one slice of the wait for the tree is the whole wait.
+const BRIEF: Duration = Duration::from_secs(2);
+
 /// One accepted stop over the `Fake`, in the order `service::launch` makes the pieces: the stop is accepted
 /// before the wait, so it is seen at once. What `on_stopping` was told, and the outcome.
 fn stopped_by(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOutcome, Vec<WaitEnd>) {
@@ -638,14 +641,19 @@ fn told_asking(mut infos: Vec<String>, event: &str) -> (Duration, Vec<String>) {
     (given, infos)
 }
 
-/// [`told_asking`] for a `timeout` of an hour: what is left of it is a time a little under it.
-fn told_asking_within_the_hour(infos: Vec<String>, event: &str) -> Vec<String> {
+/// [`told_asking`] for a `timeout`: what is left of it is a time a little under it.
+fn told_asking_within(timeout: Duration, infos: Vec<String>, event: &str) -> Vec<String> {
     let (given, rest) = told_asking(infos, event);
     assert!(
-        given <= HOUR && given > HOUR / 2,
-        "the line says {given:?} are given of {HOUR:?}, which counts from the moment the stop was seen"
+        given <= timeout && given > timeout / 2,
+        "the line says {given:?} are given of {timeout:?}, which counts from the moment the stop was seen"
     );
     rest
+}
+
+/// [`told_asking_within`] a `timeout` of an hour.
+fn told_asking_within_the_hour(infos: Vec<String>, event: &str) -> Vec<String> {
+    told_asking_within(HOUR, infos, event)
 }
 
 /// The line of an asked stop whose daemon exited before the event could be sent.
@@ -657,11 +665,11 @@ fn exited_line() -> String {
     format!("goetia-shim[{ID}]: the daemon and what it started exited within the wait")
 }
 
-/// The warning of an asked stop whose daemon's tree had not been seen to exit by the end of its `timeout` of an hour.
-fn did_not_exit_line() -> String {
+/// The warning of an asked stop whose daemon's tree had not been seen to exit by the end of its `timeout`.
+fn did_not_exit_line(timeout: Duration) -> String {
     format!(
         "goetia-shim[{ID}]: the daemon's process tree had not been seen to exit when its timeout of {} was over; it is being ended",
-        humantime::format_duration(HOUR)
+        humantime::format_duration(timeout)
     )
 }
 
@@ -942,9 +950,9 @@ fn ask_and_wait_asks_once_and_waits_for_the_timeout() {
     let [ProcessCall::Ask, ProcessCall::WaitTree(left), ProcessCall::SendKillTree] = daemon.calls()[..] else {
         panic!("asked, waited, then ended: {:?}", daemon.calls());
     };
-    assert!(
-        left <= HOUR && left > HOUR / 2,
-        "the wait was given {left:?} of {HOUR:?}, which counts from the moment the stop was seen"
+    assert_eq!(
+        left, PROGRESS_PERIOD,
+        "the first slice of a wait that is longer than a period"
     );
     assert_eq!(
         daemon.exit_code(),
@@ -960,7 +968,7 @@ fn ask_and_wait_asks_once_and_waits_for_the_timeout() {
 }
 
 #[skuld::test]
-fn a_timeout_of_none_is_waited_for_without_a_bound() {
+fn a_timeout_of_none_is_waited_for_in_slices_that_never_run_out() {
     let fake = FakeGuard::new();
     let daemon = asked(AskReply::SentAndExits(0)).wait_tree(TreeWaitReply::Drained);
 
@@ -970,11 +978,161 @@ fn a_timeout_of_none_is_waited_for_without_a_bound() {
         daemon.calls(),
         [
             ProcessCall::Ask,
-            ProcessCall::WaitTree(Duration::MAX),
+            ProcessCall::WaitTree(PROGRESS_PERIOD),
             ProcessCall::SendKillTree
         ]
     );
     let _ = fake.take_infos();
+}
+
+/// [`stopped_by`] with the progress reports recorded: how many waits for the tree had been made at each.
+fn stopped_recording_progress(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOutcome, Vec<usize>) {
+    let (supervisor, waiter, child) = launched(fake, daemon);
+    assert!(supervisor.bus.request_stop());
+    let mut waits = Vec::new();
+    let outcome = supervisor.wait_for_child_or_stop(
+        waiter,
+        &child,
+        ID,
+        plan,
+        |_| {},
+        || waits.push(fake.calls(Op::WaitTree)),
+    );
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    (outcome, waits)
+}
+
+/// The wait for the tree is made in slices of one period, each re-checking the tree, and the stop is reported as
+/// going on after each slice that left members, and not after the last one. The slices add up to the `timeout` (what
+/// is left of it, counted from when the stop was seen): the slicing neither lengthens nor shortens the wait.
+#[skuld::test]
+fn the_wait_for_the_tree_is_made_in_slices_that_add_up_to_the_timeout_and_the_stop_is_reported_between_them() {
+    let fake = FakeGuard::new();
+    let timeout = Duration::from_secs(12);
+    let daemon = asked(AskReply::Sent)
+        .wait_tree(TreeWaitReply::Remain)
+        .wait_tree(TreeWaitReply::Remain)
+        .wait_tree(TreeWaitReply::Remain);
+
+    let (outcome, progress) = stopped_recording_progress(&fake, &daemon, ask_and_wait(Some(timeout)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
+    let [
+        ProcessCall::Ask,
+        ProcessCall::WaitTree(first),
+        ProcessCall::WaitTree(second),
+        ProcessCall::WaitTree(last),
+        ProcessCall::SendKillTree,
+    ] = daemon.calls()[..]
+    else {
+        panic!("asked, waited in three slices, then ended: {:?}", daemon.calls());
+    };
+    assert_eq!((first, second), (PROGRESS_PERIOD, PROGRESS_PERIOD));
+    assert!(
+        last > Duration::ZERO && last <= timeout - 2 * PROGRESS_PERIOD,
+        "the last slice is {last:?}"
+    );
+    let total = first + second + last;
+    assert!(
+        total <= timeout && total > timeout - Duration::from_secs(1),
+        "the slices add up to {total:?}, of a timeout of {timeout:?} that counts from the stop"
+    );
+    assert_eq!(
+        progress,
+        [1, 2],
+        "after each slice that left members, and not after the last"
+    );
+    assert_eq!(fake.take_warnings(), [did_not_exit_line(timeout)]);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    let _ = fake.take_infos();
+}
+
+/// A tree that drains ends the wait at the slice that sees it: no report is made after it.
+#[skuld::test]
+fn the_stop_is_not_reported_after_the_slice_that_saw_the_tree_exit() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Sent)
+        .wait_tree(TreeWaitReply::Remain)
+        .wait_tree(TreeWaitReply::Drained);
+
+    let (outcome, progress) = stopped_recording_progress(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
+    assert_eq!(
+        daemon.calls(),
+        [
+            ProcessCall::Ask,
+            ProcessCall::WaitTree(PROGRESS_PERIOD),
+            ProcessCall::WaitTree(PROGRESS_PERIOD),
+            ProcessCall::SendKillTree
+        ]
+    );
+    assert_eq!(progress, [1]);
+    assert_eq!(fake.take_warnings(), Vec::<String>::new());
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    let _ = fake.take_infos();
+}
+
+/// With no `timeout` the slices have no end of their own: members left is not a verdict, only the tree's exit, or a
+/// failed wait, ends them.
+#[skuld::test]
+fn with_no_timeout_the_slices_go_on_until_the_tree_exits() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Sent)
+        .wait_tree(TreeWaitReply::Remain)
+        .wait_tree(TreeWaitReply::Remain)
+        .wait_tree(TreeWaitReply::Remain)
+        .wait_tree(TreeWaitReply::Drained);
+
+    let (_, progress) = stopped_recording_progress(&fake, &daemon, ask_and_wait(None));
+
+    let slices = vec![ProcessCall::WaitTree(PROGRESS_PERIOD); 4];
+    let [ProcessCall::Ask, rest @ .., ProcessCall::SendKillTree] = &daemon.calls()[..] else {
+        panic!("asked, waited, then ended: {:?}", daemon.calls());
+    };
+    assert_eq!(rest, &slices[..]);
+    assert_eq!(progress, [1, 2, 3]);
+    assert_eq!(fake.take_warnings(), Vec::<String>::new());
+    let _ = fake.take_infos();
+}
+
+/// A `timeout` within one period is one slice, after which the wait has ended: nothing to report.
+#[skuld::test]
+fn a_timeout_within_one_period_is_one_slice_and_no_report() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
+
+    let (_, progress) = stopped_recording_progress(&fake, &daemon, ask_and_wait(Some(BRIEF)));
+
+    let [
+        ProcessCall::Ask,
+        ProcessCall::WaitTree(slice),
+        ProcessCall::SendKillTree,
+    ] = daemon.calls()[..]
+    else {
+        panic!("asked, waited once, then ended: {:?}", daemon.calls());
+    };
+    assert!(slice <= BRIEF, "{slice:?}");
+    assert_eq!(progress, Vec::<usize>::new());
+    assert_eq!(fake.take_warnings(), [did_not_exit_line(BRIEF)]);
+    let _ = fake.take_infos();
+}
+
+/// While the ask is answered "no console yet" the stop is asked again, at the pace of the re-asks, and each pass that
+/// has not ended the asking reports the stop as going on: before any wait for the tree is made.
+#[skuld::test]
+fn the_reasks_report_the_stop_as_going_on_at_their_own_pace() {
+    let fake = FakeGuard::new();
+    let daemon = asked(AskReply::Unsupported)
+        .ask(AskReply::Unsupported)
+        .ask(AskReply::SentAndExits(0))
+        .wait_tree(TreeWaitReply::Drained);
+
+    let (outcome, progress) = stopped_recording_progress(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
+    assert_eq!(progress, [0, 0], "one report after each answer that was asked again");
+    let _ = (fake.take_warnings(), fake.take_infos());
 }
 
 /// A daemon that ignores the event is ended when the wait's bound passes, by the teardown that kills.
@@ -983,7 +1141,7 @@ fn a_daemon_that_ignores_the_ask_is_killed_when_the_wait_expires() {
     let fake = FakeGuard::new();
     let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
 
-    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(BRIEF)));
 
     assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
     assert!(daemon.killed(), "the daemon was left running after its timeout");
@@ -992,10 +1150,10 @@ fn a_daemon_that_ignores_the_ask_is_killed_when_the_wait_expires() {
     };
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(
-        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        told_asking_within(BRIEF, fake.take_infos(), "Ctrl+C"),
         Vec::<String>::new()
     );
-    assert_eq!(fake.take_warnings(), [did_not_exit_line()]);
+    assert_eq!(fake.take_warnings(), [did_not_exit_line(BRIEF)]);
 }
 
 /// One line for an asked stop, saying what happened: the ask, then how the wait ended.
@@ -1038,31 +1196,14 @@ fn an_asked_stop_that_ends_the_daemon_at_the_end_of_the_wait_says_so_in_one_warn
     let fake = FakeGuard::new();
     let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
 
-    stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+    stopped_by(&fake, &daemon, ask_and_wait(Some(BRIEF)));
 
     assert_eq!(
-        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        told_asking_within(BRIEF, fake.take_infos(), "Ctrl+C"),
         Vec::<String>::new()
     );
-    assert_eq!(fake.take_warnings(), [did_not_exit_line()]);
+    assert_eq!(fake.take_warnings(), [did_not_exit_line(BRIEF)]);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
-}
-
-/// A stop with no `timeout` that ends its wait with members left names no time it was given.
-#[skuld::test]
-fn the_end_of_a_wait_with_no_limit_names_no_timeout() {
-    let fake = FakeGuard::new();
-    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
-
-    stopped_by(&fake, &daemon, ask_and_wait(None));
-
-    assert_eq!(
-        fake.take_warnings(),
-        [format!(
-            "goetia-shim[{ID}]: the daemon's process tree had not been seen to exit when the wait for it returned; it is being ended"
-        )]
-    );
-    let _ = fake.take_infos();
 }
 
 /// `AllMarkersClosed` is advisory (no proof that a process is gone) and is no `AllMembersExited`: no line says the daemon
@@ -1145,6 +1286,7 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     let (stopping, told) = mpsc::channel();
+    let progress = std::sync::atomic::AtomicUsize::new(0);
 
     let outcome = std::thread::scope(|scope| {
         let running = scope.spawn(|| {
@@ -1156,7 +1298,9 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
                 |end| {
                     stopping.send(end).expect("the test is listening");
                 },
-                || {},
+                || {
+                    progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
             )
         });
         assert!(supervisor.bus.request_stop());
@@ -1179,6 +1323,11 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
     );
     assert_eq!(fake.calls(Op::Ask), 0);
     assert_eq!(fake.calls(Op::WaitTree), 0);
+    assert_eq!(
+        progress.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a task's stop reports nothing: it waits for the program alone"
+    );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(
@@ -1286,7 +1435,7 @@ fn an_ask_that_may_have_been_sent_is_waited_for() {
         let fake = FakeGuard::new();
         let daemon = asked(reply).wait_tree(TreeWaitReply::Remain);
 
-        let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait_with(event, Some(HOUR)));
+        let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait_with(event, Some(BRIEF)));
 
         assert!(matches!(outcome, WaitOutcome::Stopping { .. }), "{reply:?}");
         let [ProcessCall::Ask, ProcessCall::WaitTree(_), ProcessCall::SendKillTree] = daemon.calls()[..] else {
@@ -1295,11 +1444,11 @@ fn an_ask_that_may_have_been_sent_is_waited_for() {
         assert_eq!(fake.take_failures(), Vec::<String>::new(), "{reply:?}");
         assert_eq!(
             fake.take_warnings(),
-            [may_have_sent_line(named, &error()), did_not_exit_line()],
+            [may_have_sent_line(named, &error()), did_not_exit_line(BRIEF)],
             "{reply:?} {named}"
         );
         assert_eq!(
-            told_asking_within_the_hour(fake.take_infos(), named),
+            told_asking_within(BRIEF, fake.take_infos(), named),
             Vec::<String>::new(),
             "{reply:?} {named}"
         );
@@ -1469,7 +1618,7 @@ fn an_exit_that_cannot_be_read_leaves_an_unassessable_ask_waited_for() {
         .try_wait_fails()
         .wait_tree(TreeWaitReply::Remain);
 
-    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+    let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(BRIEF)));
 
     assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
     let [ProcessCall::Ask, ProcessCall::WaitTree(_), ProcessCall::SendKillTree] = daemon.calls()[..] else {
@@ -1483,11 +1632,11 @@ fn an_exit_that_cannot_be_read_leaves_an_unassessable_ask_waited_for() {
                 Chain(&try_wait_failed())
             ),
             may_have_sent_line("Ctrl+C", &ask_unassessable()),
-            did_not_exit_line(),
+            did_not_exit_line(BRIEF),
         ]
     );
     assert_eq!(
-        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        told_asking_within(BRIEF, fake.take_infos(), "Ctrl+C"),
         Vec::<String>::new()
     );
 }

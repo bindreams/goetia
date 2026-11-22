@@ -414,6 +414,13 @@ impl Supervisor {
     /// service reports `STOP_PENDING`, so that SCM never reads it as running while the daemon is being stopped,
     /// and where a task records the stop before the wait that may outlast the shim.
     ///
+    /// `on_progress` is called, from the calling thread, while an ask-and-wait plan goes on: after each slice of
+    /// [`PROGRESS_PERIOD`] of the wait for the tree that left members and had a next one, and after each pause of the
+    /// re-ask loop that is followed by another ask. It is not called after the wait has ended, and never by a plan that
+    /// asks nothing or waits for the program alone. The service reports `STOP_PENDING` with a higher checkpoint in
+    /// it, which is what keeps Windows from ending a service whose stop takes long at a shutdown. Nothing is called
+    /// while the ask itself is being made: cosca 0.10's `terminate_tree` waits for its proxy with no bound.
+    ///
     /// **The read** of the process, once, where the stop is seen and before `on_stopping` (a read that fails counts as
     /// gone if the waiter has reported the exit): a root already gone is
     /// told as [`WaitEnd::Exit`], not [`WaitEnd::Stop`], and no plan runs for it. The status the read gives is the
@@ -645,6 +652,9 @@ impl Supervisor {
 
 // Stop plans ----------------------------------------------------------------------------------------------------------
 
+/// How often the wait for the tree is cut, so that the stop can be reported as going on: the length of one slice.
+pub(super) const PROGRESS_PERIOD: Duration = Duration::from_secs(5);
+
 /// How long the asking pauses after the first answer of `Unsupported`, which says the daemon has no console to be
 /// sent the event on yet. Each such pass starts a proxy process, so the pause doubles ([`grown_pace`]) up to
 /// [`REASK_PACE_CEILING`]: the first re-ask is fast, which is the case that matters (a daemon right after its
@@ -756,17 +766,25 @@ impl Supervisor {
                         self.log.failure(id, &never_asked(&e));
                         return None;
                     }
+                    // Asked again after this pause, so the stop is still going on.
+                    on_progress();
                 }
             }
         }
-        match child.wait_tree_timeout(left().unwrap_or(Duration::MAX)) {
+        match wait_for_tree(child, left, on_progress) {
             // The job is empty, so the root has exited and its report is on its way.
             Ok(TreeDrain::AllMembersExited) => {
                 self.log.info(id, EXITED_WITHIN_THE_WAIT);
                 self.bus.await_exit_report();
             }
             Ok(TreeDrain::AllMarkersClosed) => self.log.warning(id, MARKERS_CLOSED),
-            Ok(TreeDrain::MembersRemain) => self.log.warning(id, &tree_not_seen_to_exit(timeout)),
+            // Only a wait with a `timeout` ends with members left: one with none goes on.
+            Ok(TreeDrain::MembersRemain) => {
+                debug_assert!(timeout.is_some(), "a wait with no timeout ended with members left");
+                if let Some(timeout) = timeout {
+                    self.log.warning(id, &tree_not_seen_to_exit(timeout));
+                }
+            }
             Err(e) => self.log.failure(id, &wait_tree_failed(&e)),
         }
         None
@@ -786,6 +804,35 @@ impl Supervisor {
                 }
                 reported.then_some(Gone { status: None })
             }
+        }
+    }
+}
+
+/// Wait for the whole tree to exit within `left()` (what is left of the `timeout`; `None`: as long as it takes), in
+/// slices of [`PROGRESS_PERIOD`] that each re-check the tree, calling `on_progress` after each slice that left members
+/// and had a next one. A slice that left members has waited its whole bound, so the next one is what the last left
+/// of the wait, or what the clock says is left of the `timeout` if less: the slices add up to the `timeout`, never
+/// more. With no `timeout` members left are no verdict, and the slices go on until the tree exits or the wait fails.
+fn wait_for_tree(
+    child: &dyn Spawned,
+    left: impl Fn() -> Option<Duration>,
+    on_progress: &mut impl FnMut(),
+) -> Result<TreeDrain, cosca::error::Error> {
+    let mut remaining = left();
+    loop {
+        let slice = remaining.map_or(PROGRESS_PERIOD, |remaining| remaining.min(PROGRESS_PERIOD));
+        match child.wait_tree_timeout(slice) {
+            Ok(TreeDrain::MembersRemain) => {
+                remaining = remaining.map(|remaining| {
+                    let after = remaining.saturating_sub(slice);
+                    left().map_or(after, |left| after.min(left))
+                });
+                if remaining == Some(Duration::ZERO) {
+                    return Ok(TreeDrain::MembersRemain);
+                }
+                on_progress();
+            }
+            answer => return answer,
         }
     }
 }
@@ -969,16 +1016,11 @@ const EXITED_WITHIN_THE_WAIT: &str = "the daemon and what it started exited with
 
 /// What a wait that ended with members left says: its process tree had not been seen to exit, and the teardown that
 /// follows is told by its own lines. The root may have exited, and a member may be finishing its exit.
-fn tree_not_seen_to_exit(timeout: Option<Duration>) -> String {
-    match timeout {
-        Some(t) => format!(
-            "the daemon's process tree had not been seen to exit when its timeout of {} was over; it is being ended",
-            humantime::format_duration(t)
-        ),
-        // Reached only if cosca's wait returns before the end of a `Duration::MAX` bound.
-        None => "the daemon's process tree had not been seen to exit when the wait for it returned; it is being ended"
-            .to_string(),
-    }
+fn tree_not_seen_to_exit(timeout: Duration) -> String {
+    format!(
+        "the daemon's process tree had not been seen to exit when its timeout of {} was over; it is being ended",
+        humantime::format_duration(timeout)
+    )
 }
 
 /// `TreeDrain::AllMarkersClosed` is advisory: no member is known to have exited. (A Job Object does not answer it.)

@@ -5,6 +5,7 @@
 //! exits, once, with the code it reported; SCM's recovery actions (`backend::scm::generate`) start a
 //! new shim, which reads the installed spec afresh.
 
+use std::cell::RefCell;
 use std::ffi::{OsString, c_void};
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -118,14 +119,17 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
     if plan.asks() {
         clear_ctrl_c_ignored(&log, id);
     }
+    let progress = RefCell::new(StopProgress::default());
     let reported = run_daemon(
         &blob.spec,
         plan,
         &supervisor,
         id,
         || report_running(&log, id, status_handle),
-        |hint| report_stopping(&log, id, status_handle, hint),
-        || {},
+        |hint| report_stopping(&log, id, status_handle, &progress.borrow_mut().begin(hint)),
+        // Reported from this thread, between the slices of the stop's own waits: nothing is reported while the ask
+        // itself is being made, which cosca's `terminate_tree` bounds by nothing.
+        || report_stopping(&log, id, status_handle, &progress.borrow_mut().advance()),
     );
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
@@ -232,19 +236,43 @@ fn wait_hint_millis(hint: Duration) -> u32 {
 /// The `STOP_PENDING` status held while the shim stops the daemon, accepting no control. SCM
 /// then refuses a second `STOP` (1061) and a `START` (1056) itself, and a `STOPPED` that follows
 /// restarts or not exactly as one that follows `RUNNING` (measured). The hint is the stop's longest wait
-/// ([`stop_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is a constant 1.
+/// ([`stop_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is [`StopProgress`]'s.
 /// Measured: SCM does nothing when the hint expires (the status, a refused STOP (1061) and a refused START (1056) held
-/// for 10 s past a 1 s hint). Not measured: a `STOP_PENDING` held for longer than that with a checkpoint that does not
-/// move.
-fn stopping_status(hint: Duration) -> SERVICE_STATUS {
+/// for 10 s past a 1 s hint), nor does it with a checkpoint that moves, held for 150 s on a plain `STOP`.
+fn stopping_status(hint: Duration, checkpoint: u32) -> SERVICE_STATUS {
     SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: SERVICE_STOP_PENDING,
         dwControlsAccepted: 0,
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
-        dwCheckPoint: 1,
+        dwCheckPoint: checkpoint,
         dwWaitHint: wait_hint_millis(hint),
+    }
+}
+
+/// The `STOP_PENDING` reports of one stop: the first, and each one after it that says the stop is still going on,
+/// with the checkpoint one higher and the hint the stop began with. Windows ends a service at a shutdown whose
+/// checkpoint stays put for about 45 s, and waits for as long as it moves (measured in Server Core containers of
+/// Windows Server 2025, build 26100); SCM does nothing with it on any other stop.
+#[derive(Default)]
+struct StopProgress {
+    hint: Duration,
+    checkpoint: u32,
+}
+
+impl StopProgress {
+    /// The first report, of a stop that can take `hint`: checkpoint 1.
+    fn begin(&mut self, hint: Duration) -> SERVICE_STATUS {
+        self.hint = hint;
+        self.checkpoint = 1;
+        stopping_status(hint, self.checkpoint)
+    }
+
+    /// The report that the stop is still going on.
+    fn advance(&mut self) -> SERVICE_STATUS {
+        self.checkpoint = self.checkpoint.wrapping_add(1);
+        stopping_status(self.hint, self.checkpoint)
     }
 }
 
@@ -361,11 +389,11 @@ fn clear_ctrl_c_ignored(log: &Log, id: &str) {
     }
 }
 
-/// Report `STOP_PENDING`. A failure is logged: the teardown goes on and `STOPPED` is still reported.
-fn report_stopping(log: &Log, id: &str, handle: StatusHandle, hint: Duration) {
-    let status = stopping_status(hint);
+/// Report `STOP_PENDING`, as `status` ([`StopProgress`]) says. A failure is logged: the teardown goes on and
+/// `STOPPED` is still reported.
+fn report_stopping(log: &Log, id: &str, handle: StatusHandle, status: &SERVICE_STATUS) {
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
-    if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
+    if unsafe { SetServiceStatus(handle.0, status) } == 0 {
         let e = std::io::Error::last_os_error();
         log.failure(id, &format!("report SERVICE_STOP_PENDING to SCM: {}", Chain(&e)));
     }

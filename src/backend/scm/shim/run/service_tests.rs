@@ -1017,12 +1017,76 @@ fn run_recording_stopping(
 /// while a host holds it (measured), which is what keeps `start` from reading the service as up.
 #[skuld::test]
 fn the_stopping_status_accepts_no_control_and_records_no_exit() {
-    let status = stopping_status(Duration::from_secs(10));
+    let status = stopping_status(Duration::from_secs(10), 1);
 
     assert_eq!(status.dwCurrentState, SERVICE_STOP_PENDING);
     assert_eq!(status.dwControlsAccepted, 0);
     assert_eq!((status.dwWin32ExitCode, status.dwServiceSpecificExitCode), (0, 0));
     assert_eq!((status.dwCheckPoint, status.dwWaitHint), (1, 10_000));
+}
+
+/// The checkpoint is what the status says of progress: SCM and Windows read a checkpoint that moves as a service that
+/// is still stopping, and end one whose checkpoint stays put for about 45 s at a shutdown (measured in Server Core
+/// containers of Windows Server 2025, build 26100). The first report is checkpoint 1; each report that the stop is
+/// still going on is one higher, with the hint the stop began with.
+#[skuld::test]
+fn each_report_that_the_stop_is_going_on_has_the_checkpoint_one_higher() {
+    let mut progress = StopProgress::default();
+
+    let first = progress.begin(Duration::from_secs(40));
+    let second = progress.advance();
+    let third = progress.advance();
+
+    for status in [first, second, third] {
+        assert_eq!(status.dwCurrentState, SERVICE_STOP_PENDING);
+        assert_eq!(status.dwControlsAccepted, 0);
+        assert_eq!(status.dwWaitHint, 40_000);
+    }
+    assert_eq!([first.dwCheckPoint, second.dwCheckPoint, third.dwCheckPoint], [1, 2, 3]);
+}
+
+/// A run reports `STOP_PENDING` once through `on_stopping`, then calls `on_progress` while the stop's wait goes on:
+/// a daemon that ignores the ask for a `timeout` of 12 s has its wait cut in three slices, and the service reports twice
+/// between them.
+#[skuld::test]
+fn a_run_reports_progress_while_its_stop_waits() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    let service = stopping_by(StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(Duration::from_secs(12)),
+    });
+    fake.will_make_thread();
+    fake.will_spawn(
+        FakeProcess::new()
+            .wait(WaitReply::Blocks)
+            .ask(AskReply::Sent)
+            .wait_tree(TreeWaitReply::Remain)
+            .wait_tree(TreeWaitReply::Remain)
+            .wait_tree(TreeWaitReply::Remain)
+            .send_kill_tree(KillReply::Ends),
+    );
+    let bus = Arc::clone(&supervisor.bus);
+    let reports = std::cell::RefCell::new(Vec::new());
+
+    let reported = super::run_daemon(
+        &service,
+        StopPlan::of(&service),
+        &supervisor,
+        ID,
+        || assert!(bus.request_stop()),
+        |hint| reports.borrow_mut().push(format!("stopping {hint:?}")),
+        || reports.borrow_mut().push("progress".to_string()),
+    );
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(
+        *reports.borrow(),
+        ["stopping 22s", "progress", "progress"],
+        "the hint is the stop's longest wait, and a report follows each slice but the last"
+    );
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    let _ = (fake.take_warnings(), fake.take_infos());
 }
 
 /// The hint covers what the stop can take: the `timeout` and the teardown, in milliseconds, and for no
@@ -1031,11 +1095,11 @@ fn the_stopping_status_accepts_no_control_and_records_no_exit() {
 fn the_stopping_hint_is_the_stops_longest_wait_in_milliseconds() {
     let longest = StopAction::MAX_TIMEOUT + StopAction::TEARDOWN_MARGIN;
 
-    assert_eq!(stopping_status(Duration::from_secs(40)).dwWaitHint, 40_000);
-    assert_eq!(stopping_status(longest).dwWaitHint, 86_410_000);
-    assert_eq!(stopping_status(Duration::MAX).dwWaitHint, u32::MAX);
+    assert_eq!(stopping_status(Duration::from_secs(40), 1).dwWaitHint, 40_000);
+    assert_eq!(stopping_status(longest, 1).dwWaitHint, 86_410_000);
+    assert_eq!(stopping_status(Duration::MAX, 1).dwWaitHint, u32::MAX);
     assert_eq!(
-        stopping_status(Duration::from_secs(u64::from(u32::MAX))).dwWaitHint,
+        stopping_status(Duration::from_secs(u64::from(u32::MAX)), 1).dwWaitHint,
         u32::MAX
     );
 }
