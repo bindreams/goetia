@@ -1073,12 +1073,13 @@ with the request standing.
   the program's own exit, which is then the run's record, and a program still
   running when the second is over is ended with the host and its run is
   recorded as stopped. A `Stopped` record means a stop was accepted and the host
-  never saw the program exit, not that the program's tree has ended. A stop that arrives before the host has started the
-  program starts nothing, and the run is still recorded as stopped. A stop that
-  arrives in the moment between that check and the start still starts the
-  program, which never receives the event and runs until it exits or Windows
-  ends the host and its Job Object takes the program's tree with it. A run in
-  flight at a system shutdown is ended by Windows and may leave no record.
+  never saw the program exit, not that the program's tree has ended. A stop that
+  arrives before the host has started the program starts nothing, and the run is
+  still recorded as stopped. A stop that arrives in the moment between that
+  check and the start still starts the program, which never receives the event
+  and runs until it exits or Windows ends the host and its Job Object takes the
+  program's tree with it. A run in flight at a system shutdown is ended by
+  Windows and may leave no record.
   `kill` terminates the host, and its Job Object takes the program's tree with
   it; a waiting `run` then reports that the run ended without recording its exit
   (exit `4`), as it does for a shutdown or a host failure. When a stop could not
