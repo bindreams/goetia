@@ -105,6 +105,7 @@ pub(crate) use registry::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use windows_service::service::{
     Service, ServiceAccess, ServiceActionType, ServiceConfig, ServiceErrorControl, ServiceFailureResetPeriod,
@@ -112,7 +113,10 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree};
-use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
+use windows_sys::Win32::System::Services::{
+    ChangeServiceConfigW, QueryServiceConfig2W, SERVICE_CONFIG_PRESHUTDOWN_INFO, SERVICE_NO_CHANGE,
+    SERVICE_PRESHUTDOWN_INFO,
+};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
@@ -427,7 +431,17 @@ impl Scm {
     fn service_installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
         let id = snapshot.id();
         let config = snapshot.config()?;
-        let definition = read_live_registration(config, snapshot.service()?, id.as_str(), &snapshot.parameters)?;
+        // The pre-shutdown time is read only where goetia sets one: a native service's is its own, and is no drift.
+        let reads_preshutdown = snapshot
+            .blob()
+            .map_or(true, |blob| generate::sets_preshutdown(&blob.spec));
+        let definition = read_live_registration(
+            config,
+            snapshot.service()?,
+            id.as_str(),
+            &snapshot.parameters,
+            reads_preshutdown,
+        )?;
         Ok(InstalledDefinition {
             definition,
             external: ExternalConfig::Absent,
@@ -1042,11 +1056,17 @@ fn read_live_registration(
     service: &Service,
     name: &str,
     live_params: &Parameters,
+    reads_preshutdown: bool,
 ) -> Result<ScmRegistration> {
     let cmdline = cfg.executable_path.to_string_lossy().into_owned();
     let (executable, arguments) = split_command_line(&cmdline);
     let account = registered_account(cfg);
     let failure_actions = read_failure_actions(service, name)?;
+    let preshutdown = if reads_preshutdown {
+        Some(read_preshutdown(service, name)?)
+    } else {
+        None
+    };
     let environment = held_service(name, registry::read_environment(name)?)?;
 
     Ok(ScmRegistration {
@@ -1056,6 +1076,7 @@ fn read_live_registration(
         arguments,
         account,
         failure_actions,
+        preshutdown,
         environment,
         parameters: live_params.fields.clone(),
         stray_parameters: live_params.strays.clone(),
@@ -1110,6 +1131,33 @@ fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailu
         },
         on_non_crash_failures,
     }))
+}
+
+/// The time Windows waits for `service` to stop at a system shutdown (`SERVICE_CONFIG_PRESHUTDOWN_INFO`), which a
+/// service that never set one reads as [`generate::DEFAULT_PRESHUTDOWN`]. `windows-service` has a setter and no getter.
+fn read_preshutdown(service: &Service, name: &str) -> Result<Duration> {
+    let mut info = SERVICE_PRESHUTDOWN_INFO {
+        dwPreshutdownTimeout: 0,
+    };
+    let mut needed = 0;
+    // SAFETY: `service` is a live handle with `SERVICE_QUERY_CONFIG`; the buffer is a `SERVICE_PRESHUTDOWN_INFO`,
+    // which is what this info level fills, and its size is passed; `needed` is a valid out-parameter.
+    let read = unsafe {
+        QueryServiceConfig2W(
+            service.raw_handle(),
+            SERVICE_CONFIG_PRESHUTDOWN_INFO,
+            (&raw mut info).cast::<u8>(),
+            size_of::<SERVICE_PRESHUTDOWN_INFO>() as u32,
+            &mut needed,
+        )
+    };
+    if read == 0 {
+        return Err(Error::os(
+            format!("query the pre-shutdown time of `{name}`"),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(Duration::from_millis(u64::from(info.dwPreshutdownTimeout)))
 }
 
 /// `windows-service`'s `ServiceConfig::executable_path` is the raw
@@ -1216,7 +1264,11 @@ fn apply(
         let change = make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
         after = change.map_or(default_log::Step::Narrow, |change| change.step_after());
     }
-    apply_gated(reg, gated.password, installed.is_none())?;
+    // A plain service that becomes a native one has the value goetia wrote taken back, once ([`generate::preshutdown_to_write`]).
+    let was_set = installed
+        .and_then(|installed| installed.blob().ok())
+        .is_some_and(|blob| generate::sets_preshutdown(&blob.spec));
+    apply_gated(reg, gated.password, installed.is_none(), was_set)?;
     make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
 }
 
@@ -1345,13 +1397,14 @@ fn service_run(id: &Id) -> Result<default_log::Run> {
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it
-/// returned.
-fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool) -> Result<()> {
-    if create {
+/// returned. `was_set` says that the service it replaces was a plain one, whose pre-shutdown time goetia set
+/// ([`generate::preshutdown_to_write`]).
+fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool, was_set: bool) -> Result<()> {
+    let service = if create {
         let scm = open_scm(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
         let info = service_info(reg, password, None);
         scm.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
-            .map_err(|e| to_error(&format!("create service `{}`", reg.name), e))?;
+            .map_err(|e| to_error(&format!("create service `{}`", reg.name), e))?
     } else {
         let scm = open_scm(ServiceManagerAccess::CONNECT)?;
         let service = scm
@@ -1365,6 +1418,14 @@ fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool) ->
         service
             .change_config(&info)
             .map_err(|e| to_error(&format!("update service `{}`", reg.name), e))?;
+        service
+    };
+    // Before `Parameters`, whose blob is what says the service is plain: an install that fails here leaves the old
+    // blob, and the next one finds the value still to be written.
+    if let Some(preshutdown) = generate::preshutdown_to_write(reg.preshutdown, was_set) {
+        service
+            .set_preshutdown_timeout(preshutdown)
+            .map_err(|e| to_error(&format!("set the pre-shutdown time of `{}`", reg.name), e))?;
     }
 
     registry::write_parameters(&reg.name, &reg.parameters)?;

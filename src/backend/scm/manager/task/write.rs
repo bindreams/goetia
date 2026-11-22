@@ -634,7 +634,7 @@ impl Scm {
             &mut System,
             || service_gate(definition, written, Password::Read),
             |gated| {
-                apply_gated(definition, gated.password, true)?;
+                apply_gated(definition, gated.password, true, false)?;
                 make_default_log(spec, definition, gated.checked.as_ref(), &[], Step::Narrow)?;
                 Ok(WriteOutcome::Done)
             },

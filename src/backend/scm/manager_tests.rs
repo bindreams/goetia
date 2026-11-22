@@ -26,6 +26,7 @@ fn dummy_reg(account: Option<&str>) -> ScmRegistration {
         arguments: vec![],
         account: account.map(str::to_string),
         failure_actions: None,
+        preshutdown: None,
         environment: vec![],
         parameters: BTreeMap::new(),
         stray_parameters: Vec::new(),

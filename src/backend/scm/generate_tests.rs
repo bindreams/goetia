@@ -124,7 +124,7 @@ fn simple_kind_executable_is_shim() {
 }
 
 #[skuld::test]
-fn registration_of_a_service_is_unchanged() {
+fn a_plain_services_registration_text_is_pinned() {
     let spec = simple_spec();
     let expected = format!(
         "Name: frpc\n\
@@ -133,6 +133,7 @@ fn registration_of_a_service_is_unchanged() {
          Executable: {exe:?}\n\
          Arguments:\n  - \"--service-host\"\n\
          FailureActions:\n  Delay: 1s\n  ResetPeriod: 1day\n  OnNonCrashFailures: true\n\
+         PreshutdownTimeout: 40s\n\
          Environment:\n\
          Parameters:\n  Marker: \"goetia\"\n  Schema: \"2\"\n  Spec: {spec_text:?}\n  Version: {version:?}\n",
         exe = shim_path(),
@@ -1422,6 +1423,7 @@ fn display_output_format_is_pinned() {
             reset_period: Duration::from_secs(86_400),
             on_non_crash_failures: true,
         }),
+        preshutdown: Some(Duration::from_secs(40)),
         environment: vec!["A=1".to_string(), "B=x y".to_string()],
         parameters: BTreeMap::from([
             ("Marker".to_string(), "goetia".to_string()),
@@ -1449,6 +1451,7 @@ fn display_output_format_is_pinned() {
         format!("  Delay: {delay_text}"),
         format!("  ResetPeriod: {reset_period_text}"),
         "  OnNonCrashFailures: true".to_string(),
+        "PreshutdownTimeout: 40s".to_string(),
         "Environment:".to_string(),
         "  \"A=1\"".to_string(),
         "  \"B=x y\"".to_string(),
@@ -1473,6 +1476,7 @@ fn a_registration_displays_as_its_canonical_text() {
         arguments: vec![],
         account: None,
         failure_actions: None,
+        preshutdown: None,
         environment: vec![],
         parameters: BTreeMap::from([("k".to_string(), "v".to_string())]),
         stray_parameters: Vec::new(),
@@ -1503,8 +1507,7 @@ fn written(signal: &str, timeout: Option<u64>) -> StopAction {
     }
 }
 
-/// Until the shim asks, the registration is what it was: the stop action is carried in the
-/// blob, and nothing of it reaches SCM.
+/// The stop action is carried in the blob, and reaches SCM only as the pre-shutdown time of a plain service.
 #[skuld::test]
 fn a_stop_action_is_carried_in_the_blob_and_changes_nothing_else() {
     for spec in [managed_spec(), simple_spec()] {
@@ -1515,9 +1518,109 @@ fn a_stop_action_is_carried_in_the_blob_and_changes_nothing_else() {
         assert_eq!(with.executable, plain.executable);
         assert_eq!(with.arguments, plain.arguments);
         assert_eq!(with.failure_actions, plain.failure_actions);
+        assert_eq!(with.environment, plain.environment);
         let blob = crate::blob::decode(&with.parameters[FIELD_SPEC]).unwrap();
         assert_eq!(blob.spec, spec);
     }
+}
+
+// Pre-shutdown time -------------------------------------------------------------------------------------------------------
+
+fn millis(n: u64) -> Option<Duration> {
+    Some(Duration::from_millis(n))
+}
+
+/// A plain service is given as long to stop at a system shutdown as a `stop` gives it
+/// ([`StopAction::longest_stop`]): the `timeout` and the teardown margin, the largest value the field holds for no
+/// timeout, and the margin alone for `kill`. Windows waits at least this long, as measured in Server Core containers
+/// of Windows Server 2025, build 26100.
+#[skuld::test]
+fn a_plain_services_preshutdown_time_is_its_stop_actions_longest_wait() {
+    for (action, expected) in [
+        (StopAction::default(), millis(40_000)),
+        (written("interrupt", Some(5)), millis(15_000)),
+        (written("terminate", None), millis(0xFFFF_FFFF)),
+        (written("kill", None), millis(10_000)),
+        (written("wm-close", Some(30)), millis(40_000)),
+        (written("terminate", Some(86_400)), millis(86_410_000)),
+    ] {
+        let spec = with_stop_action(simple_spec(), action);
+        assert_eq!(build(&spec).preshutdown, expected, "{action:?}");
+        assert_eq!(
+            install_registration(&spec, &identity(), &|| Ok(host()))
+                .unwrap()
+                .preshutdown,
+            expected,
+            "{action:?}"
+        );
+    }
+}
+
+/// goetia does not run a native service's stop, so it sets nothing of its own: the value is the service's.
+#[skuld::test]
+fn a_native_service_gets_no_preshutdown_time() {
+    for action in [
+        StopAction::default(),
+        written("terminate", Some(120)),
+        written("terminate", None),
+    ] {
+        let spec = with_stop_action(managed_spec(), action);
+        assert_eq!(build(&spec).preshutdown, None, "{action:?}");
+        assert!(!build(&spec).to_string().contains("Preshutdown"), "{action:?}");
+    }
+}
+
+/// The text a diff compares has the value, so one that differs from what is wanted is an update: a service installed
+/// before this reads 10 000 ms (Windows' default), and a changed `timeout` changes the wanted value.
+#[skuld::test]
+fn a_preshutdown_time_that_differs_from_the_wanted_one_is_drift() {
+    let wanted = build(&simple_spec());
+    assert_eq!(wanted.preshutdown, millis(40_000));
+    assert!(wanted.to_string().contains("PreshutdownTimeout: 40s\n"), "{wanted}");
+
+    let installed_before = ScmRegistration {
+        preshutdown: Some(DEFAULT_PRESHUTDOWN),
+        ..wanted.clone()
+    };
+    assert_ne!(installed_before.to_string(), wanted.to_string());
+
+    let patient = build(&with_stop_action(simple_spec(), written("terminate", Some(120))));
+    assert_ne!(patient.to_string(), wanted.to_string(), "a changed timeout");
+
+    // `kill` wants the teardown margin alone, which is the default a service that never set one reads.
+    let kill = build(&with_stop_action(simple_spec(), written("kill", None)));
+    let unset = ScmRegistration {
+        preshutdown: Some(DEFAULT_PRESHUTDOWN),
+        ..kill.clone()
+    };
+    assert_eq!(unset.to_string(), kill.to_string());
+}
+
+/// What an install writes: the wanted value; for a service that goetia registered as plain and now registers as native,
+/// Windows' default once (goetia wrote the old value and leaves none of its own behind); else nothing.
+#[skuld::test]
+fn a_change_from_plain_to_native_puts_the_default_back_once() {
+    let wanted = millis(40_000);
+    assert_eq!(preshutdown_to_write(wanted, true), wanted);
+    assert_eq!(preshutdown_to_write(wanted, false), wanted);
+    assert_eq!(preshutdown_to_write(None, true), Some(DEFAULT_PRESHUTDOWN));
+    assert_eq!(
+        preshutdown_to_write(None, false),
+        None,
+        "a native service that was native, or that goetia did not register as plain, keeps its own value"
+    );
+}
+
+/// Which services have a pre-shutdown time of goetia's: a plain service, never a native one.
+#[skuld::test]
+fn only_a_plain_service_has_a_preshutdown_time_of_goetias() {
+    assert!(sets_preshutdown(&simple_spec()));
+    assert!(!sets_preshutdown(&managed_spec()));
+    assert!(!sets_preshutdown(&crate::testing::task(
+        "frpc",
+        vec![program("frpc-agent")],
+        None
+    )));
 }
 
 #[skuld::test]
@@ -1557,7 +1660,7 @@ fn a_native_signal_is_refused_naming_windows() {
 #[skuld::test]
 fn a_native_service_handles_its_own_stop_so_a_signal_is_refused_and_a_timeout_is_not() {
     let patient = with_stop_action(managed_spec(), written("terminate", Some(120)));
-    registration(&patient, &identity(), &no_host).expect("a timeout is the CLI's wait and the shutdown bound");
+    registration(&patient, &identity(), &no_host).expect("a timeout is the CLI's wait");
 
     let quit = with_stop_action(managed_spec(), written("quit", Some(30)));
     let err = registration(&quit, &identity(), &no_host).expect_err("a signal for a service that speaks SCM");
