@@ -918,7 +918,6 @@ fn a_stop_with_the_program_already_gone_records_its_exit_once() {
         let process = FakeProcess::new()
             .exited_unreported(exit)
             .wait(WaitReply::Blocks)
-            .wait(WaitReply::Blocks)
             .send_kill_tree(KillReply::Ends)
             .when(Op::Spawn, run.stop_at_the_spawn());
         let run = run.program(process);
@@ -945,6 +944,29 @@ fn a_stop_with_the_program_already_gone_records_its_exit_once() {
         assert_eq!(run.finish(), Vec::<String>::new());
         run.no_pin_is_left();
     }
+}
+
+/// The program is gone when the stop is seen, and the waiter's wait fails after the read that found it so: the
+/// shim has the program's exit status all the same, so that is the record, and the program is not killed.
+#[skuld::test]
+fn a_stop_that_read_the_program_gone_records_its_exit_when_the_waiter_then_fails() {
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let process = FakeProcess::new()
+        .exited_unreported(7)
+        .wait(WaitReply::FailsWhenEnded)
+        .send_kill_tree(KillReply::Ends)
+        .when(Op::Spawn, run.stop_at_the_spawn());
+    let run = run.program(process.clone());
+
+    let code = run.run();
+
+    assert_eq!(code, 7);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    assert_eq!(process.calls(), [ProcessCall::SendKillTree], "the program was killed");
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("background wait on child"), "{failures:?}");
+    run.no_pin_is_left();
 }
 
 /// A stop accepted before the program is spawned spawns nothing: the program would never be sent the close event,

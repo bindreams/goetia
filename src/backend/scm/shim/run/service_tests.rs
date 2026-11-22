@@ -28,8 +28,8 @@ use windows_sys::Win32::System::Services::{
 use super::*;
 use crate::backend::scm::shim::run::os::LogKind;
 use crate::backend::scm::shim::run::os::fake::{
-    AskReply, ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, TreeWaitReply,
-    WaitReply, WaiterEnd, tree_kill_refused, wait_failed, wait_failed_with_code,
+    AskReply, ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, ProcessCall,
+    TreeWaitReply, WaitReply, WaiterEnd, tree_kill_refused, wait_failed, wait_failed_with_code,
 };
 use crate::backend::scm::shim::run::stop_bus::WaitEnd;
 use crate::backend::scm::shim::run::test_support::{
@@ -848,7 +848,6 @@ fn a_stop_over_a_daemon_that_exited_by_itself_carries_its_exit_code_and_is_clean
         let gone = FakeProcess::new()
             .exited_unreported(7)
             .wait(WaitReply::Blocks)
-            .wait(WaitReply::Blocks)
             .send_kill_tree(KillReply::Ends);
         let (outcome, told) = stopped_pass(plan, gone);
 
@@ -871,6 +870,44 @@ fn a_stop_over_a_daemon_that_exited_by_itself_carries_its_exit_code_and_is_clean
     assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "exited within the ask");
     assert_eq!(told, [WaitEnd::Stop]);
     assert_eq!(outcome.reported(), Reported::Clean);
+}
+
+/// The read at the stop gave the daemon's exit status, and the waiter's wait fails after the read: the exit is the
+/// daemon's all the same, the daemon is not killed, and the service is told a clean stop.
+#[skuld::test]
+fn a_stop_that_read_the_daemon_gone_carries_its_exit_code_when_the_waiter_then_fails() {
+    for plan in [StopPlan::AtOnce, StopPlan::WaitOnly] {
+        let fake = FakeGuard::new();
+        let supervisor = supervisor(&fake);
+        fake.will_make_thread();
+        let gone = FakeProcess::new()
+            .exited_unreported(7)
+            .wait(WaitReply::FailsWhenEnded)
+            .send_kill_tree(KillReply::Ends);
+        fake.will_spawn(gone.clone());
+        let bus = Arc::clone(&supervisor.bus);
+
+        let outcome = run_pass(
+            &kill_spec(),
+            plan,
+            &supervisor,
+            ID,
+            || assert!(bus.request_stop()),
+            |_| {},
+        );
+
+        assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "{plan:?}");
+        assert_eq!(outcome.reported(), Reported::Clean);
+        assert_eq!(
+            gone.calls(),
+            [ProcessCall::SendKillTree],
+            "{plan:?}: the root was killed"
+        );
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+        let failures = fake.take_failures();
+        assert_eq!(failures.len(), 1, "{plan:?}: {failures:?}");
+        assert!(failures[0].contains("background wait on child"), "{failures:?}");
+    }
 }
 
 /// A stop accepted between the wake of the wait and the decision of the exit: the exit was seen first, so the pass
@@ -1347,13 +1384,12 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
 fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
-    // The daemon is gone when the stop is read (its waiter's report lags), so its status is read too, by a second
-    // wait; the accepted stop is what the pass reports, whatever the status.
+    // The daemon is gone when the stop is read (its waiter's report lags), and the read gave its status; the accepted
+    // stop is what the pass reports, whatever the status.
     fake.will_make_thread();
     fake.will_spawn(
         FakeProcess::new()
             .exited_unreported(7)
-            .wait(WaitReply::Blocks)
             .wait(WaitReply::Blocks)
             .send_kill_tree(KillReply::Ends),
     );

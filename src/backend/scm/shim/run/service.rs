@@ -6,6 +6,7 @@
 //! new shim, which reads the installed spec afresh.
 
 use std::ffi::{OsString, c_void};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -489,11 +490,15 @@ pub(super) fn run_pass(
             }
         }
         // `wait_for_child_or_stop` terminated the tree before returning this. A daemon that exited by itself first
-        // has its exit status, which is the one read of the `ChildExited` arm.
-        WaitOutcome::Stopping { root_exited } => PassOutcome::Stopped(if root_exited {
-            exit_code(child.as_ref(), log, id)
-        } else {
-            None
+        // has its exit status: the one a read of the process gave, or, when none did, the one the waiter's wait
+        // returned (as in the `ChildExited` arm).
+        WaitOutcome::Stopping {
+            root_exited,
+            exit_status,
+        } => PassOutcome::Stopped(match exit_status {
+            Some(status) => code_of(status, log, id),
+            None if root_exited => exit_code(child.as_ref(), log, id),
+            None => None,
         }),
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => PassOutcome::IncompleteStop,
@@ -504,18 +509,21 @@ pub(super) fn run_pass(
 /// carries no code: told in the log.
 fn exit_code(child: &dyn Spawned, log: &Log, id: &str) -> Option<i32> {
     match child.wait() {
-        Ok(status) => {
-            let code = status.code();
-            if code.is_none() {
-                log.failure(id, NO_EXIT_CODE);
-            }
-            code
-        }
+        Ok(status) => code_of(status, log, id),
         Err(e) => {
             log.failure(id, &exit_status_unavailable(&e));
             None
         }
     }
+}
+
+/// The code of an exit status, or `None` when it carries none: told in the log.
+fn code_of(status: ExitStatus, log: &Log, id: &str) -> Option<i32> {
+    let code = status.code();
+    if code.is_none() {
+        log.failure(id, NO_EXIT_CODE);
+    }
+    code
 }
 
 /// How an exited daemon is reported, before [`StopBus::settle`] lets a stop win. `None` is an exit

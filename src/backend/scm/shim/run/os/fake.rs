@@ -141,6 +141,9 @@ pub(crate) enum WaitReply {
     /// Block until the process is ended, by a successful kill or [`FakeProcess::end`], and return
     /// its status.
     Blocks,
+    /// Block as [`WaitReply::Blocks`] does, until the process has ended and its report is not held, then fail: the
+    /// wait fails after the read that released the report.
+    FailsWhenEnded,
     /// Fail, with this OS error code ([`wait_failed_with_code`]) or, with none, [`wait_failed`].
     Fails(Option<i32>),
     /// Panic, ending the waiter thread without it reporting the child done.
@@ -425,6 +428,12 @@ impl FakeProcess {
         lock(&self.0.state).exit.is_some()
     }
 
+    /// Make the blocked wait on the process fail, by hand: its report is a failure, and the process is not ended.
+    pub(crate) fn fail_wait(&self) {
+        lock(&self.0.state).wait_fails = true;
+        self.0.ended.notify_all();
+    }
+
     /// The status it ended with, if it has ended.
     pub(crate) fn exit_code(&self) -> Option<i32> {
         lock(&self.0.state).exit.and_then(|status| status.code())
@@ -495,6 +504,7 @@ impl Spawned for Instance {
             None => self.unstated("wait"),
             Some(WaitReply::Exits(code)) => Ok(self.proc.end(status(code))),
             Some(WaitReply::Blocks) => self.proc.wait_ended(),
+            Some(WaitReply::FailsWhenEnded) => self.proc.wait_ended().and_then(|_| Err(wait_failed())),
             Some(WaitReply::Fails(Some(code))) => Err(wait_failed_with_code(code)),
             Some(WaitReply::Fails(None)) => Err(wait_failed()),
             Some(WaitReply::Panics) => panic!("the wait panicked (fake)"),

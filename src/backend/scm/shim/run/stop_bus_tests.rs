@@ -407,7 +407,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
 
     assert!(
-        matches!(outcome, WaitOutcome::Stopping { root_exited: false }),
+        matches!(outcome, WaitOutcome::Stopping { root_exited: false, .. }),
         "a failed wait is no exit"
     );
     assert!(daemon.killed());
@@ -702,7 +702,7 @@ fn a_stop_that_finds_the_daemon_gone_is_told_as_its_exit_and_runs_no_plan() {
         let (outcome, told) = stopped_by(&fake, &daemon, plan);
 
         assert!(
-            matches!(outcome, WaitOutcome::Stopping { root_exited: true }),
+            matches!(outcome, WaitOutcome::Stopping { root_exited: true, .. }),
             "{plan:?}"
         );
         assert_eq!(told, [WaitEnd::Exit], "{plan:?}");
@@ -733,7 +733,7 @@ fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_go
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 
         assert!(
-            matches!(outcome, WaitOutcome::Stopping { root_exited: true }),
+            matches!(outcome, WaitOutcome::Stopping { root_exited: true, .. }),
             "{plan:?}"
         );
         assert_eq!(told, [WaitEnd::Exit], "{plan:?}");
@@ -748,6 +748,140 @@ fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_go
     }
 }
 
+/// The read at the stop gave the exit status, so that is the root's exit and the teardown is the exited tree's, whatever
+/// the waiter reports after the read: here its wait fails. The root is not killed, as it is known gone.
+#[skuld::test]
+fn a_stop_that_read_the_daemon_gone_keeps_its_exit_when_the_waiter_fails_after_the_read() {
+    for plan in [ask_and_wait(Some(HOUR)), StopPlan::WaitOnly, StopPlan::AtOnce] {
+        let fake = FakeGuard::new();
+        let daemon = FakeProcess::new()
+            .exited_unreported(5)
+            .wait(WaitReply::FailsWhenEnded)
+            .send_kill_tree(KillReply::Refuses);
+
+        let (outcome, told) = stopped_by(&fake, &daemon, plan);
+
+        assert!(
+            matches!(outcome, WaitOutcome::TreeMayRun),
+            "{plan:?}: the exited tree's teardown, whose refusal is a tree left"
+        );
+        assert_eq!(told, [WaitEnd::Exit], "{plan:?}");
+        assert_eq!(
+            daemon.calls(),
+            [ProcessCall::SendKillTree],
+            "{plan:?}: the root was killed"
+        );
+        // The waiter's line and the teardown's are made on two threads, in no fixed order.
+        let mut failures = fake.take_failures();
+        failures.sort();
+        let mut expected = vec![
+            format!("goetia-shim[{ID}]: background wait on child: {}", Chain(&wait_failed())),
+            format!(
+                "goetia-shim[{ID}]: terminating the process tree after the daemon ended failed: {}; its descendants may still be running{NOT_RESTARTED}",
+                Chain(&tree_kill_refused())
+            ),
+        ];
+        expected.sort();
+        assert_eq!(failures, expected, "{plan:?}");
+    }
+}
+
+/// As above, with the tree kill sent: the outcome carries the status the read gave.
+#[skuld::test]
+fn a_stop_that_read_the_daemon_gone_reports_the_status_it_read() {
+    for plan in [ask_and_wait(Some(HOUR)), StopPlan::WaitOnly, StopPlan::AtOnce] {
+        let fake = FakeGuard::new();
+        let daemon = FakeProcess::new()
+            .exited_unreported(5)
+            .wait(WaitReply::FailsWhenEnded)
+            .send_kill_tree(KillReply::Ends);
+
+        let (outcome, _) = stopped_by(&fake, &daemon, plan);
+
+        let WaitOutcome::Stopping {
+            root_exited,
+            exit_status,
+        } = outcome
+        else {
+            panic!("{plan:?}: not a stop");
+        };
+        assert!(root_exited, "{plan:?}");
+        assert_eq!(exit_status.and_then(|status| status.code()), Some(5), "{plan:?}");
+        assert_eq!(daemon.calls(), [ProcessCall::SendKillTree], "{plan:?}");
+        assert_eq!(fake.take_failures().len(), 1, "{plan:?}: the waiter's failure");
+    }
+}
+
+/// The same where the read that found the daemon gone is one the ask makes before it asks again, not the one at the stop.
+#[skuld::test]
+fn a_read_before_a_second_ask_that_finds_the_daemon_gone_keeps_its_exit_when_the_waiter_fails() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::FailsWhenEnded)
+        .ask(AskReply::UnsupportedAndExitedUnreported(5))
+        .send_kill_tree(KillReply::Ends);
+
+    let (outcome, told) = stopped_by(&fake, &daemon, ask_and_wait(Some(HOUR)));
+
+    let WaitOutcome::Stopping {
+        root_exited,
+        exit_status,
+    } = outcome
+    else {
+        panic!("not a stop");
+    };
+    assert!(root_exited);
+    assert_eq!(exit_status.and_then(|status| status.code()), Some(5));
+    assert_eq!(told, [WaitEnd::Stop]);
+    assert_eq!(daemon.calls(), [ProcessCall::Ask, ProcessCall::SendKillTree]);
+    assert_eq!(fake.take_failures().len(), 1, "the waiter's failure");
+    assert_eq!(fake.take_warnings(), [unsupported_warning()]);
+    assert_eq!(
+        told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
+        [exited_unasked_line()]
+    );
+}
+
+/// The stop is seen with the daemon alive and the waiter fails afterwards, while the plan waits: nothing says the
+/// daemon ended, so it is killed, and the stop's record is `Stopped`, with no exit.
+#[skuld::test]
+fn a_waiter_that_fails_while_a_wait_only_plan_waits_gets_the_daemon_killed() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .send_kill_tree(KillReply::Ends);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    assert!(supervisor.bus.request_stop());
+    let mut told = Vec::new();
+
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |end| {
+        told.push(end);
+        daemon.fail_wait();
+    });
+
+    assert_eq!(told, [WaitEnd::Stop]);
+    assert!(
+        matches!(
+            outcome,
+            WaitOutcome::Stopping {
+                root_exited: false,
+                exit_status: None
+            }
+        ),
+        "the daemon is not known to have exited"
+    );
+    assert_eq!(daemon.calls(), [ProcessCall::SendKillTree]);
+    assert!(daemon.killed(), "the daemon was left running");
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_eq!(
+        fake.take_failures(),
+        [format!(
+            "goetia-shim[{ID}]: background wait on child: {}",
+            Chain(&wait_failed())
+        )]
+    );
+}
+
 /// The daemon exits right after the stop is seen, before anything is asked: the stop was seen with the daemon alive,
 /// so it is told as a stop, and the exit is only what the teardown choice rests on.
 #[skuld::test]
@@ -759,7 +893,7 @@ fn a_daemon_that_exited_after_the_stop_was_seen_is_neither_asked_nor_waited_for(
 
     let (outcome, told) = stopped_after_exit(&fake, &daemon, ask_and_wait(Some(HOUR)));
 
-    assert!(matches!(outcome, WaitOutcome::Stopping { root_exited: true }));
+    assert!(matches!(outcome, WaitOutcome::Stopping { root_exited: true, .. }));
     assert_eq!(told, [WaitEnd::Stop]);
     assert_eq!(daemon.calls(), [ProcessCall::SendKillTree]);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
@@ -1022,7 +1156,7 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
         running.join().expect("the supervisor did not panic")
     });
 
-    assert!(matches!(outcome, WaitOutcome::Stopping { root_exited: true }));
+    assert!(matches!(outcome, WaitOutcome::Stopping { root_exited: true, .. }));
     assert_eq!(
         daemon.exit_code(),
         Some(0),
@@ -1068,7 +1202,7 @@ fn at_once_asks_and_waits_for_nothing() {
     let (outcome, _) = stopped_by(&fake, &daemon, StopPlan::AtOnce);
 
     assert!(
-        matches!(outcome, WaitOutcome::Stopping { root_exited: false }),
+        matches!(outcome, WaitOutcome::Stopping { root_exited: false, .. }),
         "the teardown ended it"
     );
     assert_eq!(daemon.calls(), [ProcessCall::SendKillTree]);
