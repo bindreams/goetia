@@ -214,18 +214,15 @@ fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exi
     });
 
     let left = &stopped.left;
-    let exit = stopped.exit.unwrap_or_else(|e| panic!("run: {}
-{left}", e.report()));
+    let exit = stopped.exit.unwrap_or_else(|e| panic!("run: {}\n{left}", e.report()));
     assert!(
         stopped.said.contains("daemon: record=") && stopped.said.contains("stopped"),
-        "the record the program saw, as the stop was accepted, was `stopped`: {}
-{left}",
+        "the record the program saw, as the stop was accepted, was `stopped`: {}\n{left}",
         stopped.said
     );
     assert!(
         exit == Exit::Code(9) || exit == STOPPED,
-        "the program's own code or the stop's, not {exit:?}
-{left}"
+        "the program's own code or the stop's, not {exit:?}\n{left}"
     );
     println!(
         "measured: {}",

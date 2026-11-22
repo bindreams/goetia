@@ -328,11 +328,7 @@ fn a_delete_outcome_that_is_no_deletion_is_an_error() {
 
 /// What `files::read` opens a record with: read, sharing everything.
 fn holding_as_read_does(path: &Path) -> fs::File {
-    OpenOptions::new()
-        .read(true)
-        .share_mode(SHARE_ALL)
-        .open(path)
-        .unwrap()
+    OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path).unwrap()
 }
 
 /// A record is replaced while a reader has the old one open (`files::read` shares read, write and delete):
@@ -358,7 +354,10 @@ fn a_rename_replaces_a_file_another_handle_has_open_and_shares_delete() {
         read(&held_in, OsStr::new("rec.json")).unwrap().as_deref(),
         Some(&b"new"[..])
     );
-    assert!(!dir.path().join("rec.json.tmp").exists(), "nothing of the temp name is left");
+    assert!(
+        !dir.path().join("rec.json.tmp").exists(),
+        "nothing of the temp name is left"
+    );
 }
 
 /// A holder that shares no delete keeps the target: the rename is refused, as `STATUS_SHARING_VIOLATION`

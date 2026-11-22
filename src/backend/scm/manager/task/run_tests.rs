@@ -342,7 +342,11 @@ fn a_first_stopped_record_of_a_run_that_is_listed_on_the_second_read_is_followed
 
     let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
 
-    assert_eq!(run.wait().unwrap(), Exit::Code(3), "the run's own exit, not the first `Stopped`");
+    assert_eq!(
+        run.wait().unwrap(),
+        Exit::Code(3),
+        "the run's own exit, not the first `Stopped`"
+    );
     assert_eq!(
         fake.calls(),
         [
