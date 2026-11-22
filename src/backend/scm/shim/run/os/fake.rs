@@ -259,6 +259,8 @@ struct ProcState {
     dropped: bool,
     /// What happens in the world as the `Fake` spawns the process ([`FakeProcess::when_spawned`]).
     when_spawned: Option<Box<dyn FnOnce() + Send>>,
+    /// What happens in the world as the first failed read of the exit is made ([`FakeProcess::when_the_exit_read_fails`]).
+    when_the_exit_read_fails: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn status(code: i32) -> ExitStatus {
@@ -316,6 +318,7 @@ impl FakeProcess {
                 killed: false,
                 dropped: false,
                 when_spawned: None,
+                when_the_exit_read_fails: None,
             }),
             ended: Condvar::new(),
         }))
@@ -379,6 +382,17 @@ impl FakeProcess {
     /// Every read of whether the process has exited fails.
     pub(crate) fn try_wait_fails(self) -> FakeProcess {
         self.with(|state| state.try_wait_fails = true)
+    }
+
+    /// `effect` happens as the first failed read of the exit is made (with [`FakeProcess::try_wait_fails`]), with no lock
+    /// held: what the world has done by the time the read is tried, such as the waiter's report of the exit. At most one.
+    pub(crate) fn when_the_exit_read_fails(self, effect: impl FnOnce() + Send + 'static) -> FakeProcess {
+        self.with(|state| {
+            assert!(
+                state.when_the_exit_read_fails.replace(Box::new(effect)).is_none(),
+                "`when_the_exit_read_fails` was stated twice"
+            );
+        })
     }
 
     /// The reply to the next `wait_tree_timeout` not yet stated for.
@@ -484,6 +498,11 @@ impl Spawned for Instance {
     fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error> {
         let mut state = lock(&self.proc.state);
         if state.try_wait_fails {
+            let effect = state.when_the_exit_read_fails.take();
+            drop(state);
+            if let Some(effect) = effect {
+                effect();
+            }
             return Err(try_wait_failed());
         }
         let exit = state.exit;

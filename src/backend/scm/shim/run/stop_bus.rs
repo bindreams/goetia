@@ -423,7 +423,8 @@ impl Supervisor {
     /// service reports `STOP_PENDING`, so that SCM never reads it as running while the daemon is being stopped,
     /// and where a task records the stop before the wait that may outlast the shim.
     ///
-    /// **The read** of the process, once, where the stop is seen and before `on_stopping`: a root already gone is
+    /// **The read** of the process, once, where the stop is seen and before `on_stopping` (a read that fails counts as
+    /// gone if the waiter has reported the exit): a root already gone is
     /// told as [`WaitEnd::Exit`], not [`WaitEnd::Stop`], and no plan runs for it; the waiter's report of its exit is
     /// awaited, since it can lag the process. [`WaitOutcome::Stopping`] says whether the root had exited by itself
     /// before the teardown, so a caller can read its exit status.
@@ -570,7 +571,8 @@ impl Supervisor {
         // callers (e.g. a second, redundant SCM stop control) for no reason.
         drop(g);
         // The one read of the live process at the stop, before `on_stopping`: a root already gone is its own exit,
-        // told as one, and no plan runs for it. A failed wait says nothing of the daemon: no read.
+        // told as one, and no plan runs for it. Gone is decided here, once ([`Supervisor::has_exited`]). A failed wait
+        // says nothing of the daemon: no read.
         let mut unreadable_told = false;
         let gone = stopping && wait_failure.is_none() && self.has_exited(child.as_ref(), id, &mut unreadable_told);
         on_stopping(if stopping && !gone {
@@ -583,7 +585,12 @@ impl Supervisor {
         } else {
             // A failed wait says nothing of the daemon, and nothing is watching it: no ask, no wait.
             if stopping && wait_failure.is_none() {
-                self.run_plan(plan, gone, child.as_ref(), id, seen, unreadable_told);
+                if gone {
+                    // Not asked and not waited for; the waiter's report of its exit can lag the process.
+                    self.bus.await_exit_report();
+                } else {
+                    self.run_plan(plan, child.as_ref(), id, seen, unreadable_told);
+                }
             }
             // By the waiter's report now: a daemon that exited, during the plan or before it, is a
             // tree to end, not a process to kill.
@@ -653,22 +660,10 @@ fn grown_pace(pace: Duration) -> Duration {
 }
 
 impl Supervisor {
-    /// What an accepted stop does before the teardown. `gone` is the read of the process the stop was seen with
-    /// ([`Supervisor::wait_for_child_or_stop`]): a root that is gone is not asked, and what it left in the job is not
-    /// given a wait; its report is on its way. `seen` is when the supervisor saw the stop; `unreadable_told` says that a
-    /// failed read of the process was told already.
-    fn run_plan(
-        &self,
-        plan: StopPlan,
-        gone: bool,
-        child: &dyn Spawned,
-        id: &str,
-        seen: Instant,
-        unreadable_told: bool,
-    ) {
-        if gone {
-            return self.bus.await_exit_report();
-        }
+    /// What an accepted stop does before the teardown, for a root that was not gone when the stop was seen
+    /// ([`Supervisor::wait_for_child_or_stop`]). `seen` is when the supervisor saw the stop; `unreadable_told` says that
+    /// a failed read of the process was told already.
+    fn run_plan(&self, plan: StopPlan, child: &dyn Spawned, id: &str, seen: Instant, unreadable_told: bool) {
         match plan {
             StopPlan::AtOnce => {}
             // No cap of goetia's: the stop that Windows delivered ends the program, or Windows ends the shim. The
@@ -761,8 +756,9 @@ impl Supervisor {
         }
     }
 
-    /// Whether the daemon's root has exited, read from the process itself: the waiter's report can lag the exit.
-    /// A read that fails says nothing, and is logged the first time it fails (`told` says it was).
+    /// Whether the daemon's root is gone: the process itself says it has exited (the waiter's report can lag the
+    /// exit), or the read of it failed and the waiter has reported the exit. A failed read is logged the first time
+    /// it fails (`told` says it was); by itself it says nothing.
     fn has_exited(&self, child: &dyn Spawned, id: &str, told: &mut bool) -> bool {
         match child.try_wait() {
             Ok(status) => status.is_some(),
@@ -770,7 +766,7 @@ impl Supervisor {
                 if !std::mem::replace(told, true) {
                     self.log.warning(id, &exit_unreadable(&e));
                 }
-                false
+                self.bus.exit_report() == (true, None)
             }
         }
     }

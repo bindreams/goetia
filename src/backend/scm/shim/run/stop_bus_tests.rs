@@ -712,6 +712,45 @@ fn a_stop_that_finds_the_daemon_gone_is_told_as_its_exit_and_runs_no_plan() {
     }
 }
 
+/// The read of the process fails, and the waiter has reported the exit by the time it does (the effect stands for
+/// that): the daemon is gone all the same. It is told as its exit, neither asked nor waited for, and its tree is
+/// ended as after any exit; the failed read is told once.
+#[skuld::test]
+fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_gone() {
+    for plan in [ask_and_wait(Some(HOUR)), StopPlan::WaitOnly] {
+        let fake = FakeGuard::new();
+        let daemon = FakeProcess::new()
+            .wait(WaitReply::Exits(0))
+            .try_wait_fails()
+            .send_kill_tree(KillReply::Ends);
+        let (supervisor, waiter, child) = launched(&fake, &daemon);
+        let bus = Arc::clone(&supervisor.bus);
+        let _ = daemon.clone().when_the_exit_read_fails(move || bus.await_exit_report());
+        assert!(supervisor.bus.request_stop());
+        let mut told = Vec::new();
+
+        let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end));
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+
+        assert!(
+            matches!(outcome, WaitOutcome::Stopping { root_exited: true }),
+            "{plan:?}"
+        );
+        assert_eq!(told, [WaitEnd::Exit], "{plan:?}");
+        assert_eq!(daemon.calls(), [ProcessCall::SendKillTree], "{plan:?}");
+        assert_eq!(fake.take_failures(), Vec::<String>::new());
+        assert_eq!(
+            fake.take_warnings(),
+            [format!(
+                "goetia-shim[{ID}]: could not read whether the daemon has exited: {}",
+                Chain(&try_wait_failed())
+            )],
+            "{plan:?}: told once"
+        );
+        assert_eq!(fake.take_infos(), Vec::<String>::new(), "{plan:?}: an ask was told");
+    }
+}
+
 /// The daemon exits right after the stop is seen, before anything is asked: the stop was seen with the daemon alive,
 /// so it is told as a stop, and the exit is only what the teardown choice rests on.
 #[skuld::test]

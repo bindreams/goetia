@@ -71,7 +71,7 @@ pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> 
         (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), info.cast::<u8>().add(header).cast::<u16>(), name.len());
     }
-    let mut set = |flags: u32, class| {
+    let set = |flags: u32, class| {
         // SAFETY: `info` is `total` bytes `buffer` holds; the flags are a plain write into its first field.
         unsafe { (*info).Anonymous.Flags = flags };
         let mut block = IO_STATUS_BLOCK::default();
