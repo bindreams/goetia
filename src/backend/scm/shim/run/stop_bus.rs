@@ -677,8 +677,8 @@ impl Supervisor {
 
     /// Ask the daemon's tree to exit, then wait for the whole tree to exit within what is left of `timeout`.
     ///
-    /// The daemon's exit is read from the process itself before every ask: one that has exited is neither asked
-    /// (again) nor waited for. The first ask is told in the log before it is made, so that the line comes before
+    /// The daemon's exit is read before every ask ([`Supervisor::has_exited`]: the process itself, or the waiter's
+    /// report when that read fails): one that has exited is neither asked (again) nor waited for. The first ask is told in the log before it is made, so that the line comes before
     /// whatever the daemon does in answer. What the ask answered decides the rest ([`judge_ask`]); a wait that cannot
     /// be made is logged and the teardown follows at once.
     ///
@@ -757,16 +757,18 @@ impl Supervisor {
     }
 
     /// Whether the daemon's root is gone: the process itself says it has exited (the waiter's report can lag the
-    /// exit), or the read of it failed and the waiter has reported the exit. A failed read is logged the first time
-    /// it fails (`told` says it was); by itself it says nothing.
+    /// exit), or the read of it failed and the waiter has reported the exit. A failed read that the report does not
+    /// settle says nothing, and is logged the first time it fails (`told` says it was); one that the report settles
+    /// is not logged, since the exit is known.
     fn has_exited(&self, child: &dyn Spawned, id: &str, told: &mut bool) -> bool {
         match child.try_wait() {
             Ok(status) => status.is_some(),
             Err(e) => {
-                if !std::mem::replace(told, true) {
+                let reported = self.bus.exit_report() == (true, None);
+                if !reported && !std::mem::replace(told, true) {
                     self.log.warning(id, &exit_unreadable(&e));
                 }
-                self.bus.exit_report() == (true, None)
+                reported
             }
         }
     }

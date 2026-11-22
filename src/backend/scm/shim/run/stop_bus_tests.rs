@@ -714,7 +714,7 @@ fn a_stop_that_finds_the_daemon_gone_is_told_as_its_exit_and_runs_no_plan() {
 
 /// The read of the process fails, and the waiter has reported the exit by the time it does (the effect stands for
 /// that): the daemon is gone all the same. It is told as its exit, neither asked nor waited for, and its tree is
-/// ended as after any exit; the failed read is told once.
+/// ended as after any exit; the failed read is not told, since the report says what it could not.
 #[skuld::test]
 fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_gone() {
     for plan in [ask_and_wait(Some(HOUR)), StopPlan::WaitOnly] {
@@ -741,11 +741,8 @@ fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_go
         assert_eq!(fake.take_failures(), Vec::<String>::new());
         assert_eq!(
             fake.take_warnings(),
-            [format!(
-                "goetia-shim[{ID}]: could not read whether the daemon has exited: {}",
-                Chain(&try_wait_failed())
-            )],
-            "{plan:?}: told once"
+            Vec::<String>::new(),
+            "{plan:?}: the report settles it, so a read that failed has nothing to say"
         );
         assert_eq!(fake.take_infos(), Vec::<String>::new(), "{plan:?}: an ask was told");
     }
