@@ -1603,10 +1603,10 @@ fn a_pre_shutdown_time_of_the_largest_value_is_shown_as_none() {
     let no_timeout = build(&with_stop_action(simple_spec(), written("terminate", None)));
     assert_eq!(no_timeout.preshutdown, millis(u64::from(u32::MAX)));
     assert!(
-        no_timeout
-            .to_string()
-            .contains("PreshutdownTimeout: none (the largest value the field holds)
-"),
+        no_timeout.to_string().contains(
+            "PreshutdownTimeout: none (the largest value the field holds)
+"
+        ),
         "{no_timeout}"
     );
 

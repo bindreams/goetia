@@ -591,17 +591,11 @@ fn stopped_after_exit(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) ->
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
     let bus = Arc::clone(&supervisor.bus);
-    let outcome = supervisor.wait_for_child_or_stop(
-        waiter,
-        &child,
-        ID,
-        plan,
-        |event| {
-            told.extend(began(event));
-            daemon.end(0);
-            bus.await_exit_report();
-        },
-    );
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |event| {
+        told.extend(began(event));
+        daemon.end(0);
+        bus.await_exit_report();
+    });
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, told)
 }
@@ -698,13 +692,9 @@ fn began_is_told_a_stop_from_an_exit() {
     let daemon = FakeProcess::new().wait(WaitReply::Exits(0));
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     let mut told = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(
-        waiter,
-        &child,
-        ID,
-        ask_and_wait(Some(HOUR)),
-        |event| told.extend(began(event)),
-    );
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |event| {
+        told.extend(began(event))
+    });
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(told, [WaitEnd::Exit], "the program's own exit was told as a stop");
@@ -863,16 +853,10 @@ fn a_waiter_that_fails_while_a_wait_only_plan_waits_gets_the_daemon_killed() {
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
 
-    let outcome = supervisor.wait_for_child_or_stop(
-        waiter,
-        &child,
-        ID,
-        StopPlan::WaitOnly,
-        |event| {
-            told.extend(began(event));
-            daemon.fail_wait();
-        },
-    );
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |event| {
+        told.extend(began(event));
+        daemon.fail_wait();
+    });
 
     assert_eq!(told, [WaitEnd::Stop]);
     assert!(
@@ -987,17 +971,11 @@ fn stopped_recording_progress(fake: &FakeGuard, daemon: &FakeProcess, plan: Stop
     let (supervisor, waiter, child) = launched(fake, daemon);
     assert!(supervisor.bus.request_stop());
     let mut waits = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(
-        waiter,
-        &child,
-        ID,
-        plan,
-        |event| {
-            if event == StopEvent::Progress {
-                waits.push(fake.calls(Op::WaitTree));
-            }
-        },
-    );
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |event| {
+        if event == StopEvent::Progress {
+            waits.push(fake.calls(Op::WaitTree));
+        }
+    });
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, waits)
 }
@@ -1276,18 +1254,12 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
 
     let outcome = std::thread::scope(|scope| {
         let running = scope.spawn(|| {
-            supervisor.wait_for_child_or_stop(
-                waiter,
-                &child,
-                ID,
-                StopPlan::WaitOnly,
-                |event| match event {
-                    StopEvent::Began(end) => stopping.send(end).expect("the test is listening"),
-                    StopEvent::Progress => {
-                        progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                },
-            )
+            supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |event| match event {
+                StopEvent::Began(end) => stopping.send(end).expect("the test is listening"),
+                StopEvent::Progress => {
+                    progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
         });
         assert!(supervisor.bus.request_stop());
         assert_eq!(told.recv().expect("`Began` was told"), WaitEnd::Stop);

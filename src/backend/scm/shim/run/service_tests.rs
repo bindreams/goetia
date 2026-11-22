@@ -34,7 +34,8 @@ use crate::backend::scm::shim::run::os::fake::{
 };
 use crate::backend::scm::shim::run::stop_bus::{StopEvent, WaitEnd};
 use crate::backend::scm::shim::run::test_support::{
-    assert_failures, assert_one_failure, began, chained, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
+    assert_failures, assert_one_failure, began, chained, fallback_refused_failure, not_found, supervisor,
+    tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
@@ -801,24 +802,10 @@ fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) 
 fn run_daemon_is_run_pass_then_reported() {
     for ending in endings() {
         let outcome = pass_of(&ending, |supervisor, on_running| {
-            run_pass(
-                &kill_spec(),
-                StopPlan::AtOnce,
-                supervisor,
-                ID,
-                on_running,
-                |_| {},
-            )
+            run_pass(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {})
         });
         let reported = pass_of(&ending, |supervisor, on_running| {
-            super::run_daemon(
-                &kill_spec(),
-                StopPlan::AtOnce,
-                supervisor,
-                ID,
-                on_running,
-                |_| {},
-            )
+            super::run_daemon(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {})
         });
 
         assert_eq!(outcome, ending.outcome);
@@ -993,16 +980,9 @@ fn run_recording_stopping(
     on_running: impl FnOnce(),
 ) -> (Reported, Vec<usize>) {
     let mut stopping = Vec::new();
-    let reported = super::run_daemon(
-        daemon,
-        StopPlan::of(daemon),
-        supervisor,
-        ID,
-        on_running,
-        |_| {
-            stopping.push(fake.calls(Op::SendKillTree));
-        },
-    );
+    let reported = super::run_daemon(daemon, StopPlan::of(daemon), supervisor, ID, on_running, |_| {
+        stopping.push(fake.calls(Op::SendKillTree));
+    });
     (reported, stopping)
 }
 
@@ -1076,7 +1056,11 @@ fn a_run_reports_progress_while_its_stop_waits() {
     assert_eq!(reported, Reported::Clean);
     assert_eq!(
         events,
-        [StopEvent::Began(WaitEnd::Stop), StopEvent::Progress, StopEvent::Progress],
+        [
+            StopEvent::Began(WaitEnd::Stop),
+            StopEvent::Progress,
+            StopEvent::Progress
+        ],
         "began before any progress, and a progress after each slice but the last"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
