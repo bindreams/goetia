@@ -7,10 +7,40 @@
 //! `--goetia-task`, the task's id and the registration's token ([`requested`]), and anything else
 //! is service mode. Task mode never reports to SCM.
 //!
-//! **A stop** reaches the shim as `CTRL_CLOSE_EVENT` on its console, from `IRunningTask::Stop`.
-//! The handler is registered before anything is read, so a stop at any point is held by the bus. It
-//! only requests the stop and then never returns: Windows ends the process about a second after the
-//! event whatever the handler does, and the run thread alone ends it with the run's own code.
+//! **A stop** reaches the shim as `CTRL_CLOSE_EVENT` on its console, from `IRunningTask::Stop`, and
+//! reaches the program too, on the console they share: goetia sends nothing. The handler is registered
+//! before anything is read, so a stop at any point is held by the bus. It only requests the stop and then
+//! never returns: Windows ends the process about a second after the event whatever the handler does, and
+//! the run thread alone ends it with the run's own code.
+//!
+//! **The order of the event** (measured on Windows Server 2025, build 26100): it visits the processes on
+//! the console one at a time, newest first, and enters the next process's handler only after the previous
+//! process has ended. The second is one bound for the whole console, counted from the stop. So for a
+//! program on the shim's console the shim's handler is entered only after the program has ended, and the
+//! shim's waiter had seen the exit before that; a program that never leaves its handler is never followed by
+//! the shim's handler, and Windows ends the shim at the end of the second, its job closes and the program
+//! dies with it: nothing is recorded.
+//!
+//! **The record is the program's exit whenever the shim had its exit status, whichever thread came first.**
+//! [`RunOutcome::Stopped`] is only for a stop whose program the shim never saw exit: no spawn, a failed wait, a
+//! program its own teardown ended, or Windows ending the shim, or the final write failing, after the provisional
+//! file was written. What the run thread does with an accepted stop, in this order:
+//!
+//! - it reads the program once ([`Supervisor::wait_for_child_or_stop`]); one that is gone is its own exit, and
+//!   no provisional file is written first;
+//! - for a program that is alive as the stop is heard (one that is not on the shim's console, a GUI-subsystem
+//!   program or one that detached, and the window between the look before the spawn and the spawn), it writes
+//!   the provisional file of its `Stopped` first ([`Pin::write_stopping`]), since Windows may end the shim
+//!   before anything later; it waits for the program's own exit, with no cap of goetia's
+//!   ([`StopPlan::WaitOnly`]);
+//! - it tears down what the program left and ends: with the program's own exit when the shim saw it exit, with
+//!   [`STOPPED_EXIT`] when it did not, with the incomplete stop's code when the teardown fails.
+//!
+//! A shim that Windows ends first leaves the provisional file, which a reader takes as `Stopped`: a stop was
+//! accepted, not that the tree ended; the Job Object's `KILL_ON_JOB_CLOSE` ends the tree. A stop accepted before
+//! the spawn starts no program, which the close event would never reach: the bus is looked at right before the
+//! spawn, and the one stop that arrives between that look and the spawn starts the program, which runs until it
+//! exits or Windows ends the shim and the job closes over it.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
@@ -26,14 +56,14 @@ use super::exit;
 use super::logging::Log;
 use super::os::Real;
 use super::service::{PassOutcome, SpecStop, run_pass, set_daemon_log};
-use super::stop_bus::{StopBus, StopPlan, Supervisor};
+use super::stop_bus::{StopBus, StopPlan, Supervisor, WaitEnd};
 use crate::backend::scm::exit_status::Reported;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::Registered;
 use crate::backend::scm::manager::task::clock::file_time_of;
 use crate::backend::scm::manager::task::{Com, TaskApi};
-use crate::backend::scm::runs::{Pin, RunOutcome, RunRecord, Runs};
+use crate::backend::scm::runs::{Pin, RunOutcome, RunRecord, Runs, stopping_name};
 use crate::backend::scm::task_xml::{TaskXml, Token, ending, extract_from_data};
 use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Id};
@@ -82,8 +112,8 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 }
 
 /// Runs the task `id` as the process `own_pid`, started under the registration `token`, and returns the
-/// code the process is to end with: the program's own, or the stop's ([`STOPPED_EXIT`]), or the
-/// incomplete stop's, or a shim failure's.
+/// code the process is to end with: the program's own, or the stop's ([`STOPPED_EXIT`]) when the shim never saw the
+/// program exit, or the incomplete stop's, or a shim failure's.
 ///
 /// The program starts only when every step below passed, in this order; a step that fails logs the case
 /// (the default log when it is held, the Event Log always), releases what the shim holds and ends the
@@ -102,12 +132,17 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 /// 4. Waits for its own instance by `own_pid` to be listed ([`own_instance`]); a listing that cannot be
 ///    read, and a registration that went while it waited, end the shim. A stop during the wait starts no
 ///    program: the run is recorded stopped and ends with the stop's code. A stop after the wait is held by
-///    the bus, and the program is spawned and then killed.
+///    the bus until step 6 looks at it.
 /// 5. Looks for the removal's marker again ([`Runs::is_closed`]), before anything opens a log or spawns:
 ///    a marker that stands, or a look that cannot be made, ends the shim.
-/// 6. Sets the diagnostics log, writes the run's marker as the first line of `logs` when there is one, runs
-///    the program and writes the one record, under the pin, which is released as the record is renamed in
-///    place ([`Runs::write`]). A record that cannot be written is logged and does not change the code.
+/// 6. Sets the diagnostics log, writes the run's marker as the first line of `logs` when there is one, looks at
+///    the bus once more and, for a stop accepted by then, starts no program: the record is `Stopped`, as in
+///    step 4. Otherwise runs the program and writes its record, under the pin, which is released as the
+///    record is renamed in place ([`Runs::write`]). An accepted stop writes the provisional file
+///    ([`Pin::write_stopping`]) before the wait, with the pin lent, so that the run stays one that is alive; the
+///    record is written to its own name after it. A program that is gone when the stop is seen gets no such
+///    file: its exit is the one record ([`ended_as`]). A record that cannot be written is logged and does not
+///    change the code.
 pub(super) fn run_in(
     id: &str,
     token: Option<Token>,
@@ -198,7 +233,37 @@ pub(super) fn run_in(
     }
 
     let started = file_time_now();
-    let (record, code) = ended_as(run_pass(&spec, StopPlan::of(&spec), supervisor, id, || {}, |_| {}));
+    // Right before the spawn: a program started after the close event never receives it. A stop that arrives
+    // after this look still starts the program (see the module's doc).
+    if supervisor.bus.stop_accepted() {
+        record_run(log, id, runs, pin, Some(instance), started, Some(RunOutcome::Stopped));
+        return STOPPED_EXIT;
+    }
+    let outcome = run_pass(
+        &spec,
+        StopPlan::of(&spec),
+        supervisor,
+        id,
+        || {},
+        |end| {
+            // Before the wait, which Windows may cut short by ending the shim; the pin stays held, since the run is
+            // alive.
+            if end == WaitEnd::Stop
+                && let Err(e) = pin.write_stopping(&instance, started)
+            {
+                log.failure(
+                    id,
+                    &format!(
+                        "write the provisional file {} in the run records {}: {}",
+                        stopping_name(&instance).to_string_lossy(),
+                        runs.dir().display(),
+                        Chain(&e)
+                    ),
+                );
+            }
+        },
+    );
+    let (record, code) = ended_as(outcome);
     record_run(log, id, runs, pin, Some(instance), started, record);
     code
 }
@@ -430,7 +495,9 @@ fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &Insta
 fn ended_as(outcome: PassOutcome) -> (Option<RunOutcome>, u32) {
     match outcome {
         PassOutcome::Exited(Some(code)) => (Some(RunOutcome::Exited(code as u32)), code as u32),
-        PassOutcome::Stopped => (Some(RunOutcome::Stopped), STOPPED_EXIT),
+        // See the module doc: the record is the program's exit when the shim saw it.
+        PassOutcome::Stopped(Some(code)) => (Some(RunOutcome::Exited(code as u32)), code as u32),
+        PassOutcome::Stopped(None) => (Some(RunOutcome::Stopped), STOPPED_EXIT),
         // The program may be running: a launch that may have started it says so as a stop does.
         PassOutcome::IncompleteStop | PassOutcome::NotRun(Reported::IncompleteStop) => (
             Some(RunOutcome::IncompleteStop),

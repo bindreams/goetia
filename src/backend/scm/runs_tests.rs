@@ -157,8 +157,10 @@ fn a_record_round_trips_by_its_instance() {
     );
 }
 
+/// Nothing is renamed onto a name that exists: a second record for an instance is refused, whoever holds the
+/// first, and the first is as it was.
 #[skuld::test]
-fn a_second_write_for_an_instance_replaces_its_record() {
+fn a_second_write_for_an_instance_is_refused_and_leaves_its_record() {
     let (_dir, runs) = fixture();
     let first = RunRecord {
         outcome: RunOutcome::Stopped,
@@ -168,12 +170,13 @@ fn a_second_write_for_an_instance_replaces_its_record() {
         outcome: RunOutcome::IncompleteStop,
         ..first.clone()
     };
-
     runs.write(&first, None).unwrap();
-    runs.write(&second, None).unwrap();
 
-    assert_eq!(runs.read(&first.instance).unwrap(), Some(second));
-    assert_eq!(names(&runs), [file_of(&first.instance)]);
+    let refused = runs.write(&second, None).unwrap_err();
+
+    assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused:?}");
+    assert_eq!(runs.read(&first.instance).unwrap(), Some(first.clone()));
+    assert_eq!(names(&runs), [file_of(&first.instance)], "no temp file is left");
 }
 
 #[skuld::test]
@@ -928,6 +931,563 @@ fn write_with_its_own_pin_prunes_and_is_not_blocked_by_it() {
     assert_eq!(problems, Vec::<String>::new());
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
     assert_eq!(names(&runs), [file_of(&instance(2))], "the pin is gone");
+}
+
+/// The provisional file of the run `instance`'s first `Stopped`.
+fn stopping_file_of(instance: &InstanceId) -> String {
+    format!("{}.stopping", instance.hex())
+}
+
+/// The run `n`'s record as a first `Stopped` writes it.
+fn stopped(n: u8, started: u64) -> RunRecord {
+    RunRecord {
+        outcome: RunOutcome::Stopped,
+        ..record(n, started)
+    }
+}
+
+/// A first `Stopped` goes to a file of its own beside where the record will be, keeps the writer's pin and
+/// prunes nothing: the run is still alive, so "no pin held" keeps meaning "no run alive".
+#[skuld::test]
+fn write_stopping_leaves_a_provisional_file_keeps_the_pin_and_prunes_nothing() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let pin = runs.hold().unwrap();
+
+    pin.write_stopping(&instance(2), 2).unwrap();
+
+    assert!(runs.dir.join(stopping_file_of(&instance(2))).exists());
+    assert!(!runs.dir.join(file_of(&instance(2))).exists(), "no record is written");
+    assert_eq!(instances_kept(&runs, &[instance(1)]), [true], "a stopping write pruned");
+    assert!(
+        names(&runs).iter().all(|name| !name.ends_with(".tmp")),
+        "no temp file is left: {:?}",
+        names(&runs)
+    );
+    assert!(runs.held_pin().unwrap().is_some(), "a stopping write released the pin");
+    drop(pin);
+    assert_eq!(runs.held_pin().unwrap(), None);
+}
+
+/// The file lands where the pin's handle is, not at the path: the directory that became a link after the pin's
+/// handle opened it refuses the write, and nothing is made in the link's target. (The pin's file is held elsewhere:
+/// a directory with a file in it cannot become a link.)
+#[skuld::test]
+fn write_stopping_writes_through_the_pins_handle_and_not_the_path() {
+    let (_dir, runs) = fixture();
+    let (held, target) = held_and_then_linked(&runs);
+    let pin = Pin {
+        _file: tempfile::tempfile().unwrap(),
+        dir: held,
+        name: fresh_pin_name(),
+        listing: None,
+    };
+
+    let refused = pin.write_stopping(&instance(1), 1).unwrap_err();
+
+    assert_eq!(refused.kind(), io::ErrorKind::NotADirectory, "{refused}");
+    assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1, "only victim.txt");
+}
+
+/// The provisional file is written to a temp file of its own name, which no write of the record uses: another handle
+/// holds it (a scanner, say), so the write fails and cannot remove it, and the run's record lands all the same, to its
+/// own temp name.
+#[skuld::test]
+fn a_provisional_write_that_fails_at_its_temp_file_does_not_stop_the_record() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    let temp = runs.dir.join(format!("{}.stopping.tmp", instance(1).hex()));
+    let holder = temp_held(&runs, &temp);
+
+    let failed = pin.write_stopping(&instance(1), 1).unwrap_err();
+    let exited = record(1, 1);
+    let problems = runs.write(&exited, Some(pin)).unwrap();
+
+    assert!(files::is_sharing_violation(&failed), "{failed}");
+    assert_eq!(
+        problems,
+        Vec::<String>::new(),
+        "a file that is held is for the next prune"
+    );
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(exited));
+    assert!(temp.exists(), "the held temp file is left");
+    drop(holder);
+    runs.write(&record(2, 2), None).unwrap();
+    assert_eq!(names(&runs), [file_of(&instance(2))], "the next prune removes it");
+}
+
+/// A failed write whose temp file cannot be removed either says so in its error, which the caller logs, and keeps
+/// the kind of the write's own failure.
+#[skuld::test]
+fn a_failed_write_whose_cleanup_failed_says_so_and_keeps_its_kind() {
+    let failed = io::Error::new(io::ErrorKind::AlreadyExists, "the name exists");
+    let temp = OsStr::new("x.stopping.tmp");
+
+    let told = after_cleanup(failed, temp, DeleteOutcome::Failed(io::Error::other("access denied")));
+
+    assert_eq!(told.kind(), io::ErrorKind::AlreadyExists);
+    let text = told.to_string();
+    assert!(
+        text.contains("the name exists") && text.contains("x.stopping.tmp") && text.contains("access denied"),
+        "{text}"
+    );
+    for removed in [DeleteOutcome::Deleted, DeleteOutcome::Held] {
+        let failed = io::Error::new(io::ErrorKind::AlreadyExists, "the name exists");
+        assert_eq!(after_cleanup(failed, temp, removed).to_string(), "the name exists");
+    }
+}
+
+/// A provisional file with no record beside it is a run that was told to stop and never recorded how it ended.
+#[skuld::test]
+fn read_of_a_provisional_file_alone_is_stopped_with_its_started() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    pin.write_stopping(&instance(1), 7).unwrap();
+
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(stopped(1, 7)));
+}
+
+/// The record wins over a provisional file beside it.
+#[skuld::test]
+fn read_gives_the_record_when_there_is_one_beside_the_provisional_file() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    pin.write_stopping(&instance(1), 7).unwrap();
+    let exited = record(1, 7);
+    // Another pin is held, so the write that lands the record prunes nothing and leaves the provisional file.
+    let other = runs.hold().unwrap();
+    runs.write(&exited, Some(pin)).unwrap();
+
+    assert!(runs.dir.join(stopping_file_of(&instance(1))).exists());
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(exited));
+    drop(other);
+}
+
+#[skuld::test]
+fn read_of_an_instance_with_neither_file_is_none() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(2, 2), None).unwrap();
+
+    assert_eq!(runs.read(&instance(1)).unwrap(), None);
+}
+
+/// A directory where the provisional file of `instance` is, so that it cannot be read. (A handle held open without
+/// sharing would do too, but the files of this directory do not refuse a read to one on this machine.)
+fn provisional_unreadable(runs: &Runs, instance: &InstanceId) {
+    directory_with_a_file(&runs.dir.join(stopping_file_of(instance)));
+}
+
+/// A provisional file that cannot be read does not hide the record beside it: the record is the answer.
+#[skuld::test]
+fn read_gives_the_record_when_the_provisional_file_cannot_be_read() {
+    let (_dir, runs) = fixture();
+    let exited = record(1, 7);
+    runs.write(&exited, None).unwrap();
+    provisional_unreadable(&runs, &instance(1));
+
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(exited));
+}
+
+/// With no record, what the provisional file's read gave is the answer, its error included.
+#[skuld::test]
+fn read_is_the_error_of_a_provisional_file_that_cannot_be_read_when_there_is_no_record() {
+    let (_dir, runs) = fixture();
+    provisional_unreadable(&runs, &instance(1));
+
+    let read = runs.read(&instance(1)).unwrap_err();
+
+    assert_eq!(read.kind(), io::ErrorKind::PermissionDenied, "{read}");
+}
+
+/// The name of the one pin `runs`' directory holds.
+fn the_pin_of(runs: &Runs) -> String {
+    let mut pins: Vec<String> = names(runs).into_iter().filter(|name| name.ends_with(".pin")).collect();
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    pins.remove(0)
+}
+
+/// A provisional file holds its run's `started` and the name of its writer's own pin, and nothing else: a provisional
+/// file is always `Stopped`, and the pin is what says whether its run is alive.
+#[skuld::test]
+fn write_stopping_stores_the_start_and_its_own_pins_name() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+
+    pin.write_stopping(&instance(1), 7).unwrap();
+
+    let text = fs::read_to_string(runs.dir.join(stopping_file_of(&instance(1)))).unwrap();
+    assert_eq!(text, format!(r#"{{"started":7,"pin":"{}"}}"#, the_pin_of(&runs)));
+}
+
+/// A provisional file with an outcome in it is not what the shim writes (an earlier form, never released): it is a
+/// corrupt record, reported and not read as `Stopped`.
+#[skuld::test]
+fn a_provisional_file_with_an_outcome_field_is_a_corrupt_record() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    let named = the_pin_of(&runs);
+    let file = runs.dir.join(stopping_file_of(&instance(1)));
+    for text in [
+        r#"{"started":1,"outcome":"stopped"}"#.to_owned(),
+        format!(r#"{{"started":1,"outcome":"stopped","pin":"{named}"}}"#),
+    ] {
+        let _ = fs::remove_file(&file);
+        fs::write(&file, text.as_bytes()).unwrap();
+
+        let read = runs.read(&instance(1)).unwrap_err();
+
+        assert_eq!(read.kind(), io::ErrorKind::Other, "{text}");
+    }
+    drop(pin);
+}
+
+/// Another program holds the provisional file open without sharing delete (a scanner, say). The record is written
+/// to a name nothing holds, so it lands at once, and the held provisional file is left for a later prune.
+#[skuld::test]
+fn a_final_write_lands_while_another_handle_holds_the_provisional_file_without_sharing_delete() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    pin.write_stopping(&instance(1), 1).unwrap();
+    let provisional = runs.dir.join(stopping_file_of(&instance(1)));
+    let holder = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&provisional)
+        .unwrap();
+    let exited = record(1, 1);
+
+    let problems = runs.write(&exited, Some(pin)).unwrap();
+
+    assert_eq!(
+        problems,
+        Vec::<String>::new(),
+        "a file that is held is for the next prune"
+    );
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(exited));
+    assert!(provisional.exists(), "the held provisional file is left");
+    drop(holder);
+    runs.write(&record(2, 2), None).unwrap();
+    assert_eq!(names(&runs), [file_of(&instance(2))], "the next prune removes it");
+}
+
+/// With no pin held a write removes every record but its own, every temp file and every provisional file, its
+/// own run's too: its record has landed, and the record wins.
+#[skuld::test]
+fn without_a_pin_a_write_prunes_every_provisional_file_the_writers_own_too() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    pin.write_stopping(&instance(1), 1).unwrap();
+    pin.write_stopping(&instance(2), 2).unwrap();
+    runs.write(&record(3, 3), None).unwrap();
+    fs::write(runs.dir.join(format!("{}.json.tmp", instance(4).hex())), "").unwrap();
+    drop(pin);
+
+    runs.write(&record(1, 1), None).unwrap();
+
+    assert_eq!(names(&runs), [file_of(&instance(1))]);
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(record(1, 1)));
+}
+
+/// With a pin held no operation deletes a provisional file, a leftover one included: the record wins.
+#[skuld::test]
+fn with_a_pin_held_a_write_prunes_no_provisional_file() {
+    let (_dir, runs) = fixture();
+    let own = runs.hold().unwrap();
+    own.write_stopping(&instance(1), 1).unwrap();
+    own.write_stopping(&instance(2), 2).unwrap();
+    let other = runs.hold().unwrap();
+
+    runs.write(&record(1, 1), Some(own)).unwrap();
+    runs.write(&record(3, 3), None).unwrap();
+
+    assert!(
+        runs.dir.join(stopping_file_of(&instance(1))).exists(),
+        "the writer's own"
+    );
+    assert!(runs.dir.join(stopping_file_of(&instance(2))).exists(), "another run's");
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(record(1, 1)), "the record wins");
+    drop(other);
+}
+
+/// A provisional file the pin's listing already held is not new to its holder; one that came after it is.
+#[skuld::test]
+fn appeared_does_not_list_a_provisional_file_the_pin_listed_and_lists_one_that_came_after() {
+    let (_dir, runs) = fixture();
+    let first = runs.hold().unwrap();
+    first.write_stopping(&instance(1), 1).unwrap();
+    let pin = runs.pin().unwrap();
+    assert_eq!(pin.appeared().unwrap(), Vec::<RunRecord>::new());
+
+    first.write_stopping(&instance(2), 2).unwrap();
+
+    assert_eq!(pin.appeared().unwrap(), [stopped(2, 2)]);
+}
+
+/// A record that lands after a provisional file the pin listed is new to it: the run it ended is the one the
+/// holder waits for.
+#[skuld::test]
+fn appeared_lists_the_record_that_lands_after_a_listed_provisional_file() {
+    let (_dir, runs) = fixture();
+    let own = runs.hold().unwrap();
+    own.write_stopping(&instance(1), 1).unwrap();
+    let pin = runs.pin().unwrap();
+
+    runs.write(&record(1, 1), Some(own)).unwrap();
+
+    assert_eq!(pin.appeared().unwrap(), [record(1, 1)]);
+}
+
+/// One entry per instance: the record when there is one, else the provisional file.
+#[skuld::test]
+fn appeared_lists_one_entry_per_instance_the_record_over_the_provisional_file() {
+    let (_dir, runs) = fixture();
+    let pin = runs.pin().unwrap();
+    let own = runs.hold().unwrap();
+    own.write_stopping(&instance(1), 1).unwrap();
+    own.write_stopping(&instance(2), 2).unwrap();
+    runs.write(&record(1, 1), Some(own)).unwrap();
+
+    assert_eq!(pin.appeared().unwrap(), [record(1, 1), stopped(2, 2)]);
+}
+
+/// A provisional file that cannot be read does not keep `appeared` from listing the record beside it.
+#[skuld::test]
+fn appeared_lists_the_record_when_the_provisional_file_beside_it_cannot_be_read() {
+    let (_dir, runs) = fixture();
+    let pin = runs.pin().unwrap();
+    runs.write(&record(1, 1), None).unwrap();
+    provisional_unreadable(&runs, &instance(1));
+
+    assert_eq!(pin.appeared().unwrap(), [record(1, 1)]);
+}
+
+/// A provisional file names its writer's pin, and a reader waits for that name: a pin's name must not come again
+/// after its holder is gone, or the reader would wait for another run's pin. The name is 128 random bits.
+#[skuld::test]
+fn a_pins_name_is_a_128_bit_random_one_never_taken_again() {
+    let (_dir, runs) = fixture();
+    let mut seen = BTreeSet::new();
+
+    for _ in 0..64 {
+        let pin = runs.hold().unwrap();
+        let name = the_pin_of(&runs);
+        let digits = name
+            .strip_prefix("pin-")
+            .and_then(|rest| rest.strip_suffix(".pin"))
+            .unwrap_or_else(|| panic!("{name}"));
+        assert!(
+            digits.len() == 32 && digits.bytes().all(|b| b.is_ascii_hexdigit()),
+            "32 hex digits: {name}"
+        );
+        assert!(seen.insert(name), "a name came again after its pin was gone");
+        drop(pin);
+    }
+}
+
+// the settling read ===================================================================================================
+
+/// The pause of a read that has nothing to wait for.
+fn no_pause() {
+    panic!("the writer's pin is not held, so there is nothing to wait for");
+}
+
+/// A reader's pin ([`Runs::pin`], as a `run` holds one) and the pin of the shim of the run `1`, which has written its
+/// provisional file (`started` 7) and is alive.
+fn a_run_that_heard_its_stop(runs: &Runs) -> (Pin, Pin) {
+    let reader = runs.pin().unwrap();
+    let writer = runs.hold().unwrap();
+    writer.write_stopping(&instance(1), 7).unwrap();
+    (reader, writer)
+}
+
+/// A record is the answer, and nothing is waited for.
+#[skuld::test]
+fn the_settling_read_gives_the_record_when_there_is_one() {
+    let (_dir, runs) = fixture();
+    let (reader, writer) = a_run_that_heard_its_stop(&runs);
+    let exited = record(1, 7);
+    runs.write(&exited, Some(writer)).unwrap();
+
+    assert_eq!(reader.settle(&instance(1), no_pause).unwrap(), Some(exited));
+}
+
+/// The shim's pin is held, so the run is alive: the read waits, and gives the record that lands while it does.
+#[skuld::test]
+fn the_settling_read_waits_for_a_held_writer_pin_and_gives_the_record_that_lands_meanwhile() {
+    let (_dir, runs) = fixture();
+    let (reader, writer) = a_run_that_heard_its_stop(&runs);
+    let exited = record(1, 7);
+    let mut writer = Some(writer);
+    let mut pauses = 0;
+
+    // The record lands, and the pin goes with the write, when the read says it waits.
+    let read = reader
+        .settle(&instance(1), || {
+            pauses += 1;
+            runs.write(&exited, writer.take()).unwrap();
+        })
+        .unwrap();
+
+    assert_eq!(pauses, 1, "the read waited for the pin once");
+    assert_eq!(read, Some(exited));
+}
+
+/// The same, and the shim is ended before it records: the provisional file's `Stopped` is the answer.
+#[skuld::test]
+fn the_settling_read_waits_for_a_held_writer_pin_and_gives_stopped_when_no_record_lands() {
+    let (_dir, runs) = fixture();
+    let (reader, writer) = a_run_that_heard_its_stop(&runs);
+    let mut writer = Some(writer);
+    let mut pauses = 0;
+
+    let read = reader
+        .settle(&instance(1), || {
+            pauses += 1;
+            drop(writer.take());
+        })
+        .unwrap();
+
+    assert_eq!(pauses, 1);
+    assert_eq!(read, Some(stopped(1, 7)));
+}
+
+/// The named pin is gone already (the shim was ended): the read does not wait.
+#[skuld::test]
+fn the_settling_read_of_a_provisional_file_whose_pin_is_gone_gives_stopped_at_once() {
+    let (_dir, runs) = fixture();
+    let (reader, writer) = a_run_that_heard_its_stop(&runs);
+    drop(writer);
+
+    assert_eq!(reader.settle(&instance(1), no_pause).unwrap(), Some(stopped(1, 7)));
+}
+
+/// A pin that is a file nothing holds, as a power cut leaves one, is not held: deleted by the asking, and the run is
+/// not alive.
+#[skuld::test]
+fn the_settling_read_takes_a_pin_file_nothing_holds_as_a_run_that_is_gone() {
+    let (_dir, runs) = fixture();
+    let reader = runs.pin().unwrap();
+    let named = fresh_pin_name();
+    fs::write(runs.dir.join(&named), "").unwrap();
+    fs::write(
+        runs.dir.join(stopping_file_of(&instance(1))),
+        format!(r#"{{"started":7,"pin":"{named}"}}"#),
+    )
+    .unwrap();
+
+    assert_eq!(reader.settle(&instance(1), no_pause).unwrap(), Some(stopped(1, 7)));
+    assert!(
+        !runs.dir.join(&named).exists(),
+        "the stale pin was deleted by the asking"
+    );
+}
+
+/// No file of the run: none.
+#[skuld::test]
+fn the_settling_read_of_a_run_with_no_file_is_none() {
+    let (_dir, runs) = fixture();
+    let reader = runs.pin().unwrap();
+
+    assert_eq!(reader.settle(&instance(1), no_pause).unwrap(), None);
+}
+
+/// A named pin whose state cannot be told may be held: an error that names it, and no answer.
+#[skuld::test]
+fn the_settling_read_of_a_pin_it_cannot_judge_is_an_error_naming_it() {
+    let (_dir, runs) = fixture();
+    let reader = runs.pin().unwrap();
+    let named = fresh_pin_name();
+    // A directory by a pin's name: a delete of it fails, and says nothing of a handle.
+    directory_with_a_file(&runs.dir.join(&named));
+    fs::write(
+        runs.dir.join(stopping_file_of(&instance(1))),
+        format!(r#"{{"started":7,"pin":"{named}"}}"#),
+    )
+    .unwrap();
+
+    let failed = reader.settle(&instance(1), no_pause).unwrap_err();
+
+    assert!(failed.to_string().contains(&named), "{failed}");
+    assert!(!files::is_sharing_violation(&failed), "{failed}");
+}
+
+/// A provisional file is the task's account's to write, and the pin it names is deleted to tell whether it is held:
+/// a name that is no pin of goetia's is a corrupt file, and nothing is deleted for it.
+#[skuld::test]
+fn a_provisional_file_that_names_what_is_no_pin_of_goetias_is_corrupt_and_deletes_nothing() {
+    let (_dir, runs) = fixture();
+    let reader = runs.pin().unwrap();
+    fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
+    for named in ["pin-stale.pin", r"..\victim.pin", "pin-0123.pin", "victim.json", ""] {
+        let text = serde_json::json!({ "started": 7, "pin": named }).to_string();
+        let file = runs.dir.join(stopping_file_of(&instance(1)));
+        let _ = fs::remove_file(&file);
+        fs::write(&file, text).unwrap();
+
+        let settled = reader.settle(&instance(1), no_pause).unwrap_err();
+        let read = runs.read(&instance(1)).unwrap_err();
+
+        assert_eq!(settled.kind(), io::ErrorKind::Other, "{named:?}");
+        assert_eq!(read.kind(), io::ErrorKind::Other, "{named:?}");
+        assert!(runs.dir.join("pin-stale.pin").exists(), "{named:?}: a file was deleted");
+    }
+}
+
+/// The reader holds its own pin, so a provisional file that names it would be held for ever: no run's shim writes
+/// one, and it is a corrupt record at once, not a wait.
+#[skuld::test]
+fn a_provisional_file_that_names_the_readers_own_pin_is_corrupt_and_is_not_waited_for() {
+    let (_dir, runs) = fixture();
+    let reader = runs.pin().unwrap();
+    reader.write_stopping(&instance(1), 7).unwrap();
+
+    let settled = reader.settle(&instance(1), no_pause).unwrap_err();
+
+    assert_eq!(settled.kind(), io::ErrorKind::Other);
+    assert!(settled.to_string().contains("own pin"), "{settled}");
+}
+
+/// A provisional file is a file goetia made: the removal takes it with the rest.
+#[skuld::test]
+fn remove_all_removes_a_provisional_file() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    pin.write_stopping(&instance(1), 1).unwrap();
+    drop(pin);
+
+    runs.remove_all(no_note).unwrap();
+
+    assert!(!runs.dir.exists());
+}
+
+/// A provisional file has its own kind in a listing, and a name that is not an instance's is no provisional file.
+#[skuld::test]
+fn entries_tell_a_provisional_file_from_a_record_and_from_a_name_that_is_neither() {
+    let (_dir, runs) = fixture();
+    fs::write(runs.dir.join(stopping_file_of(&instance(1))), "").unwrap();
+    fs::write(runs.dir.join(file_of(&instance(2))), "").unwrap();
+    fs::write(runs.dir.join("short.stopping"), "").unwrap();
+
+    let mut kinds: Vec<String> = entries(&Dir::open(&runs.dir).unwrap())
+        .unwrap()
+        .iter()
+        .map(|entry| match entry {
+            Entry::Stopping { instance, .. } => format!("stopping {}", instance.hex()),
+            Entry::Record { instance, .. } => format!("record {}", instance.hex()),
+            Entry::Other { name, .. } => format!("other {}", name.to_string_lossy()),
+            Entry::Temp { .. } | Entry::Pin { .. } => "temp or pin".to_owned(),
+        })
+        .collect();
+    kinds.sort();
+
+    assert_eq!(
+        kinds,
+        [
+            "other short.stopping".to_owned(),
+            format!("record {}", instance(2).hex()),
+            format!("stopping {}", instance(1).hex()),
+        ]
+    );
 }
 
 /// A write with a pin lands where the pin's handle is, not at the path.
