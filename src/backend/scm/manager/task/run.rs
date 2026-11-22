@@ -4,7 +4,8 @@
 //! Which run it was is not always what `Run` returns: a task whose action is alive ignores the start
 //! (`IgnoreNew`) and answers with a GUID that is never listed, and a scheduled run can begin in the
 //! same moment. [`identify`] decides from what `Run` named, what is alive, and which records appeared
-//! after the pin was taken.
+//! after the pin was taken. A record says its run has ended, but for a first `Stopped`, which a run
+//! writes while it is alive: that one is confirmed by a listing read after the record.
 //!
 //! The run's own exit is its shim's record, written as the shim ends and read by the run's instance;
 //! the process held is how `wait` knows the shim has ended, with no bound.
@@ -45,7 +46,8 @@ pub(super) const UNRECORDED: &str = "it left no record: its program may have run
 pub(super) enum Identity {
     /// A run that is alive, with the pid it is listed with.
     Live { id: InstanceId, pid: u32 },
-    /// A run that has ended and left its record.
+    /// A run that left this record. It has ended, unless the record is a first `Stopped`, which a live run
+    /// writes: [`Scm::task_begin_run_with`] confirms that one against the listing.
     Done(RunRecord),
     /// No run that is known to be ours.
     Unrecorded,
@@ -101,7 +103,7 @@ enum Following<H> {
     Process { instance: InstanceId, process: H },
     /// The run's process was gone when it was opened: it has ended, and its shim wrote its record first.
     Ended(InstanceId),
-    /// The run ended before it was followed, and left this record.
+    /// The run had ended before it was followed, and left this record: not a `Stopped` of a run still listed.
     Done(RunRecord),
     /// No run known to be ours.
     Unrecorded,
@@ -241,6 +243,9 @@ impl Scm {
     ///    [`Error::RunUnrecorded`].
     /// 4. A run that is alive has its process held, by its pid and confirmed by a second read of the
     ///    listing; one whose process is gone then has ended, and is read by its instance.
+    /// 5. A record that is a `Stopped` may be the first of a run that is alive (the records were read after
+    ///    the listing): the listing is read again. A run it lists is followed as a live one (step 4); one it
+    ///    does not has ended, and its record is read again, which is its last.
     ///
     /// There is no wait for a pid or for the listing to drop: every listed run has a pid (L1), and
     /// starts are accepted while an ended run is listed (L2).
@@ -272,7 +277,31 @@ impl Scm {
                 Error::os(format!("read the run records of `{id}`"), e),
             )
         })?;
-        let following = match identify(Some(&started), &live, &appeared) {
+        let identity = match identify(Some(&started), &live, &appeared) {
+            Identity::Done(first) if first.outcome == RunOutcome::Stopped => {
+                let live = live_runs(&*self.tasks, "run", &id, &path, |pid| processes.alive(pid))
+                    .map_err(|e| unfollowed(&id, "tell which run it began", e))?;
+                match live.iter().find(|listed| listed.id == first.instance) {
+                    Some(listed) => Identity::Live {
+                        id: listed.id,
+                        pid: listed.pid,
+                    },
+                    None => match runs.read(&first.instance) {
+                        Ok(Some(last)) => Identity::Done(last),
+                        Ok(None) => Identity::Unrecorded,
+                        Err(e) => {
+                            return Err(unfollowed(
+                                &id,
+                                "tell which run it began",
+                                Error::os(format!("read the run records of `{id}`"), e),
+                            ));
+                        }
+                    },
+                }
+            }
+            identity => identity,
+        };
+        let following = match identity {
             Identity::Live { id: instance, pid } => {
                 let listed = Instance { id: instance, pid };
                 match hold_run(&*self.tasks, "run", &id, &path, &listed, &mut processes)

@@ -322,6 +322,92 @@ fn a_listing_that_fails_after_the_start_leaves_the_run_unrecorded() {
     assert!(failed.report().to_string().contains("busy"), "{failed}");
 }
 
+/// `Run` named none of ours, and a scheduled run began and was stopped between `run`'s two reads: the first
+/// `Stopped` is on disk while the run is alive. A listing read after the record says it is listed, and the run
+/// is followed as a live one, to its own exit.
+#[skuld::test]
+fn a_first_stopped_record_of_a_run_that_is_listed_on_the_second_read_is_followed_as_live() {
+    let (dir, _path, runs) = records();
+    let shim = Runs::of(dir.path(), &id());
+    let first = Runs::of(dir.path(), &id());
+    let fake = Fake::new();
+    fake.on_run(Ok(unnamed(9)))
+        .during(move || shim_writes(&first, &record(1, RunOutcome::Stopped)))
+        .on_instances(Ok(Vec::new()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let mut machine = Machine::new(&fake, &[4242]);
+    machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::Exited(3))));
+
+    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
+
+    assert_eq!(run.wait().unwrap(), Exit::Code(3), "the run's own exit, not the first `Stopped`");
+    assert_eq!(
+        fake.calls(),
+        [
+            Call::Run(PATH.to_owned()),
+            Call::Instances(PATH.to_owned()),
+            Call::Instances(PATH.to_owned()),
+            Call::Instances(PATH.to_owned()),
+            Call::Instances(PATH.to_owned())
+        ],
+        "the confirming read, then the hold's own second read and the wait's"
+    );
+    fake.finish();
+}
+
+/// The same record, and the run is not listed on the confirming read: it has ended, and the record is read
+/// again, which is its final one.
+#[skuld::test]
+fn a_first_stopped_record_of_a_run_that_is_not_listed_on_the_second_read_is_read_again() {
+    let (dir, _path, runs) = records();
+    let shim = Runs::of(dir.path(), &id());
+    let first = Runs::of(dir.path(), &id());
+    let fake = Fake::new();
+    fake.on_run(Ok(unnamed(9)))
+        .during(move || shim_writes(&first, &record(1, RunOutcome::Stopped)))
+        .on_instances(Ok(Vec::new()))
+        .on_instances(Ok(Vec::new()))
+        .during(move || shim_writes(&shim, &record(1, RunOutcome::Exited(5))));
+
+    let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
+
+    assert_eq!(run.wait().unwrap(), Exit::Code(5), "the record read again");
+    assert_eq!(
+        fake.calls(),
+        [
+            Call::Run(PATH.to_owned()),
+            Call::Instances(PATH.to_owned()),
+            Call::Instances(PATH.to_owned())
+        ]
+    );
+    fake.finish();
+}
+
+/// Only a `Stopped` record, which a live run writes first, is confirmed: any other costs no read.
+#[skuld::test]
+fn a_record_that_is_not_stopped_costs_no_second_listing() {
+    for outcome in [RunOutcome::Exited(0), RunOutcome::IncompleteStop] {
+        let (dir, _path, runs) = records();
+        let shim = Runs::of(dir.path(), &id());
+        let fake = Fake::new();
+        fake.on_run(Ok(unnamed(9)))
+            .during(move || shim_writes(&shim, &record(1, outcome)))
+            .on_instances(Ok(Vec::new()));
+
+        let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
+        drop(run);
+
+        assert_eq!(
+            fake.calls(),
+            [Call::Run(PATH.to_owned()), Call::Instances(PATH.to_owned())],
+            "{outcome:?}"
+        );
+        fake.finish();
+    }
+}
+
 /// The process is waited for, and only then is the record read: the shim writes it as it ends.
 #[skuld::test]
 fn wait_blocks_on_the_held_process_and_then_reads_the_record() {
@@ -406,6 +492,10 @@ fn exited_stopped_and_incomplete_records_map_to_their_results() {
         fake.on_run(Ok(named(1, 4242)))
             .during(move || shim_writes(&shim, &record(1, outcome)))
             .on_instances(Ok(Vec::new()));
+        if outcome == RunOutcome::Stopped {
+            // A first `Stopped` is confirmed by a second listing.
+            fake.on_instances(Ok(Vec::new()));
+        }
 
         let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
         let waited = run.wait();
