@@ -1035,7 +1035,7 @@ impl Systemctl {
         // A pid that does not read as a number is a process goetia cannot rule out.
         let process = ["MainPID", "ControlPID"]
             .iter()
-            .any(|pid| props[*pid].parse::<u32>().map_or(true, |pid| pid != 0));
+            .any(|pid| props[*pid].parse::<u32>() != Ok(0));
         Ok(UnitRun {
             phase: match active {
                 "inactive" | "failed" => RunPhase::None,
