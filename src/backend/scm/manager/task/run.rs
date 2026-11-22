@@ -47,7 +47,8 @@ pub(super) enum Identity {
     /// A run that is alive, with the pid it is listed with.
     Live { id: InstanceId, pid: u32 },
     /// A run that left this record. It has ended, unless the record is a first `Stopped`, which a live run
-    /// writes: [`Scm::task_begin_run_with`] confirms that one against the listing.
+    /// writes: [`Scm::task_begin_run_with`] confirms that one against the listing, and follows the run it
+    /// lists as live or, when none is listed, as ended.
     Done(RunRecord),
     /// No run that is known to be ours.
     Unrecorded,
@@ -101,9 +102,10 @@ pub(super) fn identify(started: Option<&Started>, live: &[Instance], appeared: &
 enum Following<H> {
     /// The run's process, held: its exit is what `wait` blocks on, and the record is read after it.
     Process { instance: InstanceId, process: H },
-    /// The run's process was gone when it was opened: it has ended, and its shim wrote its record first.
+    /// The run's process was gone when it was opened, or its first `Stopped` was not listed on the read after
+    /// it: it has ended, and its shim wrote its record first.
     Ended(InstanceId),
-    /// The run had ended before it was followed, and left this record: not a `Stopped` of a run still listed.
+    /// The run had ended before it was followed, and left this record, which is not a first `Stopped`.
     Done(RunRecord),
     /// No run known to be ours.
     Unrecorded,
@@ -245,7 +247,7 @@ impl Scm {
     ///    listing; one whose process is gone then has ended, and is read by its instance.
     /// 5. A record that is a `Stopped` may be the first of a run that is alive (the records were read after
     ///    the listing): the listing is read again. A run it lists is followed as a live one (step 4); one it
-    ///    does not has ended, and its record is read again, which is its last.
+    ///    does not has ended, and [`TaskRun::wait`](RunHandle::wait) reads its record, which is its last.
     ///
     /// There is no wait for a pid or for the listing to drop: every listed run has a pid (L1), and
     /// starts are accepted while an ended run is listed (L2).
@@ -277,38 +279,28 @@ impl Scm {
                 Error::os(format!("read the run records of `{id}`"), e),
             )
         })?;
-        let identity = match identify(Some(&started), &live, &appeared) {
-            Identity::Done(first) if first.outcome == RunOutcome::Stopped => {
-                let live = live_runs(&*self.tasks, "run", &id, &path, |pid| processes.alive(pid))
-                    .map_err(|e| unfollowed(&id, "tell which run it began", e))?;
-                match live.iter().find(|listed| listed.id == first.instance) {
-                    Some(listed) => Identity::Live {
-                        id: listed.id,
-                        pid: listed.pid,
-                    },
-                    None => match runs.read(&first.instance) {
-                        Ok(Some(last)) => Identity::Done(last),
-                        Ok(None) => Identity::Unrecorded,
-                        Err(e) => {
-                            return Err(unfollowed(
-                                &id,
-                                "tell which run it began",
-                                Error::os(format!("read the run records of `{id}`"), e),
-                            ));
-                        }
-                    },
-                }
+        // A listed run is followed by its process. A first `Stopped` is a run's own record while it is alive, so
+        // it is confirmed by a listing read after it: listed, the run is followed as a live one; not listed, it
+        // has ended, and `wait` reads its record, which is its last.
+        let hold = |listed: &Instance, processes: &mut P| -> Result<Following<P::Held>> {
+            match hold_run(&*self.tasks, "run", &id, &path, listed, processes)
+                .map_err(|e| unfollowed(&id, "hold the process of the run it began", e))?
+            {
+                Some(process) => Ok(Following::Process {
+                    instance: listed.id,
+                    process,
+                }),
+                None => Ok(Following::Ended(listed.id)),
             }
-            identity => identity,
         };
-        let following = match identity {
-            Identity::Live { id: instance, pid } => {
-                let listed = Instance { id: instance, pid };
-                match hold_run(&*self.tasks, "run", &id, &path, &listed, &mut processes)
-                    .map_err(|e| unfollowed(&id, "hold the process of the run it began", e))?
-                {
-                    Some(process) => Following::Process { instance, process },
-                    None => Following::Ended(instance),
+        let following = match identify(Some(&started), &live, &appeared) {
+            Identity::Live { id: instance, pid } => hold(&Instance { id: instance, pid }, &mut processes)?,
+            Identity::Done(first) if first.outcome == RunOutcome::Stopped => {
+                let later = live_runs(&*self.tasks, "run", &id, &path, |pid| processes.alive(pid))
+                    .map_err(|e| unfollowed(&id, "tell which run it began", e))?;
+                match later.iter().find(|listed| listed.id == first.instance) {
+                    Some(listed) => hold(listed, &mut processes)?,
+                    None => Following::Ended(first.instance),
                 }
             }
             Identity::Done(record) => Following::Done(record),
