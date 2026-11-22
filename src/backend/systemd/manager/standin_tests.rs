@@ -1017,7 +1017,7 @@ fn uninstalling_an_installed_id_where_no_manager_can_be_asked_is_refused(#[fixtu
         .expect_err("no manager");
 
     assert!(matches!(e, Error::NoManager { .. }), "{e:?}");
-    assert!(paths(&id).iter().all(|p| p.exists()), "nothing was removed");
+    assert!(unit_path(&id, UnitKind::Service).exists(), "nothing was removed");
 }
 
 /// systemd holds a definition loaded from goetia's own path whose file is gone (a `Leave` uninstall whose
