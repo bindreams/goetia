@@ -11,6 +11,8 @@
 //! reloads. With [`RunInFlight::Stop`] `uninstall` stops the run first. goetia reads `/etc/systemd/system`
 //! for fragments, so a stand-in never makes an id read as installed (see `discover`).
 
+mod plan;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +35,7 @@ pub(super) fn standin_path(id: &str) -> PathBuf {
 }
 
 /// What is at `id`'s stand-in path.
+#[derive(Debug)]
 pub(super) enum StandinFile {
     Absent,
     /// A stand-in of `id`'s own, with its text: the identity its replacement verifies.

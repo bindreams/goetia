@@ -1436,30 +1436,34 @@ fn task_state_table() {
     );
 }
 
-/// The one read `uninstall` decides from: no process is `inactive`, `failed` and a restart that is waiting
-/// (`activating` with `auto-restart`); a start job is any other `activating`; every other state, the ones
-/// goetia does not know included, is a run. The unit's own words for the two stop settings and the file it was
-/// loaded from come back as they were printed.
+/// The one read `uninstall` decides from. No process is `inactive` and `failed`; a restart that is waiting is
+/// `activating` with no `MainPID` and no `ControlPID`, whatever the `SubState` (`auto-restart`, and
+/// `auto-restart-queued` of systemd 254 and later); `activating` with a process of either kind is a start job;
+/// every other state, the ones goetia does not know included, is a run. The unit's own words for the two stop
+/// settings and the file it was loaded from come back as they were printed.
 #[skuld::test]
 fn run_of_table() {
-    for (active, sub, phase) in [
-        ("inactive", "dead", RunPhase::None),
-        ("failed", "failed", RunPhase::None),
-        ("activating", "auto-restart", RunPhase::None),
-        ("activating", "start", RunPhase::InStartJob),
-        ("activating", "start-pre", RunPhase::InStartJob),
-        ("active", "running", RunPhase::Running),
-        ("active", "exited", RunPhase::Running),
-        ("deactivating", "stop-sigterm", RunPhase::Running),
-        ("reloading", "reload", RunPhase::Running),
-        ("maintenance", "clean", RunPhase::Running),
-        ("refreshing", "x", RunPhase::Running),
-        ("", "", RunPhase::Running),
-        ("a-state-of-the-future", "y", RunPhase::Running),
+    for (active, sub, main, control, phase) in [
+        ("inactive", "dead", "0", "0", RunPhase::None),
+        ("failed", "failed", "0", "0", RunPhase::None),
+        ("activating", "auto-restart", "0", "0", RunPhase::PendingRestart),
+        ("activating", "auto-restart-queued", "0", "0", RunPhase::PendingRestart),
+        ("activating", "start", "4242", "0", RunPhase::InStartJob),
+        ("activating", "start-pre", "0", "4242", RunPhase::InStartJob),
+        ("activating", "start", "4242", "4243", RunPhase::InStartJob),
+        ("activating", "a-substate-of-the-future", "0", "0", RunPhase::PendingRestart),
+        ("active", "running", "4242", "0", RunPhase::Running),
+        ("active", "exited", "0", "0", RunPhase::Running),
+        ("deactivating", "stop-sigterm", "4242", "0", RunPhase::Running),
+        ("reloading", "reload", "4242", "0", RunPhase::Running),
+        ("maintenance", "clean", "0", "0", RunPhase::Running),
+        ("refreshing", "x", "0", "0", RunPhase::Running),
+        ("", "", "0", "0", RunPhase::Running),
+        ("a-state-of-the-future", "y", "0", "0", RunPhase::Running),
     ] {
         let answer = format!(
-            "ActiveState={active}\nSubState={sub}\nKillSignal=12\nTimeoutStopUSec=1min 30s\nLoadState=loaded\n\
-             FragmentPath=/etc/systemd/system/x.service\n"
+            "ActiveState={active}\nSubState={sub}\nMainPID={main}\nControlPID={control}\nKillSignal=12\n\
+             TimeoutStopUSec=1min 30s\nLoadState=loaded\nFragmentPath=/etc/systemd/system/x.service\n"
         );
         assert_eq!(
             showing(&answer).run_of("x.service").expect(active),
@@ -1471,16 +1475,28 @@ fn run_of_table() {
                 load_state: "loaded".to_string(),
                 fragment_path: "/etc/systemd/system/x.service".to_string(),
             },
-            "{active:?} {sub:?}"
+            "{active:?} {sub:?} {main} {control}"
         );
     }
+}
+
+/// A pid that is not a number is a process goetia cannot rule out: never read as no process.
+#[skuld::test]
+fn run_of_a_pid_it_cannot_read_is_a_process() {
+    let answer = "ActiveState=activating\nSubState=start\nMainPID=what\nControlPID=0\nKillSignal=15\n\
+                  TimeoutStopUSec=infinity\nLoadState=loaded\nFragmentPath=\n";
+
+    assert_eq!(
+        showing(answer).run_of("x.service").expect("a read").phase,
+        RunPhase::InStartJob
+    );
 }
 
 /// A unit systemd has no file for is answered like any other, not an error: the absent id's read is of it.
 #[skuld::test]
 fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
-    let answer = "ActiveState=inactive\nSubState=dead\nKillSignal=15\nTimeoutStopUSec=1min 30s\n\
-                  LoadState=not-found\nFragmentPath=\n";
+    let answer = "ActiveState=inactive\nSubState=dead\nMainPID=0\nControlPID=0\nKillSignal=15\n\
+                  TimeoutStopUSec=1min 30s\nLoadState=not-found\nFragmentPath=\n";
 
     let run = showing(answer).run_of("x.service").expect("a read");
 
@@ -1493,8 +1509,8 @@ fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
 fn a_run_is_loaded_from_a_path_only_when_systemd_says_loaded_from_it() {
     let read = |load: &str, fragment: &str| {
         let answer = format!(
-            "ActiveState=active\nSubState=running\nKillSignal=15\nTimeoutStopUSec=infinity\nLoadState={load}\n\
-             FragmentPath={fragment}\n"
+            "ActiveState=active\nSubState=running\nMainPID=4242\nControlPID=0\nKillSignal=15\n\
+             TimeoutStopUSec=infinity\nLoadState={load}\nFragmentPath={fragment}\n"
         );
         showing(&answer).run_of("x.service").expect("a read")
     };

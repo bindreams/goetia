@@ -207,37 +207,62 @@ fn a_service_that_uninstalls_itself_with_no_stop_keeps_running_and_is_not_restar
     assert_not_installed(&mgr, &id);
 }
 
-/// A service waiting to be restarted has no process, so there is no run to leave: the uninstall is the
-/// plain one, which cancels the restart. The unit ends `inactive`, not failed by the reload that drops its
-/// file, and nothing is left listed.
+/// A service that crashes at once and is restarted after goetia's default delay is, at any moment, a process
+/// or a restart waiting; `--no-stop` over either sends nothing to any process. A restart that was waiting
+/// is cleared (the reload fails it on the missing unit, and goetia clears what failed); a process is left
+/// to exit, and is not restarted when it does. So whichever it was, the unit ends `inactive` and unlisted, or
+/// `failed` with no restart behind it, and no process was ever signalled.
 #[skuld::test]
-fn no_stop_on_a_service_waiting_to_be_restarted_cancels_the_restart(#[fixture(systemd_group)] _group: &Group) {
+fn no_stop_on_a_service_that_restarts_signals_nothing_and_is_not_restarted_again(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = restarting_service(&id, sh("exit 3"), Some(Duration::from_secs(3600)));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (starts, signals) = (dir.path().join("starts"), dir.path().join("signals"));
+    let command = sh(&format!(
+        "echo $$ >> \"{}\"; trap 'echo signal >> \"{}\"' TERM INT HUP; sleep 0.2 & wait $!; exit 3",
+        starts.display(),
+        signals.display()
+    ));
+    let spec = restarting_service(&id, command, None);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
     mgr.start(&id_of(&id), Budget::Immediate).expect("start");
-    wait::until_paced(Duration::from_millis(50), || {
-        let [state, sub] = show_properties(&unit_of(&id), ["ActiveState", "SubState"]);
-        state == "activating" && sub == "auto-restart"
-    });
+    let began = || fs::read_to_string(&starts).map_or(0, |text| text.lines().count());
+    wait::until_paced(Duration::from_millis(20), || began() >= 2);
 
     mgr.uninstall(&id_of(&id), RunInFlight::Leave).expect("uninstall");
 
     assert_not_installed(&mgr, &id);
-    let [state, main_pid] = show_properties(&unit_of(&id), ["ActiveState", "MainPID"]);
-    assert_eq!(state, "inactive", "the restart was cancelled, not failed by the reload");
-    assert_eq!(main_pid, "0");
-    let failed = cmd::run(
-        "systemctl",
-        &["list-units", "--failed", "--plain", "--no-legend", &unit_of(&id)],
+    let [restarts_at_return] = show_properties(&unit_of(&id), ["NRestarts"]);
+    wait::until_paced(Duration::from_millis(20), || {
+        let [state] = show_properties(&unit_of(&id), ["ActiveState"]);
+        matches!(state.as_str(), "inactive" | "failed")
+    });
+    let [state, load, main_pid, restarts] = show_properties(
+        &unit_of(&id),
+        ["ActiveState", "LoadState", "MainPID", "NRestarts"],
     );
+    assert_eq!(restarts, restarts_at_return, "nothing restarted it after the uninstall returned");
+    assert_eq!(main_pid, "0", "no process is left");
+    let listed = cmd::run("systemctl", &["list-units", "--all", "--plain", "--no-legend", &unit_of(&id)]);
+    // A process caught between its fork and its exec is still in its start job, which gets a stand-in.
+    let loaded_from = if standin(&id).exists() { "loaded" } else { "not-found" };
+    match state.as_str() {
+        "inactive" => assert!(
+            !listed.stdout.contains(&id),
+            "a restart that was waiting is cleared, and nothing is left listed: {listed}"
+        ),
+        _ => assert_eq!(
+            load, loaded_from,
+            "a process that was left exited and was not restarted: {listed}"
+        ),
+    }
     assert!(
-        !failed.stdout.contains(&id),
-        "nothing is left listed as failed: {failed}"
+        fs::read_to_string(&signals).unwrap_or_default().is_empty(),
+        "no process was sent a signal"
     );
-    assert!(!standin(&id).exists());
 }
 
 // A definition whose file is gone =====================================================================================

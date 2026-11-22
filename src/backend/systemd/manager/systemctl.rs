@@ -1078,6 +1078,7 @@ pub(super) enum RunPhase {
     /// No process: `inactive`, `failed`, or `activating` with `SubState=auto-restart`, a restart waiting
     /// for its delay (a stop of it cancels the restart and signals nothing).
     None,
+    PendingRestart,
     /// A run still in its start job: `activating` with any other `SubState`. A reload that drops its unit
     /// file ends it at the start timeout.
     InStartJob,
