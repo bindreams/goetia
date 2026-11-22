@@ -223,11 +223,18 @@ impl Run {
     /// provisional file is on disk. For a run stopped at its spawn that is the file written before the wait: the
     /// program is still running then, and `while_waiting` is what ends it. Returns the run's code.
     fn run_until_it_records(&self, while_waiting: impl FnOnce()) -> u32 {
+        self.run_until(
+            NameChange::RenamedTo(format!("{}.stopping", instance().hex())),
+            while_waiting,
+        )
+    }
+
+    /// [`Run::run_until_it_records`] for the change `change` of a name in the records' directory.
+    fn run_until(&self, change: NameChange, while_waiting: impl FnOnce()) -> u32 {
         let mut watch = DirWatch::new(&self.records_dir());
-        let own = NameChange::RenamedTo(format!("{}.stopping", instance().hex()));
         std::thread::scope(|scope| {
             let running = scope.spawn(|| self.run());
-            watch.until(|changes| changes.contains(&own));
+            watch.until(|changes| changes.contains(&change));
             while_waiting();
             running.join().expect("the run did not panic")
         })
@@ -1638,6 +1645,35 @@ fn a_failed_record_write_still_returns_the_programs_code() {
     );
     assert_eq!(run.fake.waiter_end(0), WaiterEnd::Returned);
     run.api.finish();
+    run.no_pin_is_left();
+}
+
+/// A stop heard with the program alive whose provisional file cannot be written is logged as that, in words of its
+/// own (the run was stopped and the first note of it could not be written), not as a failed record; the run then
+/// records its end as it does.
+#[skuld::test]
+fn a_provisional_file_that_cannot_be_written_is_logged_as_that_and_the_record_still_lands() {
+    let process = runs_until_stopped();
+    let run = Run::of(&spec_logging_to(None)).listed();
+    // A directory where the provisional file is to be: the write is refused, and removes its temp file.
+    directory_with_a_file(&run.records_dir().join(format!("{}.stopping", instance().hex())));
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.clone().when(Op::Spawn, stop));
+
+    let code = run.run_until(NameChange::Removed(format!("{}.json.tmp", instance().hex())), || {
+        process.end(7)
+    });
+
+    assert_eq!(code, 7);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!(
+            "goetia-shim[{ID}]: the run was stopped and the first note of it could not be written: "
+        )),
+        "{failures:?}"
+    );
     run.no_pin_is_left();
 }
 

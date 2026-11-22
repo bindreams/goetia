@@ -326,7 +326,8 @@ fn a_delete_outcome_that_is_no_deletion_is_an_error() {
     );
 }
 
-/// Nothing is renamed onto a name that exists: the operating system refuses it and the target is as it was. A name that is free is taken.
+/// Nothing is renamed onto a name that exists: the operating system refuses it and the target is as it was. A name
+/// that is free is taken.
 #[skuld::test]
 fn a_rename_onto_a_name_that_exists_is_refused_and_one_onto_a_free_name_lands() {
     let dir = tempfile::tempdir().unwrap();

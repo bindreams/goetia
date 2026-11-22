@@ -969,21 +969,16 @@ fn write_stopping_leaves_a_provisional_file_keeps_the_pin_and_prunes_nothing() {
     assert_eq!(runs.held_pin().unwrap(), None);
 }
 
-/// A stopping write lands through the pin's directory handle, as a given write does.
+/// The file lands in the pin's directory, so a pin of another `Runs`' directory is a mistake the write refuses.
+#[cfg(debug_assertions)]
 #[skuld::test]
-fn write_stopping_writes_through_the_pins_directory() {
+#[should_panic(expected = "the pin is of another directory")]
+fn write_stopping_with_a_pin_of_another_directory_is_refused() {
     let (_pinned_dir, pinned) = fixture();
     let (_other_dir, other) = fixture();
     let pin = pinned.hold().unwrap();
 
-    other.write_stopping(&instance(1), 1, &pin).unwrap();
-
-    assert!(pinned.dir.join(stopping_file_of(&instance(1))).exists());
-    assert!(
-        !other.dir.join(stopping_file_of(&instance(1))).exists(),
-        "nothing went by the path"
-    );
-    drop(pin);
+    let _ = other.write_stopping(&instance(1), 1, &pin);
 }
 
 /// A provisional file with no record beside it is a run that was told to stop and never recorded how it ended.
@@ -1018,6 +1013,55 @@ fn read_of_an_instance_with_neither_file_is_none() {
     runs.write(&record(2, 2), None).unwrap();
 
     assert_eq!(runs.read(&instance(1)).unwrap(), None);
+}
+
+/// A directory where the provisional file of `instance` is, so that it cannot be read. (A handle held open without
+/// sharing would do too, but the files of this directory do not refuse a read to one on this machine.)
+fn provisional_unreadable(runs: &Runs, instance: &InstanceId) {
+    directory_with_a_file(&runs.dir.join(stopping_file_of(instance)));
+}
+
+/// A provisional file that cannot be read does not hide the record beside it: the record is the answer.
+#[skuld::test]
+fn read_gives_the_record_when_the_provisional_file_cannot_be_read() {
+    let (_dir, runs) = fixture();
+    let exited = record(1, 7);
+    runs.write(&exited, None).unwrap();
+    provisional_unreadable(&runs, &instance(1));
+
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(exited));
+}
+
+/// With no record, what the provisional file's read gave is the answer, its error included.
+#[skuld::test]
+fn read_is_the_error_of_a_provisional_file_that_cannot_be_read_when_there_is_no_record() {
+    let (_dir, runs) = fixture();
+    provisional_unreadable(&runs, &instance(1));
+
+    let read = runs.read(&instance(1)).unwrap_err();
+
+    assert_eq!(read.kind(), io::ErrorKind::PermissionDenied, "{read}");
+}
+
+/// A provisional file holds `Stopped`, which is what its writer stores: another outcome in it is a record that does
+/// not make sense, and is reported, not overwritten with `Stopped`.
+#[skuld::test]
+fn a_provisional_file_that_holds_another_outcome_than_stopped_is_a_corrupt_record() {
+    let (_dir, runs) = fixture();
+    let stored = Stored {
+        started: 1,
+        outcome: RunOutcome::Exited(3),
+    };
+    fs::write(
+        runs.dir.join(stopping_file_of(&instance(1))),
+        serde_json::to_vec(&stored).unwrap(),
+    )
+    .unwrap();
+
+    let read = runs.read(&instance(1)).unwrap_err();
+
+    assert_eq!(read.kind(), io::ErrorKind::Other);
+    assert!(read.to_string().contains("provisional"), "{read}");
 }
 
 /// The case that used to block a final record: another program holds the provisional file open without sharing
@@ -1128,6 +1172,17 @@ fn appeared_lists_one_entry_per_instance_the_record_over_the_provisional_file() 
     runs.write(&record(1, 1), Some(own)).unwrap();
 
     assert_eq!(pin.appeared().unwrap(), [record(1, 1), stopped(2, 2)]);
+}
+
+/// A provisional file that cannot be read does not keep `appeared` from listing the record beside it.
+#[skuld::test]
+fn appeared_lists_the_record_when_the_provisional_file_beside_it_cannot_be_read() {
+    let (_dir, runs) = fixture();
+    let pin = runs.pin().unwrap();
+    runs.write(&record(1, 1), None).unwrap();
+    provisional_unreadable(&runs, &instance(1));
+
+    assert_eq!(pin.appeared().unwrap(), [record(1, 1)]);
 }
 
 /// A provisional file is a file goetia made: the removal takes it with the rest.

@@ -253,7 +253,13 @@ pub(super) fn run_in(
             if end == WaitEnd::Stop
                 && let Err(e) = runs.write_stopping(&instance, started, &pin)
             {
-                log.failure(id, &format!("write the run record: {}", Chain(&e)));
+                log.failure(
+                    id,
+                    &format!(
+                        "the run was stopped and the first note of it could not be written: {}",
+                        Chain(&e)
+                    ),
+                );
             }
         },
     );

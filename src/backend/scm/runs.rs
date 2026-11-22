@@ -423,9 +423,10 @@ impl Runs {
     /// writes before it waits, since Windows may end the shim before anything later. It is a file of its own,
     /// `<instance>.stopping`, so the record that follows is written to a name nothing holds. `pin` is the run's
     /// own, and stays held: nothing is pruned (the run is alive, and "no pin held" means "no run alive"). The
-    /// write goes through the pin's directory handle, not the path, by the body that writes a record; a run that
-    /// has one is refused ([`io::ErrorKind::AlreadyExists`]).
+    /// file lands in the pin's directory, through its handle, which must be this `Runs`'; the body is the one
+    /// that writes a record, and a run that has a provisional file is refused ([`io::ErrorKind::AlreadyExists`]).
     pub(crate) fn write_stopping(&self, instance: &InstanceId, started: u64, pin: &Pin) -> io::Result<()> {
+        debug_assert!(pin.dir.path() == self.dir, "the pin is of another directory");
         let stored = Stored {
             started,
             outcome: RunOutcome::Stopped,
@@ -691,9 +692,9 @@ impl Runs {
         Ok(held)
     }
 
-    /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record
-    /// but `own`, every provisional file and every temp file. A file that cannot be removed now (a write in flight holds its
-    /// temp file) is for the next write. Returns what went wrong that is not that.
+    /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record but `own`,
+    /// every provisional file and every temp file. A file that cannot be removed now (a write in flight holds
+    /// its temp file) is for the next write. Returns what went wrong that is not that.
     fn prune(&self, dir: &Dir, own: &InstanceId) -> Vec<String> {
         self.prune_listing(dir, own, || entries(dir))
     }
@@ -782,25 +783,34 @@ fn stopping_name(instance: &InstanceId) -> OsString {
     format!("{}{STOPPING}", instance.hex()).into()
 }
 
-/// The record of `instance` in `dir`, else its provisional file read as `Stopped`, else none.
+/// The record of `instance` in `dir`, else its provisional file, else none. **The record is the answer whatever
+/// the provisional file's read gave:** only when there is no record does that read decide, its error included.
 ///
-/// **The provisional file is read first.** A reader may hold no pin, and a write that lands the record and then
-/// prunes can run between the two reads: the other way round, a record not there yet followed by a provisional
-/// file already pruned would read a run that was recorded as none. Read in this order, a provisional file that
-/// is gone says its record landed before, and the second read finds it.
+/// **The provisional file is read first,** so that a record that lands between the two reads is found by the
+/// second: read the other way round, the record would be missed and the provisional file still there, and a run
+/// that was recorded would read as `Stopped`. Every reader holds a pin ([`Pin::appeared`], a `run`'s wait, a
+/// stop's check of the runs it ended), so no write prunes in between. A read with no pin can still answer
+/// `Stopped` for a run whose record was pruned in between.
+///
+/// A provisional file holds `Stopped`, as [`Runs::write_stopping`] stores it, and is taken as stored: another
+/// outcome in it is a corrupt record.
 fn read_in(dir: &Dir, instance: &InstanceId) -> io::Result<Option<RunRecord>> {
-    let provisional = files::read(dir, &stopping_name(instance))?;
+    let provisional = files::read(dir, &stopping_name(instance));
     if let Some(bytes) = files::read(dir, &record_name(instance))? {
         return decode(*instance, &bytes).map(Some);
     }
-    provisional
-        .map(|bytes| {
-            decode(*instance, &bytes).map(|record| RunRecord {
-                outcome: RunOutcome::Stopped,
-                ..record
-            })
-        })
-        .transpose()
+    let Some(bytes) = provisional? else {
+        return Ok(None);
+    };
+    let record = decode(*instance, &bytes)?;
+    if record.outcome != RunOutcome::Stopped {
+        return Err(io::Error::other(format!(
+            "the provisional file of run {} holds {:?}, and only `Stopped` is written to one",
+            instance.hex(),
+            record.outcome
+        )));
+    }
+    Ok(Some(record))
 }
 
 /// The instance a file name `text` is of, if it is the instance's 32 hex digits and `suffix`.
