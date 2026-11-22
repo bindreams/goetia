@@ -543,8 +543,6 @@ fn unkillable_failures() -> [String; 3] {
 
 // Stop plans ----------------------------------------------------------------------------------------------------------
 
-/// The `timeout` the ask-and-wait tests state: far from any wait a test makes, so what is left of it is
-/// read off the duration the tree wait was given.
 /// A service whose stop is `signal` and `timeout`.
 fn service_stopping_by(signal: crate::spec::StopSignal, timeout: Option<Duration>) -> DaemonSpec {
     use crate::spec::{Protocol, ServiceFields, ServiceSpec, StopAction};
@@ -560,6 +558,8 @@ fn service_stopping_by(signal: crate::spec::StopSignal, timeout: Option<Duration
     .expect("a valid service")
 }
 
+/// The `timeout` the ask-and-wait tests state: far from any wait a test makes, so what is left of it is
+/// read off the duration the tree wait was given.
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
 /// One accepted stop over the `Fake`, in the order `service::launch` makes the pieces: the stop is accepted
@@ -633,6 +633,11 @@ fn told_asking_within_the_hour(infos: Vec<String>, event: &str) -> Vec<String> {
     rest
 }
 
+/// The line of an asked stop whose daemon exited before the event could be sent.
+fn exited_unasked_line() -> String {
+    format!("goetia-shim[{ID}]: the daemon exited before it could be asked")
+}
+
 fn exited_line() -> String {
     format!("goetia-shim[{ID}]: the daemon and what it started exited within the wait")
 }
@@ -693,8 +698,7 @@ fn a_stop_that_finds_the_daemon_exited_is_still_told_as_a_stop() {
     assert_eq!(told, [WaitEnd::Stop]);
 }
 
-/// The daemon is gone when the stop is seen: nothing is asked and nothing is waited for, and the tree
-/// it left is ended as after any exit.
+/// The daemon is gone when the stop is seen.
 #[skuld::test]
 fn a_daemon_that_exited_before_the_stop_was_seen_is_neither_asked_nor_waited_for() {
     let fake = FakeGuard::new();
@@ -952,49 +956,6 @@ fn at_once_asks_and_waits_for_nothing() {
     assert_eq!(daemon.calls(), [ProcessCall::SendKillTree]);
 }
 
-/// Wait-only sends nothing, and the daemon's own exit is what ends the wait: the test ends the daemon once
-/// the supervisor is in it, and the exit code says nothing ended it before.
-#[skuld::test]
-fn wait_only_sends_nothing_and_waits_for_the_daemons_own_exit() {
-    let fake = FakeGuard::new();
-    let daemon = FakeProcess::new()
-        .wait(WaitReply::Blocks)
-        .send_kill_tree(KillReply::Ends);
-    let (supervisor, waiter, child) = launched(&fake, &daemon);
-    assert!(supervisor.bus.request_stop());
-    let (stopping_tx, stopping_rx) = mpsc::channel();
-    let (tx, rx) = mpsc::channel();
-    {
-        let child = Arc::clone(&child);
-        let supervisor = Arc::clone(&supervisor);
-        std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |_| {
-                let _ = stopping_tx.send(());
-            });
-            let _ = tx.send(outcome);
-        });
-    }
-
-    stopping_rx
-        .recv()
-        .expect("the wait ended without telling `on_stopping`");
-    daemon.end(0);
-    let outcome = rx.recv().expect("the supervisor ended without an outcome");
-
-    assert!(matches!(outcome, WaitOutcome::Stopping));
-    assert_eq!(
-        daemon.exit_code(),
-        Some(0),
-        "something ended the daemon before it exited by itself"
-    );
-    assert_eq!(
-        daemon.calls(),
-        [ProcessCall::SendKillTree],
-        "only the teardown after the exit"
-    );
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-}
-
 /// SCM can deliver a second `STOP` before `STOP_PENDING` is reported: it changes nothing, and the ask is
 /// made once.
 #[skuld::test]
@@ -1048,8 +1009,7 @@ fn an_ask_that_sent_nothing_is_logged_and_the_daemon_is_ended_at_once() {
     );
 }
 
-/// The proxy may have run: ending a daemon that may be shutting down is the worse mistake, so the wait
-/// is made, and the answer is a warning, not a failure. The warning says which event may have been sent.
+/// The answer is a warning, not a failure, and it says which event may have been sent.
 #[skuld::test]
 fn an_ask_that_may_have_been_sent_is_waited_for() {
     let answers: [(AskReply, fn() -> cosca::error::Error); 2] = [
@@ -1120,9 +1080,8 @@ fn unsupported_warning() -> String {
     )
 }
 
-/// The daemon exits while it is asked again: the asking stops, nothing is waited for, and the tree it left is
-/// ended as after any exit. The daemon may or may not have been asked again before its exit is
-/// reported, so the answers after the first are not counted.
+/// The daemon may or may not have been asked again before its exit is reported, so the answers after the first are
+/// not counted.
 #[skuld::test]
 fn an_ask_that_is_unsupported_stops_when_the_daemon_exits() {
     let fake = FakeGuard::new();
@@ -1146,12 +1105,11 @@ fn an_ask_that_is_unsupported_stops_when_the_daemon_exits() {
     assert_eq!(fake.take_warnings(), [unsupported_warning()]);
     assert_eq!(
         told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
-        Vec::<String>::new()
+        [exited_unasked_line()]
     );
 }
 
-/// A daemon that has exited, whose report has not come in yet, is neither asked nor waited for: the supervisor
-/// reads the process itself, not only the waiter's report. The tree it left is ended as after any exit.
+/// The supervisor reads the process itself, not only the waiter's report, which can lag the exit.
 #[skuld::test]
 fn a_daemon_that_has_exited_unreported_is_neither_asked_nor_waited_for() {
     let fake = FakeGuard::new();
@@ -1168,9 +1126,7 @@ fn a_daemon_that_has_exited_unreported_is_neither_asked_nor_waited_for() {
     assert_eq!(fake.take_warnings(), Vec::<String>::new());
 }
 
-/// cosca answers `Unassessable` for a root that had exited when it looked (nothing sent) and for an event the proxy
-/// generated and could not confirm (sent), and the two cannot be told apart: a daemon that exited after the ask is
-/// still waited for, so that a launcher that was sent the event and exited at once has its tree given the `timeout`.
+/// A daemon that exited after an `Unassessable` ask is still waited for (see `judge_ask`).
 #[skuld::test]
 fn an_ask_answered_unassessable_is_waited_for_though_the_daemon_has_exited() {
     let fake = FakeGuard::new();
@@ -1216,7 +1172,7 @@ fn a_daemon_that_exited_while_it_was_asked_again_is_not_asked_a_third_time() {
     assert_eq!(fake.take_warnings(), [unsupported_warning()]);
     assert_eq!(
         told_asking_within_the_hour(fake.take_infos(), "Ctrl+C"),
-        Vec::<String>::new()
+        [exited_unasked_line()]
     );
     assert_eq!(fake.take_failures(), Vec::<String>::new());
 }
@@ -1481,7 +1437,59 @@ fn a_service_asks_for_every_signal_but_kill_and_wm_close() {
     }
 }
 
-/// Task mode keeps its stop as it is until part 2 gives it the wait-only plan.
+/// Ctrl+C for the signals Windows maps to it, Ctrl+Break for the two it maps to that, and nothing to send for
+/// `kill` and `wm-close`.
+#[skuld::test]
+fn each_signal_is_the_console_event_it_is_on_windows() {
+    use crate::spec::StopSignal::{CtrlBreak, CtrlC, Interrupt, Kill, Quit, Terminate, WmClose};
+    use cosca::CtrlEvent::{CtrlBreak as Break, CtrlC as C};
+    let events = [
+        (Terminate, Some(C)),
+        (Interrupt, Some(C)),
+        (CtrlC, Some(C)),
+        (Quit, Some(Break)),
+        (CtrlBreak, Some(Break)),
+        (Kill, None),
+        (WmClose, None),
+    ];
+    for (signal, event) in events {
+        assert_eq!(console_event(signal), event, "{signal}");
+    }
+}
+
+/// A daemon whose stop asks is spawned with the cooperative stop set to the event of its signal and no process group of
+/// its own; one whose stop does not ask is spawned with cosca's defaults.
+#[skuld::test]
+fn a_daemon_is_spawned_for_a_stop_that_asks_exactly_where_its_plan_asks() {
+    use crate::spec::StopSignal::{CtrlBreak, CtrlC, Interrupt, Kill, Quit, Terminate, WmClose};
+    use cosca::CtrlEvent::{CtrlBreak as Break, CtrlC as C};
+    let signals = [
+        (Terminate, Some(C)),
+        (Interrupt, Some(C)),
+        (CtrlC, Some(C)),
+        (Quit, Some(Break)),
+        (CtrlBreak, Some(Break)),
+        (Kill, None),
+        (WmClose, None),
+    ];
+    for (signal, event) in signals {
+        let plan = StopPlan::of(&service_stopping_by(signal, Some(Duration::from_secs(5))));
+        let setup = plan.spawn_setup();
+
+        assert_eq!(setup.ask_with, event, "{signal}");
+        assert_eq!(setup.process_group, event.map(|_| false), "{signal}");
+        assert_eq!(plan.asks(), setup.ask_with.is_some(), "{signal}");
+    }
+    assert_eq!(
+        StopPlan::of(&crate::testing::task(ID, vec!["C:/daemon.exe".to_string()], None)).spawn_setup(),
+        SpawnSetup {
+            ask_with: None,
+            process_group: None
+        },
+        "a task is spawned with cosca's defaults"
+    );
+}
+
 #[skuld::test]
 fn a_task_is_stopped_at_once() {
     assert_eq!(
@@ -1503,7 +1511,6 @@ fn a_stop_hint_covers_the_timeout_and_the_teardown() {
     // The program's own exit is torn down, not asked, whatever the plan.
     assert_eq!(plan.wait_hint(WaitEnd::Exit), Duration::from_secs(10));
     assert_eq!(StopPlan::AtOnce.wait_hint(WaitEnd::Stop), Duration::from_secs(10));
-    assert_eq!(StopPlan::WaitOnly.wait_hint(WaitEnd::Stop), Duration::from_secs(10));
 }
 
 /// Only a stop that asks needs a host that called `init_helpers`.
@@ -1511,5 +1518,4 @@ fn a_stop_hint_covers_the_timeout_and_the_teardown() {
 fn only_an_ask_needs_the_proxy() {
     assert!(ask_and_wait(None).asks());
     assert!(!StopPlan::AtOnce.asks());
-    assert!(!StopPlan::WaitOnly.asks());
 }

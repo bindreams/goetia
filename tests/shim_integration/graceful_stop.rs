@@ -1,14 +1,10 @@
-//! A `protocol: plain` service's stop asks the daemon to exit first (goetia#263, unit 3a), through the real
-//! SCM and the real shim: the shim sends the console event its `send-signal` names, waits for the daemon's whole
-//! tree up to `timeout`, and only then ends what is left.
+//! A `protocol: plain` service's stop asks the daemon to exit first, through the real SCM and the real shim: the
+//! shim sends the console event its `send-signal` names, waits for the daemon's whole tree up to `timeout`, and only
+//! then ends what is left.
 //!
 //! The daemon is `fixture`'s `catch` mode: it records the events it receives in a file and exits 0 on the one
 //! it is told to exit on. A record that shows the event *and* the daemon's own exit is what says the daemon was
 //! asked and answered, which a stop that ended it at once never produces.
-//!
-//! Each test logs the time from the stop being issued to the event reaching the daemon (the shim's ask
-//! returns within it) and writes it to the probe results, so the 10 s that `stop` and `restart` allow beyond
-//! the `timeout` rest on a measurement.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,9 +22,9 @@ use crate::common::{
     LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, embedded_manager, fixture_command_with_exe, manager, recorded_exit,
     scm_status, simple_spec,
 };
-use crate::fixture::HOST;
+use crate::fixture::{HOST, started_marker};
 use crate::provision::default_folder;
-use crate::supervisor_integration::pid_is_alive;
+use crate::support::windows_tasks::ProcessHandle;
 use crate::support::{self, ConnectBack, Group, WorldReadableExe, scm_group};
 
 /// How the stop is issued.
@@ -110,8 +106,8 @@ struct Stopped {
     _guard: ShimGuard,
     logs: LogDir,
     id: String,
-    /// What the fixtures reported in with: their pids.
-    pids: Vec<String>,
+    /// The fixtures that reported in, opened before the stop was issued.
+    daemons: Vec<ProcessHandle>,
     stop_took: Duration,
     /// When the stop was issued, to read the record's timestamps against.
     issued: SystemTime,
@@ -154,8 +150,9 @@ impl Stopped {
         support::record_probe(&format!("graceful-stop-{name}"), &line);
     }
 
-    /// The service stopped cleanly, which is the record SCM does not restart from, and left nothing of the
-    /// daemon's tree.
+    /// The service stopped cleanly, which is the record SCM does not restart from, and the daemons exited. The
+    /// teardown does not drain, so `STOPPED` can come before a daemon has finished exiting: each one's exit is
+    /// waited for on the handle opened before the stop.
     fn assert_clean_and_gone(&self) {
         let status = scm_status(&self.id);
         assert_eq!(status.current_state, ServiceState::Stopped, "{status:?}");
@@ -164,8 +161,8 @@ impl Stopped {
             RecordedExit { win32: 0, specific: 0 },
             "{status:?}"
         );
-        for pid in &self.pids {
-            assert!(!pid_is_alive(pid), "the daemon {pid} is still running after the stop");
+        for daemon in &self.daemons {
+            daemon.wait_for_exit();
         }
     }
 }
@@ -214,9 +211,12 @@ fn run_to_stop(run: Run) -> Stopped {
     // Unbounded: a first logon under a new account builds a profile, which outruns any fixed number.
     mgr.start(&goetia_id, Budget::Unbounded)
         .unwrap_or_else(|e| panic!("start: {}", e.report()));
-    let mut pids = Vec::new();
+    let mut daemons = Vec::new();
     if !setup.stop_at_once {
-        pids.push(reported.accept_line("the daemon to install its handler and report in"));
+        let pid = reported.accept_line("the daemon to install its handler and report in");
+        daemons.push(ProcessHandle::open(
+            pid.trim().parse().expect("the daemon reports its pid"),
+        ));
     }
 
     let mut actor = match how {
@@ -240,7 +240,7 @@ fn run_to_stop(run: Run) -> Stopped {
         _guard: guard,
         logs,
         id,
-        pids,
+        daemons,
         stop_took,
         issued,
     }
@@ -275,23 +275,16 @@ fn assert_asked_and_answered(stopped: &Stopped, exit_on: &str) {
 }
 
 /// [`assert_asked_and_answered`] for a stop that may reach the daemon before its `main` has installed the handler,
-/// which Windows' own handler then ends with no record. Either way the daemon was asked and not ended by the
-/// teardown, and nothing here depends on which side of the installation the event lands:
-/// - a record with lines in it shows the event and the daemon's exit by it;
-/// - an empty record is a daemon ended by Windows' handler, or by the teardown unasked, and only the shim's own
-///   log tells them apart.
-///
-/// The shim's log lines this reads are written by `ask_and_wait` in `stop_bus.rs`, beside the functions that make
-/// their text (`asking`, `may_have_sent`, `could_not_ask`, `never_asked`):
-/// - "asking the daemon to exit with `event`" is written before the first ask, so it is no proof that anything was
-///   sent. It is the evidence of an ask when no line says the ask failed: "the stop could not ask" and "without being
-///   asked" are the two failures that end the daemon unasked (`could_not_ask`, `never_asked`);
-/// - "the stop may have sent `event`" is the warning of an ask whose answer left it unknown whether the event was
-///   sent, which a correct stop of a daemon right after its start can get. It names the event, so it is evidence of
-///   an ask by itself;
-/// - a line of the two failures is never allowed, whichever of the others is there.
+/// which Windows' own handler then ends with no record. An empty record is possible for that reason, and only the
+/// shim's own log tells a daemon that was asked from one that the teardown ended unasked. The lines it reads are
+/// written by `ask_and_wait` (`stop_bus.rs`):
+/// - "asking the daemon to exit with `event`" is written before the first ask, so by itself it proves nothing was
+///   sent. With an empty record the stop must also have written a line that ends an asked stop: the tree exited within
+///   the wait, the daemon exited before it could be asked, or the warning that the event may have been sent;
+/// - the two lines that end a daemon unasked ("the stop could not ask", "without being asked") are never allowed.
 fn assert_asked_not_killed(stopped: &Stopped, exit_on: &str) {
-    if !stopped.record().is_empty() {
+    let record_is_empty = stopped.record().is_empty();
+    if !record_is_empty {
         assert_asked_and_answered(stopped, exit_on);
     }
     let log_path = stopped.logs.path_for(&stopped.id);
@@ -311,6 +304,15 @@ fn assert_asked_not_killed(stopped: &Stopped, exit_on: &str) {
     assert!(
         asking || may_have_sent,
         "the shim's log has no line for the ask of {event}:
+{log}"
+    );
+    let closed = ours().any(|line| {
+        line == format!("{prefix}the daemon and what it started exited within the wait")
+            || line == format!("{prefix}the daemon exited before it could be asked")
+    });
+    assert!(
+        !record_is_empty || closed || may_have_sent,
+        "the record is empty and the shim's log has no line that ends an asked stop:
 {log}"
     );
 }
@@ -358,8 +360,7 @@ fn an_sc_stop_asks_the_daemon_with_ctrl_c_and_ctrl_break(#[fixture(scm_group)] _
     }
 }
 
-/// A daemon that ignores the event is ended when its `timeout` is over, and not before: the stop takes at
-/// least the `timeout`, the daemon was sent the event and never exited by it, and nothing of it is left.
+/// A daemon that ignores the event is ended when its `timeout` is over, and not before.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_daemon_that_ignores_the_event_is_ended_when_its_timeout_is_over(#[fixture(scm_group)] _group: &Group) {
     let timeout = Duration::from_secs(3);
@@ -533,8 +534,7 @@ fn a_consumer_style_host_asks_the_daemon(#[fixture(scm_group)] _group: &Group) {
     stopped.log_timing("consumer-host");
 }
 
-/// A host that did not call `init_host` cannot be the proxy, so a service whose stop asks is refused when it
-/// starts, with the shim's refusal record (which SCM does not restart) and a log line that names the call.
+/// A host that did not call `init_host` cannot be the proxy: a service whose stop asks is refused when it starts.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_host_that_did_not_initialise_is_refused_at_start(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -542,6 +542,7 @@ fn a_host_that_did_not_initialise_is_refused_at_start(#[fixture(scm_group)] _gro
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
     let mgr = host_manager("no-init");
+    let record = logs.path().join("record.txt");
     let spec = simple_spec(
         &id,
         fixture_command_with_exe(
@@ -549,7 +550,7 @@ fn a_host_that_did_not_initialise_is_refused_at_start(#[fixture(scm_group)] _gro
             "catch",
             &[
                 &reported.port().to_string(),
-                logs.path().join("record.txt").to_str().expect("a UTF-8 path"),
+                record.to_str().expect("a UTF-8 path"),
                 "ctrl-c",
             ],
         ),
@@ -570,11 +571,17 @@ fn a_host_that_did_not_initialise_is_refused_at_start(#[fixture(scm_group)] _gro
     );
     let log = std::fs::read_to_string(logs.path_for(&id)).expect("the shim's log");
     assert!(
-        log.contains("goetia::shim::init_host()"),
-        "the log does not name the call:\n{log}"
+        log.lines().any(|line| {
+            line.starts_with(&format!(
+                "goetia-shim[{id}]: this host did not call `goetia::shim::init_host()` first"
+            )) && line.contains("No daemon was started")
+        }),
+        "the log has no refusal that names the call:\n{log}"
     );
+    // Read once the service is gone, so that no shim of it can still be starting a daemon.
+    mgr.uninstall(&spec.common().id).expect("uninstall");
     assert!(
-        !reported.connected_yet(),
+        !started_marker(&record).exists(),
         "the daemon was started by a host that was refused"
     );
 }

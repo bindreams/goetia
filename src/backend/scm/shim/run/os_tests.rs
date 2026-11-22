@@ -23,6 +23,7 @@ use super::*;
 use crate::backend::scm::shim::run::logging::Log;
 use crate::backend::scm::shim::run::os::fake::FakeGuard;
 use crate::backend::scm::shim::run::service::build_command;
+use crate::backend::scm::shim::run::stop_bus::StopPlan;
 use crate::backend::scm::shim::run::test_support::not_found;
 use crate::backend::scm::sid::sid_display;
 use crate::backend::scm::test_support::{permit_only, withdraw_append};
@@ -228,7 +229,13 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
 
     let daemon = reap.hold(
         Real::default()
-            .spawn(build_command(&spec, &Real::default(), &fake.log(), ID))
+            .spawn(build_command(
+                &spec,
+                StopPlan::of(&spec),
+                &Real::default(),
+                &fake.log(),
+                ID,
+            ))
             .expect("spawn the daemon"),
     );
     let contained = daemon.containment();
@@ -303,7 +310,13 @@ fn a_task_programs_env_and_cwd_are_the_specs_over_the_inherited_ones(#[fixture(t
 
     let program = reap.hold(
         Real::default()
-            .spawn(build_command(&spec, &Real::default(), &fake.log(), ID))
+            .spawn(build_command(
+                &spec,
+                StopPlan::of(&spec),
+                &Real::default(),
+                &fake.log(),
+                ID,
+            ))
             .expect("spawn the program"),
     );
     program.wait().expect("the program exits");
@@ -330,7 +343,7 @@ fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] di
 
     let program = reap.hold(
         Real::default()
-            .spawn(build_command(&spec, &Real::default(), &log, ID))
+            .spawn(build_command(&spec, StopPlan::of(&spec), &Real::default(), &log, ID))
             .expect("spawn the program"),
     );
     program.wait().expect("the program exits");

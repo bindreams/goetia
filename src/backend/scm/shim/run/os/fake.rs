@@ -156,31 +156,25 @@ pub(crate) enum KillReply {
 }
 
 /// What a [`Spawned::terminate_tree`] answers, by the contract the supervisor reads (`stop_bus`'s
-/// `judge_ask`).
+/// `judge_ask`). A variant names the `cosca::error::Error` it answers with (none: `Ok`), and what else the `Fake`
+/// does when it answers.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AskReply {
-    /// `Ok`: the event was sent. The daemon decides what it does with it.
     Sent,
-    /// `Ok`, and the daemon honours the event: it exits with this code.
+    /// The daemon exits with this code.
     SentAndExits(i32),
-    /// `Error::Io`: nothing was sent.
     Io,
-    /// `Error::Unsupported`: nothing was sent (no console yet, or none ever).
     Unsupported,
-    /// `Error::Unsupported`, and the daemon exits meanwhile with this code.
+    /// The daemon exits meanwhile with this code.
     UnsupportedAndExits(i32),
-    /// `Error::Unsupported`, and the daemon has exited with this code while the waiter's report of it lags: only a read
-    /// of the process itself ([`Spawned::try_wait`]) shows it.
+    /// The daemon has exited with this code while the waiter's report of it lags: only a read of the process itself
+    /// ([`Spawned::try_wait`]) shows it.
     UnsupportedAndExitedUnreported(i32),
-    /// `Error::MayHaveStarted`: the proxy may have run.
     MayHaveStarted,
-    /// `Error::Unassessable`: whether the event was sent is unknown.
     Unassessable,
-    /// `Error::Unsupported`, and the wait on the process fails (the daemon is not ended): a wait that fails while
-    /// the daemon is asked. The waiter's report of it is not seen by the supervisor at a fixed moment.
+    /// The wait on the process fails; the daemon is not ended.
     UnsupportedAndWaitFails,
-    /// `Error::Unassessable`, and the daemon has exited with this code: cosca's answer for a root that has
-    /// exited by the time the proxy ran, whether or not the proxy sent anything.
+    /// The daemon has exited with this code.
     UnassessableAndExited(i32),
 }
 

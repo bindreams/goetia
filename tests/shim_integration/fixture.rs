@@ -39,7 +39,9 @@
 //!   connects to `<port>` and writes its pid, and blocks. On the event `<exit-on>` names (`ctrl-c`,
 //!   `ctrl-break`; `none` never) it records `daemon: exiting by the event` and exits 0; any other event is
 //!   handled and ignored. With `launcher` it starts a `catch-worker` of the same record first and reports
-//!   nothing itself: the worker does, so a report means both handlers are in place.
+//!   nothing itself: the worker does, so a report means both handlers are in place. Once its handler is in
+//!   place it also creates `<record>.started` ([`started_marker`]), so that a daemon that was never started
+//!   is told from one that was started and received nothing.
 //! - `catch-worker <record> <exit-on> <port>` — `catch` as the launcher's worker: on the event it takes 600 ms
 //!   to shut down (a slow shutdown, which the launcher's own exit must not cut short), then records
 //!   `worker: exiting by the event` and exits 0.
@@ -49,7 +51,7 @@
 //! first thing in `main` (as every invocation of this binary does), `no-init` has not.
 
 use std::io::{Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -230,10 +232,21 @@ fn exit_on(name: &str) -> Option<u32> {
 
 /// Installs the handler. The process is not yet reported in: the caller does that once this has returned.
 fn catch_events(catch: Catch) {
+    let marker = started_marker(&catch.record);
     assert!(CATCH.set(catch).is_ok(), "one `catch` per process");
     // SAFETY: `on_event` is a function, so it lives for the whole process; `TRUE` adds it.
     let added = unsafe { SetConsoleCtrlHandler(Some(on_event), 1) };
     assert_ne!(added, 0, "SetConsoleCtrlHandler: {}", std::io::Error::last_os_error());
+    if let Err(e) = std::fs::write(&marker, std::process::id().to_string()) {
+        eprintln!("the start marker {} was not written: {e}", marker.display());
+    }
+}
+
+/// The file a `catch` process of `record` creates once it is running with its handler in place.
+pub fn started_marker(record: &Path) -> PathBuf {
+    let mut name = record.as_os_str().to_owned();
+    name.push(".started");
+    PathBuf::from(name)
 }
 
 /// One line of the record, appended in one write so that the two processes of a launcher's tree cannot split

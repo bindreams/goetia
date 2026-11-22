@@ -26,7 +26,7 @@ use super::exit;
 use super::logging::Log;
 use super::os::Real;
 use super::service::{PassOutcome, SpecStop, run_pass, set_daemon_log};
-use super::stop_bus::{StopBus, Supervisor};
+use super::stop_bus::{StopBus, StopPlan, Supervisor};
 use crate::backend::scm::exit_status::Reported;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
@@ -198,7 +198,7 @@ pub(super) fn run_in(
     }
 
     let started = file_time_now();
-    let (record, code) = ended_as(run_pass(&spec, supervisor, id, || {}, |_| {}));
+    let (record, code) = ended_as(run_pass(&spec, StopPlan::of(&spec), supervisor, id, || {}, |_| {}));
     record_run(log, id, runs, pin, Some(instance), started, record);
     code
 }

@@ -25,10 +25,9 @@ use crate::backend::scm::exit_status::Reported;
 
 use super::logging::Log;
 use super::os::{Os, Spawned};
-use super::service::console_event;
 use crate::backend::standby::Standby;
 use crate::error::{Chain, os_error_in};
-use crate::spec::{DaemonSpec, StopAction};
+use crate::spec::{DaemonSpec, StopAction, StopSignal};
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
 /// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM
@@ -74,7 +73,8 @@ pub enum WaitEnd {
 }
 
 /// What an accepted stop does before the teardown. One function runs it
-/// ([`Supervisor::wait_for_child_or_stop`]); a plan only says how much of it.
+/// ([`Supervisor::wait_for_child_or_stop`]); a plan only says how much of it. A run derives its plan once, from its
+/// spec ([`StopPlan::of`]), and hands it to everything that needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopPlan {
     /// Ask the daemon to exit with `event`, then wait for its whole tree for `timeout` (`None`: as long as it
@@ -83,25 +83,26 @@ pub enum StopPlan {
         event: CtrlEvent,
         timeout: Option<Duration>,
     },
-    /// Ask nothing; wait for the daemon's own exit with no cap. Task mode takes it in part 2.
-    #[allow(
-        dead_code,
-        reason = "task mode is wired to it in part 2; the supervisor tests run it"
-    )]
-    WaitOnly,
-    /// No ask, no wait: the teardown at once. `send-signal: kill`, `wm-close` until it has a send, and task
-    /// mode until part 2.
+    /// No ask, no wait: the teardown at once. `send-signal: kill`, `wm-close` (it has no send yet) and a task (its
+    /// stop is the teardown).
     AtOnce,
+}
+
+/// What a spawn sets for a stop, decided by the plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SpawnSetup {
+    /// The console event the cooperative stop sends: set only where the plan asks.
+    pub(super) ask_with: Option<CtrlEvent>,
+    /// `Some(false)`: no process group of its own, which is what lets the event reach the daemon (a child that
+    /// leads a group starts with Ctrl+C ignored, and Ctrl+Break reaches either). `None`: cosca's default.
+    pub(super) process_group: Option<bool>,
 }
 
 impl StopPlan {
     /// The plan a daemon's stop runs.
     pub(super) fn of(spec: &DaemonSpec) -> StopPlan {
         match spec {
-            // Part 2 gives a task the wait-only plan.
             DaemonSpec::Task(_) => StopPlan::AtOnce,
-            // A stop asks exactly where `console_event` has an event to send, which is what `build_command`
-            // sends: one source for which signals ask.
             DaemonSpec::Service(service) => match console_event(service.stop_action.send_signal) {
                 Some(event) => StopPlan::AskAndWait {
                     event,
@@ -109,6 +110,17 @@ impl StopPlan {
                 },
                 None => StopPlan::AtOnce,
             },
+        }
+    }
+
+    /// What the daemon is spawned with for this plan: the one place the spawn's stop settings are decided.
+    pub(super) fn spawn_setup(self) -> SpawnSetup {
+        match self {
+            StopPlan::AskAndWait { event, .. } => SpawnSetup {
+                ask_with: Some(event),
+                process_group: Some(false),
+            },
+            StopPlan::AtOnce => SpawnSetup::default(),
         }
     }
 
@@ -126,6 +138,17 @@ impl StopPlan {
             }
             _ => StopAction::TEARDOWN_MARGIN,
         }
+    }
+}
+
+/// The console event a stop of `signal` sends the daemon, or `None` where it sends nothing: the one source for which
+/// signals ask.
+fn console_event(signal: StopSignal) -> Option<CtrlEvent> {
+    match signal {
+        StopSignal::Terminate | StopSignal::Interrupt | StopSignal::CtrlC => Some(CtrlEvent::CtrlC),
+        StopSignal::Quit | StopSignal::CtrlBreak => Some(CtrlEvent::CtrlBreak),
+        // `wm-close` sends nothing yet; a native signal is refused on Windows at install.
+        StopSignal::Kill | StopSignal::WmClose | StopSignal::Native(_) => None,
     }
 }
 
@@ -371,8 +394,7 @@ impl Supervisor {
     }
 
     /// Block until `child` exits or a stop is requested, returning which. On a stop, first runs `plan`
-    /// (the ask and the wait of [`StopPlan::AskAndWait`], the wait of [`StopPlan::WaitOnly`], or
-    /// nothing), then tears the whole contained tree down (`send_kill_tree`, with a
+    /// (the ask and the wait of [`StopPlan::AskAndWait`], or nothing), then tears the whole contained tree down (`send_kill_tree`, with a
     /// fallback to killing just the direct child — see below) before
     /// returning, and says in its return value whether that teardown
     /// succeeded.
@@ -394,9 +416,7 @@ impl Supervisor {
     /// otherwise `kill_for_stop`.
     ///
     /// **Not cosca's `graceful_shutdown_tree`**, which ends by waiting with no deadline for every member
-    /// its sweep killed: the standing rule below against that wait would be broken. This composition (the ask,
-    /// the bounded wait, the teardown with no drain) is what to delete when cosca offers a graceful stop
-    /// that does not drain (bindreams/cosca#1055).
+    /// its sweep killed: the standing rule below against that wait would be broken.
     ///
     /// `waiter` is consumed here: it was made before `child` was spawned
     /// ([`Waiter`]), and this is where it is handed the daemon it was made
@@ -608,7 +628,6 @@ impl Supervisor {
         }
         match plan {
             StopPlan::AtOnce => {}
-            StopPlan::WaitOnly => self.bus.await_exit_report(),
             StopPlan::AskAndWait { event, timeout } => self.ask_and_wait(child, id, event, timeout, seen),
         }
     }
@@ -620,18 +639,14 @@ impl Supervisor {
     /// whatever the daemon does in answer. What the ask answered decides the rest ([`judge_ask`]); a wait that cannot
     /// be made is logged and the teardown follows at once.
     ///
-    /// **A tree is waited for after any answer that may mean the event was sent, whether or not the root has
-    /// exited since**: cosca answers `Unassessable` both for a root that had exited when it looked (nothing sent)
-    /// and for an event the proxy generated and could not confirm (sent), and a launcher that was sent the event
-    /// and exited at once has a worker that needs its `timeout`. The one case this waits for that was never asked
-    /// is a root that exits by itself between the read before an ask and that ask: waiting is the safe side, as
-    /// ending a tree that may be shutting down is the worse mistake.
+    /// A tree is waited for after any answer that may mean the event was sent, whether or not the root has exited
+    /// since. That includes a root that exits by itself between the read before an ask and that ask, which is then
+    /// waited for though never asked: waiting is the safe side.
     ///
-    /// **Delete that window when bindreams/cosca#1054 ships**, which tells the two answers apart.
-    ///
-    /// **Delete the re-ask loop when bindreams/cosca#1053 ships**, and this whole composition when
-    /// bindreams/cosca#1055 does: cosca then answers "no console yet" apart from "never", and has a graceful
-    /// stop that does not drain.
+    /// **To delete when cosca ships it.** That window, when bindreams/cosca#1054 tells the two `Unassessable` answers
+    /// apart. The re-ask loop, when bindreams/cosca#1053 answers "no console yet" apart from "never". The ask's own
+    /// bound, when bindreams/cosca#1057 bounds it: `terminate_tree` waits for its proxy with no cap under cosca 0.10.
+    /// This whole composition, when bindreams/cosca#1055 has a graceful stop that does not drain.
     fn ask_and_wait(&self, child: &dyn Spawned, id: &str, event: CtrlEvent, timeout: Option<Duration>, seen: Instant) {
         let left = || timeout.map(|t| t.saturating_sub(seen.elapsed()));
         let mut unreadable_told = false;
@@ -640,6 +655,9 @@ impl Supervisor {
         let mut pace = REASK_PACE_FIRST;
         loop {
             if self.has_exited(child, id, &mut unreadable_told) {
+                if asking_told {
+                    self.log.info(id, EXITED_UNASKED);
+                }
                 // Its report is on its way.
                 return self.bus.await_exit_report();
             }
@@ -647,8 +665,6 @@ impl Supervisor {
                 asking_told = true;
                 self.log.info(id, &asking(event, left()));
             }
-            // Bound at the cosca 0.11 bump, bindreams/cosca#1057, unit 3c: `terminate_tree` waits for its proxy
-            // with no cap under cosca 0.10.
             match judge_ask(child.terminate_tree()) {
                 Ask::Sent => break,
                 Ask::MaySent(e) => {
@@ -665,6 +681,10 @@ impl Supervisor {
                         self.log.warning(id, &not_asked_yet(&e));
                     }
                     if self.bus.exited_within(left().map_or(pace, |left| left.min(pace))) {
+                        // A wait that failed is reported the same way, and told by its own failure line.
+                        if self.bus.exit_report().1.is_none() {
+                            self.log.info(id, EXITED_UNASKED);
+                        }
                         return;
                     }
                     pace = grown_pace(pace);
@@ -705,9 +725,7 @@ impl Supervisor {
 enum Ask {
     /// The event was sent.
     Sent,
-    /// It may have been sent: the proxy started and something failed after, or cosca could not tell a root that
-    /// had exited (nothing sent) from an event the proxy could not confirm (sent). Ending a daemon that may be
-    /// shutting down is the worse mistake, so the wait is made.
+    /// It may have been sent ([`judge_ask`]), so the wait is made.
     MaySent(cosca::error::Error),
     /// Nothing was sent, and asking again cannot help: the proxy could not be started.
     NothingSent(cosca::error::Error),
@@ -715,8 +733,11 @@ enum Ask {
     NotYet(cosca::error::Error),
 }
 
-/// The one mapping of an ask's answer. `Error` is non-exhaustive and cosca's contract names no other
-/// answer, so one it does not name, `Unassessable` included, is read as "may have been sent".
+/// The one mapping of an ask's answer. `Error` is non-exhaustive and cosca's contract names no other answer, so one it
+/// does not name is read as "may have been sent". That includes `Unassessable`: cosca answers it both for a root that
+/// had exited when it looked (nothing sent) and for an event the proxy generated and could not confirm (sent), and a
+/// launcher that was sent the event and exited at once has a worker that needs its `timeout`. Ending a tree that may be
+/// shutting down is the worse mistake, so the tree is waited for.
 fn judge_ask(answer: Result<(), cosca::error::Error>) -> Ask {
     match answer {
         Ok(()) => Ask::Sent,
@@ -865,6 +886,8 @@ fn asking(event: CtrlEvent, left: Option<Duration>) -> String {
         ),
     }
 }
+
+const EXITED_UNASKED: &str = "the daemon exited before it could be asked";
 
 const EXITED_WITHIN_THE_WAIT: &str = "the daemon and what it started exited within the wait";
 
