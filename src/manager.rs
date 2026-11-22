@@ -211,7 +211,8 @@ pub trait ServiceManager {
     /// Stop the service now, waiting up to `budget` for it, or, with `None`, for as long as the daemon's
     /// own stop takes ([`Budget::for_stop`]): its `stop-action` `timeout` plus
     /// [`StopAction::TEARDOWN_MARGIN`](crate::spec::StopAction::TEARDOWN_MARGIN), without bound where it has
-    /// no `timeout`, and [`Budget::DEFAULT`] for `send-signal: kill`. `None` is read from the definition this
+    /// no `timeout`, and the margin alone for `send-signal: kill`
+    /// ([`StopAction::longest_stop`](crate::spec::StopAction::longest_stop)). `None` is read from the definition this
     /// call reads and acts on, so the wait and the stop cannot disagree; a definition that does not decode
     /// has none to read, and `None` is then [`Error::StopActionUnreadable`], over the decode failure.
     /// Does not change its boot-enablement.

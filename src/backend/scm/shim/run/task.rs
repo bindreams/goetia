@@ -262,6 +262,8 @@ pub(super) fn run_in(
                 );
             }
         },
+        // Nothing reports a task's stop to SCM, and its plan waits for the program alone.
+        || {},
     );
     let (record, code) = ended_as(outcome);
     record_run(log, id, runs, pin, Some(instance), started, record);

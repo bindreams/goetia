@@ -53,7 +53,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
             let _ = tx.send(outcome);
         });
     }
@@ -104,7 +104,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         let child = Arc::clone(&child);
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
             let _ = tx.send(outcome);
         });
     }
@@ -173,7 +173,7 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+                supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
             }))
             .is_err();
             // Dropped before the send, so the reference count asserted below is not a race against
@@ -224,7 +224,7 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // No stop requested: the child exiting on its own is the only wakeup source.
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(
@@ -272,7 +272,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -298,7 +298,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(!daemon.ended(), "the daemon ended though neither kill worked");
@@ -316,7 +316,7 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping { .. }),
@@ -338,7 +338,7 @@ fn a_stop_whose_send_kill_tree_fails_kills_the_child_and_reports_the_daemon_poss
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::TreeMayRun),
@@ -364,7 +364,7 @@ fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -384,7 +384,7 @@ fn a_failed_background_wait_carries_its_os_error() {
         .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: Some(5) }),
@@ -409,7 +409,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping(RootExit::NotSeen)),
@@ -435,7 +435,7 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(daemon.killed());
@@ -454,7 +454,7 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(
@@ -475,7 +475,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::AtOnce, |_| {}, || {});
 
     assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(
@@ -576,7 +576,7 @@ fn stopped_by(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) -> (WaitOu
     let (supervisor, waiter, child) = launched(fake, daemon);
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end));
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end), || {});
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, told)
 }
@@ -588,11 +588,18 @@ fn stopped_after_exit(fake: &FakeGuard, daemon: &FakeProcess, plan: StopPlan) ->
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
     let bus = Arc::clone(&supervisor.bus);
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| {
-        told.push(end);
-        daemon.end(0);
-        bus.await_exit_report();
-    });
+    let outcome = supervisor.wait_for_child_or_stop(
+        waiter,
+        &child,
+        ID,
+        plan,
+        |end| {
+            told.push(end);
+            daemon.end(0);
+            bus.await_exit_report();
+        },
+        || {},
+    );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     (outcome, told)
 }
@@ -684,7 +691,7 @@ fn on_stopping_is_told_a_stop_from_an_exit() {
     let daemon = FakeProcess::new().wait(WaitReply::Exits(0));
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     let mut told = Vec::new();
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |end| told.push(end));
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |end| told.push(end), || {});
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(told, [WaitEnd::Exit], "the program's own exit was told as a stop");
@@ -731,7 +738,7 @@ fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_go
         assert!(supervisor.bus.request_stop());
         let mut told = Vec::new();
 
-        let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end));
+        let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, plan, |end| told.push(end), || {});
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 
         assert!(root_exited(&outcome), "{plan:?}");
@@ -843,10 +850,17 @@ fn a_waiter_that_fails_while_a_wait_only_plan_waits_gets_the_daemon_killed() {
     assert!(supervisor.bus.request_stop());
     let mut told = Vec::new();
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |end| {
-        told.push(end);
-        daemon.fail_wait();
-    });
+    let outcome = supervisor.wait_for_child_or_stop(
+        waiter,
+        &child,
+        ID,
+        StopPlan::WaitOnly,
+        |end| {
+            told.push(end);
+            daemon.fail_wait();
+        },
+        || {},
+    );
 
     assert_eq!(told, [WaitEnd::Stop]);
     assert!(
@@ -1127,9 +1141,16 @@ fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
 
     let outcome = std::thread::scope(|scope| {
         let running = scope.spawn(|| {
-            supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |end| {
-                stopping.send(end).expect("the test is listening");
-            })
+            supervisor.wait_for_child_or_stop(
+                waiter,
+                &child,
+                ID,
+                StopPlan::WaitOnly,
+                |end| {
+                    stopping.send(end).expect("the test is listening");
+                },
+                || {},
+            )
         });
         assert!(supervisor.bus.request_stop());
         assert_eq!(told.recv().expect("on_stopping was called"), WaitEnd::Stop);
@@ -1200,7 +1221,7 @@ fn a_second_stop_does_not_ask_again() {
     assert!(supervisor.bus.request_stop());
     assert!(supervisor.bus.request_stop());
 
-    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |_| {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(HOUR)), |_| {}, || {});
 
     assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
     assert_eq!(fake.calls(Op::Ask), 1);
@@ -1732,24 +1753,6 @@ fn a_task_waits_only_for_the_programs_own_exit() {
         StopPlan::of(&crate::testing::task(ID, vec!["C:/daemon.exe".to_string()], None)),
         StopPlan::WaitOnly
     );
-}
-
-#[skuld::test]
-fn a_stop_hint_covers_the_timeout_and_the_teardown() {
-    let plan = ask_and_wait(Some(Duration::from_secs(30)));
-
-    assert_eq!(plan.wait_hint(WaitEnd::Stop), Duration::from_secs(40));
-    assert_eq!(
-        ask_and_wait(None).wait_hint(WaitEnd::Stop),
-        Duration::MAX,
-        "no timeout: as long as the field holds"
-    );
-    // The program's own exit is torn down, not asked, whatever the plan.
-    assert_eq!(plan.wait_hint(WaitEnd::Exit), Duration::from_secs(10));
-    assert_eq!(StopPlan::AtOnce.wait_hint(WaitEnd::Stop), Duration::from_secs(10));
-    // Nothing reports a task's wait to SCM; were it asked, the wait has no cap of goetia's.
-    assert_eq!(StopPlan::WaitOnly.wait_hint(WaitEnd::Stop), Duration::MAX);
-    assert_eq!(StopPlan::WaitOnly.wait_hint(WaitEnd::Exit), Duration::from_secs(10));
 }
 
 /// Only a stop that asks needs a host that called `init_helpers`.

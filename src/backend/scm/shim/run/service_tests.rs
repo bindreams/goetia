@@ -40,7 +40,7 @@ const ID: &str = "goetia-shim-launch-test";
 
 /// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report, with the plan of `spec`.
 fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnce()) -> Reported {
-    super::run_daemon(spec, StopPlan::of(spec), supervisor, ID, on_running, |_| {})
+    super::run_daemon(spec, StopPlan::of(spec), supervisor, ID, on_running, |_| {}, || {})
 }
 
 /// [`super::launch`] with the plan of `spec`.
@@ -800,10 +800,10 @@ fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) 
 fn run_daemon_is_run_pass_then_reported() {
     for ending in endings() {
         let outcome = pass_of(&ending, |supervisor, on_running| {
-            run_pass(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {})
+            run_pass(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {}, || {})
         });
         let reported = pass_of(&ending, |supervisor, on_running| {
-            super::run_daemon(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {})
+            super::run_daemon(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {}, || {})
         });
 
         assert_eq!(outcome, ending.outcome);
@@ -828,6 +828,7 @@ fn stopped_pass(plan: StopPlan, process: FakeProcess) -> (PassOutcome, Vec<WaitE
         ID,
         || assert!(bus.request_stop()),
         |end| told.push(end),
+        || {},
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
@@ -894,6 +895,7 @@ fn a_stop_that_read_the_daemon_gone_carries_its_exit_code_when_the_waiter_then_f
             ID,
             || assert!(bus.request_stop()),
             |_| {},
+            || {},
         );
 
         assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "{plan:?}");
@@ -930,6 +932,7 @@ fn a_stop_accepted_after_the_exit_was_seen_carries_the_exit_code_and_is_clean() 
             assert_eq!(end, WaitEnd::Exit);
             assert!(bus.request_stop());
         },
+        || {},
     );
 
     assert_eq!(outcome, PassOutcome::Stopped(Some(7)));
@@ -960,6 +963,7 @@ fn a_stop_over_a_daemon_the_shim_never_saw_exit_carries_no_code() {
         ID,
         || assert!(bus.request_stop()),
         |_| {},
+        || {},
     );
     assert_eq!(outcome, PassOutcome::Stopped(None), "a failed wait");
     assert_eq!(outcome.reported(), Reported::Clean);
@@ -978,9 +982,17 @@ fn run_recording_stopping(
     on_running: impl FnOnce(),
 ) -> (Reported, Vec<usize>) {
     let mut stopping = Vec::new();
-    let reported = super::run_daemon(daemon, StopPlan::of(daemon), supervisor, ID, on_running, |_| {
-        stopping.push(fake.calls(Op::SendKillTree));
-    });
+    let reported = super::run_daemon(
+        daemon,
+        StopPlan::of(daemon),
+        supervisor,
+        ID,
+        on_running,
+        |_| {
+            stopping.push(fake.calls(Op::SendKillTree));
+        },
+        || {},
+    );
     (reported, stopping)
 }
 
@@ -1011,9 +1023,29 @@ fn the_stopping_hint_is_the_stops_longest_wait_in_milliseconds() {
     );
 }
 
-/// A run reports the hint of its plan to the status setter: a stop reports the stop's, an exit the exit's.
+/// The hint of a stop is the stop action's longest wait ([`StopAction::longest_stop`], the one rule the pre-shutdown
+/// time and the CLI's wait read too); the exit of the daemon by itself is torn down, not asked, so it is the teardown.
 #[skuld::test]
-fn a_run_reports_the_hint_of_its_plan_for_what_ended_it() {
+fn the_hint_is_the_stop_actions_longest_wait_and_an_exit_is_the_teardown() {
+    let action = |send_signal, timeout: Option<u64>| StopAction {
+        send_signal,
+        timeout: timeout.map(Duration::from_secs),
+    };
+    let secs = Duration::from_secs;
+    for (action, stop) in [
+        (action(StopSignal::Terminate, Some(30)), secs(40)),
+        (action(StopSignal::Quit, None), Duration::MAX),
+        (action(StopSignal::Kill, None), secs(10)),
+        (action(StopSignal::WmClose, Some(30)), secs(40)),
+    ] {
+        assert_eq!(stop_hint(&action, WaitEnd::Stop), stop, "{action:?}");
+        assert_eq!(stop_hint(&action, WaitEnd::Exit), secs(10), "{action:?}");
+    }
+}
+
+/// A run reports the hint of its stop action to the status setter: a stop reports the stop's, an exit the exit's.
+#[skuld::test]
+fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
     let service = spec();
     let plan = StopPlan::of(&service);
     let mut hints = Vec::new();
@@ -1038,17 +1070,17 @@ fn a_run_reports_the_hint_of_its_plan_for_what_ended_it() {
         ID,
         || assert!(bus.request_stop()),
         |hint| hints.push(hint),
+        || {},
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     let _ = fake.take_infos();
-    assert_eq!(hints, [plan.wait_hint(WaitEnd::Stop)]);
     assert_eq!(hints, [Duration::from_secs(40)], "the `timeout` and the teardown");
 
     let mut hints = Vec::new();
     let fake = FakeGuard::new();
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
-    super::run_daemon(&service, plan, &supervisor(&fake), ID, || {}, |hint| hints.push(hint));
+    super::run_daemon(&service, plan, &supervisor(&fake), ID, || {}, |hint| hints.push(hint), || {});
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(hints, [Duration::from_secs(10)], "the teardown alone");
 }
@@ -1113,6 +1145,7 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
         |_| {
             alive_when_stopping.push((fake.calls(Op::SendKillTree), !daemon.ended()));
         },
+        || {},
     );
 
     assert_eq!(reported, Reported::Clean);

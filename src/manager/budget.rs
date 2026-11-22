@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::spec::{StopAction, StopSignal};
+use crate::spec::StopAction;
 
 // Budget ==============================================================================================================
 
@@ -27,14 +27,11 @@ impl Budget {
     pub const DEFAULT: Budget = Budget::Bounded(Self::DEFAULT_WAIT);
 
     /// The wait of a `stop` that names none: the daemon's own stop action, with
-    /// [`StopAction::TEARDOWN_MARGIN`] to be torn down and recorded ([`StopAction::longest_stop`]); no bound
-    /// for a stop action with no `timeout`; and [`Self::DEFAULT`], what it always was, for `kill`, which
-    /// sends nothing to answer.
+    /// [`StopAction::TEARDOWN_MARGIN`] to be torn down and recorded ([`StopAction::longest_stop`], which is
+    /// that margin alone for `kill`, which sends nothing to answer); no bound for a stop action with no
+    /// `timeout`.
     pub fn for_stop(action: &StopAction) -> Budget {
-        match action.send_signal {
-            StopSignal::Kill => Budget::DEFAULT,
-            _ => action.longest_stop().map_or(Budget::Unbounded, Budget::Bounded),
-        }
+        action.longest_stop().map_or(Budget::Unbounded, Budget::Bounded)
     }
 
     /// Whether this budget permits any waiting at all. `false` for

@@ -292,6 +292,30 @@ fn a_timeout_a_manifest_could_not_write_is_a_defect_wherever_it_came_from() {
     assert_eq!(StopAction::default().defect(), None);
 }
 
+/// The one rule for how long a stop can take: the `timeout` and the teardown margin, and none where there is no
+/// timeout. A `kill` ends the daemon at once, so it takes the margin alone; `wm-close` asks nothing yet but is
+/// given what a stop that asks is, so that it needs no change when it does.
+#[skuld::test]
+fn a_stops_longest_wait_is_its_timeout_and_the_teardown_margin() {
+    let secs = Duration::from_secs;
+    let day = StopAction::MAX_TIMEOUT.as_secs();
+    for signal in ["terminate", "interrupt", "quit", "ctrl-c", "ctrl-break", "wm-close", "sigusr1"] {
+        for (timeout, longest) in [
+            (Some(30), Some(secs(40))),
+            (Some(1), Some(secs(11))),
+            (Some(day), Some(secs(day + 10))),
+            (None, None),
+        ] {
+            assert_eq!(action(signal, timeout).longest_stop(), longest, "{signal}, {timeout:?}");
+        }
+    }
+    assert_eq!(
+        action("kill", None).longest_stop(),
+        Some(StopAction::TEARDOWN_MARGIN),
+        "kill"
+    );
+}
+
 // Refusals ============================================================================================================
 
 fn action(signal: &str, timeout: Option<u64>) -> StopAction {

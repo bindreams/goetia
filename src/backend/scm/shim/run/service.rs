@@ -18,7 +18,7 @@ use crate::backend::scm::wide::wide_null;
 use crate::backend::scm::win32::winapi_io;
 use crate::blob::Blob;
 use crate::error::{Chain, Error};
-use crate::spec::{DaemonSpec, Restart};
+use crate::spec::{DaemonSpec, Restart, StopAction};
 use cosca::error::ChildFate;
 use cosca::{ContainMode, Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
@@ -125,6 +125,7 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
         id,
         || report_running(&log, id, status_handle),
         |hint| report_stopping(&log, id, status_handle, hint),
+        || {},
     );
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
@@ -212,6 +213,16 @@ pub(super) fn finish(log: &Log, id: &str, reported: Reported, report: impl FnOnc
     }
 }
 
+/// What a stop that ended the wait with `end` tells SCM it can take, as `STOP_PENDING`'s wait hint: the stop action's
+/// longest wait ([`StopAction::longest_stop`]; the largest the field holds for none), or, for the daemon's own exit,
+/// the teardown alone. Only a service reports a hint: task mode reports to no SCM.
+fn stop_hint(action: &StopAction, end: WaitEnd) -> Duration {
+    match end {
+        WaitEnd::Stop => action.longest_stop().unwrap_or(Duration::MAX),
+        WaitEnd::Exit => StopAction::TEARDOWN_MARGIN,
+    }
+}
+
 /// `hint` as the wait hint field holds it: milliseconds, at most `u32::MAX`, which is what a stop with no `timeout`
 /// reports.
 fn wait_hint_millis(hint: Duration) -> u32 {
@@ -221,7 +232,7 @@ fn wait_hint_millis(hint: Duration) -> u32 {
 /// The `STOP_PENDING` status held while the shim stops the daemon, accepting no control. SCM
 /// then refuses a second `STOP` (1061) and a `START` (1056) itself, and a `STOPPED` that follows
 /// restarts or not exactly as one that follows `RUNNING` (measured). The hint is the stop's longest wait
-/// ([`StopPlan::wait_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is a constant 1.
+/// ([`stop_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is a constant 1.
 /// Measured: SCM does nothing when the hint expires (the status, a refused STOP (1061) and a refused START (1056) held
 /// for 10 s past a 1 s hint). Not measured: a `STOP_PENDING` held for longer than that with a checkpoint that does not
 /// move.
@@ -385,10 +396,17 @@ pub(super) fn run_daemon(
     id: &str,
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(Duration),
+    on_progress: impl FnMut(),
 ) -> Reported {
-    run_pass(spec, plan, supervisor, id, on_running, |end| {
-        on_stopping(plan.wait_hint(end))
-    })
+    run_pass(
+        spec,
+        plan,
+        supervisor,
+        id,
+        on_running,
+        |end| on_stopping(stop_hint(spec.stop_action(), end)),
+        on_progress,
+    )
     .reported()
 }
 
@@ -454,6 +472,7 @@ pub(super) fn run_pass(
     id: &str,
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(WaitEnd),
+    on_progress: impl FnMut(),
 ) -> PassOutcome {
     let log = &*supervisor.log;
     let (child, waiter) = match launch(spec, plan, supervisor, id) {
@@ -464,7 +483,7 @@ pub(super) fn run_pass(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
-    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping, on_progress) {
         WaitOutcome::ChildExited => {
             let code = exit_code(child.as_ref(), log, id);
             // A stop accepted before this decision wins over a failure: `settle` then says something
