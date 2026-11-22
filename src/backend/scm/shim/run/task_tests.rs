@@ -212,7 +212,7 @@ impl Run {
         self.runs.read(&instance()).unwrap()
     }
 
-    /// What a stop does as the program is spawned ([`FakeProcess::when_spawned`]): it is accepted after the last
+    /// What a stop does as the program is spawned ([`FakeProcess::when`] with [`Op::Spawn`]): it is accepted after the last
     /// look at the bus, which is task mode's alone and comes first.
     fn stop_at_the_spawn(&self) -> impl FnOnce() + Send + 'static {
         let bus = Arc::clone(&self.supervisor.bus);
@@ -913,7 +913,7 @@ fn a_stop_with_the_program_already_gone_records_its_exit_once() {
             .wait(WaitReply::Blocks)
             .wait(WaitReply::Blocks)
             .send_kill_tree(KillReply::Ends)
-            .when_spawned(run.stop_at_the_spawn());
+            .when(Op::Spawn, run.stop_at_the_spawn());
         let run = run.program(process);
         let mut watch = DirWatch::new(&run.records_dir());
 
@@ -961,7 +961,7 @@ fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_t
     let process = runs_until_stopped();
     let run = Run::of(&spec_logging_to(None)).listed();
     let stop = run.stop_at_the_spawn();
-    let run = run.program(process.clone().when_spawned(stop));
+    let run = run.program(process.clone().when(Op::Spawn, stop));
 
     let code = run.run_until_it_records(|| {
         assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
@@ -995,7 +995,7 @@ fn a_teardown_that_fails_replaces_the_record_with_an_incomplete_stop() {
         .send_kill_tree(KillReply::Refuses);
     let run = Run::of(&spec_logging_to(None)).listed();
     let stop = run.stop_at_the_spawn();
-    let run = run.program(process.clone().when_spawned(stop));
+    let run = run.program(process.clone().when(Op::Spawn, stop));
 
     let code = run.run_until_it_records(|| {
         assert_eq!(
@@ -1027,7 +1027,7 @@ fn a_stop_whose_kills_are_both_refused_is_an_incomplete_stop() {
         .kill(KillReply::Refuses);
     let run = Run::of(&spec_logging_to(None)).listed();
     let stop = run.stop_at_the_spawn();
-    let run = run.program(process.when_spawned(stop));
+    let run = run.program(process.when(Op::Spawn, stop));
 
     let code = run.run();
 
@@ -1054,7 +1054,7 @@ fn a_stop_whose_wait_failed_records_stopped() {
         .send_kill_tree(KillReply::Ends);
     let run = Run::of(&spec_logging_to(None)).listed();
     let stop = run.stop_at_the_spawn();
-    let run = run.program(process.when_spawned(stop));
+    let run = run.program(process.when(Op::Spawn, stop));
 
     let code = run.run();
 
@@ -1120,7 +1120,7 @@ fn a_stop_between_the_last_look_and_the_spawn_still_spawns_the_program() {
     let process = runs_until_stopped();
     let run = Run::of(&spec_logging_to(None)).listed();
     let stop = run.stop_at_the_spawn();
-    let run = run.program(process.clone().when_spawned(stop));
+    let run = run.program(process.clone().when(Op::Spawn, stop));
 
     let code = run.run_until_it_records(|| {
         assert_eq!(run.fake.calls(Op::Spawn), 1);
@@ -1234,7 +1234,7 @@ fn the_close_handler_only_requests_a_stop() {
     let bus = Arc::clone(&run.supervisor.bus);
     // The handler's thread is held for the life of the process, as the system's is: it is never joined. It is
     // started as the program is spawned, after the look at the bus that spawns nothing.
-    let run = run.program(process.clone().when_spawned(move || {
+    let run = run.program(process.clone().when(Op::Spawn, move || {
         std::thread::spawn(move || on_event(&bus, CTRL_CLOSE_EVENT));
     }));
 

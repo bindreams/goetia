@@ -725,7 +725,7 @@ fn a_stop_whose_read_of_the_daemon_fails_after_its_exit_was_reported_finds_it_go
             .send_kill_tree(KillReply::Ends);
         let (supervisor, waiter, child) = launched(&fake, &daemon);
         let bus = Arc::clone(&supervisor.bus);
-        let _ = daemon.clone().when_the_exit_read_fails(move || bus.await_exit_report());
+        let _ = daemon.clone().when(Op::TryWait, move || bus.await_exit_report());
         assert!(supervisor.bus.request_stop());
         let mut told = Vec::new();
 
