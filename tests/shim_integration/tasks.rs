@@ -5,7 +5,7 @@
 
 use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
 
-use goetia::manager::{Budget, Exit, ServiceManager as _, State};
+use goetia::manager::{Budget, Exit, RunInFlight, ServiceManager as _, State};
 use goetia::spec::{Id, User};
 use goetia::testing::RemovalMarker;
 
@@ -44,7 +44,7 @@ fn run_as_local_service(mode: &str, args: &[&str]) -> (Exit, String) {
         .run(&id, &mut Vec::new())
         .unwrap_or_else(|e| panic!("run: {}", e.report()));
     let said = reported.accept_line("the program to report");
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
     (exit, said)
 }
 
@@ -68,7 +68,7 @@ fn a_task_run_by_the_shim_records_its_exit(#[fixture(scm_group)] _group: &Group)
         "the program's own exit, read from the shim's record"
     );
     reported.accept("the program to have run");
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// A program with no close handler is ended by the event before the shim hears the stop, so the record is its own
@@ -112,7 +112,7 @@ fn a_stop_ends_a_program_with_no_handler_and_the_run_records_its_death_by_the_ev
         }
     });
     assert_eq!(mgr.status(&id).expect("status").common().state, State::Idle);
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// What stopping one run of a task left, from [`stop_a_run`].
@@ -165,7 +165,7 @@ fn stop_a_run(mode: &str, args: impl FnOnce(&std::path::Path, &std::path::Path) 
     let said = std::fs::read_to_string(&record).unwrap_or_default();
     let left = what_the_run_left(&records, &shim_log, &record);
     let files = files_in(&records);
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
     StoppedRun {
         exit,
         pid,
@@ -430,7 +430,7 @@ fn a_spec_without_cwd_runs_in_system32(#[fixture(scm_group)] _group: &Group) {
         "a spec with no `cwd` runs where Task Scheduler starts the shim: {cwd} (want {system32})"
     );
     mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// The shim's child inherits the priority class Task Scheduler gave the shim: `Priority` 5 is the normal
@@ -455,7 +455,7 @@ fn a_task_runs_at_normal_priority(#[fixture(scm_group)] _group: &Group) {
         "0x20",
         "NORMAL_PRIORITY_CLASS"
     );
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// An uninstall of a task whose run is in flight stops the run before it deletes the task.
@@ -479,7 +479,7 @@ fn uninstall_with_a_run_in_flight_leaves_no_program(#[fixture(scm_group)] _group
     let child = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
     ends_the_run.defuse();
 
     // The kernel reaches Gone as the shim's job closes: wait for it.
@@ -537,5 +537,5 @@ fn the_real_shim_obeys_the_marker(#[fixture(scm_group)] _group: &Group) {
     );
     assert!(!reported.connected_yet(), "the program ran under a marker");
     drop(marker);
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
 }

@@ -11,6 +11,7 @@ use super::super::busctl::Busctl;
 use super::super::journal::fake::Fake as JournalFake;
 use super::super::journal::{DEACTIVATED, Entry as JournalEntry, MAIN_PROCESS_EXITED, STARTING};
 use super::super::manager_tests::QuarantineSweep;
+use super::super::standin::standin_path;
 use super::super::systemctl::Systemctl;
 use super::super::systemctl::systemctl_tests::{booted, gate_then};
 use super::*;
@@ -26,7 +27,7 @@ use crate::testing::{base_fields, task};
 
 // Specs and snapshots =================================================================================================
 
-fn units_of(spec: &DaemonSpec) -> Units {
+pub(in crate::backend::systemd::manager) fn units_of(spec: &DaemonSpec) -> Units {
     generate::units(spec, &Identity { user: "0".to_string() }).expect("a spec that renders")
 }
 
@@ -441,7 +442,7 @@ fn an_unanswered_question_whether_the_timer_is_armed_fails_the_update() {
 
 // Fakes ===============================================================================================================
 
-fn reload() -> Entry {
+pub(in crate::backend::systemd::manager) fn reload() -> Entry {
     reply(&["daemon-reload"], exited(0, "", ""))
 }
 
@@ -490,16 +491,16 @@ pub(in crate::backend::systemd::manager) fn manager(systemctl: &Fake, busctl: Fa
 }
 
 /// A manager that must reach neither `busctl` nor the journal.
-fn over(systemctl: &Fake) -> Systemd {
+pub(in crate::backend::systemd::manager) fn over(systemctl: &Fake) -> Systemd {
     manager(systemctl, Fake::new([]), JournalFake::new(Vec::new()))
 }
 
 /// The version gate's two probes, then every call of `calls`.
-fn without_gate(fake: &Fake) -> Vec<Vec<String>> {
+pub(in crate::backend::systemd::manager) fn without_gate(fake: &Fake) -> Vec<Vec<String>> {
     fake.calls().into_iter().skip(2).collect()
 }
 
-fn call(args: &[&str]) -> Vec<String> {
+pub(in crate::backend::systemd::manager) fn call(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
 }
 
@@ -780,15 +781,15 @@ fn disable_of_a_service_disables_its_unit() {
     assert_eq!(without_gate(&fake), [call(&["disable", "--", "x.service"])]);
 }
 
-/// Everything a test's id can leave in the unit directory: both units, both drop-in directories, the
+/// Everything a test's id can leave in the unit directories: both units, the stand-in, both drop-in directories, the
 /// enablement links, and the quarantine files. Registered before the first write.
-struct Leftovers {
+pub(in crate::backend::systemd::manager) struct Leftovers {
     id: String,
     _sweep: QuarantineSweep,
 }
 
 impl Leftovers {
-    fn new(id: &str) -> Leftovers {
+    pub(in crate::backend::systemd::manager) fn new(id: &str) -> Leftovers {
         Leftovers {
             id: id.to_string(),
             _sweep: QuarantineSweep::new(id),
@@ -798,6 +799,7 @@ impl Leftovers {
 
 impl Drop for Leftovers {
     fn drop(&mut self) {
+        remove_or_warn(&standin_path(&self.id), false);
         for kind in UnitKind::ALL {
             remove_or_warn(&unit_path(&self.id, kind), false);
             remove_or_warn(&dropin_dir(&self.id, kind), true);
@@ -811,21 +813,21 @@ impl Drop for Leftovers {
     }
 }
 
-fn seed(id: &str, kind: UnitKind, text: &str) {
+pub(in crate::backend::systemd::manager) fn seed(id: &str, kind: UnitKind, text: &str) {
     std::fs::write(unit_path(id, kind), text).unwrap_or_else(|e| panic!("seed {id}{}: {e}", kind.suffix()));
 }
 
-fn text_of(id: &str, kind: UnitKind) -> Option<String> {
+pub(in crate::backend::systemd::manager) fn text_of(id: &str, kind: UnitKind) -> Option<String> {
     std::fs::read_to_string(unit_path(id, kind)).ok()
 }
 
 /// A path the fake's action can own.
-fn owned(id: &str, kind: UnitKind) -> PathBuf {
+pub(in crate::backend::systemd::manager) fn owned(id: &str, kind: UnitKind) -> PathBuf {
     unit_path(id, kind)
 }
 
 /// What the manager reads at `id` now, which must be marked.
-fn marked(mgr: &Systemd, id: &str) -> Fragment {
+pub(in crate::backend::systemd::manager) fn marked(mgr: &Systemd, id: &str) -> Fragment {
     match Backend::read(mgr, &Id::try_from(id).expect("an id")) {
         Ok(ReadOutcome::Marked(snapshot)) => snapshot,
         Ok(ReadOutcome::Absent) => panic!("{id} reads as absent"),
@@ -839,7 +841,7 @@ fn install(mgr: &Systemd, spec: &DaemonSpec, force: bool) -> Outcome {
     flow::install(mgr, spec, force, &mut held).expect("install")
 }
 
-fn held(mgr: &Systemd) -> Held {
+pub(in crate::backend::systemd::manager) fn held(mgr: &Systemd) -> Held {
     Backend::reserve(mgr, &[Step::Install], Budget::Unbounded).expect("reserve")
 }
 
@@ -1016,7 +1018,8 @@ fn a_timer_without_its_job_is_ours_unusable_and_uninstall_removes_it(#[fixture(s
     assert!(why.contains("the timer's job is missing"), "{why}");
     assert!(matches!(flow::preview(&mgr, &spec), Ok(Outcome::RefuseUnusable { .. })));
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(text_of(&id, UnitKind::Timer), None);
     assert_eq!(
@@ -1987,7 +1990,8 @@ fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixtur
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(
         without_gate(&fake),
@@ -2014,7 +2018,8 @@ fn uninstalling_a_service_keeps_its_order(#[fixture(systemd_group)] _group: &Gro
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(
         without_gate(&fake),
@@ -2038,7 +2043,8 @@ fn uninstalling_a_job_without_a_timer_asks_nothing_of_the_timer(#[fixture(system
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(
         without_gate(&fake),
@@ -2068,7 +2074,7 @@ fn uninstall_reports_a_timer_that_changed_as_a_concurrent_change(#[fixture(syste
     let snapshot = marked(&mgr, &id);
 
     let e = mgr
-        .uninstall_units(snapshot, &mut held(&mgr))
+        .uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
         .expect_err("the timer changed");
 
     assert!(
@@ -2132,7 +2138,7 @@ fn scan_lists_a_task_once_and_a_timer_only_id_as_unusable(#[fixture(systemd_grou
 
 // status ==============================================================================================================
 
-fn show(active: &str, pid: u32) -> Entry {
+pub(in crate::backend::systemd::manager) fn show(active: &str, pid: u32) -> Entry {
     show_in(active, pid, "")
 }
 

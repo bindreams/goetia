@@ -116,6 +116,11 @@ pub(in crate::backend::systemd::manager) fn gate_passes() -> Vec<Entry> {
     ]
 }
 
+/// The version gate's two probes, refusing: systemd 241 is older than the floor.
+pub(in crate::backend::systemd::manager) fn gate_refuses() -> Vec<Entry> {
+    two_versions("241", "241")
+}
+
 /// A fake that passes the version gate, and then answers `rest`.
 pub(in crate::backend::systemd::manager) fn gate_then(rest: impl IntoIterator<Item = Entry>) -> Fake {
     Fake::new(gate_passes().into_iter().chain(rest))
@@ -800,7 +805,10 @@ fn every_path() -> Vec<Way> {
         }),
         Way::request("clean timer", |s: &Systemctl| s.clean_timer("x", &mut Held::default())),
         Way::request("reset-failed timer", |s: &Systemctl| {
-            s.reset_timer("x", &mut Held::default())
+            s.reset_failed("x", UnitKind::Timer, &mut Held::default())
+        }),
+        Way::request("reset-failed job", |s: &Systemctl| {
+            s.reset_failed("x", UnitKind::Service, &mut Held::default())
         }),
         Way {
             name: "show stamp".to_string(),
@@ -1431,6 +1439,112 @@ fn task_state_table() {
             invocation: Some("0123abcd".to_string())
         }
     );
+}
+
+/// The one read `uninstall` decides from. `inactive` and `failed` are no run, unless a job is pending for the unit
+/// (a start job queued and not yet running reads `inactive`), which is a run in its start job; `activating` with a
+/// `SubState` that begins with `auto-restart` (`auto-restart`, and `auto-restart-queued` of systemd 254 and later)
+/// is a restart that is waiting; every other `activating`, a sub-state goetia does not know included, is a run in
+/// its start job, the safe side. Every other state, the ones goetia does not know included, is a run. The unit's own
+/// words for the two stop settings and the file it was loaded from come back as they were printed.
+#[skuld::test]
+fn run_of_table() {
+    for (active, sub, job, phase) in [
+        ("inactive", "dead", "", RunPhase::None),
+        ("failed", "failed", "", RunPhase::None),
+        ("inactive", "dead", "412", RunPhase::InStartJob),
+        ("failed", "failed", "412", RunPhase::InStartJob),
+        ("activating", "auto-restart", "", RunPhase::PendingRestart),
+        ("activating", "auto-restart", "412", RunPhase::PendingRestart),
+        ("activating", "auto-restart-queued", "", RunPhase::PendingRestart),
+        ("activating", "start", "", RunPhase::InStartJob),
+        ("activating", "start-pre", "412", RunPhase::InStartJob),
+        ("activating", "a-substate-of-the-future", "", RunPhase::InStartJob),
+        ("activating", "", "", RunPhase::InStartJob),
+        ("active", "running", "", RunPhase::Running),
+        ("active", "running", "412", RunPhase::Running),
+        ("active", "exited", "", RunPhase::Running),
+        ("deactivating", "stop-sigterm", "", RunPhase::Running),
+        ("reloading", "reload", "", RunPhase::Running),
+        ("maintenance", "clean", "", RunPhase::Running),
+        ("refreshing", "x", "", RunPhase::Running),
+        ("", "", "", RunPhase::Running),
+        ("a-state-of-the-future", "y", "", RunPhase::Running),
+    ] {
+        let answer = format!(
+            "ActiveState={active}\nSubState={sub}\nJob={job}\nKillSignal=12\n\
+             TimeoutStopUSec=1min 30s\nLoadState=loaded\nFragmentPath=/etc/systemd/system/x.service\n"
+        );
+        assert_eq!(
+            showing(&answer).run_of("x.service").expect(active),
+            UnitRun {
+                phase,
+                failed: active == "failed",
+                kill_signal: "12".to_string(),
+                stop_timeout: "1min 30s".to_string(),
+                load_state: "loaded".to_string(),
+                fragment_path: "/etc/systemd/system/x.service".to_string(),
+            },
+            "{active:?} {sub:?} job {job:?}"
+        );
+    }
+}
+
+/// An answer with no `Job` line at all means no job is pending, as an empty `Job=` does; the other properties are
+/// still required.
+#[skuld::test]
+fn run_of_reads_a_missing_job_line_as_no_job_pending() {
+    for (active, spelling, phase) in [
+        ("inactive", "Job=\n", RunPhase::None),
+        ("inactive", "", RunPhase::None),
+        ("failed", "Job=\n", RunPhase::None),
+        ("failed", "", RunPhase::None),
+        ("inactive", "Job=412\n", RunPhase::InStartJob),
+    ] {
+        let answer = format!(
+            "ActiveState={active}\nSubState=dead\n{spelling}KillSignal=15\nTimeoutStopUSec=1min 30s\n\
+             LoadState=loaded\nFragmentPath=/etc/systemd/system/x.service\n"
+        );
+        assert_eq!(
+            showing(&answer).run_of("x.service").expect(active).phase,
+            phase,
+            "{active} {spelling:?}"
+        );
+    }
+    let no_kill_signal =
+        "ActiveState=inactive\nSubState=dead\nTimeoutStopUSec=1min 30s\nLoadState=loaded\nFragmentPath=\n";
+    let e = showing(no_kill_signal).run_of("x.service").expect_err("incomplete");
+    assert!(matches!(e, Error::IncompleteAnswer { .. }), "{e:?}");
+}
+
+/// A unit systemd has no file for is answered like any other, not an error: the absent id's read is of it.
+#[skuld::test]
+fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
+    let answer = "ActiveState=inactive\nSubState=dead\nJob=\nKillSignal=15\n\
+                  TimeoutStopUSec=1min 30s\nLoadState=not-found\nFragmentPath=\n";
+
+    let run = showing(answer).run_of("x.service").expect("a read");
+
+    assert_eq!(run.phase, RunPhase::None);
+    assert!(!run.loaded_from(std::path::Path::new("/etc/systemd/system/x.service")));
+}
+
+/// Only a definition loaded from the path asked about is "held".
+#[skuld::test]
+fn a_run_is_loaded_from_a_path_only_when_systemd_says_loaded_from_it() {
+    let read = |load: &str, fragment: &str| {
+        let answer = format!(
+            "ActiveState=active\nSubState=running\nJob=\nKillSignal=15\n\
+             TimeoutStopUSec=infinity\nLoadState={load}\nFragmentPath={fragment}\n"
+        );
+        showing(&answer).run_of("x.service").expect("a read")
+    };
+    let path = std::path::Path::new("/etc/systemd/system/x.service");
+
+    assert!(read("loaded", "/etc/systemd/system/x.service").loaded_from(path));
+    assert!(!read("loaded", "/run/systemd/system/x.service").loaded_from(path));
+    assert!(!read("not-found", "/etc/systemd/system/x.service").loaded_from(path));
+    assert!(!read("loaded", "").loaded_from(path));
 }
 
 #[skuld::test]

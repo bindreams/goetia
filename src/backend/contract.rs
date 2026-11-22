@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
-use crate::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step, flow};
+use crate::manager::{Budget, Exit, Installed, RunInFlight, Sequence, ServiceManager, State, Status, Step, flow};
 use crate::spec::{DaemonKind, DaemonSpec, Id, StopAction};
 
 /// A marked artifact's metadata as `read` decoded it, or the failure kept in its place. Shared, so
@@ -177,15 +177,24 @@ pub(crate) trait Backend {
     // snapshot the ownership gate ([`flow::owned`]) yielded. Taken by value so a verb can let go of
     // what the snapshot holds when it must (SCM's open handle keeps a deleted service alive).
 
-    /// See [`ServiceManager::uninstall`].
-    fn uninstall(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
+    /// See [`ServiceManager::uninstall`]: `in_flight` is what it does with a run in flight, and a backend
+    /// that cannot honour [`RunInFlight::Leave`] refuses it before it reads or changes anything.
+    fn uninstall(
+        &self,
+        snapshot: Self::Snapshot,
+        in_flight: RunInFlight,
+        reservation: &mut Self::Reservation,
+    ) -> Result<()>;
 
     /// What `uninstall` of an `id` that is not installed does before it says so: a backend that keeps
     /// something of its own beyond the service itself (SCM's shim files, which an uninstall that
     /// failed to sweep leaves behind) cleans it up. A failure replaces [`Error::NotInstalled`], which
     /// the CLI renders as success, so that re-running `uninstall` is how a failed cleanup is retried.
     /// Never called for an id that is foreign or whose state is undetermined.
-    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+    ///
+    /// `in_flight` as for [`ServiceManager::uninstall`], for a backend whose leftover has a run (systemd's
+    /// stand-in: see its `standin` module); a backend with none ignores it.
+    fn uninstall_absent(&self, _id: &Id, _in_flight: RunInFlight) -> Result<()> {
         Ok(())
     }
 
@@ -425,6 +434,19 @@ pub(crate) struct Scan<S> {
     pub reported: Vec<Installed>,
 }
 
+// RunInFlight::Leave, until every backend honours it ==================================================================
+
+/// The refusal of [`RunInFlight::Leave`] by `manager`, a backend that does not honour it yet: nothing
+/// was read or changed, and `uninstall` without `--no-stop` still works.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn leave_not_built(id: &Id, manager: &str) -> Error {
+    Error::Invalid {
+        daemon: id.to_string(),
+        message: format!("`--no-stop` is not built for {manager} yet, so nothing was changed: uninstall without it"),
+        source: None,
+    }
+}
+
 // ServiceManager ======================================================================================================
 
 impl<B: Backend> ServiceManager for B {
@@ -438,16 +460,16 @@ impl<B: Backend> ServiceManager for B {
         flow::preview(self, spec)
     }
 
-    fn uninstall(&self, id: &Id) -> Result<()> {
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
         let snapshot = match flow::owned(self, id) {
             Err(absent @ Error::NotInstalled { .. }) => {
-                return Err(Backend::uninstall_absent(self, id).err().unwrap_or(absent));
+                return Err(Backend::uninstall_absent(self, id, in_flight).err().unwrap_or(absent));
             }
             owned => owned?,
         };
         // `uninstall` has no `--timeout` of its own: its stop is unbounded.
         let mut reservation = flow::reserved(self, id, &[Step::Uninstall], Budget::Unbounded)?;
-        Backend::uninstall(self, snapshot, &mut reservation)
+        Backend::uninstall(self, snapshot, in_flight, &mut reservation)
     }
 
     fn enable(&self, id: &Id) -> Result<()> {

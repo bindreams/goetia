@@ -20,7 +20,7 @@ use goetia::backend::Identity;
 use goetia::backend::launchd::generate;
 use goetia::backend::launchd::manager::{ENABLED_DIR, Launchd, STAGING_DIR};
 use goetia::decide::Outcome;
-use goetia::manager::{self, Budget, Installed, ServiceManager, State};
+use goetia::manager::{self, Budget, Installed, RunInFlight, ServiceManager, State};
 use goetia::spec::{
     DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
 };
@@ -172,7 +172,7 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        match Launchd::new().uninstall(&self.0) {
+        match Launchd::new().uninstall(&self.0, RunInFlight::Stop) {
             Ok(()) | Err(goetia::Error::NotInstalled { .. }) => {}
             Err(e) => eprintln!("Guard[{}]: cleanup failed: {e}", self.0),
         }
@@ -902,7 +902,7 @@ fn uninstall_leaves_nothing(#[fixture(launchd_group)] _group: &Group) {
     let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     assert!(!staging_path(&id).exists(), "no plist should remain in staging");
     assert!(!enabled_path(&id).exists(), "no plist should remain in LaunchDaemons");

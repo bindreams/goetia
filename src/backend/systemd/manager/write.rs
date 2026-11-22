@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Error, Result};
 
 use super::discover::{RawState, ReadFailure, classify_and_read};
-use super::{UNIT_DIR, UnitKind, remove_file_if_present, unit_name, unit_path};
+use super::{UNIT_DIR, UnitKind, remove_file_if_present, unit_name};
 
 // CreateOutcome / create_unit =========================================================================================
 
@@ -26,11 +26,16 @@ pub(super) enum CreateOutcome {
 /// [`tempfile::NamedTempFile::persist_noclobber`] is `linkat(2)` without
 /// replace semantics, so this fails rather than clobbers if anything now occupies `unit_path(id, kind)`.
 pub(super) fn create_unit(id: &str, kind: UnitKind, text: &str) -> Result<CreateOutcome> {
-    let final_path = unit_path(id, kind);
-    let tmp = write_temp_unit(id, kind, text)?;
+    create_unit_in(Path::new(UNIT_DIR), id, kind, text)
+}
+
+/// [`create_unit`] in `dir`, which is `UNIT_DIR` or the runtime unit directory a stand-in goes in.
+pub(super) fn create_unit_in(dir: &Path, id: &str, kind: UnitKind, text: &str) -> Result<CreateOutcome> {
+    let final_path = dir.join(unit_name(id, kind));
+    let tmp = write_temp_unit(dir, id, kind, text)?;
     match tmp.persist_noclobber(&final_path) {
         Ok(_file) => {
-            fsync_unit_dir()?;
+            fsync_dir(dir)?;
             Ok(CreateOutcome::Created)
         }
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(CreateOutcome::Raced),
@@ -64,23 +69,34 @@ pub(super) fn replace_unit_verified(
     text: &str,
     expected_text: &str,
 ) -> Result<ReplaceOutcome> {
-    let Some(backup_path) = quarantine_if_still_ours(id, kind, expected_text)? else {
+    replace_unit_verified_in(Path::new(UNIT_DIR), id, kind, text, expected_text)
+}
+
+/// [`replace_unit_verified`] in `dir`, which is `UNIT_DIR` or the runtime unit directory a stand-in goes in.
+pub(super) fn replace_unit_verified_in(
+    dir: &Path,
+    id: &str,
+    kind: UnitKind,
+    text: &str,
+    expected_text: &str,
+) -> Result<ReplaceOutcome> {
+    let Some(backup_path) = quarantine_if_still_ours_in(dir, id, kind, expected_text)? else {
         return Ok(ReplaceOutcome::Raced);
     };
-    let final_path = unit_path(id, kind);
+    let final_path = dir.join(unit_name(id, kind));
 
     // Every failure from here on restores the quarantined original before reporting, except the one
     // case where doing so would itself clobber a third file — see that arm's own comment. A transient
     // write failure (ENOSPC, EIO, a permission error) must never turn a routine `install` over an
     // already-installed service into a silent uninstall.
-    let tmp = match write_temp_unit(id, kind, text) {
+    let tmp = match write_temp_unit(dir, id, kind, text) {
         Ok(tmp) => tmp,
         Err(e) => return Err(restore_or_chain(id, &backup_path, &final_path, e)),
     };
 
     match tmp.persist_noclobber(&final_path) {
         Ok(_file) => {
-            fsync_unit_dir()?;
+            fsync_dir(dir)?;
             remove_file_if_present(&backup_path)?;
             Ok(ReplaceOutcome::Replaced)
         }
@@ -149,8 +165,13 @@ fn restore_or_chain(id: &str, backup_path: &Path, final_path: &Path, primary: Er
 /// the same arm and get the same answer: `expected_text` is UTF-8 by construction, so they cannot be
 /// the file this was asked to verify.
 pub(super) fn quarantine_if_still_ours(id: &str, kind: UnitKind, expected_text: &str) -> Result<Option<PathBuf>> {
-    let final_path = unit_path(id, kind);
-    let backup_path = unique_quarantine_path(id, kind);
+    quarantine_if_still_ours_in(Path::new(UNIT_DIR), id, kind, expected_text)
+}
+
+/// [`quarantine_if_still_ours`] in `dir`.
+fn quarantine_if_still_ours_in(dir: &Path, id: &str, kind: UnitKind, expected_text: &str) -> Result<Option<PathBuf>> {
+    let final_path = dir.join(unit_name(id, kind));
+    let backup_path = unique_quarantine_path(dir, id, kind);
 
     match fs::rename(&final_path, &backup_path) {
         Ok(()) => {}
@@ -176,14 +197,46 @@ pub(super) fn quarantine_if_still_ours(id: &str, kind: UnitKind, expected_text: 
     }
 }
 
+/// `id`'s `kind` unit in `dir` removed, if it is still the file with `expected_text`; anything else there is
+/// [`Error::ConcurrentChange`], and is left where it is.
+pub(super) fn remove_verified(dir: &Path, id: &str, kind: UnitKind, expected_text: &str) -> Result<()> {
+    match remove_verified_with(dir, id, kind, expected_text, || Ok(()))? {
+        true => Ok(()),
+        false => Err(Error::ConcurrentChange {
+            id: id.to_string(),
+            path: Some(dir.join(unit_name(id, kind))),
+        }),
+    }
+}
+
+/// [`remove_verified`] with `between` run once the file is found to be `expected_text` and moved aside, before it
+/// is deleted: `false` if the path held something else (or nothing), which is left where it is and `between` is
+/// not run. If `between` fails the file is put back and its error is returned.
+pub(super) fn remove_verified_with(
+    dir: &Path,
+    id: &str,
+    kind: UnitKind,
+    expected_text: &str,
+    between: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let Some(backup) = quarantine_if_still_ours_in(dir, id, kind, expected_text)? else {
+        return Ok(false);
+    };
+    if let Err(e) = between() {
+        return Err(restore_or_chain(id, &backup, &dir.join(unit_name(id, kind)), e));
+    }
+    remove_file_if_present(&backup)?;
+    Ok(true)
+}
+
 /// A quarantine name unique to this attempt, so two quarantines for the same id — a prior attempt
 /// left one behind, or a genuinely concurrent one — never collide. A monotonic per-process counter
 /// combined with the PID is unique across both this process's own repeated attempts and any other
 /// process running concurrently.
-fn unique_quarantine_path(id: &str, kind: UnitKind) -> PathBuf {
+fn unique_quarantine_path(dir: &Path, id: &str, kind: UnitKind) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    Path::new(UNIT_DIR).join(format!(
+    dir.join(format!(
         ".{unit}.goetia-quarantine.{pid:x}-{n:x}",
         unit = unit_name(id, kind),
         pid = std::process::id()
@@ -214,15 +267,14 @@ pub(super) fn restore_quarantine(id: &str, backup_path: &Path, final_path: &Path
 
 // write_temp_unit / fsync_unit_dir ====================================================================================
 
-/// A temp file in `UNIT_DIR` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
+/// A temp file in `dir` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
 /// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (so
 /// `list`/`show`/`diff` need no elevation) and `fsync`ed to stable storage — `NamedTempFile`'s
 /// `Write` impl forwards `flush()` straight to `std::fs::File`, whose `flush` is a documented no-op,
 /// so without a real `sync_all()` here a crash between this write and the later rename can leave the
 /// fragment on disk fully or partially zero-filled: no `[X-Goetia]` marker, `extract` returns
 /// `Ok(None)`, and every verb then refuses an id goetia itself created.
-pub(super) fn write_temp_unit(id: &str, kind: UnitKind, text: &str) -> Result<tempfile::NamedTempFile> {
-    let dir = Path::new(UNIT_DIR);
+pub(super) fn write_temp_unit(dir: &Path, id: &str, kind: UnitKind, text: &str) -> Result<tempfile::NamedTempFile> {
     let mut tmp = tempfile::Builder::new()
         .prefix(&format!(".goetia-{id}-"))
         .suffix(&format!("{}.tmp", kind.suffix()))
@@ -239,10 +291,9 @@ pub(super) fn write_temp_unit(id: &str, kind: UnitKind, text: &str) -> Result<te
     Ok(tmp)
 }
 
-/// `fsync`s `UNIT_DIR` itself, so a just-completed rename's new directory entry is durable — a file's
+/// `fsync`s `dir` itself, so a just-completed rename's new directory entry is durable — a file's
 /// own `fsync` (see `write_temp_unit`) says nothing about the directory entry pointing to it.
-pub(super) fn fsync_unit_dir() -> Result<()> {
-    let dir = Path::new(UNIT_DIR);
+pub(super) fn fsync_dir(dir: &Path) -> Result<()> {
     let f = fs::File::open(dir).map_err(|e| Error::os_at("open", dir, e))?;
     f.sync_all().map_err(|e| Error::os_at("fsync", dir, e))
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
-use goetia::manager::{Budget, Installed, ServiceManager as _, State};
+use goetia::manager::{Budget, Installed, RunInFlight, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
 use goetia::testing::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED, service_fields};
 use windows_service::service::ServiceAccess;
@@ -398,7 +398,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let _guard = ServiceGuard::new(&id);
     let spec = install_native(&mgr, &id);
 
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "service should no longer exist:\n{query}");
@@ -447,7 +447,8 @@ fn uninstall_then_immediate_reinstall_succeeds(#[fixture(scm_group)] _group: &Gr
     // Uninstalling a *running* service is the real test of
     // delete-after-stop: `delete` must not run until a confirmed stop, or the registry key survives
     // and the immediate reinstall below meets `ERROR_SERVICE_MARKED_FOR_DELETE`.
-    mgr.uninstall(&spec.common().id).expect("uninstall a running service");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop)
+        .expect("uninstall a running service");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP as part of uninstall");
 
     let outcome = mgr.install(&spec, false).expect("immediate reinstall");
@@ -478,7 +479,7 @@ fn uninstall_errors_when_service_will_not_stop(#[fixture(scm_group)] _group: &Gr
     started.accept("the fixture to report SERVICE_RUNNING");
 
     let err = mgr
-        .uninstall(&spec.common().id)
+        .uninstall(&spec.common().id, RunInFlight::Stop)
         .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped by uninstall");
     let text = err.report().to_string();
     assert!(
@@ -506,7 +507,7 @@ fn uninstall_errors_when_service_will_not_stop(#[fixture(scm_group)] _group: &Gr
     // The named remedy, then the retry: it succeeds and the record is gone (1060).
     mgr.kill(&spec.common().id)
         .expect("kill the service uninstall could not stop");
-    mgr.uninstall(&spec.common().id)
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop)
         .expect("re-running uninstall after the kill");
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert_eq!(
@@ -2210,7 +2211,7 @@ fn uninstall_of_a_service_that_denies_a_step_fails_as_the_verb_and_leaves_it_ins
         let _denied = deny(&id);
 
         let err = mgr
-            .uninstall(&spec.common().id)
+            .uninstall(&spec.common().id, RunInFlight::Stop)
             .expect_err("a denied open cannot disable or delete the service");
         assert!(
             !matches!(err.cause(), goetia::Error::Undetermined { .. }),
