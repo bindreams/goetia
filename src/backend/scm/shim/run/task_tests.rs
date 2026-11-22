@@ -1666,6 +1666,12 @@ fn a_provisional_file_that_cannot_be_written_is_logged_as_that_and_the_record_st
 
     assert_eq!(code, 7);
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    // The prune cannot remove what is in the provisional file's place.
+    let warnings = run.fake.take_warnings();
+    assert!(
+        warnings.len() == 1 && warnings[0].contains("prune the run records"),
+        "{warnings:?}"
+    );
     let failures = run.finish();
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
