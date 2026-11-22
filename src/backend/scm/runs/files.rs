@@ -10,10 +10,11 @@ use std::os::windows::io::AsRawHandle as _;
 
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_RENAME_INFORMATION,
-    FileRenameInformation, NtSetInformationFile,
+    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformation, FileRenameInformationEx,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_SHARING_VIOLATION, HANDLE, STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    ERROR_SHARING_VIOLATION, HANDLE, STATUS_DELETE_PENDING, STATUS_INVALID_INFO_CLASS, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
     STATUS_REPARSE_POINT_NOT_RESOLVED, STATUS_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -47,6 +48,12 @@ pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
 /// the handle, relative to the directory's, so there is no moment at which it is closed and under its
 /// old name: nothing can delete it between its last write and the rename. `file` must have been opened
 /// with `DELETE`, and be in `dir`.
+///
+/// The replacement has POSIX semantics: a target that others have open (a reader of the record being
+/// replaced) is replaced all the same, they go on reading the old bytes, and a new open gets the new file.
+/// A holder that shares no delete refuses it with `STATUS_SHARING_VIOLATION` (measured; the plain class
+/// answered `STATUS_ACCESS_DENIED` for any open target). A file system that does not know the class,
+/// `STATUS_INVALID_INFO_CLASS`, gets the plain `FileRenameInformation`, which cannot replace an open target.
 pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> {
     debug_assert!(is_bare(to), "a name, not a path");
     let name: Vec<u16> = to.encode_wide().collect();
@@ -60,23 +67,34 @@ pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> 
     // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFORMATION`: room for
     // the struct and for the name, which is copied in at the name's own offset.
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = true;
         (*info).RootDirectory = dir.file().as_raw_handle() as HANDLE;
         (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), info.cast::<u8>().add(header).cast::<u16>(), name.len());
     }
-    let mut block = IO_STATUS_BLOCK::default();
-    // SAFETY: `file` is a live handle opened with `DELETE`, `dir`'s handle is live; `info` is `total`
-    // readable bytes.
-    let status = unsafe {
-        NtSetInformationFile(
-            file.as_raw_handle() as HANDLE,
-            &mut block,
-            info.cast(),
-            total as u32,
-            FileRenameInformation,
-        )
+    let mut set = |flags: u32, class| {
+        // SAFETY: `info` is `total` bytes `buffer` holds; the flags are a plain write into its first field.
+        unsafe { (*info).Anonymous.Flags = flags };
+        let mut block = IO_STATUS_BLOCK::default();
+        // SAFETY: `file` is a live handle opened with `DELETE`, `dir`'s handle is live; `info` is `total`
+        // readable bytes.
+        unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle() as HANDLE,
+                &mut block,
+                info.cast(),
+                total as u32,
+                class,
+            )
+        }
     };
+    let mut status = set(
+        FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+        FileRenameInformationEx,
+    );
+    if status == STATUS_INVALID_INFO_CLASS {
+        // The first byte of the flags is the `ReplaceIfExists` of the plain class.
+        status = set(FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformation);
+    }
     if status < 0 {
         return Err(io_error(status));
     }

@@ -87,6 +87,7 @@ pub(crate) enum RunOutcome {
     /// teardown ended it, or Windows ended the shim after this was written, which is before the shim waits for a
     /// program that is alive at the stop. It does not say the program's tree has ended: a shim that Windows ends
     /// first leaves it, and the Job Object ends the tree. A program the shim saw exit is `Exited`, stop or not.
+    /// If the record that replaces this one cannot be written, this is what stays on disk.
     Stopped,
     /// A stop was accepted and something of the program's tree could not be ended. It replaces `Stopped`.
     IncompleteStop,
@@ -376,7 +377,8 @@ impl Runs {
     /// whole once this returns `Ok`; a prune that cannot remove a file leaves it for the next write.
     /// What the prune could not do, and a failure of its own (not a file that is gone or held), is
     /// returned as one line each for the caller to log: it never fails the write. A directory that is a
-    /// link is refused ([`Runs::ensure`]), and nothing is written.
+    /// link is refused ([`Runs::ensure`]), and nothing is written. A replacement that fails (a holder of the old record
+    /// that shares no delete, or any other error) leaves the old record as it was, a first `Stopped` included.
     ///
     /// `pin` is the writer's pin ([`Writing`]; a bare `None`, `Some(pin)` or `&pin` says it). **Given**, it is held
     /// until the record is renamed into place, then released before the prune, which a held pin would stop; a failed
