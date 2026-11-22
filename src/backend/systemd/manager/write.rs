@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Error, Result};
 
 use super::discover::{RawState, ReadFailure, classify_and_read};
-use super::{UNIT_DIR, UnitKind, remove_file_if_present, unit_name, unit_path};
+use super::{UNIT_DIR, UnitKind, remove_file_if_present, unit_name};
 
 // CreateOutcome / create_unit =========================================================================================
 
@@ -69,23 +69,34 @@ pub(super) fn replace_unit_verified(
     text: &str,
     expected_text: &str,
 ) -> Result<ReplaceOutcome> {
-    let Some(backup_path) = quarantine_if_still_ours(id, kind, expected_text)? else {
+    replace_unit_verified_in(Path::new(UNIT_DIR), id, kind, text, expected_text)
+}
+
+/// [`replace_unit_verified`] in `dir`, which is `UNIT_DIR` or the runtime unit directory a stand-in goes in.
+pub(super) fn replace_unit_verified_in(
+    dir: &Path,
+    id: &str,
+    kind: UnitKind,
+    text: &str,
+    expected_text: &str,
+) -> Result<ReplaceOutcome> {
+    let Some(backup_path) = quarantine_if_still_ours_in(dir, id, kind, expected_text)? else {
         return Ok(ReplaceOutcome::Raced);
     };
-    let final_path = unit_path(id, kind);
+    let final_path = dir.join(unit_name(id, kind));
 
     // Every failure from here on restores the quarantined original before reporting, except the one
     // case where doing so would itself clobber a third file — see that arm's own comment. A transient
     // write failure (ENOSPC, EIO, a permission error) must never turn a routine `install` over an
     // already-installed service into a silent uninstall.
-    let tmp = match write_temp_unit(Path::new(UNIT_DIR), id, kind, text) {
+    let tmp = match write_temp_unit(dir, id, kind, text) {
         Ok(tmp) => tmp,
         Err(e) => return Err(restore_or_chain(id, &backup_path, &final_path, e)),
     };
 
     match tmp.persist_noclobber(&final_path) {
         Ok(_file) => {
-            fsync_dir(Path::new(UNIT_DIR))?;
+            fsync_dir(dir)?;
             remove_file_if_present(&backup_path)?;
             Ok(ReplaceOutcome::Replaced)
         }
@@ -154,8 +165,13 @@ fn restore_or_chain(id: &str, backup_path: &Path, final_path: &Path, primary: Er
 /// the same arm and get the same answer: `expected_text` is UTF-8 by construction, so they cannot be
 /// the file this was asked to verify.
 pub(super) fn quarantine_if_still_ours(id: &str, kind: UnitKind, expected_text: &str) -> Result<Option<PathBuf>> {
-    let final_path = unit_path(id, kind);
-    let backup_path = unique_quarantine_path(id, kind);
+    quarantine_if_still_ours_in(Path::new(UNIT_DIR), id, kind, expected_text)
+}
+
+/// [`quarantine_if_still_ours`] in `dir`.
+fn quarantine_if_still_ours_in(dir: &Path, id: &str, kind: UnitKind, expected_text: &str) -> Result<Option<PathBuf>> {
+    let final_path = dir.join(unit_name(id, kind));
+    let backup_path = unique_quarantine_path(dir, id, kind);
 
     match fs::rename(&final_path, &backup_path) {
         Ok(()) => {}
@@ -185,10 +201,10 @@ pub(super) fn quarantine_if_still_ours(id: &str, kind: UnitKind, expected_text: 
 /// left one behind, or a genuinely concurrent one — never collide. A monotonic per-process counter
 /// combined with the PID is unique across both this process's own repeated attempts and any other
 /// process running concurrently.
-fn unique_quarantine_path(id: &str, kind: UnitKind) -> PathBuf {
+fn unique_quarantine_path(dir: &Path, id: &str, kind: UnitKind) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    Path::new(UNIT_DIR).join(format!(
+    dir.join(format!(
         ".{unit}.goetia-quarantine.{pid:x}-{n:x}",
         unit = unit_name(id, kind),
         pid = std::process::id()

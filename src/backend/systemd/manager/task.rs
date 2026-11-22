@@ -55,8 +55,8 @@ use crate::manager::{Budget, DaemonStatus, RunInFlight, State, Status, TaskStatu
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
-use super::standin::Standin;
-use super::systemctl::{Held, TimerArming};
+use super::standin::{Standin, StandinFile, standin_file};
+use super::systemctl::{Held, RunPhase, TimerArming};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::{
     Systemd, UnitKind, dropin_dir, identity_for, journal, remove_dir_if_present, remove_file_if_present, unit_name,
@@ -354,32 +354,55 @@ impl Systemd {
     /// The timer disarmed, the job stopped, then the timer and the job removed, each verified against
     /// what `read` saw. A plain service keeps its order: stop, disable, remove, reload.
     ///
-    /// With [`RunInFlight::Leave`] the stop is the one step left out, and a run of a task that is in flight
-    /// gets the stand-in unit that keeps it alive through the reload (see [`super::standin`]): read after
-    /// the timer is disarmed, and written before anything is removed.
+    /// With [`RunInFlight::Leave`] one read of the job's unit, after the timer is disarmed, decides (see
+    /// [`super::standin`]): no run is the plain uninstall, stop included (it cancels a restart that is
+    /// waiting); a run still in its start job gets the stand-in unit that keeps it alive through the reload;
+    /// a run past it is left with no stop and no stand-in.
     pub(super) fn uninstall_units(&self, snapshot: Fragment, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
         let id = snapshot.id.as_str();
         let owns_timer = snapshot.owns_timer_slot();
 
+        // Before anything is changed: a file at the stand-in's path that is not goetia's refuses `Leave`.
+        let file = standin_file(id)?;
+        if in_flight == RunInFlight::Leave {
+            self.refuse_blocked(id, &file)?;
+        }
+
         if snapshot.timer().is_some() {
             self.systemctl.disable_timer(id, held)?;
         }
-        if snapshot.service_text().is_some() {
+        let run = match in_flight {
+            RunInFlight::Leave => {
+                self.systemctl.require_supported(held)?;
+                Some(self.systemctl.run_of(&unit_name(id, UnitKind::Service))?)
+            }
+            RunInFlight::Stop => None,
+        };
+        // With a stand-in of ours at the id its run is stopped too, whatever the snapshot holds.
+        if run.as_ref().is_none_or(|run| run.phase == RunPhase::None)
+            && (snapshot.service_text().is_some() || matches!(file, StandinFile::Ours(_)))
+        {
             // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
             // means rather than an end, and bounding it would turn a slow-stopping service into a failed
             // uninstall where today it succeeds.
-            if in_flight == RunInFlight::Stop {
-                self.systemctl
-                    .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
-            }
-            // A task's job has no `[Install]`: there is nothing to disable.
-            if !snapshot.is_task() {
-                self.systemctl.disable_impl(id, held)?;
-            }
+            self.systemctl
+                .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
         }
-        let standin = self.plan_standin(&snapshot, in_flight, held)?;
-        if let Standin::Write(job) = &standin {
-            self.write_standin(id, job)?;
+        // A task's job has no `[Install]`: there is nothing to disable.
+        if snapshot.service_text().is_some() && !snapshot.is_task() {
+            self.systemctl.disable_impl(id, held)?;
+        }
+
+        // The order from here: the stand-in is written before any file is removed, and no `systemctl enable`
+        // or `disable` comes between the first removal and the last reload, since both reload the manager at
+        // once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
+        let standin = self.plan_standin(id, in_flight, &file, run)?;
+        if let Standin::Write {
+            kill_signal,
+            stop_timeout,
+        } = &standin
+        {
+            self.write_standin(id, &file, kill_signal, stop_timeout)?;
         }
 
         // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file

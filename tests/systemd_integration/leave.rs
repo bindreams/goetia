@@ -10,7 +10,7 @@ use goetia::Error;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, RunInFlight, ServiceManager};
-use goetia::spec::{DaemonSpec, ServiceSpec};
+use goetia::spec::{DaemonSpec, Restart, ServiceFields, ServiceSpec};
 
 use crate::linux::{show_properties, unit_of};
 use crate::support::tasks::{Held, id_of, sh};
@@ -28,14 +28,23 @@ struct SelfUninstalling {
 }
 
 impl SelfUninstalling {
+    /// A run that exits 0 when released.
     fn new(id: &str) -> Self {
+        Self::exiting(id, 0)
+    }
+
+    /// A run that exits with `code` when released.
+    fn exiting(id: &str, code: u8) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let pid = dir.path().join("pid");
-        let held = Held::after(&format!(
-            "echo $$ > \"{}\"; \"{}\" daemon uninstall --no-stop {id} 2>&1; ",
-            pid.display(),
-            env!("CARGO_BIN_EXE_goetia"),
-        ));
+        let held = Held::after_exiting(
+            &format!(
+                "echo $$ > \"{}\"; \"{}\" daemon uninstall --no-stop {id} 2>&1; ",
+                pid.display(),
+                env!("CARGO_BIN_EXE_goetia"),
+            ),
+            code,
+        );
         SelfUninstalling { held, pid, _dir: dir }
     }
 
@@ -48,10 +57,15 @@ impl SelfUninstalling {
     }
 }
 
-fn service(id: &str, command: Vec<String>) -> DaemonSpec {
-    ServiceSpec::new(goetia::testing::base_fields(id, command))
-        .map(DaemonSpec::from)
-        .expect("a service")
+/// A service that systemd restarts whenever its process ends, after `delay`.
+fn restarting_service(id: &str, command: Vec<String>, delay: Option<Duration>) -> DaemonSpec {
+    ServiceSpec::new(ServiceFields {
+        restart: Restart::Always,
+        restart_delay: delay,
+        ..goetia::testing::base_fields(id, command)
+    })
+    .map(DaemonSpec::from)
+    .expect("a service")
 }
 
 fn standin(id: &str) -> PathBuf {
@@ -151,15 +165,16 @@ fn no_stop_on_a_task_that_is_not_running_leaves_nothing(#[fixture(systemd_group)
 // A service ===========================================================================================================
 
 /// The run removes its own service and goes on: it keeps its main pid, the unit is loaded with no file,
-/// and when the run exits by itself it is not restarted.
+/// and when the run exits by itself with a failure it is not restarted, although the removed unit said
+/// `Restart=always`.
 #[skuld::test]
-fn a_service_that_uninstalls_itself_with_no_stop_keeps_running_until_it_exits(
+fn a_service_that_uninstalls_itself_with_no_stop_keeps_running_and_is_not_restarted_when_it_fails(
     #[fixture(systemd_group)] _group: &Group,
 ) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let mut run = SelfUninstalling::new(&id);
-    let spec = service(&id, run.held.command.clone());
+    let mut run = SelfUninstalling::exiting(&id, 3);
+    let spec = restarting_service(&id, run.held.command.clone(), None);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
     mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
@@ -182,9 +197,115 @@ fn a_service_that_uninstalls_itself_with_no_stop_keeps_running_until_it_exits(
     run.held.release();
     wait_for_exit(&id, &pid);
 
+    // The process is gone, and the unit has not gone to `activating` for a restart: it is failed, as the
+    // process was, and one start is all there was.
     let [state, restarts, result] = show_properties(&unit_of(&id), ["ActiveState", "NRestarts", "Result"]);
-    assert_eq!(state, "inactive", "it exited and was not restarted");
+    assert_eq!(state, "failed", "it exited and was not restarted");
     assert_eq!(restarts, "0");
-    assert_eq!(result, "success");
+    assert_eq!(result, "exit-code");
+    assert_eq!(run.held.begun(), 1, "one run, not a second");
     assert_not_installed(&mgr, &id);
+}
+
+/// A service waiting to be restarted has no process, so there is no run to leave: the uninstall is the
+/// plain one, which cancels the restart. The unit ends `inactive`, not failed by the reload that drops its
+/// file, and nothing is left listed.
+#[skuld::test]
+fn no_stop_on_a_service_waiting_to_be_restarted_cancels_the_restart(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = restarting_service(&id, sh("exit 3"), Some(Duration::from_secs(3600)));
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&id_of(&id), Budget::Immediate).expect("start");
+    wait::until_paced(Duration::from_millis(50), || {
+        let [state, sub] = show_properties(&unit_of(&id), ["ActiveState", "SubState"]);
+        state == "activating" && sub == "auto-restart"
+    });
+
+    mgr.uninstall(&id_of(&id), RunInFlight::Leave).expect("uninstall");
+
+    assert_not_installed(&mgr, &id);
+    let [state, main_pid] = show_properties(&unit_of(&id), ["ActiveState", "MainPID"]);
+    assert_eq!(state, "inactive", "the restart was cancelled, not failed by the reload");
+    assert_eq!(main_pid, "0");
+    let failed = cmd::run(
+        "systemctl",
+        &["list-units", "--failed", "--plain", "--no-legend", &unit_of(&id)],
+    );
+    assert!(
+        !failed.stdout.contains(&id),
+        "nothing is left listed as failed: {failed}"
+    );
+    assert!(!standin(&id).exists());
+}
+
+// A definition whose file is gone =====================================================================================
+
+/// An earlier `--no-stop` uninstall removed the unit file and its reload failed, so systemd still holds the
+/// definition and would restart the service from memory when it exits: the retry finds nothing installed and
+/// reloads, and the process, still running, is left alone.
+#[skuld::test]
+fn a_retry_after_a_removal_with_no_reload_reloads_and_leaves_the_run(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let mut held = Held::new();
+    let spec = restarting_service(&id, held.command.clone(), None);
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
+    held.wait_started();
+    let [pid, load] = show_properties(&unit_of(&id), ["MainPID", "LoadState"]);
+    assert_eq!(load, "loaded");
+    fs::remove_file(&unit_files(&id)[0]).expect("remove the unit file by hand, with no reload");
+    let [load] = show_properties(&unit_of(&id), ["LoadState"]);
+    assert_eq!(load, "loaded", "systemd still holds the definition");
+
+    match mgr.uninstall(&id_of(&id), RunInFlight::Leave) {
+        Err(Error::NotInstalled { .. }) => {}
+        other => panic!("nothing is installed at `{id}`, got {other:?}"),
+    }
+
+    let [load, state, main_pid] = show_properties(&unit_of(&id), ["LoadState", "ActiveState", "MainPID"]);
+    assert_eq!(load, "not-found", "systemd no longer holds the definition");
+    assert_eq!(state, "active");
+    assert_eq!(main_pid, pid, "and the process still runs");
+
+    held.release();
+    wait_for_exit(&id, &pid);
+}
+
+// What a stop of the left run uses ====================================================================================
+
+/// A drop-in sets the task's `KillSignal=` and `TimeoutStopSec=`, and the uninstall deletes it with the job:
+/// the stand-in carries the values systemd was applying, so a hand stop of the left run signals and waits as
+/// before.
+#[skuld::test]
+fn the_standin_carries_the_stop_settings_a_drop_in_gave_the_job(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let mut run = SelfUninstalling::new(&id);
+    let spec = goetia::testing::task(&id, run.held.command.clone(), None);
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    let dropin = Path::new(SYSTEMD_UNIT_DIR).join(format!("{}.d", unit_of(&id)));
+    fs::create_dir_all(&dropin).expect("create the drop-in directory");
+    fs::write(
+        dropin.join("override.conf"),
+        "[Service]\nKillSignal=SIGUSR2\nTimeoutStopSec=45s\n",
+    )
+    .expect("write the drop-in");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+    mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
+
+    run.held.wait_started();
+
+    let [signal, timeout, fragment] = show_properties(&unit_of(&id), ["KillSignal", "TimeoutStopUSec", "FragmentPath"]);
+    assert_eq!(fragment, standin(&id).display().to_string());
+    assert_eq!(signal, "12", "SIGUSR2");
+    assert_eq!(timeout, "45s");
+    assert!(!dropin.exists(), "the drop-in went with the job");
+
+    run.held.release();
+    wait_for_exit(&id, &run.pid());
 }

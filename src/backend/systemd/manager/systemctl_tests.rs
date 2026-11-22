@@ -1419,7 +1419,6 @@ fn task_state_table() {
             showing(&answer).task_state("x.service").expect(active),
             TaskJob {
                 state,
-                failed: active == "failed",
                 pid: None,
                 invocation: None
             },
@@ -1431,11 +1430,95 @@ fn task_state_table() {
         showing(answer).task_state("x.service").expect("a pid"),
         TaskJob {
             state: State::Running,
-            failed: false,
             pid: Some(42),
             invocation: Some("0123abcd".to_string())
         }
     );
+}
+
+/// The one read `uninstall` decides from: no process is `inactive`, `failed` and a restart that is waiting
+/// (`activating` with `auto-restart`); a start job is any other `activating`; every other state, the ones
+/// goetia does not know included, is a run. The unit's own words for the two stop settings and the file it was
+/// loaded from come back as they were printed.
+#[skuld::test]
+fn run_of_table() {
+    for (active, sub, phase) in [
+        ("inactive", "dead", RunPhase::None),
+        ("failed", "failed", RunPhase::None),
+        ("activating", "auto-restart", RunPhase::None),
+        ("activating", "start", RunPhase::InStartJob),
+        ("activating", "start-pre", RunPhase::InStartJob),
+        ("active", "running", RunPhase::Running),
+        ("active", "exited", RunPhase::Running),
+        ("deactivating", "stop-sigterm", RunPhase::Running),
+        ("reloading", "reload", RunPhase::Running),
+        ("maintenance", "clean", RunPhase::Running),
+        ("refreshing", "x", RunPhase::Running),
+        ("", "", RunPhase::Running),
+        ("a-state-of-the-future", "y", RunPhase::Running),
+    ] {
+        let answer = format!(
+            "ActiveState={active}
+SubState={sub}
+KillSignal=12
+TimeoutStopUSec=1min 30s
+LoadState=loaded
+             FragmentPath=/etc/systemd/system/x.service
+"
+        );
+        assert_eq!(
+            showing(&answer).run_of("x.service").expect(active),
+            UnitRun {
+                phase,
+                failed: active == "failed",
+                kill_signal: "12".to_string(),
+                stop_timeout: "1min 30s".to_string(),
+                load_state: "loaded".to_string(),
+                fragment_path: "/etc/systemd/system/x.service".to_string(),
+            },
+            "{active:?} {sub:?}"
+        );
+    }
+}
+
+/// A unit systemd has no file for is answered like any other, not an error: the absent id's read is of it.
+#[skuld::test]
+fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
+    let answer = "ActiveState=inactive
+SubState=dead
+KillSignal=15
+TimeoutStopUSec=1min 30s
+                  LoadState=not-found
+FragmentPath=
+";
+
+    let run = showing(answer).run_of("x.service").expect("a read");
+
+    assert_eq!(run.phase, RunPhase::None);
+    assert!(!run.loaded_from(std::path::Path::new("/etc/systemd/system/x.service")));
+}
+
+/// Only a definition loaded from the path asked about is "held".
+#[skuld::test]
+fn a_run_is_loaded_from_a_path_only_when_systemd_says_loaded_from_it() {
+    let read = |load: &str, fragment: &str| {
+        let answer = format!(
+            "ActiveState=active
+SubState=running
+KillSignal=15
+TimeoutStopUSec=infinity
+LoadState={load}
+             FragmentPath={fragment}
+"
+        );
+        showing(&answer).run_of("x.service").expect("a read")
+    };
+    let path = std::path::Path::new("/etc/systemd/system/x.service");
+
+    assert!(read("loaded", "/etc/systemd/system/x.service").loaded_from(path));
+    assert!(!read("loaded", "/run/systemd/system/x.service").loaded_from(path));
+    assert!(!read("not-found", "/etc/systemd/system/x.service").loaded_from(path));
+    assert!(!read("loaded", "").loaded_from(path));
 }
 
 #[skuld::test]

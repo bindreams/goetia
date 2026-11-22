@@ -1020,9 +1020,29 @@ impl Systemctl {
         };
         Ok(TaskJob {
             state,
-            failed: props.get("ActiveState").is_some_and(|s| s == "failed"),
             pid: main_pid(&props),
             invocation: props.get("InvocationID").filter(|id| !id.is_empty()).cloned(),
+        })
+    }
+
+    /// `unit`'s run as `uninstall` has to treat it, in one `systemctl show`: see [`UnitRun`]. Any unit
+    /// name is answered, one systemd has no file for included, so nothing here is an error for an absent
+    /// unit.
+    pub(super) fn run_of(&self, unit: &str) -> Result<UnitRun> {
+        let props = self.show_properties(unit, &UnitRun::PROPERTIES)?;
+        let (active, sub) = (props["ActiveState"].as_str(), props["SubState"].as_str());
+        Ok(UnitRun {
+            phase: match (active, sub) {
+                ("inactive" | "failed", _) | ("activating", "auto-restart") => RunPhase::None,
+                ("activating", _) => RunPhase::InStartJob,
+                // Every other state systemd reports, the ones goetia does not know included.
+                _ => RunPhase::Running,
+            },
+            failed: active == "failed",
+            kill_signal: props["KillSignal"].clone(),
+            stop_timeout: props["TimeoutStopUSec"].clone(),
+            load_state: props["LoadState"].clone(),
+            fragment_path: props["FragmentPath"].clone(),
         })
     }
 
@@ -1047,11 +1067,57 @@ impl Systemctl {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TaskJob {
     pub state: State,
-    /// `ActiveState` is `failed`: a run that failed, which `reset-failed` clears. `state` calls it idle.
-    pub failed: bool,
     pub pid: Option<u32>,
     /// The `InvocationID` of the run the unit is in, if it has one.
     pub invocation: Option<String>,
+}
+
+/// Whether a unit has a run, and which kind, as `ActiveState` and `SubState` say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunPhase {
+    /// No process: `inactive`, `failed`, or `activating` with `SubState=auto-restart`, a restart waiting
+    /// for its delay (a stop of it cancels the restart and signals nothing).
+    None,
+    /// A run still in its start job: `activating` with any other `SubState`. A reload that drops its unit
+    /// file ends it at the start timeout.
+    InStartJob,
+    /// Every other state systemd reports, the ones goetia does not know included.
+    Running,
+}
+
+/// What one `systemctl show` of a job's unit says of the run `uninstall` decides about: see
+/// [`Systemctl::run_of`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct UnitRun {
+    pub phase: RunPhase,
+    /// `ActiveState` is `failed`: a run that failed, which `reset-failed` clears.
+    pub failed: bool,
+    /// `KillSignal` as systemd prints it: a number, a drop-in's override included.
+    pub kill_signal: String,
+    /// `TimeoutStopUSec` as systemd prints it (`1min 30s`, `infinity`): a unit file takes it back verbatim as
+    /// `TimeoutStopSec=`.
+    pub stop_timeout: String,
+    pub load_state: String,
+    /// The file systemd loaded the unit from, empty if none.
+    pub fragment_path: String,
+}
+
+impl UnitRun {
+    /// What the read asks, in this order.
+    const PROPERTIES: [&'static str; 6] = [
+        "ActiveState",
+        "SubState",
+        "KillSignal",
+        "TimeoutStopUSec",
+        "LoadState",
+        "FragmentPath",
+    ];
+
+    /// Whether systemd still holds a definition loaded from `path`: `uninstall` of the unit's file left no
+    /// reload, so the manager still has what the file said and restarts the unit from memory.
+    pub fn loaded_from(&self, path: &std::path::Path) -> bool {
+        self.load_state == "loaded" && std::path::Path::new(&self.fragment_path) == path
+    }
 }
 
 /// Whether systemd has no unit file for the name `shown` is about.

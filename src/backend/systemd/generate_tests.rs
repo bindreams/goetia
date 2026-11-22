@@ -1502,78 +1502,43 @@ fn a_stop_action_survives_the_blob_and_the_unit_regenerates_byte_for_byte() {
 // The stand-in unit ===================================================================================================
 
 /// What `uninstall --no-stop` writes for a run it leaves, byte for byte: a valid oneshot unit with no
-/// start timeout, whose own start asserts a path that cannot exist, and the job's stop settings.
-fn expected_standin(id: &str, stop_lines: &str) -> String {
+/// start timeout, whose own start asserts a path that cannot exist, and the two stop settings `systemctl
+/// show` printed.
+fn expected_standin(id: &str, kill_signal: &str, stop_timeout: &str) -> String {
     format!(
         "[Unit]\nDescription=goetia: the run of {id} that uninstall left\nAssertPathExists=/dev/null/goetia-left-run\n\n\
-         [Service]\nType=oneshot\nTimeoutStartSec=infinity\nExecStart=/bin/true\n{stop_lines}\n\
+         [Service]\nType=oneshot\nTimeoutStartSec=infinity\nExecStart=/bin/true\n\
+         KillSignal={kill_signal}\nTimeoutStopSec={stop_timeout}\n\n\
          [X-Goetia]\nMarker=goetia\nId={id}\n"
     )
 }
 
+/// The two values go in as they were printed: a signal number and systemd's own spelling of the span, a
+/// drop-in's override included. Nothing is read from the job's text, so no unit shape changes the result.
 #[skuld::test]
-fn the_standin_carries_the_jobs_stop_settings() {
-    let job = unit(
-        &with_stop_action(StopAction {
-            send_signal: StopSignal::Quit,
-            timeout: Some(Duration::from_secs(7)),
-        }),
-        &minimal_identity(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        standin("frpc", &job),
-        expected_standin("frpc", "KillSignal=SIGQUIT\nTimeoutStopSec=7s\n")
-    );
-}
-
-#[skuld::test]
-fn the_standin_of_a_job_whose_stop_has_no_timeout_carries_infinity() {
-    let job = unit(
-        &with_stop_action(StopAction {
-            send_signal: StopSignal::Terminate,
-            timeout: None,
-        }),
-        &minimal_identity(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        standin("frpc", &job),
-        expected_standin("frpc", "KillSignal=SIGTERM\nTimeoutStopSec=infinity\n")
-    );
-}
-
-/// A job that writes no `TimeoutStopSec=` (`kill`'s) gives the stand-in none: systemd's default stays.
-#[skuld::test]
-fn the_standin_of_a_kill_job_carries_no_timeout() {
-    let job = unit(
-        &with_stop_action(StopAction {
-            send_signal: StopSignal::Kill,
-            timeout: None,
-        }),
-        &minimal_identity(),
-    )
-    .unwrap();
-
-    assert_eq!(standin("frpc", &job), expected_standin("frpc", "KillSignal=SIGKILL\n"));
-}
-
-/// Only `[Service]`'s lines count, and a job with none (a hand-edited one) gives a stand-in with none.
-#[skuld::test]
-fn the_standin_of_a_job_with_no_stop_settings_carries_none() {
-    let job = "[Unit]\nDescription=KillSignal=SIGHUP\n\n[Service]\nExecStart=/bin/true\n\n[X-Goetia]\nMarker=goetia\n";
-
-    assert_eq!(standin("frpc", job), expected_standin("frpc", ""));
+fn the_standin_carries_the_two_values_systemd_printed() {
+    for (signal, timeout) in [
+        ("15", "1min 30s"),
+        ("3", "7s"),
+        ("37", "infinity"),
+        ("12", "45s"),
+        ("9", "1h 30min"),
+    ] {
+        assert_eq!(
+            standin("frpc", signal, timeout),
+            expected_standin("frpc", signal, timeout),
+            "{signal} {timeout}"
+        );
+    }
 }
 
 #[skuld::test]
 fn the_standin_is_recognised_by_its_own_recogniser_with_its_id() {
-    let job = unit(&minimal_spec(), &minimal_identity()).unwrap();
-
-    assert_eq!(standin_id(&standin("frpc", &job)).as_deref(), Some("frpc"));
-    assert_eq!(standin_id(&expected_standin("a.b-c_d", "")).as_deref(), Some("a.b-c_d"));
+    assert_eq!(standin_id(&standin("frpc", "15", "5s")).as_deref(), Some("frpc"));
+    assert_eq!(
+        standin_id(&expected_standin("a.b-c_d", "2", "infinity")).as_deref(),
+        Some("a.b-c_d")
+    );
 }
 
 /// An installed unit carries goetia's marker and a `Spec=`, and is not a stand-in; neither is a file that
@@ -1591,6 +1556,7 @@ fn the_recogniser_rejects_an_installed_unit_and_a_foreign_file() {
         "another marker"
     );
     assert_eq!(standin_id("[X-Goetia]\nMarker=goetia\n"), None, "no id");
+    assert_eq!(standin_id("[X-Goetia]\nMarker=goetia\nId=\n"), None, "an empty id");
     assert_eq!(
         standin_id("[X-Goetia]\nMarker=goetia\nId=a\nId=b\n"),
         None,
@@ -1606,4 +1572,78 @@ fn the_recogniser_rejects_an_installed_unit_and_a_foreign_file() {
         None,
         "two sections"
     );
+}
+
+// The one reader of the marker section =================================================================================
+
+#[skuld::test]
+fn goetia_keys_is_none_with_no_section() {
+    assert!(goetia_keys("[Unit]\nDescription=x\n").unwrap().is_none());
+    assert!(goetia_keys("").unwrap().is_none());
+}
+
+#[skuld::test]
+fn goetia_keys_gives_the_keys_of_the_section_up_to_the_next_header() {
+    let text = "[Unit]\nMarker=not-this\n\n[X-Goetia]\nMarker=goetia\n  Id=a \nSchema=2\n[Other]\nId=elsewhere\n";
+
+    let keys = goetia_keys(text).unwrap().expect("a section");
+
+    assert_eq!(
+        keys,
+        BTreeMap::from([("Marker", "goetia"), ("Id", "a"), ("Schema", "2")]),
+        "trimmed, and only the section's own lines"
+    );
+}
+
+/// Each key goetia writes, repeated, is a forged extra line picking which of two values wins.
+#[skuld::test]
+fn goetia_keys_refuses_a_repeated_key() {
+    for key in ["Marker", "Schema", "Version", "Spec", "Id"] {
+        let value = if key == "Marker" { "goetia" } else { "x" };
+        let text = format!("[X-Goetia]\nMarker=goetia\n{key}={value}\n{key}={value}\n");
+
+        let err = goetia_keys(&text).expect_err(key);
+
+        assert!(format!("{err}").contains(&format!("{key}=")), "{key}: {err}");
+    }
+}
+
+#[skuld::test]
+fn goetia_keys_refuses_a_second_section() {
+    let err = goetia_keys("[X-Goetia]\nMarker=goetia\n[X-Goetia]\nMarker=goetia\n").unwrap_err();
+
+    assert!(format!("{err}").contains("X-Goetia"));
+}
+
+#[skuld::test]
+fn goetia_keys_refuses_a_missing_or_foreign_marker() {
+    assert!(
+        goetia_keys("[X-Goetia]\nId=a\n")
+            .unwrap_err()
+            .to_string()
+            .contains("Marker=")
+    );
+    assert!(
+        goetia_keys("[X-Goetia]\nMarker=not-goetia\n")
+            .unwrap_err()
+            .to_string()
+            .contains("Marker")
+    );
+}
+
+/// `extract` now reads through `goetia_keys`, so a repeated `Schema=` or `Version=` is refused as well as a
+/// repeated `Marker=` or `Spec=`.
+#[skuld::test]
+fn extract_errors_on_a_repeated_schema_or_version_line() {
+    let genuine = blob::encode(&minimal_spec());
+    for key in ["Schema=2", "Version=0.1.0"] {
+        let text = format!("[X-Goetia]\nMarker=goetia\n{key}\n{key}\nSpec={genuine}\n");
+
+        let err = extract(&text).expect_err(key);
+
+        assert!(
+            format!("{err}").contains(&format!("{}=", key.split('=').next().unwrap())),
+            "{key}: {err}"
+        );
+    }
 }

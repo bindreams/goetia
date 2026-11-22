@@ -216,9 +216,9 @@ impl Backend for Systemd {
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         dirs::ensure_parent_dirs(spec, scope)?;
-        // An install never stops a run: a stand-in whose unit is active stays, and systemd adopts the run
+        // An install never stops a run: a stand-in with a run in flight stays, and systemd adopts the run
         // under the new definition.
-        self.release_standin(spec.common().id.as_str(), RunInFlight::Leave, reservation)?;
+        self.release_standin(spec.common().id.as_str(), reservation)?;
         match outcome {
             Outcome::Create => self.create_units(spec.common().id.as_str(), definition, reservation),
             Outcome::Update { .. } | Outcome::Stale { .. } => {
@@ -292,10 +292,10 @@ impl Backend for Systemd {
         self.uninstall_units(snapshot, in_flight, reservation)
     }
 
-    /// What systemd keeps of an id nothing installed is a stand-in left by `uninstall --no-stop`: see
-    /// [`standin`].
+    /// What systemd keeps of an id nothing installed: a stand-in left by `uninstall --no-stop`, and a
+    /// definition whose file is gone: see [`standin`].
     fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
-        self.release_standin(id.as_str(), in_flight, &mut Held::default())
+        self.uninstall_leftovers(id.as_str(), in_flight, &mut Held::default())
     }
 
     // `disable` is handed none and asks the gate for itself.

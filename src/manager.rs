@@ -86,12 +86,14 @@ pub trait ServiceManager {
     /// is never left for want of one. Which backends honour `Leave`, and what each leaves while the
     /// run lives, is the README's "Uninstalling a daemon".
     ///
-    /// **systemd** leaves the unit loaded with no file, which systemd never restarts. A task's run is
-    /// a oneshot start job, which a reload would end at the default start timeout, so for a run in
-    /// flight the backend writes a stand-in unit of the same name under `/run/systemd/system` first
-    /// (see `generate::standin`); the next `install` or `uninstall` of the id removes it once its
-    /// unit is no longer active. A run somebody else starts between the backend reading that a run is
-    /// in flight and the reload is that caller's own conflicting action, and nothing guards it.
+    /// **systemd** leaves the unit loaded with no file, which systemd never restarts. One read of the
+    /// unit decides: with no process (including a restart that is waiting) it is the plain uninstall; a
+    /// run still in its start job, which a reload would end at the default start timeout, gets a stand-in
+    /// unit of the same name under `/run/systemd/system`, written first (see `generate::standin`); a run
+    /// past its start job is left as it is. The next `install` or `uninstall` of the id removes the
+    /// stand-in once its run is over. A file at that path that is not goetia's is refused with
+    /// [`Error::StandinBlocked`], whether or not a run is in flight. A run somebody else starts between
+    /// the backend's read and the reload is that caller's own conflicting action, and nothing guards it.
     ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other

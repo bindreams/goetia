@@ -1,26 +1,27 @@
 //! The stand-in unit that keeps a left run alive: see [`crate::manager::ServiceManager::uninstall`] and
-//! [`generate::standin`] for what it is and why a task's run needs one.
+//! [`generate::standin`] for what it is and why a run still in its start job needs one.
 //!
-//! Its life: `uninstall` with [`RunInFlight::Leave`] writes it for a task's run that is in flight, before
-//! the unit files go and the manager reloads. Nothing removes it while its unit is active. The next
-//! `install` or `uninstall` of the id, the absent id included, removes it once its unit is not active,
-//! after a `reset-failed` for a left run that failed, and reloads. `uninstall` without `Leave`
-//! stops the run first. goetia reads `/etc/systemd/system` for fragments, so a stand-in never makes an id
-//! read as installed (see `discover`).
+//! One `systemctl show` of the job's unit decides what `uninstall` does about the run (see [`UnitRun`]):
+//! with [`RunInFlight::Leave`], a run in its start job gets a stand-in, a run past it is left alone, and no
+//! run is the plain uninstall, whose stop cancels a restart that is waiting. Nothing is decided from the unit
+//! file's text or from what goetia reads the job to be.
+//!
+//! Its life: nothing removes it while its run is in flight. The next `install` or `uninstall` of the id, the
+//! absent id included, removes it once there is no run, after a `reset-failed` for a left run that failed, and
+//! reloads. With [`RunInFlight::Stop`] `uninstall` stops the run first. goetia reads `/etc/systemd/system`
+//! for fragments, so a stand-in never makes an id read as installed (see `discover`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::backend::InstalledService as _;
 use crate::backend::systemd::generate;
 use crate::error::{Error, Result};
-use crate::manager::{Budget, RunInFlight, State};
+use crate::manager::{Budget, RunInFlight};
 
 use super::discover::{RawState, classify_and_read};
-use super::systemctl::Held;
-use super::task::Fragment;
-use super::write::{CreateOutcome, create_unit_in};
-use super::{Systemd, UnitKind, remove_file_if_present, unit_name};
+use super::systemctl::{Held, RunPhase, UnitRun};
+use super::write::{CreateOutcome, ReplaceOutcome, create_unit_in, replace_unit_verified_in};
+use super::{Systemd, UnitKind, remove_file_if_present, unit_name, unit_path};
 
 /// Where systemd reads runtime unit files: a tmpfs, so a stand-in is gone at a reboot.
 pub(super) const RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
@@ -31,102 +32,126 @@ pub(super) fn standin_path(id: &str) -> PathBuf {
     Path::new(RUNTIME_UNIT_DIR).join(unit_name(id, UnitKind::Service))
 }
 
+/// What is at `id`'s stand-in path.
+pub(super) enum StandinFile {
+    Absent,
+    /// A stand-in of `id`'s own, with its text: the identity its replacement verifies.
+    Ours(String),
+    /// Anything else: somebody's runtime unit, which goetia never touches.
+    NotOurs,
+}
+
+impl StandinFile {
+    fn is_ours(&self) -> bool {
+        matches!(self, StandinFile::Ours(_))
+    }
+}
+
+pub(super) fn standin_file(id: &str) -> Result<StandinFile> {
+    match classify_and_read(&standin_path(id)).map_err(super::discover::ReadFailure::into_os_error)? {
+        RawState::Regular(text) if generate::standin_id(&text).as_deref() == Some(id) => Ok(StandinFile::Ours(text)),
+        RawState::Regular(_) | RawState::NotOurs => Ok(StandinFile::NotOurs),
+        RawState::Absent => Ok(StandinFile::Absent),
+    }
+}
+
 /// What `uninstall_units` does about the stand-in, decided before anything is removed.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Standin {
-    /// Nothing: no run to keep, no stand-in of ours, or a run another stand-in already keeps.
+    /// Nothing: no run to keep, no stand-in of ours, or a stand-in whose run is still going.
     Nothing,
-    /// Write it for the run of the job whose text is this, before the files go and the manager reloads.
-    Write(String),
-    /// Remove the one that is there, whose unit is not active, after clearing its failed run if it has one
+    /// Write it, replacing one of ours that is there, before the files go and the manager reloads. The two
+    /// values are what the read printed.
+    Write { kill_signal: String, stop_timeout: String },
+    /// Remove the one that is there, whose run is over, after clearing its failed run if it has one
     /// (`reset-failed` refuses a unit that is not in memory, as one that did not fail is not).
     Remove { failed: bool },
 }
 
-/// What systemd says of the run of a job, in one read.
-struct Job {
-    running: bool,
-    failed: bool,
+/// The one rule for a stand-in of ours that is found, whichever of `uninstall`, `uninstall` of an absent id
+/// and `install` found it: it goes when there is no run, and with [`RunInFlight::Stop`] there is none by
+/// now (the caller stopped it first); with [`RunInFlight::Leave`] a run in flight keeps it.
+fn found(in_flight: RunInFlight, run: &UnitRun) -> Standin {
+    match (in_flight, run.phase) {
+        (RunInFlight::Leave, RunPhase::InStartJob | RunPhase::Running) => Standin::Nothing,
+        _ => Standin::Remove { failed: run.failed },
+    }
 }
 
-/// Whether the file at `id`'s stand-in path is a stand-in of `id`'s own. Anything else there is somebody's
-/// runtime unit and is never touched.
-fn is_ours(id: &str) -> Result<bool> {
-    match classify_and_read(&standin_path(id)).map_err(super::discover::ReadFailure::into_os_error)? {
-        RawState::Regular(text) => Ok(generate::standin_id(&text).as_deref() == Some(id)),
-        RawState::Absent | RawState::NotOurs => Ok(false),
-    }
+/// What a release of a stand-in left: whether it reloaded the manager, and the read it was decided from.
+pub(super) struct Released {
+    pub reloaded: bool,
+    pub run: Option<UnitRun>,
 }
 
 impl Systemd {
-    /// What to do about the stand-in of `snapshot`'s id when it is uninstalled with `in_flight`. With
-    /// `Leave` this is the one read of whether a run is in flight, after the timer is disarmed: a task's
-    /// job that is running gets a stand-in, and a stand-in whose unit is not active goes. The read is
-    /// made only where its answer can matter: a task or a job with a timer of goetia's, or a stand-in of
-    /// ours at the id.
-    ///
-    /// A run somebody else starts between this read and the reload is that caller's own conflicting
-    /// action, and nothing guards it.
-    pub(super) fn plan_standin(&self, snapshot: &Fragment, in_flight: RunInFlight, held: &mut Held) -> Result<Standin> {
-        let id = snapshot.id().as_str();
-        let present = is_ours(id)?;
-        match in_flight {
-            // The run is stopped, so a stand-in left by an earlier `Leave` has nothing to keep.
-            RunInFlight::Stop if present => Ok(Standin::Remove {
-                failed: self.job(id)?.failed,
+    /// The refusal of [`RunInFlight::Leave`] when a file that is not goetia's is at the stand-in's path:
+    /// raised whether or not a run is in flight now, and before anything is changed.
+    pub(super) fn refuse_blocked(&self, id: &str, file: &StandinFile) -> Result<()> {
+        match file {
+            StandinFile::NotOurs => Err(Error::StandinBlocked {
+                id: id.to_string(),
+                path: standin_path(id),
             }),
-            RunInFlight::Stop => Ok(Standin::Nothing),
-            RunInFlight::Leave => {
-                let task_like = snapshot.owns_timer_slot();
-                if !task_like && !present {
-                    return Ok(Standin::Nothing);
-                }
-                self.systemctl.require_supported(held)?;
-                let job = self.job(id)?;
-                Ok(match (job.running, snapshot.service_text()) {
-                    (true, Some(text)) if task_like => Standin::Write(text.to_string()),
-                    (true, _) => Standin::Nothing,
-                    (false, _) if present => Standin::Remove { failed: job.failed },
-                    (false, _) => Standin::Nothing,
-                })
+            StandinFile::Absent | StandinFile::Ours(_) => Ok(()),
+        }
+    }
+
+    /// What `uninstall_units` does about the stand-in of `snapshot`'s id, from `run`: the read it made first
+    /// for `Leave`, none for `Stop` (which stopped the run, and reads what is left only if there is a stand-in
+    /// to settle).
+    pub(super) fn plan_standin(
+        &self,
+        id: &str,
+        in_flight: RunInFlight,
+        file: &StandinFile,
+        run: Option<UnitRun>,
+    ) -> Result<Standin> {
+        match run {
+            Some(run) if in_flight == RunInFlight::Leave && run.phase == RunPhase::InStartJob => Ok(Standin::Write {
+                kill_signal: run.kill_signal,
+                stop_timeout: run.stop_timeout,
+            }),
+            _ if file.is_ours() => {
+                let run = match run {
+                    Some(run) => run,
+                    None => self.systemctl.run_of(&unit_name(id, UnitKind::Service))?,
+                };
+                Ok(found(in_flight, &run))
             }
+            _ => Ok(Standin::Nothing),
         }
     }
 
-    /// Whether `id`'s job is in its start job or running, and whether it failed: a unit systemd has no file
-    /// for is neither.
-    fn job(&self, id: &str) -> Result<Job> {
-        match self.systemctl.task_state(&unit_name(id, UnitKind::Service)) {
-            Ok(job) => Ok(Job {
-                running: job.state == State::Running,
-                failed: job.failed,
-            }),
-            Err(Error::UnitNotLoaded { .. }) => Ok(Job {
-                running: false,
-                failed: false,
-            }),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// The stand-in for the run of `id`, whose removed job was `job`, written without replacing a file that
-    /// is not one of goetia's. One of ours already there (the left run of an earlier `Leave`) is what is
-    /// wanted.
-    pub(super) fn write_standin(&self, id: &str, job: &str) -> Result<()> {
-        fs::create_dir_all(RUNTIME_UNIT_DIR).map_err(|e| Error::os_at("create", Path::new(RUNTIME_UNIT_DIR), e))?;
-        match create_unit_in(
-            Path::new(RUNTIME_UNIT_DIR),
-            id,
-            UnitKind::Service,
-            &generate::standin(id, job),
-        )? {
-            CreateOutcome::Created => Ok(()),
-            CreateOutcome::Raced if is_ours(id)? => Ok(()),
-            CreateOutcome::Raced => Err(Error::ConcurrentChange {
+    /// The stand-in for the run of `id`, written without replacing a file that is not one of goetia's: a
+    /// stand-in of ours already there is replaced, since its values are an earlier job's. A file that is
+    /// not ours, which appeared after the check, is [`Error::ConcurrentChange`].
+    pub(super) fn write_standin(
+        &self,
+        id: &str,
+        file: &StandinFile,
+        kill_signal: &str,
+        stop_timeout: &str,
+    ) -> Result<()> {
+        let dir = Path::new(RUNTIME_UNIT_DIR);
+        fs::create_dir_all(dir).map_err(|e| Error::os_at("create", dir, e))?;
+        let text = generate::standin(id, kill_signal, stop_timeout);
+        let raced = match file {
+            StandinFile::Ours(old) => matches!(
+                replace_unit_verified_in(dir, id, UnitKind::Service, &text, old)?,
+                ReplaceOutcome::Raced
+            ),
+            StandinFile::Absent | StandinFile::NotOurs => {
+                matches!(create_unit_in(dir, id, UnitKind::Service, &text)?, CreateOutcome::Raced)
+            }
+        };
+        if raced {
+            return Err(Error::ConcurrentChange {
                 id: id.to_string(),
                 path: Some(standin_path(id)),
-            }),
+            });
         }
+        Ok(())
     }
 
     /// The stand-in of `id` removed, after a failed left run is cleared; the manager is reloaded by the
@@ -138,26 +163,59 @@ impl Systemd {
         remove_file_if_present(&standin_path(id))
     }
 
-    /// The part of `install` and of `uninstall` of an id nothing installed that concerns a stand-in left
-    /// there: `Stop` stops its run first, `Leave` leaves a stand-in whose unit is active, and a stand-in
-    /// whose unit is not active is removed and the manager reloaded. Asks nothing of systemd where there is
-    /// no stand-in of ours.
-    pub(super) fn release_standin(&self, id: &str, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
-        if !is_ours(id)? {
-            return Ok(());
+    /// The part of `install` that concerns a stand-in left at the id: a stand-in whose run is over is
+    /// removed and the manager reloaded, and one with a run in flight stays, as an install never stops a run.
+    /// Asks nothing of systemd where there is no stand-in of ours.
+    pub(super) fn release_standin(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.release(id, RunInFlight::Leave, held, false).map(drop)
+    }
+
+    /// `uninstall` of an id nothing is installed at. A stand-in of ours at it is settled by the one rule
+    /// (`Stop` stops its run first). And one read says whether systemd still holds a definition loaded from
+    /// goetia's own path whose file is gone, which a `Leave` uninstall whose last reload failed leaves, and
+    /// which restarts a unit from memory when its process exits: it is reloaded before the answer, with `Stop`
+    /// and with `Leave` alike. A reload that fails is the call's error, not "not installed".
+    pub(super) fn uninstall_leftovers(&self, id: &str, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
+        let released = self.release(id, in_flight, held, true)?;
+        let held_definition = released
+            .run
+            .is_some_and(|run| run.loaded_from(&unit_path(id, UnitKind::Service)));
+        if held_definition && !released.reloaded {
+            self.systemctl.daemon_reload(held)?;
+        }
+        Ok(())
+    }
+
+    /// The stand-in of ours at `id`, settled by the one rule: with `Stop` the run is stopped first, then,
+    /// and with `Leave` when there is no run, the stand-in is removed and the manager reloaded. `always_read`
+    /// reads the unit's run even when there is no stand-in.
+    fn release(&self, id: &str, in_flight: RunInFlight, held: &mut Held, always_read: bool) -> Result<Released> {
+        let present = standin_file(id)?.is_ours();
+        if !present && !always_read {
+            return Ok(Released {
+                reloaded: false,
+                run: None,
+            });
         }
         self.systemctl.require_supported(held)?;
-        if in_flight == RunInFlight::Stop {
+        if present && in_flight == RunInFlight::Stop {
             // Unbounded, as `uninstall`'s own stop.
             self.systemctl
                 .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
         }
-        let job = self.job(id)?;
-        if in_flight == RunInFlight::Leave && job.running {
-            return Ok(());
+        let run = self.systemctl.run_of(&unit_name(id, UnitKind::Service))?;
+        if present && let Standin::Remove { failed } = found(in_flight, &run) {
+            self.remove_standin(id, failed, held)?;
+            self.systemctl.daemon_reload(held)?;
+            return Ok(Released {
+                reloaded: true,
+                run: Some(run),
+            });
         }
-        self.remove_standin(id, job.failed, held)?;
-        self.systemctl.daemon_reload(held)
+        Ok(Released {
+            reloaded: false,
+            run: Some(run),
+        })
     }
 }
 

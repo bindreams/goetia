@@ -19,7 +19,7 @@
 //! run of them gets a trailing space (see `raw_value`). The values no encoding can carry are
 //! refused by [`units()`]: see `refuse_unrepresentable`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::{Identity, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob, MARKER};
@@ -117,7 +117,7 @@ pub(crate) fn timer_schedule(spec: &DaemonSpec) -> Option<String> {
 /// `body`, a blank line, and the `[X-Goetia]` section of `spec`.
 fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
     body.push('\n');
-    body.push_str(&goetia_section(spec));
+    body.push_str(&spec_section(spec));
     body
 }
 
@@ -284,76 +284,65 @@ fn log_lines(common: &DaemonFields) -> String {
     out
 }
 
-/// The `[X-Goetia]` section both units carry: the marker and the spec's blob.
-fn goetia_section(spec: &DaemonSpec) -> String {
+/// A unit's `[X-Goetia]` section: the one place its header and `Marker=` line are written, followed by
+/// `fields`. [`goetia_keys`] reads it back.
+fn goetia_section(fields: &[(&str, &str)]) -> String {
     let mut out = String::new();
     out.push_str("[X-Goetia]\n");
     out.push_str(&format!("Marker={MARKER}\n"));
-    out.push_str(&format!("Schema={}\n", blob::SCHEMA));
-    out.push_str(&format!("Version={}\n", crate::version()));
-    out.push_str(&format!("Spec={}\n", blob::encode(spec)));
+    for (key, value) in fields {
+        out.push_str(&format!("{key}={value}\n"));
+    }
     out
+}
+
+/// The section both units of a spec carry: the marker, the schema and version, and the spec's blob.
+fn spec_section(spec: &DaemonSpec) -> String {
+    goetia_section(&[
+        ("Schema", &blob::SCHEMA.to_string()),
+        ("Version", crate::version()),
+        ("Spec", &blob::encode(spec)),
+    ])
 }
 
 // The stand-in unit ===================================================================================================
 
-/// What `uninstall --no-stop` writes under `/run/systemd/system` for the run of `id` it leaves, whose
-/// removed job was `job`. A task's run is a oneshot start job, which a reload would end at systemd's
-/// default start timeout; a unit of the same name with no start timeout keeps it. It is a valid unit, and
-/// a hand `start` of it fails: its one command sits behind an assertion on a path that cannot exist. It
-/// carries the job's own `KillSignal=` and `TimeoutStopSec=`, so a `stop` of the left run is the job's, and
-/// goetia's `[X-Goetia]` section with the `id`, which is how [`standin_id`] tells the file is its own.
+/// What `uninstall --no-stop` writes under `/run/systemd/system` for the run of `id` it leaves. A run still
+/// in its start job (a task's run, for goetia's units) would be ended by a reload at systemd's default
+/// start timeout; a unit of the same name with no start timeout keeps it. It is a valid unit, and a hand
+/// `start` of it fails: its one command sits behind an assertion on a path that cannot exist. It carries
+/// `kill_signal` and `stop_timeout` as `systemctl show` printed them for the removed job (a signal number
+/// and systemd's own spelling of the span, a drop-in's override included), so a `stop` of the left run
+/// signals and waits as the job's would have; any other stop setting is not carried. And goetia's
+/// `[X-Goetia]` section with the `id`, which is how [`standin_id`] tells the file is its own.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only the systemd manager, which is Linux-only, writes one")
 )]
-pub(crate) fn standin(id: &str, job: &str) -> String {
+pub(crate) fn standin(id: &str, kill_signal: &str, stop_timeout: &str) -> String {
     let mut out = String::new();
     out.push_str("[Unit]\n");
     out.push_str(&format!("Description=goetia: the run of {id} that uninstall left\n"));
     out.push_str("AssertPathExists=/dev/null/goetia-left-run\n\n");
     out.push_str("[Service]\nType=oneshot\nTimeoutStartSec=infinity\nExecStart=/bin/true\n");
-    for line in section_lines(job, "[Service]") {
-        if line.starts_with("KillSignal=") || line.starts_with("TimeoutStopSec=") {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out.push_str(&format!("\n[X-Goetia]\nMarker={MARKER}\nId={id}\n"));
+    out.push_str(&format!("KillSignal={kill_signal}\nTimeoutStopSec={stop_timeout}\n\n"));
+    out.push_str(&goetia_section(&[("Id", id)]));
     out
 }
 
 /// The `id` of the stand-in `text` is, and `None` for anything else: an installed unit (its section has a
-/// `Spec=` and no `Id=`), a file that is not goetia's, a section with no id, and a second section or `Id=`,
-/// which [`extract`] refuses for the same reason.
+/// `Spec=` and no `Id=`), a file that is not goetia's, a section with no id, and whatever [`goetia_keys`]
+/// refuses (a second section or a repeated key).
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only the systemd manager, which is Linux-only, reads one")
 )]
 pub(crate) fn standin_id(text: &str) -> Option<String> {
-    let headers = text.lines().filter(|line| line.trim() == "[X-Goetia]").count();
-    if headers != 1 {
-        return None;
-    }
-    let lines: Vec<&str> = section_lines(text, "[X-Goetia]").collect();
-    let values = |key: &str| -> Vec<&str> { lines.iter().filter_map(|line| line.strip_prefix(key)).collect() };
-    match (
-        values("Marker=").as_slice(),
-        values("Id=").as_slice(),
-        values("Spec=").as_slice(),
-    ) {
-        ([MARKER], [id], []) if !id.is_empty() => Some((*id).to_string()),
+    let keys = goetia_keys(text).ok()??;
+    match (keys.get("Id"), keys.get("Spec")) {
+        (Some(id), None) if !id.is_empty() => Some((*id).to_string()),
         _ => None,
     }
-}
-
-/// The trimmed lines of the section whose header is `header`, up to the next header.
-fn section_lines<'a>(text: &'a str, header: &'a str) -> impl Iterator<Item = &'a str> {
-    text.lines()
-        .map(str::trim)
-        .skip_while(move |line| *line != header)
-        .skip(1)
-        .take_while(|line| !is_section_header(line))
 }
 
 // OnCalendar ==========================================================================================================
@@ -561,16 +550,18 @@ fn quote(s: &str) -> String {
 
 // Extraction ==========================================================================================================
 
-/// Extract the embedded metadata blob from a unit file's text.
+/// The keys goetia writes in its `[X-Goetia]` section: each is read once, so a repeated one is a forged
+/// extra line picking which of two values wins.
+const SECTION_KEYS: [&str; 5] = ["Marker", "Schema", "Version", "Spec", "Id"];
+
+/// The `key=value` lines of a unit's `[X-Goetia]` section, trimmed, up to the next header: the one reader of
+/// the section, which [`extract`] and [`standin_id`] read through.
 ///
-/// Returns `Ok(None)` only when no `[X-Goetia]` section is present at
-/// all — that is the "this is not (or no longer) ours" case, e.g. a
-/// foreign unit or one Goetia has never touched. A section that *is*
-/// present but does not decode into a valid blob is `Err`, and more than
-/// one `[X-Goetia]` section is `Err` even if every copy decodes cleanly:
-/// otherwise a forged extra section could let user-controlled unit text
-/// choose which blob `extract` reads.
-pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
+/// `Ok(None)` only when no section is present at all: a foreign unit, or one goetia has never touched.
+/// Anything else that is not goetia's section is `Err`: more than one section (even if every copy is
+/// well-formed: otherwise a forged extra section could let user-controlled unit text choose which one is
+/// read), a repeated key of [`SECTION_KEYS`], and a `Marker=` that is missing or not [`MARKER`].
+fn goetia_keys(unit_text: &str) -> Result<Option<BTreeMap<&str, &str>>, Error> {
     let lines: Vec<&str> = unit_text.lines().collect();
 
     let section_starts: Vec<usize> = lines
@@ -597,39 +588,40 @@ pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
         .map(|offset| start + offset)
         .unwrap_or(lines.len());
 
-    // A second `Marker=` or `Spec=` line within the one section is
-    // rejected for the same reason a second section is: a forged extra
-    // line would otherwise let user-controlled text pick which of two
-    // values `extract` trusts, silently overriding the genuine one.
-    let mut marker: Option<&str> = None;
-    let mut spec_value: Option<&str> = None;
+    let mut keys = BTreeMap::new();
     for line in &lines[start..end] {
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("Marker=") {
-            if marker.is_some() {
-                return Err(Error::blob(
-                    "[X-Goetia] section has more than one Marker= line".to_string(),
-                ));
-            }
-            marker = Some(value);
-        } else if let Some(value) = trimmed.strip_prefix("Spec=") {
-            if spec_value.is_some() {
-                return Err(Error::blob(
-                    "[X-Goetia] section has more than one Spec= line".to_string(),
-                ));
-            }
-            spec_value = Some(value);
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if keys.insert(key, value).is_some() && SECTION_KEYS.contains(&key) {
+            return Err(Error::blob(format!("[X-Goetia] section has more than one {key}= line")));
         }
     }
 
-    let marker = marker.ok_or_else(|| Error::blob("[X-Goetia] section has no Marker= line".to_string()))?;
-    if marker != MARKER {
-        return Err(Error::blob(format!(
-            "[X-Goetia] section has unexpected Marker value `{marker}`"
-        )));
+    match keys.get("Marker") {
+        None => Err(Error::blob("[X-Goetia] section has no Marker= line".to_string())),
+        Some(&MARKER) => Ok(Some(keys)),
+        Some(other) => Err(Error::blob(format!(
+            "[X-Goetia] section has unexpected Marker value `{other}`"
+        ))),
     }
+}
 
-    let spec_value = spec_value.ok_or_else(|| Error::blob("[X-Goetia] section has no Spec= line".to_string()))?;
+/// Extract the embedded metadata blob from a unit file's text.
+///
+/// Returns `Ok(None)` only when no `[X-Goetia]` section is present at
+/// all — that is the "this is not (or no longer) ours" case, e.g. a
+/// foreign unit or one Goetia has never touched. A section that *is*
+/// present but does not decode into a valid blob is `Err`, as is whatever
+/// [`goetia_keys`] refuses.
+pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
+    let Some(keys) = goetia_keys(unit_text)? else {
+        return Ok(None);
+    };
+
+    let spec_value = keys
+        .get("Spec")
+        .ok_or_else(|| Error::blob("[X-Goetia] section has no Spec= line".to_string()))?;
 
     // Our own generator never emits whitespace or a backslash inside
     // `Spec=`'s base64 value. Either one means the line was hand-edited

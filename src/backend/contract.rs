@@ -194,8 +194,9 @@ pub(crate) trait Backend {
     ///
     /// `in_flight` is what `uninstall` was asked to do with a run in flight, for a backend whose leftover
     /// has one: systemd's stand-in unit for a left run is stopped first under [`RunInFlight::Stop`] and
-    /// left, with its run, under [`RunInFlight::Leave`] while its unit is active. A backend with no such
-    /// leftover ignores it.
+    /// left, with its run, under [`RunInFlight::Leave`] while its run is in flight; and a definition systemd
+    /// still holds for a file that is gone is reloaded under either. A backend with no such leftover
+    /// ignores it.
     fn uninstall_absent(&self, _id: &Id, _in_flight: RunInFlight) -> Result<()> {
         Ok(())
     }
