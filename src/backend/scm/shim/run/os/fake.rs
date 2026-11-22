@@ -129,6 +129,8 @@ pub(crate) enum Op {
     /// A [`Spawned::terminate_tree`], the ask.
     Ask,
     WaitTree,
+    /// A [`Spawned::try_wait`], the read of whether the process has exited.
+    TryWait,
 }
 
 /// What a [`Spawned::wait`] does.
@@ -139,6 +141,9 @@ pub(crate) enum WaitReply {
     /// Block until the process is ended, by a successful kill or [`FakeProcess::end`], and return
     /// its status.
     Blocks,
+    /// Block as [`WaitReply::Blocks`] does, until the process has ended and its report is not held, then fail: the
+    /// wait fails after the read that released the report.
+    FailsWhenEnded,
     /// Fail, with this OS error code ([`wait_failed_with_code`]) or, with none, [`wait_failed`].
     Fails(Option<i32>),
     /// Panic, ending the waiter thread without it reporting the child done.
@@ -256,7 +261,11 @@ struct ProcState {
     calls: Vec<ProcessCall>,
     exit: Option<ExitStatus>,
     killed: bool,
+    /// Whether the process had already ended when the first kill or tree kill reached it, replied to or not.
+    ended_at_teardown: Option<bool>,
     dropped: bool,
+    /// What happens in the world the first time the process performs an [`Op`] ([`FakeProcess::when`]).
+    when: BTreeMap<Op, Box<dyn FnOnce() + Send>>,
 }
 
 fn status(code: i32) -> ExitStatus {
@@ -270,6 +279,13 @@ impl Proc {
         let first = *lock(&self.state).exit.get_or_insert(status);
         self.ended.notify_all();
         first
+    }
+
+    fn fire(&self, op: Op) {
+        let effect = lock(&self.state).when.remove(&op);
+        if let Some(effect) = effect {
+            effect();
+        }
     }
 
     /// Let go of a report that is held, so that the waiter can return.
@@ -312,7 +328,9 @@ impl FakeProcess {
                 calls: Vec::new(),
                 exit: None,
                 killed: false,
+                ended_at_teardown: None,
                 dropped: false,
+                when: BTreeMap::new(),
             }),
             ended: Condvar::new(),
         }))
@@ -383,6 +401,20 @@ impl FakeProcess {
         self.with(|state| state.tree_waits.push_back(reply))
     }
 
+    /// `effect` happens the first time this process performs `op`, with no lock held and before the call's reply is
+    /// made: for [`Op::Spawn`], once the process is registered and before the supervisor holds it (a stop accepted
+    /// after the last look at the stop and before the program exists); for [`Op::TryWait`], before the read of the
+    /// process's state (what the world has done by the time the read is tried, such as the waiter's report of the
+    /// exit). At most one for each op. One that never fires is named when the `Fake` is checked for being spent.
+    pub(crate) fn when(self, op: Op, effect: impl FnOnce() + Send + 'static) -> FakeProcess {
+        self.with(|state| {
+            assert!(
+                state.when.insert(op, Box::new(effect)).is_none(),
+                "`when` was stated twice for {op:?}"
+            );
+        })
+    }
+
     /// Every ask, tree wait and kill made on the process, in order.
     pub(crate) fn calls(&self) -> Vec<ProcessCall> {
         lock(&self.0.state).calls.clone()
@@ -398,9 +430,21 @@ impl FakeProcess {
         lock(&self.0.state).exit.is_some()
     }
 
+    /// Make the blocked wait on the process fail, by hand: its report is a failure, and the process is not ended.
+    pub(crate) fn fail_wait(&self) {
+        lock(&self.0.state).wait_fails = true;
+        self.0.ended.notify_all();
+    }
+
     /// The status it ended with, if it has ended.
     pub(crate) fn exit_code(&self) -> Option<i32> {
         lock(&self.0.state).exit.and_then(|status| status.code())
+    }
+
+    /// Whether the process had already ended when the first kill or tree kill reached it: `None` if none has. A
+    /// teardown that came before the program's own exit says `Some(false)`.
+    pub(crate) fn ended_at_teardown(&self) -> Option<bool> {
+        lock(&self.0.state).ended_at_teardown
     }
 
     /// Whether a kill or tree kill of it succeeded.
@@ -427,6 +471,13 @@ impl Instance {
         panic!("unstated call: {what} on a process");
     }
 
+    /// Counts `op`, then runs the effect stated for it ([`FakeProcess::when`]): the one place a process's op is
+    /// counted.
+    fn count(&self, op: Op) {
+        self.fake.count(op);
+        self.proc.fire(op);
+    }
+
     fn record(&self, call: ProcessCall) {
         lock(&self.proc.state).calls.push(call);
     }
@@ -437,6 +488,11 @@ impl Instance {
         refused: fn() -> cosca::error::Error,
         reply: Option<KillReply>,
     ) -> Result<(), cosca::error::Error> {
+        {
+            let mut state = lock(&self.proc.state);
+            let ended = state.exit.is_some();
+            state.ended_at_teardown.get_or_insert(ended);
+        }
         match reply {
             None => self.unstated(what),
             Some(KillReply::Ends) => {
@@ -461,6 +517,7 @@ impl Spawned for Instance {
             None => self.unstated("wait"),
             Some(WaitReply::Exits(code)) => Ok(self.proc.end(status(code))),
             Some(WaitReply::Blocks) => self.proc.wait_ended(),
+            Some(WaitReply::FailsWhenEnded) => self.proc.wait_ended().and_then(|_| Err(wait_failed())),
             Some(WaitReply::Fails(Some(code))) => Err(wait_failed_with_code(code)),
             Some(WaitReply::Fails(None)) => Err(wait_failed()),
             Some(WaitReply::Panics) => panic!("the wait panicked (fake)"),
@@ -468,6 +525,7 @@ impl Spawned for Instance {
     }
 
     fn try_wait(&self) -> Result<Option<ExitStatus>, cosca::error::Error> {
+        self.count(Op::TryWait);
         let mut state = lock(&self.proc.state);
         if state.try_wait_fails {
             return Err(try_wait_failed());
@@ -487,14 +545,14 @@ impl Spawned for Instance {
     }
 
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
-        self.fake.count(Op::SendKillTree);
+        self.count(Op::SendKillTree);
         self.record(ProcessCall::SendKillTree);
         let reply = lock(&self.proc.state).send_kill_tree_replies.pop_front();
         self.kill_with("send_kill_tree", tree_kill_refused, reply)
     }
 
     fn terminate_tree(&self) -> Result<(), cosca::error::Error> {
-        self.fake.count(Op::Ask);
+        self.count(Op::Ask);
         self.record(ProcessCall::Ask);
         // The proxy takes long enough for the waiter's report to have come in.
         self.proc.release_report();
@@ -538,7 +596,7 @@ impl Spawned for Instance {
     }
 
     fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error> {
-        self.fake.count(Op::WaitTree);
+        self.count(Op::WaitTree);
         self.record(ProcessCall::WaitTree(timeout));
         let reply = lock(&self.proc.state).tree_waits.pop_front();
         match reply {
@@ -885,6 +943,10 @@ impl Fake {
                     problems.push(format!("process {n}: {left} stated {what} replies never used"));
                 }
             }
+            if !state.when.is_empty() {
+                let ops: Vec<&Op> = state.when.keys().collect();
+                problems.push(format!("process {n}: effects stated for {ops:?} never fired"));
+            }
         }
         assert!(problems.is_empty(), "the Fake was not spent: {problems:#?}");
     }
@@ -906,6 +968,7 @@ impl Os for Fake {
             Some(SpawnReply::Refuses(error)) => Err(error),
             Some(SpawnReply::Process(FakeProcess(proc))) => {
                 lock(&self.shared.state).processes.push(Arc::clone(&proc));
+                proc.fire(Op::Spawn);
                 Ok(Box::new(Instance {
                     proc,
                     fake: Arc::clone(&self.shared),

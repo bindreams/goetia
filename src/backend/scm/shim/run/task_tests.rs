@@ -21,7 +21,7 @@ use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::shim::run::os::fake::{
-    ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd,
+    ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, Op, ProcessCall, WaitReply, WaiterEnd,
 };
 use crate::backend::scm::shim::run::os::{LogKind, Severity};
 use crate::backend::scm::shim::run::test_support::{
@@ -212,6 +212,34 @@ impl Run {
         self.runs.read(&instance()).unwrap()
     }
 
+    /// What a stop does as the program is spawned ([`FakeProcess::when`] with [`Op::Spawn`]): it is accepted after the last
+    /// look at the bus, which is task mode's alone and comes first.
+    fn stop_at_the_spawn(&self) -> impl FnOnce() + Send + 'static {
+        let bus = Arc::clone(&self.supervisor.bus);
+        move || assert!(bus.request_stop())
+    }
+
+    /// Runs the task on a thread of its own and calls `while_waiting` on the test's thread once the run's
+    /// provisional file is on disk. For a run stopped at its spawn that is the file written before the wait: the
+    /// program is still running then, and `while_waiting` is what ends it. Returns the run's code.
+    fn run_until_it_records(&self, while_waiting: impl FnOnce()) -> u32 {
+        self.run_until(
+            NameChange::RenamedTo(format!("{}.stopping", instance().hex())),
+            while_waiting,
+        )
+    }
+
+    /// [`Run::run_until_it_records`] for the change `change` of a name in the records' directory.
+    fn run_until(&self, change: NameChange, while_waiting: impl FnOnce()) -> u32 {
+        let mut watch = DirWatch::new(&self.records_dir());
+        std::thread::scope(|scope| {
+            let running = scope.spawn(|| self.run());
+            watch.until(|changes| changes.contains(&change));
+            while_waiting();
+            running.join().expect("the run did not panic")
+        })
+    }
+
     /// The program's thread ended, and the failures the run logged, taken.
     fn finish(&self) -> Vec<String> {
         assert_eq!(self.fake.waiter_end(0), WaiterEnd::Returned);
@@ -224,9 +252,10 @@ fn exits(code: i32) -> FakeProcess {
     FakeProcess::new().exited(code).send_kill_tree(KillReply::Ends)
 }
 
-/// A program a stop ends: it runs until the tree is killed.
+/// A program that runs until it is ended by hand ([`FakeProcess::end`]): two waits, the waiter's and the one that
+/// reads the code of a program that exited by itself.
 fn runs_until_stopped() -> FakeProcess {
-    FakeProcess::running()
+    FakeProcess::running().wait(WaitReply::Blocks)
 }
 
 fn recorded(outcome: RunOutcome) -> Option<RunRecord> {
@@ -879,48 +908,278 @@ fn a_program_that_cannot_be_spawned_is_a_logged_shim_failure_and_is_not_recorded
 
 // A stop ==============================================================================================================
 
+/// A stop accepted while the program is being spawned, and the program already gone when the shim sees it (the
+/// waiter's report of its exit lags): the shim has the program's exit status, so the record is the program's exit, with
+/// its code, whatever the code is, and it is written once: no `Stopped` comes first.
 #[skuld::test]
-fn an_accepted_stop_records_stopped_whatever_the_exit_code() {
-    for exit in [Some(0), Some(7), None] {
+fn a_stop_with_the_program_already_gone_records_its_exit_once() {
+    for exit in [0, 7, STOPPED as i32] {
         let run = Run::of(&spec_logging_to(None)).listed();
-        let process = match exit {
-            Some(code) => FakeProcess::new()
-                .wait(WaitReply::Exits(code))
-                .send_kill_tree(KillReply::Ends),
-            None => runs_until_stopped(),
-        };
+        let process = FakeProcess::new()
+            .exited_unreported(exit)
+            .wait(WaitReply::Blocks)
+            .send_kill_tree(KillReply::Ends)
+            .when(Op::Spawn, run.stop_at_the_spawn());
         let run = run.program(process);
-        assert!(run.supervisor.bus.request_stop());
+        let mut watch = DirWatch::new(&run.records_dir());
 
         let code = run.run();
 
-        assert_eq!(code, STOPPED, "the program's exit {exit:?}");
-        assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+        assert_eq!(code, exit as u32, "the program's exit {exit}");
+        std::fs::write(run.records_dir().join("done"), "").unwrap();
+        let changes = watch.until_added("done");
+        let own = NameChange::RenamedTo(format!("{}.json", instance().hex()));
+        let provisional = NameChange::RenamedTo(format!("{}.stopping", instance().hex()));
+        assert_eq!(
+            changes.iter().filter(|change| **change == own).count(),
+            1,
+            "the record was written more than once, for the exit {exit}: {changes:?}"
+        );
+        assert!(
+            !changes.contains(&provisional),
+            "a provisional file was written first, for the exit {exit}: {changes:?}"
+        );
+        assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(exit as u32)));
+        drop(watch);
         assert_eq!(run.finish(), Vec::<String>::new());
+        run.no_pin_is_left();
     }
 }
 
+/// The program is gone when the stop is seen, and the waiter's wait fails after the read that found it so: the
+/// shim has the program's exit status all the same, so that is the record, and the program is not killed.
 #[skuld::test]
-fn a_stop_ends_with_0xc000013a() {
-    let run = Run::of(&spec_logging_to(None)).listed().program(runs_until_stopped());
-    assert!(run.supervisor.bus.request_stop());
+fn a_stop_that_read_the_program_gone_records_its_exit_when_the_waiter_then_fails() {
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let process = FakeProcess::new()
+        .exited_unreported(7)
+        .wait(WaitReply::FailsWhenEnded)
+        .send_kill_tree(KillReply::Ends)
+        .when(Op::Spawn, run.stop_at_the_spawn());
+    let run = run.program(process.clone());
 
-    assert_eq!(run.run(), 0xC000_013A);
-    run.finish();
+    let code = run.run();
+
+    assert_eq!(code, 7);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    assert_eq!(process.calls(), [ProcessCall::SendKillTree], "the program was killed");
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("background wait on child"), "{failures:?}");
+    run.no_pin_is_left();
 }
 
-/// The handler is registered before the task is read, so a stop that arrives before the program is
-/// spawned is held by the bus until the run reaches it.
+/// A stop accepted before the program is spawned spawns nothing: the program would never be sent the close event,
+/// which reached the shim already. The run is recorded stopped and ends with the stop's code, holding nothing.
 #[skuld::test]
-fn a_stop_before_the_spawn_is_not_lost() {
-    let run = Run::of(&spec_logging_to(None)).listed().program(runs_until_stopped());
+fn a_stop_before_the_spawn_spawns_nothing_and_records_stopped() {
+    let run = Run::of(&spec_logging_to(None)).listed();
     assert!(run.supervisor.bus.request_stop());
 
     let code = run.run();
 
     assert_eq!(code, STOPPED);
+    assert_eq!(run.fake.calls(Op::Spawn), 0, "a program was started");
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+    run.no_pin_is_left();
+    run.api.finish();
+    assert_eq!(run.fake.take_failures(), Vec::<String>::new());
+}
+
+/// The program is alive when the stop is seen: the run reads `Stopped` from a provisional file on disk before the
+/// wait for the program, and the run's pin is still held: an account change or an uninstall that read "no pin held"
+/// as "no run alive" would otherwise act on a run that is alive. The program is then waited for (nothing ends it),
+/// and it exits by itself: the tree is torn down, and the final write, which releases the pin, is the program's exit,
+/// with its code, in a record of its own name; the prune that follows removes the provisional file.
+#[skuld::test]
+fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_the_pin_held_meanwhile() {
+    let process = runs_until_stopped();
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.clone().when(Op::Spawn, stop));
+
+    let code = run.run_until_it_records(|| {
+        assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+        assert!(
+            run.runs.held_pin().unwrap().is_some(),
+            "the pin was let go when the stop was accepted: the run is alive"
+        );
+        process.end(7);
+    });
+
+    assert_eq!(code, 7);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    assert!(
+        !run.records_dir()
+            .join(format!("{}.stopping", instance().hex()))
+            .exists(),
+        "the provisional file was left"
+    );
+    assert_eq!(
+        process.ended_at_teardown(),
+        Some(true),
+        "the program was ended before it exited by itself"
+    );
+    assert_eq!(process.exit_code(), Some(7));
+    assert_eq!(
+        process.calls(),
+        [ProcessCall::SendKillTree],
+        "the teardown follows the exit"
+    );
+    run.no_pin_is_left();
     assert_eq!(run.finish(), Vec::<String>::new());
+}
+
+/// A teardown that fails after the wait is recorded as an incomplete stop, which a reader takes over the `Stopped` of
+/// the provisional file written first, and the run ends with the incomplete stop's code.
+#[skuld::test]
+fn a_teardown_that_fails_records_an_incomplete_stop_over_the_provisional_file() {
+    let process = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .send_kill_tree(KillReply::Refuses);
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.clone().when(Op::Spawn, stop));
+
+    let code = run.run_until_it_records(|| {
+        assert_eq!(
+            without_start(run.record()),
+            recorded(RunOutcome::Stopped),
+            "written first"
+        );
+        process.end(0);
+    });
+
+    assert_eq!(code, 1003);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::IncompleteStop));
+    run.no_pin_is_left();
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].contains("terminating the process tree after the daemon ended failed"),
+        "{failures:?}"
+    );
+}
+
+/// A stop whose wait on the program failed is not waited for: nothing watches the program, so both kills are
+/// tried at once, and when both are refused the run is the incomplete stop.
+#[skuld::test]
+fn a_stop_whose_kills_are_both_refused_is_an_incomplete_stop() {
+    let process = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .send_kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.when(Op::Spawn, stop));
+
+    let code = run.run();
+
+    assert_eq!(code, 1003);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::IncompleteStop));
+    let failures = run.finish();
+    assert_eq!(failures.len(), 3, "{failures:?}");
+    assert!(failures[0].contains("background wait on child"), "{failures:?}");
+    assert_eq!(
+        failures[1..],
+        [
+            format!("goetia-shim[{ID}]: {}", tree_refused_failure()),
+            format!("goetia-shim[{ID}]: {}", fallback_refused_failure()),
+        ]
+    );
+}
+
+/// A stop whose wait on the program failed: the shim never saw the program exit, so the stop is what the record says,
+/// whether the program is alive or not, and the run ends with the stop's code.
+#[skuld::test]
+fn a_stop_whose_wait_failed_records_stopped() {
+    let process = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .send_kill_tree(KillReply::Ends);
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.when(Op::Spawn, stop));
+
+    let code = run.run();
+
+    assert_eq!(code, STOPPED);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("background wait on child"), "{failures:?}");
+    run.no_pin_is_left();
+}
+
+/// The one place the rule lives: a stopped pass that carries the program's exit is that exit, with its code; one
+/// that does not is `Stopped`, with the stop's code. A run that ended some other way is as it was.
+#[skuld::test]
+fn a_stopped_pass_is_the_programs_exit_when_it_has_one() {
+    assert_eq!(
+        ended_as(PassOutcome::Stopped(Some(7))),
+        (Some(RunOutcome::Exited(7)), 7)
+    );
+    assert_eq!(
+        ended_as(PassOutcome::Stopped(Some(STOPPED as i32))),
+        (Some(RunOutcome::Exited(STOPPED)), STOPPED)
+    );
+    assert_eq!(
+        ended_as(PassOutcome::Stopped(None)),
+        (Some(RunOutcome::Stopped), STOPPED)
+    );
+    assert_eq!(
+        ended_as(PassOutcome::IncompleteStop).0,
+        Some(RunOutcome::IncompleteStop)
+    );
+    assert_eq!(ended_as(PassOutcome::WaitFailed(None)).0, None);
+}
+
+/// The program's own exit is no stop: nothing is written before the run's one record.
+#[skuld::test]
+fn the_programs_own_exit_writes_no_stopped_record_first() {
+    let run = Run::of(&spec_logging_to(None)).listed().program(exits(3));
+    let mut watch = DirWatch::new(&run.records_dir());
+
+    assert_eq!(run.run(), 3);
+
+    std::fs::write(run.records_dir().join("done"), "").unwrap();
+    let changes = watch.until_added("done");
+    let own = NameChange::RenamedTo(format!("{}.json", instance().hex()));
+    let provisional = NameChange::RenamedTo(format!("{}.stopping", instance().hex()));
+    assert_eq!(
+        changes.iter().filter(|change| **change == own).count(),
+        1,
+        "the record was written more than once: {changes:?}"
+    );
+    assert!(
+        !changes.contains(&provisional),
+        "a provisional file was written first: {changes:?}"
+    );
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(3)));
+    drop(watch);
+    run.finish();
+    run.no_pin_is_left();
+}
+
+/// A stop that is accepted after the last look at the bus and before the program exists still spawns it. The
+/// record says `Stopped` while it runs, which is true: a stop was accepted. The program was started after the close
+/// event and never got it; it runs until it exits (its exit is then the record) or Windows ends the shim, which ends
+/// the job over it and leaves `Stopped`.
+#[skuld::test]
+fn a_stop_between_the_last_look_and_the_spawn_still_spawns_the_program() {
+    let process = runs_until_stopped();
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.clone().when(Op::Spawn, stop));
+
+    let code = run.run_until_it_records(|| {
+        assert_eq!(run.fake.calls(Op::Spawn), 1);
+        assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+        process.end(0);
+    });
+
+    assert_eq!(code, 0);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(0)));
+    run.finish();
 }
 
 /// Which read of Task Scheduler a [`StopsDuring`] asks for the stop in.
@@ -989,10 +1248,11 @@ impl TaskApi for StopsDuring {
     }
 }
 
+/// A stop during a read of Task Scheduler is held by the bus, and is there at the look before the spawn.
 #[skuld::test]
-fn a_stop_during_the_com_reads_is_not_lost() {
+fn a_stop_during_the_com_reads_is_not_lost_and_spawns_nothing() {
     for at in [Read::Get, Read::Instances] {
-        let run = Run::of(&spec_logging_to(None)).listed().program(runs_until_stopped());
+        let run = Run::of(&spec_logging_to(None)).listed();
         let api = StopsDuring {
             inner: run.api.clone(),
             bus: Arc::clone(&run.supervisor.bus),
@@ -1009,47 +1269,33 @@ fn a_stop_during_the_com_reads_is_not_lost() {
         );
 
         assert_eq!(code, STOPPED, "a stop during {at:?}");
+        assert_eq!(run.fake.calls(Op::Spawn), 0, "a stop during {at:?} spawned the program");
         assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped), "{at:?}");
-        assert_eq!(run.finish(), Vec::<String>::new());
+        run.api.finish();
+        assert_eq!(run.fake.take_failures(), Vec::<String>::new());
     }
 }
 
 #[skuld::test]
-fn an_incomplete_stop_is_recorded_as_incomplete_and_returns_1003() {
-    let process = FakeProcess::new()
-        .wait(WaitReply::Blocks)
-        .send_kill_tree(KillReply::Refuses)
-        .kill(KillReply::Refuses);
-    let run = Run::of(&spec_logging_to(None)).listed().program(process.clone());
-    assert!(run.supervisor.bus.request_stop());
-
-    let code = run.run();
-
-    assert_eq!(code, 1003);
-    assert_eq!(without_start(run.record()), recorded(RunOutcome::IncompleteStop));
-    // Both kills were refused, so the program outlives the run: the test ends it.
-    process.end(1);
-    assert_eq!(
-        run.finish(),
-        vec![
-            format!("goetia-shim[{ID}]: {}", tree_refused_failure()),
-            format!("goetia-shim[{ID}]: {}", fallback_refused_failure()),
-        ]
-    );
-}
-
-#[skuld::test]
 fn the_close_handler_only_requests_a_stop() {
-    let run = Run::of(&spec_logging_to(None)).listed().program(runs_until_stopped());
+    let process = runs_until_stopped();
+    let run = Run::of(&spec_logging_to(None)).listed();
     let bus = Arc::clone(&run.supervisor.bus);
-    // The handler's thread is held for the life of the process, as the system's is: it is never joined.
-    std::thread::spawn(move || on_event(&bus, CTRL_CLOSE_EVENT));
+    // The handler's thread is held for the life of the process, as the system's is: it is never joined. It is
+    // started as the program is spawned, after the look at the bus that spawns nothing.
+    let run = run.program(process.clone().when(Op::Spawn, move || {
+        std::thread::spawn(move || on_event(&bus, CTRL_CLOSE_EVENT));
+    }));
 
-    // Only a stop that reached the bus ends a program that runs until stopped.
-    let code = run.run();
+    // Only a stop that reached the bus makes the run record one, and the handler thread never returns to end
+    // the process: the run thread alone ends it, with the program's own exit once it has one.
+    let code = run.run_until_it_records(|| {
+        assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+        process.end(0);
+    });
 
-    assert_eq!(code, STOPPED);
-    assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+    assert_eq!(code, 0);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(0)));
     assert_eq!(run.finish(), Vec::<String>::new());
 }
 
@@ -1424,6 +1670,44 @@ fn a_failed_record_write_still_returns_the_programs_code() {
     );
     assert_eq!(run.fake.waiter_end(0), WaiterEnd::Returned);
     run.api.finish();
+    run.no_pin_is_left();
+}
+
+/// A stop heard with the program alive whose provisional file cannot be written is logged as that, in words of its
+/// own (the file and the run records it was to be written in), not as a failed record; the run then records its end
+/// as it does.
+#[skuld::test]
+fn a_provisional_file_that_cannot_be_written_is_logged_as_that_and_the_record_still_lands() {
+    let process = runs_until_stopped();
+    let run = Run::of(&spec_logging_to(None)).listed();
+    // A directory where the provisional file is to be: the write is refused, and removes its temp file.
+    directory_with_a_file(&run.records_dir().join(format!("{}.stopping", instance().hex())));
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.clone().when(Op::Spawn, stop));
+
+    let code = run.run_until(
+        NameChange::Removed(format!("{}.stopping.tmp", instance().hex())),
+        || process.end(7),
+    );
+
+    assert_eq!(code, 7);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    // The prune cannot remove what is in the provisional file's place.
+    let warnings = run.fake.take_warnings();
+    assert!(
+        warnings.len() == 1 && warnings[0].contains("prune the run records"),
+        "{warnings:?}"
+    );
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!(
+            "goetia-shim[{ID}]: write the provisional file {}.stopping in the run records {}: ",
+            instance().hex(),
+            run.records_dir().display()
+        )),
+        "{failures:?}"
+    );
     run.no_pin_is_left();
 }
 

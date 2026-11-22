@@ -6,6 +6,7 @@
 //! new shim, which reads the installed spec afresh.
 
 use std::ffi::{OsString, c_void};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +34,8 @@ use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{
-    NOT_RESTARTED, StopBus, StopPlan, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree,
+    NOT_RESTARTED, RootExit, StopBus, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop,
+    terminate_exited_tree,
 };
 
 // Entry ===============================================================================================================
@@ -384,7 +386,10 @@ pub(super) fn run_daemon(
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(Duration),
 ) -> Reported {
-    run_pass(spec, plan, supervisor, id, on_running, on_stopping).reported()
+    run_pass(spec, plan, supervisor, id, on_running, |end| {
+        on_stopping(plan.wait_hint(end))
+    })
+    .reported()
 }
 
 /// How one pass ended, before it is read as anything: what the service tells SCM
@@ -395,8 +400,10 @@ pub(super) enum PassOutcome {
     /// be had, which is already logged.
     Exited(Option<i32>),
     /// A stop was accepted, and the daemon's tree was terminated. It wins over the exit code the
-    /// teardown made the daemon leave, and over a failed wait.
-    Stopped,
+    /// teardown made the daemon leave, and over a failed wait. The code is the daemon's own exit, when the shim had its
+    /// exit status because the daemon had exited by itself, before the teardown; `None` when the teardown ended it
+    /// (or the wait failed, or the status could not be had). A service ignores it; a task's record is that exit.
+    Stopped(Option<i32>),
     /// Something of the daemon's tree may still be running, after a stop, a failure, or an exit
     /// whose tree could not be terminated.
     IncompleteStop,
@@ -412,7 +419,7 @@ impl PassOutcome {
     pub(super) fn reported(self) -> Reported {
         match self {
             PassOutcome::Exited(code) => exit_report(code),
-            PassOutcome::Stopped => Reported::Clean,
+            PassOutcome::Stopped(_) => Reported::Clean,
             PassOutcome::IncompleteStop => Reported::incomplete_stop(),
             PassOutcome::WaitFailed(os_error) => Reported::shim_failure(os_error),
             PassOutcome::NotRun(reported) => reported,
@@ -424,11 +431,10 @@ impl PassOutcome {
 /// stop, and say how it ended. `plan` is the run's [`StopPlan`]: the daemon is spawned for it, and it is the stop the
 /// supervisor runs.
 ///
-/// `on_stopping` is called exactly once, after `on_running` and before the daemon's tree is torn
-/// down, whatever ends the run; never when `on_running` was not. It is told the plan's longest wait for the
-/// end that ended the run ([`StopPlan::wait_hint`]). The service reads `STOP_PENDING`
-/// through the teardown, so a `start` is refused rather than answered "running" for a service that
-/// is about to stop.
+/// `on_stopping` is called exactly once, after `on_running` and before anything is asked of the daemon or its tree
+/// is torn down, whatever ends the run; never when `on_running` was not. It is told by a [`WaitEnd`] whether an
+/// accepted stop or the daemon's own end ended the wait. The service reads `STOP_PENDING` through the teardown, so
+/// a `start` is refused rather than answered "running" for a service that is about to stop.
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
@@ -447,7 +453,7 @@ pub(super) fn run_pass(
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(Duration),
+    on_stopping: impl FnOnce(WaitEnd),
 ) -> PassOutcome {
     let log = &*supervisor.log;
     let (child, waiter) = match launch(spec, plan, supervisor, id) {
@@ -458,21 +464,9 @@ pub(super) fn run_pass(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
-    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, |end| on_stopping(plan.wait_hint(end))) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping) {
         WaitOutcome::ChildExited => {
-            let code = match child.wait() {
-                Ok(status) => {
-                    let code = status.code();
-                    if code.is_none() {
-                        log.failure(id, NO_EXIT_CODE);
-                    }
-                    code
-                }
-                Err(e) => {
-                    log.failure(id, &exit_status_unavailable(&e));
-                    None
-                }
-            };
+            let code = exit_code(child.as_ref(), log, id);
             // A stop accepted before this decision wins over a failure: `settle` then says something
             // other than the candidate. A clean exit and a stop accepted after the wait ended read
             // alike.
@@ -481,7 +475,7 @@ pub(super) fn run_pass(
             if !terminate_exited_tree(child.as_ref(), log, id) {
                 PassOutcome::IncompleteStop
             } else if stop_won {
-                PassOutcome::Stopped
+                PassOutcome::Stopped(code)
             } else {
                 PassOutcome::Exited(code)
             }
@@ -493,14 +487,41 @@ pub(super) fn run_pass(
             if supervisor.bus.settle(candidate) == candidate {
                 PassOutcome::WaitFailed(os_error)
             } else {
-                PassOutcome::Stopped
+                PassOutcome::Stopped(None)
             }
         }
-        // `wait_for_child_or_stop` terminated the tree before returning this.
-        WaitOutcome::Stopping => PassOutcome::Stopped,
+        // `wait_for_child_or_stop` terminated the tree before returning this. A daemon that exited by itself first
+        // has its exit status: the one a read of the process gave, or, when none did, the one the waiter's wait
+        // returned (as in the `ChildExited` arm).
+        WaitOutcome::Stopping(root) => PassOutcome::Stopped(match root {
+            RootExit::Status(status) => code_of(status, log, id),
+            RootExit::Unread => exit_code(child.as_ref(), log, id),
+            RootExit::NotSeen => None,
+        }),
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => PassOutcome::IncompleteStop,
     }
+}
+
+/// The exit code of a daemon that has exited and been waited for, or `None` when its exit status could not be had or
+/// carries no code: told in the log.
+fn exit_code(child: &dyn Spawned, log: &Log, id: &str) -> Option<i32> {
+    match child.wait() {
+        Ok(status) => code_of(status, log, id),
+        Err(e) => {
+            log.failure(id, &exit_status_unavailable(&e));
+            None
+        }
+    }
+}
+
+/// The code of an exit status, or `None` when it carries none: told in the log.
+fn code_of(status: ExitStatus, log: &Log, id: &str) -> Option<i32> {
+    let code = status.code();
+    if code.is_none() {
+        log.failure(id, NO_EXIT_CODE);
+    }
+    code
 }
 
 /// How an exited daemon is reported, before [`StopBus::settle`] lets a stop win. `None` is an exit

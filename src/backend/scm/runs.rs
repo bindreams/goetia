@@ -1,20 +1,33 @@
 //! The record the shim writes for each run of a task, and that `run` and status read.
 //!
 //! One file per run, `<ProgramData>\Goetia\runs\<id>\<instance>.json`, named by the 32 hex digits of
-//! the instance GUID Task Scheduler gave the run. It is written to `<instance>.json.tmp` and renamed
-//! over its name, so a reader sees a whole record or none.
+//! the instance GUID Task Scheduler gave the run. It is written to `<instance>.json.tmp` and renamed to its
+//! name (the provisional file below to `<instance>.stopping.tmp`, a temp name of its own), so a reader sees a whole
+//! record or none. **Nothing is ever renamed onto a name that exists** (the
+//! operating system refuses it, [`files::rename_to`]): no program that holds a file open can keep a record
+//! from landing.
+//!
+//! A run whose stop is heard with its program alive writes a second kind of file first, the provisional
+//! `<instance>.stopping` ([`Pin::write_stopping`]), which holds its `started` and the file name of its writer's own
+//! pin, with the pin lent (no release, no prune: the run is still alive, and "no pin held" means "no run alive").
+//! Its record follows, to `<instance>.json` as every run's does, with the pin given. A reader takes the record when
+//! there is one, and the provisional file alone as `Stopped` ([`Runs::read`]); one that must know whether the run is
+//! still alive settles it by the named pin, which it asks as the module asks every pin ([`Pin::read_final`]).
+//! A pin's name is 128 random bits, so a name a reader waits for is never another run's.
 //!
 //! **No clock decides anything.** A record is pruned when a later run writes, and only when nobody
 //! waits for what it holds: a waiting `run` takes a [`Pin`] before it asks Task Scheduler to start the
 //! task, and while any pin is live a write prunes nothing. With none, a write removes every record
-//! but its own. **A run pins too:** the shim takes a pin before it reads anything, and holds it until its
+//! but its own, every provisional file (its own run's too: its record has landed) and every temp file.
+//! **A run pins too:** the shim takes a pin before it reads anything, and holds it until its
 //! own record is renamed into place; it releases it before its own prune, so a run's pin never stops its
 //! own prune. A pin is a file held open with no sharing: it
 //! goes when its holder does, however it ends, and while it is held nothing can delete it, whoever tries.
 //! One left by a power cut is held by nothing, and the next write finds it by deleting it: a sharing
 //! violation says it is live ([`files::delete`] reads every failed delete, here and in the removal). What a
-//! pin's holder did not see yet is whatever [`Pin::appeared`] lists: the records written after the
-//! pin's directory listing, which was taken after the pin. **No operation deletes a record while a pin
+//! pin's holder did not see yet is whatever [`Pin::appeared`] lists: the runs that have a file the pin's
+//! directory listing, which was taken after the pin, did not hold, the record of each when it has one and its
+//! provisional file when it has not. **No operation deletes a record or a provisional file while a pin
 //! is held:** a write prunes nothing, and [`Runs::remove_all`] waits for the pins first. A pin made
 //! after the marker is placed is refused ([`Runs::hold`]), but for the one pin of the uninstall that placed
 //! it, taken past it ([`MarkerCheck::Ignore`]) and let go before the removal waits. The pins the removal
@@ -49,7 +62,6 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tempfile::Builder;
 
 use self::dir::Dir;
 use self::files::DeleteOutcome;
@@ -60,19 +72,27 @@ use crate::error::{Error, Result};
 use crate::spec::Id;
 
 use super::instance::InstanceId;
+use super::task_xml::Token;
 
 /// The end of a record's file name; a name's stem is the instance's [`InstanceId::hex`].
 const RECORD: &str = ".json";
+/// The end of the name of a run's provisional file, which holds its first `Stopped`: the same stem as the record's.
+const STOPPING: &str = ".stopping";
 /// The end of the file a record is written to before it is renamed.
 const TEMP: &str = ".json.tmp";
+/// The end of the file a provisional file is written to before it is renamed: a name of its own, so that nothing
+/// that stays of a failed provisional write is in the way of the record's.
+const STOPPING_TEMP: &str = ".stopping.tmp";
+/// The start of a pin's file name; the rest is [`PIN`] after the 32 hex digits of 128 random bits.
+const PIN_PREFIX: &str = "pin-";
 /// The end of a pin's file name.
 const PIN: &str = ".pin";
 /// The end of the name of a removal's marker file, `runs\<id>~removing`, which a new pin looks for
 /// ([`Runs::remove_all`]). An id has no `~`, so no task's directory is named like it.
 const REMOVING: &str = "~removing";
 /// The pace of [`Runs::remove_all`]'s passes while something is held or the directory is not yet
-/// empty. Each re-check decides; the pace only keeps the loop from spinning (the shim's re-reads of
-/// Task Scheduler's listing run at the same pace).
+/// empty, and of [`Pin::read_final`]'s re-reads while a run's pin is held. Each re-check decides; the pace only keeps
+/// the loop from spinning (the shim's re-reads of Task Scheduler's listing run at the same pace).
 const REMOVE_PACE: Duration = Duration::from_millis(100);
 
 /// How a run ended.
@@ -81,9 +101,12 @@ const REMOVE_PACE: Duration = Duration::from_millis(100);
 pub(crate) enum RunOutcome {
     /// The program exited with this code.
     Exited(u32),
-    /// A stop was asked for and the program's tree ended.
+    /// A stop was accepted and the shim never recorded how the program ended: no program was started, its wait
+    /// failed, its own teardown ended it, Windows ended the shim first, or the final write failed. For the last two
+    /// the run left only its provisional file, which a reader takes as this. It does not say the program's tree has
+    /// ended. A program the shim saw exit is `Exited`, stop or not (see the module doc of `shim::run::task`).
     Stopped,
-    /// A stop was asked for and something of the program's tree could not be ended.
+    /// A stop was accepted and something of the program's tree could not be ended.
     IncompleteStop,
 }
 
@@ -102,6 +125,16 @@ pub(crate) struct RunRecord {
 struct Stored {
     started: u64,
     outcome: RunOutcome,
+}
+
+/// What a provisional file holds: a provisional file is always `Stopped`, so it has no outcome, and `pin` is the file
+/// name of its writer's own pin, which is held for as long as the run is alive ([`Pin::read_final`]). A file with an
+/// outcome is not one the shim writes.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredStopping {
+    started: u64,
+    pin: String,
 }
 
 /// What a refusal says when the removal's marker stands: an install or an uninstall of `id` is running or did not
@@ -131,14 +164,18 @@ pub(crate) struct Pin {
     /// The directory the pin was made in, opened once for the pin's life: what the pin reads is read
     /// through it, never through the path again.
     dir: Dir,
-    /// The records that were there already, when the pin was made by [`Runs::pin`].
-    listing: Option<BTreeSet<InstanceId>>,
+    /// The pin's file name in `dir`, which a provisional file written under it names ([`Pin::write_stopping`]).
+    name: String,
+    /// The files that were there already, when the pin was made by [`Runs::pin`].
+    listing: Option<BTreeSet<(InstanceId, FileKind)>>,
 }
 
 impl Pin {
-    /// The records that are not in the pin's listing, the earliest `started` first (ties by instance).
-    /// The directory is there: the pin is a file in it that nothing can delete while it is held. It is
-    /// read through the handle the pin was made through.
+    /// The runs that have a file the pin's listing did not hold, one entry per run, the earliest `started` first
+    /// (ties by instance): its record when it has one, else its provisional file, which reads as `Stopped`. A
+    /// listing holds each file by instance and kind, so a provisional file that was there before the pin is not
+    /// new, and a record that lands after it is. The directory is there: the pin is a file in it that nothing can
+    /// delete while it is held. It is read through the handle the pin was made through.
     ///
     /// # Panics
     ///
@@ -148,19 +185,14 @@ impl Pin {
             .listing
             .as_ref()
             .expect("`appeared` needs a pin made by `Runs::pin`, which lists");
+        let new: BTreeSet<InstanceId> = entries(&self.dir)?
+            .iter()
+            .filter_map(Entry::file)
+            .filter(|file| !listing.contains(file))
+            .map(|(instance, _)| instance)
+            .collect();
         let mut appeared = Vec::new();
-        for entry in entries(&self.dir)? {
-            let Entry::Record {
-                instance,
-                directory: false,
-                ..
-            } = entry
-            else {
-                continue;
-            };
-            if listing.contains(&instance) {
-                continue;
-            }
+        for instance in new {
             // Gone since the listing: a write pruned it, which only happens when nothing waits for it.
             if let Some(record) = read_in(&self.dir, &instance)? {
                 appeared.push(record);
@@ -169,6 +201,88 @@ impl Pin {
         appeared.sort_by_key(|record| (record.started, record.instance));
         Ok(appeared)
     }
+
+    /// The final record of the run `instance`, read through the pin's directory handle. **The caller's pin is
+    /// what makes it final:** while it is held no prune deletes the run's provisional file, and the read below
+    /// never meets one gone for another reason than the run's end.
+    ///
+    /// A record is the answer. A provisional file alone says the run heard a stop, and whether it is still alive is
+    /// its writer's pin, which the file names: that pin is deleted, as the module tells a live pin from a dead one
+    /// ([`files::delete`]). Held, the run is alive, and the read pauses for [`REMOVE_PACE`] and reads again, with no
+    /// cap: the wait ends when the shim does (Windows ends it about a second after a stop). Not held, or not there,
+    /// the shim is gone, and its record was renamed into place before its pin was released: the record if it is
+    /// there, else `Stopped`, from the provisional file's `started` (Windows ended the shim first, or its final write
+    /// failed). Neither file is none, as for [`Runs::read`].
+    ///
+    /// A pin whose state cannot be told is an error that names it: it may be held. A provisional file that names
+    /// no pin of goetia's ([`decode_stopping`]), or the reader's own pin, is corrupt.
+    pub(crate) fn read_final(&self, instance: &InstanceId) -> io::Result<Option<RunRecord>> {
+        self.settle(instance, || thread::sleep(REMOVE_PACE))
+    }
+
+    /// [`Pin::read_final`] over `pause`, which is called each time the writer's pin is found held, before the read is
+    /// made again.
+    fn settle(&self, instance: &InstanceId, mut pause: impl FnMut()) -> io::Result<Option<RunRecord>> {
+        loop {
+            let provisional = match find_in(&self.dir, instance)? {
+                Found::Provisional(provisional) => provisional,
+                answered => return Ok(answered.into_record(instance)),
+            };
+            // The reader holds its own pin: deleting it would answer `Held` for ever.
+            if provisional.pin.eq_ignore_ascii_case(&self.name) {
+                return Err(io::Error::other(format!(
+                    "the provisional file of run {} names the reader's own pin, which is no run's writer",
+                    instance.hex()
+                )));
+            }
+            match files::delete(&self.dir, OsStr::new(&provisional.pin)) {
+                DeleteOutcome::Held => pause(),
+                DeleteOutcome::Deleted => {
+                    return match files::read(&self.dir, &record_name(instance))? {
+                        Some(bytes) => decode(*instance, &bytes).map(Some),
+                        None => Ok(Some(stopped_record(instance, provisional.started))),
+                    };
+                }
+                DeleteOutcome::Failed(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "tell whether the pin {} named by the provisional file of run {} is held: {e}",
+                            self.dir.path().join(&provisional.pin).display(),
+                            instance.hex()
+                        ),
+                    ));
+                }
+                DeleteOutcome::Linked => return Err(self.dir.link_error()),
+            }
+        }
+    }
+
+    /// Writes the provisional file of the run this pin is the shim's own of, which is alive: its `Stopped`, which a
+    /// stop that finds the program alive writes before it waits, since Windows may end the shim before anything
+    /// later. It is a file of its own, `<instance>.stopping`, which holds `started` and this pin's own file name
+    /// ([`StoredStopping`]): the pin is what says the run is alive ([`Pin::read_final`]). The pin stays held: nothing is
+    /// pruned (the run is alive, and "no pin held" means "no run alive"). The file lands in the pin's directory,
+    /// through its handle, and a run that has a provisional file is refused ([`io::ErrorKind::AlreadyExists`]).
+    pub(crate) fn write_stopping(&self, instance: &InstanceId, started: u64) -> io::Result<()> {
+        let stored = StoredStopping {
+            started,
+            pin: self.name.clone(),
+        };
+        put(
+            &self.dir,
+            &stopping_temp_name(instance),
+            &stopping_name(instance),
+            &stored,
+        )
+    }
+}
+
+/// Which of a run's two files a name is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FileKind {
+    Stopping,
+    Record,
 }
 
 /// What a task's directory holds, by what its name says it is. `directory` is whether it is a directory or a
@@ -176,6 +290,12 @@ impl Pin {
 /// takes it with its tree ([`Runs::remove_all`]).
 enum Entry {
     Record {
+        instance: InstanceId,
+        name: OsString,
+        directory: bool,
+    },
+    /// The provisional file of a run's first `Stopped`.
+    Stopping {
         instance: InstanceId,
         name: OsString,
         directory: bool,
@@ -200,15 +320,34 @@ impl Entry {
     fn name(&self) -> &OsStr {
         match self {
             Entry::Record { name, .. }
+            | Entry::Stopping { name, .. }
             | Entry::Temp { name, .. }
             | Entry::Pin { name, .. }
             | Entry::Other { name, .. } => name,
         }
     }
 
+    /// The instance and kind of a file that is a record or a provisional file; none for a directory of such a name.
+    fn file(&self) -> Option<(InstanceId, FileKind)> {
+        match self {
+            Entry::Record {
+                instance,
+                directory: false,
+                ..
+            } => Some((*instance, FileKind::Record)),
+            Entry::Stopping {
+                instance,
+                directory: false,
+                ..
+            } => Some((*instance, FileKind::Stopping)),
+            _ => None,
+        }
+    }
+
     fn directory(&self) -> bool {
         match self {
             Entry::Record { directory, .. }
+            | Entry::Stopping { directory, .. }
             | Entry::Temp { directory, .. }
             | Entry::Pin { directory, .. }
             | Entry::Other { directory, .. } => *directory,
@@ -345,45 +484,45 @@ impl Runs {
         &self.dir
     }
 
-    /// Writes the record of a run, replacing one of the same instance, then prunes. The record is
-    /// whole once this returns `Ok`; a prune that cannot remove a file leaves it for the next write.
-    /// What the prune could not do, and a failure of its own (not a file that is gone or held), is
-    /// returned as one line each for the caller to log: it never fails the write. A directory that is a
-    /// link is refused ([`Runs::ensure`]), and nothing is written.
+    /// Writes the record of a run, then prunes. The record is whole once this returns `Ok`; a prune that cannot
+    /// remove a file leaves it for the next write. What the prune could not do, and a failure of its own (not a
+    /// file that is gone or held), is returned as one line each for the caller to log: it never fails the write. A
+    /// directory that is a link is refused ([`Runs::ensure`]), and nothing is written.
     ///
-    /// `own` is the writer's pin: held until the record is renamed into place, then released before the
-    /// prune, which a held pin would stop. A failed write releases it too. The write goes through the pin's
-    /// directory handle, not the path.
+    /// **Nothing is renamed onto a name that exists:** a record for an instance that has one is refused
+    /// ([`io::ErrorKind::AlreadyExists`]) and the first is as it was. A run's first `Stopped` is another file
+    /// ([`Pin::write_stopping`]).
+    ///
+    /// `own` is the writer's pin: held until the record is renamed into place, then released before the prune,
+    /// which a held pin would stop. A failed write releases it too. The write goes through the pin's directory
+    /// handle, not the path.
     pub(crate) fn write(&self, record: &RunRecord, own: Option<Pin>) -> io::Result<Vec<String>> {
         let (dir, own) = match own {
             Some(Pin { _file, dir, .. }) => (dir, Some(_file)),
             None => (Dir::open(&self.dir)?, None),
         };
-        let name = record.instance.hex();
-        let temp = OsString::from(format!("{name}{TEMP}"));
-        let body = serde_json::to_vec(&Stored {
+        let stored = Stored {
             started: record.started,
             outcome: record.outcome,
-        })
-        .map_err(io::Error::other)?;
-
-        let mut file = files::create_temp(&dir, &temp)?;
-        let landed = file
-            .write_all(&body)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| files::rename_over(&dir, &file, &record_name(&record.instance)));
-        drop(file);
+        };
+        let landed = put(
+            &dir,
+            &record_temp_name(&record.instance),
+            &record_name(&record.instance),
+            &stored,
+        );
         drop(own);
-        if let Err(e) = landed {
-            // Best effort: a temp that stays is pruned by a later write.
-            let _ = files::delete(&dir, &temp);
-            return Err(e);
-        }
+        landed?;
         Ok(self.prune(&dir, &record.instance))
     }
 
-    /// The record of the run `instance`, if it has one.
-    /// A directory that is not there, or is a link (the account can make one), holds no records.
+    /// The record of the run `instance`: its record when it has one, else, if its provisional file is there, the
+    /// run as `Stopped` with the `started` the file holds; else none. A directory that is not there, or is a link
+    /// (the account can make one), holds no records.
+    ///
+    /// It never waits and does not say whether the run is alive: for a caller that is told its run is gone (the stop
+    /// reads after the shim's process has ended, so the record has landed or never will). A reader that may meet a
+    /// run that is alive holds a pin and reads through it ([`Pin::read_final`]).
     pub(crate) fn read(&self, instance: &InstanceId) -> io::Result<Option<RunRecord>> {
         match Dir::open(&self.dir).and_then(|dir| read_in(&dir, instance)) {
             Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(None),
@@ -395,17 +534,7 @@ impl Runs {
     /// is waited for: whatever [`Pin::appeared`] lists is then newer than the pin.
     pub(crate) fn pin(&self) -> io::Result<Pin> {
         let mut pin = self.hold_in(Dir::open(&self.dir)?, MarkerCheck::Refuse)?;
-        let listing = entries(&pin.dir)?
-            .into_iter()
-            .filter_map(|entry| match entry {
-                Entry::Record {
-                    instance,
-                    directory: false,
-                    ..
-                } => Some(instance),
-                Entry::Record { .. } | Entry::Temp { .. } | Entry::Pin { .. } | Entry::Other { .. } => None,
-            })
-            .collect();
+        let listing = entries(&pin.dir)?.iter().filter_map(Entry::file).collect();
         pin.listing = Some(listing);
         Ok(pin)
     }
@@ -432,11 +561,8 @@ impl Runs {
     /// [`Runs::hold`] in `dir`, which was opened for the pin's life; the marker is looked for as `check`
     /// says. A holder that placed the marker itself ([`Runs::close`]) takes its own pin past it.
     fn hold_in(&self, dir: Dir, check: MarkerCheck) -> io::Result<Pin> {
-        let mut names = Builder::new();
-        names.prefix("pin-").suffix(PIN).disable_cleanup(true);
-        let made = names.make_in(&self.dir, |path| {
-            files::create_pin(&dir, path.file_name().expect("a name was made"))
-        });
+        let name = fresh_pin_name();
+        let made = files::create_pin(&dir, OsStr::new(&name));
         // Looked for when the pin was not made as well: a removal deleting the directory fails the create,
         // and that is no "no records".
         let removing = match check {
@@ -453,11 +579,12 @@ impl Runs {
                 ),
             ));
         }
-        let (file, _path) = made?.into_parts();
+        let file = made?;
         removing?;
         Ok(Pin {
             _file: file,
             dir,
+            name,
             listing: None,
         })
     }
@@ -649,9 +776,9 @@ impl Runs {
         Ok(held)
     }
 
-    /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record
-    /// but `own` and every temp file. A file that cannot be removed now (a write in flight holds its
-    /// temp file) is for the next write. Returns what went wrong that is not that.
+    /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record but `own`,
+    /// every provisional file and every temp file. A file that cannot be removed now (a write in flight holds
+    /// its temp file) is for the next write. Returns what went wrong that is not that.
     fn prune(&self, dir: &Dir, own: &InstanceId) -> Vec<String> {
         self.prune_listing(dir, own, || entries(dir))
     }
@@ -694,7 +821,8 @@ impl Runs {
         for entry in entries {
             let doomed = match &entry {
                 Entry::Record { instance, name, .. } if instance != own => name,
-                Entry::Temp { name, .. } => name,
+                // The writer's own run's too: its record has landed, and the record wins.
+                Entry::Stopping { name, .. } | Entry::Temp { name, .. } => name,
                 Entry::Record { .. } | Entry::Pin { .. } | Entry::Other { .. } => continue,
             };
             // A file that is gone, held or on its way out is for the next write.
@@ -711,17 +839,120 @@ impl Runs {
     }
 }
 
+/// Writes `stored` to `to` in `dir` through the temp file `temp`, and renames the temp onto `to`, so a
+/// reader sees a whole file or none. The rename is refused if `to` exists ([`files::rename_to`]). A failure
+/// removes the temp, best effort: one that stays is pruned by a later write, and a failure to remove it that is no
+/// handle's hold is in the error ([`after_cleanup`]).
+fn put(dir: &Dir, temp: &OsStr, to: &OsStr, stored: &impl Serialize) -> io::Result<()> {
+    let body = serde_json::to_vec(stored).map_err(io::Error::other)?;
+    let mut file = files::create_temp(dir, temp)?;
+    let landed = file
+        .write_all(&body)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| files::rename_to(dir, &file, to));
+    drop(file);
+    landed.map_err(|failed| after_cleanup(failed, temp, files::delete(dir, temp)))
+}
+
+/// `failed`, the error of a write, told with the failure to remove its temp file `temp` when `removed` says the
+/// removal failed for a reason that is no handle's hold (a held file is for the next prune). The kind is the write's.
+fn after_cleanup(failed: io::Error, temp: &OsStr, removed: DeleteOutcome) -> io::Error {
+    match removed {
+        DeleteOutcome::Failed(cleanup) => io::Error::new(
+            failed.kind(),
+            format!(
+                "{failed}; and its temp file {} could not be removed: {cleanup}",
+                Path::new(temp).display()
+            ),
+        ),
+        DeleteOutcome::Deleted | DeleteOutcome::Held | DeleteOutcome::Linked => failed,
+    }
+}
+
 /// The file name of the record of `instance`.
 fn record_name(instance: &InstanceId) -> OsString {
     format!("{}{RECORD}", instance.hex()).into()
 }
 
-/// The record of `instance` in `dir`, if it has one.
-fn read_in(dir: &Dir, instance: &InstanceId) -> io::Result<Option<RunRecord>> {
-    match files::read(dir, &record_name(instance))? {
-        Some(bytes) => decode(*instance, &bytes).map(Some),
-        None => Ok(None),
+/// The file name of the provisional file of `instance`.
+pub(crate) fn stopping_name(instance: &InstanceId) -> OsString {
+    format!("{}{STOPPING}", instance.hex()).into()
+}
+
+/// The name of the temp file a record is written through.
+fn record_temp_name(instance: &InstanceId) -> OsString {
+    format!("{}{TEMP}", instance.hex()).into()
+}
+
+/// The name of the temp file a provisional file is written through.
+fn stopping_temp_name(instance: &InstanceId) -> OsString {
+    format!("{}{STOPPING_TEMP}", instance.hex()).into()
+}
+
+/// What the files of one run say.
+enum Found {
+    Record(RunRecord),
+    /// Its provisional file and no record.
+    Provisional(Provisional),
+    Neither,
+}
+
+/// A provisional file as read: when its run began, and its writer's pin.
+struct Provisional {
+    started: u64,
+    pin: String,
+}
+
+impl Found {
+    /// The run as a reader without a pin takes it: its record, else `Stopped` for a provisional file.
+    fn into_record(self, instance: &InstanceId) -> Option<RunRecord> {
+        match self {
+            Found::Record(record) => Some(record),
+            Found::Provisional(provisional) => Some(stopped_record(instance, provisional.started)),
+            Found::Neither => None,
+        }
     }
+}
+
+/// The `Stopped` record that a provisional file with this `started` reads as.
+fn stopped_record(instance: &InstanceId, started: u64) -> RunRecord {
+    RunRecord {
+        instance: *instance,
+        started,
+        outcome: RunOutcome::Stopped,
+    }
+}
+
+/// The record of `instance` in `dir`, else its provisional file, else none. **The record is the answer whatever
+/// the provisional file's read gave:** only when there is no record does that read decide, its error included.
+///
+/// **The provisional file is read first,** so that a record that lands between the two reads is found by the
+/// second: read the other way round, the record would be missed and the provisional file still there, and a run
+/// that was recorded would read as `Stopped`. A read with no pin can still answer `Stopped` for a run whose record
+/// was pruned in between.
+fn find_in(dir: &Dir, instance: &InstanceId) -> io::Result<Found> {
+    let provisional = files::read(dir, &stopping_name(instance));
+    if let Some(bytes) = files::read(dir, &record_name(instance))? {
+        return decode(*instance, &bytes).map(Found::Record);
+    }
+    let Some(bytes) = provisional? else {
+        return Ok(Found::Neither);
+    };
+    decode_stopping(&bytes).map(Found::Provisional)
+}
+
+/// The record of `instance` in `dir`, else its provisional file as `Stopped`, else none ([`find_in`]). Says nothing
+/// of whether the run is alive: a reader that must know settles it by the provisional file's pin
+/// ([`Pin::read_final`]).
+fn read_in(dir: &Dir, instance: &InstanceId) -> io::Result<Option<RunRecord>> {
+    find_in(dir, instance).map(|found| found.into_record(instance))
+}
+
+/// The instance a file name `text` is of, if it is the instance's 32 hex digits and `suffix`.
+fn instance_named(text: &str, suffix: &str) -> Option<InstanceId> {
+    text.strip_suffix(suffix)
+        .filter(|stem| stem.len() == 32)
+        .and_then(InstanceId::parse)
 }
 
 /// What the directory holds, in no order. One listing, over the names as the file system gives them: a
@@ -735,15 +966,17 @@ fn entries(dir: &Dir) -> io::Result<Vec<Entry>> {
         .map(|listed| {
             let text = listed.name.to_string_lossy().into_owned();
             let (name, directory) = (listed.name, listed.directory);
-            if text.ends_with(TEMP) {
+            if text.ends_with(TEMP) || text.ends_with(STOPPING_TEMP) {
                 Entry::Temp { name, directory }
             } else if text.ends_with(PIN) {
                 Entry::Pin { name, directory }
-            } else if let Some(instance) = text
-                .strip_suffix(RECORD)
-                .filter(|stem| stem.len() == 32)
-                .and_then(InstanceId::parse)
-            {
+            } else if let Some(instance) = instance_named(&text, STOPPING) {
+                Entry::Stopping {
+                    instance,
+                    name,
+                    directory,
+                }
+            } else if let Some(instance) = instance_named(&text, RECORD) {
                 Entry::Record {
                     instance,
                     name,
@@ -888,6 +1121,36 @@ fn decode(instance: InstanceId, bytes: &[u8]) -> io::Result<RunRecord> {
         started: stored.started,
         outcome: stored.outcome,
     })
+}
+
+/// A provisional file's content. The pin it names must be a name [`fresh_pin_name`] makes: it is deleted to tell
+/// whether it is held, and the file is the task's account's to write, so any other name is a corrupt file and not
+/// something to delete.
+fn decode_stopping(bytes: &[u8]) -> io::Result<Provisional> {
+    let stored: StoredStopping = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+    if !is_pin_name(&stored.pin) {
+        return Err(io::Error::other(format!(
+            "the provisional file names {:?}, which is no pin of goetia's",
+            stored.pin
+        )));
+    }
+    Ok(Provisional {
+        started: stored.started,
+        pin: stored.pin,
+    })
+}
+
+/// A pin's file name: [`PIN_PREFIX`], a [`Token`]'s 32 hex digits (128 random bits), and [`PIN`]. A name is never
+/// taken again, so a reader that waits for the pin a provisional file names never waits for another run's.
+fn fresh_pin_name() -> String {
+    format!("{PIN_PREFIX}{}{PIN}", Token::fresh().hex())
+}
+
+/// Whether `name` is of the form [`fresh_pin_name`] makes: its digits are a [`Token`].
+fn is_pin_name(name: &str) -> bool {
+    name.strip_prefix(PIN_PREFIX)
+        .and_then(|rest| rest.strip_suffix(PIN))
+        .is_some_and(|digits| Token::parse(digits).is_some())
 }
 
 #[cfg(test)]
