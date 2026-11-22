@@ -19,7 +19,7 @@ use goetia::Error;
 use goetia::backend::launchd::manager::Launchd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Exit, Installed, ServiceManager, State};
+use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State};
 use goetia::spec::{DaemonKind, DaemonSpec, Id, StopAction, StopSignal, TaskFields, TaskSpec};
 use goetia::testing::task;
 
@@ -720,7 +720,7 @@ fn uninstall_removes_both_plists_and_boots_both_out(#[fixture(launchd_group)] _g
     mgr.enable(&task_id).expect("enable");
     assert!(is_loaded(&id) && is_loaded(&timer_of(&id)));
 
-    mgr.uninstall(&task_id).expect("uninstall");
+    mgr.uninstall(&task_id, RunInFlight::Stop).expect("uninstall");
 
     for path in [
         staging_path(&id),
@@ -751,7 +751,7 @@ fn uninstall_of_a_running_armed_task_ends_it(#[fixture(launchd_group)] _group: &
         .pid
         .expect("a running task has a pid");
 
-    mgr.uninstall(&task_id).expect("uninstall");
+    mgr.uninstall(&task_id, RunInFlight::Stop).expect("uninstall");
 
     // SAFETY: signal 0 only checks that the process exists.
     let alive = unsafe { libc::kill(libc::pid_t::try_from(pid).expect("a pid"), 0) } == 0;
@@ -1094,7 +1094,7 @@ fn uninstall_clears_a_stranded_hold(#[fixture(launchd_group)] _group: &Group) {
     mgr.enable(&task_id).expect("enable");
     cmd::run("launchctl", &["debug", &format!("system/{id}"), "--start-suspended"]).expect_ok();
 
-    mgr.uninstall(&task_id).expect("uninstall");
+    mgr.uninstall(&task_id, RunInFlight::Stop).expect("uninstall");
 
     mgr.install(&spec, false).expect("install again");
     mgr.enable(&task_id).expect("enable again");

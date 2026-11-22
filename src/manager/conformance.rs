@@ -52,7 +52,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Budget, Installed, ServiceManager, State, Status, TaskStatus};
+use super::{Budget, Installed, RunInFlight, ServiceManager, State, Status, TaskStatus};
 use crate::error::Error;
 use crate::spec::{DaemonKind, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
 
@@ -77,7 +77,7 @@ struct Cleanup<'a> {
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         for id in &self.ids {
-            if let Err(e) = self.mgr.uninstall(id) {
+            if let Err(e) = self.mgr.uninstall(id, RunInFlight::Stop) {
                 eprintln!("manager::conformance cleanup: uninstall({id}) failed: {}", e.report());
             }
         }
@@ -418,7 +418,7 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
     let spec = mk(FOREIGN_ID);
 
     assert!(
-        mgr.uninstall(&spec.common().id).is_err(),
+        mgr.uninstall(&spec.common().id, RunInFlight::Stop).is_err(),
         "uninstall must refuse a foreign id"
     );
     assert!(
@@ -727,7 +727,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
     // this read established neither.
     for (verb, result) in [
         ("status", mgr.status(id).map(drop)),
-        ("uninstall", mgr.uninstall(id)),
+        ("uninstall", mgr.uninstall(id, RunInFlight::Stop)),
         ("enable", mgr.enable(id)),
         ("disable", mgr.disable(id)),
         ("start", mgr.start(id, Budget::DEFAULT).map(drop)),

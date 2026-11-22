@@ -1044,7 +1044,7 @@ fn drawings() -> [Drawing; 5] {
             plist: marked_plist_restarting,
             calls: |_| fixed(&BOOTOUT),
             drew: (SERVICE_STOP_REQUESTS, SERVICE_STOP_CALLS),
-            run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
+            run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, RunInFlight::Stop, reservation) {
                 Err(Error::Os { what, source, .. })
                     if what == "remove"
                         && source
@@ -1512,7 +1512,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     script.assert_driven("status");
 
     let (mgr, script) = over_sh(&BOOTOUT);
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
     script.assert_driven("uninstall");
     assert!(!staging_path(&name).exists(), "uninstall left the plist");
 }
@@ -1730,7 +1730,7 @@ fn an_uninstall_removes_the_plist_only_after_the_old_instance_is_gone() {
         ..marked_plist(&never_installed())
     };
 
-    Backend::uninstall(&mgr, plist, &mut reserved(&[Step::Uninstall])).expect("uninstall");
+    Backend::uninstall(&mgr, plist, RunInFlight::Stop, &mut reserved(&[Step::Uninstall])).expect("uninstall");
 
     fake.assert_spent("the wait for the old instance");
     assert!(!path.exists(), "uninstall left the plist");

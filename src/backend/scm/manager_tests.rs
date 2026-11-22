@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::*;
 use crate::backend::scm::parameters::Stray;
 use crate::backend::scm::test_support::{SHIM_HEX, blob_of};
-use crate::manager::ServiceManager;
+use crate::manager::{RunInFlight, ServiceManager};
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::{AccountId, DaemonFields, DaemonSpec, Restart, ServiceFields, ServiceSpec, User};
 use crate::testing::{FakeProvider, command};
@@ -793,7 +793,7 @@ fn new_has_no_provider() {
 #[skuld::test]
 fn uninstall_of_an_absent_id_without_a_provider_takes_no_lock() {
     Scm::new()
-        .uninstall_absent(&Id::try_from("never-installed").unwrap())
+        .uninstall_absent(&Id::try_from("never-installed").unwrap(), RunInFlight::Stop)
         .expect("nothing to sweep");
 }
 

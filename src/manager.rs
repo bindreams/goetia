@@ -24,6 +24,19 @@ use std::time::SystemTime;
 use crate::error::{Error, Reason, Result};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
+// RunInFlight =========================================================================================================
+
+/// What [`ServiceManager::uninstall`] does with a run in flight: the service's running process, or a
+/// task's run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunInFlight {
+    /// Stop it, then remove the daemon.
+    Stop,
+    /// Send it nothing and wait for nothing of it: remove the daemon and everything that would start
+    /// another run. The caller may be the run itself, or a process it started.
+    Leave,
+}
+
 // ServiceManager ======================================================================================================
 
 /// One platform's service manager, seen through the operations Goetia needs.
@@ -65,8 +78,20 @@ pub trait ServiceManager {
     /// The same flow as `install` minus the write, so the two cannot disagree.
     fn preview_install(&self, spec: &DaemonSpec) -> Result<crate::decide::Outcome>;
 
-    /// Stop the service if running, remove the artifact, and reload the
-    /// manager. Operates by id alone, so it works without the original manifest.
+    /// Remove the artifact, and reload the manager. Operates by id alone, so it works without the
+    /// original manifest. `in_flight` is what it does with a run in flight:
+    /// [`RunInFlight::Stop`] stops it first, and [`RunInFlight::Leave`] sends it nothing and waits for
+    /// nothing of it (`goetia daemon uninstall --no-stop`). The definition and everything that would
+    /// start another run are removed either way. With no run in flight the two do the same, so a run
+    /// is never left for want of one. Which backends honour `Leave`, and what each leaves while the
+    /// run lives, is the README's "Uninstalling a daemon".
+    ///
+    /// **systemd** leaves the unit loaded with no file, which systemd never restarts. A task's run is
+    /// a oneshot start job, which a reload would end at the default start timeout, so for a run in
+    /// flight the backend writes a stand-in unit of the same name under `/run/systemd/system` first
+    /// (see `generate::standin`); the next `install` or `uninstall` of the id removes it once its
+    /// unit is no longer active. A run somebody else starts between the backend reading that a run is
+    /// in flight and the reload is that caller's own conflicting action, and nothing guards it.
     ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other
@@ -80,7 +105,7 @@ pub trait ServiceManager {
     /// or, after the delete, only its run records: re-run `uninstall`, or run the install again with
     /// `--force`. Once it has closed the task's run records, `enable`, `disable`, `run`, and a `stop` that
     /// finds a run to wait for refuse until one of those two has finished.
-    fn uninstall(&self, id: &Id) -> Result<()>;
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
     /// `id` is not managed by Goetia. A task's `enable` arms its schedule; a task with no schedule

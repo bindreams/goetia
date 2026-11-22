@@ -16,7 +16,7 @@ use clap::Parser as _;
 use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step};
+use goetia::manager::{Budget, Exit, Installed, RunInFlight, Sequence, ServiceManager, State, Status, Step};
 use goetia::shim::HostCommand;
 use goetia::spec::{DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal};
 use goetia::testing::service_fields;
@@ -395,7 +395,7 @@ impl ServiceManager for FlakyManager {
         }
         self.inner.preview_install(spec)
     }
-    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> goetia::Result<()> {
         if self.step_over_not_installed_uninstall_for.as_deref() == Some(id.as_str()) {
             return Err(goetia::Error::Step {
                 what: "uninstall".to_string(),
@@ -404,7 +404,7 @@ impl ServiceManager for FlakyManager {
                 }),
             });
         }
-        self.inner.uninstall(id)
+        self.inner.uninstall(id, in_flight)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
         if self.fail_enable_for.as_deref() == Some(id.as_str()) {
@@ -1199,8 +1199,8 @@ impl ServiceManager for PanicsOnStart {
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
         self.0.preview_install(spec)
     }
-    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
-        self.0.uninstall(id)
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> goetia::Result<()> {
+        self.0.uninstall(id, in_flight)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
         self.0.enable(id)
@@ -3622,8 +3622,8 @@ impl ServiceManager for PanicsOnStatus {
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
         self.0.preview_install(spec)
     }
-    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
-        self.0.uninstall(id)
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> goetia::Result<()> {
+        self.0.uninstall(id, in_flight)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
         self.0.enable(id)

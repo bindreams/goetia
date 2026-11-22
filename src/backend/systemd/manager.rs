@@ -101,7 +101,7 @@ use crate::backend::{
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, State, Status, Step, flow};
+use crate::manager::{Budget, Installed, RunInFlight, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -284,8 +284,8 @@ impl Backend for Systemd {
 
     /// A task, or a service with a timer of goetia's: the timer disarmed, the job stopped, the timer
     /// then the job removed. A plain service: stop, disable, remove, reload. See [`task`].
-    fn uninstall(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
-        self.uninstall_units(snapshot, reservation)
+    fn uninstall(&self, snapshot: Fragment, in_flight: RunInFlight, reservation: &mut Held) -> Result<()> {
+        self.uninstall_units(snapshot, in_flight, reservation)
     }
 
     // `disable` is handed none and asks the gate for itself.

@@ -1016,7 +1016,8 @@ fn a_timer_without_its_job_is_ours_unusable_and_uninstall_removes_it(#[fixture(s
     assert!(why.contains("the timer's job is missing"), "{why}");
     assert!(matches!(flow::preview(&mgr, &spec), Ok(Outcome::RefuseUnusable { .. })));
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(text_of(&id, UnitKind::Timer), None);
     assert_eq!(
@@ -1987,7 +1988,8 @@ fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixtur
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(
         without_gate(&fake),
@@ -2014,7 +2016,8 @@ fn uninstalling_a_service_keeps_its_order(#[fixture(systemd_group)] _group: &Gro
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(
         without_gate(&fake),
@@ -2038,7 +2041,8 @@ fn uninstalling_a_job_without_a_timer_asks_nothing_of_the_timer(#[fixture(system
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
-    mgr.uninstall_units(snapshot, &mut held(&mgr)).expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
     assert_eq!(
         without_gate(&fake),
@@ -2068,7 +2072,7 @@ fn uninstall_reports_a_timer_that_changed_as_a_concurrent_change(#[fixture(syste
     let snapshot = marked(&mgr, &id);
 
     let e = mgr
-        .uninstall_units(snapshot, &mut held(&mgr))
+        .uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
         .expect_err("the timer changed");
 
     assert!(

@@ -20,7 +20,9 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
-use crate::manager::{Budget, DaemonStatus, Exit, Installed, ServiceManager, State, Status, Step, TaskStatus};
+use crate::manager::{
+    Budget, DaemonStatus, Exit, Installed, RunInFlight, ServiceManager, State, Status, Step, TaskStatus,
+};
 use crate::spec::{DaemonFields, DaemonKind, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
 
 /// The fake's own artifact marker, deliberately not any real backend's
@@ -1099,7 +1101,7 @@ impl crate::backend::Backend for Fake {
         }
     }
 
-    fn uninstall(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
+    fn uninstall(&self, snapshot: Artifact, _in_flight: RunInFlight, _reservation: &mut ()) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.confirm(&snapshot)?;
         state.entries.remove(snapshot.id().as_str());
@@ -1107,7 +1109,7 @@ impl crate::backend::Backend for Fake {
     }
 
     /// Recorded as `uninstall_absent`, and fails where [`Fake::seed_absent_cleanup_fails`] says.
-    fn uninstall_absent(&self, id: &Id) -> Result<()> {
+    fn uninstall_absent(&self, id: &Id, _in_flight: RunInFlight) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("uninstall_absent", id.as_str().to_string()));
         match &state.absent_cleanup_fails {

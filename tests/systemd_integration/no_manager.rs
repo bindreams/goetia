@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use goetia::backend::systemd::manager::Systemd;
-use goetia::manager::{Budget, ServiceManager};
+use goetia::manager::{Budget, RunInFlight, ServiceManager};
 use goetia::spec::Id;
 
 use crate::linux::{
@@ -540,7 +540,9 @@ fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs(#[f
     let unit_dir = tempfile::tempdir().expect("tempdir");
     let unit = unit_dir.path().join(format!("{}.service", guard.id()));
     fs::copy(unit_path(guard.id()), &unit).expect("copy the unit");
-    Systemd::new().uninstall(&daemon).expect("uninstall from the host");
+    Systemd::new()
+        .uninstall(&daemon, RunInFlight::Stop)
+        .expect("uninstall from the host");
     let unit = unit.to_str().expect("utf-8 temp path");
 
     for (shape, evidence) in [

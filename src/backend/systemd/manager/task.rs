@@ -51,7 +51,7 @@ use crate::blob::Blob;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::flow::NOTHING_TO_ARM;
-use crate::manager::{Budget, DaemonStatus, State, Status, TaskStatus};
+use crate::manager::{Budget, DaemonStatus, RunInFlight, State, Status, TaskStatus};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
@@ -352,7 +352,7 @@ fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
 impl Systemd {
     /// The timer disarmed, the job stopped, then the timer and the job removed, each verified against
     /// what `read` saw. A plain service keeps its order: stop, disable, remove, reload.
-    pub(super) fn uninstall_units(&self, snapshot: Fragment, held: &mut Held) -> Result<()> {
+    pub(super) fn uninstall_units(&self, snapshot: Fragment, _in_flight: RunInFlight, held: &mut Held) -> Result<()> {
         let id = snapshot.id.as_str();
         let owns_timer = snapshot.owns_timer_slot();
 
