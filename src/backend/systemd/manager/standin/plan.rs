@@ -103,9 +103,7 @@ impl Plan {
 impl Known<'_> {
     /// Rule 5: this call is refused before anything is changed.
     pub(in crate::backend::systemd::manager) fn blocked(&self) -> bool {
-        self.in_flight == RunInFlight::Leave
-            && self.call == Call::Job
-            && matches!(self.file, StandinFile::NotOurs)
+        self.in_flight == RunInFlight::Leave && self.call == Call::Job && matches!(self.file, StandinFile::NotOurs)
     }
 
     /// Whether the call reads the job's unit before any stop: `Leave` over an installed id or a stand-in of
@@ -130,9 +128,9 @@ pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option
             kill_signal: run.kill_signal.clone(),
             stop_timeout: run.stop_timeout.clone(),
         },
-        Some(run) if ours && !matches!(run.phase, RunPhase::InStartJob | RunPhase::Running) => {
-            Standin::Remove { reset_failed: run.failed }
-        }
+        Some(run) if ours && !matches!(run.phase, RunPhase::InStartJob | RunPhase::Running) => Standin::Remove {
+            reset_failed: run.failed,
+        },
         _ => Standin::Nothing,
     };
     Plan {

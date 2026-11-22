@@ -537,10 +537,22 @@ fn an_installed_id_is_refused_by_the_gate_before_anything_is_removed(#[fixture(s
 /// A fake whose first calls are `reads`, then a gate that refuses (systemd 241).
 fn reads_then_refusing_gate(reads: impl IntoIterator<Item = Entry>) -> Fake {
     Fake::new(reads.into_iter().chain([
-        reply(&["--version"], exited(0, "systemd 241 (241)
-", "")),
-        reply(&["show", "--property=Version", "--value"], exited(0, "241
-", "")),
+        reply(
+            &["--version"],
+            exited(
+                0,
+                "systemd 241 (241)
+",
+                "",
+            ),
+        ),
+        reply(
+            &["show", "--property=Version", "--value"],
+            exited(
+                0, "241
+", "",
+            ),
+        ),
     ]))
 }
 
@@ -558,7 +570,10 @@ fn a_standin_is_not_removed_before_the_gate_is_passed(#[fixture(systemd_group)] 
 
         let e = uninstall_absent(&mgr, &id, in_flight).expect_err("the gate refuses");
 
-        assert!(e.to_string().contains("systemd 243 or newer"), "sweep, {in_flight:?}: {e}");
+        assert!(
+            e.to_string().contains("systemd 243 or newer"),
+            "sweep, {in_flight:?}: {e}"
+        );
         assert_eq!(calls_of(&fake), [read_call(&id)], "sweep, {in_flight:?}");
         assert_eq!(standin_text(&id), Some(default_standin(&id)), "sweep, {in_flight:?}");
     }
@@ -569,9 +584,7 @@ fn a_standin_is_not_removed_before_the_gate_is_passed(#[fixture(systemd_group)] 
     let fake = reads_then_refusing_gate([read_of(&id, false)]);
     let mgr = over(&fake);
 
-    let e = mgr
-        .release_standin(&id, &mut held(&mgr))
-        .expect_err("the gate refuses");
+    let e = mgr.release_standin(&id, &mut held(&mgr)).expect_err("the gate refuses");
 
     assert!(e.to_string().contains("systemd 243 or newer"), "install: {e}");
     assert_eq!(calls_of(&fake), [read_call(&id)], "install");
@@ -608,11 +621,7 @@ fn stopping_a_task_reads_once_after_the_stop_and_clears_a_failed_run(#[fixture(s
                 expected.push(reset_call(&id));
             }
             expected.push(reload_call());
-            assert_eq!(
-                calls_of(&fake),
-                expected,
-                "stand-in: {with_standin}, failed: {failed}"
-            );
+            assert_eq!(calls_of(&fake), expected, "stand-in: {with_standin}, failed: {failed}");
             assert_eq!(standin_text(&id), None);
             assert!(paths(&id).iter().all(|p| !p.exists()));
         }
@@ -800,7 +809,12 @@ fn stopping_a_snapshot_with_a_timer_and_no_job_still_stops_the_run_of_its_standi
     let spec = task_spec(&id, "/bin/a", SCHEDULE);
     let snapshot = timer_alone(&id, &spec);
     seed_standin(&id, "15", "1min 30s");
-    let fake = gate_then([disabled(), enqueued("stop", 3), state(&id, "inactive", "dead"), reload()]);
+    let fake = gate_then([
+        disabled(),
+        enqueued("stop", 3),
+        state(&id, "inactive", "dead"),
+        reload(),
+    ]);
     let mgr = over(&fake);
 
     mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
@@ -808,12 +822,7 @@ fn stopping_a_snapshot_with_a_timer_and_no_job_still_stops_the_run_of_its_standi
 
     assert_eq!(
         calls_of(&fake),
-        [
-            disable_timer_call(&id),
-            stop_call(&id),
-            read_call(&id),
-            reload_call()
-        ]
+        [disable_timer_call(&id), stop_call(&id), read_call(&id), reload_call()]
     );
     assert_eq!(standin_text(&id), None);
     assert!(paths(&id).iter().all(|p| !p.exists()));
@@ -896,7 +905,11 @@ fn leaving_an_absent_id_whose_standin_has_a_run_in_flight_changes_nothing(#[fixt
         let e = uninstall_absent(&mgr, &id, RunInFlight::Leave).expect_err("absent");
 
         assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
-        assert_eq!(fake.calls(), [read_call(&id)], "{active}: no gate for a plan that changes nothing");
+        assert_eq!(
+            fake.calls(),
+            [read_call(&id)],
+            "{active}: no gate for a plan that changes nothing"
+        );
         assert_eq!(standin_text(&id), Some(default_standin(&id)));
     }
 }

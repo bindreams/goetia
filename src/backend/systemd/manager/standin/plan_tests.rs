@@ -267,9 +267,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
-        plan: || {
-            plan_with(false, Standin::Remove { reset_failed: false }, true)
-        },
+        plan: || plan_with(false, Standin::Remove { reset_failed: false }, true),
     },
     Row {
         rule: "4: and one whose run failed, after reset-failed",
@@ -278,9 +276,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Failed],
         held_gone: NOT_HELD,
-        plan: || {
-            plan_with(false, Standin::Remove { reset_failed: true }, true)
-        },
+        plan: || plan_with(false, Standin::Remove { reset_failed: true }, true),
     },
     Row {
         rule: "4: the stand-in stays while the run has a process",
@@ -325,9 +321,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: EITHER,
-        plan: || {
-            plan_with(false, Standin::Remove { reset_failed: false }, true)
-        },
+        plan: || plan_with(false, Standin::Remove { reset_failed: false }, true),
     },
     Row {
         rule: "4, 6: and one whose run failed, after reset-failed",
@@ -336,9 +330,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Failed],
         held_gone: EITHER,
-        plan: || {
-            plan_with(false, Standin::Remove { reset_failed: true }, true)
-        },
+        plan: || plan_with(false, Standin::Remove { reset_failed: true }, true),
     },
     Row {
         rule: "4, 6: the stand-in and its run stay; the reload only for a held definition",
@@ -375,9 +367,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
-        plan: || {
-            plan_with(false, Standin::Remove { reset_failed: false }, true)
-        },
+        plan: || plan_with(false, Standin::Remove { reset_failed: false }, true),
     },
     Row {
         rule: "7, 4: and one whose run failed, after reset-failed",
@@ -386,9 +376,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Failed],
         held_gone: NOT_HELD,
-        plan: || {
-            plan_with(false, Standin::Remove { reset_failed: true }, true)
-        },
+        plan: || plan_with(false, Standin::Remove { reset_failed: true }, true),
     },
     Row {
         rule: "7, 4: an install leaves a stand-in whose run has a process, and never stops it",
