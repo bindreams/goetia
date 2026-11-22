@@ -2041,7 +2041,7 @@ manager. It reads the installed artifact, so it works where the manifest is gone
 `uninstall` then removes the definition and everything that would start another run, sends nothing to a run in
 flight and waits for nothing of it. The caller may be the run itself, or a process it started. With several ids,
 `--no-stop` applies to each. With no run in flight it is a plain `uninstall`: it does all that `uninstall` does,
-so nothing is left behind for want of a run.
+so nothing is left behind for want of a run, except, on systemd, a service waiting to be restarted (below).
 
 What is left while the run lives is the manager's to report, and goetia reports it as it is.
 
@@ -2059,18 +2059,20 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
   `systemctl stop` of the left run uses systemd's defaults for those. A hand `systemctl start` of the stand-in
   fails. A run past its start phase needs none and is left as it is. A task whose job is gone and whose timer
   alone is installed gets none either: the unit under its name may be somebody else's.
-- A service that is waiting to be restarted is not restarted, and is cleared. It has no process to leave, and
-  nothing is sent to it; the reload fails its restart on the missing unit, which leaves the unit failed, and
-  goetia reads the unit once more and clears it with `systemctl reset-failed`. If systemd restarted it first, the
-  process is left like any other run and nothing restarts it again.
+- A service that is waiting to be restarted is not restarted, and nothing is sent to it. The reload fails the
+  restart on the missing unit, so systemd lists the unit as `not-found failed`, and the machine reads `degraded`,
+  until `systemctl reset-failed <id>` or a reboot. If systemd restarted it before the reload, that run began after
+  goetia read the unit; it is left running, and nothing restarts it again. To cancel the restart instead,
+  uninstall without `--no-stop`.
 - Nothing removes the stand-in while its run has a process. The next `install` or `uninstall` of the id, an id
   nobody installed included, removes it once its run is over, reloads the manager, and clears a failed run of it
   with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and
   the run; `uninstall` without the flag stops the run, then removes the file.
-- A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an installed id
-  refuses with an error naming the path, whether or not a run is in flight, and before anything is changed, the
-  timer included. Remove the file, or uninstall without `--no-stop`. For an id nothing is installed at, or for
-  `uninstall` without the flag, the file is left alone and changes nothing.
+- A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an id whose job
+  goetia removes refuses with an error naming the path, whether or not a run is in flight, and before anything
+  is changed, the timer included. Remove the file, or uninstall without `--no-stop`. For a task whose timer alone
+  is installed (it gets no stand-in), for an id nothing is installed at, or for `uninstall` without the flag, the
+  file is left alone and changes nothing.
 - `uninstall` of an id nothing is installed at stops nothing, with or without `--no-stop`, except the run a
   stand-in of goetia's keeps, which `uninstall` without the flag stops. Whatever else is left running is the
   caller's process, and `systemctl stop <id>` ends it. It reloads the manager when systemd still holds a
@@ -2080,7 +2082,7 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
   nothing and answers "not installed".
 - `systemctl reset-failed` clears a unit that failed, even when its file is gone: such a unit is in memory. A unit
   that is not in memory has nothing to clear. goetia clears only what it can tell is its own: the failed run of a
-  stand-in it removes, and the restart its own reload failed. A left run that fails later stays listed as
+  stand-in it removes. A left run that fails later stays listed as
   `not-found failed`, and the machine reads `degraded`, until `systemctl reset-failed <id>` or a reboot.
 - An `install` of the same id while the left run lives is not refused: systemd adopts the process under the new
   definition until it exits.

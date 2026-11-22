@@ -89,10 +89,13 @@ pub trait ServiceManager {
     /// **systemd** leaves the unit loaded with no file, which systemd never restarts, and sends it nothing in any
     /// state. One read of the unit decides what else: a run still in its start job, which a reload would end at
     /// the default start timeout, gets a stand-in unit of the same name under `/run/systemd/system`, written
-    /// first (see `generate::standin`), when it is the run of the definition being removed; a restart that is
-    /// waiting is cleared once the reload has failed it; a run past its start job is left as it is. The next
-    /// `install` or `uninstall` of the id removes the stand-in once its run has no process. A file at that path
-    /// that is not goetia's is refused with [`Error::StandinBlocked`], whether or not a run is in flight. A run
+    /// first (see `generate::standin`), when it is the run of the definition being removed; a run past its start
+    /// job is left as it is. A service waiting to be restarted is sent nothing and cleared of nothing: the reload
+    /// fails the restart on the missing unit, and systemd lists the unit `not-found failed` until `systemctl
+    /// reset-failed <id>` or a reboot (a restart that came first leaves a process, which is left and not
+    /// restarted again). The next `install` or `uninstall` of the id removes the stand-in once its run has no
+    /// process. A file at that path that is not goetia's is refused with [`Error::StandinBlocked`] when the
+    /// job goetia removes is there, whether or not a run is in flight; a timer alone is not refused. A run
     /// somebody else starts between the backend's read and the reload is that caller's own conflicting action,
     /// and nothing guards it.
     ///

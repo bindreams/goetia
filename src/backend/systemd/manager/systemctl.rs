@@ -1032,14 +1032,11 @@ impl Systemctl {
     pub(super) fn run_of(&self, unit: &str) -> Result<UnitRun> {
         let props = self.show_properties(unit, &UnitRun::PROPERTIES)?;
         let active = props["ActiveState"].as_str();
-        // A pid that does not read as a number is a process goetia cannot rule out.
-        let process = ["MainPID", "ControlPID"]
-            .iter()
-            .any(|pid| props[*pid].parse::<u32>() != Ok(0));
         Ok(UnitRun {
             phase: match active {
                 "inactive" | "failed" => RunPhase::None,
-                "activating" if !process => RunPhase::PendingRestart,
+                // Positive evidence: no process is not, since a start job has none before its first fork.
+                "activating" if props["SubState"].starts_with("auto-restart") => RunPhase::PendingRestart,
                 "activating" => RunPhase::InStartJob,
                 // Every other state systemd reports, the ones goetia does not know included.
                 _ => RunPhase::Running,
@@ -1078,17 +1075,18 @@ pub(super) struct TaskJob {
     pub invocation: Option<String>,
 }
 
-/// Whether a unit has a run, and which kind, as `ActiveState`, `MainPID` and `ControlPID` say.
+/// Whether a unit has a run, and which kind, as `ActiveState` and `SubState` say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RunPhase {
     /// `inactive` or `failed`.
     None,
-    /// `activating` with no process, `MainPID` and `ControlPID` both 0: a restart waiting for its delay
-    /// (`SubState` `auto-restart`, and `auto-restart-queued` of systemd 254 and later). A stop of it would
-    /// signal nothing, but one sent after this read could land on a process systemd restarted in between.
+    /// `activating` with a `SubState` that begins with `auto-restart` (`auto-restart`, and
+    /// `auto-restart-queued` of systemd 254 and later): a restart waiting for its delay. It is no run to keep
+    /// alive, so it gets no stand-in, and a stop of it would signal nothing but could land on a process systemd
+    /// restarted after the read: nothing is sent to it.
     PendingRestart,
-    /// A run still in its start job: `activating` with a process. A reload that drops its unit file ends it
-    /// at the start timeout.
+    /// Any other `activating`: a run in its start job, the unknown sub-states included, the safe side. A reload
+    /// that drops its unit file ends it at the start timeout.
     InStartJob,
     /// Every other state systemd reports, the ones goetia does not know included.
     Running,
@@ -1113,11 +1111,9 @@ pub(super) struct UnitRun {
 
 impl UnitRun {
     /// What the read asks, in this order.
-    const PROPERTIES: [&'static str; 8] = [
+    const PROPERTIES: [&'static str; 6] = [
         "ActiveState",
         "SubState",
-        "MainPID",
-        "ControlPID",
         "KillSignal",
         "TimeoutStopUSec",
         "LoadState",

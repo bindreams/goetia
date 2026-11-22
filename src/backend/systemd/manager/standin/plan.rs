@@ -3,23 +3,24 @@
 //! [`plan`] takes everything known and returns everything to do; `Systemd::settle` reads the facts, calls it
 //! and carries the plan out in one order. The rules, each written once:
 //!
-//! 1. [`RunInFlight::Leave`] never stops: a stop sent after a read of a restart that is waiting could land on
-//!    a process systemd started in between.
+//! 1. [`RunInFlight::Leave`] never stops, and clears nothing of a run that has no stand-in: a stop sent after a
+//!    read of a restart that is waiting could land on a process systemd started in between.
 //! 2. [`RunInFlight::Stop`] stops when goetia holds a job or a stand-in of its own is there, and never
 //!    otherwise.
 //! 3. A stand-in is written (or one of ours replaced) only for `Leave`, a job goetia removes, and a run still
-//!    in its start job: with the two values the read printed. Never for a timer alone or an id nothing is
-//!    installed at, whose unit may be somebody else's.
-//! 4. A stand-in of ours that is not written goes when the run has no process once the stop is done, after
-//!    `reset-failed` when the run failed; it stays while the run has a process. Removing is followed by the
-//!    reload.
-//! 5. A file at the stand-in's path that is not ours refuses `Leave` on an installed id, before anything is
-//!    changed ([`Known::blocked`]); with `Stop`, and where nothing is installed, it is left alone.
-//! 6. `Leave` over a restart that is waiting, with files removed: after the reload the unit is read again,
-//!    and cleared with `reset-failed` if it failed (the restart fails on the missing unit).
-//! 7. Where nothing is installed, and a manager can be asked, a definition systemd holds from the id's own
+//!    in its start job: with the two values the read printed. A restart that is waiting
+//!    ([`RunPhase::PendingRestart`]) is not such a run, and is left to systemd. Never for a timer alone or an
+//!    id nothing is installed at, whose unit may be somebody else's.
+//! 4. A stand-in of ours that is not written goes when the run has no process: after the stop for `Stop`, from
+//!    the one read for `Leave`; it stays while a run left by `Leave` has a process. Its failed run is cleared
+//!    with `reset-failed` first: for `Stop` by what a read after the stop says, which the read before it does
+//!    not decide ([`Clearing::ReadAfterStop`]). Removing is followed by the reload.
+//! 5. A file at the stand-in's path that is not ours refuses `Leave` of a job goetia removes, before anything
+//!    is changed ([`Known::blocked`]): a stand-in could be written there. For a timer alone, with `Stop` and
+//!    where nothing is installed it is left alone.
+//! 6. Where nothing is installed, and a manager can be asked, a definition systemd holds from the id's own
 //!    path whose file is gone is reloaded, under either choice, and nothing else is done for it.
-//! 8. `install` applies rule 4 to a stand-in it finds, and nothing else of this.
+//! 7. `install` applies rule 4 to a stand-in it finds, and nothing else of this.
 
 use crate::manager::RunInFlight;
 
@@ -77,8 +78,6 @@ pub(in crate::backend::systemd::manager) enum Clearing {
     Needed,
     /// The plan stops the run, which is what ends it: whether it failed is read once the stop is done, and
     /// cleared if it did.
-    // Red: not planned yet.
-    #[allow(dead_code)]
     ReadAfterStop,
 }
 
@@ -95,7 +94,7 @@ impl Known<'_> {
     /// Rule 5: this call is refused before anything is changed.
     pub(in crate::backend::systemd::manager) fn blocked(&self) -> bool {
         self.in_flight == RunInFlight::Leave
-            && self.holding != Holding::Absent
+            && self.holding == Holding::Job
             && matches!(self.file, StandinFile::NotOurs)
     }
 
@@ -131,7 +130,11 @@ pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option
             kill_signal: seen.run.kill_signal.clone(),
             stop_timeout: seen.run.stop_timeout.clone(),
         }
-    } else if ours && (!leave || !process) {
+    } else if ours && !leave {
+        Standin::Remove {
+            clearing: Clearing::ReadAfterStop,
+        }
+    } else if ours && !process {
         Standin::Remove {
             clearing: if seen.run.failed {
                 Clearing::Needed

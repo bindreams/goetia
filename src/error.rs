@@ -598,7 +598,8 @@ pub enum Error {
 
     /// `uninstall --no-stop` on systemd found a file that is not goetia's at the path of the unit that
     /// keeps a left run alive, and refused: raised whether or not a run is in flight, since the next run
-    /// may be. Determinate: nothing was changed. No source, so the advice is in the message.
+    /// may be, and only for an id whose job goetia removes (a timer alone gets no such unit). Determinate:
+    /// nothing was changed. No source, so the advice is in the message.
     #[error("{}", standin_blocked(id, path))]
     StandinBlocked { id: String, path: PathBuf },
 

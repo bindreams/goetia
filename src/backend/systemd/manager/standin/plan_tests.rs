@@ -236,7 +236,7 @@ const ROWS: &[Row] = &[
         },
     },
     Row {
-        rule: "7, 2: Stop of an id nothing is installed at, with no stand-in of ours, stops and changes nothing",
+        rule: "6, 2: Stop of an id nothing is installed at, with no stand-in of ours, stops and changes nothing",
         in_flight: STOP,
         call: &[Sweep],
         file: &[Absent, Foreign],
@@ -245,7 +245,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
-        rule: "7: a definition held for a file that is gone is reloaded and nothing else is done for it",
+        rule: "6: a definition held for a file that is gone is reloaded and nothing else is done for it",
         in_flight: STOP,
         call: &[Sweep],
         file: &[Absent, Foreign],
@@ -326,7 +326,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "7, 3: Leave of an id nothing is installed at changes nothing: no stop, no stand-in",
+        rule: "6, 3: Leave of an id nothing is installed at changes nothing: no stop, no stand-in",
         in_flight: LEAVE,
         call: &[Sweep],
         file: &[Absent, Foreign],
@@ -335,7 +335,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
-        rule: "7: and reloads a definition held for a file that is gone, with no read after it",
+        rule: "6: and reloads a definition held for a file that is gone, with no read after it",
         in_flight: LEAVE,
         call: &[Sweep],
         file: &[Absent, Foreign],
@@ -344,7 +344,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "4, 7: Leave removes a stand-in of ours with no process, and reloads",
+        rule: "4, 6: Leave removes a stand-in of ours with no process, and reloads",
         in_flight: LEAVE,
         call: &[Sweep],
         file: &[Ours],
@@ -353,7 +353,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
     },
     Row {
-        rule: "4, 7: and one whose run failed, after reset-failed",
+        rule: "4, 6: and one whose run failed, after reset-failed",
         in_flight: LEAVE,
         call: &[Sweep],
         file: &[Ours],
@@ -370,7 +370,7 @@ const ROWS: &[Row] = &[
         },
     },
     Row {
-        rule: "4, 7: the stand-in and its run stay; the reload only for a held definition",
+        rule: "4, 6: the stand-in and its run stay; the reload only for a held definition",
         in_flight: LEAVE,
         call: &[Sweep],
         file: &[Ours],
@@ -379,7 +379,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
-        rule: "7: the stand-in and its run stay and a held definition is reloaded",
+        rule: "6: the stand-in and its run stay and a held definition is reloaded",
         in_flight: LEAVE,
         call: &[Sweep],
         file: &[Ours],
@@ -389,7 +389,7 @@ const ROWS: &[Row] = &[
     },
     // install ---------------------------------------------------------------------------------------------------------
     Row {
-        rule: "8: an install with no stand-in of ours reads nothing and does nothing",
+        rule: "7: an install with no stand-in of ours reads nothing and does nothing",
         in_flight: LEAVE,
         call: &[Install],
         file: &[Absent, Foreign],
@@ -398,7 +398,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
-        rule: "8, 4: an install removes a stand-in of ours with no process, and reloads",
+        rule: "7, 4: an install removes a stand-in of ours with no process, and reloads",
         in_flight: LEAVE,
         call: &[Install],
         file: &[Ours],
@@ -407,7 +407,7 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
     },
     Row {
-        rule: "8, 4: and one whose run failed, after reset-failed",
+        rule: "7, 4: and one whose run failed, after reset-failed",
         in_flight: LEAVE,
         call: &[Install],
         file: &[Ours],
@@ -424,7 +424,7 @@ const ROWS: &[Row] = &[
         },
     },
     Row {
-        rule: "8, 4: an install leaves a stand-in whose run has a process, and never stops it",
+        rule: "7, 4: an install leaves a stand-in whose run has a process, and never stops it",
         in_flight: LEAVE,
         call: &[Install],
         file: &[Ours],

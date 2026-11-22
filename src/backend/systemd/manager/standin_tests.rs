@@ -30,7 +30,7 @@ use crate::testing::groups::{Group, systemd_group};
 const SCHEDULE: Option<&str> = Some("30 3 * * *");
 
 /// The one read of a unit's run: these properties, in this order.
-const READ: &str = "ActiveState,SubState,MainPID,ControlPID,KillSignal,TimeoutStopUSec,LoadState,FragmentPath";
+const READ: &str = "ActiveState,SubState,KillSignal,TimeoutStopUSec,LoadState,FragmentPath";
 
 fn read_call(id: &str) -> Vec<String> {
     call(&["show", "--property", READ, "--", &format!("{id}.service")])
@@ -41,44 +41,19 @@ fn etc_path(id: &str) -> String {
 }
 
 /// `systemctl show` of `id`'s job as the one read asks it, loaded from goetia's own path and stopping with the
-/// defaults. A pid is given to every state that has a process.
+/// defaults.
 fn state(id: &str, active: &str, sub: &str) -> Entry {
     unit_state(active, sub, "loaded", &etc_path(id), "15", "1min 30s")
 }
 
 fn unit_state(active: &str, sub: &str, load: &str, fragment: &str, kill: &str, timeout: &str) -> Entry {
-    let process =
-        !(matches!(active, "inactive" | "failed") || (active == "activating" && sub.starts_with("auto-restart")));
-    unit_state_of(
-        active,
-        sub,
-        if process { 4242 } else { 0 },
-        0,
-        load,
-        fragment,
-        kill,
-        timeout,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn unit_state_of(
-    active: &str,
-    sub: &str,
-    main: u32,
-    control: u32,
-    load: &str,
-    fragment: &str,
-    kill: &str,
-    timeout: &str,
-) -> Entry {
     reply(
         &["show"],
         exited(
             0,
             &format!(
-                "ActiveState={active}\nSubState={sub}\nMainPID={main}\nControlPID={control}\nKillSignal={kill}\n\
-                 TimeoutStopUSec={timeout}\nLoadState={load}\nFragmentPath={fragment}\n"
+                "ActiveState={active}\nSubState={sub}\nKillSignal={kill}\nTimeoutStopUSec={timeout}\n\
+                 LoadState={load}\nFragmentPath={fragment}\n"
             ),
             "",
         ),
