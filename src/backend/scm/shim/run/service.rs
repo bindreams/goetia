@@ -33,7 +33,7 @@ use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{
-    NOT_RESTARTED, StopBus, StopPlan, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree,
+    NOT_RESTARTED, StopBus, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree,
 };
 
 // Entry ===============================================================================================================
@@ -384,7 +384,10 @@ pub(super) fn run_daemon(
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(Duration),
 ) -> Reported {
-    run_pass(spec, plan, supervisor, id, on_running, on_stopping).reported()
+    run_pass(spec, plan, supervisor, id, on_running, |end| {
+        on_stopping(plan.wait_hint(end))
+    })
+    .reported()
 }
 
 /// How one pass ended, before it is read as anything: what the service tells SCM
@@ -424,11 +427,10 @@ impl PassOutcome {
 /// stop, and say how it ended. `plan` is the run's [`StopPlan`]: the daemon is spawned for it, and it is the stop the
 /// supervisor runs.
 ///
-/// `on_stopping` is called exactly once, after `on_running` and before the daemon's tree is torn
-/// down, whatever ends the run; never when `on_running` was not. It is told the plan's longest wait for the
-/// end that ended the run ([`StopPlan::wait_hint`]). The service reads `STOP_PENDING`
-/// through the teardown, so a `start` is refused rather than answered "running" for a service that
-/// is about to stop.
+/// `on_stopping` is called exactly once, after `on_running` and before anything is asked of the daemon or its tree
+/// is torn down, whatever ends the run; never when `on_running` was not. It is told by a [`WaitEnd`] whether an
+/// accepted stop or the daemon's own end ended the wait. The service reads `STOP_PENDING` through the teardown, so
+/// a `start` is refused rather than answered "running" for a service that is about to stop.
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
@@ -447,7 +449,7 @@ pub(super) fn run_pass(
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(Duration),
+    on_stopping: impl FnOnce(WaitEnd),
 ) -> PassOutcome {
     let log = &*supervisor.log;
     let (child, waiter) = match launch(spec, plan, supervisor, id) {
@@ -458,7 +460,7 @@ pub(super) fn run_pass(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
-    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, |end| on_stopping(plan.wait_hint(end))) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping) {
         WaitOutcome::ChildExited => {
             let code = match child.wait() {
                 Ok(status) => {

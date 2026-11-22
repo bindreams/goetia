@@ -83,9 +83,12 @@ pub enum StopPlan {
         event: CtrlEvent,
         timeout: Option<Duration>,
     },
-    /// No ask, no wait: the teardown at once. `send-signal: kill`, `wm-close` (it has no send yet) and a task (its
-    /// stop is the teardown).
+    /// No ask, no wait: the teardown at once. `send-signal: kill` and `wm-close` (it has no send yet).
     AtOnce,
+    /// No ask; wait for the daemon's own exit, with no cap of goetia's, then the teardown. A task: Task Scheduler's
+    /// stop is the console close event, which reaches the program on the console it shares with the shim, and
+    /// Windows ends everything on that console about a second later.
+    WaitOnly,
 }
 
 /// What a spawn sets for a stop, decided by the plan.
@@ -102,7 +105,7 @@ impl StopPlan {
     /// The plan a daemon's stop runs.
     pub(super) fn of(spec: &DaemonSpec) -> StopPlan {
         match spec {
-            DaemonSpec::Task(_) => StopPlan::AtOnce,
+            DaemonSpec::Task(_) => StopPlan::WaitOnly,
             DaemonSpec::Service(service) => match console_event(service.stop_action.send_signal) {
                 Some(event) => StopPlan::AskAndWait {
                     event,
@@ -120,7 +123,7 @@ impl StopPlan {
                 ask_with: Some(event),
                 process_group: Some(false),
             },
-            StopPlan::AtOnce => SpawnSetup::default(),
+            StopPlan::AtOnce | StopPlan::WaitOnly => SpawnSetup::default(),
         }
     }
 
@@ -130,12 +133,14 @@ impl StopPlan {
     }
 
     /// How long a stop that ended the wait with `end` can take, for `STOP_PENDING`'s wait hint: the
-    /// teardown, and the `timeout` when a stop asks (the largest the hint's field holds for none).
+    /// teardown, and the `timeout` when a stop asks (the largest the hint's field holds for none). A wait-only
+    /// stop has no timeout of goetia's; nothing reports its hint, since task mode reports to no SCM.
     pub(super) fn wait_hint(self, end: WaitEnd) -> Duration {
         match (self, end) {
             (StopPlan::AskAndWait { timeout, .. }, WaitEnd::Stop) => {
                 timeout.map_or(Duration::MAX, |t| t.saturating_add(StopAction::TEARDOWN_MARGIN))
             }
+            (StopPlan::WaitOnly, WaitEnd::Stop) => Duration::MAX,
             _ => StopAction::TEARDOWN_MARGIN,
         }
     }
@@ -335,6 +340,11 @@ impl StopBus {
         }
     }
 
+    /// Whether a stop has been accepted: for task mode's look right before its spawn.
+    pub(super) fn stop_accepted(&self) -> bool {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).fate == Fate::Stopped
+    }
+
     /// Whether the waiter has reported its wait over, and with what failure, if any.
     fn exit_report(&self) -> (bool, Option<Option<i32>>) {
         let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -394,20 +404,23 @@ impl Supervisor {
     }
 
     /// Block until `child` exits or a stop is requested, returning which. On a stop, first runs `plan`
-    /// (the ask and the wait of [`StopPlan::AskAndWait`], or nothing), then tears the whole contained tree down (`send_kill_tree`, with a
+    /// (the ask and the wait of [`StopPlan::AskAndWait`], the wait for the daemon's own exit of
+    /// [`StopPlan::WaitOnly`], or nothing), then tears the whole contained tree down (`send_kill_tree`, with a
     /// fallback to killing just the direct child — see below) before
     /// returning, and says in its return value whether that teardown
     /// succeeded.
     ///
     /// `on_stopping` is called exactly once, as soon as the wait has ended for any reason (a stop,
-    /// the child exiting, a failed wait) and before anything is asked or torn down, with no lock held, told
-    /// by a [`WaitEnd`] whether an accepted stop or the daemon's own end ended the wait. It
-    /// is where the service reports `STOP_PENDING`, so that SCM never reads it as running while
-    /// the daemon is being stopped.
+    /// the child exiting, a failed wait) and before anything is asked, waited for or torn down, with no lock held,
+    /// told by a [`WaitEnd`] whether an accepted stop or the daemon's own end ended the wait. It is where the
+    /// service reports `STOP_PENDING`, so that SCM never reads it as running while the daemon is being stopped,
+    /// and where a task records the stop before the wait that may outlast the shim.
     ///
     /// **The plan** runs only for a stop accepted with the daemon not yet reported ended. The
     /// `timeout` of an ask-and-wait is counted from when this call saw the stop. A daemon that exited
-    /// before the plan is neither asked nor waited for, and the tree it left is ended as after any exit.
+    /// before the plan is neither asked nor waited for, and the tree it left is ended as after any exit. A
+    /// wait-only plan has no `timeout`: it waits as long as the daemon lives, so what ends the daemon is outside
+    /// this call (a task's close event, which Windows follows by ending the shim).
     /// The ask's answers are mapped in one place ([`judge_ask`]). The waiter stays in `child.wait()`
     /// throughout, which cosca supports beside `terminate_tree` and `wait_tree_timeout`.
     ///
@@ -628,6 +641,9 @@ impl Supervisor {
         }
         match plan {
             StopPlan::AtOnce => {}
+            // No cap of goetia's: the stop that Windows delivered ends the program, or Windows ends the shim. The
+            // waiter's report ends the wait, a failed wait's included ([`StopBus::exit_report`] says which).
+            StopPlan::WaitOnly => self.bus.await_exit_report(),
             StopPlan::AskAndWait { event, timeout } => self.ask_and_wait(child, id, event, timeout, seen),
         }
     }

@@ -37,8 +37,8 @@
 //! - `catch <port> <record> <exit-on> [launcher]` — records every console event it receives as a line of
 //!   `<record>` (`daemon: event=CTRL_C at_us=<unix microseconds>`), then, once its handler is in place,
 //!   connects to `<port>` and writes its pid, and blocks. On the event `<exit-on>` names (`ctrl-c`,
-//!   `ctrl-break`; `none` never) it records `daemon: exiting by the event` and exits 0; any other event is
-//!   handled and ignored. With `launcher` it starts a `catch-worker` of the same record first and reports
+//!   `ctrl-break`, `close`; `none` never) it records `daemon: exiting by the event` and exits 0; any other event
+//!   is handled and ignored. `close` is `CTRL_CLOSE_EVENT`, which is what a task's `stop` sends. With `launcher` it starts a `catch-worker` of the same record first and reports
 //!   nothing itself: the worker does, so a report means both handlers are in place. Once its handler is in
 //!   place it also creates `<record>.started` ([`started_marker`]), so that a daemon that was never started
 //!   is told from one that was started and received nothing.
@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
 
 use crate::support::sentinel::{connect, open, send_line};
@@ -225,6 +225,7 @@ fn exit_on(name: &str) -> Option<u32> {
     match name {
         "ctrl-c" => Some(CTRL_C_EVENT),
         "ctrl-break" => Some(CTRL_BREAK_EVENT),
+        "close" => Some(CTRL_CLOSE_EVENT),
         "none" => None,
         other => panic!("`{other}` is not an event to exit on"),
     }
@@ -268,6 +269,7 @@ unsafe extern "system" fn on_event(event: u32) -> i32 {
     let name = match event {
         CTRL_C_EVENT => "CTRL_C",
         CTRL_BREAK_EVENT => "CTRL_BREAK",
+        CTRL_CLOSE_EVENT => "CTRL_CLOSE",
         _ => return 0,
     };
     let at = SystemTime::now()

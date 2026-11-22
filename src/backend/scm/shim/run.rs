@@ -17,7 +17,9 @@
 //! **Task mode** ([`task`]): Task Scheduler runs the shim as a task's action, and its arguments end
 //! in the task-mode argument, the task's id and the registration's token. It reads its own task, and
 //! starts no program (a shim failure) when the task's registration is not the one it was started
-//! under. Otherwise it runs the program the same way and records how the run ended.
+//! under. Otherwise it runs the program the same way and records how the run ended. A task's stop is the
+//! console close event, which reaches the program on its own: the shim records the stop first, then waits for
+//! the program to exit, with no cap of its own, and tears down what is left (`stop_bus::StopPlan::WaitOnly`).
 
 use std::ffi::OsString;
 

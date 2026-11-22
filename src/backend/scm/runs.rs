@@ -9,7 +9,9 @@
 //! task, and while any pin is live a write prunes nothing. With none, a write removes every record
 //! but its own. **A run pins too:** the shim takes a pin before it reads anything, and holds it until its
 //! own record is renamed into place; it releases it before its own prune, so a run's pin never stops its
-//! own prune. A pin is a file held open with no sharing: it
+//! own prune. A run that has been stopped writes its record twice: `Stopped` as the stop is accepted, with its
+//! pin lent (no release, no prune: the run is still alive, and "no pin held" means "no run alive"), and the
+//! final record with the pin given. A pin is a file held open with no sharing: it
 //! goes when its holder does, however it ends, and while it is held nothing can delete it, whoever tries.
 //! One left by a power cut is held by nothing, and the next write finds it by deleting it: a sharing
 //! violation says it is live ([`files::delete`] reads every failed delete, here and in the removal). What a
@@ -81,9 +83,10 @@ const REMOVE_PACE: Duration = Duration::from_millis(100);
 pub(crate) enum RunOutcome {
     /// The program exited with this code.
     Exited(u32),
-    /// A stop was asked for and the program's tree ended.
+    /// A stop was accepted. It is written before the shim waits for the program, so it does not say the program's
+    /// tree has ended: a shim that Windows ends first leaves it, and the Job Object ends the tree.
     Stopped,
-    /// A stop was asked for and something of the program's tree could not be ended.
+    /// A stop was accepted and something of the program's tree could not be ended. It replaces `Stopped`.
     IncompleteStop,
 }
 
@@ -168,6 +171,28 @@ impl Pin {
         }
         appeared.sort_by_key(|record| (record.started, record.instance));
         Ok(appeared)
+    }
+}
+
+/// How [`Runs::write`] holds the writer's pin.
+pub(crate) enum Writing<'a> {
+    /// The writer holds none: the directory is opened by its path.
+    Unpinned,
+    /// The writer's own pin, which the write releases once the record has landed, before its prune.
+    Given(Pin),
+    /// The writer's own pin, which stays held: the write releases nothing and prunes nothing.
+    Lent(&'a Pin),
+}
+
+impl From<Option<Pin>> for Writing<'_> {
+    fn from(pin: Option<Pin>) -> Self {
+        pin.map_or(Writing::Unpinned, Writing::Given)
+    }
+}
+
+impl<'a> From<&'a Pin> for Writing<'a> {
+    fn from(pin: &'a Pin) -> Self {
+        Writing::Lent(pin)
     }
 }
 
@@ -351,13 +376,23 @@ impl Runs {
     /// returned as one line each for the caller to log: it never fails the write. A directory that is a
     /// link is refused ([`Runs::ensure`]), and nothing is written.
     ///
-    /// `own` is the writer's pin: held until the record is renamed into place, then released before the
-    /// prune, which a held pin would stop. A failed write releases it too. The write goes through the pin's
-    /// directory handle, not the path.
-    pub(crate) fn write(&self, record: &RunRecord, own: Option<Pin>) -> io::Result<Vec<String>> {
-        let (dir, own) = match own {
-            Some(Pin { _file, dir, .. }) => (dir, Some(_file)),
-            None => (Dir::open(&self.dir)?, None),
+    /// `pin` is the writer's pin ([`Writing`]; a bare `None`, `Some(pin)` or `&pin` says it). **Given**, it is held
+    /// until the record is renamed into place, then released before the prune, which a held pin would stop; a failed
+    /// write releases it too. **Lent**, it stays held and nothing is pruned: the record is one a run writes while it
+    /// is still alive, so that "no pin held" keeps meaning "no run alive". The write goes through the pin's directory
+    /// handle, not the path.
+    pub(crate) fn write<'a>(&self, record: &RunRecord, pin: impl Into<Writing<'a>>) -> io::Result<Vec<String>> {
+        let opened;
+        let (dir, own, prunes) = match pin.into() {
+            Writing::Given(Pin { _file, dir, .. }) => {
+                opened = dir;
+                (&opened, Some(_file), true)
+            }
+            Writing::Lent(pin) => (&pin.dir, None, false),
+            Writing::Unpinned => {
+                opened = Dir::open(&self.dir)?;
+                (&opened, None, true)
+            }
         };
         let name = record.instance.hex();
         let temp = OsString::from(format!("{name}{TEMP}"));
@@ -367,19 +402,23 @@ impl Runs {
         })
         .map_err(io::Error::other)?;
 
-        let mut file = files::create_temp(&dir, &temp)?;
+        let mut file = files::create_temp(dir, &temp)?;
         let landed = file
             .write_all(&body)
             .and_then(|()| file.sync_all())
-            .and_then(|()| files::rename_over(&dir, &file, &record_name(&record.instance)));
+            .and_then(|()| files::rename_over(dir, &file, &record_name(&record.instance)));
         drop(file);
         drop(own);
         if let Err(e) = landed {
             // Best effort: a temp that stays is pruned by a later write.
-            let _ = files::delete(&dir, &temp);
+            let _ = files::delete(dir, &temp);
             return Err(e);
         }
-        Ok(self.prune(&dir, &record.instance))
+        Ok(if prunes {
+            self.prune(dir, &record.instance)
+        } else {
+            Vec::new()
+        })
     }
 
     /// The record of the run `instance`, if it has one.

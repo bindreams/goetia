@@ -930,6 +930,74 @@ fn write_with_its_own_pin_prunes_and_is_not_blocked_by_it() {
     assert_eq!(names(&runs), [file_of(&instance(2))], "the pin is gone");
 }
 
+/// A lent pin is still the writer's afterwards: the write releases nothing and prunes nothing, so a run that
+/// has recorded its stop is still a run that is alive to everything that reads "no pin held".
+#[skuld::test]
+fn write_with_a_lent_pin_keeps_it_and_prunes_nothing() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let pin = runs.hold().unwrap();
+
+    let problems = runs.write(&record(2, 2), &pin).unwrap();
+
+    assert_eq!(problems, Vec::<String>::new());
+    assert_eq!(
+        instances_kept(&runs, &[instance(1), instance(2)]),
+        [true, true],
+        "a lent write pruned"
+    );
+    assert!(runs.held_pin().unwrap().is_some(), "a lent write released the pin");
+    drop(pin);
+    assert_eq!(runs.held_pin().unwrap(), None);
+}
+
+/// The record a lent write lands replaces the one of the same instance, whole, and the later write that
+/// gives the pin prunes and releases as it always did.
+#[skuld::test]
+fn a_given_write_after_a_lent_one_replaces_the_record_prunes_and_releases() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1), None).unwrap();
+    let pin = runs.hold().unwrap();
+    let stopped = RunRecord {
+        outcome: RunOutcome::Stopped,
+        ..record(2, 2)
+    };
+    runs.write(&stopped, &pin).unwrap();
+    assert_eq!(runs.read(&instance(2)).unwrap(), Some(stopped.clone()));
+
+    let incomplete = RunRecord {
+        outcome: RunOutcome::IncompleteStop,
+        ..stopped
+    };
+    let problems = runs.write(&incomplete, Some(pin)).unwrap();
+
+    assert_eq!(problems, Vec::<String>::new());
+    assert_eq!(runs.read(&instance(2)).unwrap(), Some(incomplete));
+    assert_eq!(
+        names(&runs),
+        [file_of(&instance(2))],
+        "the earlier record was pruned, the pin is gone"
+    );
+}
+
+/// A lent write lands through the pin's directory handle, as a given one does.
+#[skuld::test]
+fn write_with_a_lent_pin_writes_through_the_pins_directory() {
+    let (_pinned_dir, pinned) = fixture();
+    let (_other_dir, other) = fixture();
+    let pin = pinned.hold().unwrap();
+
+    other.write(&record(1, 1), &pin).unwrap();
+
+    assert_eq!(instances_kept(&pinned, &[instance(1)]), [true]);
+    assert_eq!(
+        instances_kept(&other, &[instance(1)]),
+        [false],
+        "nothing went by the path"
+    );
+    drop(pin);
+}
+
 /// A write with a pin lands where the pin's handle is, not at the path.
 #[skuld::test]
 fn write_with_its_own_pin_writes_through_the_pins_directory() {

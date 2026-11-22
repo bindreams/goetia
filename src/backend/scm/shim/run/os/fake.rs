@@ -257,6 +257,8 @@ struct ProcState {
     exit: Option<ExitStatus>,
     killed: bool,
     dropped: bool,
+    /// What happens in the world as the `Fake` spawns the process ([`FakeProcess::when_spawned`]).
+    when_spawned: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn status(code: i32) -> ExitStatus {
@@ -313,6 +315,7 @@ impl FakeProcess {
                 exit: None,
                 killed: false,
                 dropped: false,
+                when_spawned: None,
             }),
             ended: Condvar::new(),
         }))
@@ -381,6 +384,17 @@ impl FakeProcess {
     /// The reply to the next `wait_tree_timeout` not yet stated for.
     pub(crate) fn wait_tree(self, reply: TreeWaitReply) -> FakeProcess {
         self.with(|state| state.tree_waits.push_back(reply))
+    }
+
+    /// `effect` happens as the `Fake` spawns the process, before the supervisor holds it and with no lock held: a stop
+    /// that is accepted after the last look at the stop and before the program exists. At most one.
+    pub(crate) fn when_spawned(self, effect: impl FnOnce() + Send + 'static) -> FakeProcess {
+        self.with(|state| {
+            assert!(
+                state.when_spawned.replace(Box::new(effect)).is_none(),
+                "`when_spawned` was stated twice"
+            );
+        })
     }
 
     /// Every ask, tree wait and kill made on the process, in order.
@@ -906,6 +920,10 @@ impl Os for Fake {
             Some(SpawnReply::Refuses(error)) => Err(error),
             Some(SpawnReply::Process(FakeProcess(proc))) => {
                 lock(&self.shared.state).processes.push(Arc::clone(&proc));
+                let effect = lock(&proc.state).when_spawned.take();
+                if let Some(effect) = effect {
+                    effect();
+                }
                 Ok(Box::new(Instance {
                     proc,
                     fake: Arc::clone(&self.shared),

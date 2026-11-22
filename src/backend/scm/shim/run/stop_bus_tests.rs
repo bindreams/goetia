@@ -945,6 +945,68 @@ fn a_drained_tree_gets_the_exited_tree_teardown() {
     );
 }
 
+/// A wait-only stop sends the program nothing and waits for its own exit, with no cap of goetia's; only then is
+/// the tree torn down. The program here is ended by the test, after the supervisor has passed `on_stopping`.
+#[skuld::test]
+fn wait_only_waits_for_the_programs_own_exit_and_then_tears_down() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .send_kill_tree(KillReply::Ends);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    let (stopping, told) = mpsc::channel();
+
+    let outcome = std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            supervisor.wait_for_child_or_stop(waiter, &child, ID, StopPlan::WaitOnly, |end| {
+                stopping.send(end).expect("the test is listening");
+            })
+        });
+        assert!(supervisor.bus.request_stop());
+        assert_eq!(told.recv().expect("on_stopping was called"), WaitEnd::Stop);
+        // Past `on_stopping`, the supervisor waits for the program: it has asked nothing and ended nothing.
+        assert_eq!(daemon.calls(), Vec::<ProcessCall>::new());
+        daemon.end(0);
+        running.join().expect("the supervisor did not panic")
+    });
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert_eq!(
+        daemon.exit_code(),
+        Some(0),
+        "the program was ended before it exited by itself"
+    );
+    assert_eq!(
+        daemon.calls(),
+        [ProcessCall::SendKillTree],
+        "the teardown came once, after the exit"
+    );
+    assert_eq!(fake.calls(Op::Ask), 0);
+    assert_eq!(fake.calls(Op::WaitTree), 0);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    assert_eq!(
+        fake.take_infos(),
+        Vec::<String>::new(),
+        "a wait-only stop tells nothing of an ask"
+    );
+}
+
+/// A program that has exited when the stop is seen is not waited for: it is torn down at once, as after any exit.
+#[skuld::test]
+fn wait_only_does_not_wait_for_a_program_that_has_exited() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .send_kill_tree(KillReply::Ends);
+
+    let (outcome, told) = stopped_after_exit(&fake, &daemon, StopPlan::WaitOnly);
+
+    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert_eq!(told, [WaitEnd::Stop]);
+    assert_eq!(daemon.calls(), [ProcessCall::SendKillTree]);
+}
+
 #[skuld::test]
 fn at_once_asks_and_waits_for_nothing() {
     let fake = FakeGuard::new();
@@ -1490,11 +1552,13 @@ fn a_daemon_is_spawned_for_a_stop_that_asks_exactly_where_its_plan_asks() {
     );
 }
 
+/// Task Scheduler's stop is the console close event, which reaches the program on its own: goetia sends nothing
+/// and waits only for the program to exit.
 #[skuld::test]
-fn a_task_is_stopped_at_once() {
+fn a_task_waits_only_for_the_programs_own_exit() {
     assert_eq!(
         StopPlan::of(&crate::testing::task(ID, vec!["C:/daemon.exe".to_string()], None)),
-        StopPlan::AtOnce
+        StopPlan::WaitOnly
     );
 }
 
@@ -1511,6 +1575,9 @@ fn a_stop_hint_covers_the_timeout_and_the_teardown() {
     // The program's own exit is torn down, not asked, whatever the plan.
     assert_eq!(plan.wait_hint(WaitEnd::Exit), Duration::from_secs(10));
     assert_eq!(StopPlan::AtOnce.wait_hint(WaitEnd::Stop), Duration::from_secs(10));
+    // Nothing reports a task's wait to SCM; were it asked, the wait has no cap of goetia's.
+    assert_eq!(StopPlan::WaitOnly.wait_hint(WaitEnd::Stop), Duration::MAX);
+    assert_eq!(StopPlan::WaitOnly.wait_hint(WaitEnd::Exit), Duration::from_secs(10));
 }
 
 /// Only a stop that asks needs a host that called `init_helpers`.
@@ -1518,4 +1585,5 @@ fn a_stop_hint_covers_the_timeout_and_the_teardown() {
 fn only_an_ask_needs_the_proxy() {
     assert!(ask_and_wait(None).asks());
     assert!(!StopPlan::AtOnce.asks());
+    assert!(!StopPlan::WaitOnly.asks());
 }

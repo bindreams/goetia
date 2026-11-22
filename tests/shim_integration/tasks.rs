@@ -9,7 +9,7 @@ use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{Id, User};
 use goetia::testing::RemovalMarker;
 
-use crate::common::{UNIT_DIR_EXCLUSIVE, fixture_command, fixture_command_with_exe, manager};
+use crate::common::{LogDir, UNIT_DIR_EXCLUSIVE, fixture_command, fixture_command_with_exe, manager};
 use crate::supervisor_integration::pid_is_alive;
 use crate::support::windows_tasks::{EndsTheRunOnPanic, ServiceAccountHost, status_once_ended, task_spec};
 use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group, wait};
@@ -70,7 +70,8 @@ fn a_task_run_by_the_shim_records_its_exit(#[fixture(scm_group)] _group: &Group)
     mgr.uninstall(&id).expect("uninstall");
 }
 
-/// A stop ends the run through Task Scheduler; the shim ends its tree at once and writes one record, `Stopped`.
+/// A stop ends the run through Task Scheduler: the close event reaches the program on the shim's console, which
+/// ignores it, and Windows ends everything on that console. The shim has recorded `Stopped` by then.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_group)] _group: &Group) {
     let id = task_id();
@@ -104,6 +105,53 @@ fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_
             assert!(!pid_is_alive(&pid), "the {what} (pid {pid}) is gone");
         }
     });
+    assert_eq!(mgr.status(&id).expect("status").common().state, State::Idle);
+    mgr.uninstall(&id).expect("uninstall");
+}
+
+/// A program that handles the close event and exits by itself is let run its own shutdown: goetia sends it
+/// nothing and adds no wait of its own. The run's record says it was stopped, the program's own shutdown ran (it
+/// left its line in the record file), and `stop` succeeds.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_program_that_handles_the_close_event_runs_its_own_shutdown(#[fixture(scm_group)] _group: &Group) {
+    let id = task_id();
+    // Declared before the guard, so the directory goes after the task is removed.
+    let logs = LogDir::new();
+    let _guard = ServiceGuard::new(id.as_str());
+    let mgr = manager();
+    let reported = ConnectBack::listen();
+    let record = logs.path().join("record.txt");
+    let command = fixture_command(
+        "catch",
+        &[
+            &reported.port().to_string(),
+            record.to_str().expect("the record's path is UTF-8"),
+            "close",
+        ],
+    );
+    mgr.install(&task_spec(&id, command, None, User::Root, None), false)
+        .expect("install");
+
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| mgr.run(&id, &mut Vec::new()));
+        let ends_the_run = EndsTheRunOnPanic::new(&id);
+        reported.accept_line("the program to report in, its handler in place");
+
+        mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
+        ends_the_run.defuse();
+
+        let exit = run.join().expect("the run thread").expect("run");
+        assert_eq!(exit, STOPPED, "the record says a stop was accepted");
+    });
+    let said = std::fs::read_to_string(&record).unwrap_or_else(|e| panic!("read {}: {e}", record.display()));
+    assert!(
+        said.contains("daemon: event=CTRL_CLOSE"),
+        "the program was sent the close event: {said}"
+    );
+    assert!(
+        said.contains("daemon: exiting by the event"),
+        "the program's own shutdown ran: {said}"
+    );
     assert_eq!(mgr.status(&id).expect("status").common().state, State::Idle);
     mgr.uninstall(&id).expect("uninstall");
 }
