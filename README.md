@@ -2062,8 +2062,9 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
 - A service that is waiting to be restarted is not restarted, and nothing is sent to it. The reload fails the
   restart on the missing unit, so systemd lists the unit as `not-found failed`, and the machine reads `degraded`,
   until `systemctl reset-failed <id>` or a reboot. If systemd restarted it before the reload, that run began after
-  goetia read the unit; it is left running, and nothing restarts it again. To cancel the restart instead,
-  uninstall without `--no-stop`.
+  goetia read the unit: nothing is sent to it and nothing restarts it again; it gets no stand-in, so one that
+  has not finished starting when the manager reloads is ended by systemd at its start timeout. To cancel the
+  restart instead, uninstall without `--no-stop`.
 - Nothing removes the stand-in while its run has a process. The next `install` or `uninstall` of the id, an id
   nobody installed included, removes it once its run is over, reloads the manager, and clears a failed run of it
   with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and

@@ -92,12 +92,13 @@ pub trait ServiceManager {
     /// first (see `generate::standin`), when it is the run of the definition being removed; a run past its start
     /// job is left as it is. A service waiting to be restarted is sent nothing and cleared of nothing: the reload
     /// fails the restart on the missing unit, and systemd lists the unit `not-found failed` until `systemctl
-    /// reset-failed <id>` or a reboot (a restart that came first leaves a process, which is left and not
-    /// restarted again). The next `install` or `uninstall` of the id removes the stand-in once its run has no
-    /// process. A file at that path that is not goetia's is refused with [`Error::StandinBlocked`] when the
-    /// job goetia removes is there, whether or not a run is in flight; a timer alone is not refused. A run
-    /// somebody else starts between the backend's read and the reload is that caller's own conflicting action,
-    /// and nothing guards it.
+    /// reset-failed <id>` or a reboot (if systemd restarted it before the reload, that run began after goetia
+    /// read the unit: nothing is sent to it and nothing restarts it again; it gets no stand-in, so one that has
+    /// not finished starting when the manager reloads is ended by systemd at its start timeout). The next
+    /// `install` or `uninstall` of the id removes the stand-in once its run has no process. A file at that path
+    /// that is not goetia's is refused with [`Error::StandinBlocked`] when the job goetia removes is there,
+    /// whether or not a run is in flight; a timer alone is not refused. A run somebody else starts between the
+    /// backend's read and the reload is that caller's own conflicting action, and nothing guards it.
     ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other

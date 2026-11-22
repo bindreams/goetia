@@ -1,16 +1,19 @@
 //! The stand-in unit that keeps a left run alive: see [`crate::manager::ServiceManager::uninstall`] and
 //! [`generate::standin`] for what it is and why a run still in its start job needs one.
 //!
-//! What `uninstall` and `install` do about a run and a stand-in is decided once, by [`plan::plan`] from one
-//! `systemctl show` of the job's unit (see [`UnitRun`](super::systemctl::UnitRun)), and carried out in one
-//! order by `Systemd::settle` (in `task`). The three callers, [`Systemd::uninstall_units`], [`Systemd::uninstall_leftovers`]
-//! and [`Systemd::release_standin`], only say what they are. Nothing is decided from the unit file's text or from
-//! what goetia reads the job to be.
+//! What `uninstall` and `install` do about a run and a stand-in is decided once, by [`plan::plan`], and carried out
+//! in one order by `Systemd::settle` (in `task`). The three callers, [`Systemd::uninstall_units`],
+//! [`Systemd::uninstall_leftovers`] and [`Systemd::release_standin`], only say what they are. The job's unit
+//! (see [`UnitRun`](super::systemctl::UnitRun)) is read before the plan for `Leave` over an installed id or a
+//! stand-in of ours, and for the sweep of an absent id (which also answers "no manager" and a held definition):
+//! the plan is made from that read. A `Stop` reads once, after the stop, only to decide whether the stopped run
+//! is cleared. Nothing is decided from the unit file's text or from what goetia reads the job to be.
 //!
 //! Its life: nothing removes it while its run has a process. The next `install` or `uninstall` of the id, the
 //! absent id included, removes it once there is none, after a `reset-failed` for a left run that failed, and
-//! reloads. With [`RunInFlight::Stop`] `uninstall` stops the run first. goetia reads `/etc/systemd/system`
-//! for fragments, so a stand-in never makes an id read as installed (see `discover`).
+//! reloads. With [`RunInFlight::Stop`] `uninstall` stops the run first and clears a stopped run that failed.
+//! goetia reads `/etc/systemd/system` for fragments, so a stand-in never makes an id read as installed (see
+//! `discover`).
 
 mod plan;
 
@@ -27,7 +30,7 @@ use super::task::Fragment;
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit_in, replace_unit_verified_in};
 use super::{Systemd, UnitKind, remove_file_if_present, unit_name, unit_path};
 
-pub(super) use plan::{Clearing, Holding, Known, Seen, Standin, plan};
+pub(super) use plan::{Call, Known, Seen, Standin, plan};
 
 /// Where systemd reads runtime unit files: a tmpfs, so a stand-in is gone at a reboot.
 pub(super) const RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
@@ -73,17 +76,29 @@ pub(super) enum Target<'a> {
     Install,
 }
 
+impl Target<'_> {
+    /// What the call is about, for [`plan`].
+    pub(super) fn call(&self) -> Call {
+        match self {
+            Target::Installed(snapshot) if snapshot.service_text().is_some() => Call::Job,
+            Target::Installed(_) => Call::TimerAlone,
+            Target::Sweep => Call::Sweep,
+            Target::Install => Call::Install,
+        }
+    }
+}
+
 impl Systemd {
-    /// The one read of `id`'s job unit a call makes, when [`Known::reads`] says it makes one. A read asks no
-    /// version gate. For a call that looks for a held definition, whether systemd holds one loaded from the
-    /// id's own path whose file is gone.
+    /// The read of `id`'s job unit a call makes before any stop, when [`Known::reads`] says it makes one. A read
+    /// asks no version gate. For the sweep, whether systemd holds a definition loaded from the id's own path
+    /// whose file is gone.
     pub(super) fn look(&self, id: &str, known: &Known<'_>) -> Result<Option<Seen>> {
         if !known.reads() {
             return Ok(None);
         }
         let run = self.systemctl.run_of(&unit_name(id, UnitKind::Service))?;
         let path = unit_path(id, UnitKind::Service);
-        let held_gone = known.asks_held
+        let held_gone = known.call == Call::Sweep
             && run.loaded_from(&path)
             && matches!(
                 classify_and_read(&path).map_err(ReadFailure::into_os_error)?,

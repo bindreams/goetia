@@ -6,18 +6,6 @@ use super::*;
 use crate::backend::systemd::manager::systemctl::RunPhase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Call {
-    /// `uninstall` of an installed id whose snapshot has the job's file.
-    Job,
-    /// `uninstall` of an installed id whose snapshot is a timer alone.
-    NoJob,
-    /// `uninstall` of an id nothing is installed at.
-    Sweep,
-    /// `install`, which settles a stand-in it finds as `Leave` does.
-    Install,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum File {
     Absent,
     Ours,
@@ -36,7 +24,7 @@ enum Run {
 }
 
 const CHOICES: [RunInFlight; 2] = [RunInFlight::Stop, RunInFlight::Leave];
-const CALLS: [Call; 4] = [Call::Job, Call::NoJob, Call::Sweep, Call::Install];
+const CALLS: [Call; 4] = [Call::Job, Call::TimerAlone, Call::Sweep, Call::Install];
 const FILES: [File; 3] = [File::Absent, File::Ours, File::Foreign];
 const RUNS: [Run; 6] = [
     Run::Unread,
@@ -57,14 +45,6 @@ struct Cell {
 }
 
 impl Cell {
-    fn holding(&self) -> Holding {
-        match self.call {
-            Call::Job => Holding::Job,
-            Call::NoJob => Holding::NoJob,
-            Call::Sweep | Call::Install => Holding::Absent,
-        }
-    }
-
     fn standin_file(&self) -> StandinFile {
         match self.file {
             File::Absent => StandinFile::Absent,
@@ -74,7 +54,7 @@ impl Cell {
     }
 
     fn installed(&self) -> bool {
-        matches!(self.call, Call::Job | Call::NoJob)
+        matches!(self.call, Call::Job | Call::TimerAlone)
     }
 
     /// The refusal of rule 5, as the table states it: only where a stand-in could be written.
@@ -84,8 +64,7 @@ impl Cell {
 
     /// Whether a call of this shape reads the unit, as the table states it.
     fn reads(&self) -> bool {
-        (self.in_flight == RunInFlight::Leave && self.installed())
-            || self.file == File::Ours
+        (self.in_flight == RunInFlight::Leave && (self.installed() || self.file == File::Ours))
             || self.call == Call::Sweep
     }
 
@@ -141,9 +120,8 @@ fn plan_of(cell: &Cell) -> Plan {
     let file = cell.standin_file();
     let known = Known {
         in_flight: cell.in_flight,
-        holding: cell.holding(),
+        call: cell.call,
         file: &file,
-        asks_held: cell.call == Call::Sweep,
     };
     assert_eq!(known.reads(), cell.reads(), "{cell:?}: whether the unit is read");
     let seen = Seen {
@@ -187,7 +165,7 @@ fn written() -> Standin {
     }
 }
 
-use Call::{Install, Job, NoJob, Sweep};
+use Call::{Install, Job, Sweep, TimerAlone};
 use File::{Absent, Foreign, Ours};
 use Run::{Failed, Idle, Pending, Running, Start, Unread};
 
@@ -201,7 +179,7 @@ const READ: &[Run] = &[Idle, Failed, Pending, Start, Running];
 const ROWS: &[Row] = &[
     // Stop ------------------------------------------------------------------------------------------------------------
     Row {
-        rule: "2: Stop stops a held job; a file that is not ours at the stand-in's path changes nothing",
+        rule: "2: Stop stops a held job, reading nothing before the stop; a file that is not ours at the stand-in's path changes nothing",
         in_flight: STOP,
         call: &[Job],
         file: &[Absent, Foreign],
@@ -212,28 +190,29 @@ const ROWS: &[Row] = &[
     Row {
         rule: "2: Stop stops nothing when only a timer is held",
         in_flight: STOP,
-        call: &[NoJob],
+        call: &[TimerAlone],
         file: &[Absent, Foreign],
         run: &[Unread],
         held_gone: NOT_HELD,
         plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "2, 4: Stop with a stand-in of ours stops, then removes it and reloads; whether the run failed is read after the stop, whatever the read before it said",
+        rule: "2, 4: Stop with a stand-in of ours stops, then removes it and reloads, reading nothing before the stop: what the stop left is read after it",
         in_flight: STOP,
-        call: &[Job, NoJob, Sweep],
+        call: &[Job, TimerAlone],
+        file: &[Ours],
+        run: &[Unread],
+        held_gone: NOT_HELD,
+        plan: || plan_with(true, Standin::Remove { reset_failed: false }, true),
+    },
+    Row {
+        rule: "2, 4, 6: the sweep of an absent id reads for its own sake, and then stops the run of a stand-in of ours, removes it and reloads",
+        in_flight: STOP,
+        call: &[Sweep],
         file: &[Ours],
         run: READ,
         held_gone: EITHER,
-        plan: || {
-            plan_with(
-                true,
-                Standin::Remove {
-                    clearing: Clearing::ReadAfterStop,
-                },
-                true,
-            )
-        },
+        plan: || plan_with(true, Standin::Remove { reset_failed: false }, true),
     },
     Row {
         rule: "6, 2: Stop of an id nothing is installed at, with no stand-in of ours, stops and changes nothing",
@@ -275,7 +254,7 @@ const ROWS: &[Row] = &[
     Row {
         rule: "3, 5: no stand-in for a timer alone, whatever its unit is doing; a file that is not ours at the path is no concern of it",
         in_flight: LEAVE,
-        call: &[NoJob],
+        call: &[TimerAlone],
         file: &[Absent, Foreign],
         run: READ,
         held_gone: NOT_HELD,
@@ -284,35 +263,23 @@ const ROWS: &[Row] = &[
     Row {
         rule: "4: Leave removes a stand-in of ours whose run has no process, a restart that is waiting included",
         in_flight: LEAVE,
-        call: &[Job, NoJob],
+        call: &[Job, TimerAlone],
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
         plan: || {
-            plan_with(
-                false,
-                Standin::Remove {
-                    clearing: Clearing::Not,
-                },
-                true,
-            )
+            plan_with(false, Standin::Remove { reset_failed: false }, true)
         },
     },
     Row {
         rule: "4: and one whose run failed, after reset-failed",
         in_flight: LEAVE,
-        call: &[Job, NoJob],
+        call: &[Job, TimerAlone],
         file: &[Ours],
         run: &[Failed],
         held_gone: NOT_HELD,
         plan: || {
-            plan_with(
-                false,
-                Standin::Remove {
-                    clearing: Clearing::Needed,
-                },
-                true,
-            )
+            plan_with(false, Standin::Remove { reset_failed: true }, true)
         },
     },
     Row {
@@ -327,7 +294,7 @@ const ROWS: &[Row] = &[
     Row {
         rule: "3, 4: a timer alone gets no stand-in, and one of ours at its id stays while the run has a process",
         in_flight: LEAVE,
-        call: &[NoJob],
+        call: &[TimerAlone],
         file: &[Ours],
         run: &[Start, Running],
         held_gone: NOT_HELD,
@@ -359,13 +326,7 @@ const ROWS: &[Row] = &[
         run: &[Idle, Pending],
         held_gone: EITHER,
         plan: || {
-            plan_with(
-                false,
-                Standin::Remove {
-                    clearing: Clearing::Not,
-                },
-                true,
-            )
+            plan_with(false, Standin::Remove { reset_failed: false }, true)
         },
     },
     Row {
@@ -376,13 +337,7 @@ const ROWS: &[Row] = &[
         run: &[Failed],
         held_gone: EITHER,
         plan: || {
-            plan_with(
-                false,
-                Standin::Remove {
-                    clearing: Clearing::Needed,
-                },
-                true,
-            )
+            plan_with(false, Standin::Remove { reset_failed: true }, true)
         },
     },
     Row {
@@ -421,13 +376,7 @@ const ROWS: &[Row] = &[
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
         plan: || {
-            plan_with(
-                false,
-                Standin::Remove {
-                    clearing: Clearing::Not,
-                },
-                true,
-            )
+            plan_with(false, Standin::Remove { reset_failed: false }, true)
         },
     },
     Row {
@@ -438,13 +387,7 @@ const ROWS: &[Row] = &[
         run: &[Failed],
         held_gone: NOT_HELD,
         plan: || {
-            plan_with(
-                false,
-                Standin::Remove {
-                    clearing: Clearing::Needed,
-                },
-                true,
-            )
+            plan_with(false, Standin::Remove { reset_failed: true }, true)
         },
     },
     Row {
@@ -495,9 +438,8 @@ fn a_file_that_is_not_ours_refuses_leave_on_a_held_job_and_nothing_else() {
         let file = cell.standin_file();
         let known = Known {
             in_flight: cell.in_flight,
-            holding: cell.holding(),
+            call: cell.call,
             file: &file,
-            asks_held: cell.call == Call::Sweep,
         };
         assert_eq!(known.blocked(), cell.refused(), "{cell:?}");
     }
@@ -512,9 +454,8 @@ fn the_stand_in_carries_the_values_the_read_printed() {
     let file = StandinFile::Absent;
     let known = Known {
         in_flight: RunInFlight::Leave,
-        holding: Holding::Job,
+        call: Call::Job,
         file: &file,
-        asks_held: false,
     };
 
     let planned = plan(&known, Some(&Seen { run, held_gone: false }));

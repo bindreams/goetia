@@ -6,46 +6,59 @@
 //! 1. [`RunInFlight::Leave`] never stops, and clears nothing of a run that has no stand-in: a stop sent after a
 //!    read of a restart that is waiting could land on a process systemd started in between.
 //! 2. [`RunInFlight::Stop`] stops when goetia holds a job or a stand-in of its own is there, and never
-//!    otherwise.
+//!    otherwise. The unit is read once, after the stop, and a run that read `failed` (a stopped oneshot does)
+//!    is cleared with `reset-failed` before the files go, so the removal leaves nothing listed `not-found
+//!    failed`. Nothing is read before the stop for this; the sweep of an absent id reads first for its own
+//!    sake (rule 6).
 //! 3. A stand-in is written (or one of ours replaced) only for `Leave`, a job goetia removes, and a run still
 //!    in its start job: with the two values the read printed. A restart that is waiting
 //!    ([`RunPhase::PendingRestart`]) is not such a run, and is left to systemd. Never for a timer alone or an
 //!    id nothing is installed at, whose unit may be somebody else's.
-//! 4. A stand-in of ours that is not written goes when the run has no process: after the stop for `Stop`, from
-//!    the one read for `Leave`; it stays while a run left by `Leave` has a process. Its failed run is cleared
-//!    with `reset-failed` first: for `Stop` by what a read after the stop says, which the read before it does
-//!    not decide ([`Clearing::ReadAfterStop`]). Removing is followed by the reload.
+//! 4. A stand-in of ours that is not written goes: after the stop for `Stop`; for `Leave`, when the one read
+//!    says the run has no process, after `reset-failed` if it failed. It stays while a run left by `Leave` has
+//!    a process. Removing is followed by the reload.
 //! 5. A file at the stand-in's path that is not ours refuses `Leave` of a job goetia removes, before anything
 //!    is changed ([`Known::blocked`]): a stand-in could be written there. For a timer alone, with `Stop` and
 //!    where nothing is installed it is left alone.
 //! 6. Where nothing is installed, and a manager can be asked, a definition systemd holds from the id's own
 //!    path whose file is gone is reloaded, under either choice, and nothing else is done for it.
 //! 7. `install` applies rule 4 to a stand-in it finds, and nothing else of this.
+//!
+//! A plan that changes anything ([`Plan::changes`]) passes the version gate before its first change; one that
+//! changes nothing passes none.
 
 use crate::manager::RunInFlight;
 
 use super::StandinFile;
 use crate::backend::systemd::manager::systemctl::{RunPhase, UnitRun};
 
-/// What goetia holds of the id, as far as this call removes it.
+/// What a call is about: one fact, from which what goetia removes and what it looks for follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::backend::systemd::manager) enum Holding {
-    /// An installed id whose snapshot has the job's own file, which this call removes.
+pub(in crate::backend::systemd::manager) enum Call {
+    /// `uninstall` of an installed id whose snapshot has the job's own file, which this call removes.
     Job,
-    /// An installed id whose snapshot has no job file: a timer alone.
-    NoJob,
-    /// Nothing is removed: `uninstall` of an id nothing is installed at, and `install`.
-    Absent,
+    /// `uninstall` of an installed id whose snapshot has no job file: a timer alone.
+    TimerAlone,
+    /// `uninstall` of an id nothing is installed at: it looks for a definition systemd still holds whose file
+    /// is gone (rule 6).
+    Sweep,
+    /// `install`, which settles a stand-in it finds as [`RunInFlight::Leave`] does.
+    Install,
+}
+
+impl Call {
+    /// The call removes the files of an installed id.
+    fn removes_files(self) -> bool {
+        matches!(self, Call::Job | Call::TimerAlone)
+    }
 }
 
 /// What is known before the run is read.
 #[derive(Debug)]
 pub(in crate::backend::systemd::manager) struct Known<'a> {
     pub in_flight: RunInFlight,
-    pub holding: Holding,
+    pub call: Call,
     pub file: &'a StandinFile,
-    /// The call is `uninstall` of an id nothing is installed at, which looks for a held definition (rule 7).
-    pub asks_held: bool,
 }
 
 /// What the one read of the job's unit showed.
@@ -64,47 +77,43 @@ pub(in crate::backend::systemd::manager) enum Standin {
     /// Write it, replacing one of ours that is there, before the files go. The two values are what the read
     /// printed.
     Write { kill_signal: String, stop_timeout: String },
-    /// Remove it, after the run's failure is cleared where there is one.
-    Remove { clearing: Clearing },
-}
-
-/// Whether the failed run of a stand-in that goes is cleared with `reset-failed` first (the verb refuses a
-/// unit that is not in memory, as one that did not fail is not).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::backend::systemd::manager) enum Clearing {
-    /// The read says the run did not fail.
-    Not,
-    /// The read says it failed.
-    Needed,
-    /// The plan stops the run, which is what ends it: whether it failed is read once the stop is done, and
-    /// cleared if it did.
-    ReadAfterStop,
+    /// Remove it. `reset_failed`: the one read, made with no stop, says the run failed, and the verb refuses a
+    /// unit that is not in memory, as one that did not fail is not. Under a stop it is false: the stop's own
+    /// read clears (rule 2).
+    Remove { reset_failed: bool },
 }
 
 /// Everything to do, in the order `Systemd::settle` does it: the stop, the stand-in, the reload.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::backend::systemd::manager) struct Plan {
+    /// Stop the run, then read what it left and clear it if it failed (rule 2).
     pub stop: bool,
     pub standin: Standin,
     /// The manager is reloaded once, after the files and the stand-in are dealt with.
     pub reload: bool,
 }
 
+impl Plan {
+    /// The plan changes something: a stop, a stand-in written or removed, or a reload.
+    pub(in crate::backend::systemd::manager) fn changes(&self) -> bool {
+        self.stop || self.standin != Standin::Nothing || self.reload
+    }
+}
+
 impl Known<'_> {
     /// Rule 5: this call is refused before anything is changed.
     pub(in crate::backend::systemd::manager) fn blocked(&self) -> bool {
         self.in_flight == RunInFlight::Leave
-            && self.holding == Holding::Job
+            && self.call == Call::Job
             && matches!(self.file, StandinFile::NotOurs)
     }
 
-    /// Whether the call reads the job's unit: `Leave` over an installed id, a stand-in of ours to settle, or
-    /// the look for a held definition. `Stop` over an installed id with no stand-in of ours, and an `install`
-    /// with none, read nothing.
+    /// Whether the call reads the job's unit before any stop: `Leave` over an installed id or a stand-in of
+    /// ours to settle, and the sweep, which looks for a held definition. `Stop` reads after its stop, in the
+    /// executor, and `install` with no stand-in of ours reads nothing.
     pub(in crate::backend::systemd::manager) fn reads(&self) -> bool {
-        (self.in_flight == RunInFlight::Leave && self.holding != Holding::Absent)
-            || self.file.is_ours()
-            || self.asks_held
+        (self.in_flight == RunInFlight::Leave && (self.call.removes_files() || self.file.is_ours()))
+            || self.call == Call::Sweep
     }
 }
 
@@ -114,40 +123,23 @@ pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option
     debug_assert_eq!(known.reads(), seen.is_some());
     let leave = known.in_flight == RunInFlight::Leave;
     let ours = known.file.is_ours();
-    let removes_files = known.holding != Holding::Absent;
-    let stop = !leave && (known.holding == Holding::Job || ours);
-    let Some(seen) = seen else {
-        return Plan {
-            stop,
-            standin: Standin::Nothing,
-            reload: removes_files,
-        };
-    };
-    let phase = seen.run.phase;
-    let process = matches!(phase, RunPhase::InStartJob | RunPhase::Running);
-    let standin = if leave && known.holding == Holding::Job && phase == RunPhase::InStartJob {
-        Standin::Write {
-            kill_signal: seen.run.kill_signal.clone(),
-            stop_timeout: seen.run.stop_timeout.clone(),
+    let stop = !leave && (known.call == Call::Job || ours);
+    let standin = match seen.map(|seen| &seen.run) {
+        _ if ours && !leave => Standin::Remove { reset_failed: false },
+        Some(run) if leave && known.call == Call::Job && run.phase == RunPhase::InStartJob => Standin::Write {
+            kill_signal: run.kill_signal.clone(),
+            stop_timeout: run.stop_timeout.clone(),
+        },
+        Some(run) if ours && !matches!(run.phase, RunPhase::InStartJob | RunPhase::Running) => {
+            Standin::Remove { reset_failed: run.failed }
         }
-    } else if ours && !leave {
-        Standin::Remove {
-            clearing: Clearing::ReadAfterStop,
-        }
-    } else if ours && !process {
-        Standin::Remove {
-            clearing: if seen.run.failed {
-                Clearing::Needed
-            } else {
-                Clearing::Not
-            },
-        }
-    } else {
-        Standin::Nothing
+        _ => Standin::Nothing,
     };
     Plan {
         stop,
-        reload: removes_files || matches!(standin, Standin::Remove { .. }) || seen.held_gone,
+        reload: known.call.removes_files()
+            || matches!(standin, Standin::Remove { .. })
+            || seen.is_some_and(|seen| seen.held_gone),
         standin,
     }
 }
