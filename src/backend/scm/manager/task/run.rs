@@ -277,19 +277,16 @@ impl Scm {
                 Error::os(format!("read the run records of `{id}`"), e),
             )
         })?;
-        let hold = |listed: &Instance, processes: &mut P| -> Result<Following<P::Held>> {
-            match hold_run(&*self.tasks, "run", &id, &path, listed, processes)
-                .map_err(|e| unfollowed(&id, "hold the process of the run it began", e))?
-            {
-                Some(process) => Ok(Following::Process {
-                    instance: listed.id,
-                    process,
-                }),
-                None => Ok(Following::Ended(listed.id)),
-            }
-        };
         let following = match identify(Some(&started), &live, &appeared) {
-            Identity::Live { id: instance, pid } => hold(&Instance { id: instance, pid }, &mut processes)?,
+            Identity::Live { id: instance, pid } => {
+                let listed = Instance { id: instance, pid };
+                match hold_run(&*self.tasks, "run", &id, &path, &listed, &mut processes)
+                    .map_err(|e| unfollowed(&id, "hold the process of the run it began", e))?
+                {
+                    Some(process) => Following::Process { instance, process },
+                    None => Following::Ended(instance),
+                }
+            }
             Identity::Done(first) if first.outcome == RunOutcome::Stopped => Following::Ended(first.instance),
             Identity::Done(record) => Following::Done(record),
             Identity::Unrecorded => Following::Unrecorded,
