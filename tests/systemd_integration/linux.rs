@@ -733,7 +733,7 @@ impl Drop for Unstoppable {
                 &["stop", &unit],
                 &["reset-failed", &unit],
             ],
-            not_loaded,
+            cmd::Run::systemctl_says_not_loaded,
         ));
     }
 }
@@ -1297,15 +1297,9 @@ impl Drop for ScopeGuard {
         warn_left_behind(cmd::run_cleanup_unless(
             "systemctl",
             &[&["reset-failed", &self.0]],
-            not_loaded,
+            cmd::Run::systemctl_says_not_loaded,
         ));
     }
-}
-
-/// Whether a failed `systemctl` run says its unit is not loaded: `stop` exits 5, while `kill` and
-/// `reset-failed` pass the bus error through as exit 1.
-fn not_loaded(run: &cmd::Run) -> bool {
-    run.code == Some(5) || (run.code == Some(1) && run.stderr.contains("not loaded"))
 }
 
 /// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes

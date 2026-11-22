@@ -87,6 +87,21 @@ fn wait_for_exit(id: &str, pid: &str) {
     });
 }
 
+/// What `systemctl list-units --all` lists of `id`'s service and timer.
+fn list_units(id: &str) -> cmd::Run {
+    cmd::run(
+        "systemctl",
+        &[
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            &unit_of(id),
+            &format!("{id}.timer"),
+        ],
+    )
+}
+
 fn assert_not_installed(mgr: &Systemd, id: &str) {
     match mgr.status(&id_of(id)) {
         Err(Error::NotInstalled { .. }) => {}
@@ -169,17 +184,28 @@ fn an_uninstall_that_stops_the_run_a_standin_keeps_leaves_nothing_listed(#[fixtu
 
     assert!(!standin(&id).exists(), "the stand-in is removed");
     assert!(!Path::new(&format!("/proc/{pid}")).exists(), "the run was stopped");
-    let listed = cmd::run(
-        "systemctl",
-        &[
-            "list-units",
-            "--all",
-            "--plain",
-            "--no-legend",
-            &unit_of(&id),
-            &format!("{id}.timer"),
-        ],
-    );
+    let listed = list_units(&id);
+    assert!(!listed.stdout.contains(&id), "nothing of the id is listed: {listed}");
+    assert_not_installed(&mgr, &id);
+}
+
+/// A plain `uninstall` of a task with a run in flight stops it by signal, which fails the oneshot: the removal
+/// leaves nothing of the id listed, not `not-found failed`.
+#[skuld::test]
+fn an_uninstall_that_stops_a_tasks_run_leaves_nothing_listed(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let mut run = Held::new();
+    let spec = goetia::testing::task(&id, run.command.clone(), Some(DAILY));
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.enable(&id_of(&id)).expect("enable");
+    mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
+    run.wait_started();
+
+    mgr.uninstall(&id_of(&id), RunInFlight::Stop).expect("uninstall");
+
+    let listed = list_units(&id);
     assert!(!listed.stdout.contains(&id), "nothing of the id is listed: {listed}");
     assert_not_installed(&mgr, &id);
 }
@@ -272,6 +298,11 @@ fn no_stop_on_a_service_waiting_to_be_restarted_signals_nothing_and_leaves_it_fa
 
     mgr.uninstall(&id_of(&id), RunInFlight::Leave).expect("uninstall");
 
+    // The reload ends the waiting restart on its own: the unit is `activating` until systemd has.
+    wait::until_paced(Duration::from_millis(20), || {
+        let [state] = show_properties(&unit_of(&id), ["ActiveState"]);
+        state != "activating"
+    });
     assert_not_installed(&mgr, &id);
     let [state, load, main_pid] = show_properties(&unit_of(&id), ["ActiveState", "LoadState", "MainPID"]);
     assert_eq!((state.as_str(), load.as_str()), ("failed", "not-found"));
@@ -286,18 +317,12 @@ fn no_stop_on_a_service_waiting_to_be_restarted_signals_nothing_and_leaves_it_fa
         "no signal was sent"
     );
     assert!(!standin(&id).exists(), "a restart that is waiting gets no stand-in");
-    let list = || {
-        cmd::run(
-            "systemctl",
-            &["list-units", "--all", "--plain", "--no-legend", &unit_of(&id)],
-        )
-    };
-    let listed = list();
+    let listed = list_units(&id);
     assert!(listed.stdout.contains("not-found failed"), "listed as failed: {listed}");
 
     cmd::run("systemctl", &["reset-failed", &unit_of(&id)]).expect_ok();
 
-    let listed = list();
+    let listed = list_units(&id);
     assert!(!listed.stdout.contains(&id), "reset-failed clears it: {listed}");
 }
 

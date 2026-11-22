@@ -534,26 +534,89 @@ fn an_installed_id_is_refused_by_the_gate_before_anything_is_removed(#[fixture(s
     }
 }
 
-// Stop ================================================================================================================
+/// A fake whose first calls are `reads`, then a gate that refuses (systemd 241).
+fn reads_then_refusing_gate(reads: impl IntoIterator<Item = Entry>) -> Fake {
+    Fake::new(reads.into_iter().chain([
+        reply(&["--version"], exited(0, "systemd 241 (241)
+", "")),
+        reply(&["show", "--property=Version", "--value"], exited(0, "241
+", "")),
+    ]))
+}
 
-/// `Stop` stops the job and needs no stand-in: it is today's sequence, with no read and no file written.
+/// A plan that changes anything passes the version gate before its first change, on every path: the sweep of an
+/// absent id and `install` too, whose stand-in of ours with an idle run would otherwise be removed before the
+/// first gated request.
 #[skuld::test]
-fn stopping_a_task_writes_no_standin_and_reads_nothing(#[fixture(systemd_group)] _group: &Group) {
+fn a_standin_is_not_removed_before_the_gate_is_passed(#[fixture(systemd_group)] _group: &Group) {
+    for in_flight in [RunInFlight::Leave, RunInFlight::Stop] {
+        let id = fresh_id("systemd");
+        let _left = Leftovers::new(&id);
+        seed_standin(&id, "15", "1min 30s");
+        let fake = reads_then_refusing_gate([read_of(&id, false)]);
+        let mgr = over(&fake);
+
+        let e = uninstall_absent(&mgr, &id, in_flight).expect_err("the gate refuses");
+
+        assert!(e.to_string().contains("systemd 243 or newer"), "sweep, {in_flight:?}: {e}");
+        assert_eq!(calls_of(&fake), [read_call(&id)], "sweep, {in_flight:?}");
+        assert_eq!(standin_text(&id), Some(default_standin(&id)), "sweep, {in_flight:?}");
+    }
+
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
-    installed(&id, SCHEDULE);
-    let fake = gate_then([disabled(), enqueued("stop", 3), reload()]);
+    seed_standin(&id, "15", "1min 30s");
+    let fake = reads_then_refusing_gate([read_of(&id, false)]);
     let mgr = over(&fake);
-    let snapshot = marked(&mgr, &id);
 
-    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
-        .expect("uninstall");
+    let e = mgr
+        .release_standin(&id, &mut held(&mgr))
+        .expect_err("the gate refuses");
 
-    assert_eq!(
-        calls_of(&fake),
-        [disable_timer_call(&id), stop_call(&id), reload_call()]
-    );
-    assert_eq!(standin_text(&id), None);
+    assert!(e.to_string().contains("systemd 243 or newer"), "install: {e}");
+    assert_eq!(calls_of(&fake), [read_call(&id)], "install");
+    assert_eq!(standin_text(&id), Some(default_standin(&id)), "install");
+}
+
+// Stop ================================================================================================================
+
+/// `Stop` of a held job stops it and then reads once what the stop left, whatever the stand-in: `reset-failed` is
+/// sent when that read says failed, so the removal does not leave the unit listed `not-found failed`. Nothing is
+/// read before the stop, and no stand-in is written.
+#[skuld::test]
+fn stopping_a_task_reads_once_after_the_stop_and_clears_a_failed_run(#[fixture(systemd_group)] _group: &Group) {
+    for with_standin in [false, true] {
+        for failed in [false, true] {
+            let id = fresh_id("systemd");
+            let _left = Leftovers::new(&id);
+            installed(&id, SCHEDULE);
+            if with_standin {
+                seed_standin(&id, "15", "1min 30s");
+            }
+            let mut steps = vec![disabled(), enqueued("stop", 3), read_of(&id, failed)];
+            steps.extend(failed_reset(failed));
+            steps.push(reload());
+            let fake = gate_then(steps);
+            let mgr = over(&fake);
+            let snapshot = marked(&mgr, &id);
+
+            mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+                .expect("uninstall");
+
+            let mut expected = vec![disable_timer_call(&id), stop_call(&id), read_call(&id)];
+            if failed {
+                expected.push(reset_call(&id));
+            }
+            expected.push(reload_call());
+            assert_eq!(
+                calls_of(&fake),
+                expected,
+                "stand-in: {with_standin}, failed: {failed}"
+            );
+            assert_eq!(standin_text(&id), None);
+            assert!(paths(&id).iter().all(|p| !p.exists()));
+        }
+    }
 }
 
 // A file that is not goetia's at the stand-in's path ==================================================================
@@ -726,46 +789,6 @@ fn leaving_an_installed_id_removes_a_standin_when_the_run_has_no_process(#[fixtu
     }
 }
 
-/// `uninstall` of an installed id with `Stop` and a stand-in of ours: the stop comes first, and what the stop left
-/// is read after it; `reset-failed` is sent when that read says failed, and the read before the stop, whatever
-/// it said, decides nothing.
-#[skuld::test]
-fn stopping_an_installed_id_reads_whether_the_run_failed_after_the_stop(#[fixture(systemd_group)] _group: &Group) {
-    for (before, after) in [(false, false), (true, false), (false, true), (true, true)] {
-        let id = fresh_id("systemd");
-        let _left = Leftovers::new(&id);
-        installed(&id, SCHEDULE);
-        seed_standin(&id, "15", "1min 30s");
-        let mut steps = vec![
-            disabled(),
-            state(
-                &id,
-                if before { "failed" } else { "active" },
-                if before { "failed" } else { "running" },
-            ),
-            enqueued("stop", 3),
-            read_of(&id, after),
-        ];
-        steps.extend(failed_reset(after));
-        steps.push(reload());
-        let fake = gate_then(steps);
-        let mgr = over(&fake);
-        let snapshot = marked(&mgr, &id);
-
-        mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
-            .expect("uninstall");
-
-        let mut expected = vec![disable_timer_call(&id), read_call(&id), stop_call(&id), read_call(&id)];
-        if after {
-            expected.push(reset_call(&id));
-        }
-        expected.push(reload_call());
-        assert_eq!(calls_of(&fake), expected, "before: {before}, after: {after}");
-        assert_eq!(standin_text(&id), None, "before: {before}, after: {after}");
-        assert!(paths(&id).iter().all(|p| !p.exists()));
-    }
-}
-
 /// With `Stop` the run is stopped whenever there is a stand-in, whatever the snapshot holds: a timer and no
 /// job still has a run to stop.
 #[skuld::test]
@@ -777,13 +800,7 @@ fn stopping_a_snapshot_with_a_timer_and_no_job_still_stops_the_run_of_its_standi
     let spec = task_spec(&id, "/bin/a", SCHEDULE);
     let snapshot = timer_alone(&id, &spec);
     seed_standin(&id, "15", "1min 30s");
-    let fake = gate_then([
-        disabled(),
-        state(&id, "active", "running"),
-        enqueued("stop", 3),
-        state(&id, "inactive", "dead"),
-        reload(),
-    ]);
+    let fake = gate_then([disabled(), enqueued("stop", 3), state(&id, "inactive", "dead"), reload()]);
     let mgr = over(&fake);
 
     mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
@@ -793,7 +810,6 @@ fn stopping_a_snapshot_with_a_timer_and_no_job_still_stops_the_run_of_its_standi
         calls_of(&fake),
         [
             disable_timer_call(&id),
-            read_call(&id),
             stop_call(&id),
             read_call(&id),
             reload_call()
@@ -880,7 +896,7 @@ fn leaving_an_absent_id_whose_standin_has_a_run_in_flight_changes_nothing(#[fixt
         let e = uninstall_absent(&mgr, &id, RunInFlight::Leave).expect_err("absent");
 
         assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
-        assert_eq!(calls_of(&fake), [read_call(&id)], "{active}");
+        assert_eq!(fake.calls(), [read_call(&id)], "{active}: no gate for a plan that changes nothing");
         assert_eq!(standin_text(&id), Some(default_standin(&id)));
     }
 }
