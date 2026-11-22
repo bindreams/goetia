@@ -48,8 +48,9 @@
 //! - `catch-hang <port> <record>` — `catch` that, on the close event, records it and never leaves its handler.
 //! - `detach <port> <record> <runs-dir> <code|never>` — leaves the console (`FreeConsole`), so that the close
 //!   event does not reach it, then writes its pid to `<port>` and waits for `<runs-dir>` (a task's run records) to
-//!   hold a record, which only a stop makes the shim write while the program is alive. It notes the record's text in
-//!   `<record>` (`daemon: record=<json>`) and then exits with `<code>`, or, for `never`, blocks forever.
+//!   hold a provisional file (`<instance>.stopping`), which only a stop makes the shim write while the program is
+//!   alive. It notes the file's text in `<record>` (`daemon: record=<json>`) and then exits with `<code>`, or, for
+//!   `never`, blocks forever.
 //! - `catch-worker <record> <exit-on> <port>` — `catch` as the launcher's worker: on the event it takes 600 ms
 //!   to shut down (a slow shutdown, which the launcher's own exit must not cut short), then records
 //!   `worker: exiting by the event` and exits 0.
@@ -240,7 +241,7 @@ pub fn run_if_requested() -> bool {
                 std::io::Error::last_os_error()
             );
             send_line(port, &std::process::id().to_string());
-            let seen = await_record(&runs);
+            let seen = await_provisional_file(&runs);
             append_line(&record, "daemon", &format!("record={seen}"));
             match code {
                 Some(code) => std::process::exit(code),
@@ -357,20 +358,20 @@ unsafe extern "system" fn on_event(event: u32) -> i32 {
     1
 }
 
-/// The text of the run record (`<instance>.json`) once `dir` holds one. Each pass re-reads the directory, and none
-/// ends the wait by its length.
-fn await_record(dir: &Path) -> String {
+/// The text of the provisional file (`<instance>.stopping`) once `dir` holds one. Each pass re-reads the directory,
+/// and none ends the wait by its length.
+fn await_provisional_file(dir: &Path) -> String {
     let mut text = None;
     wait::until_paced(Duration::from_millis(5), || {
         text = std::fs::read_dir(dir).ok().and_then(|entries| {
             entries
                 .flatten()
-                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".stopping"))
                 .find_map(|entry| std::fs::read_to_string(entry.path()).ok())
         });
         text.is_some()
     });
-    text.expect("the wait ends when a record is read")
+    text.expect("the wait ends when a provisional file is read")
 }
 
 /// The SID of the account this process runs as, from `whoami /user`: `"<name>","<sid>"` on one line.

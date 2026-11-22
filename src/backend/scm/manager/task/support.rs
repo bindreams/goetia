@@ -18,7 +18,7 @@ use crate::backend::scm::manager::Scm;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::sid::try_sid_display;
-use crate::backend::scm::test_support::{no_wait, registered_task};
+use crate::backend::scm::test_support::registered_task;
 use crate::blob::Blob;
 use crate::elevation::test_support::process_user_sid;
 use crate::manager::budget::Deadline;
@@ -133,7 +133,15 @@ pub(super) fn linked_records() -> (TempDir, PathBuf, Runs, TempDir) {
 
 /// What a shim does as its run ends: it writes the run's record, and its prune has nothing to say.
 pub(super) fn shim_writes(shim: &Runs, record: &RunRecord) {
-    assert_eq!(shim.write(record, None, no_wait).unwrap(), Vec::<String>::new());
+    assert_eq!(shim.write(record, None).unwrap(), Vec::<String>::new());
+}
+
+/// What a shim does as it hears a stop with its program alive: it writes the provisional file of the run `n`'s first
+/// `Stopped`, under its own pin ([`Runs::write_stopping`]). The pin is let go as the call ends, which a test that
+/// follows the run does not notice: the run it follows holds a pin of its own.
+pub(super) fn shim_writes_stopping(shim: &Runs, n: u8) {
+    let pin = shim.hold().unwrap();
+    shim.write_stopping(&instance_id(n), 1, &pin).unwrap();
 }
 
 pub(super) fn record(n: u8, outcome: RunOutcome) -> RunRecord {

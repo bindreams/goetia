@@ -23,25 +23,25 @@
 //!
 //! **The record is the program's exit whenever the shim had its exit status, whichever thread came first.**
 //! [`RunOutcome::Stopped`] is only for a stop whose program the shim never saw exit: no spawn, a failed wait, a
-//! program its own teardown ended, or Windows ending the shim after the first write. What the run thread does
-//! with an accepted stop, in this order:
+//! program its own teardown ended, or Windows ending the shim, or the final write failing, after the provisional
+//! file was written. What the run thread does with an accepted stop, in this order:
 //!
 //! - it reads the program once ([`Supervisor::wait_for_child_or_stop`]); one that is gone is its own exit, and
-//!   no `Stopped` is written first;
+//!   no provisional file is written first;
 //! - for a program that is alive as the stop is heard (one that is not on the shim's console, a GUI-subsystem
 //!   program or one that detached, and the window between the look before the spawn and the spawn), it writes
-//!   `Stopped` first, since Windows may end the shim before anything later; it waits for the program's own exit,
-//!   with no cap of goetia's ([`StopPlan::WaitOnly`]);
-//! - it tears down what the program left and ends: with the program's own exit when the shim saw it exit (the
-//!   record replaced by the same write), with [`STOPPED_EXIT`] when it did not, with the incomplete stop's
-//!   code when the teardown fails.
+//!   the provisional file of its `Stopped` first ([`Runs::write_stopping`]), since Windows may end the shim
+//!   before anything later; it waits for the program's own exit, with no cap of goetia's
+//!   ([`StopPlan::WaitOnly`]);
+//! - it tears down what the program left and ends: with the program's own exit when the shim saw it exit, with
+//!   [`STOPPED_EXIT`] when it did not, with the incomplete stop's code when the teardown fails.
 //!
-//! A shim that Windows ends first leaves the `Stopped` record, which says that a stop was accepted, not that
-//! the tree ended; the Job Object's `KILL_ON_JOB_CLOSE` ends the tree. A stop accepted before the spawn starts no
-//! program, which the close event would never reach: the bus is looked at right before the spawn, and the one
-//! stop that arrives between that look and the spawn starts the program, which runs until it exits or Windows
-//! ends the shim and the job closes over it. A run in flight at a system shutdown is ended by Windows and may
-//! leave no record: nothing here handles `CTRL_SHUTDOWN_EVENT`.
+//! A shim that Windows ends first leaves the provisional file, which a reader takes as `Stopped`: a stop was
+//! accepted, not that the tree ended; the Job Object's `KILL_ON_JOB_CLOSE` ends the tree. A stop accepted before
+//! the spawn starts no program, which the close event would never reach: the bus is looked at right before the
+//! spawn, and the one stop that arrives between that look and the spawn starts the program, which runs until it
+//! exits or Windows ends the shim and the job closes over it. A run in flight at a system shutdown is ended by
+//! Windows and may leave no record: nothing here handles `CTRL_SHUTDOWN_EVENT`.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
@@ -64,7 +64,7 @@ use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::Registered;
 use crate::backend::scm::manager::task::clock::file_time_of;
 use crate::backend::scm::manager::task::{Com, TaskApi};
-use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs, Writing};
+use crate::backend::scm::runs::{Pin, RunOutcome, RunRecord, Runs};
 use crate::backend::scm::task_xml::{TaskXml, Token, ending, extract_from_data};
 use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Id};
@@ -138,11 +138,12 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 ///    a marker that stands, or a look that cannot be made, ends the shim.
 /// 6. Sets the diagnostics log, writes the run's marker as the first line of `logs` when there is one, looks at
 ///    the bus once more and, for a stop accepted by then, starts no program: the record is `Stopped`, as in
-///    step 4. Otherwise runs the program and writes the one record, under the pin, which is released as the
-///    record is renamed in place ([`Runs::write`]). An accepted stop writes `Stopped` before the wait, with
-///    the pin lent, so that the run stays one that is alive; the final write replaces it. A program that is gone
-///    when the stop is seen gets no such write: its exit is the one record ([`ended_as`]). A record that
-///    cannot be written is logged and does not change the code.
+///    step 4. Otherwise runs the program and writes its record, under the pin, which is released as the
+///    record is renamed in place ([`Runs::write`]). An accepted stop writes the provisional file
+///    ([`Runs::write_stopping`]) before the wait, with the pin lent, so that the run stays one that is alive; the
+///    record is written to its own name after it. A program that is gone when the stop is seen gets no such
+///    file: its exit is the one record ([`ended_as`]). A record that cannot be written is logged and does not
+///    change the code.
 pub(super) fn run_in(
     id: &str,
     token: Option<Token>,
@@ -201,15 +202,7 @@ pub(super) fn run_in(
         OwnInstanceOutcome::Listed(instance) => instance,
         OwnInstanceOutcome::Ended(stop) => return end(stop),
         OwnInstanceOutcome::Stopped(instance) => {
-            record_run(
-                log,
-                id,
-                runs,
-                Writing::Given(pin),
-                instance,
-                file_time_now(),
-                Some(RunOutcome::Stopped),
-            );
+            record_run(log, id, runs, pin, instance, file_time_now(), Some(RunOutcome::Stopped));
             return STOPPED_EXIT;
         }
     };
@@ -244,15 +237,7 @@ pub(super) fn run_in(
     // Right before the spawn: a program started after the close event never receives it. A stop that arrives
     // after this look still starts the program (see the module's doc).
     if supervisor.bus.stop_accepted() {
-        record_run(
-            log,
-            id,
-            runs,
-            Writing::Given(pin),
-            Some(instance),
-            started,
-            Some(RunOutcome::Stopped),
-        );
+        record_run(log, id, runs, pin, Some(instance), started, Some(RunOutcome::Stopped));
         return STOPPED_EXIT;
     }
     let outcome = run_pass(
@@ -263,34 +248,27 @@ pub(super) fn run_in(
         || {},
         |end| {
             // Only for a stop heard with the program alive, never for its own exit (a program that is gone when the
-            // stop is seen is told as one): the record comes before the wait, which Windows may end the shim in,
-            // and the pin stays held (the run is alive).
+            // stop is seen is told as one): the provisional file comes before the wait, which Windows may end the
+            // shim in, and the pin stays held (the run is alive).
             if end == WaitEnd::Stop {
-                record_run(
-                    log,
-                    id,
-                    runs,
-                    Writing::Lent(&pin),
-                    Some(instance),
-                    started,
-                    Some(RunOutcome::Stopped),
-                );
+                if let Err(e) = runs.write_stopping(&instance, started, &pin) {
+                    log.failure(id, &format!("write the run record: {}", Chain(&e)));
+                }
             }
         },
     );
     let (record, code) = ended_as(outcome);
-    record_run(log, id, runs, Writing::Given(pin), Some(instance), started, record);
+    record_run(log, id, runs, pin, Some(instance), started, record);
     code
 }
 
 /// Writes the run's record, under its own pin, when it has everything one needs; a write that fails is
-/// logged, and one that waits for a program holding the old record says so. A pin that is given is released
-/// either way, as the function ends; one that is lent stays held and nothing is pruned ([`Runs::write`]).
+/// logged. The pin is released either way, as the function ends.
 fn record_run(
     log: &Log,
     id: &str,
     runs: &Runs,
-    pin: Writing<'_>,
+    pin: Pin,
     instance: Option<InstanceId>,
     started: u64,
     outcome: Option<RunOutcome>,
@@ -302,24 +280,13 @@ fn record_run(
                 started,
                 outcome,
             },
-            pin,
-            |held| {
-                log.warning(
-                    id,
-                    &format!(
-                        "the run record {} is held open by another program; the write is retried until it is released",
-                        held.display()
-                    ),
-                );
-            },
+            Some(pin),
         ) {
             Ok(problems) => {
                 for problem in problems {
                     log.warning(id, &format!("prune the run records: {problem}"));
                 }
             }
-            // `tests/shim_integration/tasks.rs` relies on this line's text being absent from the log of a run whose final
-            // record was written.
             Err(e) => log.failure(id, &format!("write the run record: {}", Chain(&e))),
         }
     }

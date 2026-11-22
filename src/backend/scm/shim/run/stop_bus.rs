@@ -678,9 +678,10 @@ impl Supervisor {
     /// Ask the daemon's tree to exit, then wait for the whole tree to exit within what is left of `timeout`.
     ///
     /// The daemon's exit is read before every ask ([`Supervisor::has_exited`]: the process itself, or the waiter's
-    /// report when that read fails): one that has exited is neither asked (again) nor waited for. The first ask is told in the log before it is made, so that the line comes before
-    /// whatever the daemon does in answer. What the ask answered decides the rest ([`judge_ask`]); a wait that cannot
-    /// be made is logged and the teardown follows at once.
+    /// report when that read fails): one that has exited is neither asked (again) nor waited for. The first ask is
+    /// told in the log before it is made, so that the line comes before whatever the daemon does in answer. What the
+    /// ask answered decides the rest ([`judge_ask`]); a wait that cannot be made is logged and the teardown follows
+    /// at once.
     ///
     /// A tree is waited for after any answer that may mean the event was sent, whether or not the root has exited
     /// since. That includes a root that exits by itself between the read before an ask and that ask, which is then

@@ -29,7 +29,7 @@ use crate::backend::scm::shim::run::test_support::{
 };
 use crate::backend::scm::task_xml::Token;
 use crate::backend::scm::test_support::{
-    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, delete_pending, directory_with_a_file, make_mount_point, no_wait,
+    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, delete_pending, directory_with_a_file, make_mount_point,
     registered_task, registered_task_with, set_dacl, task_token,
 };
 use crate::elevation::test_support::process_user_sid;
@@ -219,12 +219,12 @@ impl Run {
         move || assert!(bus.request_stop())
     }
 
-    /// Runs the task on a thread of its own and calls `while_waiting` on the test's thread once the run's record
-    /// is on disk. For a run stopped at its spawn that is the record written before the wait: the program is
-    /// still running then, and `while_waiting` is what ends it. Returns the run's code.
+    /// Runs the task on a thread of its own and calls `while_waiting` on the test's thread once the run's
+    /// provisional file is on disk. For a run stopped at its spawn that is the file written before the wait: the
+    /// program is still running then, and `while_waiting` is what ends it. Returns the run's code.
     fn run_until_it_records(&self, while_waiting: impl FnOnce()) -> u32 {
         let mut watch = DirWatch::new(&self.records_dir());
-        let own = NameChange::RenamedTo(format!("{}.json", instance().hex()));
+        let own = NameChange::RenamedTo(format!("{}.stopping", instance().hex()));
         std::thread::scope(|scope| {
             let running = scope.spawn(|| self.run());
             watch.until(|changes| changes.contains(&own));
@@ -805,8 +805,8 @@ fn a_run_records_under_its_own_pin_and_drops_it_after_the_rename() {
     let (first, second) = (earlier(5), earlier(6));
     let seen = (first.clone(), second.clone());
     run.api.on_instances(Ok(listed())).during(move || {
-        other.write(&seen.0, None, no_wait).unwrap();
-        other.write(&seen.1, None, no_wait).unwrap();
+        other.write(&seen.0, None).unwrap();
+        other.write(&seen.1, None).unwrap();
         assert!(
             other.read(&seen.0.instance).unwrap().is_some(),
             "the shim's pin did not keep an earlier record from the next write's prune"
@@ -923,10 +923,15 @@ fn a_stop_with_the_program_already_gone_records_its_exit_once() {
         std::fs::write(run.records_dir().join("done"), "").unwrap();
         let changes = watch.until_added("done");
         let own = NameChange::RenamedTo(format!("{}.json", instance().hex()));
+        let provisional = NameChange::RenamedTo(format!("{}.stopping", instance().hex()));
         assert_eq!(
             changes.iter().filter(|change| **change == own).count(),
             1,
-            "a `Stopped` was written first, for the exit {exit}: {changes:?}"
+            "the record was written more than once, for the exit {exit}: {changes:?}"
+        );
+        assert!(
+            !changes.contains(&provisional),
+            "a provisional file was written first, for the exit {exit}: {changes:?}"
         );
         assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(exit as u32)));
         drop(watch);
@@ -952,10 +957,11 @@ fn a_stop_before_the_spawn_spawns_nothing_and_records_stopped() {
     assert_eq!(run.fake.take_failures(), Vec::<String>::new());
 }
 
-/// The program is alive when the stop is seen: the record is `Stopped` on disk before the wait for the program, and
-/// the run's pin is still held: an account change or an uninstall that read "no pin held" as "no run alive" would
-/// otherwise act on a run that is alive. The program is then waited for (nothing ends it), and it exits by itself: the
-/// tree is torn down, and the final write, which releases the pin, is the program's exit, with its code.
+/// The program is alive when the stop is seen: the run reads `Stopped` from a provisional file on disk before the
+/// wait for the program, and the run's pin is still held: an account change or an uninstall that read "no pin held"
+/// as "no run alive" would otherwise act on a run that is alive. The program is then waited for (nothing ends it),
+/// and it exits by itself: the tree is torn down, and the final write, which releases the pin, is the program's exit,
+/// with its code, in a record of its own name; the prune that follows removes the provisional file.
 #[skuld::test]
 fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_the_pin_held_meanwhile() {
     let process = runs_until_stopped();
@@ -976,6 +982,12 @@ fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_t
 
     assert_eq!(code, 7);
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    assert!(
+        !run.records_dir()
+            .join(format!("{}.stopping", instance().hex()))
+            .exists(),
+        "the provisional file was left"
+    );
     assert_eq!(process.exit_code(), Some(7));
     assert_eq!(
         process.calls(),
@@ -986,10 +998,10 @@ fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_t
     assert_eq!(run.finish(), Vec::<String>::new());
 }
 
-/// A teardown that fails after the wait replaces the `Stopped` that was written first, by the same write, and the
-/// run ends with the incomplete stop's code.
+/// A teardown that fails after the wait is recorded as an incomplete stop, which a reader takes over the `Stopped` of
+/// the provisional file written first, and the run ends with the incomplete stop's code.
 #[skuld::test]
-fn a_teardown_that_fails_replaces_the_record_with_an_incomplete_stop() {
+fn a_teardown_that_fails_records_an_incomplete_stop_over_the_provisional_file() {
     let process = FakeProcess::new()
         .wait(WaitReply::Blocks)
         .send_kill_tree(KillReply::Refuses);
@@ -1100,10 +1112,15 @@ fn the_programs_own_exit_writes_no_stopped_record_first() {
     std::fs::write(run.records_dir().join("done"), "").unwrap();
     let changes = watch.until_added("done");
     let own = NameChange::RenamedTo(format!("{}.json", instance().hex()));
+    let provisional = NameChange::RenamedTo(format!("{}.stopping", instance().hex()));
     assert_eq!(
         changes.iter().filter(|change| **change == own).count(),
         1,
         "the record was written more than once: {changes:?}"
+    );
+    assert!(
+        !changes.contains(&provisional),
+        "a provisional file was written first: {changes:?}"
     );
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(3)));
     drop(watch);

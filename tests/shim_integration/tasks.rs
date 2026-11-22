@@ -124,8 +124,8 @@ struct StoppedRun {
     pid: String,
     /// What the program wrote of its own in its record file.
     said: String,
-    /// The shim's log (the task's `logs`) as the run left it.
-    shim_log: String,
+    /// The names of the files the run left in its records directory.
+    files: Vec<String>,
     /// The records directory, the shim's log and the program's record file as the run left them, for a message.
     left: String,
 }
@@ -165,13 +165,20 @@ fn stop_a_run(mode: &str, args: impl FnOnce(&std::path::Path, &std::path::Path) 
     });
     let said = std::fs::read_to_string(&record).unwrap_or_default();
     let left = what_the_run_left(&records, &shim_log, &record);
-    let shim_log = std::fs::read_to_string(&shim_log).unwrap_or_default();
+    let files = std::fs::read_dir(&records)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     mgr.uninstall(&id).expect("uninstall");
     StoppedRun {
         exit,
         pid,
         said,
-        shim_log,
+        files,
         left,
     }
 }
@@ -203,14 +210,13 @@ fn a_program_that_handles_the_close_event_and_exits_has_its_own_exit_recorded(#[
     );
 }
 
-/// A program that left the console is sent nothing, so the shim hears the stop with the program alive: it records
-/// `Stopped` and waits for the program's own exit. What the shim guarantees, and the program's own line proves, is that
-/// the record on disk while the program was alive said `stopped`. How the run ends then is Windows' to decide, about a
-/// second after the stop: the program exits by itself in time and `run` answers its code (the record is its exit), or
-/// Windows ends the shim first and `run` answers `0xC000013A` (the record stays `stopped`), which is accepted only if
-/// the shim did not fail to write the final record (`record_run`'s "write the run record" line is absent from its
-/// log: that line is the one this test relies on). Either end is accepted, and which it was is printed. The order of
-/// the two records is pinned by the shim's own unit tests
+/// A program that left the console is sent nothing, so the shim hears the stop with the program alive: it writes the
+/// provisional file of its `Stopped` and waits for the program's own exit. What the shim guarantees, and the
+/// program's own line proves, is that the file on disk while the program was alive said `stopped`. How the run ends
+/// then is Windows' to decide, about a second after the stop: the program exits by itself in time and `run` answers
+/// its code (the record is its exit), or Windows ends the shim first and `run` answers `0xC000013A`: the run left its
+/// provisional file and no record. Either end is accepted, and which it was is printed. The order of the two files is
+/// pinned by the shim's own unit tests
 /// (`task_tests::a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_the_pin_held_meanwhile`).
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exit_or_as_stopped(
@@ -236,15 +242,14 @@ fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exi
         "the program's own code or the stop's, not {exit:?}\n{left}"
     );
     if exit == STOPPED {
-        assert!(
-            !stopped.shim_log.contains("write the run record"),
-            "the record stayed `stopped` because the final write failed, not because Windows ended the shim first\n{left}"
-        );
+        let ends = |suffix: &str| stopped.files.iter().filter(|name| name.ends_with(suffix)).count();
+        assert_eq!(ends(".stopping"), 1, "the run left its provisional file\n{left}");
+        assert_eq!(ends(".json"), 0, "the run left no record\n{left}");
     }
     println!(
         "measured: {}",
         if exit == STOPPED {
-            "Windows ended the shim first: the record stayed `stopped`"
+            "Windows ended the shim first: the run left its provisional file and no record"
         } else {
             "the program exited in time: the record is its own exit"
         }

@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -326,58 +326,24 @@ fn a_delete_outcome_that_is_no_deletion_is_an_error() {
     );
 }
 
-/// What `files::read` opens a record with: read, sharing everything.
-fn holding_as_read_does(path: &Path) -> fs::File {
-    OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path).unwrap()
-}
-
-/// A record is replaced while a reader has the old one open (`files::read` shares read, write and delete):
-/// the reader goes on reading the old bytes, a new open reads the new ones, and no temp name is left.
+/// Nothing is renamed onto a name that exists: the operating system refuses it and the target is as it was. A name that is free is taken.
 #[skuld::test]
-fn a_rename_replaces_a_file_another_handle_has_open_and_shares_delete() {
+fn a_rename_onto_a_name_that_exists_is_refused_and_one_onto_a_free_name_lands() {
     let dir = tempfile::tempdir().unwrap();
     let held_in = open(dir.path());
     let target = dir.path().join("rec.json");
     fs::write(&target, "old").unwrap();
-    let mut holder = holding_as_read_does(&target);
     let mut file = create_temp(&held_in, OsStr::new("rec.json.tmp")).unwrap();
     file.write_all(b"new").unwrap();
 
-    rename_over(&held_in, &file, OsStr::new("rec.json")).unwrap();
+    let refused = rename_to(&held_in, &file, OsStr::new("rec.json")).unwrap_err();
+
+    assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused:?}");
+    assert_eq!(fs::read(&target).unwrap(), b"old");
+
+    rename_to(&held_in, &file, OsStr::new("free.json")).unwrap();
     drop(file);
 
-    let mut old = String::new();
-    holder.read_to_string(&mut old).unwrap();
-    assert_eq!(old, "old", "the holder goes on reading what it opened");
-    assert_eq!(fs::read(&target).unwrap(), b"new", "a new open reads the new bytes");
-    assert_eq!(
-        read(&held_in, OsStr::new("rec.json")).unwrap().as_deref(),
-        Some(&b"new"[..])
-    );
-    assert!(
-        !dir.path().join("rec.json.tmp").exists(),
-        "nothing of the temp name is left"
-    );
-}
-
-/// A holder that shares no delete keeps the target: the rename is refused, as `STATUS_SHARING_VIOLATION`
-/// (measured; the plain replacement answered `STATUS_ACCESS_DENIED`), and the holder's file is as it was.
-#[skuld::test]
-fn a_rename_onto_a_file_held_without_sharing_delete_is_a_sharing_violation() {
-    let dir = tempfile::tempdir().unwrap();
-    let held_in = open(dir.path());
-    let target = dir.path().join("rec.json");
-    fs::write(&target, "old").unwrap();
-    let _holder = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(&target)
-        .unwrap();
-    let mut file = create_temp(&held_in, OsStr::new("rec.json.tmp")).unwrap();
-    file.write_all(b"new").unwrap();
-
-    let refused = rename_over(&held_in, &file, OsStr::new("rec.json")).unwrap_err();
-
-    assert!(is_sharing_violation(&refused), "{refused:?}");
-    assert_eq!(fs::read(&target).unwrap(), b"old");
+    assert_eq!(fs::read(dir.path().join("free.json")).unwrap(), b"new");
+    assert!(!dir.path().join("rec.json.tmp").exists());
 }

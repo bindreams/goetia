@@ -10,7 +10,7 @@ use std::os::windows::io::AsRawHandle as _;
 
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_RENAME_INFORMATION,
-    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformationEx, NtSetInformationFile,
+    FileRenameInformation, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_SHARING_VIOLATION, HANDLE, STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
@@ -43,18 +43,12 @@ pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
     .map_err(|status| dir.open_error(status))
 }
 
-/// Renames the file `file` holds to the name `to` in `dir`, replacing what is there. It is renamed through
-/// the handle, relative to the directory's, so there is no moment at which it is closed and under its
-/// old name: nothing can delete it between its last write and the rename. `file` must have been opened
-/// with `DELETE`, and be in `dir`.
-///
-/// The replacement has POSIX semantics: a target that others have open (a reader of the record being
-/// replaced) is replaced all the same, they go on reading the old bytes, and a new open gets the new file.
-/// A holder that shares no delete refuses it with `STATUS_SHARING_VIOLATION` (measured; the plain class
-/// answered `STATUS_ACCESS_DENIED` for any open target). No fallback to the plain `FileRenameInformation` is
-/// kept for a Windows that lacks the class (it would answer `STATUS_INVALID_INFO_CLASS`):
-/// [`delete_by_disposition`] already needs a Windows at least as new, for the POSIX-semantics delete.
-pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> {
+/// Renames the file `file` holds to the name `to` in `dir`, which must be free: a name that exists is refused
+/// by the operating system ([`io::ErrorKind::AlreadyExists`]) and nothing is replaced, whoever has it open. It is
+/// renamed through the handle, relative to the directory's, so there is no moment at which it is closed and
+/// under its old name: nothing can delete it between its last write and the rename. `file` must have been
+/// opened with `DELETE`, and be in `dir`.
+pub(super) fn rename_to(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> {
     debug_assert!(is_bare(to), "a name, not a path");
     let name: Vec<u16> = to.encode_wide().collect();
     let name_bytes = name.len() * size_of::<u16>();
@@ -65,24 +59,22 @@ pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> 
     let mut buffer = vec![0u64; total.div_ceil(size_of::<u64>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFORMATION`: room for
-    // the struct and for the name, which is copied in at the name's own offset.
+    // the struct and for the name, which is copied in at the name's own offset. `ReplaceIfExists` stays zero.
     unsafe {
         (*info).RootDirectory = dir.file().as_raw_handle() as HANDLE;
         (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), info.cast::<u8>().add(header).cast::<u16>(), name.len());
     }
-    // SAFETY: `info` is `total` bytes `buffer` holds; the flags are a plain write into its first field.
-    unsafe { (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS };
     let mut block = IO_STATUS_BLOCK::default();
-    // SAFETY: `file` is a live handle opened with `DELETE`, `dir`'s handle is live; `info` is `total` readable
-    // bytes.
+    // SAFETY: `file` is a live handle opened with `DELETE`, `dir`'s handle is live; `info` is `total`
+    // readable bytes.
     let status = unsafe {
         NtSetInformationFile(
             file.as_raw_handle() as HANDLE,
             &mut block,
             info.cast(),
             total as u32,
-            FileRenameInformationEx,
+            FileRenameInformation,
         )
     };
     if status < 0 {
@@ -112,7 +104,7 @@ pub(super) fn create_pin(dir: &Dir, name: &OsStr) -> io::Result<File> {
 pub(super) const PIN_ACCESS: u32 = DELETE | SYNCHRONIZE;
 
 /// What the handle of a temp file is made with, by the same rule: write and append are the record's bytes,
-/// `DELETE` the rename ([`rename_over`]), `SYNCHRONIZE` the synchronous handle. Not `FILE_GENERIC_WRITE`.
+/// `DELETE` the rename ([`rename_to`]), `SYNCHRONIZE` the synchronous handle. Not `FILE_GENERIC_WRITE`.
 const TEMP_ACCESS: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | SYNCHRONIZE;
 
 /// The bytes of the file `name` in `dir`, or `None` if there is no such file. A link is opened, not

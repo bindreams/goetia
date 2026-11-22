@@ -6,12 +6,13 @@ use std::io;
 use std::path::Path;
 
 use super::super::support::{
-    Machine, PATH, id, instance, instance_id, pins_in, record, records, scm, shim_writes, snapshot_of,
+    Machine, PATH, id, instance, instance_id, pins_in, record, records, scm, shim_writes, shim_writes_stopping,
+    snapshot_of,
 };
 use super::*;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::runs::RunOutcome;
-use crate::backend::scm::test_support::{no_wait, task_spec};
+use crate::backend::scm::test_support::task_spec;
 use crate::spec::{DaemonSpec, TaskSpec};
 
 fn named(n: u8, pid: u32) -> Started {
@@ -264,16 +265,13 @@ fn failure<T>(begun: Result<T>) -> Error {
 fn begin_run_takes_the_pin_and_lists_before_run_is_called() {
     let (dir, path, runs) = records();
     let older = Runs::of(dir.path(), &id());
-    older
-        .write(&written(9, 0, RunOutcome::Exited(7)), None, no_wait)
-        .unwrap();
+    older.write(&written(9, 0, RunOutcome::Exited(7)), None).unwrap();
     let fake = Fake::new();
     let shim = Runs::of(dir.path(), &id());
     fake.on_run(Ok(unnamed(1)))
         .during(move || {
             assert_eq!(pins_in(&path), 1, "the pin is held when Run is called");
-            shim.write(&written(1, 5, RunOutcome::Exited(0)), None, no_wait)
-                .unwrap();
+            shim.write(&written(1, 5, RunOutcome::Exited(0)), None).unwrap();
         })
         .on_instances(Ok(Vec::new()));
 
@@ -335,7 +333,7 @@ fn a_first_stopped_record_of_a_run_that_is_listed_on_the_second_read_is_followed
     let first = Runs::of(dir.path(), &id());
     let fake = Fake::new();
     fake.on_run(Ok(unnamed(9)))
-        .during(move || shim_writes(&first, &record(1, RunOutcome::Stopped)))
+        .during(move || shim_writes_stopping(&first, 1))
         .on_instances(Ok(Vec::new()))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
@@ -373,7 +371,7 @@ fn a_first_stopped_record_of_a_run_that_is_not_listed_on_the_second_read_is_read
     let first = Runs::of(dir.path(), &id());
     let fake = Fake::new();
     fake.on_run(Ok(unnamed(9)))
-        .during(move || shim_writes(&first, &record(1, RunOutcome::Stopped)))
+        .during(move || shim_writes_stopping(&first, 1))
         .on_instances(Ok(Vec::new()))
         .on_instances(Ok(Vec::new()))
         .during(move || shim_writes(&shim, &record(1, RunOutcome::Exited(5))));
@@ -445,7 +443,7 @@ fn a_process_gone_at_the_open_reads_the_record_by_the_instance() {
     let mut machine = Machine::new(&fake, &[4242]);
     machine.holdable.clear();
     Runs::of(dir.path(), &id())
-        .write(&record(1, RunOutcome::Exited(4)), None, no_wait)
+        .write(&record(1, RunOutcome::Exited(4)), None)
         .unwrap();
 
     let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
@@ -527,7 +525,7 @@ fn the_end_of_a_run_does_not_wait_for_the_listing_to_drop() {
     let fake = Fake::new();
     fake.on_run(Ok(named(1, 4242)))
         .during(move || {
-            shim.write(&record(1, RunOutcome::Exited(0)), None, no_wait).unwrap();
+            shim.write(&record(1, RunOutcome::Exited(0)), None).unwrap();
         })
         .on_instances(Ok(vec![instance(1, 4242)]));
 
