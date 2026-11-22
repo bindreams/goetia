@@ -157,6 +157,17 @@ fn console_event(signal: StopSignal) -> Option<CtrlEvent> {
     }
 }
 
+/// What a stop saw of the root's own exit: the fact the teardown is chosen by.
+pub enum RootExit {
+    /// The root was not seen to exit before the teardown (or the waiter's wait failed, so it is not known to have).
+    NotSeen,
+    /// The root exited by itself, when the stop was seen or during its plan, and a read of the process gave its
+    /// status.
+    Status(ExitStatus),
+    /// The root exited by itself and no read gave its status: the waiter's `wait()` has it.
+    Unread,
+}
+
 pub enum WaitOutcome {
     ChildExited,
     /// The waiter's `child.wait()` failed, so whether the daemon ended was unknown. The tree kill was
@@ -168,14 +179,7 @@ pub enum WaitOutcome {
     },
     /// A stop was requested, and its plan ran: the ask and the wait it made, then the teardown, whose
     /// tree kill was sent (or the daemon had exited, and its tree was ended).
-    Stopping {
-        /// The root had exited by itself, before the teardown: when the stop was seen or during its plan. The
-        /// fact the teardown was chosen by; its exit status is the root's own.
-        root_exited: bool,
-        /// The root's exit status, when a read of the process gave it (`Some` only with `root_exited`). With none,
-        /// the waiter's `wait()` has it.
-        exit_status: Option<ExitStatus>,
-    },
+    Stopping(RootExit),
     /// The daemon may still be running: `send_kill_tree` and the direct-child fallback both failed, after
     /// a stop or a failed wait. See [`Supervisor::wait_for_child_or_stop`] for why this is a return
     /// rather than a wait, and `Reported::incomplete_stop` for what the caller reports for it.
@@ -630,10 +634,11 @@ impl Supervisor {
                     }
                     WaitOutcome::TreeMayRun
                 }
-                _ if stopping => WaitOutcome::Stopping {
-                    root_exited: exited && wait_failure.is_none(),
-                    exit_status: read_status,
-                },
+                _ if stopping => WaitOutcome::Stopping(match read_status {
+                    Some(status) => RootExit::Status(status),
+                    None if exited && wait_failure.is_none() => RootExit::Unread,
+                    None => RootExit::NotSeen,
+                }),
                 (Teardown::Tree, os_error) => WaitOutcome::WaitFailed {
                     os_error: os_error.flatten(),
                 },

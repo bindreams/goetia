@@ -34,7 +34,8 @@ use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{
-    NOT_RESTARTED, StopBus, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree,
+    NOT_RESTARTED, RootExit, StopBus, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop,
+    terminate_exited_tree,
 };
 
 // Entry ===============================================================================================================
@@ -492,13 +493,10 @@ pub(super) fn run_pass(
         // `wait_for_child_or_stop` terminated the tree before returning this. A daemon that exited by itself first
         // has its exit status: the one a read of the process gave, or, when none did, the one the waiter's wait
         // returned (as in the `ChildExited` arm).
-        WaitOutcome::Stopping {
-            root_exited,
-            exit_status,
-        } => PassOutcome::Stopped(match exit_status {
-            Some(status) => code_of(status, log, id),
-            None if root_exited => exit_code(child.as_ref(), log, id),
-            None => None,
+        WaitOutcome::Stopping(root) => PassOutcome::Stopped(match root {
+            RootExit::Status(status) => code_of(status, log, id),
+            RootExit::Unread => exit_code(child.as_ref(), log, id),
+            RootExit::NotSeen => None,
         }),
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => PassOutcome::IncompleteStop,
