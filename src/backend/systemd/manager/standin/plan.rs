@@ -18,10 +18,11 @@
 //!    rewritten when this call writes one, and otherwise removed, in every state of the run and under both
 //!    choices, with no clearing of its own.
 //! 4. Where the stand-in is the unit's definition (the sweep of an absent id, a timer alone, an `install` over
-//!    no job file), one of ours that is not written goes: after the stop and the clearing of rule 2 for `Stop`;
-//!    for `Leave`, when the one read says the run has no process, after `reset-failed` if it failed. It stays
-//!    while a run left by `Leave` has a process. A stand-in is removed only if it is still the file read as
-//!    ours, and `reset-failed` is sent only after it was found so and moved aside; one that has vanished or
+//!    no job file), one of ours that is not written goes. `Stop` stops first and clears the run that failed
+//!    (rule 2), as a stop precedes the verified removal of the installed units. `Leave` removes it when the one
+//!    read says the run has no process, and clears a run that failed with `reset-failed` only once the stand-in
+//!    was found still ours and moved aside, since nothing was stopped. It stays while a run left by `Leave` has a
+//!    process. A stand-in is removed only if it is still the file read as ours; one that has vanished or
 //!    changed is left alone, and the call goes on.
 //! 5. A file at the stand-in's path that is not ours refuses `Leave` of a job goetia removes, before anything
 //!    is changed ([`Known::blocked`]): a stand-in could be written there. For a timer alone, with `Stop` and
@@ -93,9 +94,10 @@ pub(in crate::backend::systemd::manager) enum Standin {
     /// printed.
     Write { kill_signal: String, stop_timeout: String },
     /// Remove it. `reset_failed`: the stand-in is the unit's definition, nothing was stopped and the one read
-    /// says the run failed, so it is cleared first (the verb refuses a unit that is not in memory, as one that
-    /// did not fail is not). False for a stale stand-in, which has no clearing, and under a stop, where
-    /// [`Plan::clears_after_stop`] decides from a read after it.
+    /// says the run failed, so the run is cleared once the stand-in is found ours and moved aside, before it is
+    /// deleted (the verb refuses a unit that is not in memory, as one that did not fail is not). False for a
+    /// stale stand-in, which has no clearing, and under a stop, where the stop and the clearing that follows it
+    /// ([`Plan::clears_after_stop`], decided from a read after the stop) come before the removal.
     Remove { reset_failed: bool },
 }
 
