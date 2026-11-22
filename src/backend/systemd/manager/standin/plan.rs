@@ -49,8 +49,8 @@ pub(in crate::backend::systemd::manager) struct Known<'a> {
 
 /// What the one read of the job's unit showed.
 #[derive(Debug)]
-pub(in crate::backend::systemd::manager) struct Seen<'a> {
-    pub run: &'a UnitRun,
+pub(in crate::backend::systemd::manager) struct Seen {
+    pub run: UnitRun,
     /// Systemd holds a definition loaded from the id's own path, and that file does not exist.
     pub held_gone: bool,
 }
@@ -63,21 +63,32 @@ pub(in crate::backend::systemd::manager) enum Standin {
     /// Write it, replacing one of ours that is there, before the files go. The two values are what the read
     /// printed.
     Write { kill_signal: String, stop_timeout: String },
-    /// Remove it, after clearing its failed run if it has one (`reset-failed` refuses a unit that is not in
-    /// memory, as one that did not fail is not).
-    Remove { failed: bool },
+    /// Remove it, after the run's failure is cleared where there is one.
+    Remove { clearing: Clearing },
 }
 
-/// Everything to do, in the order `Systemd::settle` does it: the stop, the stand-in, the reload, the read
-/// after it.
+/// Whether the failed run of a stand-in that goes is cleared with `reset-failed` first (the verb refuses a
+/// unit that is not in memory, as one that did not fail is not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::backend::systemd::manager) enum Clearing {
+    /// The read says the run did not fail.
+    Not,
+    /// The read says it failed.
+    Needed,
+    /// The plan stops the run, which is what ends it: whether it failed is read once the stop is done, and
+    /// cleared if it did.
+    // Red: not planned yet.
+    #[allow(dead_code)]
+    ReadAfterStop,
+}
+
+/// Everything to do, in the order `Systemd::settle` does it: the stop, the stand-in, the reload.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::backend::systemd::manager) struct Plan {
     pub stop: bool,
     pub standin: Standin,
     /// The manager is reloaded once, after the files and the stand-in are dealt with.
     pub reload: bool,
-    /// After the reload the unit is read again and a failed one is cleared (rule 6).
-    pub reread: bool,
 }
 
 impl Known<'_> {
@@ -99,7 +110,7 @@ impl Known<'_> {
 }
 
 /// The plan for a call that is not [`Known::blocked`]. `seen` is `Some` exactly when [`Known::reads`].
-pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option<&Seen<'_>>) -> Plan {
+pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option<&Seen>) -> Plan {
     debug_assert!(!known.blocked());
     debug_assert_eq!(known.reads(), seen.is_some());
     let leave = known.in_flight == RunInFlight::Leave;
@@ -111,7 +122,6 @@ pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option
             stop,
             standin: Standin::Nothing,
             reload: removes_files,
-            reread: false,
         };
     };
     let phase = seen.run.phase;
@@ -123,7 +133,11 @@ pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option
         }
     } else if ours && (!leave || !process) {
         Standin::Remove {
-            failed: seen.run.failed,
+            clearing: if seen.run.failed {
+                Clearing::Needed
+            } else {
+                Clearing::Not
+            },
         }
     } else {
         Standin::Nothing
@@ -131,7 +145,6 @@ pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option
     Plan {
         stop,
         reload: removes_files || matches!(standin, Standin::Remove { .. }) || seen.held_gone,
-        reread: leave && removes_files && phase == RunPhase::PendingRestart,
         standin,
     }
 }

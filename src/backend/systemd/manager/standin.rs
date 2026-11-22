@@ -22,11 +22,12 @@ use crate::error::{Error, Result};
 use crate::manager::RunInFlight;
 
 use super::discover::{RawState, ReadFailure, classify_and_read};
-use super::systemctl::{Held, UnitRun};
+use super::systemctl::Held;
+use super::task::Fragment;
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit_in, replace_unit_verified_in};
 use super::{Systemd, UnitKind, remove_file_if_present, unit_name, unit_path};
 
-pub(super) use plan::{Holding, Known, Seen, Standin, plan};
+pub(super) use plan::{Clearing, Holding, Known, Seen, Standin, plan};
 
 /// Where systemd reads runtime unit files: a tmpfs, so a stand-in is gone at a reboot.
 pub(super) const RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
@@ -61,26 +62,22 @@ pub(super) fn standin_file(id: &str) -> Result<StandinFile> {
     }
 }
 
-/// What the one read of the job's unit showed.
-pub(super) struct Looked {
-    pub run: UnitRun,
-    pub held_gone: bool,
-}
-
-impl Looked {
-    pub(super) fn seen(&self) -> Seen<'_> {
-        Seen {
-            run: &self.run,
-            held_gone: self.held_gone,
-        }
-    }
+/// What a call of [`Systemd::settle`] is about.
+pub(super) enum Target<'a> {
+    /// `uninstall` of an installed id, whose snapshot this call removes.
+    Installed(&'a Fragment),
+    /// `uninstall` of an id nothing is installed at: it looks for a definition systemd still holds whose file
+    /// is gone.
+    Sweep,
+    /// `install`, which settles a stand-in it finds as [`RunInFlight::Leave`] does.
+    Install,
 }
 
 impl Systemd {
     /// The one read of `id`'s job unit a call makes, when [`Known::reads`] says it makes one. A read asks no
     /// version gate. For a call that looks for a held definition, whether systemd holds one loaded from the
     /// id's own path whose file is gone.
-    pub(super) fn look(&self, id: &str, known: &Known<'_>) -> Result<Option<Looked>> {
+    pub(super) fn look(&self, id: &str, known: &Known<'_>) -> Result<Option<Seen>> {
         if !known.reads() {
             return Ok(None);
         }
@@ -92,7 +89,7 @@ impl Systemd {
                 classify_and_read(&path).map_err(ReadFailure::into_os_error)?,
                 RawState::Absent
             );
-        Ok(Some(Looked { run, held_gone }))
+        Ok(Some(Seen { run, held_gone }))
     }
 
     /// The stand-in for the run of `id`, written without replacing a file that is not one of goetia's: a
@@ -139,7 +136,7 @@ impl Systemd {
     /// reloaded, and one with a process stays, as an install never stops a run. Asks nothing of systemd where
     /// there is no stand-in of ours.
     pub(super) fn release_standin(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.settle(id, RunInFlight::Leave, None, false, held)
+        self.settle(id, RunInFlight::Leave, Target::Install, held)
     }
 
     /// `uninstall` of an id nothing is installed at: a stand-in of ours is settled by the one plan, and a
@@ -148,7 +145,7 @@ impl Systemd {
     /// choice. Where no manager can be asked nothing is read and the answer stays "not installed". A reload
     /// that fails is the call's error, not "not installed".
     pub(super) fn uninstall_leftovers(&self, id: &str, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
-        self.settle(id, in_flight, None, true, held)
+        self.settle(id, in_flight, Target::Sweep, held)
     }
 }
 

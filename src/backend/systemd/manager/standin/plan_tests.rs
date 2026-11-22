@@ -77,9 +77,9 @@ impl Cell {
         matches!(self.call, Call::Job | Call::NoJob)
     }
 
-    /// The refusal of rule 5, as the table states it.
+    /// The refusal of rule 5, as the table states it: only where a stand-in could be written.
     fn refused(&self) -> bool {
-        self.in_flight == RunInFlight::Leave && self.installed() && self.file == File::Foreign
+        self.in_flight == RunInFlight::Leave && self.call == Call::Job && self.file == File::Foreign
     }
 
     /// Whether a call of this shape reads the unit, as the table states it.
@@ -146,9 +146,8 @@ fn plan_of(cell: &Cell) -> Plan {
         asks_held: cell.call == Call::Sweep,
     };
     assert_eq!(known.reads(), cell.reads(), "{cell:?}: whether the unit is read");
-    let run = unit_run(cell.run);
     let seen = Seen {
-        run: &run,
+        run: unit_run(cell.run),
         held_gone: cell.held_gone,
     };
     plan(&known, (cell.run != Run::Unread).then_some(&seen))
@@ -177,13 +176,8 @@ impl Row {
     }
 }
 
-fn plan_with(stop: bool, standin: Standin, reload: bool, reread: bool) -> Plan {
-    Plan {
-        stop,
-        standin,
-        reload,
-        reread,
-    }
+fn plan_with(stop: bool, standin: Standin, reload: bool) -> Plan {
+    Plan { stop, standin, reload }
 }
 
 fn written() -> Standin {
@@ -213,7 +207,7 @@ const ROWS: &[Row] = &[
         file: &[Absent, Foreign],
         run: &[Unread],
         held_gone: NOT_HELD,
-        plan: || plan_with(true, Standin::Nothing, true, false),
+        plan: || plan_with(true, Standin::Nothing, true),
     },
     Row {
         rule: "2: Stop stops nothing when only a timer is held",
@@ -222,25 +216,24 @@ const ROWS: &[Row] = &[
         file: &[Absent, Foreign],
         run: &[Unread],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "2, 4: Stop with a stand-in of ours stops, then removes it and reloads",
+        rule: "2, 4: Stop with a stand-in of ours stops, then removes it and reloads; whether the run failed is read after the stop, whatever the read before it said",
         in_flight: STOP,
         call: &[Job, NoJob, Sweep],
         file: &[Ours],
-        run: &[Idle, Pending, Start, Running],
+        run: READ,
         held_gone: EITHER,
-        plan: || plan_with(true, Standin::Remove { failed: false }, true, false),
-    },
-    Row {
-        rule: "2, 4: Stop with a stand-in of ours whose run failed clears it first",
-        in_flight: STOP,
-        call: &[Job, NoJob, Sweep],
-        file: &[Ours],
-        run: &[Failed],
-        held_gone: EITHER,
-        plan: || plan_with(true, Standin::Remove { failed: true }, true, false),
+        plan: || {
+            plan_with(
+                true,
+                Standin::Remove {
+                    clearing: Clearing::ReadAfterStop,
+                },
+                true,
+            )
+        },
     },
     Row {
         rule: "7, 2: Stop of an id nothing is installed at, with no stand-in of ours, stops and changes nothing",
@@ -249,7 +242,7 @@ const ROWS: &[Row] = &[
         file: &[Absent, Foreign],
         run: READ,
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, false, false),
+        plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
         rule: "7: a definition held for a file that is gone is reloaded and nothing else is done for it",
@@ -258,7 +251,7 @@ const ROWS: &[Row] = &[
         file: &[Absent, Foreign],
         run: READ,
         held_gone: HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     // Leave -----------------------------------------------------------------------------------------------------------
     Row {
@@ -268,52 +261,34 @@ const ROWS: &[Row] = &[
         file: &[Absent, Ours],
         run: &[Start],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, written(), true, false),
+        plan: || plan_with(false, written(), true),
     },
     Row {
-        rule: "1: Leave of a job with no process, or past its start job, removes the files and sends nothing",
+        rule: "1, 3: Leave of a job with no process, past its start job, or with a restart waiting (which gets no stand-in either) removes the files and sends nothing",
         in_flight: LEAVE,
         call: &[Job],
         file: &[Absent],
-        run: &[Idle, Failed, Running],
+        run: &[Idle, Failed, Pending, Running],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "1, 6: Leave of a job whose restart is waiting sends nothing and reads the unit again after the reload",
-        in_flight: LEAVE,
-        call: &[Job, NoJob],
-        file: &[Absent],
-        run: &[Pending],
-        held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, true, true),
-    },
-    Row {
-        rule: "3: no stand-in for a timer alone, whatever its unit is doing",
+        rule: "3, 5: no stand-in for a timer alone, whatever its unit is doing; a file that is not ours at the path is no concern of it",
         in_flight: LEAVE,
         call: &[NoJob],
-        file: &[Absent],
-        run: &[Idle, Failed, Start, Running],
+        file: &[Absent, Foreign],
+        run: READ,
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "4: Leave removes a stand-in of ours whose run has no process",
+        rule: "4: Leave removes a stand-in of ours whose run has no process, a restart that is waiting included",
         in_flight: LEAVE,
         call: &[Job, NoJob],
         file: &[Ours],
-        run: &[Idle],
+        run: &[Idle, Pending],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Remove { failed: false }, true, false),
-    },
-    Row {
-        rule: "4, 6: and one whose run is a restart that is waiting, then reads the unit again",
-        in_flight: LEAVE,
-        call: &[Job, NoJob],
-        file: &[Ours],
-        run: &[Pending],
-        held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Remove { failed: false }, true, true),
+        plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
     },
     Row {
         rule: "4: and one whose run failed, after reset-failed",
@@ -322,25 +297,33 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Failed],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Remove { failed: true }, true, false),
+        plan: || {
+            plan_with(
+                false,
+                Standin::Remove {
+                    clearing: Clearing::Needed,
+                },
+                true,
+            )
+        },
     },
     Row {
         rule: "4: the stand-in stays while the run has a process",
         in_flight: LEAVE,
-        call: &[Job, NoJob],
+        call: &[Job],
         file: &[Ours],
         run: &[Running],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "3, 4: a timer alone gets no stand-in, and one of ours at its id stays with a run in its start job",
+        rule: "3, 4: a timer alone gets no stand-in, and one of ours at its id stays while the run has a process",
         in_flight: LEAVE,
         call: &[NoJob],
         file: &[Ours],
-        run: &[Start],
+        run: &[Start, Running],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
         rule: "7, 3: Leave of an id nothing is installed at changes nothing: no stop, no stand-in",
@@ -349,7 +332,7 @@ const ROWS: &[Row] = &[
         file: &[Absent, Foreign],
         run: READ,
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, false, false),
+        plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
         rule: "7: and reloads a definition held for a file that is gone, with no read after it",
@@ -358,7 +341,7 @@ const ROWS: &[Row] = &[
         file: &[Absent, Foreign],
         run: READ,
         held_gone: HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
         rule: "4, 7: Leave removes a stand-in of ours with no process, and reloads",
@@ -367,7 +350,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: EITHER,
-        plan: || plan_with(false, Standin::Remove { failed: false }, true, false),
+        plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
     },
     Row {
         rule: "4, 7: and one whose run failed, after reset-failed",
@@ -376,7 +359,15 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Failed],
         held_gone: EITHER,
-        plan: || plan_with(false, Standin::Remove { failed: true }, true, false),
+        plan: || {
+            plan_with(
+                false,
+                Standin::Remove {
+                    clearing: Clearing::Needed,
+                },
+                true,
+            )
+        },
     },
     Row {
         rule: "4, 7: the stand-in and its run stay; the reload only for a held definition",
@@ -385,7 +376,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Start, Running],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, false, false),
+        plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
         rule: "7: the stand-in and its run stay and a held definition is reloaded",
@@ -394,7 +385,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Start, Running],
         held_gone: HELD,
-        plan: || plan_with(false, Standin::Nothing, true, false),
+        plan: || plan_with(false, Standin::Nothing, true),
     },
     // install ---------------------------------------------------------------------------------------------------------
     Row {
@@ -404,7 +395,7 @@ const ROWS: &[Row] = &[
         file: &[Absent, Foreign],
         run: &[Unread],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, false, false),
+        plan: || plan_with(false, Standin::Nothing, false),
     },
     Row {
         rule: "8, 4: an install removes a stand-in of ours with no process, and reloads",
@@ -413,7 +404,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Remove { failed: false }, true, false),
+        plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
     },
     Row {
         rule: "8, 4: and one whose run failed, after reset-failed",
@@ -422,7 +413,15 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Failed],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Remove { failed: true }, true, false),
+        plan: || {
+            plan_with(
+                false,
+                Standin::Remove {
+                    clearing: Clearing::Needed,
+                },
+                true,
+            )
+        },
     },
     Row {
         rule: "8, 4: an install leaves a stand-in whose run has a process, and never stops it",
@@ -431,7 +430,7 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Start, Running],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, false, false),
+        plan: || plan_with(false, Standin::Nothing, false),
     },
 ];
 
@@ -464,9 +463,10 @@ fn every_reachable_cell_has_one_row_and_gets_its_plan() {
     assert!(reachable > 100, "the generator reached {reachable} cells");
 }
 
-/// Rule 5: only `Leave` over an installed id is refused, and only for a file that is not ours.
+/// Rule 5: only `Leave` over an id whose job goetia removes is refused, and only for a file that is not ours:
+/// a timer alone never gets a stand-in, so a file at the path is no concern of it.
 #[skuld::test]
-fn a_file_that_is_not_ours_refuses_leave_on_an_installed_id_and_nothing_else() {
+fn a_file_that_is_not_ours_refuses_leave_on_a_held_job_and_nothing_else() {
     for cell in cells() {
         let file = cell.standin_file();
         let known = Known {
@@ -496,7 +496,7 @@ fn the_stand_in_carries_the_values_the_read_printed() {
     let planned = plan(
         &known,
         Some(&Seen {
-            run: &run,
+            run,
             held_gone: false,
         }),
     );

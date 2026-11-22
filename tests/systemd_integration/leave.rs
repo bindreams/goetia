@@ -146,6 +146,44 @@ fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixt
     assert!(unit_files(&id).iter().all(|path| path.exists()));
 }
 
+/// The run a stand-in keeps is stopped by the next `uninstall` without `--no-stop`, which then removes the
+/// stand-in: afterwards nothing of the id is listed, whether the stopped run read as failed or not.
+#[skuld::test]
+fn an_uninstall_that_stops_the_run_a_standin_keeps_leaves_nothing_listed(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let mut run = SelfUninstalling::new(&id);
+    let spec = goetia::testing::task(&id, run.held.command.clone(), Some(DAILY));
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.enable(&id_of(&id)).expect("enable");
+    mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
+    run.held.wait_started();
+    let pid = run.pid();
+    assert!(standin(&id).exists(), "the run was left under a stand-in");
+
+    match mgr.uninstall(&id_of(&id), RunInFlight::Stop) {
+        Err(Error::NotInstalled { .. }) => {}
+        other => panic!("nothing is installed at `{id}`, got {other:?}"),
+    }
+
+    assert!(!standin(&id).exists(), "the stand-in is removed");
+    assert!(!Path::new(&format!("/proc/{pid}")).exists(), "the run was stopped");
+    let listed = cmd::run(
+        "systemctl",
+        &[
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            &unit_of(&id),
+            &format!("{id}.timer"),
+        ],
+    );
+    assert!(!listed.stdout.contains(&id), "nothing of the id is listed: {listed}");
+    assert_not_installed(&mgr, &id);
+}
+
 /// With no run in flight `--no-stop` is a plain uninstall: nothing is left, the stand-in included.
 #[skuld::test]
 fn no_stop_on_a_task_that_is_not_running_leaves_nothing(#[fixture(systemd_group)] _group: &Group) {
@@ -207,13 +245,11 @@ fn a_service_that_uninstalls_itself_with_no_stop_keeps_running_and_is_not_restar
     assert_not_installed(&mgr, &id);
 }
 
-/// A service that crashes at once and is restarted after goetia's default delay is, at any moment, a process
-/// or a restart waiting; `--no-stop` over either sends nothing to any process. A restart that was waiting
-/// is cleared (the reload fails it on the missing unit, and goetia clears what failed); a process is left
-/// to exit, and is not restarted when it does. So whichever it was, the unit ends `inactive` and unlisted, or
-/// `failed` with no restart behind it, and no process was ever signalled.
+/// A service whose process has exited and whose restart is waiting (a long delay holds it there) is uninstalled
+/// with `--no-stop`: nothing is sent and nothing is started. The reload fails the restart on the missing unit,
+/// so systemd lists the unit `not-found failed` until `systemctl reset-failed` clears it.
 #[skuld::test]
-fn no_stop_on_a_service_that_restarts_signals_nothing_and_is_not_restarted_again(
+fn no_stop_on_a_service_waiting_to_be_restarted_signals_nothing_and_leaves_it_failed_until_reset(
     #[fixture(systemd_group)] _group: &Group,
 ) {
     let id = support::random_test_id();
@@ -221,52 +257,48 @@ fn no_stop_on_a_service_that_restarts_signals_nothing_and_is_not_restarted_again
     let dir = tempfile::tempdir().expect("tempdir");
     let (starts, signals) = (dir.path().join("starts"), dir.path().join("signals"));
     let command = sh(&format!(
-        "echo $$ >> \"{}\"; trap 'echo signal >> \"{}\"' TERM INT HUP; sleep 0.2 & wait $!; exit 3",
+        "echo $$ >> \"{}\"; trap 'echo signal >> \"{}\"' TERM INT HUP; exit 3",
         starts.display(),
         signals.display()
     ));
-    let spec = restarting_service(&id, command, None);
+    let spec = restarting_service(&id, command, Some(Duration::from_secs(3600)));
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
     mgr.start(&id_of(&id), Budget::Immediate).expect("start");
-    let began = || fs::read_to_string(&starts).map_or(0, |text| text.lines().count());
-    wait::until_paced(Duration::from_millis(20), || began() >= 2);
+    wait::until_paced(Duration::from_millis(20), || {
+        let [state, sub] = show_properties(&unit_of(&id), ["ActiveState", "SubState"]);
+        state == "activating" && sub.starts_with("auto-restart")
+    });
 
     mgr.uninstall(&id_of(&id), RunInFlight::Leave).expect("uninstall");
 
     assert_not_installed(&mgr, &id);
-    let [restarts_at_return] = show_properties(&unit_of(&id), ["NRestarts"]);
-    wait::until_paced(Duration::from_millis(20), || {
-        let [state] = show_properties(&unit_of(&id), ["ActiveState"]);
-        matches!(state.as_str(), "inactive" | "failed")
-    });
-    let [state, load, main_pid, restarts] =
-        show_properties(&unit_of(&id), ["ActiveState", "LoadState", "MainPID", "NRestarts"]);
+    let [state, load, main_pid] = show_properties(&unit_of(&id), ["ActiveState", "LoadState", "MainPID"]);
+    assert_eq!((state.as_str(), load.as_str()), ("failed", "not-found"));
+    assert_eq!(main_pid, "0", "no process exists");
     assert_eq!(
-        restarts, restarts_at_return,
-        "nothing restarted it after the uninstall returned"
+        fs::read_to_string(&starts).expect("the run began").lines().count(),
+        1,
+        "nothing was started"
     );
-    assert_eq!(main_pid, "0", "no process is left");
-    let listed = cmd::run(
-        "systemctl",
-        &["list-units", "--all", "--plain", "--no-legend", &unit_of(&id)],
-    );
-    // A process caught between its fork and its exec is still in its start job, which gets a stand-in.
-    let loaded_from = if standin(&id).exists() { "loaded" } else { "not-found" };
-    match state.as_str() {
-        "inactive" => assert!(
-            !listed.stdout.contains(&id),
-            "a restart that was waiting is cleared, and nothing is left listed: {listed}"
-        ),
-        _ => assert_eq!(
-            load, loaded_from,
-            "a process that was left exited and was not restarted: {listed}"
-        ),
-    }
     assert!(
         fs::read_to_string(&signals).unwrap_or_default().is_empty(),
-        "no process was sent a signal"
+        "no signal was sent"
     );
+    assert!(!standin(&id).exists(), "a restart that is waiting gets no stand-in");
+    let list = || {
+        cmd::run(
+            "systemctl",
+            &["list-units", "--all", "--plain", "--no-legend", &unit_of(&id)],
+        )
+    };
+    let listed = list();
+    assert!(listed.stdout.contains("not-found failed"), "listed as failed: {listed}");
+
+    cmd::run("systemctl", &["reset-failed", &unit_of(&id)]).expect_ok();
+
+    let listed = list();
+    assert!(!listed.stdout.contains(&id), "reset-failed clears it: {listed}");
 }
 
 // A definition whose file is gone =====================================================================================

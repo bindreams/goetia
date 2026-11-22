@@ -55,7 +55,7 @@ use crate::manager::{Budget, DaemonStatus, RunInFlight, State, Status, TaskStatu
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
-use super::standin::{self, Holding, Known, Looked, Standin, standin_file, standin_path};
+use super::standin::{self, Clearing, Holding, Known, Standin, Target, standin_file, standin_path};
 use super::systemctl::{Held, TimerArming};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::{
@@ -353,15 +353,13 @@ fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
 impl Systemd {
     /// A task or service removed, with the run it has: see [`Systemd::settle`].
     pub(super) fn uninstall_units(&self, snapshot: Fragment, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
-        let id = snapshot.id.as_str().to_string();
-        self.settle(&id, in_flight, Some(snapshot), false, held)
+        self.settle(snapshot.id.as_str(), in_flight, Target::Installed(&snapshot), held)
     }
 
     /// The one executor of `uninstall` and `install` over a run and a stand-in. What is done is
     /// [`standin::plan`]'s, from what is known before the one read of the job's unit ([`Known`]) and what the
-    /// read shows; this does it in one order, which each caller shares. `installed` is the snapshot of an id
-    /// whose files this removes, and `None` for `uninstall` of an id nothing is installed at (`asks_held`) and
-    /// for `install`.
+    /// read shows; this does it in one order, which each caller shares. `target` says which caller this is, and
+    /// an installed id's snapshot is the files this removes.
     ///
     /// 1. Refuse: a file that is not goetia's at the stand-in's path refuses `Leave`, before anything is changed.
     /// 2. Disarm the timer, so no run starts after the read.
@@ -370,7 +368,6 @@ impl Systemd {
     /// 5. Write the stand-in, before any file is removed.
     /// 6. Remove the timer and the job, each verified against what `read` saw, and their drop-ins; remove the
     ///    stand-in (after `reset-failed` for a failed run); reload.
-    /// 7. When the plan says so, read the unit again and clear it if it failed.
     ///
     /// No `systemctl enable` or `disable` comes between the first removal and the reload, since both reload the
     /// manager at once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
@@ -378,11 +375,15 @@ impl Systemd {
         &self,
         id: &str,
         in_flight: RunInFlight,
-        installed: Option<Fragment>,
-        asks_held: bool,
+        target: Target<'_>,
         held: &mut Held,
     ) -> Result<()> {
-        let holding = match &installed {
+        let installed = match target {
+            Target::Installed(snapshot) => Some(snapshot),
+            Target::Sweep | Target::Install => None,
+        };
+        let asks_held = matches!(target, Target::Sweep);
+        let holding = match installed {
             Some(snapshot) if snapshot.service_text().is_some() => Holding::Job,
             Some(_) => Holding::NoJob,
             None => Holding::Absent,
@@ -401,17 +402,17 @@ impl Systemd {
             });
         }
 
-        if let Some(snapshot) = &installed
+        if let Some(snapshot) = installed
             && snapshot.timer().is_some()
         {
             self.systemctl.disable_timer(id, held)?;
         }
-        let looked = match self.look(id, &known) {
+        let seen = match self.look(id, &known) {
             // Nothing can be asked, so nothing is held: as before a held definition could be asked about.
             Err(Error::NoManager { .. }) if asks_held => return Ok(()),
-            looked => looked?,
+            seen => seen?,
         };
-        let plan = standin::plan(&known, looked.as_ref().map(Looked::seen).as_ref());
+        let plan = standin::plan(&known, seen.as_ref());
 
         if plan.stop {
             // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
@@ -421,7 +422,7 @@ impl Systemd {
                 .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
         }
         // A task's job has no `[Install]`: there is nothing to disable.
-        if let Some(snapshot) = &installed
+        if let Some(snapshot) = installed
             && snapshot.service_text().is_some()
             && !snapshot.is_task()
         {
@@ -438,7 +439,7 @@ impl Systemd {
         // Both attempted regardless of whether the first failed, and every failure reported together: a
         // partial failure here must not leave systemd's loaded view silently stale.
         let mut removed = Ok(());
-        if let Some(snapshot) = &installed {
+        if let Some(snapshot) = installed {
             // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file spans
             // `systemctl` round-trips, wide enough for something else to have replaced it.
             if let Some(timer) = snapshot.timer() {
@@ -452,8 +453,8 @@ impl Systemd {
                 removed = both(removed, remove_dir_if_present(&dropin_dir(id, UnitKind::Timer)));
             }
         }
-        if let Standin::Remove { failed } = plan.standin {
-            removed = both(removed, self.remove_standin(id, failed, held));
+        if let Standin::Remove { clearing } = plan.standin {
+            removed = both(removed, self.remove_standin(id, clearing == Clearing::Needed, held));
         }
         let reloaded = if plan.reload {
             self.systemctl.daemon_reload(held)
@@ -466,14 +467,7 @@ impl Systemd {
                 source: Box::new(e),
             }),
             settled => settled,
-        }?;
-
-        // A restart that was waiting failed on the missing unit when the manager reloaded, and no process
-        // started. One that has a process came first, and is left.
-        if plan.reread && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
-            self.systemctl.reset_failed(id, UnitKind::Service, held)?;
         }
-        Ok(())
     }
 }
 
