@@ -111,8 +111,10 @@ try {
     Write-Host ("SHUTDOWN: the container was gone after {0:N1} s" -f $elapsed.TotalSeconds)
 }
 finally {
-    # Only the container this script made.
+    # Only the container this script made. `--rm` may be removing it already, which makes this fail: the cleanup's exit
+    # code is not the script's verdict, so it is forgotten.
     if ($container) { docker rm -f $container *> $null }
+    $global:LASTEXITCODE = 0
 }
 
 # Judge ------------------------------------------------------------------------------------------------------------------
@@ -143,3 +145,4 @@ Expect "the second program was ended by the shim at its timeout (the shim's own 
 
 if ($failures.Count -gt 0) { throw "the demonstration failed: $($failures -join '; ')" }
 Write-Host 'The demonstration passed.'
+exit 0

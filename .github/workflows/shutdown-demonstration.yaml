@@ -48,7 +48,7 @@ jobs:
             exit 0
           fi
           files="$(gh api -X GET "repos/$REPO/pulls/$PULL/files" --paginate --jq '.[].filename')"
-          paths='^(src/backend/scm/shim/|src/backend/scm/generate\.rs$|src/backend/scm/manager\.rs$|src/spec/stop_action\.rs$|\.github/workflows/shutdown-demonstration\.yaml$|\.github/scripts/shutdown-demonstration/|Cargo\.lock$)'
+          paths='^(src/backend/scm/|src/bin/goetia-shim\.rs$|src/spec/stop_action\.rs$|Cargo\.toml$|Cargo\.lock$|\.github/workflows/shutdown-demonstration\.yaml$|\.github/scripts/shutdown-demonstration/)'
           if grep -Eq "$paths" <<< "$files"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
