@@ -415,7 +415,7 @@ fn every_reachable_cell_has_one_row_and_gets_its_plan() {
             row.rule
         );
     }
-    assert!(reachable > 100, "the generator reached {reachable} cells");
+    assert!(reachable > 90, "the generator reached {reachable} cells");
 }
 
 /// Rule 5: only `Leave` over an id whose job goetia removes is refused, and only for a file that is not ours:

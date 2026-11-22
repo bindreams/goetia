@@ -77,7 +77,7 @@ pub(super) enum Target<'a> {
 }
 
 impl Target<'_> {
-    /// What the call is about, for [`plan`].
+    /// What the call is about, for [`plan::plan`].
     pub(super) fn call(&self) -> Call {
         match self {
             Target::Installed(snapshot) if snapshot.service_text().is_some() => Call::Job,
@@ -166,4 +166,4 @@ impl Systemd {
 
 #[cfg(test)]
 #[path = "standin_tests.rs"]
-mod standin_tests;
+pub(super) mod standin_tests;

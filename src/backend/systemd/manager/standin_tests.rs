@@ -32,7 +32,7 @@ const SCHEDULE: Option<&str> = Some("30 3 * * *");
 /// The one read of a unit's run: these properties, in this order.
 const READ: &str = "ActiveState,SubState,KillSignal,TimeoutStopUSec,LoadState,FragmentPath";
 
-fn read_call(id: &str) -> Vec<String> {
+pub(in crate::backend::systemd::manager) fn read_call(id: &str) -> Vec<String> {
     call(&["show", "--property", READ, "--", &format!("{id}.service")])
 }
 
@@ -75,7 +75,7 @@ fn failed_reset(failed: bool) -> Vec<Entry> {
 
 /// The read of a left run with no process, and the `reset-failed` that follows only where the read says it failed:
 /// systemd refuses `reset-failed` of a unit that is not in memory, which one that did not fail is not.
-fn read_of(id: &str, failed: bool) -> Entry {
+pub(in crate::backend::systemd::manager) fn read_of(id: &str, failed: bool) -> Entry {
     if failed {
         state(id, "failed", "failed")
     } else {
@@ -730,7 +730,7 @@ fn a_foreign_file_at_the_standins_path_does_not_stop_a_stop(#[fixture(systemd_gr
     let _left = Leftovers::new(&id);
     installed(&id, SCHEDULE);
     seed_foreign_at(&id);
-    let fake = gate_then([disabled(), enqueued("stop", 3), reload()]);
+    let fake = gate_then([disabled(), enqueued("stop", 3), read_of(&id, false), reload()]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
