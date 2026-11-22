@@ -18,9 +18,11 @@
 //!    rewritten when this call writes one, and otherwise removed, in every state of the run and under both
 //!    choices, with no clearing of its own.
 //! 4. Where the stand-in is the unit's definition (the sweep of an absent id, a timer alone, an `install` over
-//!    no job file), one of ours that is not written goes: after the stop and the clearing of rule 2 for `Stop`; for `Leave`, when the
-//!    one read says the run has no process, after `reset-failed` if it failed. It stays while a run left by
-//!    `Leave` has a process.
+//!    no job file), one of ours that is not written goes: after the stop and the clearing of rule 2 for `Stop`;
+//!    for `Leave`, when the one read says the run has no process, after `reset-failed` if it failed. It stays
+//!    while a run left by `Leave` has a process. A stand-in is removed only if it is still the file read as
+//!    ours, and `reset-failed` is sent only after it was found so and moved aside; one that has vanished or
+//!    changed is left alone, and the call goes on.
 //! 5. A file at the stand-in's path that is not ours refuses `Leave` of a job goetia removes, before anything
 //!    is changed ([`Known::blocked`]): a stand-in could be written there. For a timer alone, with `Stop` and
 //!    where nothing is installed it is left alone.
