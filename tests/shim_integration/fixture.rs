@@ -39,13 +39,17 @@
 //!   connects to `<port>` and writes its pid, and blocks. On the event `<exit-on>` names (`ctrl-c`,
 //!   `ctrl-break`, `close`; `none` never) it records `daemon: exiting by the event` and exits 0; any other event
 //!   is handled and ignored. `close` is `CTRL_CLOSE_EVENT`, which is what a task's `stop` sends.
-//! - `catch-recording <port> <record> <runs-dir>` — `catch` with `close` as the event it exits on, which it
-//!   exits on only once `<runs-dir>` (a task's run records) holds a record. The program and the shim are sent
-//!   the close event together, and a program that exits at once can beat the shim's handler, so the run's
-//!   record would be its exit; waiting for the record is what makes the order the test looks at. With `launcher` it starts a `catch-worker` of the same record first and reports
-//!   nothing itself: the worker does, so a report means both handlers are in place. Once its handler is in
-//!   place it also creates `<record>.started` ([`started_marker`]), so that a daemon that was never started
-//!   is told from one that was started and received nothing.
+//!   With `launcher` it starts a `catch-worker` of the same record first and reports nothing itself: the worker
+//!   does, so a report means both handlers are in place. Once its handler is in place it also creates
+//!   `<record>.started` ([`started_marker`]), so that a daemon that was never started is told from one that was
+//!   started and received nothing.
+//! - `catch-close <port> <record> <code>` — `catch` that, on the close event (what a task's `stop` sends),
+//!   records `daemon: exiting by the event` and exits with `<code>`.
+//! - `catch-hang <port> <record>` — `catch` that, on the close event, records it and never leaves its handler.
+//! - `detach <port> <record> <runs-dir> <code|never>` — leaves the console (`FreeConsole`), so that the close
+//!   event does not reach it, then writes its pid to `<port>` and waits for `<runs-dir>` (a task's run records) to
+//!   hold a record, which only a stop makes the shim write while the program is alive. It notes the record's text in
+//!   `<record>` (`daemon: record=<json>`) and then exits with `<code>`, or, for `never`, blocks forever.
 //! - `catch-worker <record> <exit-on> <port>` — `catch` as the launcher's worker: on the event it takes 600 ms
 //!   to shut down (a slow shutdown, which the launcher's own exit must not cut short), then records
 //!   `worker: exiting by the event` and exits 0.
@@ -59,7 +63,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, FreeConsole, SetConsoleCtrlHandler,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
 
 use crate::support::sentinel::{connect, open, send_line};
@@ -174,7 +180,8 @@ pub fn run_if_requested() -> bool {
                 exit_on,
                 role: if launcher { "launcher" } else { "daemon" },
                 linger: Duration::ZERO,
-                recorded_in: None,
+                exit_code: 0,
+                hangs: false,
             });
             if launcher {
                 // Not waited on: it ends by the event, or with the job that holds this tree.
@@ -192,17 +199,52 @@ pub fn run_if_requested() -> bool {
             }
             block_forever();
         }
-        "catch-recording" => {
+        "catch-close" => {
             let port: u16 = args[3].parse().expect("port");
             catch_events(Catch {
                 record: PathBuf::from(&args[4]),
                 exit_on: exit_on("close"),
                 role: "daemon",
                 linger: Duration::ZERO,
-                recorded_in: Some(PathBuf::from(&args[5])),
+                exit_code: args[5].parse().expect("code"),
+                hangs: false,
             });
             send_line(port, &std::process::id().to_string());
             block_forever();
+        }
+        "catch-hang" => {
+            let port: u16 = args[3].parse().expect("port");
+            catch_events(Catch {
+                record: PathBuf::from(&args[4]),
+                exit_on: exit_on("close"),
+                role: "daemon",
+                linger: Duration::ZERO,
+                exit_code: 0,
+                hangs: true,
+            });
+            send_line(port, &std::process::id().to_string());
+            block_forever();
+        }
+        "detach" => {
+            let port: u16 = args[3].parse().expect("port");
+            let record = PathBuf::from(&args[4]);
+            let runs = PathBuf::from(&args[5]);
+            // `never` ends nothing by itself: the test reads what Windows leaves.
+            let code: Option<i32> = (args[6] != "never").then(|| args[6].parse().expect("code"));
+            // SAFETY: no argument; it detaches this process from the console it shares with the shim.
+            assert_ne!(
+                unsafe { FreeConsole() },
+                0,
+                "FreeConsole: {}",
+                std::io::Error::last_os_error()
+            );
+            send_line(port, &std::process::id().to_string());
+            let seen = await_record(&runs);
+            append_line(&record, "daemon", &format!("record={seen}"));
+            match code {
+                Some(code) => std::process::exit(code),
+                None => block_forever(),
+            }
         }
         "catch-worker" => {
             let record = PathBuf::from(&args[3]);
@@ -212,7 +254,8 @@ pub fn run_if_requested() -> bool {
                 exit_on: exit_on(&args[4]),
                 role: "worker",
                 linger: Duration::from_millis(600),
-                recorded_in: None,
+                exit_code: 0,
+                hangs: false,
             });
             send_line(port, &std::process::id().to_string());
             block_forever();
@@ -235,8 +278,10 @@ struct Catch {
     role: &'static str,
     /// How long it takes to end once the event it exits on arrives.
     linger: Duration,
-    /// A directory that must hold a run record before it ends.
-    recorded_in: Option<PathBuf>,
+    /// The code it ends with.
+    exit_code: i32,
+    /// Whether it never leaves the handler of the event it exits on, instead of exiting.
+    hangs: bool,
 }
 
 static CATCH: OnceLock<Catch> = OnceLock::new();
@@ -273,14 +318,18 @@ pub fn started_marker(record: &Path) -> PathBuf {
 /// One line of the record, appended in one write so that the two processes of a launcher's tree cannot split
 /// each other's.
 fn note(catch: &Catch, line: &str) {
-    let line = format!("{}: {line}\n", catch.role);
+    append_line(&catch.record, catch.role, line);
+}
+
+fn append_line(record: &Path, role: &str, line: &str) {
+    let line = format!("{role}: {line}\n");
     let written = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&catch.record)
+        .open(record)
         .and_then(|mut file| file.write_all(line.as_bytes()));
     if let Err(e) = written {
-        eprintln!("the record {} was not written: {e}", catch.record.display());
+        eprintln!("the record {} was not written: {e}", record.display());
     }
 }
 
@@ -298,26 +347,27 @@ unsafe extern "system" fn on_event(event: u32) -> i32 {
     note(catch, &format!("event={name} at_us={at}"));
     if Some(event) == catch.exit_on {
         std::thread::sleep(catch.linger);
-        if let Some(dir) = &catch.recorded_in {
-            await_record(dir);
+        if catch.hangs {
+            block_forever();
         }
         note(catch, "exiting by the event");
-        std::process::exit(0);
+        std::process::exit(catch.exit_code);
     }
     1
 }
 
-/// Returns once `dir` holds a run record (`<instance>.json`). Each pass re-reads the directory, and none ends the
-/// wait by its length: Windows ends a close handler that takes more than a few seconds, which is its bound.
-fn await_record(dir: &Path) {
+/// The text of the run record (`<instance>.json`) once `dir` holds one. Each pass re-reads the directory, and none
+/// ends the wait by its length.
+fn await_record(dir: &Path) -> String {
     loop {
-        let held = std::fs::read_dir(dir).is_ok_and(|entries| {
+        let held = std::fs::read_dir(dir).ok().and_then(|entries| {
             entries
                 .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+                .find_map(|entry| std::fs::read_to_string(entry.path()).ok())
         });
-        if held {
-            return;
+        if let Some(text) = held {
+            return text;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
