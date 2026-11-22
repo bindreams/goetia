@@ -428,38 +428,27 @@ impl Systemd {
         {
             self.systemctl.disable_impl(id, held)?;
         }
-        let wrote = match &plan.standin {
-            Standin::Write {
-                kill_signal,
-                stop_timeout,
-            } => Some(self.write_standin(id, &file, kill_signal, stop_timeout)?),
-            _ => None,
-        };
+        if let Standin::Write {
+            kill_signal,
+            stop_timeout,
+        } = &plan.standin
+        {
+            self.write_standin(id, &file, kill_signal, stop_timeout)?;
+        }
 
-        // A verified removal of the timer or the job that fails aborts here. The stand-in this call wrote is
-        // taken back, verified against its text, where a file at the job's path outranks it (a failure of that
-        // is reported with the error); with the path empty it is the unit's definition and stays
-        // ([`Systemd::take_back_standin`]). Past them the removals are all attempted and every failure is
-        // reported together, so the reload still runs.
+        // A verified removal of the timer or the job that fails aborts here with its own error. A stand-in this
+        // call wrote stays: whether it is stale would take a second, racy look at the job's path, and the README
+        // says what removes it. Past them the removals are all attempted and every failure is reported together,
+        // so the reload still runs.
         let mut removed = Ok(());
         if let Some(snapshot) = installed {
             // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file spans
             // `systemctl` round-trips, wide enough for something else to have replaced it.
-            let files: Result<()> = (|| {
-                if let Some(timer) = snapshot.timer() {
-                    remove_verified(Path::new(UNIT_DIR), id, UnitKind::Timer, &timer.text)?;
-                }
-                if let Some(job) = snapshot.service_text() {
-                    remove_verified(Path::new(UNIT_DIR), id, UnitKind::Service, job)?;
-                }
-                Ok(())
-            })();
-            if let Err(e) = files {
-                let unwritten = match &wrote {
-                    Some(text) => self.take_back_standin(id, text, held),
-                    None => Ok(()),
-                };
-                return both(Err(e), unwritten);
+            if let Some(timer) = snapshot.timer() {
+                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Timer, &timer.text)?;
+            }
+            if let Some(job) = snapshot.service_text() {
+                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Service, job)?;
             }
             removed = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
             if snapshot.owns_timer_slot() {

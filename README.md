@@ -2092,11 +2092,15 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
   with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and
   the run. `uninstall` without the flag of an id nobody installed stops the run, clears it with
   `systemctl reset-failed` only if the stopped run failed, then removes the file. Once the id is installed again,
-  the installed file outranks the stand-in, which is stale. The next `install` that changes the definition and the
+  the installed file outranks the stand-in, which is stale. The next `install` that rewrites the unit and the
   next `uninstall` of the id, with or without the flag, remove it whatever the run is doing (with `--no-stop`, a
   run still in its start job gets a fresh one), and clear nothing of the run, which is the installed job's. An
   `install` that finds the definition up to date does not touch it: the installed unit shadows it, and a reboot
-  removes it.
+  removes it. An `uninstall --no-stop` that fails after writing the stand-in leaves it, and it is then removed as
+  above: while goetia's unit file is still installed the file shadows it, and with the file gone the stand-in is
+  the unit's definition. If another program put its own unit file at the id during the call, goetia refuses the id
+  as not its own, and the stand-in stays in `/run/systemd/system/` until a reboot, until you remove it, or until
+  that file is gone and the next `uninstall` of the id removes it.
 - A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an id whose job
   goetia removes refuses with an error naming the path, whether or not a run is in flight, and before anything
   is changed, the timer included. Remove the file, or uninstall without `--no-stop`. For a task whose timer alone

@@ -16,7 +16,7 @@
 //!    id nothing is installed at, whose unit may be somebody else's. Where an installed job file is there (an
 //!    `uninstall` of a held job, an `install` over one) it outranks a stand-in of ours, which is stale: it is
 //!    rewritten when this call writes one, and otherwise removed, in every state of the run and under both
-//!    choices, with no clearing of its own.
+//!    choices, with no clearing of its own. A stand-in this call wrote is not taken back when a removal fails.
 //! 4. Where the stand-in is the unit's definition (the sweep of an absent id, a timer alone, an `install` over
 //!    no job file), one of ours that is not written goes. `Stop` stops first and clears the run that failed
 //!    (rule 2), as a stop precedes the verified removal of the installed units. `Leave` removes it when the one

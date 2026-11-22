@@ -101,14 +101,14 @@ impl Systemd {
 
     /// The stand-in for the run of `id`, written without replacing a file that is not one of goetia's: a
     /// stand-in of ours already there is replaced, since its values are an earlier job's. A file that is
-    /// not ours, which appeared after the check, is [`Error::ConcurrentChange`]. The text written is returned.
+    /// not ours, which appeared after the check, is [`Error::ConcurrentChange`].
     pub(super) fn write_standin(
         &self,
         id: &str,
         file: &StandinFile,
         kill_signal: &str,
         stop_timeout: &str,
-    ) -> Result<String> {
+    ) -> Result<()> {
         let dir = Path::new(RUNTIME_UNIT_DIR);
         fs::create_dir_all(dir).map_err(|e| Error::os_at("create", dir, e))?;
         let text = generate::standin(id, kill_signal, stop_timeout);
@@ -127,7 +127,7 @@ impl Systemd {
                 path: Some(standin_path(id)),
             });
         }
-        Ok(text)
+        Ok(())
     }
 
     /// The stand-in of `id` removed if it is still the file read as ours (`text`), the manager being reloaded by
@@ -143,18 +143,6 @@ impl Systemd {
             Ok(())
         })
         .map(|_| ())
-    }
-
-    /// The stand-in this call wrote (`text`), after the verified removal of the timer or the job failed. A file at
-    /// the job's path, ours or anybody's, outranks it, so it is stale and removed like any other. With the path
-    /// empty (the job vanished since the read, or a restore failed) it is the unit's definition, and removing it
-    /// would let the next reload end a run in its start job: it stays. So it does where presence cannot be
-    /// settled, which is the safer error.
-    pub(super) fn take_back_standin(&self, id: &str, text: &str, held: &mut Held) -> Result<()> {
-        match classify_and_read(&unit_path(id, UnitKind::Service)) {
-            Ok(RawState::Regular(_) | RawState::NotOurs) => self.remove_standin(id, text, false, held),
-            Ok(RawState::Absent) | Err(_) => Ok(()),
-        }
     }
 
     /// `install`'s part, `over_job` saying whether the id's job file is installed: a stand-in of ours is then
