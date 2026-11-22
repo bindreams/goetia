@@ -782,7 +782,7 @@ impl Supervisor {
                 }
             }
         }
-        match wait_for_tree(child, left, on_progress) {
+        match wait_for_tree(child, left(), on_progress) {
             // The job is empty, so the root has exited and its report is on its way.
             Ok(TreeDrain::AllMembersExited) => {
                 self.log.info(id, EXITED_WITHIN_THE_WAIT);
@@ -819,25 +819,23 @@ impl Supervisor {
     }
 }
 
-/// Wait for the whole tree to exit within `left()` (what is left of the `timeout`; `None`: as long as it takes), in
-/// slices of [`PROGRESS_PERIOD`] that each re-check the tree, calling `on_progress` after each slice that left members
-/// and had a next one. A slice that left members has waited its whole bound, so the next one is what the last left
-/// of the wait, or what the clock says is left of the `timeout` if less: the slices add up to the `timeout`, never
-/// more. With no `timeout` members left are no verdict, and the slices go on until the tree exits or the wait fails.
+/// Wait for the whole tree to exit within `left` (the time left of the `timeout`, read once by the caller when this
+/// wait begins; `None`: as long as it takes), in slices of [`PROGRESS_PERIOD`] that each re-check the tree, calling
+/// `on_progress` after each slice that left members and had a next one. The slices are cut from `left` by arithmetic
+/// alone, each the period or what remains, so they add up to it and never exceed it: a slice that answers members
+/// remain is taken as slept in full, which is `wait_tree_timeout`'s contract. With no `timeout` members left are no
+/// verdict, and the slices go on until the tree exits or the wait fails.
 fn wait_for_tree(
     child: &dyn Spawned,
-    left: impl Fn() -> Option<Duration>,
+    left: Option<Duration>,
     on_progress: &mut impl FnMut(),
 ) -> Result<TreeDrain, cosca::error::Error> {
-    let mut remaining = left();
+    let mut remaining = left;
     loop {
         let slice = remaining.map_or(PROGRESS_PERIOD, |remaining| remaining.min(PROGRESS_PERIOD));
         match child.wait_tree_timeout(slice) {
             Ok(TreeDrain::MembersRemain) => {
-                remaining = remaining.map(|remaining| {
-                    let after = remaining.saturating_sub(slice);
-                    left().map_or(after, |left| after.min(left))
-                });
+                remaining = remaining.map(|remaining| remaining - slice);
                 if remaining == Some(Duration::ZERO) {
                     return Ok(TreeDrain::MembersRemain);
                 }

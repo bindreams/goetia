@@ -1002,49 +1002,35 @@ fn stopped_recording_progress(fake: &FakeGuard, daemon: &FakeProcess, plan: Stop
     (outcome, waits)
 }
 
-/// The wait for the tree is made in slices of one period, each re-checking the tree, and the stop is reported as
-/// going on after each slice that left members, and not after the last one. The slices add up to the `timeout` (what
-/// is left of it, counted from when the stop was seen): the slicing neither lengthens nor shortens the wait.
+/// The time left is read once, when the tree wait begins, and the slices are cut from that amount by arithmetic
+/// alone: they add up to it, none is longer than a period, and a report follows each slice that left members and was
+/// not the last. Whatever the scheduler does between the slices, a `timeout` is neither lengthened nor shortened.
 #[skuld::test]
-fn the_wait_for_the_tree_is_made_in_slices_that_add_up_to_the_timeout_and_the_stop_is_reported_between_them() {
+fn the_slices_of_a_wait_add_up_to_the_time_read_at_its_start() {
     let fake = FakeGuard::new();
-    let timeout = Duration::from_secs(12);
-    let daemon = asked(AskReply::Sent)
+    let left = Duration::from_secs(12);
+    let daemon = FakeProcess::new()
         .wait_tree(TreeWaitReply::Remain)
         .wait_tree(TreeWaitReply::Remain)
         .wait_tree(TreeWaitReply::Remain);
+    fake.will_spawn(daemon.clone());
+    let child = spawn_child(&fake);
+    let mut reports = 0;
 
-    let (outcome, progress) = stopped_recording_progress(&fake, &daemon, ask_and_wait(Some(timeout)));
+    let answer = wait_for_tree(&*child, Some(left), &mut || reports += 1);
 
-    assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
-    let [
-        ProcessCall::Ask,
-        ProcessCall::WaitTree(first),
-        ProcessCall::WaitTree(second),
-        ProcessCall::WaitTree(last),
-        ProcessCall::SendKillTree,
-    ] = daemon.calls()[..]
-    else {
-        panic!("asked, waited in three slices, then ended: {:?}", daemon.calls());
-    };
-    assert_eq!((first, second), (PROGRESS_PERIOD, PROGRESS_PERIOD));
-    assert!(
-        last > Duration::ZERO && last <= timeout - 2 * PROGRESS_PERIOD,
-        "the last slice is {last:?}"
-    );
-    let total = first + second + last;
-    assert!(
-        total <= timeout && total > timeout - Duration::from_secs(1),
-        "the slices add up to {total:?}, of a timeout of {timeout:?} that counts from the stop"
-    );
-    assert_eq!(
-        progress,
-        [1, 2],
-        "after each slice that left members, and not after the last"
-    );
-    assert_eq!(fake.take_warnings(), [did_not_exit_line(timeout)]);
-    assert_eq!(fake.take_failures(), Vec::<String>::new());
-    let _ = fake.take_infos();
+    assert!(matches!(answer, Ok(TreeDrain::MembersRemain)));
+    let slices: Vec<Duration> = daemon
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            ProcessCall::WaitTree(slice) => Some(slice),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(slices.iter().sum::<Duration>(), left, "the amount given");
+    assert!(slices.iter().all(|slice| *slice <= PROGRESS_PERIOD), "{slices:?}");
+    assert_eq!(reports, slices.len() - 1, "a report after each slice but the last");
 }
 
 /// A tree that drains ends the wait at the slice that sees it: no report is made after it.

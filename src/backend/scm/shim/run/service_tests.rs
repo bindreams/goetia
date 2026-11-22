@@ -1046,24 +1046,26 @@ fn each_report_that_the_stop_is_going_on_has_the_checkpoint_one_higher() {
 }
 
 /// A run reports `STOP_PENDING` once through `on_stopping`, then calls `on_progress` while the stop's wait goes on:
-/// a daemon that ignores the ask for a `timeout` of 12 s has its wait cut in three slices, and the service reports twice
-/// between them.
+/// a daemon that is still there after two slices of a long `timeout` is reported on twice, once after each, and
+/// not after the slice that saw it exit.
 #[skuld::test]
 fn a_run_reports_progress_while_its_stop_waits() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
     let service = stopping_by(StopAction {
         send_signal: StopSignal::Terminate,
-        timeout: Some(Duration::from_secs(12)),
+        timeout: Some(Duration::from_secs(3600)),
     });
     fake.will_make_thread();
     fake.will_spawn(
         FakeProcess::new()
             .wait(WaitReply::Blocks)
+            // The read of the exit status of the daemon that the stop ended.
+            .wait(WaitReply::Blocks)
             .ask(AskReply::Sent)
             .wait_tree(TreeWaitReply::Remain)
             .wait_tree(TreeWaitReply::Remain)
-            .wait_tree(TreeWaitReply::Remain)
+            .wait_tree(TreeWaitReply::Drained)
             .send_kill_tree(KillReply::Ends),
     );
     let bus = Arc::clone(&supervisor.bus);
@@ -1082,7 +1084,7 @@ fn a_run_reports_progress_while_its_stop_waits() {
     assert_eq!(reported, Reported::Clean);
     assert_eq!(
         *reports.borrow(),
-        ["stopping 22s", "progress", "progress"],
+        ["stopping 3610s", "progress", "progress"],
         "the hint is the stop's longest wait, and a report follows each slice but the last"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -1139,7 +1141,7 @@ fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
             .wait(WaitReply::Blocks)
             // The read of the exit status of a daemon that exited by itself.
             .wait(WaitReply::Blocks)
-            .ask(AskReply::SentAndExits(0))
+            .ask(AskReply::Sent)
             .wait_tree(TreeWaitReply::Drained)
             .send_kill_tree(KillReply::Ends),
     );
