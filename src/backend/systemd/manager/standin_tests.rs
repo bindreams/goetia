@@ -916,39 +916,110 @@ fn leaving_a_timer_alone_leaves_a_standin_with_a_run_going(#[fixture(systemd_gro
     }
 }
 
-/// A stand-in is removed only while it is still the file that was read as ours: another program's file written at
-/// its path since is a [`Error::ConcurrentChange`] naming the stand-in, and is left where it is. Through the
-/// uninstall of a held job (where the stand-in is stale) and the sweep of an absent id.
+/// A stand-in that has vanished since the read, or is no longer the file read as ours (another program's file
+/// written at its path), is not goetia's to remove and not an error: it is left as it is, nothing is sent for it
+/// (`reset-failed` included, though the run read `failed`) and the call goes on to the reload. Through the uninstall
+/// of a held job (where the stand-in is stale) and the sweep of an absent id.
 #[skuld::test]
-fn a_standin_replaced_since_the_read_is_not_removed(#[fixture(systemd_group)] _group: &Group) {
+fn a_standin_that_is_gone_or_no_longer_ours_is_left_alone_and_the_call_goes_on(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     for held_job in [true, false] {
-        let id = fresh_id("systemd");
-        let _left = Leftovers::new(&id);
-        seed_standin(&id, "15", "1min 30s");
-        let appears = id.clone();
-        let foreign = move || seed_foreign_at(&appears);
-        let e = if held_job {
-            installed(&id, None);
-            let fake = gate_then([state(&id, "active", "running").then(foreign), reload()]);
-            let mgr = over(&fake);
-            let snapshot = marked(&mgr, &id);
-            mgr.uninstall_units(snapshot, RunInFlight::Leave, &mut held(&mgr))
-                .expect_err("the stand-in changed")
-        } else {
-            let fake = read_then_gate([read_of(&id, false).then(foreign)], [reload()]);
-            uninstall_absent(&over(&fake), &id, RunInFlight::Leave).expect_err("the stand-in changed")
-        };
+        for vanishes in [true, false] {
+            let id = fresh_id("systemd");
+            let _left = Leftovers::new(&id);
+            seed_standin(&id, "15", "1min 30s");
+            let appears = id.clone();
+            let change = move || {
+                if vanishes {
+                    std::fs::remove_file(standin_path(&appears)).expect("remove the stand-in");
+                } else {
+                    seed_foreign_at(&appears);
+                }
+            };
+            let (result, calls) = if held_job {
+                installed(&id, None);
+                let fake = gate_then([state(&id, "active", "running").then(change), reload()]);
+                let mgr = over(&fake);
+                let snapshot = marked(&mgr, &id);
+                let result = mgr.uninstall_units(snapshot, RunInFlight::Leave, &mut held(&mgr));
+                (result, calls_of(&fake))
+            } else {
+                let fake = read_then_gate([read_of(&id, true).then(change)], [reload()]);
+                let result = uninstall_absent(&over(&fake), &id, RunInFlight::Leave);
+                (result, calls_of(&fake))
+            };
 
-        assert!(
-            matches!(&e, Error::ConcurrentChange { path: Some(path), .. } if *path == standin_path(&id)),
-            "held job {held_job}: {e:?}"
-        );
-        assert_eq!(
-            standin_text(&id).as_deref(),
-            Some(seed_foreign()),
-            "held job {held_job}: the foreign file is untouched"
-        );
+            let case = format!("held job {held_job}, vanished {vanishes}");
+            if held_job {
+                result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            } else {
+                assert!(matches!(result, Err(Error::NotInstalled { .. })), "{case}: {result:?}");
+            }
+            assert_eq!(calls, [read_call(&id), reload_call()], "{case}");
+            let left = (!vanishes).then(|| seed_foreign().to_string());
+            assert_eq!(standin_text(&id), left, "{case}");
+        }
     }
+}
+
+/// The identity check comes before the `reset-failed`: it is sent after the stand-in has been moved aside as the
+/// file read as ours, never before.
+#[skuld::test]
+fn a_failed_run_is_cleared_only_after_its_standin_is_found_ours_and_moved_aside(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    seed_standin(&id, "15", "1min 30s");
+    let path = standin_path(&id);
+    let fake = read_then_gate(
+        [read_of(&id, true)],
+        [
+            reset_failed().then(move || assert!(!path.exists(), "the stand-in is moved aside before the clearing")),
+            reload(),
+        ],
+    );
+
+    let result = uninstall_absent(&over(&fake), &id, RunInFlight::Leave);
+
+    assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
+    assert_eq!(calls_of(&fake), [read_call(&id), reset_call(&id), reload_call()]);
+    assert_eq!(standin_text(&id), None);
+}
+
+/// A removal of the job that fails after this call wrote a stand-in does not leave that stand-in behind: it is
+/// removed again, verified against the text written, before the error is returned.
+#[skuld::test]
+fn a_failed_removal_of_the_job_removes_the_standin_this_call_wrote(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    seed(&id, UnitKind::Service, &units_of(&service_spec(&id)).service);
+    let job = unit_path(&id, UnitKind::Service);
+    let replaced = job.clone();
+    let fake = gate_then([
+        state(&id, "activating", "start").then(move || {
+            std::fs::write(&replaced, seed_foreign()).expect("replace the job with another file");
+        }),
+        disabled(),
+    ]);
+    let mgr = over(&fake);
+    let snapshot = marked(&mgr, &id);
+
+    let e = mgr
+        .uninstall_units(snapshot, RunInFlight::Leave, &mut held(&mgr))
+        .expect_err("the job changed");
+
+    assert!(
+        matches!(&e, Error::ConcurrentChange { path: Some(path), .. } if *path == job),
+        "{e:?}"
+    );
+    assert_eq!(standin_text(&id), None, "the stand-in this call wrote is gone");
+    assert_eq!(
+        std::fs::read_to_string(&job).ok().as_deref(),
+        Some(seed_foreign()),
+        "the other file is untouched"
+    );
 }
 
 /// `uninstall` of an absent id: `Stop` stops the stand-in's run and reads after the stop whether it failed,
@@ -1066,6 +1137,29 @@ fn an_install_over_a_left_run_leaves_the_standin_and_is_not_refused(#[fixture(sy
         assert!(!calls_of(&fake).iter().any(|c| c[0] == "stop" || c[0] == "reset-failed"));
         assert_eq!(standin_text(&id), Some(default_standin(&id)), "{active}");
     }
+}
+
+/// An `install` over an id whose job file is installed finds a stand-in of ours stale: the installed file outranks
+/// it, so it is removed whatever the run is doing, with nothing read and nothing cleared (a failed run is the job's).
+#[skuld::test]
+fn an_install_over_an_installed_job_removes_a_standin_of_ours_and_reads_nothing(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let spec = task_spec(&id, "/bin/a", SCHEDULE);
+    let units = units_of(&spec);
+    seed(&id, UnitKind::Service, &units.service);
+    seed_standin(&id, "15", "1min 30s");
+    let fake = gate_then([reload(), reload()]);
+    let mgr = over(&fake);
+
+    let outcome = install(&mgr, &spec);
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert_eq!(calls_of(&fake), [reload_call(), reload_call()]);
+    assert_eq!(standin_text(&id), None);
+    assert_eq!(text_of(&id, UnitKind::Timer), units.timer, "and the timer is written");
 }
 
 /// With no stand-in of ours an `install` asks nothing of systemd about a run: only the units are written.

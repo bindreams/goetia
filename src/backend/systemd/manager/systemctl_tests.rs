@@ -1490,6 +1490,33 @@ fn run_of_table() {
     }
 }
 
+/// An answer with no `Job` line at all means no job is pending, as an empty `Job=` does; the other properties are
+/// still required.
+#[skuld::test]
+fn run_of_reads_a_missing_job_line_as_no_job_pending() {
+    for (active, spelling, phase) in [
+        ("inactive", "Job=\n", RunPhase::None),
+        ("inactive", "", RunPhase::None),
+        ("failed", "Job=\n", RunPhase::None),
+        ("failed", "", RunPhase::None),
+        ("inactive", "Job=412\n", RunPhase::InStartJob),
+    ] {
+        let answer = format!(
+            "ActiveState={active}\nSubState=dead\n{spelling}KillSignal=15\nTimeoutStopUSec=1min 30s\n\
+             LoadState=loaded\nFragmentPath=/etc/systemd/system/x.service\n"
+        );
+        assert_eq!(
+            showing(&answer).run_of("x.service").expect(active).phase,
+            phase,
+            "{active} {spelling:?}"
+        );
+    }
+    let no_kill_signal =
+        "ActiveState=inactive\nSubState=dead\nTimeoutStopUSec=1min 30s\nLoadState=loaded\nFragmentPath=\n";
+    let e = showing(no_kill_signal).run_of("x.service").expect_err("incomplete");
+    assert!(matches!(e, Error::IncompleteAnswer { .. }), "{e:?}");
+}
+
 /// A unit systemd has no file for is answered like any other, not an error: the absent id's read is of it.
 #[skuld::test]
 fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
