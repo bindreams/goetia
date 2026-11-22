@@ -12,7 +12,7 @@ use super::super::support::{
 use super::*;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::runs::RunOutcome;
-use crate::backend::scm::test_support::task_spec;
+use crate::backend::scm::test_support::{directory_with_a_file, task_spec};
 use crate::spec::{DaemonSpec, TaskSpec};
 
 fn named(n: u8, pid: u32) -> Started {
@@ -323,77 +323,34 @@ fn a_listing_that_fails_after_the_start_leaves_the_run_unrecorded() {
     assert!(failed.report().to_string().contains("busy"), "{failed}");
 }
 
-/// `Run` named none of ours, and a scheduled run began and was stopped between `run`'s two reads: the first
-/// `Stopped` is on disk while the run is alive. A listing read after the record says it is listed, and the run
-/// is followed as a live one, to its own exit.
+/// A first `Stopped` that `run` reads while its run is alive is not confirmed by a listing: Task Scheduler stops listing
+/// an instance within milliseconds of a stop while its shim lives about a second more. The run is followed as ended, and
+/// `wait` settles it by the pin its writer holds: here the shim is gone (its pin is), and nothing recorded after, so the
+/// answer is the first `Stopped`, after one read of the listing.
 #[skuld::test]
-fn a_first_stopped_record_of_a_run_that_is_listed_on_the_second_read_is_followed_as_live() {
+fn a_first_stopped_of_a_run_whose_shim_is_gone_is_stopped_after_one_listing() {
     let (dir, _path, runs) = records();
-    let shim = Runs::of(dir.path(), &id());
     let first = Runs::of(dir.path(), &id());
     let fake = Fake::new();
     fake.on_run(Ok(unnamed(9)))
         .during(move || shim_writes_stopping(&first, 1))
-        .on_instances(Ok(Vec::new()))
-        .on_instances(Ok(vec![instance(1, 4242)]))
-        .on_instances(Ok(vec![instance(1, 4242)]))
-        .on_instances(Ok(vec![instance(1, 4242)]));
-    let mut machine = Machine::new(&fake, &[4242]);
-    machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::Exited(3))));
-
-    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
-
-    assert_eq!(
-        run.wait().unwrap(),
-        Exit::Code(3),
-        "the run's own exit, not the first `Stopped`"
-    );
-    assert_eq!(
-        fake.calls(),
-        [
-            Call::Run(PATH.to_owned()),
-            Call::Instances(PATH.to_owned()),
-            Call::Instances(PATH.to_owned()),
-            Call::Instances(PATH.to_owned()),
-            Call::Instances(PATH.to_owned())
-        ],
-        "the confirming read, then the hold's own second read and the wait's"
-    );
-    fake.finish();
-}
-
-/// The same record, and the run is not listed on the confirming read: it has ended, and the record is read
-/// again, which is its final one.
-#[skuld::test]
-fn a_first_stopped_record_of_a_run_that_is_not_listed_on_the_second_read_is_read_again() {
-    let (dir, _path, runs) = records();
-    let shim = Runs::of(dir.path(), &id());
-    let first = Runs::of(dir.path(), &id());
-    let fake = Fake::new();
-    fake.on_run(Ok(unnamed(9)))
-        .during(move || shim_writes_stopping(&first, 1))
-        .on_instances(Ok(Vec::new()))
-        .on_instances(Ok(Vec::new()))
-        .during(move || shim_writes(&shim, &record(1, RunOutcome::Exited(5))));
+        .on_instances(Ok(Vec::new()));
 
     let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
 
-    assert_eq!(run.wait().unwrap(), Exit::Code(5), "the record read again");
+    assert_eq!(run.wait().unwrap(), Exit::Code(CLOSED as i32));
     assert_eq!(
         fake.calls(),
-        [
-            Call::Run(PATH.to_owned()),
-            Call::Instances(PATH.to_owned()),
-            Call::Instances(PATH.to_owned())
-        ]
+        [Call::Run(PATH.to_owned()), Call::Instances(PATH.to_owned())],
+        "no second read of the listing"
     );
     fake.finish();
 }
 
-/// Only a `Stopped` record, which a live run writes first, is confirmed: any other costs no read.
+/// No record costs a second listing, whatever its outcome.
 #[skuld::test]
-fn a_record_that_is_not_stopped_costs_no_second_listing() {
-    for outcome in [RunOutcome::Exited(0), RunOutcome::IncompleteStop] {
+fn a_record_costs_no_second_listing_whatever_its_outcome() {
+    for outcome in [RunOutcome::Exited(0), RunOutcome::Stopped, RunOutcome::IncompleteStop] {
         let (dir, _path, runs) = records();
         let shim = Runs::of(dir.path(), &id());
         let fake = Fake::new();
@@ -411,6 +368,60 @@ fn a_record_that_is_not_stopped_costs_no_second_listing() {
         );
         fake.finish();
     }
+}
+
+/// A directory by the name of a pin, which a delete cannot judge: what a provisional file that names it can only be
+/// settled with an error.
+fn unjudgeable_pin(path: &Path) -> String {
+    let name = format!("pin-{}.pin", "0".repeat(32));
+    directory_with_a_file(&path.join(&name));
+    name
+}
+
+/// A first `Stopped` whose writer's pin cannot be told held or not is no answer: the run is unrecorded, with the failed
+/// delete as its source, naming the pin.
+#[skuld::test]
+fn a_first_stopped_whose_writers_pin_cannot_be_judged_is_an_unrecorded_run_naming_the_pin() {
+    let (_dir, path, runs) = records();
+    let pin = unjudgeable_pin(&path);
+    let provisional = path.join(format!("{}.stopping", instance_id(1).hex()));
+    let text = format!(r#"{{"started":1,"pin":"{pin}"}}"#);
+    let fake = Fake::new();
+    // Written after the pin was taken, as a stop that finds the run begun writes it.
+    fake.on_run(Ok(unnamed(9)))
+        .during(move || fs::write(&provisional, &text).unwrap())
+        .on_instances(Ok(Vec::new()));
+
+    let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
+    let failed = run.wait().unwrap_err();
+
+    assert!(matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
+    assert!(std::error::Error::source(&failed).is_some(), "{failed:?}");
+    assert!(failed.report().to_string().contains(&pin), "{failed}");
+}
+
+/// The same for a run whose process was gone when it was opened: its end is read through the pin too.
+#[skuld::test]
+fn a_process_gone_at_the_open_settles_a_first_stopped_by_the_writers_pin() {
+    let (_dir, path, runs) = records();
+    let pin = unjudgeable_pin(&path);
+    fs::write(
+        path.join(format!("{}.stopping", instance_id(1).hex())),
+        format!(r#"{{"started":1,"pin":"{pin}"}}"#),
+    )
+    .unwrap();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let mut machine = Machine::new(&fake, &[4242]);
+    machine.holdable.clear();
+
+    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
+    let failed = run.wait().unwrap_err();
+
+    assert!(matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
+    assert!(failed.report().to_string().contains(&pin), "{failed}");
 }
 
 /// The process is waited for, and only then is the record read: the shim writes it as it ends.
@@ -497,10 +508,6 @@ fn exited_stopped_and_incomplete_records_map_to_their_results() {
         fake.on_run(Ok(named(1, 4242)))
             .during(move || shim_writes(&shim, &record(1, outcome)))
             .on_instances(Ok(Vec::new()));
-        if outcome == RunOutcome::Stopped {
-            // A first `Stopped` is confirmed by a second listing.
-            fake.on_instances(Ok(Vec::new()));
-        }
 
         let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
         let waited = run.wait();

@@ -339,7 +339,8 @@ pub(super) fn pin_records(operation: &str, id: &Id, runs: &Runs, check: MarkerCh
 /// could not end the program's process tree is a failed stop, and a record that cannot be read does not say
 /// the stop was complete. `Stopped` says a stop was accepted, which is all a stop that returns here needs: the
 /// shim's process, and with it the job over the program's tree, is gone. A task with no records, or whose
-/// directory is a link, has no stop to read ([`Runs::read`]).
+/// directory is a link, has no stop to read ([`Runs::read`]). The read is no wait: the shim is gone, so a
+/// provisional file with no record beside it is the run's last word, and needs no settling by its pin.
 fn check_stopped(id: &Id, runs: &Runs, stopped: &[InstanceId]) -> Result<()> {
     for instance in stopped {
         match runs.read(instance) {

@@ -5,10 +5,10 @@
 //! (`IgnoreNew`) and answers with a GUID that is never listed, and a scheduled run can begin in the
 //! same moment. [`identify`] decides from what `Run` named, what is alive, and which records appeared
 //! after the pin was taken. A record says its run has ended, but for a first `Stopped`, which a run
-//! writes while it is alive: that one is confirmed by a listing read after the record.
+//! writes while it is alive: that one is settled by its writer's pin, which `wait` reads it through.
 //!
-//! The run's own exit is its shim's record, written as the shim ends and read by the run's instance;
-//! the process held is how `wait` knows the shim has ended, with no bound.
+//! The run's own exit is its shim's record, written as the shim ends and read by the run's instance, through
+//! the pin `run` holds ([`Pin::read_final`]); the process held is how `wait` knows the shim has ended, with no bound.
 
 use std::io;
 use std::path::PathBuf;
@@ -100,7 +100,7 @@ pub(super) fn identify(started: Option<&Started>, live: &[Instance], appeared: &
 enum Following<H> {
     /// The run's process, held: its exit is what `wait` blocks on, and the record is read after it.
     Process { instance: InstanceId, process: H },
-    /// The run has ended, and its shim wrote its record.
+    /// The run has ended, or is a first `Stopped` that its writer's pin settles: [`Pin::read_final`] reads it in `wait`.
     Ended(InstanceId),
     /// The run had ended before it was followed, and left this record, which is not a first `Stopped`.
     Done(RunRecord),
@@ -111,7 +111,6 @@ enum Following<H> {
 /// A run of a task that [`Scm::task_begin_run`] began: the process it is, held.
 pub(crate) struct TaskRun<P: Processes = System> {
     id: Id,
-    runs: Runs,
     processes: P,
     following: Following<P::Held>,
     /// Held until the run has been read: no write prunes the record it waits for, and an uninstall
@@ -153,14 +152,14 @@ where
     }
 
     /// Blocks on the held process, under no bound: the run lasts as long as it lasts. Then reads the
-    /// record its shim wrote. A run with none is [`Error::RunUnrecorded`].
+    /// record its shim wrote, through the pin it holds, which waits for a shim that is still alive
+    /// ([`Pin::read_final`]). A run with none is [`Error::RunUnrecorded`].
     fn wait(self) -> Result<Exit> {
         let Self {
             id,
-            runs,
             mut processes,
             following,
-            pin: _pin,
+            pin,
             ..
         } = self;
         let instance = match following {
@@ -176,7 +175,7 @@ where
             Following::Done(record) => return exit_of(&id, record.outcome),
             Following::Unrecorded => return Err(unrecorded(&id, UNRECORDED, None)),
         };
-        match runs.read(&instance) {
+        match pin.read_final(&instance) {
             Ok(Some(record)) => exit_of(&id, record.outcome),
             Ok(None) => Err(unrecorded(&id, UNRECORDED, None)),
             Err(e) => Err(unrecorded(
@@ -242,9 +241,11 @@ impl Scm {
     ///    [`Error::RunUnrecorded`].
     /// 4. A run that is alive has its process held, by its pid and confirmed by a second read of the
     ///    listing; one whose process is gone then has ended, and is read by its instance.
-    /// 5. A record that is a `Stopped` may be the first of a run that is alive (the records were read after
-    ///    the listing): the listing is read again. A run it lists is followed as a live one (step 4); one it
-    ///    does not has ended, and [`TaskRun::wait`](RunHandle::wait) reads its record, which is its last.
+    /// 5. A record that is a `Stopped` may be the first of a run that is alive: its provisional file, which names
+    ///    its writer's pin. It is followed as ended, and [`TaskRun::wait`](RunHandle::wait) settles it by that pin,
+    ///    read through the one this call holds ([`Pin::read_final`]); the listing is no judge of it, since Task
+    ///    Scheduler stops listing an instance a second before its shim ends. The same read ends every run that is
+    ///    followed as ended, one whose process was gone at the open included.
     ///
     /// There is no wait for a pid or for the listing to drop: every listed run has a pid (L1), and
     /// starts are accepted while an ended run is listed (L2).
@@ -289,14 +290,7 @@ impl Scm {
         };
         let following = match identify(Some(&started), &live, &appeared) {
             Identity::Live { id: instance, pid } => hold(&Instance { id: instance, pid }, &mut processes)?,
-            Identity::Done(first) if first.outcome == RunOutcome::Stopped => {
-                let later = live_runs(&*self.tasks, "run", &id, &path, |pid| processes.alive(pid))
-                    .map_err(|e| unfollowed(&id, "tell which run it began", e))?;
-                match later.iter().find(|listed| listed.id == first.instance) {
-                    Some(listed) => hold(listed, &mut processes)?,
-                    None => Following::Ended(first.instance),
-                }
-            }
+            Identity::Done(first) if first.outcome == RunOutcome::Stopped => Following::Ended(first.instance),
             Identity::Done(record) => Following::Done(record),
             Identity::Unrecorded => Following::Unrecorded,
         };
@@ -307,7 +301,6 @@ impl Scm {
         };
         Ok(TaskRun {
             id,
-            runs,
             processes,
             following,
             pin,
