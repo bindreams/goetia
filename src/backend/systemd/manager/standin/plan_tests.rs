@@ -212,9 +212,18 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "2, 4: Stop with a stand-in of ours stops, reads nothing before the stop, reads what it left after it and clears that, then removes the stand-in and reloads",
+        rule: "2, 3: Stop of a held job with a stand-in of ours: the installed file outranks it, so the stand-in is stale and goes with the job; nothing is read, nothing is cleared",
         in_flight: STOP,
-        call: &[Job, TimerAlone],
+        call: &[Job],
+        file: &[Ours],
+        run: &[Unread],
+        held_gone: NOT_HELD,
+        plan: || plan_with(true, Standin::Remove { reset_failed: false }, true),
+    },
+    Row {
+        rule: "2, 4: Stop of a timer alone with a stand-in of ours (the unit's definition) stops, reads nothing before the stop, reads what it left after it and clears that, then removes the stand-in and reloads",
+        in_flight: STOP,
+        call: &[TimerAlone],
         file: &[Ours],
         run: &[Unread],
         held_gone: NOT_HELD,
@@ -276,9 +285,18 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "4: Leave removes a stand-in of ours whose run has no process, a restart that is waiting included",
+        rule: "3: Leave of a held job with a stand-in of ours, past its start job: the installed file outranks the stand-in, so it is stale and removed whatever the run is doing, with no clearing of its own",
         in_flight: LEAVE,
-        call: &[Job, TimerAlone],
+        call: &[Job],
+        file: &[Ours],
+        run: &[Idle, Failed, Pending, Running],
+        held_gone: NOT_HELD,
+        plan: || plan_with(false, Standin::Remove { reset_failed: false }, true),
+    },
+    Row {
+        rule: "4: Leave of a timer alone removes a stand-in of ours (the unit's definition) whose run has no process, a restart that is waiting included",
+        in_flight: LEAVE,
+        call: &[TimerAlone],
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
@@ -287,20 +305,11 @@ const ROWS: &[Row] = &[
     Row {
         rule: "4: and one whose run failed, after reset-failed",
         in_flight: LEAVE,
-        call: &[Job, TimerAlone],
+        call: &[TimerAlone],
         file: &[Ours],
         run: &[Failed],
         held_gone: NOT_HELD,
         plan: || plan_with(false, Standin::Remove { reset_failed: true }, true),
-    },
-    Row {
-        rule: "4: the stand-in stays while the run has a process",
-        in_flight: LEAVE,
-        call: &[Job],
-        file: &[Ours],
-        run: &[Running],
-        held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
         rule: "3, 4: a timer alone gets no stand-in, and one of ours at its id stays while the run has a process",
@@ -404,6 +413,18 @@ const ROWS: &[Row] = &[
     },
 ];
 
+/// How many cells a call can be in, counted from the dimensions: a call reads the run in five states, or not at all
+/// (one cell), and the sweep also tells held from not held.
+fn reachable_cells() -> usize {
+    let (files, runs) = (FILES.len(), READ.len());
+    // Stop: a job and a timer alone read nothing; the sweep reads, held or not.
+    let stop = 2 * files + files * runs * 2;
+    // Leave: a job reads, but a foreign file refuses it; a timer alone and the sweep read; an install reads only
+    // for a stand-in of ours.
+    let leave = (files - 1) * runs + files * runs + files * runs * 2 + (files - 1) + runs;
+    stop + leave
+}
+
 /// Every cell a call can be in has exactly one row, and the plan is the row's.
 #[skuld::test]
 fn every_reachable_cell_has_one_row_and_gets_its_plan() {
@@ -437,7 +458,7 @@ fn every_reachable_cell_has_one_row_and_gets_its_plan() {
             row.rule
         );
     }
-    assert!(reachable > 90, "the generator reached {reachable} cells");
+    assert_eq!(reachable, reachable_cells(), "the generator reached {reachable} cells");
 }
 
 /// Rule 5: only `Leave` over an id whose job goetia removes is refused, and only for a file that is not ours:

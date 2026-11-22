@@ -35,11 +35,21 @@ impl SelfUninstalling {
 
     /// A run that exits with `code` when released.
     fn exiting(id: &str, code: u8) -> Self {
+        Self::after("", id, code)
+    }
+
+    /// A run that exits 0 on SIGTERM: a stop of it reads as a success, not a failure.
+    fn exiting_on_sigterm(id: &str) -> Self {
+        Self::after("trap 'exit 0' TERM; ", id, 0)
+    }
+
+    /// A run that does `prelude` (shell commands, each ending in `;`) before it uninstalls its own `id`.
+    fn after(prelude: &str, id: &str, code: u8) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let pid = dir.path().join("pid");
         let held = Held::after_exiting(
             &format!(
-                "echo $$ > \"{}\"; \"{}\" daemon uninstall --no-stop {id} 2>&1; ",
+                "{prelude}echo $$ > \"{}\"; \"{}\" daemon uninstall --no-stop {id} 2>&1; ",
                 pid.display(),
                 env!("CARGO_BIN_EXE_goetia"),
             ),
@@ -162,31 +172,47 @@ fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixt
 }
 
 /// The run a stand-in keeps is stopped by the next `uninstall` without `--no-stop`, which then removes the
-/// stand-in: afterwards nothing of the id is listed, whether the stopped run read as failed or not.
+/// stand-in: afterwards nothing of the id is listed, whether the stopped run read as failed (it died of SIGTERM) or
+/// not (it exited 0 on SIGTERM).
 #[skuld::test]
 fn an_uninstall_that_stops_the_run_a_standin_keeps_leaves_nothing_listed(#[fixture(systemd_group)] _group: &Group) {
-    let id = support::random_test_id();
-    let _guard = ServiceGuard::new(&id);
-    let mut run = SelfUninstalling::new(&id);
-    let spec = goetia::testing::task(&id, run.held.command.clone(), Some(DAILY));
-    let mgr = Systemd::new();
-    mgr.install(&spec, false).expect("install");
-    mgr.enable(&id_of(&id)).expect("enable");
-    mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
-    run.held.wait_started();
-    let pid = run.pid();
-    assert!(standin(&id).exists(), "the run was left under a stand-in");
+    for failing in [true, false] {
+        let id = support::random_test_id();
+        let _guard = ServiceGuard::new(&id);
+        let mut run = if failing {
+            SelfUninstalling::new(&id)
+        } else {
+            SelfUninstalling::exiting_on_sigterm(&id)
+        };
+        let spec = goetia::testing::task(&id, run.held.command.clone(), Some(DAILY));
+        let mgr = Systemd::new();
+        mgr.install(&spec, false).expect("install");
+        mgr.enable(&id_of(&id)).expect("enable");
+        mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
+        run.held.wait_started();
+        let pid = run.pid();
+        assert!(standin(&id).exists(), "the run was left under a stand-in");
 
-    match mgr.uninstall(&id_of(&id), RunInFlight::Stop) {
-        Err(Error::NotInstalled { .. }) => {}
-        other => panic!("nothing is installed at `{id}`, got {other:?}"),
+        match mgr.uninstall(&id_of(&id), RunInFlight::Stop) {
+            Err(Error::NotInstalled { .. }) => {}
+            other => panic!("nothing is installed at `{id}`, got {other:?}"),
+        }
+
+        assert!(
+            !standin(&id).exists(),
+            "the stand-in is removed (dies of SIGTERM: {failing})"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the run was stopped (dies of SIGTERM: {failing})"
+        );
+        let listed = list_units(&id);
+        assert!(
+            !listed.stdout.contains(&id),
+            "nothing of the id is listed (dies of SIGTERM: {failing}): {listed}"
+        );
+        assert_not_installed(&mgr, &id);
     }
-
-    assert!(!standin(&id).exists(), "the stand-in is removed");
-    assert!(!Path::new(&format!("/proc/{pid}")).exists(), "the run was stopped");
-    let listed = list_units(&id);
-    assert!(!listed.stdout.contains(&id), "nothing of the id is listed: {listed}");
-    assert_not_installed(&mgr, &id);
 }
 
 /// With no run in flight `--no-stop` is a plain uninstall: nothing is left, the stand-in included.
@@ -343,8 +369,8 @@ fn a_retry_after_a_removal_with_no_reload_reloads_and_leaves_the_run(#[fixture(s
 // What a stop of the left run uses ====================================================================================
 
 /// A drop-in sets the task's `KillSignal=` and `TimeoutStopSec=`, and the uninstall deletes it with the job:
-/// the stand-in carries the values systemd was applying, so a hand stop of the left run signals and waits as
-/// before.
+/// the stand-in carries the values systemd was applying: the left run's `KillSignal` and `TimeoutStopUSec` are the
+/// drop-in's. (A stop with such values signals and waits as before: measured, M14a.)
 #[skuld::test]
 fn the_standin_carries_the_stop_settings_a_drop_in_gave_the_job(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();

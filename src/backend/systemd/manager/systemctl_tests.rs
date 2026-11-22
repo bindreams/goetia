@@ -118,10 +118,7 @@ pub(in crate::backend::systemd::manager) fn gate_passes() -> Vec<Entry> {
 
 /// The version gate's two probes, refusing: systemd 241 is older than the floor.
 pub(in crate::backend::systemd::manager) fn gate_refuses() -> Vec<Entry> {
-    vec![
-        reply(&["--version"], exited(0, "systemd 241 (241)\n", "")),
-        reply(&["show", "--property=Version", "--value"], exited(0, "241\n", "")),
-    ]
+    two_versions("241", "241")
 }
 
 /// A fake that passes the version gate, and then answers `rest`.
@@ -1444,34 +1441,38 @@ fn task_state_table() {
     );
 }
 
-/// The one read `uninstall` decides from. `inactive` and `failed` are no run; `activating` with a `SubState` that
-/// begins with `auto-restart` (`auto-restart`, and `auto-restart-queued` of systemd 254 and later) is a restart
-/// that is waiting; every other `activating`, a sub-state goetia does not know
-/// included, is a run in its start job, the safe side. Every other state, the ones goetia does not know
-/// included, is a run. The unit's own words for the two stop settings and the file it was loaded from come back
-/// as they were printed.
+/// The one read `uninstall` decides from. `inactive` and `failed` are no run, unless a job is pending for the unit
+/// (a start job queued and not yet running reads `inactive`), which is a run in its start job; `activating` with a
+/// `SubState` that begins with `auto-restart` (`auto-restart`, and `auto-restart-queued` of systemd 254 and later)
+/// is a restart that is waiting; every other `activating`, a sub-state goetia does not know included, is a run in
+/// its start job, the safe side. Every other state, the ones goetia does not know included, is a run. The unit's own
+/// words for the two stop settings and the file it was loaded from come back as they were printed.
 #[skuld::test]
 fn run_of_table() {
-    for (active, sub, phase) in [
-        ("inactive", "dead", RunPhase::None),
-        ("failed", "failed", RunPhase::None),
-        ("activating", "auto-restart", RunPhase::PendingRestart),
-        ("activating", "auto-restart-queued", RunPhase::PendingRestart),
-        ("activating", "start", RunPhase::InStartJob),
-        ("activating", "start-pre", RunPhase::InStartJob),
-        ("activating", "a-substate-of-the-future", RunPhase::InStartJob),
-        ("activating", "", RunPhase::InStartJob),
-        ("active", "running", RunPhase::Running),
-        ("active", "exited", RunPhase::Running),
-        ("deactivating", "stop-sigterm", RunPhase::Running),
-        ("reloading", "reload", RunPhase::Running),
-        ("maintenance", "clean", RunPhase::Running),
-        ("refreshing", "x", RunPhase::Running),
-        ("", "", RunPhase::Running),
-        ("a-state-of-the-future", "y", RunPhase::Running),
+    for (active, sub, job, phase) in [
+        ("inactive", "dead", "", RunPhase::None),
+        ("failed", "failed", "", RunPhase::None),
+        ("inactive", "dead", "412", RunPhase::InStartJob),
+        ("failed", "failed", "412", RunPhase::InStartJob),
+        ("activating", "auto-restart", "", RunPhase::PendingRestart),
+        ("activating", "auto-restart", "412", RunPhase::PendingRestart),
+        ("activating", "auto-restart-queued", "", RunPhase::PendingRestart),
+        ("activating", "start", "", RunPhase::InStartJob),
+        ("activating", "start-pre", "412", RunPhase::InStartJob),
+        ("activating", "a-substate-of-the-future", "", RunPhase::InStartJob),
+        ("activating", "", "", RunPhase::InStartJob),
+        ("active", "running", "", RunPhase::Running),
+        ("active", "running", "412", RunPhase::Running),
+        ("active", "exited", "", RunPhase::Running),
+        ("deactivating", "stop-sigterm", "", RunPhase::Running),
+        ("reloading", "reload", "", RunPhase::Running),
+        ("maintenance", "clean", "", RunPhase::Running),
+        ("refreshing", "x", "", RunPhase::Running),
+        ("", "", "", RunPhase::Running),
+        ("a-state-of-the-future", "y", "", RunPhase::Running),
     ] {
         let answer = format!(
-            "ActiveState={active}\nSubState={sub}\nKillSignal=12\n\
+            "ActiveState={active}\nSubState={sub}\nJob={job}\nKillSignal=12\n\
              TimeoutStopUSec=1min 30s\nLoadState=loaded\nFragmentPath=/etc/systemd/system/x.service\n"
         );
         assert_eq!(
@@ -1484,7 +1485,7 @@ fn run_of_table() {
                 load_state: "loaded".to_string(),
                 fragment_path: "/etc/systemd/system/x.service".to_string(),
             },
-            "{active:?} {sub:?}"
+            "{active:?} {sub:?} job {job:?}"
         );
     }
 }
@@ -1492,7 +1493,7 @@ fn run_of_table() {
 /// A unit systemd has no file for is answered like any other, not an error: the absent id's read is of it.
 #[skuld::test]
 fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
-    let answer = "ActiveState=inactive\nSubState=dead\nKillSignal=15\n\
+    let answer = "ActiveState=inactive\nSubState=dead\nJob=\nKillSignal=15\n\
                   TimeoutStopUSec=1min 30s\nLoadState=not-found\nFragmentPath=\n";
 
     let run = showing(answer).run_of("x.service").expect("a read");
@@ -1506,7 +1507,7 @@ fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
 fn a_run_is_loaded_from_a_path_only_when_systemd_says_loaded_from_it() {
     let read = |load: &str, fragment: &str| {
         let answer = format!(
-            "ActiveState=active\nSubState=running\nKillSignal=15\n\
+            "ActiveState=active\nSubState=running\nJob=\nKillSignal=15\n\
              TimeoutStopUSec=infinity\nLoadState={load}\nFragmentPath={fragment}\n"
         );
         showing(&answer).run_of("x.service").expect("a read")
@@ -1769,7 +1770,7 @@ fn the_gate_is_asked_once_per_reservation() {
 /// A refusal is not remembered: the next step asks again.
 #[skuld::test]
 fn a_refused_gate_is_asked_again() {
-    let fake = Fake::new(gate_refuses().into_iter().chain(gate_passes()));
+    let fake = Fake::new(two_versions("241", "257").into_iter().chain(gate_passes()));
     let systemctl = on_booted(fake.clone());
     let mut held = Held::default();
 

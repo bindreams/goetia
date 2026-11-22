@@ -504,54 +504,6 @@ pub(in crate::backend::systemd::manager) fn call(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
 }
 
-/// The one read of a unit's run: these properties, in this order.
-const READ: &str = "ActiveState,SubState,KillSignal,TimeoutStopUSec,LoadState,FragmentPath";
-
-pub(in crate::backend::systemd::manager) fn read_call(id: &str) -> Vec<String> {
-    call(&["show", "--property", READ, "--", &format!("{id}.service")])
-}
-
-pub(in crate::backend::systemd::manager) fn etc_path(id: &str) -> String {
-    unit_path(id, UnitKind::Service).display().to_string()
-}
-
-/// `systemctl show` of `id`'s job as the one read asks it, loaded from goetia's own path and stopping with the
-/// defaults.
-pub(in crate::backend::systemd::manager) fn state(id: &str, active: &str, sub: &str) -> Entry {
-    unit_state(active, sub, "loaded", &etc_path(id), "15", "1min 30s")
-}
-
-pub(in crate::backend::systemd::manager) fn unit_state(
-    active: &str,
-    sub: &str,
-    load: &str,
-    fragment: &str,
-    kill: &str,
-    timeout: &str,
-) -> Entry {
-    reply(
-        &["show"],
-        exited(
-            0,
-            &format!(
-                "ActiveState={active}\nSubState={sub}\nKillSignal={kill}\nTimeoutStopUSec={timeout}\n\
-                 LoadState={load}\nFragmentPath={fragment}\n"
-            ),
-            "",
-        ),
-    )
-}
-
-/// The read of a left run with no process, and the `reset-failed` that follows only where the read says it failed:
-/// systemd refuses `reset-failed` of a unit that is not in memory, which one that did not fail is not.
-pub(in crate::backend::systemd::manager) fn read_of(id: &str, failed: bool) -> Entry {
-    if failed {
-        state(id, "failed", "failed")
-    } else {
-        state(id, "inactive", "dead")
-    }
-}
-
 // start, stop, kill, restart ==========================================================================================
 
 /// A task's start asks for the run and returns, under every budget: the request is `--no-block`, run
