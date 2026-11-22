@@ -1023,7 +1023,8 @@ same.
   data that would not decode) or a Windows error number (it failed at something
   else; `31`, `ERROR_GEN_FAILURE`, when it has no number of its own: the task is
   gone, another install registered it again, or a removal marker stands). A program that exits with the same
-  number reads the same. After a stop it is `0xC000013A` whatever happened.
+  number reads the same. After a stop it is `0xC000013A` whatever happened: it is Task Scheduler's, and
+  `run` reports the run's own record (see [Stopping and killing a task](#stopping-and-killing-a-task)).
   An unelevated `status` or `list` of a task that runs as another account (SYSTEM,
   LocalService, or an administrator's own elevated task) cannot open the run's
   process, so it cannot tell running from idle. It reports the id as `unusable`,
@@ -1059,17 +1060,27 @@ with the request standing.
   is still alive is refused with exit `4`, saying that no start was issued:
   launchd starts no new run of a task while one is in flight, and `start`
   after it exits, or a `restart` without `--timeout 0`, does the job.
-- **Windows:** a task's `stop` sends the program the console close event
-  (`CTRL_CLOSE_EVENT`), as Task Scheduler does to any console program, and
-  Windows ends it about one second later if it has not exited; goetia adds no
-  wait of its own. The run reports `0xC000013A`. The host records the stop
-  before it waits for the program to exit, so a `Stopped` record means a stop
-  was accepted, not that the program's tree has ended; the host then ends
-  whatever is left of the tree. A stop that arrives before the host has started
-  the program starts nothing, and the run is still recorded as stopped. A stop
-  that arrives in the moment between that check and the start still starts the
-  program, which never receives the event and runs until Windows ends the host
-  and its Job Object takes the program's tree with it. A run in flight at a
+- **Windows:** a task's `stop` sends the console close event
+  (`CTRL_CLOSE_EVENT`), as Task Scheduler does to any console program. Measured
+  on Windows Server 2025 (build 26100): the event reaches the program first, and
+  the host hears it only after the program has ended, so goetia adds no wait of
+  its own; Windows allows one second for the whole run, counted from the stop. A
+  program that exits on the event is the run's record: `run` reports how the
+  program ended, `0xC000013A` when the event ended it, or its own code when it
+  handled the event and exited. `status`'s last result is Task Scheduler's, and
+  reads `0xC000013A` after any stop. A program still running when the second is
+  over is ended by Windows together with the host, and that run leaves no record:
+  `run` says so. A program with no console (a GUI program, or one that detached
+  from it) is sent nothing; the host records the stop, waits for the program's
+  own exit and ends whatever is left of the tree, and when Windows ends the host
+  first, the Job Object takes the program's tree with it and the run is recorded
+  as stopped. A `Stopped` record means a stop was accepted and the host never saw
+  the program exit, not that the program's tree has ended. A stop that arrives
+  before the host has started the program starts nothing, and the run is still
+  recorded as stopped. A stop that arrives in the moment between that check and
+  the start still starts the program, which never receives the event and runs
+  until it exits or Windows ends the host and its Job Object takes the program's
+  tree with it. A run in flight at a
   system shutdown is ended by Windows and may leave no record. `kill` terminates
   the host, and its Job Object takes the program's tree with it; a waiting `run`
   then reports that the run ended without recording its exit (exit `4`), as it

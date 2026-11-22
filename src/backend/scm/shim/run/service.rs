@@ -398,8 +398,10 @@ pub(super) enum PassOutcome {
     /// be had, which is already logged.
     Exited(Option<i32>),
     /// A stop was accepted, and the daemon's tree was terminated. It wins over the exit code the
-    /// teardown made the daemon leave, and over a failed wait.
-    Stopped,
+    /// teardown made the daemon leave, and over a failed wait. The code is the daemon's own exit, when the shim had its
+    /// exit status because the daemon had exited by itself, before the teardown; `None` when the teardown ended it
+    /// (or the wait failed, or the status could not be had). A service ignores it; a task's record is that exit.
+    Stopped(Option<i32>),
     /// Something of the daemon's tree may still be running, after a stop, a failure, or an exit
     /// whose tree could not be terminated.
     IncompleteStop,
@@ -415,7 +417,7 @@ impl PassOutcome {
     pub(super) fn reported(self) -> Reported {
         match self {
             PassOutcome::Exited(code) => exit_report(code),
-            PassOutcome::Stopped => Reported::Clean,
+            PassOutcome::Stopped(_) => Reported::Clean,
             PassOutcome::IncompleteStop => Reported::incomplete_stop(),
             PassOutcome::WaitFailed(os_error) => Reported::shim_failure(os_error),
             PassOutcome::NotRun(reported) => reported,
@@ -462,19 +464,7 @@ pub(super) fn run_pass(
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
     match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping) {
         WaitOutcome::ChildExited => {
-            let code = match child.wait() {
-                Ok(status) => {
-                    let code = status.code();
-                    if code.is_none() {
-                        log.failure(id, NO_EXIT_CODE);
-                    }
-                    code
-                }
-                Err(e) => {
-                    log.failure(id, &exit_status_unavailable(&e));
-                    None
-                }
-            };
+            let code = exit_code(child.as_ref(), log, id);
             // A stop accepted before this decision wins over a failure: `settle` then says something
             // other than the candidate. A clean exit and a stop accepted after the wait ended read
             // alike.
@@ -483,7 +473,7 @@ pub(super) fn run_pass(
             if !terminate_exited_tree(child.as_ref(), log, id) {
                 PassOutcome::IncompleteStop
             } else if stop_won {
-                PassOutcome::Stopped
+                PassOutcome::Stopped(code)
             } else {
                 PassOutcome::Exited(code)
             }
@@ -495,13 +485,36 @@ pub(super) fn run_pass(
             if supervisor.bus.settle(candidate) == candidate {
                 PassOutcome::WaitFailed(os_error)
             } else {
-                PassOutcome::Stopped
+                PassOutcome::Stopped(None)
             }
         }
-        // `wait_for_child_or_stop` terminated the tree before returning this.
-        WaitOutcome::Stopping => PassOutcome::Stopped,
+        // `wait_for_child_or_stop` terminated the tree before returning this. A daemon that exited by itself first
+        // has its exit status, which is the one read of the `ChildExited` arm.
+        WaitOutcome::Stopping { root_exited } => PassOutcome::Stopped(if root_exited {
+            exit_code(child.as_ref(), log, id)
+        } else {
+            None
+        }),
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => PassOutcome::IncompleteStop,
+    }
+}
+
+/// The exit code of a daemon that has exited and been waited for, or `None` when its exit status could not be had or
+/// carries no code: told in the log.
+fn exit_code(child: &dyn Spawned, log: &Log, id: &str) -> Option<i32> {
+    match child.wait() {
+        Ok(status) => {
+            let code = status.code();
+            if code.is_none() {
+                log.failure(id, NO_EXIT_CODE);
+            }
+            code
+        }
+        Err(e) => {
+            log.failure(id, &exit_status_unavailable(&e));
+            None
+        }
     }
 }
 

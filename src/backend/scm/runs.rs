@@ -9,9 +9,9 @@
 //! task, and while any pin is live a write prunes nothing. With none, a write removes every record
 //! but its own. **A run pins too:** the shim takes a pin before it reads anything, and holds it until its
 //! own record is renamed into place; it releases it before its own prune, so a run's pin never stops its
-//! own prune. A run that has been stopped writes its record twice: `Stopped` as the stop is accepted, with its
-//! pin lent (no release, no prune: the run is still alive, and "no pin held" means "no run alive"), and the
-//! final record with the pin given. A pin is a file held open with no sharing: it
+//! own prune. A run whose stop is heard with its program alive writes its record twice: `Stopped` as the stop
+//! is accepted, with its pin lent (no release, no prune: the run is still alive, and "no pin held" means "no run
+//! alive"), and the final record with the pin given. A pin is a file held open with no sharing: it
 //! goes when its holder does, however it ends, and while it is held nothing can delete it, whoever tries.
 //! One left by a power cut is held by nothing, and the next write finds it by deleting it: a sharing
 //! violation says it is live ([`files::delete`] reads every failed delete, here and in the removal). What a
@@ -83,8 +83,10 @@ const REMOVE_PACE: Duration = Duration::from_millis(100);
 pub(crate) enum RunOutcome {
     /// The program exited with this code.
     Exited(u32),
-    /// A stop was accepted. It is written before the shim waits for the program, so it does not say the program's
-    /// tree has ended: a shim that Windows ends first leaves it, and the Job Object ends the tree.
+    /// A stop was accepted and the shim never saw the program exit: no program was started, its wait failed, its own
+    /// teardown ended it, or Windows ended the shim after this was written, which is before the shim waits for a
+    /// program that is alive at the stop. It does not say the program's tree has ended: a shim that Windows ends
+    /// first leaves it, and the Job Object ends the tree. A program the shim saw exit is `Exited`, stop or not.
     Stopped,
     /// A stop was accepted and something of the program's tree could not be ended. It replaces `Stopped`.
     IncompleteStop,

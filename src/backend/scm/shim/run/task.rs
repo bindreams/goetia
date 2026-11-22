@@ -13,16 +13,35 @@
 //! never returns: Windows ends the process about a second after the event whatever the handler does, and
 //! the run thread alone ends it with the run's own code.
 //!
-//! What the run thread does with an accepted stop, in this order: it writes the run's record as
-//! [`RunOutcome::Stopped`] first, since Windows may end the shim before anything later; it waits for the
-//! program's own exit, with no cap of goetia's ([`StopPlan::WaitOnly`]); it tears down what the program left;
-//! and it ends with [`STOPPED_EXIT`], or with the incomplete stop's code when the teardown fails, the record
-//! replaced by the same write. A shim that Windows ends first leaves the `Stopped` record, which says that a
-//! stop was accepted, not that the tree ended; the Job Object's `KILL_ON_JOB_CLOSE` ends the tree. A stop
-//! accepted before the spawn starts no program, which the close event would never reach: the bus is looked at
-//! right before the spawn, and the one stop that arrives between that look and the spawn starts the program,
-//! which runs until Windows ends the shim and the job closes over it. A run in flight at a system shutdown
-//! is ended by Windows and may leave no record: nothing here handles `CTRL_SHUTDOWN_EVENT`.
+//! **The order of the event** (measured on Windows Server 2025, build 26100): it visits the processes on
+//! the console one at a time, newest first, and enters the next process's handler only after the previous
+//! process has ended. The second is one bound for the whole console, counted from the stop. So for a
+//! program on the shim's console the shim's handler is entered only after the program has ended, and the
+//! shim's waiter had seen the exit before that; a program that never leaves its handler is never followed by
+//! the shim's handler, and Windows ends the shim at the end of the second, its job closes and the program
+//! dies with it: nothing is recorded.
+//!
+//! **The record is the program's exit whenever the shim had its exit status, whichever thread came first.**
+//! [`RunOutcome::Stopped`] is only for a stop whose program the shim never saw exit: no spawn, a failed wait, a
+//! program its own teardown ended, or Windows ending the shim after the first write. What the run thread does
+//! with an accepted stop, in this order:
+//!
+//! - it reads the program once ([`Supervisor::wait_for_child_or_stop`]); one that is gone is its own exit, and
+//!   no `Stopped` is written first;
+//! - for a program that is alive as the stop is heard (one that is not on the shim's console, a GUI-subsystem
+//!   program or one that detached, and the window between the look before the spawn and the spawn), it writes
+//!   `Stopped` first, since Windows may end the shim before anything later; it waits for the program's own exit,
+//!   with no cap of goetia's ([`StopPlan::WaitOnly`]);
+//! - it tears down what the program left and ends: with the program's own exit when the shim saw it exit (the
+//!   record replaced by the same write), with [`STOPPED_EXIT`] when it did not, with the incomplete stop's
+//!   code when the teardown fails.
+//!
+//! A shim that Windows ends first leaves the `Stopped` record, which says that a stop was accepted, not that
+//! the tree ended; the Job Object's `KILL_ON_JOB_CLOSE` ends the tree. A stop accepted before the spawn starts no
+//! program, which the close event would never reach: the bus is looked at right before the spawn, and the one
+//! stop that arrives between that look and the spawn starts the program, which runs until it exits or Windows
+//! ends the shim and the job closes over it. A run in flight at a system shutdown is ended by Windows and may
+//! leave no record: nothing here handles `CTRL_SHUTDOWN_EVENT`.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
@@ -94,8 +113,8 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 }
 
 /// Runs the task `id` as the process `own_pid`, started under the registration `token`, and returns the
-/// code the process is to end with: the program's own, or the stop's ([`STOPPED_EXIT`]), or the
-/// incomplete stop's, or a shim failure's.
+/// code the process is to end with: the program's own, or the stop's ([`STOPPED_EXIT`]) when the shim never saw the
+/// program exit, or the incomplete stop's, or a shim failure's.
 ///
 /// The program starts only when every step below passed, in this order; a step that fails logs the case
 /// (the default log when it is held, the Event Log always), releases what the shim holds and ends the
@@ -121,7 +140,8 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 ///    the bus once more and, for a stop accepted by then, starts no program: the record is `Stopped`, as in
 ///    step 4. Otherwise runs the program and writes the one record, under the pin, which is released as the
 ///    record is renamed in place ([`Runs::write`]). An accepted stop writes `Stopped` before the wait, with
-///    the pin lent, so that the run stays one that is alive; the final write replaces it. A record that
+///    the pin lent, so that the run stays one that is alive; the final write replaces it. A program that is gone
+///    when the stop is seen gets no such write: its exit is the one record ([`ended_as`]). A record that
 ///    cannot be written is logged and does not change the code.
 pub(super) fn run_in(
     id: &str,
@@ -242,8 +262,9 @@ pub(super) fn run_in(
         id,
         || {},
         |end| {
-            // Only for an accepted stop, never for the program's own exit: the record comes before the wait,
-            // which Windows may end the shim in, and the pin stays held (the run is alive).
+            // Only for a stop heard with the program alive, never for its own exit (a program that is gone when the
+            // stop is seen is told as one): the record comes before the wait, which Windows may end the shim in,
+            // and the pin stays held (the run is alive).
             if end == WaitEnd::Stop {
                 record_run(
                     log,
@@ -490,7 +511,10 @@ fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &Insta
 fn ended_as(outcome: PassOutcome) -> (Option<RunOutcome>, u32) {
     match outcome {
         PassOutcome::Exited(Some(code)) => (Some(RunOutcome::Exited(code as u32)), code as u32),
-        PassOutcome::Stopped => (Some(RunOutcome::Stopped), STOPPED_EXIT),
+        // A stop the shim saw the program's own exit for is that exit, whichever thread came first. `Stopped` is only
+        // for a stop whose program the shim never saw exit.
+        PassOutcome::Stopped(Some(code)) => (Some(RunOutcome::Exited(code as u32)), code as u32),
+        PassOutcome::Stopped(None) => (Some(RunOutcome::Stopped), STOPPED_EXIT),
         // The program may be running: a launch that may have started it says so as a stop does.
         PassOutcome::IncompleteStop | PassOutcome::NotRun(Reported::IncompleteStop) => (
             Some(RunOutcome::IncompleteStop),

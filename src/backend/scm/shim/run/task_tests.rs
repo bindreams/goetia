@@ -245,9 +245,10 @@ fn exits(code: i32) -> FakeProcess {
     FakeProcess::new().exited(code).send_kill_tree(KillReply::Ends)
 }
 
-/// A program a stop ends: it runs until the tree is killed.
+/// A program that runs until it is ended by hand ([`FakeProcess::end`]): two waits, the waiter's and the one that
+/// reads the code of a program that exited by itself.
 fn runs_until_stopped() -> FakeProcess {
-    FakeProcess::running()
+    FakeProcess::running().wait(WaitReply::Blocks)
 }
 
 fn recorded(outcome: RunOutcome) -> Option<RunRecord> {
@@ -900,23 +901,37 @@ fn a_program_that_cannot_be_spawned_is_a_logged_shim_failure_and_is_not_recorded
 
 // A stop ==============================================================================================================
 
-/// A stop accepted while the program is being spawned: the program is spawned (the bus was looked at before), the
-/// stop wins whatever the program then exits with, and the record says so.
+/// A stop accepted while the program is being spawned, and the program already gone when the shim sees it (the
+/// waiter's report of its exit lags): the shim has the program's exit status, so the record is the program's exit, with
+/// its code, whatever the code is, and it is written once: no `Stopped` comes first.
 #[skuld::test]
-fn an_accepted_stop_records_stopped_whatever_the_exit_code() {
-    for exit in [0, 7] {
+fn a_stop_with_the_program_already_gone_records_its_exit_once() {
+    for exit in [0, 7, STOPPED as i32] {
         let run = Run::of(&spec_logging_to(None)).listed();
         let process = FakeProcess::new()
-            .wait(WaitReply::Exits(exit))
+            .exited_unreported(exit)
+            .wait(WaitReply::Blocks)
+            .wait(WaitReply::Blocks)
             .send_kill_tree(KillReply::Ends)
             .when_spawned(run.stop_at_the_spawn());
         let run = run.program(process);
+        let mut watch = DirWatch::new(&run.records_dir());
 
         let code = run.run();
 
-        assert_eq!(code, STOPPED, "the program's exit {exit}");
-        assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+        assert_eq!(code, exit as u32, "the program's exit {exit}");
+        std::fs::write(run.records_dir().join("done"), "").unwrap();
+        let changes = watch.until_added("done");
+        let own = NameChange::RenamedTo(format!("{}.json", instance().hex()));
+        assert_eq!(
+            changes.iter().filter(|change| **change == own).count(),
+            1,
+            "a `Stopped` was written first, for the exit {exit}: {changes:?}"
+        );
+        assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(exit as u32)));
+        drop(watch);
         assert_eq!(run.finish(), Vec::<String>::new());
+        run.no_pin_is_left();
     }
 }
 
@@ -937,12 +952,12 @@ fn a_stop_before_the_spawn_spawns_nothing_and_records_stopped() {
     assert_eq!(run.fake.take_failures(), Vec::<String>::new());
 }
 
-/// The record is on disk before the wait for the program, and the run's pin is still held: an account change
-/// or an uninstall that read "no pin held" as "no run alive" would otherwise act on a run that is alive. The
-/// program is then waited for (nothing ends it), and after its own exit the tree is torn down and the final
-/// write releases the pin.
+/// The program is alive when the stop is seen: the record is `Stopped` on disk before the wait for the program, and
+/// the run's pin is still held: an account change or an uninstall that read "no pin held" as "no run alive" would
+/// otherwise act on a run that is alive. The program is then waited for (nothing ends it), and it exits by itself: the
+/// tree is torn down, and the final write, which releases the pin, is the program's exit, with its code.
 #[skuld::test]
-fn an_accepted_stop_records_stopped_before_the_wait_with_the_pin_held() {
+fn a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_the_pin_held_meanwhile() {
     let process = runs_until_stopped();
     let run = Run::of(&spec_logging_to(None)).listed();
     let stop = run.stop_at_the_spawn();
@@ -956,12 +971,12 @@ fn an_accepted_stop_records_stopped_before_the_wait_with_the_pin_held() {
         );
         assert!(!process.ended(), "the program was ended before it exited by itself");
         assert!(process.calls().is_empty(), "the program was touched before it exited");
-        process.end(0);
+        process.end(7);
     });
 
-    assert_eq!(code, STOPPED);
-    assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
-    assert_eq!(process.exit_code(), Some(0));
+    assert_eq!(code, 7);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
+    assert_eq!(process.exit_code(), Some(7));
     assert_eq!(
         process.calls(),
         [ProcessCall::SendKillTree],
@@ -1030,6 +1045,50 @@ fn a_stop_whose_kills_are_both_refused_is_an_incomplete_stop() {
     );
 }
 
+/// A stop whose wait on the program failed: the shim never saw the program exit, so the stop is what the record says,
+/// whether the program is alive or not, and the run ends with the stop's code.
+#[skuld::test]
+fn a_stop_whose_wait_failed_records_stopped() {
+    let process = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .send_kill_tree(KillReply::Ends);
+    let run = Run::of(&spec_logging_to(None)).listed();
+    let stop = run.stop_at_the_spawn();
+    let run = run.program(process.when_spawned(stop));
+
+    let code = run.run();
+
+    assert_eq!(code, STOPPED);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("background wait on child"), "{failures:?}");
+    run.no_pin_is_left();
+}
+
+/// The one place the rule lives: a stopped pass that carries the program's exit is that exit, with its code; one
+/// that does not is `Stopped`, with the stop's code. A run that ended some other way is as it was.
+#[skuld::test]
+fn a_stopped_pass_is_the_programs_exit_when_it_has_one() {
+    assert_eq!(
+        ended_as(PassOutcome::Stopped(Some(7))),
+        (Some(RunOutcome::Exited(7)), 7)
+    );
+    assert_eq!(
+        ended_as(PassOutcome::Stopped(Some(STOPPED as i32))),
+        (Some(RunOutcome::Exited(STOPPED)), STOPPED)
+    );
+    assert_eq!(
+        ended_as(PassOutcome::Stopped(None)),
+        (Some(RunOutcome::Stopped), STOPPED)
+    );
+    assert_eq!(
+        ended_as(PassOutcome::IncompleteStop).0,
+        Some(RunOutcome::IncompleteStop)
+    );
+    assert_eq!(ended_as(PassOutcome::WaitFailed(None)).0, None);
+}
+
 /// The program's own exit is no stop: nothing is written before the run's one record.
 #[skuld::test]
 fn the_programs_own_exit_writes_no_stopped_record_first() {
@@ -1053,8 +1112,9 @@ fn the_programs_own_exit_writes_no_stopped_record_first() {
 }
 
 /// A stop that is accepted after the last look at the bus and before the program exists still spawns it. The
-/// record says `Stopped`, which is true: a stop was accepted. The program was started after the close event and
-/// never got it; it runs until Windows ends the shim, which ends the job over it.
+/// record says `Stopped` while it runs, which is true: a stop was accepted. The program was started after the close
+/// event and never got it; it runs until it exits (its exit is then the record) or Windows ends the shim, which ends
+/// the job over it and leaves `Stopped`.
 #[skuld::test]
 fn a_stop_between_the_last_look_and_the_spawn_still_spawns_the_program() {
     let process = runs_until_stopped();
@@ -1068,7 +1128,8 @@ fn a_stop_between_the_last_look_and_the_spawn_still_spawns_the_program() {
         process.end(0);
     });
 
-    assert_eq!(code, STOPPED);
+    assert_eq!(code, 0);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(0)));
     run.finish();
 }
 
@@ -1178,11 +1239,14 @@ fn the_close_handler_only_requests_a_stop() {
     }));
 
     // Only a stop that reached the bus makes the run record one, and the handler thread never returns to end
-    // the process: the run thread alone ends it.
-    let code = run.run_until_it_records(|| process.end(0));
+    // the process: the run thread alone ends it, with the program's own exit once it has one.
+    let code = run.run_until_it_records(|| {
+        assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+        process.end(0);
+    });
 
-    assert_eq!(code, STOPPED);
-    assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+    assert_eq!(code, 0);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(0)));
     assert_eq!(run.finish(), Vec::<String>::new());
 }
 

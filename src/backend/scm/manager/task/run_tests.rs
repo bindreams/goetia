@@ -381,7 +381,9 @@ fn wait_is_unrecorded_when_the_process_ended_and_no_record_exists() {
     assert_eq!(
         UNRECORDED,
         "it left no record: its program may have run and failed to record, its shim may have started no \
-         program, or it may have been killed or failed to log on; the task's log and the Event Log may say more"
+         program, it may have been killed or failed to log on, or its program was still running about a second \
+         after a stop, when Windows ends the shim together with it before anything could be recorded; the \
+         task's log and the Event Log may say more"
     );
 }
 

@@ -839,7 +839,7 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
     File::create(dir.join("release-worker")).expect("let the worker end");
     let outcome = rx.recv().expect("the supervisor ended without an outcome");
 
-    assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
     assert!(
         dir.join("worker-done").exists(),
         "the worker was ended before it finished its own shutdown"

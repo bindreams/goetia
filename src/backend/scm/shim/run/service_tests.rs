@@ -753,7 +753,7 @@ fn endings() -> Vec<Ending> {
         Ending {
             spawn: || Some(FakeProcess::running()),
             stop: true,
-            outcome: PassOutcome::Stopped,
+            outcome: PassOutcome::Stopped(None),
             reported: Reported::Clean,
         },
         Ending {
@@ -812,6 +812,124 @@ fn run_daemon_is_run_pass_then_reported() {
     }
 }
 
+/// One pass whose stop is accepted as the daemon is running, with the process the `Fake` spawns, the plan the pass runs
+/// and the `WaitEnd` `on_stopping` was told.
+fn stopped_pass(plan: StopPlan, process: FakeProcess) -> (PassOutcome, Vec<WaitEnd>) {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    fake.will_spawn(process);
+    let bus = Arc::clone(&supervisor.bus);
+    let mut told = Vec::new();
+    let outcome = run_pass(
+        &kill_spec(),
+        plan,
+        &supervisor,
+        ID,
+        || assert!(bus.request_stop()),
+        |end| told.push(end),
+    );
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    let _ = fake.take_infos();
+    (outcome, told)
+}
+
+/// A daemon that exited by itself, as far as the shim saw, before its teardown, and a stop was accepted: the pass
+/// carries the daemon's own exit code, wherever the stop met the exit. The service reports it clean all the same.
+#[skuld::test]
+fn a_stop_over_a_daemon_that_exited_by_itself_carries_its_exit_code_and_is_clean() {
+    let ask = StopPlan::AskAndWait {
+        event: cosca::CtrlEvent::CtrlC,
+        timeout: Some(Duration::from_secs(30)),
+    };
+    // Gone when the stop is seen, whichever plan.
+    for plan in [StopPlan::AtOnce, StopPlan::WaitOnly, ask] {
+        let gone = FakeProcess::new()
+            .exited_unreported(7)
+            .wait(WaitReply::Blocks)
+            .wait(WaitReply::Blocks)
+            .send_kill_tree(KillReply::Ends);
+        let (outcome, told) = stopped_pass(plan, gone);
+
+        assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "{plan:?}, gone at the stop");
+        assert_eq!(
+            told,
+            [WaitEnd::Exit],
+            "{plan:?}: no stop was seen over a program that is gone"
+        );
+        assert_eq!(outcome.reported(), Reported::Clean);
+    }
+    // Alive at the stop, exits as it is asked.
+    let asked = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .wait(WaitReply::Blocks)
+        .ask(AskReply::SentAndExits(7))
+        .wait_tree(TreeWaitReply::Drained)
+        .send_kill_tree(KillReply::Ends);
+    let (outcome, told) = stopped_pass(ask, asked);
+    assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "exited within the ask");
+    assert_eq!(told, [WaitEnd::Stop]);
+    assert_eq!(outcome.reported(), Reported::Clean);
+}
+
+/// A stop accepted between the wake of the wait and the decision of the exit: the exit was seen first, so the pass
+/// carries its code; the service still reports clean.
+#[skuld::test]
+fn a_stop_accepted_after_the_exit_was_seen_carries_the_exit_code_and_is_clean() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
+    let bus = Arc::clone(&supervisor.bus);
+
+    let outcome = run_pass(
+        &kill_spec(),
+        StopPlan::AtOnce,
+        &supervisor,
+        ID,
+        || {},
+        |end| {
+            assert_eq!(end, WaitEnd::Exit);
+            assert!(bus.request_stop());
+        },
+    );
+
+    assert_eq!(outcome, PassOutcome::Stopped(Some(7)));
+    assert_eq!(outcome.reported(), Reported::Clean);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+}
+
+/// A stop over a daemon the shim never saw exit carries no code: the teardown ended it, or its wait failed, and what
+/// exit status it left is the teardown's.
+#[skuld::test]
+fn a_stop_over_a_daemon_the_shim_never_saw_exit_carries_no_code() {
+    let (outcome, _) = stopped_pass(StopPlan::AtOnce, FakeProcess::running());
+    assert_eq!(outcome, PassOutcome::Stopped(None), "ended by the teardown");
+
+    let failed = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .send_kill_tree(KillReply::Ends);
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    fake.will_spawn(failed);
+    let bus = Arc::clone(&supervisor.bus);
+    let outcome = run_pass(
+        &kill_spec(),
+        StopPlan::WaitOnly,
+        &supervisor,
+        ID,
+        || assert!(bus.request_stop()),
+        |_| {},
+    );
+    assert_eq!(outcome, PassOutcome::Stopped(None), "a failed wait");
+    assert_eq!(outcome.reported(), Reported::Clean);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    let _ = fake.take_failures();
+}
+
 // STOP_PENDING --------------------------------------------------------------------------------------------------------
 
 /// `run_daemon` with both reports recorded: how many tree kills had been attempted at each
@@ -868,6 +986,8 @@ fn a_run_reports_the_hint_of_its_plan_for_what_ended_it() {
     fake.will_make_thread();
     fake.will_spawn(
         FakeProcess::new()
+            .wait(WaitReply::Blocks)
+            // The read of the exit status of a daemon that exited by itself.
             .wait(WaitReply::Blocks)
             .ask(AskReply::SentAndExits(0))
             .wait_tree(TreeWaitReply::Drained)
