@@ -195,10 +195,16 @@ fn a_program_that_handles_the_close_event_and_exits_has_its_own_exit_recorded(#[
 }
 
 /// A program that left the console is sent nothing, so the shim hears the stop with the program alive: it records
-/// `Stopped` and waits for the program's own exit. The program exits only once it has seen that record on disk, with a
-/// code of its own, and the record the shim ends with is that exit.
+/// `Stopped` and waits for the program's own exit. What the shim guarantees, and the program's own line proves, is that
+/// the record on disk while the program was alive said `stopped`. How the run ends then is Windows' to decide, about a
+/// second after the stop: the program exits by itself in time and `run` answers its code (the record is its exit), or
+/// Windows ends the shim first and `run` answers `0xC000013A` (the record stays `stopped`). Either is accepted, and
+/// which it was is printed. The order of the two records is pinned by the shim's own unit tests
+/// (`task_tests::a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_the_pin_held_meanwhile`).
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_program_with_no_console_is_recorded_stopped_first_and_then_by_its_own_exit(#[fixture(scm_group)] _group: &Group) {
+fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exit_or_as_stopped(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let stopped = stop_a_run("detach", |record, records| {
         vec![
             record.to_str().expect("the record's path is UTF-8").to_owned(),
@@ -208,12 +214,26 @@ fn a_program_with_no_console_is_recorded_stopped_first_and_then_by_its_own_exit(
     });
 
     let left = &stopped.left;
-    let exit = stopped.exit.unwrap_or_else(|e| panic!("run: {}\n{left}", e.report()));
-    assert_eq!(exit, Exit::Code(9), "the program's own code\n{left}");
+    let exit = stopped.exit.unwrap_or_else(|e| panic!("run: {}
+{left}", e.report()));
     assert!(
         stopped.said.contains("daemon: record=") && stopped.said.contains("stopped"),
-        "the record the program saw, as the stop was accepted, was `stopped`: {}\n{left}",
+        "the record the program saw, as the stop was accepted, was `stopped`: {}
+{left}",
         stopped.said
+    );
+    assert!(
+        exit == Exit::Code(9) || exit == STOPPED,
+        "the program's own code or the stop's, not {exit:?}
+{left}"
+    );
+    println!(
+        "measured: {}",
+        if exit == STOPPED {
+            "Windows ended the shim first: the record stayed `stopped`"
+        } else {
+            "the program exited in time: the record is its own exit"
+        }
     );
 }
 
