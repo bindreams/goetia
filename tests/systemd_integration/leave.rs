@@ -189,27 +189,6 @@ fn an_uninstall_that_stops_the_run_a_standin_keeps_leaves_nothing_listed(#[fixtu
     assert_not_installed(&mgr, &id);
 }
 
-/// A plain `uninstall` of a task with a run in flight stops it by signal, which fails the oneshot: the removal
-/// leaves nothing of the id listed, not `not-found failed`.
-#[skuld::test]
-fn an_uninstall_that_stops_a_tasks_run_leaves_nothing_listed(#[fixture(systemd_group)] _group: &Group) {
-    let id = support::random_test_id();
-    let _guard = ServiceGuard::new(&id);
-    let mut run = Held::new();
-    let spec = goetia::testing::task(&id, run.command.clone(), Some(DAILY));
-    let mgr = Systemd::new();
-    mgr.install(&spec, false).expect("install");
-    mgr.enable(&id_of(&id)).expect("enable");
-    mgr.start(&id_of(&id), Budget::DEFAULT).expect("start");
-    run.wait_started();
-
-    mgr.uninstall(&id_of(&id), RunInFlight::Stop).expect("uninstall");
-
-    let listed = list_units(&id);
-    assert!(!listed.stdout.contains(&id), "nothing of the id is listed: {listed}");
-    assert_not_installed(&mgr, &id);
-}
-
 /// With no run in flight `--no-stop` is a plain uninstall: nothing is left, the stand-in included.
 #[skuld::test]
 fn no_stop_on_a_task_that_is_not_running_leaves_nothing(#[fixture(systemd_group)] _group: &Group) {

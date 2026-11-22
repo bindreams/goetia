@@ -12,7 +12,6 @@ use super::super::journal::fake::Fake as JournalFake;
 use super::super::journal::{DEACTIVATED, Entry as JournalEntry, MAIN_PROCESS_EXITED, STARTING};
 use super::super::manager_tests::QuarantineSweep;
 use super::super::standin::standin_path;
-use super::super::standin::standin_tests::{read_call, read_of};
 use super::super::systemctl::Systemctl;
 use super::super::systemctl::systemctl_tests::{booted, gate_then};
 use super::*;
@@ -1963,7 +1962,7 @@ fn a_task_timer_beside_the_old_service_is_ours_and_a_rerun_finishes_the_retype(
 // uninstall ===========================================================================================================
 
 /// The timer is disarmed first, so nothing starts the job between its stop and its removal; the stop
-/// is unbounded and is followed by one read of what it left; the files go timer first.
+/// is unbounded; the files go timer first.
 #[skuld::test]
 fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
@@ -1986,7 +1985,6 @@ fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixtur
             )
         }),
         enqueued("stop", 3),
-        read_of(&id, false),
         reload(),
     ]);
     let mgr = over(&fake);
@@ -2000,7 +1998,6 @@ fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixtur
         [
             call(&["disable", "--now", "--", &format!("{id}.timer")]),
             call(&["stop", "--show-transaction", "--", &format!("{id}.service")]),
-            read_call(&id),
             call(&["daemon-reload"]),
         ]
     );
@@ -2010,20 +2007,14 @@ fn uninstalling_a_task_disarms_the_timer_stops_the_job_and_removes_both(#[fixtur
     }
 }
 
-/// A plain service keeps its order: stop, the read of what it left, disable, remove, reload, and nothing about a
-/// timer.
+/// A plain service keeps its order: stop, disable, remove, reload, and nothing about a timer.
 #[skuld::test]
 fn uninstalling_a_service_keeps_its_order(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     let spec = service_spec(&id);
     seed(&id, UnitKind::Service, &units_of(&spec).service);
-    let fake = gate_then([
-        enqueued("stop", 3),
-        read_of(&id, false),
-        reply(&["disable"], exited(0, "", "")),
-        reload(),
-    ]);
+    let fake = gate_then([enqueued("stop", 3), reply(&["disable"], exited(0, "", "")), reload()]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
@@ -2034,7 +2025,6 @@ fn uninstalling_a_service_keeps_its_order(#[fixture(systemd_group)] _group: &Gro
         without_gate(&fake),
         [
             call(&["stop", "--show-transaction", "--", &format!("{id}.service")]),
-            read_call(&id),
             call(&["disable", "--", &format!("{id}.service")]),
             call(&["daemon-reload"]),
         ]
@@ -2049,7 +2039,7 @@ fn uninstalling_a_job_without_a_timer_asks_nothing_of_the_timer(#[fixture(system
     let _left = Leftovers::new(&id);
     let spec = task_spec(&id, "/bin/a", Some("30 3 * * *"));
     seed(&id, UnitKind::Service, &units_of(&spec).service);
-    let fake = gate_then([enqueued("stop", 3), read_of(&id, false), reload()]);
+    let fake = gate_then([enqueued("stop", 3), reload()]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
@@ -2060,7 +2050,6 @@ fn uninstalling_a_job_without_a_timer_asks_nothing_of_the_timer(#[fixture(system
         without_gate(&fake),
         [
             call(&["stop", "--show-transaction", "--", &format!("{id}.service")]),
-            read_call(&id),
             call(&["daemon-reload"]),
         ]
     );
@@ -2080,7 +2069,6 @@ fn uninstall_reports_a_timer_that_changed_as_a_concurrent_change(#[fixture(syste
     let fake = gate_then([
         reply(&["disable"], exited(0, "", "")).then(move || std::fs::write(&timer, changed).expect("change")),
         enqueued("stop", 3),
-        read_of(&id, false),
     ]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);

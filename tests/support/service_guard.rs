@@ -70,13 +70,14 @@ fn cleanup(id: &str) -> Vec<String> {
     problems.extend(cmd::run_cleanup("systemctl", &[&["daemon-reload"]], &[]));
     // A unit that failed outlives its removed file as `not-found failed`, until the reload above has let go
     // of the file and this clears it.
-    for suffix in ["timer", "service"] {
-        problems.extend(cmd::run_cleanup_unless(
-            "systemctl",
-            &[&["reset-failed", &format!("{id}.{suffix}")]],
-            cmd::Run::systemctl_says_not_loaded,
-        ));
-    }
+    problems.extend(cmd::run_cleanup_unless(
+        "systemctl",
+        &[
+            &["reset-failed", &format!("{id}.timer")],
+            &["reset-failed", &format!("{id}.service")],
+        ],
+        cmd::Run::systemctl_says_not_loaded,
+    ));
     problems
 }
 

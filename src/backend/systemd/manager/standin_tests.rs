@@ -593,38 +593,54 @@ fn a_standin_is_not_removed_before_the_gate_is_passed(#[fixture(systemd_group)] 
 
 // Stop ================================================================================================================
 
-/// `Stop` of a held job stops it and then reads once what the stop left, whatever the stand-in: `reset-failed` is
-/// sent when that read says failed, so the removal does not leave the unit listed `not-found failed`. Nothing is
-/// read before the stop, and no stand-in is written.
+/// `Stop` of a held job with no stand-in of ours is today's sequence: the stop, and no read and no `reset-failed`
+/// after it, and no file written.
 #[skuld::test]
-fn stopping_a_task_reads_once_after_the_stop_and_clears_a_failed_run(#[fixture(systemd_group)] _group: &Group) {
-    for with_standin in [false, true] {
-        for failed in [false, true] {
-            let id = fresh_id("systemd");
-            let _left = Leftovers::new(&id);
-            installed(&id, SCHEDULE);
-            if with_standin {
-                seed_standin(&id, "15", "1min 30s");
-            }
-            let mut steps = vec![disabled(), enqueued("stop", 3), read_of(&id, failed)];
-            steps.extend(failed_reset(failed));
-            steps.push(reload());
-            let fake = gate_then(steps);
-            let mgr = over(&fake);
-            let snapshot = marked(&mgr, &id);
+fn stopping_a_task_with_no_standin_writes_nothing_and_reads_nothing(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    installed(&id, SCHEDULE);
+    let fake = gate_then([disabled(), enqueued("stop", 3), reload()]);
+    let mgr = over(&fake);
+    let snapshot = marked(&mgr, &id);
 
-            mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
-                .expect("uninstall");
+    mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+        .expect("uninstall");
 
-            let mut expected = vec![disable_timer_call(&id), stop_call(&id), read_call(&id)];
-            if failed {
-                expected.push(reset_call(&id));
-            }
-            expected.push(reload_call());
-            assert_eq!(calls_of(&fake), expected, "stand-in: {with_standin}, failed: {failed}");
-            assert_eq!(standin_text(&id), None);
-            assert!(paths(&id).iter().all(|p| !p.exists()));
+    assert_eq!(
+        calls_of(&fake),
+        [disable_timer_call(&id), stop_call(&id), reload_call()]
+    );
+    assert_eq!(standin_text(&id), None);
+}
+
+/// `Stop` of an installed id with a stand-in of ours: the stop comes first, with no read before it, then one read
+/// of what the stop left, and `reset-failed` only where that read says failed.
+#[skuld::test]
+fn stopping_an_installed_id_reads_whether_the_run_failed_after_the_stop(#[fixture(systemd_group)] _group: &Group) {
+    for failed in [false, true] {
+        let id = fresh_id("systemd");
+        let _left = Leftovers::new(&id);
+        installed(&id, SCHEDULE);
+        seed_standin(&id, "15", "1min 30s");
+        let mut steps = vec![disabled(), enqueued("stop", 3), read_of(&id, failed)];
+        steps.extend(failed_reset(failed));
+        steps.push(reload());
+        let fake = gate_then(steps);
+        let mgr = over(&fake);
+        let snapshot = marked(&mgr, &id);
+
+        mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
+            .expect("uninstall");
+
+        let mut expected = vec![disable_timer_call(&id), stop_call(&id), read_call(&id)];
+        if failed {
+            expected.push(reset_call(&id));
         }
+        expected.push(reload_call());
+        assert_eq!(calls_of(&fake), expected, "failed: {failed}");
+        assert_eq!(standin_text(&id), None, "failed: {failed}");
+        assert!(paths(&id).iter().all(|p| !p.exists()));
     }
 }
 
@@ -730,7 +746,7 @@ fn a_foreign_file_at_the_standins_path_does_not_stop_a_stop(#[fixture(systemd_gr
     let _left = Leftovers::new(&id);
     installed(&id, SCHEDULE);
     seed_foreign_at(&id);
-    let fake = gate_then([disabled(), enqueued("stop", 3), read_of(&id, false), reload()]);
+    let fake = gate_then([disabled(), enqueued("stop", 3), reload()]);
     let mgr = over(&fake);
     let snapshot = marked(&mgr, &id);
 
