@@ -145,6 +145,18 @@ impl Systemd {
         .map(|_| ())
     }
 
+    /// The stand-in this call wrote (`text`), after the verified removal of the timer or the job failed. A file at
+    /// the job's path, ours or anybody's, outranks it, so it is stale and removed like any other. With the path
+    /// empty (the job vanished since the read, or a restore failed) it is the unit's definition, and removing it
+    /// would let the next reload end a run in its start job: it stays. So it does where presence cannot be
+    /// settled, which is the safer error.
+    pub(super) fn take_back_standin(&self, id: &str, text: &str, held: &mut Held) -> Result<()> {
+        match classify_and_read(&unit_path(id, UnitKind::Service)) {
+            Ok(RawState::Regular(_) | RawState::NotOurs) => self.remove_standin(id, text, false, held),
+            Ok(RawState::Absent) | Err(_) => Ok(()),
+        }
+    }
+
     /// `install`'s part, `over_job` saying whether the id's job file is installed: a stand-in of ours is then
     /// stale and removed. With no job file it is the unit's definition: removed when its run has no process, and
     /// kept with one, as an install never stops a run. Asks nothing of systemd where there is no stand-in of

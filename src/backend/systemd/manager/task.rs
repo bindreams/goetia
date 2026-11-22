@@ -436,10 +436,11 @@ impl Systemd {
             _ => None,
         };
 
-        // A verified removal of the timer or the job that fails aborts here, and the stand-in this call wrote
-        // is removed again, verified against its text, before the error is returned (a failure of that removal is
-        // reported with it), so a call that fails here leaves no stand-in of its own. Past them the removals are
-        // all attempted and every failure is reported together, so the reload still runs.
+        // A verified removal of the timer or the job that fails aborts here. The stand-in this call wrote is
+        // taken back, verified against its text, where a file at the job's path outranks it (a failure of that
+        // is reported with the error); with the path empty it is the unit's definition and stays
+        // ([`Systemd::take_back_standin`]). Past them the removals are all attempted and every failure is
+        // reported together, so the reload still runs.
         let mut removed = Ok(());
         if let Some(snapshot) = installed {
             // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file spans
@@ -455,7 +456,7 @@ impl Systemd {
             })();
             if let Err(e) = files {
                 let unwritten = match &wrote {
-                    Some(text) => self.remove_standin(id, text, false, held),
+                    Some(text) => self.take_back_standin(id, text, held),
                     None => Ok(()),
                 };
                 return both(Err(e), unwritten);

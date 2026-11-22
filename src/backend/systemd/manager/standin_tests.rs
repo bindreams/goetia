@@ -1029,7 +1029,9 @@ fn a_failed_removal_of_the_job_removes_the_standin_this_call_wrote(#[fixture(sys
 /// call wrote: it is then the unit's definition, and removing it would let the next reload end the run in its start
 /// job. The error is the removal's.
 #[skuld::test]
-fn a_failed_removal_of_the_job_leaves_the_standin_where_the_job_path_is_empty(#[fixture(systemd_group)] _group: &Group) {
+fn a_failed_removal_of_the_job_leaves_the_standin_where_the_job_path_is_empty(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     seed(&id, UnitKind::Service, &units_of(&service_spec(&id)).service);
