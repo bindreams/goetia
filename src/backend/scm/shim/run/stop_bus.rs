@@ -86,12 +86,8 @@ pub enum StopPlan {
     },
     /// No ask, no wait: the teardown at once. `send-signal: kill` and `wm-close` (it has no send yet).
     AtOnce,
-    /// No ask; wait for the daemon's own exit, with no cap of goetia's, then the teardown. A task: Task Scheduler's
-    /// stop is the console close event, which reaches the program on the console it shares with the shim, and
-    /// Windows ends everything on that console about a second later. The wait is for a program that is alive when the
-    /// shim hears the stop: on a console the event enters the shim's handler only after the program has ended
-    /// (measured on Windows Server 2025, build 26100), so such a program is never waited for. One that is not on
-    /// the shim's console, a GUI-subsystem program or one that detached, is.
+    /// No ask; wait for the daemon's own exit with no cap of goetia's, then the teardown. For a task, whose stop is
+    /// the console close event; see the module doc of `shim::run::task`.
     WaitOnly,
 }
 
@@ -573,9 +569,8 @@ impl Supervisor {
         // not, and holding it across a kernel call would block `request_stop()`/`settle()`
         // callers (e.g. a second, redundant SCM stop control) for no reason.
         drop(g);
-        // The one read of the live process at the stop, before `on_stopping`: a root already gone is its own exit,
-        // told as one, and no plan runs for it. Gone is decided here, once ([`Supervisor::find_gone`]). A failed wait
-        // says nothing of the daemon: no read.
+        // The one read of the live process at the stop, before `on_stopping`. Gone is decided here, once
+        // ([`Supervisor::find_gone`]). A failed wait says nothing of the daemon: no read.
         let mut unreadable_told = false;
         let gone = if stopping && wait_failure.is_none() {
             self.find_gone(child.as_ref(), id, &mut unreadable_told)
@@ -701,9 +696,7 @@ impl Supervisor {
     ///
     /// The daemon's exit is read before every ask ([`Supervisor::find_gone`]: the process itself, or the waiter's
     /// report when that read fails): one that has exited is neither asked (again) nor waited for. The first ask is
-    /// told in the log before it is made, so that the line comes before whatever the daemon does in answer. What the
-    /// ask answered decides the rest ([`judge_ask`]); a wait that cannot be made is logged and the teardown follows
-    /// at once.
+    /// told in the log before it is made, so that the line comes before whatever the daemon does in answer.
     ///
     /// A tree is waited for after any answer that may mean the event was sent, whether or not the root has exited
     /// since. That includes a root that exits by itself between the read before an ask and that ask, which is then

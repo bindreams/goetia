@@ -18,10 +18,8 @@
 //! in the task-mode argument, the task's id and the registration's token. It reads its own task, and
 //! starts no program (a shim failure) when the task's registration is not the one it was started
 //! under. Otherwise it runs the program the same way and records how the run ended. A task's stop is the
-//! console close event, which reaches the program on its own, and a console program's own handler runs before the
-//! shim hears it (measured on Windows Server 2025, build 26100), so the record is the program's exit whenever the
-//! shim saw it exit. For a program still alive when the shim hears the stop it records the stop first, then waits
-//! for the program to exit, with no cap of its own, and tears down what is left (`stop_bus::StopPlan::WaitOnly`).
+//! console close event; what it does to the program and the shim, and what is recorded, is in the module doc of
+//! `shim::run::task`.
 
 use std::ffi::OsString;
 

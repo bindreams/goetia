@@ -281,7 +281,6 @@ impl Proc {
         first
     }
 
-    /// Runs the effect stated for the first time the process performs `op` ([`FakeProcess::when`]), with no lock held.
     fn fire(&self, op: Op) {
         let effect = lock(&self.state).when.remove(&op);
         if let Some(effect) = effect {

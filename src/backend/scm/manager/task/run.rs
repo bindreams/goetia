@@ -32,8 +32,8 @@ use crate::spec::Id;
 /// Why a run has no record of its end, with what is known: the cause is not. The program may have run and
 /// failed to record, the shim may have started none, or the shim may have been killed or the task not logged
 /// on (a missing logon right or a changed password starts nothing and raises nothing), or its program may have
-/// outlived a stop by about a second, when Windows ends the shim with it before anything is recorded (measured on
-/// Windows Server 2025, build 26100). The task's last result is not read, since a later run overwrites it.
+/// outlived a stop (see the module doc of `shim::run::task`). The task's last result is not read, since a later
+/// run overwrites it.
 pub(super) const UNRECORDED: &str = "it left no record: its program may have run and failed to record, its shim \
      may have started no program, it may have been killed or failed to log on, or its program was still running \
      about a second after a stop, when Windows ends the shim together with it before anything could be \
@@ -46,9 +46,7 @@ pub(super) const UNRECORDED: &str = "it left no record: its program may have run
 pub(super) enum Identity {
     /// A run that is alive, with the pid it is listed with.
     Live { id: InstanceId, pid: u32 },
-    /// A run that left this record. It has ended, unless the record is a first `Stopped`, which a live run
-    /// writes: [`Scm::task_begin_run_with`] confirms that one against the listing, and follows the run it
-    /// lists as live or, when none is listed, as ended.
+    /// A run that left this record: ended, unless it is a first `Stopped` (step 5 of [`Scm::task_begin_run_with`]).
     Done(RunRecord),
     /// No run that is known to be ours.
     Unrecorded,
@@ -102,8 +100,7 @@ pub(super) fn identify(started: Option<&Started>, live: &[Instance], appeared: &
 enum Following<H> {
     /// The run's process, held: its exit is what `wait` blocks on, and the record is read after it.
     Process { instance: InstanceId, process: H },
-    /// The run's process was gone when it was opened, or its first `Stopped` was not listed on the read after
-    /// it: it has ended, and its shim wrote its record first.
+    /// The run has ended, and its shim wrote its record.
     Ended(InstanceId),
     /// The run had ended before it was followed, and left this record, which is not a first `Stopped`.
     Done(RunRecord),
@@ -279,9 +276,6 @@ impl Scm {
                 Error::os(format!("read the run records of `{id}`"), e),
             )
         })?;
-        // A listed run is followed by its process. A first `Stopped` is a run's own record while it is alive, so
-        // it is confirmed by a listing read after it: listed, the run is followed as a live one; not listed, it
-        // has ended, and `wait` reads its record, which is its last.
         let hold = |listed: &Instance, processes: &mut P| -> Result<Following<P::Held>> {
             match hold_run(&*self.tasks, "run", &id, &path, listed, processes)
                 .map_err(|e| unfollowed(&id, "hold the process of the run it began", e))?

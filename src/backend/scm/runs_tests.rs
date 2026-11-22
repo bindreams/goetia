@@ -1119,9 +1119,8 @@ fn a_provisional_file_that_holds_another_outcome_than_stopped_is_a_corrupt_recor
     assert!(read.to_string().contains("provisional"), "{read}");
 }
 
-/// The case that used to block a final record: another program holds the provisional file open without sharing
-/// delete (a scanner, say). The record is written to a name nothing holds, so it lands at once, and the held
-/// provisional file is left for a later prune.
+/// Another program holds the provisional file open without sharing delete (a scanner, say). The record is written
+/// to a name nothing holds, so it lands at once, and the held provisional file is left for a later prune.
 #[skuld::test]
 fn a_final_write_lands_while_another_handle_holds_the_provisional_file_without_sharing_delete() {
     let (_dir, runs) = fixture();

@@ -40,8 +40,7 @@
 //! accepted, not that the tree ended; the Job Object's `KILL_ON_JOB_CLOSE` ends the tree. A stop accepted before
 //! the spawn starts no program, which the close event would never reach: the bus is looked at right before the
 //! spawn, and the one stop that arrives between that look and the spawn starts the program, which runs until it
-//! exits or Windows ends the shim and the job closes over it. A run in flight at a system shutdown is ended by
-//! Windows and may leave no record: nothing here handles `CTRL_SHUTDOWN_EVENT`.
+//! exits or Windows ends the shim and the job closes over it.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
@@ -247,9 +246,8 @@ pub(super) fn run_in(
         id,
         || {},
         |end| {
-            // Only for a stop heard with the program alive, never for its own exit (a program that is gone when the
-            // stop is seen is told as one): the provisional file comes before the wait, which Windows may end the
-            // shim in, and the pin stays held (the run is alive).
+            // Before the wait, which Windows may cut short by ending the shim; the pin stays held, since the run is
+            // alive.
             if end == WaitEnd::Stop
                 && let Err(e) = pin.write_stopping(&instance, started)
             {
@@ -497,8 +495,7 @@ fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &Insta
 fn ended_as(outcome: PassOutcome) -> (Option<RunOutcome>, u32) {
     match outcome {
         PassOutcome::Exited(Some(code)) => (Some(RunOutcome::Exited(code as u32)), code as u32),
-        // A stop the shim saw the program's own exit for is that exit, whichever thread came first. `Stopped` is only
-        // for a stop whose program the shim never saw exit.
+        // See the module doc: the record is the program's exit when the shim saw it.
         PassOutcome::Stopped(Some(code)) => (Some(RunOutcome::Exited(code as u32)), code as u32),
         PassOutcome::Stopped(None) => (Some(RunOutcome::Stopped), STOPPED_EXIT),
         // The program may be running: a launch that may have started it says so as a stop does.

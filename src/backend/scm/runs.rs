@@ -99,9 +99,8 @@ pub(crate) enum RunOutcome {
     Exited(u32),
     /// A stop was accepted and the shim never recorded how the program ended: no program was started, its wait
     /// failed, its own teardown ended it, Windows ended the shim first, or the final write failed. For the last two
-    /// the run left only its provisional file, written before the shim waits for a program that is alive at the
-    /// stop, which a reader takes as this. It does not say the program's tree has ended: a shim that Windows ends
-    /// first leaves it, and the Job Object ends the tree. A program the shim saw exit is `Exited`, stop or not.
+    /// the run left only its provisional file, which a reader takes as this. It does not say the program's tree has
+    /// ended. A program the shim saw exit is `Exited`, stop or not (see the module doc of `shim::run::task`).
     Stopped,
     /// A stop was accepted and something of the program's tree could not be ended.
     IncompleteStop,
@@ -189,8 +188,7 @@ impl Pin {
 
     /// Writes the provisional file of the run this pin is the shim's own of, which is alive: its `Stopped`, which a
     /// stop that finds the program alive writes before it waits, since Windows may end the shim before anything
-    /// later. It is a file of its own, `<instance>.stopping`, so the record that follows is written to a name nothing
-    /// holds. The pin stays held: nothing is pruned (the run is alive, and "no pin held" means "no run alive"). The
+    /// later. It is a file of its own, `<instance>.stopping`. The pin stays held: nothing is pruned (the run is alive, and "no pin held" means "no run alive"). The
     /// file lands in the pin's directory, through its handle; the body is the one that writes a record, and a run
     /// that has a provisional file is refused ([`io::ErrorKind::AlreadyExists`]).
     pub(crate) fn write_stopping(&self, instance: &InstanceId, started: u64) -> io::Result<()> {
@@ -210,9 +208,7 @@ impl Pin {
 /// Which of a run's two files a name is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FileKind {
-    /// The provisional file of the first `Stopped`.
     Stopping,
-    /// The record.
     Record,
 }
 
@@ -422,7 +418,7 @@ impl Runs {
     ///
     /// **Nothing is renamed onto a name that exists:** a record for an instance that has one is refused
     /// ([`io::ErrorKind::AlreadyExists`]) and the first is as it was. A run's first `Stopped` is another file
-    /// ([`Pin::write_stopping`]), so no program that holds it open can keep this write from landing.
+    /// ([`Pin::write_stopping`]).
     ///
     /// `own` is the writer's pin: held until the record is renamed into place, then released before the prune,
     /// which a held pin would stop. A failed write releases it too. The write goes through the pin's directory
@@ -823,9 +819,8 @@ fn stopping_temp_name(instance: &InstanceId) -> OsString {
 ///
 /// **The provisional file is read first,** so that a record that lands between the two reads is found by the
 /// second: read the other way round, the record would be missed and the provisional file still there, and a run
-/// that was recorded would read as `Stopped`. Every reader holds a pin ([`Pin::appeared`], a `run`'s wait, a
-/// stop's check of the runs it ended), so no write prunes in between. A read with no pin can still answer
-/// `Stopped` for a run whose record was pruned in between.
+/// that was recorded would read as `Stopped`. A read with no pin can still answer `Stopped` for a run whose record
+/// was pruned in between.
 ///
 /// A provisional file holds `Stopped`, as [`Pin::write_stopping`] stores it, and is taken as stored: another
 /// outcome in it is a corrupt record.

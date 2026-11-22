@@ -46,11 +46,9 @@
 //! - `catch-close <port> <record> <code>` — `catch` that, on the close event (what a task's `stop` sends),
 //!   records `daemon: exiting by the event` and exits with `<code>`.
 //! - `catch-hang <port> <record>` — `catch` that, on the close event, records it and never leaves its handler.
-//! - `detach <port> <record> <runs-dir> <code|never>` — leaves the console (`FreeConsole`), so that the close
-//!   event does not reach it, then writes its pid to `<port>` and waits for `<runs-dir>` (a task's run records) to
-//!   hold a provisional file (`<instance>.stopping`), which only a stop makes the shim write while the program is
-//!   alive. It notes the file's text in `<record>` (`daemon: record=<json>`) and then exits with `<code>`, or, for
-//!   `never`, blocks forever.
+//! - `detach <port> <record> <runs-dir> <code|never>` — leaves the console so the close event misses it, reports
+//!   its pid to `<port>`, waits until `<runs-dir>` holds a `.stopping` file, records its text in `<record>`, then
+//!   exits with `<code>` (or blocks forever for `never`).
 //! - `catch-worker <record> <exit-on> <port>` — `catch` as the launcher's worker: on the event it takes 600 ms
 //!   to shut down (a slow shutdown, which the launcher's own exit must not cut short), then records
 //!   `worker: exiting by the event` and exits 0.

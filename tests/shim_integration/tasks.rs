@@ -71,9 +71,8 @@ fn a_task_run_by_the_shim_records_its_exit(#[fixture(scm_group)] _group: &Group)
     mgr.uninstall(&id).expect("uninstall");
 }
 
-/// A stop of a program that has no handler for the close event: the event ends it, newest process first, and the shim
-/// hears it only after the program has ended (measured on Windows Server 2025, build 26100). The shim's waiter had
-/// seen the exit, so the run's record is the program's own death by the event, `Exited(0xC000013A)`, not `Stopped`.
+/// A program with no close handler is ended by the event before the shim hears the stop, so the record is its own
+/// death, `Exited(0xC000013A)`, not `Stopped`.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_stop_ends_a_program_with_no_handler_and_the_run_records_its_death_by_the_event(
     #[fixture(scm_group)] _group: &Group,
@@ -208,9 +207,7 @@ fn a_program_that_handles_the_close_event_and_exits_has_its_own_exit_recorded(#[
 /// program's own line proves, is that the file on disk while the program was alive said `stopped`. How the run ends
 /// then is Windows' to decide, about a second after the stop: the program exits by itself in time and `run` answers
 /// its code (the record is its exit), or Windows ends the shim first and `run` answers `0xC000013A`: the run left its
-/// provisional file and no record. Either end is accepted, and which it was is printed. The order of the two files is
-/// pinned by the shim's own unit tests
-/// (`task_tests::a_program_that_exits_after_the_stop_was_recorded_has_its_exit_recorded_with_the_pin_held_meanwhile`).
+/// provisional file and no record. Either end is accepted, and which it was is printed.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exit_or_as_stopped(
     #[fixture(scm_group)] _group: &Group,
@@ -281,14 +278,12 @@ fn a_program_with_no_console_that_never_exits_is_recorded_stopped_and_ended_with
         "the record the program saw was `stopped`: {}\n{left}",
         stopped.said
     );
-    // The kernel reaches Gone as the shim's job closes: wait for it.
     wait::until(|| !pid_is_alive(&stopped.pid));
     assert!(!pid_is_alive(&stopped.pid), "the program (pid {}) is gone", stopped.pid);
 }
 
-/// A console program that never leaves its handler for the close event: the shim's handler is never entered, Windows
-/// ends the shim about a second after the stop and the job closes over the program, and nothing is recorded. `stop`
-/// succeeds, `run` says the run left no record and why, and nothing of the tree is left.
+/// A console program that never leaves its handler for the close event (see the module doc of `shim::run::task`):
+/// nothing is recorded. `stop` succeeds, `run` says the run left no record and why, and nothing of the tree is left.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_console_program_that_never_leaves_its_handler_leaves_no_record_and_is_ended_with_the_shim(
     #[fixture(scm_group)] _group: &Group,
@@ -319,7 +314,6 @@ fn a_console_program_that_never_leaves_its_handler_leaves_no_record_and_is_ended
         "the program was sent the close event: {}\n{left}",
         stopped.said
     );
-    // The kernel reaches Gone as the shim's job closes: wait for it.
     wait::until(|| !pid_is_alive(&stopped.pid));
     assert!(!pid_is_alive(&stopped.pid), "the program (pid {}) is gone", stopped.pid);
 }
