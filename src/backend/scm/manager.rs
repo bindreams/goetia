@@ -1235,9 +1235,9 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// log, and the next install corrects what a failure left. The names come from what install knows (the snapshot's account, the new account), never from the file.
 /// A failure of the log after a create leaves the new service, and the next `install` finds it up to date and
 /// makes the log ([`Backend::ensure_beside`]).
-/// `Parameters` follows create/update immediately, minimizing the window in which a crash leaves a service
-/// with no marker; a failure in the two writes after it leaves a registration the next `install` reads as
-/// hand-edited (`Conflict`, cleared by `--force`). An update restates the start type the service has, rather
+/// `Parameters` follows a create immediately, minimizing the window in which a crash leaves a service
+/// with no marker ([`writes_after_service`]); a failure in the writes after it leaves a registration the next
+/// `install` reads as hand-edited (`Conflict`, cleared by `--force`), except the pre-shutdown time's, which it repairs. An update restates the start type the service has, rather
 /// than resetting it; see `service_info`. `written` is what [`written_user`] says of the account's spec value.
 fn apply(
     spec: &DaemonSpec,
@@ -1420,17 +1420,46 @@ fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool, wa
             .map_err(|e| to_error(&format!("update service `{}`", reg.name), e))?;
         service
     };
-    // Before `Parameters`, whose blob is what says the service is plain: an install that fails here leaves the old
-    // blob, and the next one finds the value still to be written.
-    if let Some(preshutdown) = generate::preshutdown_to_write(reg.preshutdown, was_set) {
-        service
-            .set_preshutdown_timeout(preshutdown)
-            .map_err(|e| to_error(&format!("set the pre-shutdown time of `{}`", reg.name), e))?;
+    for write in writes_after_service(generate::preshutdown_to_write(reg.preshutdown, was_set), create) {
+        match write {
+            Write::Preshutdown(preshutdown) => service
+                .set_preshutdown_timeout(preshutdown)
+                .map_err(|e| to_error(&format!("set the pre-shutdown time of `{}`", reg.name), e))?,
+            Write::Parameters => registry::write_parameters(&reg.name, &reg.parameters)?,
+            Write::Environment => registry::write_environment(&reg.name, &reg.environment)?,
+            Write::FailureActions => apply_failure_actions(&reg.name, reg.failure_actions.as_ref())?,
+        }
     }
+    Ok(())
+}
 
-    registry::write_parameters(&reg.name, &reg.parameters)?;
-    registry::write_environment(&reg.name, &reg.environment)?;
-    apply_failure_actions(&reg.name, reg.failure_actions.as_ref())
+/// One write [`apply_gated`] makes once the service exists.
+#[derive(Debug, PartialEq, Eq)]
+enum Write {
+    Preshutdown(Duration),
+    Parameters,
+    Environment,
+    FailureActions,
+}
+
+/// The writes that follow the service's own create (`create`) or update, in order; the first that fails ends the
+/// install. `Parameters` is the marker that says a service is goetia's, so a failure leaves:
+/// - on a create, `Parameters` first: a goetia service with its marker and no pre-shutdown time of its own, which the
+///   next `install` reads as drift and repairs; without it the service would have no marker and read as foreign;
+/// - on an update, the pre-shutdown time first: the old blob stays, so the next `install` finds the value still to
+///   be written ([`generate::preshutdown_to_write`]).
+fn writes_after_service(preshutdown: Option<Duration>, create: bool) -> Vec<Write> {
+    let mut writes = Vec::with_capacity(4);
+    let preshutdown = preshutdown.map(Write::Preshutdown);
+    if create {
+        writes.push(Write::Parameters);
+        writes.extend(preshutdown);
+    } else {
+        writes.extend(preshutdown);
+        writes.push(Write::Parameters);
+    }
+    writes.extend([Write::Environment, Write::FailureActions]);
+    writes
 }
 
 /// `ServiceInfo` for `reg`, for either `create_service` or `change_config`.
