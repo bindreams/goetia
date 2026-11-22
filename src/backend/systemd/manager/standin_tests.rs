@@ -586,7 +586,7 @@ fn a_foreign_file_that_appears_after_the_check_is_a_concurrent_change(#[fixture(
     assert!(paths(&id).iter().all(|p| p.exists()), "nothing was removed");
 }
 
-// The one rule for a stand-in of ours that is found ====================================================================
+// The one rule for a stand-in of ours that is found ===================================================================
 //
 // The same three questions of each caller: an `uninstall` of an installed id, of an absent id, and an
 // `install`. `Stop` stops the run first, then removes; `Leave` removes it when the run is none, after

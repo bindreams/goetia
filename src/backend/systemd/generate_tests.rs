@@ -1574,7 +1574,7 @@ fn the_recogniser_rejects_an_installed_unit_and_a_foreign_file() {
     );
 }
 
-// The one reader of the marker section =================================================================================
+// The one reader of the marker section ================================================================================
 
 #[skuld::test]
 fn goetia_keys_is_none_with_no_section() {

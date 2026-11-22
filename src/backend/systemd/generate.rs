@@ -613,7 +613,7 @@ fn goetia_keys(unit_text: &str) -> Result<Option<BTreeMap<&str, &str>>, Error> {
 /// all — that is the "this is not (or no longer) ours" case, e.g. a
 /// foreign unit or one Goetia has never touched. A section that *is*
 /// present but does not decode into a valid blob is `Err`, as is whatever
-/// [`goetia_keys`] refuses.
+/// `goetia_keys` (the one reader of the section) refuses.
 pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
     let Some(keys) = goetia_keys(unit_text)? else {
         return Ok(None);
