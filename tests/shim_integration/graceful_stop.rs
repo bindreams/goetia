@@ -306,10 +306,8 @@ fn assert_asked_not_killed(stopped: &Stopped, exit_on: &str) {
         "the shim's log has no line for the ask of {event}:
 {log}"
     );
-    let closed = ours().any(|line| {
-        line == format!("{prefix}the daemon and what it started exited within the wait")
-            || line == format!("{prefix}the daemon exited before it could be asked")
-    });
+    // Not "the daemon exited before it could be asked": that line says no ask was sent.
+    let closed = ours().any(|line| line == format!("{prefix}the daemon and what it started exited within the wait"));
     assert!(
         !record_is_empty || closed || may_have_sent,
         "the record is empty and the shim's log has no line that ends an asked stop:
