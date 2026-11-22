@@ -364,14 +364,15 @@ impl Systemd {
     /// 1. Refuse: a file that is not goetia's at the stand-in's path refuses `Leave` of a job goetia removes,
     ///    before anything is changed.
     /// 2. Pass the version gate before the first change: for an installed id, which always changes something,
-    ///    now; for the others, once the plan says it changes anything (a read asks no gate).
+    ///    now; for the others, once the plan reloads, which every plan that changes anything does (a read asks
+    ///    no gate).
     /// 3. Disarm the timer, so no run starts after the read.
     /// 4. Read the job's unit once, when the plan needs a read before any stop.
-    /// 5. Stop, when the plan says so, then read what the stop left once and `reset-failed` a run that failed;
-    ///    then disable a service.
+    /// 5. Stop, when the plan says so; where it comes with a stand-in of ours to remove, then read what the stop
+    ///    left once and `reset-failed` a run that failed. Then disable a service.
     /// 6. Write the stand-in, before any file is removed.
     /// 7. Remove the timer and the job, each verified against what `read` saw, and their drop-ins; remove the
-    ///    stand-in (after `reset-failed` for a run the read before any stop says failed); reload.
+    ///    stand-in (after `reset-failed` for a run the read before any stop says failed, under `Leave`); reload.
     ///
     /// No `systemctl enable` or `disable` comes between the first removal and the reload, since both reload the
     /// manager at once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
@@ -409,8 +410,9 @@ impl Systemd {
             seen => seen?,
         };
         let plan = standin::plan(&known, seen.as_ref());
-        // Before the first change of a plan that makes one, on every path: the absent path's read was no change.
-        if plan.changes() {
+        // Before the first change, on every path: a plan that reloads is one that changes something, and the
+        // absent path's read was no change.
+        if plan.reload {
             self.systemctl.require_supported(held)?;
         }
 
@@ -420,9 +422,9 @@ impl Systemd {
             // uninstall where today it succeeds.
             self.systemctl
                 .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
-            // What the stop left, read once: a stopped oneshot is `failed`, and removed as it is it would stay
-            // listed `not-found failed`.
-            if self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
+            // A stand-in of ours goes with the run it kept, which the stop leaves `failed` as a stopped oneshot
+            // is: cleared, so the removal does not leave it listed `not-found failed`.
+            if plan.clear_after_stop && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
                 self.systemctl.reset_failed(id, UnitKind::Service, held)?;
             }
         }

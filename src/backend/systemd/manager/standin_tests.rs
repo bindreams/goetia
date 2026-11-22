@@ -8,9 +8,10 @@ use std::sync::Arc;
 use super::super::busctl::Busctl;
 use super::super::journal::fake::Fake as JournalFake;
 use super::super::systemctl::Systemctl;
-use super::super::systemctl::systemctl_tests::{booted, gate_passes, gate_then, unbooted};
+use super::super::systemctl::systemctl_tests::{booted, gate_passes, gate_refuses, gate_then, unbooted};
 use super::super::task::task_tests::{
-    Leftovers, call, enqueued, held, marked, over, reload, seed, service_spec, task_spec, text_of, units_of,
+    Leftovers, call, enqueued, etc_path, held, marked, over, read_call, read_of, reload, seed, service_spec, state,
+    task_spec, text_of, unit_state, units_of,
 };
 use super::super::task::{Body, Fragment, Timer};
 use super::super::{Systemd, unit_path};
@@ -29,37 +30,6 @@ use crate::testing::groups::{Group, systemd_group};
 
 const SCHEDULE: Option<&str> = Some("30 3 * * *");
 
-/// The one read of a unit's run: these properties, in this order.
-const READ: &str = "ActiveState,SubState,KillSignal,TimeoutStopUSec,LoadState,FragmentPath";
-
-pub(in crate::backend::systemd::manager) fn read_call(id: &str) -> Vec<String> {
-    call(&["show", "--property", READ, "--", &format!("{id}.service")])
-}
-
-fn etc_path(id: &str) -> String {
-    unit_path(id, UnitKind::Service).display().to_string()
-}
-
-/// `systemctl show` of `id`'s job as the one read asks it, loaded from goetia's own path and stopping with the
-/// defaults.
-fn state(id: &str, active: &str, sub: &str) -> Entry {
-    unit_state(active, sub, "loaded", &etc_path(id), "15", "1min 30s")
-}
-
-fn unit_state(active: &str, sub: &str, load: &str, fragment: &str, kill: &str, timeout: &str) -> Entry {
-    reply(
-        &["show"],
-        exited(
-            0,
-            &format!(
-                "ActiveState={active}\nSubState={sub}\nKillSignal={kill}\nTimeoutStopUSec={timeout}\n\
-                 LoadState={load}\nFragmentPath={fragment}\n"
-            ),
-            "",
-        ),
-    )
-}
-
 /// `systemctl show` of a job systemd has no unit file for.
 fn not_loaded() -> Entry {
     unit_state("inactive", "dead", "not-found", "", "15", "1min 30s")
@@ -71,16 +41,6 @@ fn reset_failed() -> Entry {
 
 fn failed_reset(failed: bool) -> Vec<Entry> {
     if failed { vec![reset_failed()] } else { vec![] }
-}
-
-/// The read of a left run with no process, and the `reset-failed` that follows only where the read says it failed:
-/// systemd refuses `reset-failed` of a unit that is not in memory, which one that did not fail is not.
-pub(in crate::backend::systemd::manager) fn read_of(id: &str, failed: bool) -> Entry {
-    if failed {
-        state(id, "failed", "failed")
-    } else {
-        state(id, "inactive", "dead")
-    }
 }
 
 /// A fake whose first calls are `reads` (a read asks no gate), then the version gate that the first request
@@ -508,10 +468,7 @@ fn an_installed_id_is_refused_by_the_gate_before_anything_is_removed(#[fixture(s
             let id = fresh_id("systemd");
             let _left = Leftovers::new(&id);
             installed(&id, schedule);
-            let fake = Fake::new([
-                reply(&["--version"], exited(0, "systemd 241 (241)\n", "")),
-                reply(&["show", "--property=Version", "--value"], exited(0, "241\n", "")),
-            ]);
+            let fake = Fake::new(gate_refuses());
             let mgr = over(&fake);
             let snapshot = marked(&mgr, &id);
 
@@ -534,26 +491,9 @@ fn an_installed_id_is_refused_by_the_gate_before_anything_is_removed(#[fixture(s
     }
 }
 
-/// A fake whose first calls are `reads`, then a gate that refuses (systemd 241).
+/// A fake whose first calls are `reads`, then a gate that refuses.
 fn reads_then_refusing_gate(reads: impl IntoIterator<Item = Entry>) -> Fake {
-    Fake::new(reads.into_iter().chain([
-        reply(
-            &["--version"],
-            exited(
-                0,
-                "systemd 241 (241)
-",
-                "",
-            ),
-        ),
-        reply(
-            &["show", "--property=Version", "--value"],
-            exited(
-                0, "241
-", "",
-            ),
-        ),
-    ]))
+    Fake::new(reads.into_iter().chain(gate_refuses()))
 }
 
 /// A plan that changes anything passes the version gate before its first change, on every path: the sweep of an

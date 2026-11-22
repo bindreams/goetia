@@ -2068,7 +2068,7 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
 - Nothing removes the stand-in while its run has a process. The next `install` or `uninstall` of the id, an id
   nobody installed included, removes it once its run is over, reloads the manager, and clears a failed run of it
   with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and
-  the run; `uninstall` without the flag stops the run, then removes the file.
+  the run; `uninstall` without the flag stops the run, clears the failure that leaves, then removes the file.
 - A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an id whose job
   goetia removes refuses with an error naming the path, whether or not a run is in flight, and before anything
   is changed, the timer included. Remove the file, or uninstall without `--no-stop`. For a task whose timer alone

@@ -6,17 +6,17 @@
 //! 1. [`RunInFlight::Leave`] never stops, and clears nothing of a run that has no stand-in: a stop sent after a
 //!    read of a restart that is waiting could land on a process systemd started in between.
 //! 2. [`RunInFlight::Stop`] stops when goetia holds a job or a stand-in of its own is there, and never
-//!    otherwise. The unit is read once, after the stop, and a run that read `failed` (a stopped oneshot does)
-//!    is cleared with `reset-failed` before the files go, so the removal leaves nothing listed `not-found
-//!    failed`. Nothing is read before the stop for this; the sweep of an absent id reads first for its own
-//!    sake (rule 6).
+//!    otherwise. Nothing is read before the stop for this; the sweep of an absent id reads first for its own
+//!    sake (rule 6). Where a stand-in of ours is removed the unit is read once after the stop, and a run
+//!    that read `failed` (a stopped oneshot does) is cleared with `reset-failed` before the files go
+//!    ([`Plan::clear_after_stop`]). A stop with no stand-in of ours reads nothing and clears nothing.
 //! 3. A stand-in is written (or one of ours replaced) only for `Leave`, a job goetia removes, and a run still
 //!    in its start job: with the two values the read printed. A restart that is waiting
 //!    ([`RunPhase::PendingRestart`]) is not such a run, and is left to systemd. Never for a timer alone or an
 //!    id nothing is installed at, whose unit may be somebody else's.
-//! 4. A stand-in of ours that is not written goes: after the stop for `Stop`; for `Leave`, when the one read
-//!    says the run has no process, after `reset-failed` if it failed. It stays while a run left by `Leave` has
-//!    a process. Removing is followed by the reload.
+//! 4. A stand-in of ours that is not written goes: after the stop and the clearing of rule 2 for `Stop`; for
+//!    `Leave`, when the one read says the run has no process, after `reset-failed` if it failed. It stays while
+//!    a run left by `Leave` has a process. Removing is followed by the reload.
 //! 5. A file at the stand-in's path that is not ours refuses `Leave` of a job goetia removes, before anything
 //!    is changed ([`Known::blocked`]): a stand-in could be written there. For a timer alone, with `Stop` and
 //!    where nothing is installed it is left alone.
@@ -24,8 +24,8 @@
 //!    path whose file is gone is reloaded, under either choice, and nothing else is done for it.
 //! 7. `install` applies rule 4 to a stand-in it finds, and nothing else of this.
 //!
-//! A plan that changes anything ([`Plan::changes`]) passes the version gate before its first change; one that
-//! changes nothing passes none.
+//! Every plan that stops, writes or removes also reloads, so the plan that reloads passes the version gate
+//! before its first change; one that does not changes nothing and passes none.
 
 use crate::manager::RunInFlight;
 
@@ -78,26 +78,22 @@ pub(in crate::backend::systemd::manager) enum Standin {
     /// printed.
     Write { kill_signal: String, stop_timeout: String },
     /// Remove it. `reset_failed`: the one read, made with no stop, says the run failed, and the verb refuses a
-    /// unit that is not in memory, as one that did not fail is not. Under a stop it is false: the stop's own
-    /// read clears (rule 2).
+    /// unit that is not in memory, as one that did not fail is not. Under a stop it is false: what the stop
+    /// left is read after it ([`Plan::clear_after_stop`]).
     Remove { reset_failed: bool },
 }
 
 /// Everything to do, in the order `Systemd::settle` does it: the stop, the stand-in, the reload.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::backend::systemd::manager) struct Plan {
-    /// Stop the run, then read what it left and clear it if it failed (rule 2).
+    /// Stop the run.
     pub stop: bool,
+    /// After the stop, read the unit once and `reset-failed` it if the run failed (rule 2): true exactly when
+    /// the stop comes with a stand-in of ours to remove.
+    pub clear_after_stop: bool,
     pub standin: Standin,
     /// The manager is reloaded once, after the files and the stand-in are dealt with.
     pub reload: bool,
-}
-
-impl Plan {
-    /// The plan changes something: a stop, a stand-in written or removed, or a reload.
-    pub(in crate::backend::systemd::manager) fn changes(&self) -> bool {
-        self.stop || self.standin != Standin::Nothing || self.reload
-    }
 }
 
 impl Known<'_> {
@@ -135,6 +131,7 @@ pub(in crate::backend::systemd::manager) fn plan(known: &Known<'_>, seen: Option
     };
     Plan {
         stop,
+        clear_after_stop: stop && ours,
         reload: known.call.removes_files()
             || matches!(standin, Standin::Remove { .. })
             || seen.is_some_and(|seen| seen.held_gone),

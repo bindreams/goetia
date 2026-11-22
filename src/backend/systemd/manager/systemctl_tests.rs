@@ -116,6 +116,14 @@ pub(in crate::backend::systemd::manager) fn gate_passes() -> Vec<Entry> {
     ]
 }
 
+/// The version gate's two probes, refusing: systemd 241 is older than the floor.
+pub(in crate::backend::systemd::manager) fn gate_refuses() -> Vec<Entry> {
+    vec![
+        reply(&["--version"], exited(0, "systemd 241 (241)\n", "")),
+        reply(&["show", "--property=Version", "--value"], exited(0, "241\n", "")),
+    ]
+}
+
 /// A fake that passes the version gate, and then answers `rest`.
 pub(in crate::backend::systemd::manager) fn gate_then(rest: impl IntoIterator<Item = Entry>) -> Fake {
     Fake::new(gate_passes().into_iter().chain(rest))
@@ -1761,7 +1769,7 @@ fn the_gate_is_asked_once_per_reservation() {
 /// A refusal is not remembered: the next step asks again.
 #[skuld::test]
 fn a_refused_gate_is_asked_again() {
-    let fake = Fake::new(two_versions("241", "257").into_iter().chain(gate_passes()));
+    let fake = Fake::new(gate_refuses().into_iter().chain(gate_passes()));
     let systemctl = on_booted(fake.clone());
     let mut held = Held::default();
 

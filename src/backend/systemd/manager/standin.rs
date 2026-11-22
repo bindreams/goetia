@@ -6,12 +6,13 @@
 //! [`Systemd::uninstall_leftovers`] and [`Systemd::release_standin`], only say what they are. The job's unit
 //! (see [`UnitRun`](super::systemctl::UnitRun)) is read before the plan for `Leave` over an installed id or a
 //! stand-in of ours, and for the sweep of an absent id (which also answers "no manager" and a held definition):
-//! the plan is made from that read. A `Stop` reads once, after the stop, only to decide whether the stopped run
-//! is cleared. Nothing is decided from the unit file's text or from what goetia reads the job to be.
+//! the plan is made from that read. A `Stop` that removes a stand-in of ours reads once more, after the stop, to
+//! decide whether the stopped run is cleared; a `Stop` of a held job with no stand-in of ours reads nothing and
+//! clears nothing. Nothing is decided from the unit file's text or from what goetia reads the job to be.
 //!
 //! Its life: nothing removes it while its run has a process. The next `install` or `uninstall` of the id, the
 //! absent id included, removes it once there is none, after a `reset-failed` for a left run that failed, and
-//! reloads. With [`RunInFlight::Stop`] `uninstall` stops the run first and clears a stopped run that failed.
+//! reloads. With [`RunInFlight::Stop`] `uninstall` stops the run first, and clears the failed run of a stand-in it removes.
 //! goetia reads `/etc/systemd/system` for fragments, so a stand-in never makes an id read as installed (see
 //! `discover`).
 
@@ -166,4 +167,4 @@ impl Systemd {
 
 #[cfg(test)]
 #[path = "standin_tests.rs"]
-pub(super) mod standin_tests;
+mod standin_tests;

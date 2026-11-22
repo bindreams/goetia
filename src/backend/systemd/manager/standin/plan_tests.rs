@@ -155,7 +155,22 @@ impl Row {
 }
 
 fn plan_with(stop: bool, standin: Standin, reload: bool) -> Plan {
-    Plan { stop, standin, reload }
+    Plan {
+        stop,
+        clear_after_stop: false,
+        standin,
+        reload,
+    }
+}
+
+/// A stop with a stand-in of ours to remove: what the stop left is read after it and cleared if it failed.
+fn stop_clearing() -> Plan {
+    Plan {
+        stop: true,
+        clear_after_stop: true,
+        standin: Standin::Remove { reset_failed: false },
+        reload: true,
+    }
 }
 
 fn written() -> Standin {
@@ -197,22 +212,22 @@ const ROWS: &[Row] = &[
         plan: || plan_with(false, Standin::Nothing, true),
     },
     Row {
-        rule: "2, 4: Stop with a stand-in of ours stops, then removes it and reloads, reading nothing before the stop: what the stop left is read after it",
+        rule: "2, 4: Stop with a stand-in of ours stops, reads nothing before the stop, reads what it left after it and clears that, then removes the stand-in and reloads",
         in_flight: STOP,
         call: &[Job, TimerAlone],
         file: &[Ours],
         run: &[Unread],
         held_gone: NOT_HELD,
-        plan: || plan_with(true, Standin::Remove { reset_failed: false }, true),
+        plan: stop_clearing,
     },
     Row {
-        rule: "2, 4, 6: the sweep of an absent id reads for its own sake, and then stops the run of a stand-in of ours, removes it and reloads",
+        rule: "2, 4, 6: the sweep of an absent id reads for its own sake, and then stops the run of a stand-in of ours, clears what it left, removes it and reloads",
         in_flight: STOP,
         call: &[Sweep],
         file: &[Ours],
         run: READ,
         held_gone: EITHER,
-        plan: || plan_with(true, Standin::Remove { reset_failed: false }, true),
+        plan: stop_clearing,
     },
     Row {
         rule: "6, 2: Stop of an id nothing is installed at, with no stand-in of ours, stops and changes nothing",
@@ -406,7 +421,14 @@ fn every_reachable_cell_has_one_row_and_gets_its_plan() {
         );
         covered[rows[0]] += 1;
         let row = &ROWS[rows[0]];
-        assert_eq!(plan_of(&cell), (row.plan)(), "{cell:?}\nrule {}", row.rule);
+        let planned = plan_of(&cell);
+        assert_eq!(planned, (row.plan)(), "{cell:?}\nrule {}", row.rule);
+        // The gate is passed before the first change when the plan reloads, so no plan may change anything
+        // without reloading.
+        assert!(
+            planned.reload || !(planned.stop || planned.standin != Standin::Nothing),
+            "{cell:?}: a plan that stops, writes or removes reloads"
+        );
     }
     for (row, count) in ROWS.iter().zip(&covered) {
         assert!(
