@@ -204,10 +204,10 @@ fn a_program_that_handles_the_close_event_and_exits_has_its_own_exit_recorded(#[
 
 /// A program that left the console is sent nothing, so the shim hears the stop with the program alive: it writes the
 /// provisional file of its `Stopped` and waits for the program's own exit. What the shim guarantees, and the
-/// program's own line proves, is that the file on disk while the program was alive said `stopped`. How the run ends
-/// then is Windows' to decide, about a second after the stop: the program exits by itself in time and `run` answers
-/// its code (the record is its exit), or Windows ends the shim first and `run` answers `0xC000013A`: the run left its
-/// provisional file and no record. Either end is accepted, and which it was is printed.
+/// program's own line proves, is that the file on disk while the program was alive named the shim's pin. How the run
+/// ends then is Windows' to decide, about a second after the stop: the program exits by itself in time and `run`
+/// answers its code (the record is its exit), or Windows ends the shim first and `run` answers `0xC000013A`: the run
+/// left its provisional file and no record. Either end is accepted, and which it was is printed.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exit_or_as_stopped(
     #[fixture(scm_group)] _group: &Group,
@@ -223,8 +223,8 @@ fn a_program_with_no_console_has_stopped_on_disk_while_alive_and_ends_as_its_exi
     let left = &stopped.left;
     let exit = stopped.exit.unwrap_or_else(|e| panic!("run: {}\n{left}", e.report()));
     assert!(
-        stopped.said.contains("daemon: record=") && stopped.said.contains("stopped"),
-        "the record the program saw, as the stop was accepted, was `stopped`: {}\n{left}",
+        stopped.said.contains("daemon: record=") && stopped.said.contains(PROVISIONAL_NAMES_A_PIN),
+        "the provisional file the program saw, as the stop was accepted, named its writer's pin: {}\n{left}",
         stopped.said
     );
     assert!(
@@ -274,8 +274,8 @@ fn a_program_with_no_console_that_never_exits_is_recorded_stopped_and_ended_with
     let exit = stopped.exit.unwrap_or_else(|e| panic!("run: {}\n{left}", e.report()));
     assert_eq!(exit, STOPPED, "the record stays `stopped`\n{left}");
     assert!(
-        stopped.said.contains("stopped"),
-        "the record the program saw was `stopped`: {}\n{left}",
+        stopped.said.contains(PROVISIONAL_NAMES_A_PIN),
+        "the provisional file the program saw named its writer's pin: {}\n{left}",
         stopped.said
     );
     wait::until(|| !pid_is_alive(&stopped.pid));
@@ -317,6 +317,10 @@ fn a_console_program_that_never_leaves_its_handler_leaves_no_record_and_is_ended
     wait::until(|| !pid_is_alive(&stopped.pid));
     assert!(!pid_is_alive(&stopped.pid), "the program (pid {}) is gone", stopped.pid);
 }
+
+/// What a provisional file holds while its run is alive: the name of its writer's pin, which says the run is alive. It
+/// has no outcome (a provisional file is always `Stopped`).
+const PROVISIONAL_NAMES_A_PIN: &str = r#""pin":"pin-"#;
 
 /// The stored text of a record that is a program's death by the close event: `Exited(0xC000013A)`.
 const STOPPED_BY_THE_EVENT: &str = r#""outcome":{"exited":3221225786}"#;
