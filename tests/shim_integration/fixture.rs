@@ -69,6 +69,7 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
 
 use crate::support::sentinel::{connect, open, send_line};
+use crate::support::wait;
 
 pub const FIXTURE: &str = "--goetia-shim-fixture";
 
@@ -359,18 +360,17 @@ unsafe extern "system" fn on_event(event: u32) -> i32 {
 /// The text of the run record (`<instance>.json`) once `dir` holds one. Each pass re-reads the directory, and none
 /// ends the wait by its length.
 fn await_record(dir: &Path) -> String {
-    loop {
-        let held = std::fs::read_dir(dir).ok().and_then(|entries| {
+    let mut text = None;
+    wait::until_paced(Duration::from_millis(5), || {
+        text = std::fs::read_dir(dir).ok().and_then(|entries| {
             entries
                 .flatten()
                 .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
                 .find_map(|entry| std::fs::read_to_string(entry.path()).ok())
         });
-        if let Some(text) = held {
-            return text;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+        text.is_some()
+    });
+    text.expect("the wait ends when a record is read")
 }
 
 /// The SID of the account this process runs as, from `whoami /user`: `"<name>","<sid>"` on one line.
