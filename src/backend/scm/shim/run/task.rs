@@ -250,10 +250,10 @@ pub(super) fn run_in(
             // Only for a stop heard with the program alive, never for its own exit (a program that is gone when the
             // stop is seen is told as one): the provisional file comes before the wait, which Windows may end the
             // shim in, and the pin stays held (the run is alive).
-            if end == WaitEnd::Stop {
-                if let Err(e) = runs.write_stopping(&instance, started, &pin) {
-                    log.failure(id, &format!("write the run record: {}", Chain(&e)));
-                }
+            if end == WaitEnd::Stop
+                && let Err(e) = runs.write_stopping(&instance, started, &pin)
+            {
+                log.failure(id, &format!("write the run record: {}", Chain(&e)));
             }
         },
     );
