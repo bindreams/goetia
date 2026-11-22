@@ -1458,13 +1458,8 @@ fn run_of_table() {
         ("a-state-of-the-future", "y", RunPhase::Running),
     ] {
         let answer = format!(
-            "ActiveState={active}
-SubState={sub}
-KillSignal=12
-TimeoutStopUSec=1min 30s
-LoadState=loaded
-             FragmentPath=/etc/systemd/system/x.service
-"
+            "ActiveState={active}\nSubState={sub}\nKillSignal=12\nTimeoutStopUSec=1min 30s\nLoadState=loaded\n\
+             FragmentPath=/etc/systemd/system/x.service\n"
         );
         assert_eq!(
             showing(&answer).run_of("x.service").expect(active),
@@ -1484,13 +1479,8 @@ LoadState=loaded
 /// A unit systemd has no file for is answered like any other, not an error: the absent id's read is of it.
 #[skuld::test]
 fn run_of_a_unit_systemd_has_not_loaded_is_a_read_not_an_error() {
-    let answer = "ActiveState=inactive
-SubState=dead
-KillSignal=15
-TimeoutStopUSec=1min 30s
-                  LoadState=not-found
-FragmentPath=
-";
+    let answer = "ActiveState=inactive\nSubState=dead\nKillSignal=15\nTimeoutStopUSec=1min 30s\n\
+                  LoadState=not-found\nFragmentPath=\n";
 
     let run = showing(answer).run_of("x.service").expect("a read");
 
@@ -1503,13 +1493,8 @@ FragmentPath=
 fn a_run_is_loaded_from_a_path_only_when_systemd_says_loaded_from_it() {
     let read = |load: &str, fragment: &str| {
         let answer = format!(
-            "ActiveState=active
-SubState=running
-KillSignal=15
-TimeoutStopUSec=infinity
-LoadState={load}
-             FragmentPath={fragment}
-"
+            "ActiveState=active\nSubState=running\nKillSignal=15\nTimeoutStopUSec=infinity\nLoadState={load}\n\
+             FragmentPath={fragment}\n"
         );
         showing(&answer).run_of("x.service").expect("a read")
     };

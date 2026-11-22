@@ -421,7 +421,8 @@ fn leaving_a_job_whose_blob_does_not_decode_and_has_no_timer_writes_the_standin(
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     let snapshot = undecodable_job(&id);
-    let fake = gate_then([state(&id, "activating", "start"), reload()]);
+    // Its kind is not known, so it is disabled like a service.
+    let fake = gate_then([state(&id, "activating", "start"), disabled(), reload()]);
     let mgr = over(&fake);
 
     mgr.uninstall_units(snapshot, RunInFlight::Leave, &mut held(&mgr))
@@ -920,16 +921,21 @@ fn an_absent_ids_foreign_runtime_unit_is_left_alone(#[fixture(systemd_group)] _g
     let id = fresh_id("systemd");
     let _left = Leftovers::new(&id);
     seed_foreign_at(&id);
-    let fake = gate_then([not_loaded(), not_loaded()]);
-    let mgr = over(&fake);
 
     for in_flight in [RunInFlight::Stop, RunInFlight::Leave] {
-        let e = uninstall_absent(&mgr, &id, in_flight).expect_err("absent");
-        assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
-    }
+        let fake = gate_then([not_loaded()]);
+        let mgr = over(&fake);
 
-    assert!(without_gate(&fake).iter().all(|c| c[0] == "show"), "{:?}", fake.calls());
-    assert_eq!(standin_text(&id).as_deref(), Some(seed_foreign()));
+        let e = uninstall_absent(&mgr, &id, in_flight).expect_err("absent");
+
+        assert!(matches!(e, Error::NotInstalled { .. }), "{e:?}");
+        assert_eq!(
+            without_gate(&fake),
+            [read_call(&id)],
+            "{in_flight:?}: no stop, no removal"
+        );
+        assert_eq!(standin_text(&id).as_deref(), Some(seed_foreign()));
+    }
 }
 
 // An absent id with a stand-in is not installed =======================================================================
