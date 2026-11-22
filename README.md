@@ -2057,8 +2057,10 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
   goetia's `[X-Goetia]` section and the id, which is how goetia knows the file is its own. Any other stop setting
   a drop-in gave the job (`KillMode=`, `ExecStop=`, `SendSIGKILL=` and the like) is not carried: a hand
   `systemctl stop` of the left run uses systemd's defaults for those. A hand `systemctl start` of the stand-in
-  fails. A start job that is queued and not yet running counts as in its start job (systemd reads the unit
-  `inactive` with a job pending). A run past its start phase needs none and is left as it is. A task whose job is
+  fails. A start job that is queued and not yet running (systemd reads the unit `inactive` with a job
+  pending) gets the stand-in too. If it began before the reload, its run is kept; if it was still queued at the
+  reload, it runs the stand-in, fails on its assertion and starts nothing, and the stand-in stays until the next
+  `install` or `uninstall` of the id or a reboot. A run past its start phase needs none and is left as it is. A task whose job is
   gone and whose timer alone is installed gets none either: the unit under its name may be somebody else's.
 - A service that is waiting to be restarted is not restarted, and nothing is sent to it. The reload fails the
   restart on the missing unit, so systemd lists the unit as `not-found failed`, and the machine reads `degraded`,
@@ -2071,8 +2073,8 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
   with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and
   the run. `uninstall` without the flag of an id nobody installed stops the run, clears it with
   `systemctl reset-failed` only if the stopped run failed, then removes the file. Once the id is installed again,
-  the installed file outranks the stand-in, which is stale: the next `uninstall` of the id, with or without the
-  flag, removes it whatever the run is doing (with `--no-stop`, a run still in its start job gets a fresh one),
+  the installed file outranks the stand-in, which is stale: the next `install` over it, or `uninstall` of the id
+  with or without the flag, removes it whatever the run is doing (with `--no-stop`, a run still in its start job gets a fresh one),
   and clears nothing of the run, which is the installed job's.
 - A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an id whose job
   goetia removes refuses with an error naming the path, whether or not a run is in flight, and before anything

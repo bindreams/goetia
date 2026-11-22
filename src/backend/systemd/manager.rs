@@ -216,8 +216,10 @@ impl Backend for Systemd {
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         dirs::ensure_parent_dirs(spec, scope)?;
-        // A stand-in with a run in flight stays; systemd adopts the run under the new definition.
-        self.release_standin(spec.common().id.as_str(), reservation)?;
+        // Over an installed job file a stand-in is stale and goes; with none it is the unit's definition, and one
+        // with a run in flight stays: systemd adopts the run under the new definition.
+        let over_job = snapshot.is_some_and(|old| old.service_text().is_some());
+        self.release_standin(spec.common().id.as_str(), over_job, reservation)?;
         match outcome {
             Outcome::Create => self.create_units(spec.common().id.as_str(), definition, reservation),
             Outcome::Update { .. } | Outcome::Stale { .. } => {

@@ -313,7 +313,9 @@ fn spec_section(spec: &DaemonSpec) -> String {
 /// `kill_signal` and `stop_timeout` as `systemctl show` printed them for the removed job (a signal number
 /// and systemd's own spelling of the span, a drop-in's override included), so a `stop` of the left run
 /// signals and waits as the job's would have; any other stop setting is not carried. And goetia's
-/// `[X-Goetia]` section with the `id`, which is how [`standin_id`] tells the file is its own.
+/// `[X-Goetia]` section with the `id`, which is how [`standin_id`] tells the file is its own. The unit's one
+/// command sits behind an assertion on a path that cannot exist, so starting the stand-in (by hand, or by a job
+/// that was still queued) runs nothing and fails.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only the systemd manager, which is Linux-only, writes one")

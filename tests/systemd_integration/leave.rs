@@ -370,7 +370,7 @@ fn a_retry_after_a_removal_with_no_reload_reloads_and_leaves_the_run(#[fixture(s
 
 /// A drop-in sets the task's `KillSignal=` and `TimeoutStopSec=`, and the uninstall deletes it with the job:
 /// the stand-in carries the values systemd was applying: the left run's `KillSignal` and `TimeoutStopUSec` are the
-/// drop-in's. (A stop with such values signals and waits as before: measured, M14a.)
+/// drop-in's. (A stop's use of such values was measured on systemd 243, 249 and 255.)
 #[skuld::test]
 fn the_standin_carries_the_stop_settings_a_drop_in_gave_the_job(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();

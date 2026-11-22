@@ -373,7 +373,7 @@ impl Systemd {
     pub(super) fn settle(&self, id: &str, in_flight: RunInFlight, target: Target<'_>, held: &mut Held) -> Result<()> {
         let installed = match target {
             Target::Installed(snapshot) => Some(snapshot),
-            Target::Sweep | Target::Install => None,
+            Target::Sweep | Target::Install | Target::Update => None,
         };
         let file = standin_file(id)?;
         let known = Known {
@@ -417,7 +417,7 @@ impl Systemd {
                 .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
             // A stand-in of ours goes with the run it kept, which the stop leaves `failed` as a stopped oneshot
             // is: cleared, so the removal does not leave it listed `not-found failed`.
-            if plan.clears_after_stop(known.call) && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
+            if plan.clears_after_stop && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
                 self.systemctl.reset_failed(id, UnitKind::Service, held)?;
             }
         }
@@ -428,26 +428,37 @@ impl Systemd {
         {
             self.systemctl.disable_impl(id, held)?;
         }
-        if let Standin::Write {
-            kill_signal,
-            stop_timeout,
-        } = &plan.standin
-        {
-            self.write_standin(id, &file, kill_signal, stop_timeout)?;
-        }
+        let wrote = match &plan.standin {
+            Standin::Write {
+                kill_signal,
+                stop_timeout,
+            } => Some(self.write_standin(id, &file, kill_signal, stop_timeout)?),
+            _ => None,
+        };
 
-        // A verified removal of the timer or the job that fails aborts here: a stand-in written above stays,
-        // shadowed by the file still there and harmless, and the next call rewrites or removes it. Past them the
-        // removals are all attempted and every failure is reported together, so the reload still runs.
+        // A verified removal of the timer or the job that fails aborts here, and the stand-in this call wrote
+        // is removed again, verified against its text, before the error is returned (a failure of that removal is
+        // reported with it), so a call that fails here leaves no stand-in of its own. Past them the removals are
+        // all attempted and every failure is reported together, so the reload still runs.
         let mut removed = Ok(());
         if let Some(snapshot) = installed {
             // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file spans
             // `systemctl` round-trips, wide enough for something else to have replaced it.
-            if let Some(timer) = snapshot.timer() {
-                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Timer, &timer.text)?;
-            }
-            if let Some(job) = snapshot.service_text() {
-                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Service, job)?;
+            let files: Result<()> = (|| {
+                if let Some(timer) = snapshot.timer() {
+                    remove_verified(Path::new(UNIT_DIR), id, UnitKind::Timer, &timer.text)?;
+                }
+                if let Some(job) = snapshot.service_text() {
+                    remove_verified(Path::new(UNIT_DIR), id, UnitKind::Service, job)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = files {
+                let unwritten = match &wrote {
+                    Some(text) => self.remove_standin(id, text, false, held),
+                    None => Ok(()),
+                };
+                return both(Err(e), unwritten);
             }
             removed = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
             if snapshot.owns_timer_slot() {

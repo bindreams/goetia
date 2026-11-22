@@ -17,7 +17,7 @@ use crate::manager::RunInFlight;
 use super::discover::{RawState, ReadFailure, classify_and_read};
 use super::systemctl::Held;
 use super::task::Fragment;
-use super::write::{CreateOutcome, ReplaceOutcome, create_unit_in, remove_verified, replace_unit_verified_in};
+use super::write::{CreateOutcome, ReplaceOutcome, create_unit_in, remove_verified_with, replace_unit_verified_in};
 use super::{Systemd, UnitKind, unit_name, unit_path};
 
 pub(super) use plan::{Call, Known, Seen, Standin, plan};
@@ -63,6 +63,8 @@ pub(super) enum Target<'a> {
     Sweep,
     /// See [`Call`].
     Install,
+    /// See [`Call`].
+    Update,
 }
 
 impl Target<'_> {
@@ -73,6 +75,7 @@ impl Target<'_> {
             Target::Installed(_) => Call::TimerAlone,
             Target::Sweep => Call::Sweep,
             Target::Install => Call::Install,
+            Target::Update => Call::Update,
         }
     }
 }
@@ -98,14 +101,14 @@ impl Systemd {
 
     /// The stand-in for the run of `id`, written without replacing a file that is not one of goetia's: a
     /// stand-in of ours already there is replaced, since its values are an earlier job's. A file that is
-    /// not ours, which appeared after the check, is [`Error::ConcurrentChange`].
+    /// not ours, which appeared after the check, is [`Error::ConcurrentChange`]. The text written is returned.
     pub(super) fn write_standin(
         &self,
         id: &str,
         file: &StandinFile,
         kill_signal: &str,
         stop_timeout: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let dir = Path::new(RUNTIME_UNIT_DIR);
         fs::create_dir_all(dir).map_err(|e| Error::os_at("create", dir, e))?;
         let text = generate::standin(id, kill_signal, stop_timeout);
@@ -124,24 +127,31 @@ impl Systemd {
                 path: Some(standin_path(id)),
             });
         }
-        Ok(())
+        Ok(text)
     }
 
-    /// The stand-in of `id` removed, after a failed left run is cleared, if it is still the file read as ours
-    /// (`text`); the manager is reloaded by the caller. Another file at the path is
-    /// [`Error::ConcurrentChange`], and stays.
+    /// The stand-in of `id` removed if it is still the file read as ours (`text`), the manager being reloaded by
+    /// the caller. One that has vanished, or is another file now, is not goetia's to remove and not an error: it
+    /// is left as it is. `failed`: the run is cleared with `reset-failed`, sent only once the stand-in has been
+    /// found ours and moved aside; if that fails the stand-in is put back.
     pub(super) fn remove_standin(&self, id: &str, text: &str, failed: bool, held: &mut Held) -> Result<()> {
-        if failed {
-            self.systemctl.reset_failed(id, UnitKind::Service, held)?;
-        }
-        remove_verified(Path::new(RUNTIME_UNIT_DIR), id, UnitKind::Service, text)
+        let dir = Path::new(RUNTIME_UNIT_DIR);
+        remove_verified_with(dir, id, UnitKind::Service, text, || {
+            if failed {
+                self.systemctl.reset_failed(id, UnitKind::Service, held)?;
+            }
+            Ok(())
+        })
+        .map(|_| ())
     }
 
-    /// `install`'s part: a stand-in of ours at the id whose run has no process is removed and the manager
-    /// reloaded, and one with a process stays, as an install never stops a run. Asks nothing of systemd where
-    /// there is no stand-in of ours.
-    pub(super) fn release_standin(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.settle(id, RunInFlight::Leave, Target::Install, held)
+    /// `install`'s part, `over_job` saying whether the id's job file is installed: a stand-in of ours is then
+    /// stale and removed. With no job file it is the unit's definition: removed when its run has no process, and
+    /// kept with one, as an install never stops a run. Asks nothing of systemd where there is no stand-in of
+    /// ours, or where the job file is installed.
+    pub(super) fn release_standin(&self, id: &str, over_job: bool, held: &mut Held) -> Result<()> {
+        let target = if over_job { Target::Update } else { Target::Install };
+        self.settle(id, RunInFlight::Leave, target, held)
     }
 
     /// `uninstall` of an id nothing is installed at: see rule 6 of [`mod@plan`]. A failed reload is the call's error,

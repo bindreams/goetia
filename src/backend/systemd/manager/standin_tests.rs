@@ -285,8 +285,9 @@ fn leaving_a_service_in_its_start_job_writes_a_standin_with_the_values_the_read_
 }
 
 /// A start job that is queued and not yet running reads `inactive` (or `failed`, after an earlier run) with a job
-/// pending: it is a run in its start job, and gets the stand-in, or the reload ends it at the start timeout. With no
-/// job pending the same state is no run.
+/// pending: it gets the stand-in. If it began before the reload its run is kept; if it was still queued at the reload
+/// it runs the stand-in, fails on its assertion and starts nothing, and the stand-in stays until the next `install`
+/// or `uninstall` of the id or a reboot. With no job pending the same state is no run, and gets none.
 #[skuld::test]
 fn leaving_a_task_whose_start_job_is_queued_writes_the_standin_and_one_with_no_job_does_not(
     #[fixture(systemd_group)] _group: &Group,
@@ -604,7 +605,9 @@ fn a_standin_is_not_removed_before_the_gate_is_passed(#[fixture(systemd_group)] 
     let fake = reads_then_refusing_gate([read_of(&id, false)]);
     let mgr = over(&fake);
 
-    let e = mgr.release_standin(&id, &mut held(&mgr)).expect_err("the gate refuses");
+    let e = mgr
+        .release_standin(&id, false, &mut held(&mgr))
+        .expect_err("the gate refuses");
 
     assert!(e.to_string().contains("systemd 243 or newer"), "install: {e}");
     assert_eq!(calls_of(&fake), [read_call(&id)], "install");

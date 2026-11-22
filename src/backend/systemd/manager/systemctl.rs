@@ -934,6 +934,12 @@ impl Systemctl {
     /// on any unit name, loaded or not (an empty `UnitFileState=` included), so an answer without one
     /// is no answer, and never the state its absence would default to.
     fn show_properties(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
+        self.show_with_optional(unit, props, &[])
+    }
+
+    /// [`Systemctl::show_properties`], except that an answer may leave out any of `optional`: a property systemd
+    /// prints only when it has a value.
+    fn show_with_optional(&self, unit: &str, props: &[&str], optional: &[&str]) -> Result<BTreeMap<String, String>> {
         let joined = props.join(",");
         let (status, capture) = self.completed(
             Purpose::Read,
@@ -954,7 +960,11 @@ impl Systemctl {
                 map.insert(k.to_string(), v.to_string());
             }
         }
-        let missing: Vec<&str> = props.iter().copied().filter(|prop| !map.contains_key(*prop)).collect();
+        let missing: Vec<&str> = props
+            .iter()
+            .copied()
+            .filter(|prop| !map.contains_key(*prop) && !optional.contains(prop))
+            .collect();
         if !missing.is_empty() {
             return Err(Error::IncompleteAnswer {
                 command: format!("systemctl show {unit}"),
@@ -1030,13 +1040,15 @@ impl Systemctl {
     /// name is answered, one systemd has no file for included, so nothing here is an error for an absent
     /// unit.
     pub(super) fn run_of(&self, unit: &str) -> Result<UnitRun> {
-        let props = self.show_properties(unit, &UnitRun::PROPERTIES)?;
+        let props = self.show_with_optional(unit, &UnitRun::PROPERTIES, &["Job"])?;
         let active = props["ActiveState"].as_str();
+        // No `Job` line is no job pending, as an empty `Job=` is.
+        let job_pending = props.get("Job").is_some_and(|job| !job.is_empty());
         Ok(UnitRun {
             phase: match active {
                 // A start job that is queued and not yet running reads `inactive`: a job pending is a run
                 // that has not forked.
-                "inactive" | "failed" if !props["Job"].is_empty() => RunPhase::InStartJob,
+                "inactive" | "failed" if job_pending => RunPhase::InStartJob,
                 "inactive" | "failed" => RunPhase::None,
                 // Positive evidence: no process is not, since a start job has none before its first fork.
                 "activating" if props["SubState"].starts_with("auto-restart") => RunPhase::PendingRestart,

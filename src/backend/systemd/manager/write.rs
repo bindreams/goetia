@@ -200,13 +200,33 @@ fn quarantine_if_still_ours_in(dir: &Path, id: &str, kind: UnitKind, expected_te
 /// `id`'s `kind` unit in `dir` removed, if it is still the file with `expected_text`; anything else there is
 /// [`Error::ConcurrentChange`], and is left where it is.
 pub(super) fn remove_verified(dir: &Path, id: &str, kind: UnitKind, expected_text: &str) -> Result<()> {
-    match quarantine_if_still_ours_in(dir, id, kind, expected_text)? {
-        Some(backup) => remove_file_if_present(&backup),
-        None => Err(Error::ConcurrentChange {
+    match remove_verified_with(dir, id, kind, expected_text, || Ok(()))? {
+        true => Ok(()),
+        false => Err(Error::ConcurrentChange {
             id: id.to_string(),
             path: Some(dir.join(unit_name(id, kind))),
         }),
     }
+}
+
+/// [`remove_verified`] with `between` run once the file is found to be `expected_text` and moved aside, before it
+/// is deleted: `false` if the path held something else (or nothing), which is left where it is and `between` is
+/// not run. If `between` fails the file is put back and its error is returned.
+pub(super) fn remove_verified_with(
+    dir: &Path,
+    id: &str,
+    kind: UnitKind,
+    expected_text: &str,
+    between: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let Some(backup) = quarantine_if_still_ours_in(dir, id, kind, expected_text)? else {
+        return Ok(false);
+    };
+    if let Err(e) = between() {
+        return Err(restore_or_chain(id, &backup, &dir.join(unit_name(id, kind)), e));
+    }
+    remove_file_if_present(&backup)?;
+    Ok(true)
 }
 
 /// A quarantine name unique to this attempt, so two quarantines for the same id — a prior attempt
