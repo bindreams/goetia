@@ -38,7 +38,11 @@
 //!   `<record>` (`daemon: event=CTRL_C at_us=<unix microseconds>`), then, once its handler is in place,
 //!   connects to `<port>` and writes its pid, and blocks. On the event `<exit-on>` names (`ctrl-c`,
 //!   `ctrl-break`, `close`; `none` never) it records `daemon: exiting by the event` and exits 0; any other event
-//!   is handled and ignored. `close` is `CTRL_CLOSE_EVENT`, which is what a task's `stop` sends. With `launcher` it starts a `catch-worker` of the same record first and reports
+//!   is handled and ignored. `close` is `CTRL_CLOSE_EVENT`, which is what a task's `stop` sends.
+//! - `catch-recording <port> <record> <runs-dir>` — `catch` with `close` as the event it exits on, which it
+//!   exits on only once `<runs-dir>` (a task's run records) holds a record. The program and the shim are sent
+//!   the close event together, and a program that exits at once can beat the shim's handler, so the run's
+//!   record would be its exit; waiting for the record is what makes the order the test looks at. With `launcher` it starts a `catch-worker` of the same record first and reports
 //!   nothing itself: the worker does, so a report means both handlers are in place. Once its handler is in
 //!   place it also creates `<record>.started` ([`started_marker`]), so that a daemon that was never started
 //!   is told from one that was started and received nothing.
@@ -170,6 +174,7 @@ pub fn run_if_requested() -> bool {
                 exit_on,
                 role: if launcher { "launcher" } else { "daemon" },
                 linger: Duration::ZERO,
+                recorded_in: None,
             });
             if launcher {
                 // Not waited on: it ends by the event, or with the job that holds this tree.
@@ -187,6 +192,18 @@ pub fn run_if_requested() -> bool {
             }
             block_forever();
         }
+        "catch-recording" => {
+            let port: u16 = args[3].parse().expect("port");
+            catch_events(Catch {
+                record: PathBuf::from(&args[4]),
+                exit_on: exit_on("close"),
+                role: "daemon",
+                linger: Duration::ZERO,
+                recorded_in: Some(PathBuf::from(&args[5])),
+            });
+            send_line(port, &std::process::id().to_string());
+            block_forever();
+        }
         "catch-worker" => {
             let record = PathBuf::from(&args[3]);
             let port: u16 = args[5].parse().expect("port");
@@ -195,6 +212,7 @@ pub fn run_if_requested() -> bool {
                 exit_on: exit_on(&args[4]),
                 role: "worker",
                 linger: Duration::from_millis(600),
+                recorded_in: None,
             });
             send_line(port, &std::process::id().to_string());
             block_forever();
@@ -217,6 +235,8 @@ struct Catch {
     role: &'static str,
     /// How long it takes to end once the event it exits on arrives.
     linger: Duration,
+    /// A directory that must hold a run record before it ends.
+    recorded_in: Option<PathBuf>,
 }
 
 static CATCH: OnceLock<Catch> = OnceLock::new();
@@ -278,10 +298,29 @@ unsafe extern "system" fn on_event(event: u32) -> i32 {
     note(catch, &format!("event={name} at_us={at}"));
     if Some(event) == catch.exit_on {
         std::thread::sleep(catch.linger);
+        if let Some(dir) = &catch.recorded_in {
+            await_record(dir);
+        }
         note(catch, "exiting by the event");
         std::process::exit(0);
     }
     1
+}
+
+/// Returns once `dir` holds a run record (`<instance>.json`). Each pass re-reads the directory, and none ends the
+/// wait by its length: Windows ends a close handler that takes more than a few seconds, which is its bound.
+fn await_record(dir: &Path) {
+    loop {
+        let held = std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        });
+        if held {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// The SID of the account this process runs as, from `whoami /user`: `"<name>","<sid>"` on one line.

@@ -111,7 +111,9 @@ fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_
 
 /// A program that handles the close event and exits by itself is let run its own shutdown: goetia sends it
 /// nothing and adds no wait of its own. The run's record says it was stopped, the program's own shutdown ran (it
-/// left its line in the record file), and `stop` succeeds.
+/// left its line in the record file), and `stop` succeeds. The program exits only once the shim's record is on
+/// disk (`catch-recording`): the shim and the program get the event together, and one that exits first makes the
+/// run its exit.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_program_that_handles_the_close_event_runs_its_own_shutdown(#[fixture(scm_group)] _group: &Group) {
     let id = task_id();
@@ -121,12 +123,13 @@ fn a_program_that_handles_the_close_event_runs_its_own_shutdown(#[fixture(scm_gr
     let mgr = manager();
     let reported = ConnectBack::listen();
     let record = logs.path().join("record.txt");
+    let records = support::task_records(id.as_str());
     let command = fixture_command(
-        "catch",
+        "catch-recording",
         &[
             &reported.port().to_string(),
             record.to_str().expect("the record's path is UTF-8"),
-            "close",
+            records.to_str().expect("the records' path is UTF-8"),
         ],
     );
     mgr.install(&task_spec(&id, command, None, User::Root, None), false)
