@@ -2,8 +2,8 @@
 //! [`generate::standin`] for what it is and why a run still in its start job needs one.
 //!
 //! What `uninstall` and `install` do about a run and a stand-in is decided once, by [`plan::plan`] from one
-//! `systemctl show` of the job's unit (see [`UnitRun`]), and carried out in one order by
-//! `Systemd::settle` (in `task`). The three callers, [`Systemd::uninstall_units`], [`Systemd::uninstall_leftovers`]
+//! `systemctl show` of the job's unit (see [`UnitRun`](super::systemctl::UnitRun)), and carried out in one
+//! order by `Systemd::settle` (in `task`). The three callers, [`Systemd::uninstall_units`], [`Systemd::uninstall_leftovers`]
 //! and [`Systemd::release_standin`], only say what they are. Nothing is decided from the unit file's text or from
 //! what goetia reads the job to be.
 //!
