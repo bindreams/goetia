@@ -205,7 +205,7 @@ const EITHER: &[bool] = &[false, true];
 const READ: &[Run] = &[Idle, Failed, Pending, Start, Running];
 
 const ROWS: &[Row] = &[
-    // Stop ----------------------------------------------------------------------------------------------------------
+    // Stop ------------------------------------------------------------------------------------------------------------
     Row {
         rule: "2: Stop stops a held job; a file that is not ours at the stand-in's path changes nothing",
         in_flight: STOP,
@@ -260,7 +260,7 @@ const ROWS: &[Row] = &[
         held_gone: HELD,
         plan: || plan_with(false, Standin::Nothing, true, false),
     },
-    // Leave ---------------------------------------------------------------------------------------------------------
+    // Leave -----------------------------------------------------------------------------------------------------------
     Row {
         rule: "1, 3: Leave of a job in its start job writes the stand-in (replacing one of ours) and stops nothing",
         in_flight: LEAVE,
@@ -396,7 +396,7 @@ const ROWS: &[Row] = &[
         held_gone: HELD,
         plan: || plan_with(false, Standin::Nothing, true, false),
     },
-    // install -------------------------------------------------------------------------------------------------------
+    // install ---------------------------------------------------------------------------------------------------------
     Row {
         rule: "8: an install with no stand-in of ours reads nothing and does nothing",
         in_flight: LEAVE,
