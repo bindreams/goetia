@@ -102,7 +102,7 @@ jiff = { version = "0.2.43", optional = true }
 # The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
 # costs one fast pass.
 memchr = "2"
-# A task registration's token (`backend::scm::task_xml::Token`), 128 random bits.
+# 128 random bits: a task registration's token and a run's pin name (`backend::scm::task_xml::Token`).
 rand = "0.10"
 # A task's installed XML is read back as Task Scheduler wrote it (`backend::scm::task_xml`).
 roxmltree = "0.21"

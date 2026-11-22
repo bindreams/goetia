@@ -71,7 +71,8 @@ use super::sid::{Sid, distinct};
 use crate::error::{Error, Result};
 use crate::spec::Id;
 
-use super::instance::{InstanceId, bytes_of_hex, hex_of};
+use super::instance::InstanceId;
+use super::task_xml::Token;
 
 /// The end of a record's file name; a name's stem is the instance's [`InstanceId::hex`].
 const RECORD: &str = ".json";
@@ -214,7 +215,7 @@ impl Pin {
     /// failed). Neither file is none, as for [`Runs::read`].
     ///
     /// A pin whose state cannot be told is an error that names it: it may be held. A provisional file that names
-    /// no pin of goetia's is corrupt ([`decode_stopping`]).
+    /// no pin of goetia's ([`decode_stopping`]), or the reader's own pin, is corrupt.
     pub(crate) fn read_final(&self, instance: &InstanceId) -> io::Result<Option<RunRecord>> {
         self.settle(instance, || thread::sleep(REMOVE_PACE))
     }
@@ -227,6 +228,13 @@ impl Pin {
                 Found::Provisional(provisional) => provisional,
                 answered => return Ok(answered.into_record(instance)),
             };
+            // The reader holds its own pin: deleting it would answer `Held` for ever.
+            if provisional.pin.eq_ignore_ascii_case(&self.name) {
+                return Err(io::Error::other(format!(
+                    "the provisional file of run {} names the reader's own pin, which is no run's writer",
+                    instance.hex()
+                )));
+            }
             match files::delete(&self.dir, OsStr::new(&provisional.pin)) {
                 DeleteOutcome::Held => pause(),
                 DeleteOutcome::Deleted => {
@@ -1132,17 +1140,17 @@ fn decode_stopping(bytes: &[u8]) -> io::Result<Provisional> {
     })
 }
 
-/// A pin's file name: [`PIN_PREFIX`], 128 random bits as 32 hex digits, and [`PIN`]. A name is never taken again, so
-/// a reader that waits for the pin a provisional file names never waits for another run's.
+/// A pin's file name: [`PIN_PREFIX`], a [`Token`]'s 32 hex digits (128 random bits), and [`PIN`]. A name is never
+/// taken again, so a reader that waits for the pin a provisional file names never waits for another run's.
 fn fresh_pin_name() -> String {
-    format!("{PIN_PREFIX}{}{PIN}", hex_of(&rand::random::<u128>().to_be_bytes()))
+    format!("{PIN_PREFIX}{}{PIN}", Token::fresh().hex())
 }
 
-/// Whether `name` is of the form [`fresh_pin_name`] makes.
+/// Whether `name` is of the form [`fresh_pin_name`] makes: its digits are a [`Token`].
 fn is_pin_name(name: &str) -> bool {
     name.strip_prefix(PIN_PREFIX)
         .and_then(|rest| rest.strip_suffix(PIN))
-        .is_some_and(|digits| bytes_of_hex(digits).is_some())
+        .is_some_and(|digits| Token::parse(digits).is_some())
 }
 
 #[cfg(test)]

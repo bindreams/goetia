@@ -1433,6 +1433,20 @@ fn a_provisional_file_that_names_what_is_no_pin_of_goetias_is_corrupt_and_delete
     }
 }
 
+/// The reader holds its own pin, so a provisional file that names it would be held for ever: no run's shim writes
+/// one, and it is a corrupt record at once, not a wait.
+#[skuld::test]
+fn a_provisional_file_that_names_the_readers_own_pin_is_corrupt_and_is_not_waited_for() {
+    let (_dir, runs) = fixture();
+    let reader = runs.pin().unwrap();
+    reader.write_stopping(&instance(1), 7).unwrap();
+
+    let settled = reader.settle(&instance(1), no_pause).unwrap_err();
+
+    assert_eq!(settled.kind(), io::ErrorKind::Other);
+    assert!(settled.to_string().contains("own pin"), "{settled}");
+}
+
 /// A provisional file is a file goetia made: the removal takes it with the rest.
 #[skuld::test]
 fn remove_all_removes_a_provisional_file() {
