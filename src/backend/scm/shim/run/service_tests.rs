@@ -1347,11 +1347,14 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
 fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
-    // The accepted stop is what the pass acts on, so the exit status is never read: one wait.
+    // The daemon is gone when the stop is read (its waiter's report lags), so its status is read too, by a second
+    // wait; the accepted stop is what the pass reports, whatever the status.
     fake.will_make_thread();
     fake.will_spawn(
         FakeProcess::new()
-            .wait(WaitReply::Exits(7))
+            .exited_unreported(7)
+            .wait(WaitReply::Blocks)
+            .wait(WaitReply::Blocks)
             .send_kill_tree(KillReply::Ends),
     );
 

@@ -1061,34 +1061,33 @@ with the request standing.
   launchd starts no new run of a task while one is in flight, and `start`
   after it exits, or a `restart` without `--timeout 0`, does the job.
 - **Windows:** a task's `stop` sends the console close event
-  (`CTRL_CLOSE_EVENT`), as Task Scheduler does to any console program. Measured
-  on Windows Server 2025 (build 26100): the event reaches the program first, and
-  the host hears it only after the program has ended, so goetia adds no wait of
-  its own; Windows allows one second for the whole run, counted from the stop. A
-  program that exits on the event is the run's record: `run` reports how the
-  program ended, `0xC000013A` when the event ended it, or its own code when it
-  handled the event and exited. `status`'s last result is Task Scheduler's, and
-  reads `0xC000013A` after any stop. A program still running when the second is
-  over is ended by Windows together with the host, and that run leaves no record:
-  `run` says so. A program with no console (a GUI program, or one that detached
-  from it) is sent nothing; the host records the stop, waits for the program's
-  own exit and ends whatever is left of the tree, and when Windows ends the host
-  first, the Job Object takes the program's tree with it and the run is recorded
-  as stopped. A `Stopped` record means a stop was accepted and the host never saw
-  the program exit, not that the program's tree has ended. A stop that arrives
-  before the host has started the program starts nothing, and the run is still
-  recorded as stopped. A stop that arrives in the moment between that check and
-  the start still starts the program, which never receives the event and runs
-  until it exits or Windows ends the host and its Job Object takes the program's
-  tree with it. A run in flight at a
-  system shutdown is ended by Windows and may leave no record. `kill` terminates
-  the host, and its Job Object takes the program's tree with it; a waiting `run`
-  then reports that the run ended without recording its exit (exit `4`), as it
-  does for a shutdown or a host failure. When a stop could not end everything
-  the program started, the command that stopped it says so, and so do the
-  host's log and the Windows Event Log; `status` then shows the run as stopped
-  (exit code `0xC000013A`), as a service shows stopped. `restart --timeout 0`
-  is refused as on launchd.
+  (`CTRL_CLOSE_EVENT`), as Task Scheduler does to any console program.
+  Measured on Windows Server 2025 (build 26100): the event reaches the program
+  first, and the host hears it only after the program has ended, so goetia adds
+  no wait of its own; Windows allows one second for the whole run, counted from
+  the stop. `run` reports how the program ended: `0xC000013A` when the event
+  ended it, or its own code when it handled the event and exited. `status`'s
+  last result is Task Scheduler's, and reads `0xC000013A` after any stop. A
+  program still running when the second is over is ended by Windows together
+  with the host, and that run leaves no record: `run` says so. A program with
+  no console (a GUI program, or one that detached from it) is sent nothing: the
+  host records the stop and waits for the program's own exit, which is then the
+  run's record, and a program still running when the second is over is ended
+  with the host and its run is recorded as stopped. A `Stopped` record means a
+  stop was accepted and the host never saw the program exit, not that the
+  program's tree has ended. A stop that arrives before the host has started the
+  program starts nothing, and the run is still recorded as stopped. A stop that
+  arrives in the moment between that check and the start still starts the
+  program, which never receives the event and runs until it exits or Windows
+  ends the host and its Job Object takes the program's tree with it. A run in
+  flight at a system shutdown is ended by Windows and may leave no record.
+  `kill` terminates the host, and its Job Object takes the program's tree with
+  it; a waiting `run` then reports that the run ended without recording its exit
+  (exit `4`), as it does for a shutdown or a host failure. When a stop could not
+  end everything the program started, the command that stopped it says so, and
+  so do the host's log and the Windows Event Log; `status` then shows the run as
+  stopped (exit code `0xC000013A`), as a service shows stopped.
+  `restart --timeout 0` is refused as on launchd.
 
 ### The schedule, per platform
 
