@@ -123,6 +123,7 @@ fn a_program_that_handles_the_close_event_runs_its_own_shutdown(#[fixture(scm_gr
     let mgr = manager();
     let reported = ConnectBack::listen();
     let record = logs.path().join("record.txt");
+    let shim_log = logs.path().join("task.log");
     let records = support::task_records(id.as_str());
     let command = fixture_command(
         "catch-recording",
@@ -132,7 +133,7 @@ fn a_program_that_handles_the_close_event_runs_its_own_shutdown(#[fixture(scm_gr
             records.to_str().expect("the records' path is UTF-8"),
         ],
     );
-    mgr.install(&task_spec(&id, command, None, User::Root, None), false)
+    mgr.install(&task_spec(&id, command, None, User::Root, Some(&shim_log)), false)
         .expect("install");
 
     std::thread::scope(|scope| {
@@ -143,8 +144,22 @@ fn a_program_that_handles_the_close_event_runs_its_own_shutdown(#[fixture(scm_gr
         mgr.stop(&id, Some(Budget::DEFAULT)).expect("stop");
         ends_the_run.defuse();
 
-        let exit = run.join().expect("the run thread").expect("run");
-        assert_eq!(exit, STOPPED, "the record says a stop was accepted");
+        let left = || what_the_run_left(&records, &shim_log, &record);
+        let exit = run.join().expect("the run thread").unwrap_or_else(|e| {
+            panic!(
+                "run: {}
+{}",
+                e.report(),
+                left()
+            )
+        });
+        assert_eq!(
+            exit,
+            STOPPED,
+            "the record says a stop was accepted
+{}",
+            left()
+        );
     });
     let said = std::fs::read_to_string(&record).unwrap_or_else(|e| panic!("read {}: {e}", record.display()));
     assert!(
@@ -157,6 +172,39 @@ fn a_program_that_handles_the_close_event_runs_its_own_shutdown(#[fixture(scm_gr
     );
     assert_eq!(mgr.status(&id).expect("status").common().state, State::Idle);
     mgr.uninstall(&id).expect("uninstall");
+}
+
+/// What a run left that says why it ended as it did: the records directory (each record's text), the shim's
+/// own log (the task's `logs`: the program's output and the shim's failures) and the program's record file.
+fn what_the_run_left(
+    records: &std::path::Path,
+    shim_log: &std::path::Path,
+    program_record: &std::path::Path,
+) -> String {
+    let mut said = format!("the records in {}:", records.display());
+    match std::fs::read_dir(records) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                said.push_str(&format!(
+                    "
+  {}: {text}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+        Err(e) => said.push_str(&format!(" cannot be listed: {e}")),
+    }
+    for (what, path) in [("the shim's log", shim_log), ("the program's record", program_record)] {
+        said.push_str(&format!(
+            "
+{what} {}:
+{}",
+            path.display(),
+            std::fs::read_to_string(path).unwrap_or_else(|e| format!("<{e}>"))
+        ));
+    }
+    said
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
