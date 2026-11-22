@@ -30,7 +30,7 @@
 //!   no provisional file is written first;
 //! - for a program that is alive as the stop is heard (one that is not on the shim's console, a GUI-subsystem
 //!   program or one that detached, and the window between the look before the spawn and the spawn), it writes
-//!   the provisional file of its `Stopped` first ([`Runs::write_stopping`]), since Windows may end the shim
+//!   the provisional file of its `Stopped` first ([`Pin::write_stopping`]), since Windows may end the shim
 //!   before anything later; it waits for the program's own exit, with no cap of goetia's
 //!   ([`StopPlan::WaitOnly`]);
 //! - it tears down what the program left and ends: with the program's own exit when the shim saw it exit, with
@@ -64,7 +64,7 @@ use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::Registered;
 use crate::backend::scm::manager::task::clock::file_time_of;
 use crate::backend::scm::manager::task::{Com, TaskApi};
-use crate::backend::scm::runs::{Pin, RunOutcome, RunRecord, Runs};
+use crate::backend::scm::runs::{Pin, RunOutcome, RunRecord, Runs, stopping_name};
 use crate::backend::scm::task_xml::{TaskXml, Token, ending, extract_from_data};
 use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Id};
@@ -140,7 +140,7 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
 ///    the bus once more and, for a stop accepted by then, starts no program: the record is `Stopped`, as in
 ///    step 4. Otherwise runs the program and writes its record, under the pin, which is released as the
 ///    record is renamed in place ([`Runs::write`]). An accepted stop writes the provisional file
-///    ([`Runs::write_stopping`]) before the wait, with the pin lent, so that the run stays one that is alive; the
+///    ([`Pin::write_stopping`]) before the wait, with the pin lent, so that the run stays one that is alive; the
 ///    record is written to its own name after it. A program that is gone when the stop is seen gets no such
 ///    file: its exit is the one record ([`ended_as`]). A record that cannot be written is logged and does not
 ///    change the code.
@@ -251,12 +251,14 @@ pub(super) fn run_in(
             // stop is seen is told as one): the provisional file comes before the wait, which Windows may end the
             // shim in, and the pin stays held (the run is alive).
             if end == WaitEnd::Stop
-                && let Err(e) = runs.write_stopping(&instance, started, &pin)
+                && let Err(e) = pin.write_stopping(&instance, started)
             {
                 log.failure(
                     id,
                     &format!(
-                        "the run was stopped and the first note of it could not be written: {}",
+                        "write the provisional file {} in the run records {}: {}",
+                        stopping_name(&instance).to_string_lossy(),
+                        runs.dir().display(),
                         Chain(&e)
                     ),
                 );

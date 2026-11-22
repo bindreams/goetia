@@ -1671,8 +1671,8 @@ fn a_failed_record_write_still_returns_the_programs_code() {
 }
 
 /// A stop heard with the program alive whose provisional file cannot be written is logged as that, in words of its
-/// own (the run was stopped and the first note of it could not be written), not as a failed record; the run then
-/// records its end as it does.
+/// own (the file and the run records it was to be written in), not as a failed record; the run then records its end
+/// as it does.
 #[skuld::test]
 fn a_provisional_file_that_cannot_be_written_is_logged_as_that_and_the_record_still_lands() {
     let process = runs_until_stopped();
@@ -1682,9 +1682,10 @@ fn a_provisional_file_that_cannot_be_written_is_logged_as_that_and_the_record_st
     let stop = run.stop_at_the_spawn();
     let run = run.program(process.clone().when(Op::Spawn, stop));
 
-    let code = run.run_until(NameChange::Removed(format!("{}.json.tmp", instance().hex())), || {
-        process.end(7)
-    });
+    let code = run.run_until(
+        NameChange::Removed(format!("{}.stopping.tmp", instance().hex())),
+        || process.end(7),
+    );
 
     assert_eq!(code, 7);
     assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(7)));
@@ -1698,7 +1699,9 @@ fn a_provisional_file_that_cannot_be_written_is_logged_as_that_and_the_record_st
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
         failures[0].starts_with(&format!(
-            "goetia-shim[{ID}]: the run was stopped and the first note of it could not be written: "
+            "goetia-shim[{ID}]: write the provisional file {}.stopping in the run records {}: ",
+            instance().hex(),
+            run.records_dir().display()
         )),
         "{failures:?}"
     );

@@ -954,7 +954,7 @@ fn write_stopping_leaves_a_provisional_file_keeps_the_pin_and_prunes_nothing() {
     runs.write(&record(1, 1), None).unwrap();
     let pin = runs.hold().unwrap();
 
-    runs.write_stopping(&instance(2), 2, &pin).unwrap();
+    pin.write_stopping(&instance(2), 2).unwrap();
 
     assert!(runs.dir.join(stopping_file_of(&instance(2))).exists());
     assert!(!runs.dir.join(file_of(&instance(2))).exists(), "no record is written");
@@ -969,16 +969,71 @@ fn write_stopping_leaves_a_provisional_file_keeps_the_pin_and_prunes_nothing() {
     assert_eq!(runs.held_pin().unwrap(), None);
 }
 
-/// The file lands in the pin's directory, so a pin of another `Runs`' directory is a mistake the write refuses.
-#[cfg(debug_assertions)]
+/// The file lands where the pin's handle is, not at the path: the directory that became a link after the pin's
+/// handle opened it refuses the write, and nothing is made in the link's target. (The pin's file is held elsewhere:
+/// a directory with a file in it cannot become a link.)
 #[skuld::test]
-#[should_panic(expected = "the pin is of another directory")]
-fn write_stopping_with_a_pin_of_another_directory_is_refused() {
-    let (_pinned_dir, pinned) = fixture();
-    let (_other_dir, other) = fixture();
-    let pin = pinned.hold().unwrap();
+fn write_stopping_writes_through_the_pins_handle_and_not_the_path() {
+    let (_dir, runs) = fixture();
+    let (held, target) = held_and_then_linked(&runs);
+    let pin = Pin {
+        _file: tempfile::tempfile().unwrap(),
+        dir: held,
+        listing: None,
+    };
 
-    let _ = other.write_stopping(&instance(1), 1, &pin);
+    let refused = pin.write_stopping(&instance(1), 1).unwrap_err();
+
+    assert_eq!(refused.kind(), io::ErrorKind::NotADirectory, "{refused}");
+    assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1, "only victim.txt");
+}
+
+/// The provisional file is written to a temp file of its own name, which no write of the record uses: another handle
+/// holds it (a scanner, say), so the write fails and cannot remove it, and the run's record lands all the same, to its
+/// own temp name.
+#[skuld::test]
+fn a_provisional_write_that_fails_at_its_temp_file_does_not_stop_the_record() {
+    let (_dir, runs) = fixture();
+    let pin = runs.hold().unwrap();
+    let temp = runs.dir.join(format!("{}.stopping.tmp", instance(1).hex()));
+    let holder = temp_held(&runs, &temp);
+
+    let failed = pin.write_stopping(&instance(1), 1).unwrap_err();
+    let exited = record(1, 1);
+    let problems = runs.write(&exited, Some(pin)).unwrap();
+
+    assert!(files::is_sharing_violation(&failed), "{failed}");
+    assert_eq!(
+        problems,
+        Vec::<String>::new(),
+        "a file that is held is for the next prune"
+    );
+    assert_eq!(runs.read(&instance(1)).unwrap(), Some(exited));
+    assert!(temp.exists(), "the held temp file is left");
+    drop(holder);
+    runs.write(&record(2, 2), None).unwrap();
+    assert_eq!(names(&runs), [file_of(&instance(2))], "the next prune removes it");
+}
+
+/// A failed write whose temp file cannot be removed either says so in its error, which the caller logs, and keeps
+/// the kind of the write's own failure.
+#[skuld::test]
+fn a_failed_write_whose_cleanup_failed_says_so_and_keeps_its_kind() {
+    let failed = io::Error::new(io::ErrorKind::AlreadyExists, "the name exists");
+    let temp = OsStr::new("x.stopping.tmp");
+
+    let told = after_cleanup(failed, temp, DeleteOutcome::Failed(io::Error::other("access denied")));
+
+    assert_eq!(told.kind(), io::ErrorKind::AlreadyExists);
+    let text = told.to_string();
+    assert!(
+        text.contains("the name exists") && text.contains("x.stopping.tmp") && text.contains("access denied"),
+        "{text}"
+    );
+    for removed in [DeleteOutcome::Deleted, DeleteOutcome::Held] {
+        let failed = io::Error::new(io::ErrorKind::AlreadyExists, "the name exists");
+        assert_eq!(after_cleanup(failed, temp, removed).to_string(), "the name exists");
+    }
 }
 
 /// A provisional file with no record beside it is a run that was told to stop and never recorded how it ended.
@@ -986,7 +1041,7 @@ fn write_stopping_with_a_pin_of_another_directory_is_refused() {
 fn read_of_a_provisional_file_alone_is_stopped_with_its_started() {
     let (_dir, runs) = fixture();
     let pin = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 7, &pin).unwrap();
+    pin.write_stopping(&instance(1), 7).unwrap();
 
     assert_eq!(runs.read(&instance(1)).unwrap(), Some(stopped(1, 7)));
 }
@@ -996,7 +1051,7 @@ fn read_of_a_provisional_file_alone_is_stopped_with_its_started() {
 fn read_gives_the_record_when_there_is_one_beside_the_provisional_file() {
     let (_dir, runs) = fixture();
     let pin = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 7, &pin).unwrap();
+    pin.write_stopping(&instance(1), 7).unwrap();
     let exited = record(1, 7);
     // Another pin is held, so the write that lands the record prunes nothing and leaves the provisional file.
     let other = runs.hold().unwrap();
@@ -1071,7 +1126,7 @@ fn a_provisional_file_that_holds_another_outcome_than_stopped_is_a_corrupt_recor
 fn a_final_write_lands_while_another_handle_holds_the_provisional_file_without_sharing_delete() {
     let (_dir, runs) = fixture();
     let pin = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 1, &pin).unwrap();
+    pin.write_stopping(&instance(1), 1).unwrap();
     let provisional = runs.dir.join(stopping_file_of(&instance(1)));
     let holder = OpenOptions::new()
         .read(true)
@@ -1100,8 +1155,8 @@ fn a_final_write_lands_while_another_handle_holds_the_provisional_file_without_s
 fn without_a_pin_a_write_prunes_every_provisional_file_the_writers_own_too() {
     let (_dir, runs) = fixture();
     let pin = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 1, &pin).unwrap();
-    runs.write_stopping(&instance(2), 2, &pin).unwrap();
+    pin.write_stopping(&instance(1), 1).unwrap();
+    pin.write_stopping(&instance(2), 2).unwrap();
     runs.write(&record(3, 3), None).unwrap();
     fs::write(runs.dir.join(format!("{}.json.tmp", instance(4).hex())), "").unwrap();
     drop(pin);
@@ -1117,8 +1172,8 @@ fn without_a_pin_a_write_prunes_every_provisional_file_the_writers_own_too() {
 fn with_a_pin_held_a_write_prunes_no_provisional_file() {
     let (_dir, runs) = fixture();
     let own = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 1, &own).unwrap();
-    runs.write_stopping(&instance(2), 2, &own).unwrap();
+    own.write_stopping(&instance(1), 1).unwrap();
+    own.write_stopping(&instance(2), 2).unwrap();
     let other = runs.hold().unwrap();
 
     runs.write(&record(1, 1), Some(own)).unwrap();
@@ -1138,11 +1193,11 @@ fn with_a_pin_held_a_write_prunes_no_provisional_file() {
 fn appeared_does_not_list_a_provisional_file_the_pin_listed_and_lists_one_that_came_after() {
     let (_dir, runs) = fixture();
     let first = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 1, &first).unwrap();
+    first.write_stopping(&instance(1), 1).unwrap();
     let pin = runs.pin().unwrap();
     assert_eq!(pin.appeared().unwrap(), Vec::<RunRecord>::new());
 
-    runs.write_stopping(&instance(2), 2, &first).unwrap();
+    first.write_stopping(&instance(2), 2).unwrap();
 
     assert_eq!(pin.appeared().unwrap(), [stopped(2, 2)]);
 }
@@ -1153,7 +1208,7 @@ fn appeared_does_not_list_a_provisional_file_the_pin_listed_and_lists_one_that_c
 fn appeared_lists_the_record_that_lands_after_a_listed_provisional_file() {
     let (_dir, runs) = fixture();
     let own = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 1, &own).unwrap();
+    own.write_stopping(&instance(1), 1).unwrap();
     let pin = runs.pin().unwrap();
 
     runs.write(&record(1, 1), Some(own)).unwrap();
@@ -1167,8 +1222,8 @@ fn appeared_lists_one_entry_per_instance_the_record_over_the_provisional_file() 
     let (_dir, runs) = fixture();
     let pin = runs.pin().unwrap();
     let own = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 1, &own).unwrap();
-    runs.write_stopping(&instance(2), 2, &own).unwrap();
+    own.write_stopping(&instance(1), 1).unwrap();
+    own.write_stopping(&instance(2), 2).unwrap();
     runs.write(&record(1, 1), Some(own)).unwrap();
 
     assert_eq!(pin.appeared().unwrap(), [record(1, 1), stopped(2, 2)]);
@@ -1190,7 +1245,7 @@ fn appeared_lists_the_record_when_the_provisional_file_beside_it_cannot_be_read(
 fn remove_all_removes_a_provisional_file() {
     let (_dir, runs) = fixture();
     let pin = runs.hold().unwrap();
-    runs.write_stopping(&instance(1), 1, &pin).unwrap();
+    pin.write_stopping(&instance(1), 1).unwrap();
     drop(pin);
 
     runs.remove_all(no_note).unwrap();

@@ -137,11 +137,10 @@ pub(super) fn shim_writes(shim: &Runs, record: &RunRecord) {
 }
 
 /// What a shim does as it hears a stop with its program alive: it writes the provisional file of the run `n`'s first
-/// `Stopped`, under its own pin ([`Runs::write_stopping`]). The pin is let go as the call ends, which a test that
-/// follows the run does not notice: the run it follows holds a pin of its own.
+/// `Stopped`, under its own pin ([`Pin::write_stopping`]).
 pub(super) fn shim_writes_stopping(shim: &Runs, n: u8) {
     let pin = shim.hold().unwrap();
-    shim.write_stopping(&instance_id(n), 1, &pin).unwrap();
+    pin.write_stopping(&instance_id(n), 1).unwrap();
 }
 
 pub(super) fn record(n: u8, outcome: RunOutcome) -> RunRecord {
