@@ -374,13 +374,7 @@ impl Systemd {
     ///
     /// No `systemctl enable` or `disable` comes between the first removal and the reload, since both reload the
     /// manager at once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
-    pub(super) fn settle(
-        &self,
-        id: &str,
-        in_flight: RunInFlight,
-        target: Target<'_>,
-        held: &mut Held,
-    ) -> Result<()> {
+    pub(super) fn settle(&self, id: &str, in_flight: RunInFlight, target: Target<'_>, held: &mut Held) -> Result<()> {
         let installed = match target {
             Target::Installed(snapshot) => Some(snapshot),
             Target::Sweep | Target::Install => None,

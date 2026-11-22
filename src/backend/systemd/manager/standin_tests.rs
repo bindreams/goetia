@@ -623,7 +623,11 @@ fn a_foreign_file_at_the_standins_path_does_not_refuse_leave_of_a_timer_alone(
         calls_of(&fake),
         [disable_timer_call(&id), read_call(&id), reload_call()]
     );
-    assert_eq!(standin_text(&id).as_deref(), Some(seed_foreign()), "the file is untouched");
+    assert_eq!(
+        standin_text(&id).as_deref(),
+        Some(seed_foreign()),
+        "the file is untouched"
+    );
     assert!(paths(&id).iter().all(|p| !p.exists()), "the timer is removed");
 }
 
@@ -734,7 +738,11 @@ fn stopping_an_installed_id_reads_whether_the_run_failed_after_the_stop(#[fixtur
         seed_standin(&id, "15", "1min 30s");
         let mut steps = vec![
             disabled(),
-            state(&id, if before { "failed" } else { "active" }, if before { "failed" } else { "running" }),
+            state(
+                &id,
+                if before { "failed" } else { "active" },
+                if before { "failed" } else { "running" },
+            ),
             enqueued("stop", 3),
             read_of(&id, after),
         ];
@@ -747,12 +755,7 @@ fn stopping_an_installed_id_reads_whether_the_run_failed_after_the_stop(#[fixtur
         mgr.uninstall_units(snapshot, RunInFlight::Stop, &mut held(&mgr))
             .expect("uninstall");
 
-        let mut expected = vec![
-            disable_timer_call(&id),
-            read_call(&id),
-            stop_call(&id),
-            read_call(&id),
-        ];
+        let mut expected = vec![disable_timer_call(&id), read_call(&id), stop_call(&id), read_call(&id)];
         if after {
             expected.push(reset_call(&id));
         }
@@ -853,7 +856,10 @@ fn uninstalling_an_absent_id_removes_a_standin_when_the_run_has_no_process(#[fix
             assert_eq!(calls.contains(&stop_call(&id)), in_flight == RunInFlight::Stop);
             if in_flight == RunInFlight::Stop {
                 let at = |wanted: &Vec<String>| calls.iter().rposition(|seen| seen == wanted);
-                assert!(at(&stop_call(&id)) < at(&read_call(&id)), "read after the stop: {calls:?}");
+                assert!(
+                    at(&stop_call(&id)) < at(&read_call(&id)),
+                    "read after the stop: {calls:?}"
+                );
             }
             assert_eq!(standin_text(&id), None, "{in_flight:?}, failed: {failed}");
         }

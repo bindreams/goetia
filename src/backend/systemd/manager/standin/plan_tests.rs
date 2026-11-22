@@ -288,7 +288,15 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
+        plan: || {
+            plan_with(
+                false,
+                Standin::Remove {
+                    clearing: Clearing::Not,
+                },
+                true,
+            )
+        },
     },
     Row {
         rule: "4: and one whose run failed, after reset-failed",
@@ -350,7 +358,15 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: EITHER,
-        plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
+        plan: || {
+            plan_with(
+                false,
+                Standin::Remove {
+                    clearing: Clearing::Not,
+                },
+                true,
+            )
+        },
     },
     Row {
         rule: "4, 6: and one whose run failed, after reset-failed",
@@ -404,7 +420,15 @@ const ROWS: &[Row] = &[
         file: &[Ours],
         run: &[Idle, Pending],
         held_gone: NOT_HELD,
-        plan: || plan_with(false, Standin::Remove { clearing: Clearing::Not }, true),
+        plan: || {
+            plan_with(
+                false,
+                Standin::Remove {
+                    clearing: Clearing::Not,
+                },
+                true,
+            )
+        },
     },
     Row {
         rule: "7, 4: and one whose run failed, after reset-failed",
@@ -493,13 +517,7 @@ fn the_stand_in_carries_the_values_the_read_printed() {
         asks_held: false,
     };
 
-    let planned = plan(
-        &known,
-        Some(&Seen {
-            run,
-            held_gone: false,
-        }),
-    );
+    let planned = plan(&known, Some(&Seen { run, held_gone: false }));
 
     assert_eq!(
         planned.standin,
