@@ -73,9 +73,10 @@ const PIN: &str = ".pin";
 /// ([`Runs::remove_all`]). An id has no `~`, so no task's directory is named like it.
 const REMOVING: &str = "~removing";
 /// The pace of [`Runs::remove_all`]'s passes while something is held or the directory is not yet
-/// empty. Each re-check decides; the pace only keeps the loop from spinning (the shim's re-reads of
-/// Task Scheduler's listing run at the same pace).
-const REMOVE_PACE: Duration = Duration::from_millis(100);
+/// empty, and of [`Runs::write`]'s attempts to replace a record that is held. Each re-check decides; the
+/// pace only keeps the loop from spinning (the shim's re-reads of Task Scheduler's listing run at the same
+/// pace).
+const HELD_PACE: Duration = Duration::from_millis(100);
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +88,8 @@ pub(crate) enum RunOutcome {
     /// teardown ended it, or Windows ended the shim after this was written, which is before the shim waits for a
     /// program that is alive at the stop. It does not say the program's tree has ended: a shim that Windows ends
     /// first leaves it, and the Job Object ends the tree. A program the shim saw exit is `Exited`, stop or not.
-    /// If the record that replaces this one cannot be written, this is what stays on disk.
+    /// If Windows ends the shim before the record that replaces this one is written, or that write fails for another
+    /// reason, this is what stays on disk.
     Stopped,
     /// A stop was accepted and something of the program's tree could not be ended. It replaces `Stopped`.
     IncompleteStop,
@@ -377,15 +379,26 @@ impl Runs {
     /// whole once this returns `Ok`; a prune that cannot remove a file leaves it for the next write.
     /// What the prune could not do, and a failure of its own (not a file that is gone or held), is
     /// returned as one line each for the caller to log: it never fails the write. A directory that is a
-    /// link is refused ([`Runs::ensure`]), and nothing is written. A replacement that fails (a holder of the old record
-    /// that shares no delete, or any other error) leaves the old record as it was, a first `Stopped` included.
+    /// link is refused ([`Runs::ensure`]), and nothing is written.
+    ///
+    /// **A record that another program holds open without sharing delete** (a scanner, say) cannot be
+    /// replaced while it is held. The write calls `waiting` with the record's path, once, when it first finds
+    /// that, and tries again every [`HELD_PACE`] for as long as that is the answer, with no cap: only a flow
+    /// that began with a close event replaces a record, and Windows ends the shim about a second after that
+    /// event, so the wait is bounded by the shim's own end. A replacement that fails for any other reason
+    /// leaves the old record as it was, a first `Stopped` included, and is the write's error.
     ///
     /// `pin` is the writer's pin ([`Writing`]; a bare `None`, `Some(pin)` or `&pin` says it). **Given**, it is held
     /// until the record is renamed into place, then released before the prune, which a held pin would stop; a failed
     /// write releases it too. **Lent**, it stays held and nothing is pruned: the record is one a run writes while it
     /// is still alive, so that "no pin held" keeps meaning "no run alive". The write goes through the pin's directory
     /// handle, not the path.
-    pub(crate) fn write<'a>(&self, record: &RunRecord, pin: impl Into<Writing<'a>>) -> io::Result<Vec<String>> {
+    pub(crate) fn write<'a>(
+        &self,
+        record: &RunRecord,
+        pin: impl Into<Writing<'a>>,
+        waiting: impl FnOnce(&Path),
+    ) -> io::Result<Vec<String>> {
         let opened;
         let (dir, own, prunes) = match pin.into() {
             Writing::Given(Pin { _file, dir, .. }) => {
@@ -407,10 +420,21 @@ impl Runs {
         .map_err(io::Error::other)?;
 
         let mut file = files::create_temp(dir, &temp)?;
-        let landed = file
-            .write_all(&body)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| files::rename_over(dir, &file, &record_name(&record.instance)));
+        let landed = file.write_all(&body).and_then(|()| file.sync_all()).and_then(|()| {
+            let to = record_name(&record.instance);
+            let mut waiting = Some(waiting);
+            loop {
+                match files::rename_over(dir, &file, &to) {
+                    Err(e) if files::is_sharing_violation(&e) => {
+                        if let Some(waiting) = waiting.take() {
+                            waiting(&dir.path().join(&to));
+                        }
+                        thread::sleep(HELD_PACE);
+                    }
+                    done => return done,
+                }
+            }
+        });
         drop(file);
         drop(own);
         if let Err(e) = landed {
@@ -548,7 +572,7 @@ impl Runs {
     /// first, and a pin looks for it ([`Runs::hold`]).
     ///
     /// Something held (a pin, a file a shim is writing, the directory), or a directory not yet empty,
-    /// pauses it for [`REMOVE_PACE`], and another pass follows ([`Runs::remove_pass`]), with no cap:
+    /// pauses it for [`HELD_PACE`], and another pass follows ([`Runs::remove_pass`]), with no cap:
     /// whatever holds it lets go in time, and the user can interrupt the command. `waiting` is called with
     /// the path being waited for, and why ([`PauseKind`]), before a pause, and again each time that path
     /// changes, so the caller can say what is awaited. A pause that is [`PauseKind::Emptying`] calls it once
@@ -578,7 +602,7 @@ impl Runs {
                 return Ok(());
             }
             said.note(&self.dir, &pass, &mut waiting);
-            thread::sleep(REMOVE_PACE);
+            thread::sleep(HELD_PACE);
         }
     }
 

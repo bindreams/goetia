@@ -558,3 +558,10 @@ pub(crate) fn set_owner(path: &std::path::Path, sid: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The `waiting` of a [`Runs::write`](crate::backend::scm::runs::Runs::write) whose record nothing holds: it is
+/// never called.
+#[cfg(windows)]
+pub(crate) fn no_wait(_: &std::path::Path) {
+    panic!("nothing holds the record, so there is nothing to wait for");
+}

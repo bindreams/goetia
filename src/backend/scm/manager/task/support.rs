@@ -18,7 +18,7 @@ use crate::backend::scm::manager::Scm;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::sid::try_sid_display;
-use crate::backend::scm::test_support::registered_task;
+use crate::backend::scm::test_support::{no_wait, registered_task};
 use crate::blob::Blob;
 use crate::elevation::test_support::process_user_sid;
 use crate::manager::budget::Deadline;
@@ -133,7 +133,7 @@ pub(super) fn linked_records() -> (TempDir, PathBuf, Runs, TempDir) {
 
 /// What a shim does as its run ends: it writes the run's record, and its prune has nothing to say.
 pub(super) fn shim_writes(shim: &Runs, record: &RunRecord) {
-    assert_eq!(shim.write(record, None).unwrap(), Vec::<String>::new());
+    assert_eq!(shim.write(record, None, no_wait).unwrap(), Vec::<String>::new());
 }
 
 pub(super) fn record(n: u8, outcome: RunOutcome) -> RunRecord {

@@ -29,7 +29,7 @@ use crate::backend::scm::shim::run::test_support::{
 };
 use crate::backend::scm::task_xml::Token;
 use crate::backend::scm::test_support::{
-    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, delete_pending, directory_with_a_file, make_mount_point,
+    A_STRANGER, DirWatch, NameChange, TASK_TOKEN, delete_pending, directory_with_a_file, make_mount_point, no_wait,
     registered_task, registered_task_with, set_dacl, task_token,
 };
 use crate::elevation::test_support::process_user_sid;
@@ -805,8 +805,8 @@ fn a_run_records_under_its_own_pin_and_drops_it_after_the_rename() {
     let (first, second) = (earlier(5), earlier(6));
     let seen = (first.clone(), second.clone());
     run.api.on_instances(Ok(listed())).during(move || {
-        other.write(&seen.0, None).unwrap();
-        other.write(&seen.1, None).unwrap();
+        other.write(&seen.0, None, no_wait).unwrap();
+        other.write(&seen.1, None, no_wait).unwrap();
         assert!(
             other.read(&seen.0.instance).unwrap().is_some(),
             "the shim's pin did not keep an earlier record from the next write's prune"

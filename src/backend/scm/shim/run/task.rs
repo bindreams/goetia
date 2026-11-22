@@ -284,8 +284,8 @@ pub(super) fn run_in(
 }
 
 /// Writes the run's record, under its own pin, when it has everything one needs; a write that fails is
-/// logged. A pin that is given is released either way, as the function ends; one that is lent stays held and
-/// nothing is pruned ([`Runs::write`]).
+/// logged, and one that waits for a program holding the old record says so. A pin that is given is released
+/// either way, as the function ends; one that is lent stays held and nothing is pruned ([`Runs::write`]).
 fn record_run(
     log: &Log,
     id: &str,
@@ -303,12 +303,23 @@ fn record_run(
                 outcome,
             },
             pin,
+            |held| {
+                log.warning(
+                    id,
+                    &format!(
+                        "the run record {} is held open by another program; the write is retried until it is released",
+                        held.display()
+                    ),
+                );
+            },
         ) {
             Ok(problems) => {
                 for problem in problems {
                     log.warning(id, &format!("prune the run records: {problem}"));
                 }
             }
+            // `tests/shim_integration/tasks.rs` relies on this line's text being absent from the log of a run whose final
+            // record was written.
             Err(e) => log.failure(id, &format!("write the run record: {}", Chain(&e))),
         }
     }
