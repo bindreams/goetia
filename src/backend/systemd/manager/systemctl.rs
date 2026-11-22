@@ -844,16 +844,17 @@ impl Systemctl {
             Stamp::Left => {}
             Stamp::Clean => self.clean_timer(id, held)?,
             Stamp::ResetThenClean => {
-                self.reset_timer(id, held)?;
+                self.reset_failed(id, UnitKind::Timer, held)?;
                 self.clean_timer(id, held)?;
             }
         }
         self.enable_timer(id, held)
     }
 
-    /// `systemctl reset-failed` for `id`'s timer: a failed timer is inactive again.
-    fn reset_timer(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.unit_file_verb(&["reset-failed"], id, UnitKind::Timer, held)
+    /// `systemctl reset-failed` for `id`'s `kind` unit: a failed unit is inactive again. The unit must be
+    /// loadable: systemd refuses one it has no file for, loaded or not (measured on 255).
+    pub(super) fn reset_failed(&self, id: &str, kind: UnitKind, held: &mut Held) -> Result<()> {
+        self.unit_file_verb(&["reset-failed"], id, kind, held)
     }
 
     /// `systemctl clean --what=state` for `id`'s timer: its stamp (`/var/lib/systemd/timers/stamp-*`).

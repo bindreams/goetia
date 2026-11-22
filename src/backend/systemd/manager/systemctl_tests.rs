@@ -800,7 +800,10 @@ fn every_path() -> Vec<Way> {
         }),
         Way::request("clean timer", |s: &Systemctl| s.clean_timer("x", &mut Held::default())),
         Way::request("reset-failed timer", |s: &Systemctl| {
-            s.reset_timer("x", &mut Held::default())
+            s.reset_failed("x", UnitKind::Timer, &mut Held::default())
+        }),
+        Way::request("reset-failed job", |s: &Systemctl| {
+            s.reset_failed("x", UnitKind::Service, &mut Held::default())
         }),
         Way {
             name: "show stamp".to_string(),

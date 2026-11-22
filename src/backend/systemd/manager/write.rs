@@ -26,11 +26,16 @@ pub(super) enum CreateOutcome {
 /// [`tempfile::NamedTempFile::persist_noclobber`] is `linkat(2)` without
 /// replace semantics, so this fails rather than clobbers if anything now occupies `unit_path(id, kind)`.
 pub(super) fn create_unit(id: &str, kind: UnitKind, text: &str) -> Result<CreateOutcome> {
-    let final_path = unit_path(id, kind);
-    let tmp = write_temp_unit(id, kind, text)?;
+    create_unit_in(Path::new(UNIT_DIR), id, kind, text)
+}
+
+/// [`create_unit`] in `dir`, which is `UNIT_DIR` or the runtime unit directory a stand-in goes in.
+pub(super) fn create_unit_in(dir: &Path, id: &str, kind: UnitKind, text: &str) -> Result<CreateOutcome> {
+    let final_path = dir.join(unit_name(id, kind));
+    let tmp = write_temp_unit(dir, id, kind, text)?;
     match tmp.persist_noclobber(&final_path) {
         Ok(_file) => {
-            fsync_unit_dir()?;
+            fsync_dir(dir)?;
             Ok(CreateOutcome::Created)
         }
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(CreateOutcome::Raced),
@@ -73,14 +78,14 @@ pub(super) fn replace_unit_verified(
     // case where doing so would itself clobber a third file — see that arm's own comment. A transient
     // write failure (ENOSPC, EIO, a permission error) must never turn a routine `install` over an
     // already-installed service into a silent uninstall.
-    let tmp = match write_temp_unit(id, kind, text) {
+    let tmp = match write_temp_unit(Path::new(UNIT_DIR), id, kind, text) {
         Ok(tmp) => tmp,
         Err(e) => return Err(restore_or_chain(id, &backup_path, &final_path, e)),
     };
 
     match tmp.persist_noclobber(&final_path) {
         Ok(_file) => {
-            fsync_unit_dir()?;
+            fsync_dir(Path::new(UNIT_DIR))?;
             remove_file_if_present(&backup_path)?;
             Ok(ReplaceOutcome::Replaced)
         }
@@ -214,15 +219,14 @@ pub(super) fn restore_quarantine(id: &str, backup_path: &Path, final_path: &Path
 
 // write_temp_unit / fsync_unit_dir ====================================================================================
 
-/// A temp file in `UNIT_DIR` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
+/// A temp file in `dir` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
 /// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (so
 /// `list`/`show`/`diff` need no elevation) and `fsync`ed to stable storage — `NamedTempFile`'s
 /// `Write` impl forwards `flush()` straight to `std::fs::File`, whose `flush` is a documented no-op,
 /// so without a real `sync_all()` here a crash between this write and the later rename can leave the
 /// fragment on disk fully or partially zero-filled: no `[X-Goetia]` marker, `extract` returns
 /// `Ok(None)`, and every verb then refuses an id goetia itself created.
-pub(super) fn write_temp_unit(id: &str, kind: UnitKind, text: &str) -> Result<tempfile::NamedTempFile> {
-    let dir = Path::new(UNIT_DIR);
+pub(super) fn write_temp_unit(dir: &Path, id: &str, kind: UnitKind, text: &str) -> Result<tempfile::NamedTempFile> {
     let mut tmp = tempfile::Builder::new()
         .prefix(&format!(".goetia-{id}-"))
         .suffix(&format!("{}.tmp", kind.suffix()))
@@ -239,10 +243,9 @@ pub(super) fn write_temp_unit(id: &str, kind: UnitKind, text: &str) -> Result<te
     Ok(tmp)
 }
 
-/// `fsync`s `UNIT_DIR` itself, so a just-completed rename's new directory entry is durable — a file's
+/// `fsync`s `dir` itself, so a just-completed rename's new directory entry is durable — a file's
 /// own `fsync` (see `write_temp_unit`) says nothing about the directory entry pointing to it.
-pub(super) fn fsync_unit_dir() -> Result<()> {
-    let dir = Path::new(UNIT_DIR);
+pub(super) fn fsync_dir(dir: &Path) -> Result<()> {
     let f = fs::File::open(dir).map_err(|e| Error::os_at("open", dir, e))?;
     f.sync_all().map_err(|e| Error::os_at("fsync", dir, e))
 }

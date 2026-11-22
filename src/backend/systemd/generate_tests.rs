@@ -1498,3 +1498,112 @@ fn a_stop_action_survives_the_blob_and_the_unit_regenerates_byte_for_byte() {
         assert_eq!(unit(&extracted.spec, &minimal_identity()).unwrap(), text);
     }
 }
+
+// The stand-in unit ===================================================================================================
+
+/// What `uninstall --no-stop` writes for a run it leaves, byte for byte: a valid oneshot unit with no
+/// start timeout, whose own start asserts a path that cannot exist, and the job's stop settings.
+fn expected_standin(id: &str, stop_lines: &str) -> String {
+    format!(
+        "[Unit]\nDescription=goetia: the run of {id} that uninstall left\nAssertPathExists=/dev/null/goetia-left-run\n\n\
+         [Service]\nType=oneshot\nTimeoutStartSec=infinity\nExecStart=/bin/true\n{stop_lines}\n\
+         [X-Goetia]\nMarker=goetia\nId={id}\n"
+    )
+}
+
+#[skuld::test]
+fn the_standin_carries_the_jobs_stop_settings() {
+    let job = unit(
+        &with_stop_action(StopAction {
+            send_signal: StopSignal::Quit,
+            timeout: Some(Duration::from_secs(7)),
+        }),
+        &minimal_identity(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        standin("frpc", &job),
+        expected_standin("frpc", "KillSignal=SIGQUIT\nTimeoutStopSec=7s\n")
+    );
+}
+
+#[skuld::test]
+fn the_standin_of_a_job_whose_stop_has_no_timeout_carries_infinity() {
+    let job = unit(
+        &with_stop_action(StopAction {
+            send_signal: StopSignal::Terminate,
+            timeout: None,
+        }),
+        &minimal_identity(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        standin("frpc", &job),
+        expected_standin("frpc", "KillSignal=SIGTERM\nTimeoutStopSec=infinity\n")
+    );
+}
+
+/// A job that writes no `TimeoutStopSec=` (`kill`'s) gives the stand-in none: systemd's default stays.
+#[skuld::test]
+fn the_standin_of_a_kill_job_carries_no_timeout() {
+    let job = unit(
+        &with_stop_action(StopAction {
+            send_signal: StopSignal::Kill,
+            timeout: None,
+        }),
+        &minimal_identity(),
+    )
+    .unwrap();
+
+    assert_eq!(standin("frpc", &job), expected_standin("frpc", "KillSignal=SIGKILL\n"));
+}
+
+/// Only `[Service]`'s lines count, and a job with none (a hand-edited one) gives a stand-in with none.
+#[skuld::test]
+fn the_standin_of_a_job_with_no_stop_settings_carries_none() {
+    let job = "[Unit]\nDescription=KillSignal=SIGHUP\n\n[Service]\nExecStart=/bin/true\n\n[X-Goetia]\nMarker=goetia\n";
+
+    assert_eq!(standin("frpc", job), expected_standin("frpc", ""));
+}
+
+#[skuld::test]
+fn the_standin_is_recognised_by_its_own_recogniser_with_its_id() {
+    let job = unit(&minimal_spec(), &minimal_identity()).unwrap();
+
+    assert_eq!(standin_id(&standin("frpc", &job)).as_deref(), Some("frpc"));
+    assert_eq!(standin_id(&expected_standin("a.b-c_d", "")).as_deref(), Some("a.b-c_d"));
+}
+
+/// An installed unit carries goetia's marker and a `Spec=`, and is not a stand-in; neither is a file that
+/// is not goetia's, or one that has only half of the stand-in's section.
+#[skuld::test]
+fn the_recogniser_rejects_an_installed_unit_and_a_foreign_file() {
+    let installed = unit(&minimal_spec(), &minimal_identity()).unwrap();
+    assert_eq!(standin_id(&installed), None, "an installed unit");
+
+    assert_eq!(standin_id("[Unit]\nDescription=not goetia\n"), None, "a foreign unit");
+    assert_eq!(standin_id(""), None, "an empty file");
+    assert_eq!(
+        standin_id("[X-Goetia]\nMarker=somebody-else\nId=frpc\n"),
+        None,
+        "another marker"
+    );
+    assert_eq!(standin_id("[X-Goetia]\nMarker=goetia\n"), None, "no id");
+    assert_eq!(
+        standin_id("[X-Goetia]\nMarker=goetia\nId=a\nId=b\n"),
+        None,
+        "two ids are a forgery, as two blobs are"
+    );
+    assert_eq!(
+        standin_id("[X-Goetia]\nMarker=goetia\nId=frpc\nSpec=e30\n"),
+        None,
+        "an installed unit's section is not a stand-in's"
+    );
+    assert_eq!(
+        standin_id("[Unit]\nDescription=x\n[X-Goetia]\nMarker=goetia\nId=a\n[X-Goetia]\nMarker=goetia\nId=b\n"),
+        None,
+        "two sections"
+    );
+}

@@ -790,6 +790,19 @@ fn new_has_no_provider() {
 /// for an absent id succeeds without taking the machine-wide lock or reading anything: a library
 /// caller that is not elevated keeps getting `NotInstalled` from `uninstall`. (A regression would
 /// try to create `Global\goetia-shim`, which fails unelevated, and this would be an error.)
+/// Until the Windows units of `--no-stop` land, `Leave` is refused before anything is read or changed: for
+/// an absent id that takes no lock and touches no registry, as `Stop`'s does not either.
+#[skuld::test]
+fn leaving_a_run_is_refused_before_anything_is_touched() {
+    match Scm::new().uninstall_absent(&Id::try_from("never-installed").unwrap(), RunInFlight::Leave) {
+        Err(Error::Invalid { message, .. }) => {
+            assert!(message.contains("--no-stop"), "{message}");
+            assert!(message.contains("nothing was changed"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
 #[skuld::test]
 fn uninstall_of_an_absent_id_without_a_provider_takes_no_lock() {
     Scm::new()

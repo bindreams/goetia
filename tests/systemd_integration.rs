@@ -14,6 +14,10 @@ mod support;
 mod demonstration;
 
 #[cfg(target_os = "linux")]
+#[path = "systemd_integration/leave.rs"]
+mod leave;
+
+#[cfg(target_os = "linux")]
 #[path = "systemd_integration/linux.rs"]
 mod linux;
 

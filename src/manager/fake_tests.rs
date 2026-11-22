@@ -142,6 +142,36 @@ fn uninstall_removes_entry() {
     );
 }
 
+/// `uninstall` stops a run in flight unless it is told to leave it, which sends the run nothing; with no
+/// run in flight the two are the same.
+#[skuld::test]
+fn uninstall_stops_a_run_in_flight_and_leave_sends_it_nothing() {
+    for (in_flight, running, stopped) in [
+        (RunInFlight::Stop, true, true),
+        (RunInFlight::Leave, true, false),
+        (RunInFlight::Stop, false, false),
+        (RunInFlight::Leave, false, false),
+    ] {
+        let fake = Fake::new();
+        let spec = mk("running");
+        fake.install(&spec, false).unwrap();
+        if running {
+            fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
+        }
+        let before = fake.calls().len();
+
+        fake.uninstall(&spec.common().id, in_flight).unwrap();
+
+        let calls: Vec<_> = fake.calls().split_off(before);
+        assert_eq!(
+            calls.contains(&("stop", "running".to_string())),
+            stopped,
+            "{in_flight:?}, running: {running}: {calls:?}"
+        );
+        assert!(fake.list().unwrap().is_empty(), "removed either way");
+    }
+}
+
 #[skuld::test]
 fn operations_on_an_unknown_id_error() {
     let fake = Fake::new();

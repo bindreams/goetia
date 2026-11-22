@@ -54,10 +54,10 @@
 //!    the log directory stays root's, and one the account can write is the way for it to make root
 //!    append to any file. The unit `chdir`s into `cwd` after the switch, so `cwd` is the account's.
 //!    What is made is removed again, deepest first, unless the unit is in place when `write` ends.
-//! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
-//!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
-//!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's order puts
-//!    its timer first, so that nothing starts the job again: see the `task` module.
+//! 6. **Uninstall order** is stop (not with `--no-stop`: see `standin`) -> `systemctl disable` -> remove ->
+//!    `daemon-reload`. Disabling after the fragment is gone is impossible (no `[Install]` section left to
+//!    read), which would leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's
+//!    order puts its timer first, so that nothing starts the job again: see the `task` module.
 //! 7. **Absence is about the id, not about the fragment file.** `cli::uninstall` maps
 //!    [`Error::NotInstalled`] — and only that variant — to exit `0` and "nothing to do", so a
 //!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an
@@ -75,6 +75,7 @@ mod discover;
 mod journal;
 mod kill;
 mod run;
+mod standin;
 mod systemctl;
 mod task;
 mod write;
@@ -215,6 +216,9 @@ impl Backend for Systemd {
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         dirs::ensure_parent_dirs(spec, scope)?;
+        // An install never stops a run: a stand-in whose unit is active stays, and systemd adopts the run
+        // under the new definition.
+        self.release_standin(spec.common().id.as_str(), RunInFlight::Leave, reservation)?;
         match outcome {
             Outcome::Create => self.create_units(spec.common().id.as_str(), definition, reservation),
             Outcome::Update { .. } | Outcome::Stale { .. } => {
@@ -286,6 +290,12 @@ impl Backend for Systemd {
     /// then the job removed. A plain service: stop, disable, remove, reload. See [`task`].
     fn uninstall(&self, snapshot: Fragment, in_flight: RunInFlight, reservation: &mut Held) -> Result<()> {
         self.uninstall_units(snapshot, in_flight, reservation)
+    }
+
+    /// What systemd keeps of an id nothing installed is a stand-in left by `uninstall --no-stop`: see
+    /// [`standin`].
+    fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
+        self.release_standin(id.as_str(), in_flight, &mut Held::default())
     }
 
     // `disable` is handed none and asks the gate for itself.

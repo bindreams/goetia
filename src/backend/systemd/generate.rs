@@ -295,6 +295,67 @@ fn goetia_section(spec: &DaemonSpec) -> String {
     out
 }
 
+// The stand-in unit ===================================================================================================
+
+/// What `uninstall --no-stop` writes under `/run/systemd/system` for the run of `id` it leaves, whose
+/// removed job was `job`. A task's run is a oneshot start job, which a reload would end at systemd's
+/// default start timeout; a unit of the same name with no start timeout keeps it. It is a valid unit, and
+/// a hand `start` of it fails: its one command sits behind an assertion on a path that cannot exist. It
+/// carries the job's own `KillSignal=` and `TimeoutStopSec=`, so a `stop` of the left run is the job's, and
+/// goetia's `[X-Goetia]` section with the `id`, which is how [`standin_id`] tells the file is its own.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the systemd manager, which is Linux-only, writes one")
+)]
+pub(crate) fn standin(id: &str, job: &str) -> String {
+    let mut out = String::new();
+    out.push_str("[Unit]\n");
+    out.push_str(&format!("Description=goetia: the run of {id} that uninstall left\n"));
+    out.push_str("AssertPathExists=/dev/null/goetia-left-run\n\n");
+    out.push_str("[Service]\nType=oneshot\nTimeoutStartSec=infinity\nExecStart=/bin/true\n");
+    for line in section_lines(job, "[Service]") {
+        if line.starts_with("KillSignal=") || line.starts_with("TimeoutStopSec=") {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!("\n[X-Goetia]\nMarker={MARKER}\nId={id}\n"));
+    out
+}
+
+/// The `id` of the stand-in `text` is, and `None` for anything else: an installed unit (its section has a
+/// `Spec=` and no `Id=`), a file that is not goetia's, a section with no id, and a second section or `Id=`,
+/// which [`extract`] refuses for the same reason.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the systemd manager, which is Linux-only, reads one")
+)]
+pub(crate) fn standin_id(text: &str) -> Option<String> {
+    let headers = text.lines().filter(|line| line.trim() == "[X-Goetia]").count();
+    if headers != 1 {
+        return None;
+    }
+    let lines: Vec<&str> = section_lines(text, "[X-Goetia]").collect();
+    let values = |key: &str| -> Vec<&str> { lines.iter().filter_map(|line| line.strip_prefix(key)).collect() };
+    match (
+        values("Marker=").as_slice(),
+        values("Id=").as_slice(),
+        values("Spec=").as_slice(),
+    ) {
+        ([MARKER], [id], []) if !id.is_empty() => Some((*id).to_string()),
+        _ => None,
+    }
+}
+
+/// The trimmed lines of the section whose header is `header`, up to the next header.
+fn section_lines<'a>(text: &'a str, header: &'a str) -> impl Iterator<Item = &'a str> {
+    text.lines()
+        .map(str::trim)
+        .skip_while(move |line| *line != header)
+        .skip(1)
+        .take_while(|line| !is_section_header(line))
+}
+
 // OnCalendar ==========================================================================================================
 
 /// systemd spells day-of-week 0 to 6 `Sun` to `Sat`.

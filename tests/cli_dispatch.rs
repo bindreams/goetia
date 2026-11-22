@@ -1112,6 +1112,48 @@ fn uninstall_reaches_the_manager() {
     assert!(installed_ids(&fake).is_empty());
 }
 
+/// Without `--no-stop` each id's run is stopped, and with it each id's run is sent nothing: the flag
+/// reaches the manager as `RunInFlight::Leave` for every id it is given, in either position.
+#[skuld::test]
+fn uninstall_stops_each_run_and_no_stop_leaves_each_alone() {
+    for (flag, before_ids, stopped) in [
+        (None, false, true),
+        (Some("--no-stop"), true, false),
+        (Some("--no-stop"), false, false),
+    ] {
+        let fake = Fake::new();
+        for id in ["frpc", "ssh"] {
+            fake.install(&mk(id), false).unwrap();
+            fake.start(&Id::try_from(id).unwrap(), Budget::DEFAULT).unwrap();
+        }
+        let mut argv = vec!["goetia", "daemon", "uninstall"];
+        argv.extend(flag.filter(|_| before_ids));
+        argv.extend(["frpc", "ssh"]);
+        argv.extend(flag.filter(|_| !before_ids));
+        let before = fake.calls().len();
+
+        let (code, out, err) = dispatch_elevated(&argv, &fake);
+
+        assert_eq!(
+            code, 0,
+            "{argv:?}
+stdout:
+{out}
+stderr:
+{err}"
+        );
+        let calls = fake.calls().split_off(before);
+        for id in ["frpc", "ssh"] {
+            assert_eq!(
+                calls.contains(&("stop", id.to_string())),
+                stopped,
+                "{argv:?}: {id}: {calls:?}"
+            );
+        }
+        assert!(installed_ids(&fake).is_empty(), "{argv:?}");
+    }
+}
+
 // Absence and `uninstall`'s exemption =================================================================================
 //
 // `Error::NotInstalled` says the artifact is absent; it says nothing about

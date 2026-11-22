@@ -60,8 +60,9 @@ impl Held {
         Self::after("trap '' TERM; ")
     }
 
-    /// The task runs `prelude` before anything else.
-    fn after(prelude: &str) -> Held {
+    /// The task runs `prelude` (shell commands, each ending in `;`) before anything else, so a run is
+    /// announced only once they have finished.
+    pub fn after(prelude: &str) -> Held {
         let dir = tempfile::tempdir().expect("tempdir");
         let (started, hold) = (dir.path().join("started"), dir.path().join("hold"));
         mkfifo(&started);

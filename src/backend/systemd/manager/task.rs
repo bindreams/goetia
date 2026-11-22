@@ -55,6 +55,7 @@ use crate::manager::{Budget, DaemonStatus, RunInFlight, State, Status, TaskStatu
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
+use super::standin::Standin;
 use super::systemctl::{Held, TimerArming};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::{
@@ -352,23 +353,33 @@ fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
 impl Systemd {
     /// The timer disarmed, the job stopped, then the timer and the job removed, each verified against
     /// what `read` saw. A plain service keeps its order: stop, disable, remove, reload.
-    pub(super) fn uninstall_units(&self, snapshot: Fragment, _in_flight: RunInFlight, held: &mut Held) -> Result<()> {
+    ///
+    /// With [`RunInFlight::Leave`] the stop is the one step left out, and a run of a task that is in flight
+    /// gets the stand-in unit that keeps it alive through the reload (see [`super::standin`]): read after
+    /// the timer is disarmed, and written before anything is removed.
+    pub(super) fn uninstall_units(&self, snapshot: Fragment, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
         let id = snapshot.id.as_str();
         let owns_timer = snapshot.owns_timer_slot();
 
         if snapshot.timer().is_some() {
             self.systemctl.disable_timer(id, held)?;
         }
-        // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
-        // means rather than an end, and bounding it would turn a slow-stopping service into a failed
-        // uninstall where today it succeeds.
         if snapshot.service_text().is_some() {
-            self.systemctl
-                .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
+            // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
+            // means rather than an end, and bounding it would turn a slow-stopping service into a failed
+            // uninstall where today it succeeds.
+            if in_flight == RunInFlight::Stop {
+                self.systemctl
+                    .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
+            }
             // A task's job has no `[Install]`: there is nothing to disable.
             if !snapshot.is_task() {
                 self.systemctl.disable_impl(id, held)?;
             }
+        }
+        let standin = self.plan_standin(&snapshot, in_flight, held)?;
+        if let Standin::Write(job) = &standin {
+            self.write_standin(id, job)?;
         }
 
         // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file
@@ -385,6 +396,9 @@ impl Systemd {
         let mut dropins = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
         if owns_timer {
             dropins = both(dropins, remove_dir_if_present(&dropin_dir(id, UnitKind::Timer)));
+        }
+        if standin == Standin::Remove {
+            dropins = both(dropins, self.remove_standin(id, held));
         }
         match both(dropins, self.systemctl.daemon_reload(held)) {
             Err(e @ Error::Both { .. }) => Err(Error::Step {
