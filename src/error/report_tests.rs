@@ -631,19 +631,34 @@ fn a_carried_composite_is_found_only_as_the_type_it_carries() {
     composite!(Other);
 
     let kind = std::io::ErrorKind::Other;
-    assert!(carried_composite::<Wanted>(&carry(kind, Wanted)).is_some(), "the control");
+    assert!(
+        carried_composite::<Wanted>(&carry(kind, Wanted)).is_some(),
+        "the control"
+    );
 
     let plain = std::io::Error::from_raw_os_error(5);
-    assert!(carried_composite::<Wanted>(&plain).is_none(), "an error with no payload");
+    assert!(
+        carried_composite::<Wanted>(&plain).is_none(),
+        "an error with no payload"
+    );
 
     // A payload that is a composite itself but was not put through `carry`, so no `Carrier` wraps it.
     let uncarried = std::io::Error::new(kind, Wanted);
-    assert!(carried_composite::<Wanted>(&uncarried).is_none(), "a payload no carrier wraps");
+    assert!(
+        carried_composite::<Wanted>(&uncarried).is_none(),
+        "a payload no carrier wraps"
+    );
 
     let other = std::io::Error::new(kind, "some other payload");
     assert!(carried_composite::<Wanted>(&other).is_none(), "another error's payload");
 
     let carrying_other = carry(kind, Other);
-    assert!(carried_composite::<Wanted>(&carrying_other).is_none(), "a carrier of another composite");
-    assert!(carried_composite::<Other>(&carrying_other).is_some(), "which is found as what it is");
+    assert!(
+        carried_composite::<Wanted>(&carrying_other).is_none(),
+        "a carrier of another composite"
+    );
+    assert!(
+        carried_composite::<Other>(&carrying_other).is_some(),
+        "which is found as what it is"
+    );
 }
