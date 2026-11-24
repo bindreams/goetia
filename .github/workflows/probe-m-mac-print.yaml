@@ -1,0 +1,30 @@
+name: probe m-mac-print
+
+# Throwaway measurement for goetia; never merged. Push to this branch is the trigger.
+on:
+  push:
+    branches: [probe/m-mac-print]
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    name: recon (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15]
+    steps:
+      - name: Machine
+        run: |
+          exec 2>&1
+          sw_vers; uname -a; echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          csrutil status || true
+          sysctl hw.memsize hw.ncpu hw.model machdep.cpu.brand_string || true
+          python3 --version; which uv || echo "no uv"; cc --version | head -1
+          memory_pressure -h 2>&1 | head -40 || true
+          sysctl kern.memorystatus_vm_pressure_level kern.memorystatus_level || true
+          vm_stat | head -5
