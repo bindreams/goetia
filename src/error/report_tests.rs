@@ -603,3 +603,68 @@ fn a_composite_no_walk_names_is_told_and_searched_through_its_carrier() {
     );
     assert_eq!(e.raw_os_error(), Some(5), "the cause's code, never the mentioned one's");
 }
+
+/// `carried_composite::<T>` finds a `T` and nothing else: not a plain error, not another payload, not a
+/// carrier of another composite. A carrier is read only as the direct payload: one under a `within` context
+/// is not found.
+#[skuld::test]
+fn a_carried_composite_is_found_only_as_the_type_it_carries() {
+    #[derive(Debug)]
+    struct Wanted;
+    #[derive(Debug)]
+    struct Other;
+    macro_rules! composite {
+        ($t:ident) => {
+            impl Composite for $t {
+                fn pieces(&self) -> Pieces<'_> {
+                    Pieces::new().text(stringify!($t))
+                }
+            }
+            impl std::fmt::Display for $t {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    self.pieces().fmt(f)
+                }
+            }
+            impl std::error::Error for $t {}
+        };
+    }
+    composite!(Wanted);
+    composite!(Other);
+
+    let kind = std::io::ErrorKind::Other;
+    assert!(
+        carried_composite::<Wanted>(&carry(kind, Wanted)).is_some(),
+        "the control"
+    );
+
+    let plain = std::io::Error::from_raw_os_error(5);
+    assert!(
+        carried_composite::<Wanted>(&plain).is_none(),
+        "an error with no payload"
+    );
+
+    let uncarried = std::io::Error::other(Wanted);
+    assert!(
+        carried_composite::<Wanted>(&uncarried).is_none(),
+        "a payload no carrier wraps"
+    );
+
+    let other = std::io::Error::other("some other payload");
+    assert!(carried_composite::<Wanted>(&other).is_none(), "another error's payload");
+
+    let one_level_down = crate::error::within("ctx", carry(kind, Wanted));
+    assert!(
+        carried_composite::<Wanted>(&one_level_down).is_none(),
+        "a carrier under a context"
+    );
+
+    let carrying_other = carry(kind, Other);
+    assert!(
+        carried_composite::<Wanted>(&carrying_other).is_none(),
+        "a carrier of another composite"
+    );
+    assert!(
+        carried_composite::<Other>(&carrying_other).is_some(),
+        "which is found as what it is"
+    );
+}

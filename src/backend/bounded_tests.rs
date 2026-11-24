@@ -143,33 +143,30 @@ fn an_expiry_with_output_in_flight_is_reported_as_expired() {
 fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     // Deliberately built WITHOUT `command()`'s containment: a contained
     // descendant is killed, which is the other test below. `exec` makes the
-    // second `sleep` *be* the direct child, so the kill lands on it and not
-    // on `sh`; the backgrounded first `sleep` inherits stderr and is not
-    // killed, so its write end stays open for 68 years.
+    // `sleep` *be* the direct child, so the kill lands on it and not on `sh`;
+    // the held descendant inherits stderr and is not killed, so its write end
+    // stays open until the test lets go of `held`.
     let mut cmd = cosca::run([
         "/bin/sh",
         "-c",
-        "sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; exec sleep 2147483647",
+        &format!("{HELD_DESCENDANT} echo ready >&3; echo 'request issued' >&2; exec sleep 2147483647"),
     ]);
     cmd.stdin(cosca::Stdio::null()).unwrap();
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+    cmd.fd(4, cosca::Stdio::pipe_in()).unwrap();
     let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
+    let _held = held_pipe(&mut child.child);
 
-    // A blocking read that ends when the shell writes, so the descendant's
-    // pid is learned without racing the capture for it.
-    let fd3 = child.child.fd_read_end(3.into()).unwrap();
-    let mut line = String::new();
-    io::BufReader::new(fd3).read_line(&mut line).unwrap();
-    let descendant: libc::pid_t = line.trim().parse().unwrap();
+    // A blocking read that ends when the shell writes, which it does once the descendant is forked
+    // and holds the pipes, so the deadline cannot fall before it does.
+    let mut ready = String::new();
+    io::BufReader::new(child.child.fd_read_end(3.into()).unwrap())
+        .read_line(&mut ready)
+        .unwrap();
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
-
-    // Leave nothing behind.
-    unsafe {
-        libc::kill(descendant, libc::SIGKILL);
-    }
 }
 
 /// Kills a process on drop, so a descendant a test let escape dies however the test ends. It kills
@@ -201,6 +198,17 @@ fn descendant_on_fd3(child: &mut cosca::Child) -> KillOnDrop {
         .read_line(&mut line)
         .unwrap();
     KillOnDrop::of_pid_line(&line)
+}
+
+/// A descendant a test owns the life of before it exists: it blocks reading its fd 4, a pipe whose write
+/// end the test holds ([`held_pipe`]), so it ends at that pipe's EOF however the test ends, a panic
+/// included.
+const HELD_DESCENDANT: &str = "( read held <&4 ) &";
+
+/// The write end of the child's fd 4, to be held until the test is over. The child owns it from the
+/// spawn, so a test that fails before this call drops it with the child.
+fn held_pipe(child: &mut cosca::Child) -> cosca::PipeWriter {
+    child.fd_write_end(4.into()).unwrap()
 }
 
 /// A child that exits on its own while a descendant it let escape holds both its pipes: each heard
@@ -283,20 +291,14 @@ fn a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end() {
 
 #[skuld::test]
 fn a_contained_childs_descendant_dies_with_it() {
-    // Same script, same fd-3 handshake, but spawned through `bounded::command`
-    // so the tree IS contained.
-    let mut cmd = sh("sleep 2147483647 & echo $! >&3; exec sleep 2147483647");
+    // Same handshake, but spawned through `bounded::command` so the tree IS contained.
+    let mut cmd = sh(&format!("{HELD_DESCENDANT} echo $! >&3; exec sleep 2147483647"));
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+    cmd.fd(4, cosca::Stdio::pipe_in()).unwrap();
     let mut child = spawned(cmd, Role::Query);
-
-    let fd3 = child.child.fd_read_end(3.into()).unwrap();
-    let mut line = String::new();
-    io::BufReader::new(fd3).read_line(&mut line).unwrap();
-    let descendant: u32 = line.trim().parse().unwrap();
+    let _held = held_pipe(&mut child.child);
     // Opened while it is alive: after the kill its pid may name another process.
-    let descendant = cosca::Process::open_pid(descendant)
-        .unwrap()
-        .expect("the descendant is alive");
+    let descendant = descendant_on_fd3(&mut child.child);
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
@@ -306,8 +308,9 @@ fn a_contained_childs_descendant_dies_with_it() {
     // NOTE_EXIT on macOS), with no timeout to choose: it returns when the
     // descendant dies, and hangs if the descendant is not in the child's
     // contained tree (e.g. `command()` without `.contain()`) — then neither
-    // `send_kill_tree` nor `Drop` can reach it.
-    descendant.wait().unwrap();
+    // `send_kill_tree` nor `Drop` can reach it, and `held` is still ours, so
+    // it is the kill that ended it and not the end of its pipe.
+    descendant.0.wait().unwrap();
 }
 
 /// More than a pipe holds, on every stream in every form it takes: a temp file, and the pipe

@@ -105,9 +105,34 @@ env:
     assert!(msg.contains('='), "error should call out the `=`: {msg}");
 }
 
-/// The characters that cut a string short or start a new directive, as the escape a YAML
+/// The characters that cut a string short, end a line or start a new directive, as the escape a YAML
 /// double-quoted scalar takes for each.
-const CONTROL_CHARACTERS: [(char, &str); 2] = [('\n', r"\n"), ('\0', r"\0")];
+const CONTROL_CHARACTERS: [(char, &str); 3] = [('\n', r"\n"), ('\r', r"\r"), ('\0', r"\0")];
+
+/// Each field a `${EVIL}` reference can reach a generated artifact through: the field the gate must blame, and the
+/// YAML that writes it. A `command` row is the whole command, so its manifest has no other
+/// ([`base_command_for`]). There is none for an `env` key or `user.id`: a reference in either is refused before
+/// `.env` is read.
+const SUBSTITUTED_LEAVES: [(&str, &str); 8] = [
+    ("name", "name: ${EVIL}\n"),
+    ("command", "command: [/bin/frpc, \"${EVIL}\"]\n"),
+    ("command", "command: [\"${EVIL}\"]\n"),
+    ("cwd", "cwd: ${EVIL}\n"),
+    ("logs", "logs: ${EVIL}\n"),
+    ("env[LOG]", "env:\n  LOG: ${EVIL}\n"),
+    ("user.name", "user: ${EVIL}\n"),
+    // The struct form reaches the gate by a different arm.
+    ("user.name", "user:\n  name: ${EVIL}\n"),
+];
+
+/// The base command a [`SUBSTITUTED_LEAVES`] row of `field` is written beside.
+fn base_command_for(field: &str) -> &'static str {
+    if field == "command" {
+        ""
+    } else {
+        "command: [/bin/frpc]\n"
+    }
+}
 
 #[skuld::test]
 fn a_control_character_in_a_free_text_field_is_refused_on_every_backend() {
@@ -181,30 +206,69 @@ fn a_control_character_in_the_id_is_refused() {
 }
 
 #[skuld::test]
-fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(#[fixture(temp_dir)] dir: &Path) {
-    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value.
-    let predicate = "field `user.name` contains a control character";
-    let base = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
-    write_fixture(dir, base, Some("U=svc\0x\n"));
-    for &native in HOST_BACKENDS {
-        let msg = resolve_as(parse_manifest(base), dir, Some(native))
-            .expect_err("a NUL in a substituted value is refused")
-            .to_string();
-        assert!(msg.contains("after substituting from .env"), "native `{native}`: {msg}");
-        assert!(msg.contains(predicate), "native `{native}`: {msg}");
-        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
-        assert!(
-            !msg.contains("backend-specific"),
-            "no override wrote it, native `{native}`: {msg}"
-        );
+fn a_control_character_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value. `.env` carries
+    // NUL and a mid-line `\r` (it strips only a trailing one) in an unquoted, a single-quoted and a double-quoted
+    // value.
+    for (c, _) in CONTROL_CHARACTERS {
+        // `.env` refuses a newline itself, so no value carries one to the gate:
+        // `a_newline_cannot_arrive_through_env_substitution`.
+        if c == '\n' {
+            continue;
+        }
+        for env_file in [
+            format!("EVIL=svc{c}x\n"),
+            format!("EVIL='svc{c}x'\n"),
+            format!("EVIL=\"svc{c}x\"\n"),
+        ] {
+            write_fixture(dir, "", Some(&env_file));
+            for (field, fragment) in SUBSTITUTED_LEAVES {
+                let predicate = format!("field `{field}` contains a control character");
+                let base = format!("id: frpc\n{}", base_command_for(field));
+                let plain = format!("{base}{fragment}");
+                let indented: String = fragment.lines().map(|line| format!("    {line}\n")).collect();
+                for &native in HOST_BACKENDS {
+                    let context = format!("{env_file:?} in `{field}` ({fragment:?}) as native `{native}`");
+                    let overridden = format!("{base}backend-specific:\n  {native}:\n{indented}");
 
-        let overridden = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    user: ${{U}}\n");
-        let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
-            .expect_err("a NUL substituted into the native override is refused")
-            .to_string();
-        let blamed = format!("backend-specific.{native}: after substituting from .env: {predicate}");
-        assert!(msg.contains(&blamed), "native `{native}`: {msg}");
-        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
+                    let msg = resolve_as(parse_manifest(&plain), dir, Some(native))
+                        .expect_err(&context)
+                        .to_string();
+                    assert!(msg.contains("after substituting from .env"), "{context}: {msg}");
+                    assert!(msg.contains(&predicate), "{context}: {msg}");
+                    assert!(!msg.contains(c), "{context}: {msg:?}");
+                    assert!(
+                        !msg.contains("backend-specific"),
+                        "no override wrote it, {context}: {msg}"
+                    );
+
+                    let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
+                        .expect_err(&context)
+                        .to_string();
+                    let blamed = format!("backend-specific.{native}: after substituting from .env: {predicate}");
+                    assert!(msg.contains(&blamed), "{context}: {msg}");
+                    assert!(!msg.contains(c), "{context}: {msg:?}");
+                }
+            }
+        }
+    }
+}
+
+#[skuld::test]
+fn a_newline_cannot_arrive_through_env_substitution(#[fixture(temp_dir)] dir: &Path) {
+    // No `.env` value carries a newline: unquoted, it ends the line and what follows is no `NAME=VALUE`; quoted,
+    // the value does not close on its line, in either quote. So the gate above never sees one, and the file is what
+    // refuses it.
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nname: ${EVIL}\n";
+    for env_file in ["EVIL=svc\nx\n", "EVIL='svc\nx'\n", "EVIL=\"svc\nx\"\n"] {
+        write_fixture(dir, yaml, Some(env_file));
+        for &native in HOST_BACKENDS {
+            let context = format!("{env_file:?} as native `{native}`");
+            let err = resolve_as(parse_manifest(yaml), dir, Some(native)).expect_err(&context);
+            assert!(matches!(err, Error::EnvFile { .. }), "{context}: {err:?}");
+        }
     }
 }
 
@@ -2258,19 +2322,8 @@ fn interpolated_values_pass_through_the_injection_gate(#[fixture(temp_dir)] dir:
     // Each row names the field the error must blame. Asserting only
     // "control character" would let a row pass on a *different* leaf's
     // rejection than the one it claims to exercise.
-    let leaves = [
-        ("name", "name: ${EVIL}\ncommand: [/bin/frpc]\n"),
-        ("command", "command: [/bin/frpc, \"${EVIL}\"]\n"),
-        ("cwd", "command: [/bin/frpc]\ncwd: ${EVIL}\n"),
-        ("logs", "command: [/bin/frpc]\nlogs: ${EVIL}\n"),
-        ("env[LOG]", "command: [/bin/frpc]\nenv:\n  LOG: ${EVIL}\n"),
-        ("user.name", "command: [/bin/frpc]\nuser: ${EVIL}\n"),
-        // The struct form too: it is the syntax the `RawUser` split
-        // introduced, and it reaches the gate by a different arm.
-        ("user.name", "command: [/bin/frpc]\nuser:\n  name: ${EVIL}\n"),
-    ];
-
-    for (leaf, body) in leaves {
+    for (leaf, fragment) in SUBSTITUTED_LEAVES {
+        let body = format!("{}{fragment}", base_command_for(leaf));
         write_fixture(dir, &format!("id: frpc\n{body}"), Some("EVIL='evil\u{1b}[2Jclear'\n"));
 
         let err = load(dir).unwrap_err();
