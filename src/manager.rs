@@ -305,8 +305,9 @@ pub trait ServiceManager {
     /// the kill**: the manager reports none. Not an `Ok(())`: nothing was killed. A launchd task whose
     /// accepted start has not forked yet (which `status` reports as running, after `kickstart`
     /// returned) has no process to kill, so its `kill` waits, under no budget, for the pid and then
-    /// kills it; where the start does not happen, or the job was idle, it is `NotRunning`. An error
-    /// after the signal was sent says so.
+    /// kills it; where the start does not happen, or the job was idle, it is `NotRunning`. A wait
+    /// that fails once the kill's outcome is open (the signal was sent, or the process had already exited) is
+    /// indeterminate ([`Error::is_indeterminate`], exit `4`): see [`Error::KillUnconfirmed`].
     ///
     /// Takes no budget. The exit of a process whose kill was delivered is an event, not a wait to
     /// bound, on every backend; a process the kernel holds (one in uninterruptible sleep, on a hung
@@ -314,6 +315,8 @@ pub trait ServiceManager {
     /// does. The CLI's wait ends on Ctrl-C with the signal standing.
     ///
     /// [`Error::NotRunning`]: crate::Error::NotRunning
+    /// [`Error::KillUnconfirmed`]: crate::Error::KillUnconfirmed
+    /// [`Error::is_indeterminate`]: crate::Error::is_indeterminate
     fn kill(&self, id: &Id) -> Result<()>;
 
     /// The live state of one installed service: `state`, `pid` and `enabled` are read through

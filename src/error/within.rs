@@ -1,14 +1,12 @@
 use std::io;
 
-use super::Error;
 use super::report::{Seen, seen};
+use super::{Error, KillProgress};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]
 struct Within {
     context: String,
-    /// The context says that the signal of the operation was delivered: see [`within_delivered`].
-    delivered: bool,
     #[source]
     source: io::Error,
 }
@@ -17,22 +15,10 @@ struct Within {
 /// [`source`](std::error::Error::source), which [`Error::report`](crate::Error::report) prints
 /// after it: `context: source`.
 pub(crate) fn within(context: impl Into<String>, source: io::Error) -> io::Error {
-    said_within(context.into(), false, source)
-}
-
-/// [`within`], for a `context` that says the signal of the operation was delivered. A [`target_failed`]
-/// operation is then not called a failure: the signal stands, and the context says what failed after it.
-/// Only a delivered signal is told so; every other `within` is a failure of the operation.
-pub(crate) fn within_delivered(context: impl Into<String>, source: io::Error) -> io::Error {
-    said_within(context.into(), true, source)
-}
-
-fn said_within(context: String, delivered: bool, source: io::Error) -> io::Error {
     io::Error::new(
         source.kind(),
         Within {
-            context,
-            delivered,
+            context: context.into(),
             source,
         },
     )
@@ -59,33 +45,12 @@ fn layer(e: &io::Error) -> Layer<'_> {
     }
 }
 
-/// What one look at an [`io::Error`] found, through its contexts: the one read of what an error says of its
-/// signal and of the goetia error it carries, which [`target_failed`] and `debug_privilege_also_failed`
-/// (Windows) both take their answers from.
-pub(super) struct Looked<'a> {
-    /// A context said by [`within_delivered`] is among those the error is said within: see there.
-    delivered: bool,
-    /// The goetia [`Error`] the error carries, directly or under [`within`] contexts.
-    pub(super) carried: Option<&'a Error>,
-}
-
-pub(super) fn look(e: &io::Error) -> Looked<'_> {
+/// The goetia [`Error`] that `e` carries, directly or under [`within`] contexts.
+pub(super) fn look(e: &io::Error) -> Option<&Error> {
     match layer(e) {
-        Layer::Context(within) => {
-            let under = look(&within.source);
-            Looked {
-                delivered: within.delivered || under.delivered,
-                carried: under.carried,
-            }
-        }
-        Layer::Carried(carried) => Looked {
-            delivered: false,
-            carried: Some(carried),
-        },
-        Layer::Os => Looked {
-            delivered: false,
-            carried: None,
-        },
+        Layer::Context(within) => look(&within.source),
+        Layer::Carried(carried) => Some(carried),
+        Layer::Os => None,
     }
 }
 
@@ -112,7 +77,7 @@ fn told(e: io::Error) -> Error {
         Err(e) => e,
     };
     let e = match take_payload::<Within>(e) {
-        Ok(Within { context, source, .. }) => {
+        Ok(Within { context, source }) => {
             return Error::Step {
                 what: context,
                 source: Box::new(told(source)),
@@ -137,16 +102,18 @@ fn told(e: io::Error) -> Error {
 /// The failure `e` of a target (a manager, a process), which reports through [`io::Error`], as an
 /// [`Error`], told under `what`, the operation:
 ///
-/// - an error said within a context by [`within_delivered`], at any depth of contexts, says that the
-///   operation's signal was delivered and what failed after it, so `what` names the operation with no
-///   verdict on it;
+/// - an error that carries an [`Error::KillUnconfirmed`], at any depth of contexts, says that the
+///   operation's outcome is open and how far it got, so `what` names the operation with no verdict on it;
 /// - any other failure is one of `what`: `failed to <what>`, over the goetia error it carries, else an OS
 ///   failure.
 pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
     let what = what.into();
-    let looked = look(&e);
-    let (delivered, carried) = (looked.delivered, looked.carried.is_some());
-    if delivered {
+    let (open, carried) = match look(&e) {
+        Some(Error::KillUnconfirmed { .. }) => (true, true),
+        Some(_) => (false, true),
+        None => (false, false),
+    };
+    if open {
         Error::Step {
             what,
             source: Box::new(told(e)),
@@ -159,6 +126,20 @@ pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
     } else {
         Error::os(what, e)
     }
+}
+
+/// The failure of a wait of a kill of the process `pid`, `source`, as a target reports it through
+/// [`io::Error`] with its kind kept: an [`Error::KillUnconfirmed`] over `source` as an [`Error`], with
+/// `progress` how far the kill had got.
+pub(crate) fn kill_unconfirmed(pid: u32, progress: KillProgress, source: io::Error) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        Error::KillUnconfirmed {
+            pid,
+            progress,
+            source: Box::new(told(source)),
+        },
+    )
 }
 
 /// The failure of a hold of the process `pid`, as a target reports it through [`io::Error`] with the

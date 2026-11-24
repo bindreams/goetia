@@ -170,7 +170,7 @@ pub(super) fn hold_run<P: Processes>(
     let mut target = RunTarget::new(tasks, path, instance, processes);
     match hold_once(&mut target, Budget::Unbounded.start()) {
         Ok(Some(Hold::Held { process, .. })) => Ok(Some(process)),
-        Ok(None | Some(Hold::Ended { .. })) => Ok(None),
+        Ok(None | Some(Hold::Gone { .. } | Hold::Disowned { .. })) => Ok(None),
         Err(HoldError::Refused(e)) => Err(open_refused(
             operation,
             &format!("the process of `{id}`'s run"),

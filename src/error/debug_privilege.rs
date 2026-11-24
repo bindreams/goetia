@@ -41,7 +41,7 @@ impl std::error::Error for DebugPrivilegeAlsoFailed {}
 /// it, with `open`'s kind kept.
 pub(crate) fn debug_privilege_also_failed(open: io::Error, step: io::Error) -> io::Error {
     debug_assert!(
-        look(&open).carried.is_none() && look(&step).carried.is_none(),
+        look(&open).is_none() && look(&step).is_none(),
         "a pair is two OS failures: {open:?}, {step:?}"
     );
     carry(open.kind(), DebugPrivilegeAlsoFailed { open, step })

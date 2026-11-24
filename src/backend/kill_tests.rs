@@ -42,6 +42,9 @@ struct Scripted {
     failing_terminate: bool,
     failing_exit: bool,
     failing_recorded: bool,
+    /// Whether every `await_recorded` after the first fails, the first being answered.
+    failing_second_record: bool,
+    record_reads: usize,
     /// Whether a held process outlasts the wait before the notice: only an unbounded wait for it ends.
     running: bool,
     /// Whether `await_recorded` is cut short by its deadline.
@@ -67,6 +70,8 @@ impl Scripted {
             failing_terminate: false,
             failing_exit: false,
             failing_recorded: false,
+            failing_second_record: false,
+            record_reads: 0,
             running: false,
             expiring_recorded: false,
             lagging_record: false,
@@ -105,6 +110,13 @@ impl Scripted {
 
     fn failing_recorded(mut self) -> Self {
         self.failing_recorded = true;
+        self
+    }
+
+    /// The first read of the manager's record is answered and the next fails: a kill that reads it again
+    /// fails.
+    fn failing_second_record(mut self) -> Self {
+        self.failing_second_record = true;
         self
     }
 
@@ -225,7 +237,8 @@ impl KillTarget for Scripted {
         if self.lagging_record && deadline.remaining().is_some() {
             return Ok(Waited::Expired);
         }
-        if self.failing_recorded {
+        self.record_reads += 1;
+        if self.failing_recorded || (self.failing_second_record && self.record_reads > 1) {
             return Err(io::Error::new(READ_FAILED_KIND, "manager read failed"));
         }
         // The record, and with it every scripted state up to the last, which the manager now shows: a
@@ -397,8 +410,8 @@ fn a_wait_for_the_record_of_a_process_gone_before_it_was_opened_says_why_before_
     );
 }
 
-/// The process was gone when the open came: it has ended, so the kill waits for the manager to stop
-/// reporting it and returns. It does not ask what the service runs now.
+/// The process was gone when the open came: it has ended, so the hold waits for the manager to stop
+/// reporting it and the kill returns. It does not ask what the service runs now.
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_is_waited_for_in_the_manager_and_not_followed() {
     let mut target = Scripted::new([Some(100), Some(200)], [Open::Gone]);
@@ -406,13 +419,21 @@ fn a_process_gone_before_it_was_opened_is_waited_for_in_the_manager_and_not_foll
     assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
-        steps([
-            "service_pid",
-            "open 100",
-            "await_recorded 100 unheld",
-            "await_recorded 100 unheld"
-        ]),
-        "the hold's own wait, then the kill's: the second is answered by the first read"
+        steps(["service_pid", "open 100", "await_recorded 100 unheld"]),
+        "the hold's own wait is the only one: it has seen the record"
+    );
+}
+
+/// A process gone before the open is [`Hold::Gone`] once the hold has seen the manager record it, and the
+/// kill makes no further read of the record: a second read that would fail is never made.
+#[skuld::test]
+fn a_gone_process_whose_record_the_hold_saw_is_not_waited_for_again() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_second_record();
+
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "await_recorded 100 unheld"])
     );
 }
 
@@ -434,25 +455,6 @@ fn a_held_process_the_manager_does_not_name_is_not_signalled_and_the_record_is_w
             "close 100"
         ])
     );
-}
-
-/// The wait for the record of a process the manager moved off, which is not known to be gone, fails:
-/// that is the kill's error, plain, for nothing was signalled, and it says no more than the notice of
-/// the same wait does.
-#[skuld::test]
-fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found])
-        .disowning()
-        .failing_recorded();
-
-    let e = kill_service(&mut target, ID).unwrap_err();
-
-    assert_eq!(e.kind(), READ_FAILED_KIND);
-    assert_eq!(
-        kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
-    );
-    assert!(!target.log().iter().any(|call| call.starts_with("force_end")));
 }
 
 /// The manager reports another process by the confirmation: it has moved off the one held, which is
@@ -690,15 +692,19 @@ fn a_failed_confirming_read_closes_the_process_and_signals_nothing() {
     );
 }
 
+/// What a failed wait for the exit says of process 100, which every test here signals: the signal was
+/// delivered and the exit is not established.
+const EXIT_UNCONFIRMED: &str = "process 100 was signalled, but goetia could not establish that it exited";
+
+/// What a failed wait for the manager's record says: the exit was confirmed.
+const RECORD_UNREAD: &str =
+    "process 100 was signalled and has exited, but goetia could not confirm that the manager recorded it";
+
 /// What a failure after the signal reports: it was delivered, so the error must not read as a failed
 /// kill. The cause and its kind are kept.
-fn assert_signalled_but_unconfirmed(e: &io::Error, cause: &str, kind: io::ErrorKind) {
+fn assert_signalled_but_unconfirmed(e: &io::Error, lead: &str, cause: &str, kind: io::ErrorKind) {
     let text = crate::error::Chain(e).to_string();
-    assert!(text.contains("was signalled"), "{text}");
-    assert!(
-        text.contains("waiting for it to exit and for the manager to record that failed"),
-        "{text}"
-    );
+    assert!(text.starts_with(lead), "{text}");
     assert!(text.ends_with(cause), "{text}");
     assert!(!text.contains("kill failed"), "{text}");
     assert_eq!(e.kind(), kind);
@@ -711,7 +717,7 @@ fn a_failed_record_wait_after_the_signal_says_the_signal_was_delivered() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_signalled_but_unconfirmed(&e, "manager read failed", READ_FAILED_KIND);
+    assert_signalled_but_unconfirmed(&e, RECORD_UNREAD, "manager read failed", READ_FAILED_KIND);
     assert_eq!(
         target.log(),
         steps([
@@ -732,22 +738,161 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_signalled_but_unconfirmed(&e, "wait on the process failed", io::ErrorKind::Other);
+    assert_signalled_but_unconfirmed(&e, EXIT_UNCONFIRMED, "wait on the process failed", io::ErrorKind::Other);
     assert!(!target.log().contains(&"await_recorded 100".to_string()));
 }
 
-/// A process that was never signalled keeps the plain error: it is not a signalled one.
+/// The signal stands and the process may well have exited, so a failed wait after it leaves the outcome
+/// open, whichever wait failed. The CLI exits `4`, not `1`.
 #[skuld::test]
-fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
-    let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
+    for (what, target, progress) in [
+        (
+            "the exit wait",
+            Scripted::new([Some(100), Some(100)], [Open::Found]).failing_exit(),
+            KillProgress::Signalled,
+        ),
+        (
+            "the record wait",
+            Scripted::new([Some(100), Some(100)], [Open::Found]).failing_recorded(),
+            KillProgress::Exited,
+        ),
+    ] {
+        let mut target = target;
 
-    let e = kill_service(&mut target, ID).unwrap_err();
+        let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
 
-    assert_eq!(e.kind(), READ_FAILED_KIND);
-    assert_eq!(
-        kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
-    );
+        assert!(failed.is_indeterminate(), "{what}: {failed:?}");
+        assert!(
+            matches!(failed.cause(), Error::KillUnconfirmed { pid: 100, progress: p, .. } if *p == progress),
+            "{what}: {failed:?}"
+        );
+        #[cfg(feature = "cli")]
+        assert_eq!(
+            crate::cli::ExitCode::of(&failed),
+            crate::cli::ExitCode::Indeterminate,
+            "{what}"
+        );
+    }
+}
+
+/// A goetia error after the signal is open too, though alone it is an established failure: `cause()` is the
+/// kill's, and the report prints the carried error under it.
+#[skuld::test]
+fn a_determinate_error_after_the_signal_is_open_and_is_carried_under_the_cause() {
+    let alone = || Error::UnitNotLoaded { unit: "x".to_string() };
+    assert!(!alone().is_indeterminate());
+
+    for progress in [KillProgress::Signalled, KillProgress::Exited, KillProgress::AlreadyGone] {
+        let failed = kill_failed("x", kill_unconfirmed(7, progress, io::Error::other(alone())));
+
+        assert!(failed.is_indeterminate(), "{failed:?}");
+        let Error::KillUnconfirmed { source, .. } = failed.cause() else {
+            panic!("the cause is the kill's: {failed:?}");
+        };
+        assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
+        assert!(
+            failed.report().to_string().contains("LoadState=not-found"),
+            "{}",
+            failed.report()
+        );
+    }
+}
+
+/// What a person reads, for each state of an open kill: signalled with the exit not established, signalled
+/// and exited with the record unconfirmed, or already gone with the record unconfirmed. The OS code of the
+/// failed wait is kept.
+#[skuld::test]
+fn an_open_kill_says_how_far_it_got() {
+    const CODE: i32 = 1722;
+    let os = io::Error::from_raw_os_error(CODE);
+    for (progress, lead) in [
+        (
+            KillProgress::Signalled,
+            "process 100 was signalled, but goetia could not establish that it exited",
+        ),
+        (
+            KillProgress::Exited,
+            "process 100 was signalled and has exited, but goetia could not confirm that the manager recorded it",
+        ),
+        (
+            KillProgress::AlreadyGone,
+            "process 100 had already exited, but goetia could not confirm that the manager recorded it",
+        ),
+    ] {
+        let failed = kill_failed(ID, kill_unconfirmed(100, progress, io::Error::from_raw_os_error(CODE)));
+
+        assert_eq!(failed.raw_os_error(), Some(CODE));
+        assert_eq!(failed.report().to_string(), format!("kill `{ID}`: {lead}: {os}"));
+    }
+}
+
+/// A process that ended on its own before any signal is gone, and only the manager's record of it is
+/// unconfirmed, so the kill is open (exit `4`) as one that signalled is, and its text claims no signal. The
+/// two ways the record wait is reached: the process gone before it could be opened, and the manager's pid
+/// lagging past the first wait.
+#[skuld::test]
+fn a_failed_record_wait_for_a_process_found_gone_is_open_and_claims_no_signal() {
+    let gone = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+    let lagging = Scripted::new([Some(100)], [Open::Gone])
+        .lagging_record()
+        .failing_recorded();
+    for (what, mut target) in [("gone", gone), ("lagging", lagging)] {
+        let e = kill_service(&mut target, ID).unwrap_err();
+
+        assert_eq!(e.kind(), READ_FAILED_KIND, "{what}");
+        let failed = kill_failed(ID, e);
+        assert!(failed.is_indeterminate(), "{what}: {failed:?}");
+        assert!(
+            matches!(
+                failed.cause(),
+                Error::KillUnconfirmed {
+                    pid: 100,
+                    progress: KillProgress::AlreadyGone,
+                    ..
+                }
+            ),
+            "{what}: {failed:?}"
+        );
+        assert_eq!(
+            failed.report().to_string(),
+            "kill `frpc`: process 100 had already exited, but goetia could not confirm that the manager recorded it: manager read failed",
+            "{what}"
+        );
+        assert!(!target.log().iter().any(|step| step.starts_with("force_end")), "{what}");
+    }
+}
+
+/// The wait for the record of a process the manager moved off, which is not known to be gone, fails: that is
+/// the kill's error, plain, for nothing was signalled and nothing is known of the process. It says no more
+/// than the notice of the same wait does, and claims no exit. Three ways to be disowned: the pid shown but
+/// the process held not named as the service's, the manager moved to another pid by the confirmation, and a
+/// refused open after the manager moved on.
+#[skuld::test]
+fn a_failed_record_wait_for_a_process_the_manager_moved_off_is_a_failed_kill_with_no_claim_of_an_exit() {
+    let not_named = Scripted::new([Some(100), Some(100)], [Open::Found]).disowning();
+    let moved_at_confirmation = Scripted::new([Some(100), Some(200)], [Open::Found]);
+    let refused_then_moved = Scripted::new([Some(100), None], [Open::Fails]);
+    for (what, target) in [
+        ("held process not named", not_named),
+        ("moved at the confirmation", moved_at_confirmation),
+        ("refused open, then moved on", refused_then_moved),
+    ] {
+        let mut target = target.failing_recorded();
+
+        let e = kill_service(&mut target, ID).unwrap_err();
+
+        assert_eq!(e.kind(), READ_FAILED_KIND, "{what}");
+        let failed = kill_failed(ID, e);
+        assert!(!failed.is_indeterminate(), "{what}: {failed:?}");
+        let report = failed.report().to_string();
+        assert_eq!(
+            report, "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed",
+            "{what}"
+        );
+        assert!(!report.contains("exited"), "{what}: {report}");
+        assert!(!target.log().iter().any(|call| call.starts_with("force_end")), "{what}");
+    }
 }
 
 /// A kill that fails after the manager named the process says which process, whichever step failed and
@@ -760,13 +905,13 @@ fn every_failure_of_a_kill_after_the_pid_is_read_says_which_process() {
     let recording_after_expiry = Scripted::new([Some(100)], [Open::Gone])
         .lagging_record()
         .failing_recorded();
-    let recording_after_ended = Scripted::new([Some(100)], [Open::Found]).disowning().failing_recorded();
+    let recording_after_disowned = Scripted::new([Some(100)], [Open::Found]).disowning().failing_recorded();
     for (what, mut target) in [
         ("refused open", refused),
         ("confirming read", confirming),
         ("record wait in the hold", recording),
         ("record wait after Expired", recording_after_expiry),
-        ("record wait after Ended", recording_after_ended),
+        ("record wait after Disowned", recording_after_disowned),
     ] {
         let e = kill_service(&mut target, ID).unwrap_err();
 
@@ -859,14 +1004,14 @@ fn a_service_with_no_process_is_not_held() {
 }
 
 /// A process gone before it could be opened is waited for in the manager, until the deadline: once the
-/// manager has recorded it, it is [`Hold::Ended`].
+/// manager has recorded it, it is [`Hold::Gone`].
 #[skuld::test]
-fn a_process_gone_before_the_open_is_ended_once_the_manager_records_it() {
+fn a_process_gone_before_the_open_is_gone_once_the_manager_records_it() {
     let mut target = Scripted::new([Some(100)], [Open::Gone]);
 
     let hold = hold_once(&mut target, Budget::Unbounded.start()).expect("a record");
 
-    assert!(matches!(hold, Some(Hold::Ended { pid: 100, held: None })), "{hold:?}");
+    assert!(matches!(hold, Some(Hold::Gone { pid: 100 })), "{hold:?}");
     assert_eq!(
         target.log(),
         steps(["service_pid", "open 100", "await_recorded 100 unheld"])
@@ -890,18 +1035,18 @@ fn a_pid_the_caller_read_is_held_without_reading_the_manager_for_it() {
     drop(process);
 }
 
-/// A pid whose process is gone is [`Hold::Ended`] with no read of the manager made for it: a caller that
+/// A pid whose process is gone is [`Hold::Gone`] with no read of the manager made for it: a caller that
 /// paces its own next read (a launchd stop, whose deadline is spent) does not read twice, and a gone
 /// process is never an error of that read.
 #[skuld::test]
-fn a_pid_the_caller_read_whose_process_is_gone_is_ended_with_no_read_of_the_manager() {
+fn a_pid_the_caller_read_whose_process_is_gone_is_gone_with_no_read_of_the_manager() {
     let mut target = Scripted::new([Some(100)], [Open::Gone])
         .failing_recorded()
         .failing_read(1);
 
-    let hold = hold_pid(&mut target, 100).expect("an ended process, not a read error");
+    let hold = hold_pid(&mut target, 100).expect("a gone process, not a read error");
 
-    assert!(matches!(hold, Hold::Ended { pid: 100, held: None }), "{hold:?}");
+    assert!(matches!(hold, Hold::Gone { pid: 100 }), "{hold:?}");
     assert_eq!(target.log(), steps(["open 100"]), "the manager is not read");
 }
 
@@ -919,9 +1064,9 @@ fn an_open_that_failed_on_a_pid_the_caller_read_is_a_refusal_only_while_the_mana
 
     for moved_off in [Some(200), None] {
         let mut gone = Scripted::new([moved_off], [Open::Fails]);
-        let hold = hold_pid(&mut gone, 100).expect("an ended process, not a refusal");
+        let hold = hold_pid(&mut gone, 100).expect("a disowned process, not a refusal");
         assert!(
-            matches!(hold, Hold::Ended { pid: 100, held: None }),
+            matches!(hold, Hold::Disowned { pid: 100, held: None }),
             "{moved_off:?}: {hold:?}"
         );
     }
@@ -959,20 +1104,19 @@ fn any_other_error_is_an_os_failure_of_the_kill() {
     );
 }
 
-/// A failure after the signal was delivered, plain or of goetia's own, is told under the kill without
-/// saying the kill failed: the signal stands. A failure to signal is a failed kill, whose context says
-/// how far it got.
+/// A failure of a kill whose outcome is open, plain or of goetia's own, is told under the kill without
+/// saying the kill failed. A failure to signal is a failed kill, whose context says how far it got.
 #[skuld::test]
-fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
+fn only_an_open_kill_keeps_the_report_from_reading_as_a_failed_kill() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
     for (e, lead) in [
         (
-            signalled_but(7, io::Error::other("wait failed")),
-            "kill `x`: process 7 was signalled, but waiting",
+            kill_unconfirmed(7, KillProgress::Signalled, io::Error::other("wait failed")),
+            "kill `x`: process 7 was signalled, but goetia could not establish",
         ),
         (
-            signalled_but(7, wrapped()),
-            "kill `x`: process 7 was signalled, but waiting",
+            kill_unconfirmed(7, KillProgress::Exited, wrapped()),
+            "kill `x`: process 7 was signalled and has exited",
         ),
         (
             not_signalled(7, io::Error::other("terminate failed")),
@@ -994,29 +1138,22 @@ fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
     }
 }
 
-/// A failure of goetia's own after the signal was delivered keeps its variant, as the source of a step
-/// that says the signal was delivered, under the kill; the same for one that came before it.
+/// A failure of goetia's own that is not an open kill's (here, a failure to signal) is the step's source
+/// itself, so a caller matching on `cause()` finds it.
 #[skuld::test]
-fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
-    let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
-    for (e, kill_what, context) in [
-        (signalled_but(7, wrapped()), "kill `x`", "was signalled"),
-        (
-            not_signalled(7, wrapped()),
-            "failed to kill `x`",
-            "signalling it failed",
-        ),
-    ] {
-        let failed = kill_failed("x", e);
+fn a_wrapped_error_before_the_signal_is_the_cause_of_the_failed_kill() {
+    let wrapped = io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
 
-        let Error::Step { what: kill, source } = &failed else {
-            panic!("a step: {failed:?}");
-        };
-        let Error::Step { what, source } = &**source else {
-            panic!("a step under the kill: {failed:?}");
-        };
-        assert_eq!(kill, kill_what);
-        assert!(what.contains(context), "{what}");
-        assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
-    }
+    let failed = kill_failed("x", not_signalled(7, wrapped));
+
+    let Error::Step { what: kill, source } = &failed else {
+        panic!("a step: {failed:?}");
+    };
+    let Error::Step { what, source } = &**source else {
+        panic!("a step under the kill: {failed:?}");
+    };
+    assert_eq!(kill, "failed to kill `x`");
+    assert!(what.contains("signalling it failed"), "{what}");
+    assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
+    assert!(matches!(failed.cause(), Error::UnitNotLoaded { .. }), "{failed:?}");
 }

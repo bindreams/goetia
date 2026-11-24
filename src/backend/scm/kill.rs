@@ -68,7 +68,7 @@ pub trait ScmRelease: KillTarget {
 /// it still vouches for is the process held, never a stranger that took the number.
 ///
 /// Loops only when the service's state changed under it: the process was gone before it could be
-/// opened, or SCM no longer vouches for the pid it was opened by ([`Hold::Ended`]). Each round
+/// opened ([`Hold::Gone`]), or SCM no longer vouches for the pid it was opened by ([`Hold::Disowned`]). Each round
 /// re-reads SCM, which settles on the new process or on none. The one wait, for SCM to let go of a
 /// pid whose process is gone, ends at `deadline` as [`HoldError::Expired`]. `kill` does not loop: see
 /// [`crate::backend::kill`].
@@ -80,7 +80,7 @@ pub(crate) fn hold_service_process<T: KillTarget>(
         match hold_once(target, deadline)? {
             None => return Ok(None),
             Some(Hold::Held { pid, process }) => return Ok(Some((pid, process))),
-            Some(Hold::Ended { .. }) => {}
+            Some(Hold::Gone { .. } | Hold::Disowned { .. }) => {}
         }
     }
 }
@@ -158,6 +158,7 @@ pub(crate) fn hold_if_possible<T: KillTarget>(
         Err(HoldError::Refused(e)) => Ok(HoldOutcome::Refused(e)),
         Err(HoldError::Expired { pid }) => Ok(HoldOutcome::Expired { pid }),
         Err(HoldError::Unread(e) | HoldError::Read(e)) => Err(e),
+        Err(e @ HoldError::Unrecorded { .. }) => Err(e.into()),
     }
 }
 

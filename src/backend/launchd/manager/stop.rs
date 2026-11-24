@@ -415,7 +415,7 @@ impl Launchd {
         let mut target = JobKill::new(&self.launchctl, name, reservation)?;
         let held = match hold_pid(&mut target, pid) {
             Ok(Hold::Held { process, .. }) => process,
-            Ok(Hold::Ended { .. }) => return Ok(Up::Behind(pid)),
+            Ok(Hold::Gone { .. } | Hold::Disowned { .. }) => return Ok(Up::Behind(pid)),
             Err(error) => return Err(stop_failed(name, "holding the process", error.into())),
         };
         Ok(Up::Run {

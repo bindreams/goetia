@@ -157,7 +157,7 @@ fn stale(
         Resolved::Found(_) => Ok(!names()?),
         Resolved::Gone => Ok(true),
         Resolved::Unknown => Err(io::Error::other(format!(
-            "the manager still reports process {pid}, and the OS refused to say whether it is the one that was killed"
+            "the manager still reports process {pid}, and the OS refused to say whether it is the process goetia was waiting on"
         ))),
     }
 }

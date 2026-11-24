@@ -20,7 +20,7 @@ pub mod testing;
 #[cfg(test)]
 mod version_tests;
 
-pub use error::{Error, Reason, Result};
+pub use error::{Error, KillProgress, Reason, Result};
 
 /// The running crate version, as declared in `Cargo.toml`.
 pub fn version() -> &'static str {
