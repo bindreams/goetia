@@ -232,8 +232,7 @@ name = "marker_inertness"
 path = "tests/marker_inertness.rs"
 harness = false
 
-# `cli_dispatch`, `cli_binary`, `systemd_integration` and `launchd_integration` run the CLI, so a build
-# without the `cli` feature does not build them.
+# `cli_dispatch` and `cli_binary` are the CLI's own tests: a build without the `cli` feature does not build them.
 [[test]]
 name = "cli_dispatch"
 path = "tests/cli_dispatch.rs"
@@ -250,13 +249,11 @@ required-features = ["cli"]
 name = "systemd_integration"
 path = "tests/systemd_integration.rs"
 harness = false
-required-features = ["cli"]
 
 [[test]]
 name = "launchd_integration"
 path = "tests/launchd_integration.rs"
 harness = false
-required-features = ["cli"]
 
 [[test]]
 name = "scm_integration"

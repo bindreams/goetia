@@ -994,6 +994,7 @@ fn list_reports_a_deleted_user_as_ours_unusable(#[fixture(launchd_group)] _group
 ///
 /// Only our id is asserted: `/Library/LaunchDaemons` holds every vendor's
 /// daemons, and one `nobody` cannot open is an unrelated `undetermined` entry.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
@@ -1010,6 +1011,7 @@ fn unelevated_list_works(#[fixture(launchd_group)] _group: &Group) {
 /// `undetermined` — never left out of the document, which says it is not
 /// there — and must *not* be listed as one of goetia's own, since the marker
 /// that would have said so is precisely what went unread.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_root_only_plist_as_undetermined(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
@@ -1136,6 +1138,7 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign(#[fixture(launchd
 /// concurrently running test that installs anything would lift the denial mid-run. Nothing goetia
 /// does chmods either that parent or [`ENABLED_DIR`], so both denials hold for as long as the guard
 /// does.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn an_unsearchable_plist_directory_is_undetermined_rather_than_absent(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1194,6 +1197,7 @@ fn an_unsearchable_plist_directory_is_undetermined_rather_than_absent(#[fixture(
 /// permissions, which are what these tests need to prove. `/tmp` (the
 /// literal path, not `std::env::temp_dir()` — macOS's per-user `$TMPDIR` is
 /// `0700`) is world-traversable.
+#[cfg(feature = "cli")]
 fn run_unelevated(args: &[&str]) -> std::process::Output {
     let uid: u32 = cmd::run("id", &["-u", "nobody"])
         .stdout
@@ -1227,11 +1231,13 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
 /// Mode `0700` and a second uid, rather than mode `000` in-process: CI runs this binary as root, and
 /// root's DAC override turns a mode-`000` directory into an ordinary `NotFound` — a fixture that
 /// would report absence and pass vacuously.
+#[cfg(feature = "cli")]
 struct ModeGuard {
     dir: PathBuf,
     mode: u32,
 }
 
+#[cfg(feature = "cli")]
 impl ModeGuard {
     fn deny_traversal(dir: &Path) -> Self {
         let mode = std::fs::metadata(dir)
@@ -1248,6 +1254,7 @@ impl ModeGuard {
     }
 }
 
+#[cfg(feature = "cli")]
 impl Drop for ModeGuard {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(self.mode));

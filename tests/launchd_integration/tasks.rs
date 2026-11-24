@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use goetia::Error;
 use goetia::backend::launchd::manager::Launchd;
+#[cfg(feature = "cli")]
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State};
@@ -665,6 +666,7 @@ fn stop_of_a_task_with_send_signal_kill_ends_a_run_that_ignores_sigterm(#[fixtur
 /// unwaited form (`--timeout 0`): its stop does not wait for the run to end, and a start requested while
 /// the run is still ending finds the job running, which `kickstart` leaves alone; whether that is lost
 /// is not measured, and no test can place the start after the run's end.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn restart_of_a_running_task_ends_it_and_starts_a_new_run(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -764,6 +766,7 @@ fn uninstall_of_a_running_armed_task_ends_it(#[fixture(launchd_group)] _group: &
 
 /// What a run shows and how it ends, through the library and through `goetia daemon run`: stdout and
 /// stderr lines in order from the `logs` file, never the marker, and the program's own exit code.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn run_streams_the_logs_file_and_returns_the_exit_code(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();

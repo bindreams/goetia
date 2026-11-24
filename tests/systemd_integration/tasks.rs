@@ -14,10 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::Error;
 use goetia::backend::systemd::manager::Systemd;
+#[cfg(feature = "cli")]
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State, Status};
-use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
+#[cfg(feature = "cli")]
+use goetia::spec::User;
+use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec};
 
 use crate::linux::{
     CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, armed_status, create_root, exiting, field, main_pid,
@@ -114,6 +117,7 @@ impl Drop for JournaldConf {
 }
 
 /// `(invocation, EXIT_CODE, EXIT_STATUS)` of every "Main process exited" entry of `id`'s unit.
+#[cfg(feature = "cli")]
 fn exited(id: &str) -> Vec<(String, String, String)> {
     let unit = format!("UNIT={}", unit_of(id));
     manager_entries(&[unit.as_str(), "MESSAGE_ID=98e322203f7a4ed290d09fe03c09fe15"])
@@ -770,6 +774,7 @@ fn run_refuses_a_run_in_flight(#[fixture(systemd_group)] _group: &Group) {
 /// `restart` of a task in flight ends that run (SIGTERM) and starts a new one under the same job; the
 /// first run's result is its own, in the journal. Both forms: the waited one stops, then starts, and
 /// the unwaited one is one `systemctl restart --no-block`.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn restart_of_a_running_task_ends_it_and_starts_a_new_run(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -906,6 +911,7 @@ fn a_task_whose_command_has_a_backslash_quote_or_trailing_space_installs_and_run
 
 /// What a run shows and how it ends, through the library and through `goetia daemon run`: stdout and
 /// stderr lines in order, and the program's own exit code.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn run_streams_journal_output_and_returns_the_exit_code(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1193,6 +1199,7 @@ fn back_to_back_runs_show_only_their_own_lines_in_the_logs_file(#[fixture(system
 /// account's user journal, which a read of the system journal alone would not find. The test checks
 /// that the lines are where it says, so that it exercises the split. The storage setting is the
 /// fixture's and goes back with the drop-in.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]
 fn run_of_a_task_as_a_regular_uid_shows_its_output_on_persistent_storage(#[fixture(systemd_group)] _group: &Group) {
     let _journald = JournaldConf::set("Storage=persistent\n");

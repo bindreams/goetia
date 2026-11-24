@@ -1158,7 +1158,7 @@ impl Error {
     }
 
     /// [`report`](Error::report) with every character as it is: the exact text for `--json`.
-    #[cfg(feature = "cli")]
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn report_unescaped(&self) -> impl fmt::Display + '_ {
         Report {
             error: self,

@@ -552,7 +552,6 @@ mod windows {
 
         let e = super::system::why_unfinished(entry);
 
-        #[cfg(feature = "cli")]
         assert_eq!(
             e.report_unescaped().to_string(),
             "failed to enumerate the services: stopped\u{1b}[31m"

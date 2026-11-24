@@ -14,6 +14,7 @@ use std::time::Duration;
 use goetia::backend::Identity;
 use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
+#[cfg(feature = "cli")]
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State, TaskStatus, conformance};
@@ -23,9 +24,13 @@ use goetia::spec::{
 use goetia::testing::service_fields;
 use serde_json::Value;
 
-use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
+#[cfg(feature = "cli")]
+use crate::support::cleanup::remove_or_warn;
+use crate::support::cleanup::{DirGuard, FileGuard, warn_left_behind};
 use crate::support::tasks::{mkfifo, status_until, task_status};
-use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group, wait};
+#[cfg(feature = "cli")]
+use crate::support::wait;
+use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
 /// every test that runs `daemon list` over it. While `list_does_not_hang_on_a_fifo_in_the_unit_directory`
@@ -274,6 +279,7 @@ struct RmInRoot<L> {
 /// Drive `daemon uninstall` through the CLI rather than calling `Systemd::uninstall` directly: the
 /// thing under test is the exit code a shell sees, and `IdVerbCall::absent_is_success` turns
 /// `Error::NotInstalled` — and only that variant — into `0` and "nothing to do" on the way there.
+#[cfg(feature = "cli")]
 fn uninstall_via_cli(id: &str) -> (ExitCode, String, String) {
     let args = goetia::cli::uninstall::Args {
         ids: vec![id.to_string()],
@@ -815,6 +821,7 @@ fn a_start_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gr
 }
 
 /// The types of the jobs systemd has queued for `id`'s unit, as `systemctl list-jobs` reports them.
+#[cfg(feature = "cli")]
 fn queued_job_types(id: &str) -> Vec<String> {
     let unit = format!("{id}.service");
     let run = cmd::run("systemctl", &["list-jobs", "--no-legend", "--plain", &unit]).expect_ok();
@@ -846,6 +853,7 @@ pub(crate) fn main_pid(id: &str) -> String {
 /// `TMPDIR` cannot resolve against the unit's working directory `/`. The path is double-quoted in
 /// that line, with backslash, double quote, `%` and `$` escaped; a path with a control character
 /// (a newline would end the line) panics.
+#[cfg(feature = "cli")]
 struct StopHolder {
     unit: String,
     path: PathBuf,
@@ -853,6 +861,7 @@ struct StopHolder {
     _lock_dir: tempfile::TempDir,
 }
 
+#[cfg(feature = "cli")]
 impl StopHolder {
     fn start(id: &str) -> Self {
         let unit = format!("{id}-holder.service");
@@ -909,6 +918,7 @@ impl StopHolder {
     }
 }
 
+#[cfg(feature = "cli")]
 impl Drop for StopHolder {
     fn drop(&mut self) {
         self.release();
@@ -925,6 +935,7 @@ impl Drop for StopHolder {
 /// active, complete as a no-op. With the stop held, the daemon is still its old process and systemd
 /// holds a `restart` job for it — nothing else. Released, a blocking `start` joins that job and
 /// returns once it is done, and the daemon is a new process.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1493,6 +1504,7 @@ fn uninstall_leaves_nothing(#[fixture(systemd_group)] _group: &Group) {
 /// exit `0` and print "nothing to do". `install` on this exact state is
 /// `install_refuses_a_stray_dropin_with_no_fragment`'s `RefuseForeign`, and two verbs must not
 /// describe one filesystem state differently.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1514,6 +1526,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains(#[fix
 /// The same for the other artifact that outlives the fragment. `systemctl disable` is impossible
 /// once the `[Install]` section is gone, so this link keeps the id enrolled at boot
 /// — the very reason the exit-code table gives for `disable` returning `1` here.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_remains(
     #[fixture(systemd_group)] _group: &Group,
@@ -1841,6 +1854,7 @@ fn a_control_dropin_is_drift(#[fixture(systemd_group)] _group: &Group) {
 /// The occupancy half of the same omission: with the fragment gone, `residue` found nothing under
 /// the `.control` root, so `uninstall` certified "nothing to do" (exit `0`) for an id systemd still
 /// holds configuration for — while `install` on that same state refuses it as foreign.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -2892,6 +2906,7 @@ pub(crate) fn started_invocations(id: &str) -> Vec<String> {
 
 /// Blocks until the journal holds a `Starting` entry for a run of `id`'s unit. Each turn syncs journald
 /// and reads [`started_invocations`] (one query); the wait ends on the entry itself and has no cap.
+#[cfg(feature = "cli")]
 pub(crate) fn wait_for_started(id: &str) {
     wait::until_paced(Duration::from_millis(100), || !started_invocations(id).is_empty());
 }
