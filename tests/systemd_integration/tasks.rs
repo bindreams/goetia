@@ -14,10 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::Error;
 use goetia::backend::systemd::manager::Systemd;
+#[cfg(feature = "cli")]
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State, Status};
-use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
+#[cfg(feature = "cli")]
+use goetia::spec::User;
+use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec};
 
 use crate::linux::{
     CreatedRoot, FROM_PID_1, STARTING, UNIT_DIR_EXCLUSIVE, armed_status, create_root, exiting, field, main_pid,
@@ -114,6 +117,7 @@ impl Drop for JournaldConf {
 }
 
 /// `(invocation, EXIT_CODE, EXIT_STATUS)` of every "Main process exited" entry of `id`'s unit.
+#[cfg(feature = "cli")]
 fn exited(id: &str) -> Vec<(String, String, String)> {
     let unit = format!("UNIT={}", unit_of(id));
     manager_entries(&[unit.as_str(), "MESSAGE_ID=98e322203f7a4ed290d09fe03c09fe15"])
@@ -770,6 +774,7 @@ fn run_refuses_a_run_in_flight(#[fixture(systemd_group)] _group: &Group) {
 /// `restart` of a task in flight ends that run (SIGTERM) and starts a new one under the same job; the
 /// first run's result is its own, in the journal. Both forms: the waited one stops, then starts, and
 /// the unwaited one is one `systemctl restart --no-block`.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn restart_of_a_running_task_ends_it_and_starts_a_new_run(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -923,13 +928,16 @@ fn run_streams_journal_output_and_returns_the_exit_code(#[fixture(systemd_group)
     assert_eq!(status.common.state, State::Idle, "{status:?}");
     assert_eq!(status.last_result, Some(Exit::Code(3)), "{status:?}");
 
-    let args = goetia::cli::run::Args { id: id.clone() };
-    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    // Truthful, not a stub: the group's elevation check is this test's own precondition.
-    let code = goetia::cli::run::run(&args, &get_manager, &|| true, &mut out, &mut err);
-    assert_eq!(code, ExitCode::Run(3), "stderr:\n{}", String::from_utf8_lossy(&err));
-    assert_eq!(String::from_utf8_lossy(&out), "out-line\nerr-line\n");
+    #[cfg(feature = "cli")]
+    {
+        let args = goetia::cli::run::Args { id: id.clone() };
+        let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        // Truthful, not a stub: the group's elevation check is this test's own precondition.
+        let code = goetia::cli::run::run(&args, &get_manager, &|| true, &mut out, &mut err);
+        assert_eq!(code, ExitCode::Run(3), "stderr:\n{}", String::from_utf8_lossy(&err));
+        assert_eq!(String::from_utf8_lossy(&out), "out-line\nerr-line\n");
+    }
 }
 
 /// What a run shows is what the program wrote: a last line with no newline has none, and a line longer
@@ -1193,6 +1201,7 @@ fn back_to_back_runs_show_only_their_own_lines_in_the_logs_file(#[fixture(system
 /// account's user journal, which a read of the system journal alone would not find. The test checks
 /// that the lines are where it says, so that it exercises the split. The storage setting is the
 /// fixture's and goes back with the drop-in.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]
 fn run_of_a_task_as_a_regular_uid_shows_its_output_on_persistent_storage(#[fixture(systemd_group)] _group: &Group) {
     let _journald = JournaldConf::set("Storage=persistent\n");
@@ -1351,8 +1360,10 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
 }
 
 /// Removes the local account `name` on drop.
+#[cfg(feature = "cli")]
 struct AccountGuard(String);
 
+#[cfg(feature = "cli")]
 impl Drop for AccountGuard {
     fn drop(&mut self) {
         warn_left_behind(cmd::run_cleanup("userdel", &[&[&self.0]], &[6]));
@@ -1363,6 +1374,7 @@ impl Drop for AccountGuard {
 /// that says the task never ran: even with a user journal of its own, which `journalctl` without
 /// `--system` would open and answer from with nothing. (The raw `journalctl` facts are in the
 /// knowledge base.) A service's status needs no journal.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn status_of_a_task_for_an_account_that_cannot_read_the_system_journal_is_the_error(
     #[fixture(systemd_group)] _group: &Group,

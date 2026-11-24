@@ -232,15 +232,18 @@ name = "marker_inertness"
 path = "tests/marker_inertness.rs"
 harness = false
 
+# `cli_dispatch` and `cli_binary` test the CLI itself.
 [[test]]
 name = "cli_dispatch"
 path = "tests/cli_dispatch.rs"
 harness = false
+required-features = ["cli"]
 
 [[test]]
 name = "cli_binary"
 path = "tests/cli_binary.rs"
 harness = false
+required-features = ["cli"]
 
 [[test]]
 name = "systemd_integration"

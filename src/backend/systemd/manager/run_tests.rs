@@ -2,7 +2,6 @@
 //! its exit, and `JournalOutput::stream` following its output by the stream of the run's marker. Driven through a fake `systemctl` and a
 //! scripted journal; none of it needs systemd.
 
-use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
