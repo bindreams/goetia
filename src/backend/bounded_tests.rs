@@ -519,6 +519,33 @@ fn a_left_request_the_caller_kills_takes_its_descendant_with_it() {
     descendant.0.wait().unwrap();
 }
 
+/// A root whose kill is refused still has its tree sent the kill: [`end`] sends it whatever became of
+/// the root. The refused kill sends the root nothing, so the root's `SIGKILL` can only be the tree's:
+/// without it the root, released by its reaper at the reap, exits 7 on its own. Nothing waits for the
+/// descendant, which the test kills however it ends.
+#[skuld::test]
+fn a_left_request_whose_root_kill_is_refused_still_has_its_tree_killed() {
+    let mut cmd = sh("sleep 2147483647 & echo $! >&3; read line; exit 7");
+    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
+    cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+    let mut request = requested(cmd);
+    let _descendant = descendant_on_fd3(&mut request.child.child);
+    let finished = wait_bounded(request.child, Budget::Immediate.start()).unwrap();
+    let Finished::Left(left) = finished else {
+        panic!("expected Left, got {finished:?}")
+    };
+    let _refused = test_hook::kill_fails(|_| io::Error::from_raw_os_error(libc::EACCES).into());
+
+    left.kill();
+
+    let status = reaped_status(request.pid, &request.reaped);
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the root's kill was refused, so only the tree's kill can have ended it: {status:?}"
+    );
+}
+
 /// A refusal other than `EPERM` is returned as it came, whatever it is: a wait on this child would
 /// turn it into the lost wait that `EPERM` gets.
 #[skuld::test]
