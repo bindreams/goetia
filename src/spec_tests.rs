@@ -38,8 +38,7 @@ fn common_and_kind_read_through_the_enum() {
     assert_eq!(spec.kind(), DaemonKind::Service);
 }
 
-/// The `type` of a daemon in `--json` and in the text forms. Not `error::daemon_noun`, which is
-/// message wording.
+/// The `type` of a daemon in `--json` and in the text forms.
 #[skuld::test]
 fn a_daemon_kind_serializes_as_service_or_task() {
     for (kind, spelling) in [(DaemonKind::Service, "service"), (DaemonKind::Task, "task")] {
@@ -49,6 +48,27 @@ fn a_daemon_kind_serializes_as_service_or_task() {
             format!("\"{spelling}\"")
         );
     }
+}
+
+#[skuld::test]
+fn a_daemon_kind_parses_from_the_spelling_it_prints_as() {
+    for kind in [DaemonKind::Service, DaemonKind::Task] {
+        assert_eq!(DaemonKind::parse(kind.as_str()), Some(kind));
+        assert_eq!(kind.to_string(), kind.as_str());
+    }
+}
+
+#[skuld::test]
+fn a_daemon_kind_does_not_parse_from_any_other_text() {
+    for text in ["", "Service", "TASK", " task", "service ", "services", "simple", "managed"] {
+        assert_eq!(DaemonKind::parse(text), None, "{text:?}");
+    }
+}
+
+#[skuld::test]
+fn the_other_daemon_kind_is_the_one_that_is_not_this() {
+    assert_eq!(DaemonKind::Service.other(), DaemonKind::Task);
+    assert_eq!(DaemonKind::Task.other(), DaemonKind::Service);
 }
 
 #[skuld::test]

@@ -280,6 +280,27 @@ impl DaemonKind {
             DaemonKind::Task => "task",
         }
     }
+
+    /// The kind [`as_str`](DaemonKind::as_str) spells as `text`, and `None` for any other text.
+    pub fn parse(text: &str) -> Option<DaemonKind> {
+        [DaemonKind::Service, DaemonKind::Task]
+            .into_iter()
+            .find(|kind| kind.as_str() == text)
+    }
+
+    /// The kind that is not this one.
+    pub fn other(self) -> DaemonKind {
+        match self {
+            DaemonKind::Service => DaemonKind::Task,
+            DaemonKind::Task => DaemonKind::Service,
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl serde::Serialize for DaemonKind {

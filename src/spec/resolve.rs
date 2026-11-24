@@ -558,9 +558,9 @@ fn refuse_fields_of_the_other_type(
         Shaped::Deferred => return Ok(()),
     };
     // `schedule` is the one field of a task; the other three are a service's.
-    let (applies_only_to, this_daemon, of_the_other_type): (&str, &str, fn(&Field) -> bool) = match kind {
-        DaemonKind::Service => ("a task", "service", |field| *field == Field::Schedule),
-        DaemonKind::Task => ("a service", "task", |field| *field != Field::Schedule),
+    let of_the_other_type: fn(&Field) -> bool = match kind {
+        DaemonKind::Service => |field| *field == Field::Schedule,
+        DaemonKind::Task => |field| *field != Field::Schedule,
     };
     if let Some((field, _)) = fields
         .iter()
@@ -572,7 +572,10 @@ fn refuse_fields_of_the_other_type(
             Field::Type,
             invalid(
                 id,
-                &format!("`{path}` applies only to {applies_only_to}; this daemon is `type: {this_daemon}`"),
+                &format!(
+                    "`{path}` applies only to a {other}; this daemon is `type: {kind}`",
+                    other = kind.other()
+                ),
             ),
         ));
     }
@@ -778,12 +781,10 @@ pub(crate) fn parse_protocol(id: &Id, raw: &str) -> Result<Protocol, Error> {
 /// values `simple` and `managed` the key had before it named the kind of daemon are refused with
 /// the `protocol` that replaces each.
 pub(crate) fn parse_type(id: &Id, raw: &str) -> Result<DaemonKind, Error> {
-    match raw {
-        "service" => Ok(DaemonKind::Service),
-        "task" => Ok(DaemonKind::Task),
-        other => Err(renamed_type(id, other)
-            .unwrap_or_else(|| invalid(id, &format!("`type` must be `service` or `task`, not `{other}`")))),
-    }
+    DaemonKind::parse(raw).ok_or_else(|| {
+        renamed_type(id, raw)
+            .unwrap_or_else(|| invalid(id, &format!("`type` must be `service` or `task`, not `{raw}`")))
+    })
 }
 
 /// The refusal of `type: simple` and `type: managed`, which became `protocol: plain` and `protocol: native`.
