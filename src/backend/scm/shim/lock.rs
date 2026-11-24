@@ -16,6 +16,7 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, OpenMutexW, ReleaseMutex, WaitForSingleObject};
@@ -39,10 +40,10 @@ pub(crate) struct InstallLock {
 
 impl InstallLock {
     /// Takes the lock, waiting for whoever holds it, with no bound: the holder's release is the
-    /// event. A lock whose holder died is taken all the same (`WAIT_ABANDONED`): what it guarded is
-    /// verified by whoever takes it, not assumed from it. A lock that exists and belongs to an
-    /// account other than SYSTEM, Administrators or TrustedInstaller is
-    /// [`Error::ShimLockForeign`], before any wait.
+    /// event. A caller that has to wait says so once on stderr, naming the lock, before it waits. A
+    /// lock whose holder died is taken all the same (`WAIT_ABANDONED`): what it guarded is verified by
+    /// whoever takes it, not assumed from it. A lock that exists and belongs to an account other than
+    /// SYSTEM, Administrators or TrustedInstaller is [`Error::ShimLockForeign`], before any wait.
     pub(crate) fn acquire() -> Result<Self> {
         let descriptor = Descriptor::for_lock()?;
         let attributes = descriptor.attributes();
@@ -64,17 +65,38 @@ impl InstallLock {
                 });
             }
         }
+        take(&mutex, waiting_for_lock)?;
+        Ok(Self {
+            mutex,
+            _thread: PhantomData,
+        })
+    }
+}
+
+/// What a command that has to wait for the lock says on stderr, as the removal of run records says what it
+/// waits for: the library has no channel for a notice.
+fn waiting_for_lock() {
+    eprintln!("waiting for the install lock `{NAME}`, held by another goetia command; going on when it has finished");
+}
+
+/// Takes `mutex`: at once if nobody holds it (or its holder died, `WAIT_ABANDONED`), else after calling
+/// `waiting` once, and then with no bound, until the holder releases it.
+fn take(mutex: &OwnedHandle, waiting: impl FnOnce()) -> Result<()> {
+    let wait = |milliseconds| {
         // SAFETY: `mutex` is a live handle with `SYNCHRONIZE`.
-        match unsafe { WaitForSingleObject(mutex.as_raw_handle(), INFINITE) } {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self {
-                mutex,
-                _thread: PhantomData,
-            }),
-            _ => Err(Error::os(
-                format!("wait for the install lock `{NAME}`"),
-                io::Error::last_os_error(),
-            )),
-        }
+        unsafe { WaitForSingleObject(mutex.as_raw_handle(), milliseconds) }
+    };
+    let mut state = wait(0);
+    if state == WAIT_TIMEOUT {
+        waiting();
+        state = wait(INFINITE);
+    }
+    match state {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(()),
+        _ => Err(Error::os(
+            format!("wait for the install lock `{NAME}`"),
+            io::Error::last_os_error(),
+        )),
     }
 }
 

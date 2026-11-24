@@ -300,7 +300,7 @@ records the end as it does.
     that never has a console is asked again, about once a second, until `goetia daemon kill`.
   - `stop` and `restart` wait the `timeout` plus 10 s, as above. `uninstall` waits up to the `timeout`
     too, holding the machine-wide install lock as it does for any stop, so an `install` or `uninstall` of
-    another daemon waits behind it. For `timeout: null` and a tree that never exits it waits until
+    another daemon waits behind it, saying on stderr what it waits for. For `timeout: null` and a tree that never exits it waits until
     `goetia daemon kill` ends the daemon; a `stop --timeout` ends only goetia's own wait.
   - The service reports `STOP_PENDING` with a wait hint that covers the `timeout` and the teardown (the
     largest value the field holds for `null`); SCM does nothing when a hint runs out.
