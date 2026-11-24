@@ -242,8 +242,10 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// because every value asserts something goetia is in no position to assert, such as whether this
 /// is a chroot: detecting that is the child's job.
 ///
-/// Not reached: `DBUS_*`, which a non-root `systemctl` honours with no switch at all, and variables under neither prefix (`PAGER`, `LESS`,
-/// `TERM`, the locale), none of which changes the report.
+/// Not reached: `DBUS_*`. A non-root `systemctl` follows `DBUS_SYSTEM_BUS_ADDRESS` with no switch at
+/// all, and a root one ignores it; goetia leaves both as they are. A root `busctl` follows it and
+/// loses it (see `busctl`'s `removals`). Variables under neither prefix (`PAGER`, `LESS`, `TERM`,
+/// the locale) are not reached either: none changes the report.
 const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 
 /// The inherited names that are removed from a `systemctl`'s environment: every [`DENIED`] one that
@@ -257,11 +259,21 @@ pub(super) fn removals(inherited: impl Iterator<Item = String>) -> Vec<String> {
 }
 
 /// `cmd`'s environment as every `systemctl` goetia runs gets it: every inherited [`DENIED`] name
-/// [removed](removals), and [`ENVIRONMENT`] set. The names are those this process would pass a
-/// child of its own; one that is not UTF-8 is skipped, because `getenv` finds a switch by its exact
-/// ASCII name, so a name that does not decode is not one of them.
+/// [removed](removals), and [`ENVIRONMENT`] set.
 pub(super) fn environment(cmd: &mut cosca::Command) {
-    for key in removals(std::env::vars_os().filter_map(|(key, _)| key.into_string().ok())) {
+    environment_without(cmd, removals(inherited()));
+}
+
+/// The names this process would pass a child of its own; one that is not UTF-8 is skipped, because
+/// `getenv` finds a switch by its exact ASCII name, so a name that does not decode is not one of them.
+pub(super) fn inherited() -> impl Iterator<Item = String> {
+    std::env::vars_os().filter_map(|(key, _)| key.into_string().ok())
+}
+
+/// [`ENVIRONMENT`] set on `cmd`, and `removed` taken off it: a tool's own list, which includes
+/// [`removals`].
+pub(super) fn environment_without(cmd: &mut cosca::Command, removed: Vec<String>) {
+    for key in removed {
         cmd.env_remove(key);
     }
     for (key, value) in ENVIRONMENT {

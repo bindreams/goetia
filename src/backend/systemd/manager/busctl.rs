@@ -12,8 +12,7 @@ use crate::backend::bounded::{Finished, Reservation};
 use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::error::{Error, Result};
 
-use super::systemctl::{Host, refuse_unreachable};
-use super::systemctl;
+use super::systemctl::{self, Host, refuse_unreachable};
 
 const SYSTEMD1: &str = "org.freedesktop.systemd1";
 
@@ -22,16 +21,28 @@ const SYSTEMD1: &str = "org.freedesktop.systemd1";
 /// the same.
 const NEVER: u64 = u64::MAX;
 
-/// The inherited names removed from a `busctl`'s environment: a `systemctl`'s
-/// ([`systemctl::removals`]), and, when goetia runs as root, `DBUS_SYSTEM_BUS_ADDRESS`.
+/// The one inherited name besides a `systemctl`'s ([`systemctl::removals`]) that a root `busctl` loses.
+/// `busctl --system` follows it at any uid, while root's `systemctl` ignores it: with it set, root's
+/// `busctl` asks that bus (measured: it failed to connect to one) where root's `systemctl` asks the
+/// system manager.
+const BUS_ADDRESS: &str = "DBUS_SYSTEM_BUS_ADDRESS";
+
+/// The inherited names removed from a `busctl`'s environment: a `systemctl`'s, and when goetia runs
+/// as `root`, [`BUS_ADDRESS`]. As any other user it keeps the variable, as their `systemctl` does.
 fn removals(root: bool, inherited: impl Iterator<Item = String>) -> Vec<String> {
-    let _ = root;
-    systemctl::removals(inherited)
+    let inherited: Vec<String> = inherited.collect();
+    let bus_address = root && inherited.iter().any(|key| key == BUS_ADDRESS);
+    let mut removed = systemctl::removals(inherited.into_iter());
+    if bus_address {
+        removed.push(BUS_ADDRESS.to_string());
+    }
+    removed
 }
 
-/// `cmd`'s environment as a `busctl` goetia runs gets it.
+/// `cmd`'s environment as a `busctl` goetia runs gets it: a `systemctl`'s, less what [`removals`] says
+/// for this process's user.
 fn environment(cmd: &mut cosca::Command) {
-    systemctl::environment(cmd);
+    systemctl::environment_without(cmd, removals(cosca::elevation::is_elevated(), systemctl::inherited()));
 }
 
 /// `busctl`, reached through a [`Client`], on the system `host` reads: the same door and the same
