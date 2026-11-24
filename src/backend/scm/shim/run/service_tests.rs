@@ -32,7 +32,7 @@ use crate::backend::scm::shim::run::os::fake::{
     AskReply, ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, ProcessCall,
     TreeWaitReply, WaitReply, WaiterEnd, tree_kill_refused, wait_failed, wait_failed_with_code,
 };
-use crate::backend::scm::shim::run::stop_bus::{StopEvent, WaitEnd};
+use crate::backend::scm::shim::run::stop_bus::{PROGRESS_PERIOD, StopEvent, WaitEnd};
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, began, chained, fallback_refused_failure, not_found, supervisor,
     tree_refused_failure,
@@ -396,7 +396,11 @@ fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs()
     // What `from_program_data` said of itself.
     assert_eq!(fake.take_failures().len(), 1);
 
-    let launched = launch(&spec_logging_to(None), &Supervisor::new(fake.os(), log), ID);
+    let launched = launch(
+        &spec_logging_to(None),
+        &Supervisor::new(fake.os(), log, PROGRESS_PERIOD),
+        ID,
+    );
 
     assert!(launched.is_ok(), "a daemon with nowhere to log was not run");
     assert_one_failure(&fake.take_failures(), ID, NO_LOG_FILE);
@@ -1102,11 +1106,36 @@ fn the_hint_is_the_stop_actions_longest_wait_and_an_exit_is_the_teardown() {
     }
 }
 
+/// The status a run reports for what its stop's observer is told: a stop that began reports `STOP_PENDING` with the
+/// stop's hint and checkpoint 1, and progress the checkpoint one higher with the same hint.
+#[skuld::test]
+fn a_stop_began_is_reported_with_its_hint_and_progress_with_the_checkpoint_one_higher() {
+    let action = StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(Duration::from_secs(30)),
+    };
+    let mut progress = StopProgress::default();
+
+    let reports = [
+        stop_report(StopEvent::Began(WaitEnd::Stop), &action, &mut progress),
+        stop_report(StopEvent::Progress, &action, &mut progress),
+        stop_report(StopEvent::Progress, &action, &mut progress),
+    ];
+
+    for report in reports {
+        assert_eq!(report.dwCurrentState, SERVICE_STOP_PENDING);
+        assert_eq!(report.dwControlsAccepted, 0);
+        assert_eq!(report.dwWaitHint, 40_000, "the `timeout` and the teardown");
+    }
+    assert_eq!(reports.map(|report| report.dwCheckPoint), [1, 2, 3]);
+}
+
 /// A run reports the hint of its stop action to the status setter: a stop reports the stop's, an exit the exit's.
 #[skuld::test]
 fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
     let service = spec();
     let plan = StopPlan::of(&service);
+    let mut progress = StopProgress::default();
     let mut hints = Vec::new();
 
     let fake = FakeGuard::new();
@@ -1128,12 +1157,13 @@ fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
         &stopped,
         ID,
         || assert!(bus.request_stop()),
-        |event| hints.extend(began(event).map(|end| stop_hint(service.stop_action(), end))),
+        |event| hints.push(stop_report(event, service.stop_action(), &mut progress).dwWaitHint),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     let _ = fake.take_infos();
-    assert_eq!(hints, [Duration::from_secs(40)], "the `timeout` and the teardown");
+    assert_eq!(hints, [40_000], "the `timeout` and the teardown");
 
+    let mut progress = StopProgress::default();
     let mut hints = Vec::new();
     let fake = FakeGuard::new();
     fake.will_make_thread();
@@ -1144,10 +1174,10 @@ fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
         &supervisor(&fake),
         ID,
         || {},
-        |event| hints.extend(began(event).map(|end| stop_hint(service.stop_action(), end))),
+        |event| hints.push(stop_report(event, service.stop_action(), &mut progress).dwWaitHint),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert_eq!(hints, [Duration::from_secs(10)], "the teardown alone");
+    assert_eq!(hints, [10_000], "the teardown alone");
 }
 
 // The host that can ask -----------------------------------------------------------------------------------------------

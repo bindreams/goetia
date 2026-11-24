@@ -34,8 +34,8 @@ use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{
-    NOT_RESTARTED, RootExit, StopBus, StopEvent, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop,
-    terminate_exited_tree,
+    NOT_RESTARTED, PROGRESS_PERIOD, RootExit, StopBus, StopEvent, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter,
+    kill_for_stop, terminate_exited_tree,
 };
 
 // Entry ===============================================================================================================
@@ -91,7 +91,7 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
     // narrows them once it reads any other state, since a handle opened now keeps working.
     log.hold_default(id);
     exit::name_run(id);
-    let supervisor = Supervisor::new(real, Arc::clone(&log));
+    let supervisor = Supervisor::new(real, Arc::clone(&log), PROGRESS_PERIOD);
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
@@ -128,10 +128,7 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
         // Progress is reported from this thread, between the slices of the stop's own waits: nothing is reported
         // while the ask itself is being made, which cosca's `terminate_tree` bounds by nothing.
         |event| {
-            let status = match event {
-                StopEvent::Began(end) => progress.begin(stop_hint(blob.spec.stop_action(), end)),
-                StopEvent::Progress => progress.advance(),
-            };
+            let status = stop_report(event, blob.spec.stop_action(), &mut progress);
             report_stopping(&log, id, status_handle, &status);
         },
     );
@@ -277,6 +274,15 @@ impl StopProgress {
     fn advance(&mut self) -> SERVICE_STATUS {
         self.checkpoint = self.checkpoint.wrapping_add(1);
         stopping_status(self.hint, self.checkpoint)
+    }
+}
+
+/// The status to report for what the stop's observer was told ([`StopEvent`]): the first `STOP_PENDING` with the stop's
+/// hint when it began, and the same hint with the checkpoint one higher while it goes on.
+fn stop_report(event: StopEvent, action: &StopAction, progress: &mut StopProgress) -> SERVICE_STATUS {
+    match event {
+        StopEvent::Began(end) => progress.begin(stop_hint(action, end)),
+        StopEvent::Progress => progress.advance(),
     }
 }
 

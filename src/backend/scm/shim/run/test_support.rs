@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::os::fake::{Fake, kill_refused, tree_kill_refused};
-use super::stop_bus::{StopEvent, Supervisor, WaitEnd};
+use super::stop_bus::{PROGRESS_PERIOD, StopEvent, Supervisor, WaitEnd};
 use crate::error::Chain;
 
 /// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
@@ -28,7 +28,7 @@ pub(crate) fn began(event: StopEvent) -> Option<WaitEnd> {
 
 /// A supervisor over `fake`'s `Os` and `Log`: the one under test.
 pub(crate) fn supervisor(fake: &Fake) -> Arc<Supervisor> {
-    Arc::new(Supervisor::new(fake.os(), fake.log()))
+    Arc::new(Supervisor::new(fake.os(), fake.log(), PROGRESS_PERIOD))
 }
 
 /// Asserts `lines` is exactly one failure line for `id`: `goetia-shim[<id>]: ` then `expected`, with

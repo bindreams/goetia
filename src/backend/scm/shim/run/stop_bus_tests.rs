@@ -38,7 +38,7 @@ fn launched_with_period(
     daemon: &FakeProcess,
     period: Duration,
 ) -> (Arc<Supervisor>, Waiter, Arc<dyn Spawned>) {
-    let supervisor = Arc::new(Supervisor::new(fake.os(), fake.log()).with_progress_period(period));
+    let supervisor = Arc::new(Supervisor::new(fake.os(), fake.log(), period));
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
     let waiter = supervisor.waiter(ID).expect("make the waiter thread");

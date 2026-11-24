@@ -390,27 +390,19 @@ pub struct Supervisor {
     pub(crate) os: Arc<dyn Os>,
     pub(crate) log: Arc<Log>,
     pub(crate) bus: Arc<StopBus>,
-    /// The longest one slice of the wait for the tree is ([`PROGRESS_PERIOD`] in a run).
     progress_period: Duration,
 }
 
 impl Supervisor {
     /// A supervisor whose spawns and threads go through `os`, and whose supervisor and waiter
-    /// threads report failures to `log`.
-    pub fn new(os: Arc<dyn Os>, log: Arc<Log>) -> Supervisor {
+    /// threads report failures to `log`. `progress_period` is the longest one slice of the wait for the tree is
+    /// ([`PROGRESS_PERIOD`] in a run).
+    pub fn new(os: Arc<dyn Os>, log: Arc<Log>, progress_period: Duration) -> Supervisor {
         Supervisor {
             os,
             log,
             bus: Arc::new(StopBus::new()),
-            progress_period: PROGRESS_PERIOD,
-        }
-    }
-
-    /// The same supervisor with slices of the wait for the tree no longer than `period`.
-    pub fn with_progress_period(self, period: Duration) -> Supervisor {
-        Supervisor {
-            progress_period: period,
-            ..self
+            progress_period,
         }
     }
 

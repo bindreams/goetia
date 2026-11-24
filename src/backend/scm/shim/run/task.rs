@@ -56,7 +56,7 @@ use super::exit;
 use super::logging::Log;
 use super::os::Real;
 use super::service::{PassOutcome, SpecStop, run_pass, set_daemon_log};
-use super::stop_bus::{StopBus, StopEvent, StopPlan, Supervisor, WaitEnd};
+use super::stop_bus::{PROGRESS_PERIOD, StopBus, StopEvent, StopPlan, Supervisor, WaitEnd};
 use crate::backend::scm::exit_status::Reported;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
@@ -94,7 +94,7 @@ pub(super) fn run(id: &str, token: Option<Token>) -> ! {
     let log = Arc::new(Log::from_program_data(real.clone(), &program_data).closed_until_held());
     exit::keep_log(Arc::clone(&log));
     exit::name_run(id);
-    let supervisor = Supervisor::new(real, Arc::clone(&log));
+    let supervisor = Supervisor::new(real, Arc::clone(&log), PROGRESS_PERIOD);
     // Before anything is read: from here on a stop is held by the bus until the run reaches it.
     if let Err(e) = register_close_handler(&supervisor.bus) {
         log.failure(id, &format!("register the console control handler: {}", Chain(&e)));
