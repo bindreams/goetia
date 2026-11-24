@@ -1693,6 +1693,11 @@ share one pair of flags:
 | `--timeout 0`          | Issue the request and return without waiting.                                                                                         |
 | `--no-timeout`         | Wait indefinitely.                                                                                                                    |
 
+On Linux and macOS, a bound ends goetia's wait for its own `systemctl` or
+`launchctl` by killing it; if that process or one it started does not die once
+killed (a debugger or tracer attached to it, or a kernel call it cannot leave),
+goetia waits until it does.
+
 On macOS, launchd keeps a job's label until the job's process has exited, and
 goetia does not load a job over one that is still going away. So on macOS, for a
 service (a task's `stop` never boots its job out: see [Stopping and killing a

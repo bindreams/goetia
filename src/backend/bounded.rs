@@ -116,7 +116,7 @@ impl Left {
 
     /// End the child and its contained tree ([`end`]). One that already exited is not an error, nor
     /// is one seen exited after refusing the kill. One whose root cannot be killed is handed to its
-    /// [`Reaper`] as it is, its tree not torn down, and stderr says it could not be killed.
+    /// [`Reaper`] as it is, and stderr says it could not be killed.
     ///
     /// How long this can block: see [`EXIT_AFTER_REFUSED_KILL`].
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -449,8 +449,8 @@ fn waited_out(
 ///   tracer that is not goetia holding its zombie); the drop also waits for a cgroup leaf to drain.
 pub(crate) const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
-/// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
-/// caller. Nothing here reaps the root: [`cosca::Child::wait`] only observes an exit, so the killed
+/// End `child`: its root ([`kill_root`]), then, best-effort, its tree, whatever became of the root's
+/// kill. The one order, for every caller. Nothing here reaps the root: [`cosca::Child::wait`] only observes an exit, so the killed
 /// root stays a zombie pinning its pid and pgid until its handle drops (or is detached by a
 /// [`Reaper`]), and a kill that names the tree by the root's number cannot hit another process on
 /// any platform.
@@ -460,9 +460,9 @@ pub(crate) const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 /// either way, so nothing surfaces it, and a descendant still holding a pipe is exactly what
 /// `collect` reports as `complete == false`.
 fn end(child: &cosca::Child, bound: Duration) -> Result<KillRootOutcome, cosca::error::Error> {
-    let outcome = kill_root(child, bound)?;
+    let outcome = kill_root(child, bound);
     let _tree_teardown = child.send_kill_tree();
-    Ok(outcome)
+    outcome
 }
 
 /// [`end`] for the child of a [`Left`]: what to say on stderr if it could not be ended. It says what
@@ -501,7 +501,7 @@ fn kill_root(child: &cosca::Child, bound: Duration) -> Result<KillRootOutcome, c
 /// for another reason and then finished: goetia cannot tell them apart. One not seen exited is a lost
 /// wait: [`wait_bounded`] returns an error naming the bound and drops the child (its drop tears the
 /// contained tree down); [`Left::kill`] warns on stderr that it could not be killed and hands the child
-/// to its [`Reaper`] with its tree not torn down.
+/// to its [`Reaper`].
 pub(crate) fn settle_kill(
     sent: Result<(), cosca::error::Error>,
     alive: impl Fn() -> Liveness,
