@@ -64,7 +64,8 @@ see for itself, or send it to a manager that is not this root's. A variable
 under neither prefix is passed through as it arrived, with one exception:
 when goetia runs as root, the `busctl` that reads a timer's next run is not
 given `DBUS_SYSTEM_BUS_ADDRESS`, so it asks the same manager as root's
-`systemctl`, which ignores that variable. `install` always reaches it; the other verbs only for a daemon of goetia's, and they answer
+`systemctl`, which ignores that variable. `install` always
+reaches it; the other verbs only for a daemon of goetia's, and they answer
 from files alone otherwise:
 
 - `uninstall`, `start`, `stop`, `kill`, `restart`, `enable` and `disable` refuse
