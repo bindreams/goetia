@@ -11,7 +11,8 @@ use nix::fcntl::{FcntlArg, OFlag, fcntl};
 pub(super) struct Wake {
     read: OwnedFd,
     write: OwnedFd,
-    /// Drops after both ends are closed, and says so to the probe: for the test of the close's order.
+    /// Drops after both ends are closed, and says so to the probe: for the test of the close's order. The
+    /// order is the fields' declaration order.
     #[cfg(test)]
     closed: super::test_hook::CloseMark,
 }
@@ -37,17 +38,17 @@ impl Wake {
         })
     }
 
-    /// The read end, which a wait registers. Valid for as long as `self` lives.
+    /// The read end; valid while `self` lives.
     pub(super) fn read_fd(&self) -> RawFd {
         self.read.as_raw_fd()
     }
 
-    /// The write end, which a handler writes to. Valid for as long as `self` lives.
+    /// The write end; valid while `self` lives.
     pub(super) fn write_fd(&self) -> RawFd {
         self.write.as_raw_fd()
     }
 
-    /// What the close of this pipe did.
+    /// Records how this pipe's close went.
     #[cfg(test)]
     pub(super) fn probe(&self) -> &std::sync::Arc<super::test_hook::Probe> {
         &self.closed.probe
