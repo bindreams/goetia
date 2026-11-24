@@ -41,10 +41,10 @@ pub(crate) struct InstallLock {
 impl InstallLock {
     /// Takes the lock, waiting for whoever holds it, with no bound: the holder's release is the
     /// event. Each time it has to wait, however briefly, it says so on stderr first, naming the lock
-    /// (a failed write is ignored), so a command that takes the lock twice can say so twice. A lock
-    /// whose holder died is taken all the same (`WAIT_ABANDONED`): what it guarded is verified by
-    /// whoever takes it, not assumed from it. A lock that exists and belongs to an account other than
-    /// SYSTEM, Administrators or TrustedInstaller is [`Error::ShimLockForeign`], before any wait.
+    /// (a failed write is ignored). A lock whose holder died is taken all the same (`WAIT_ABANDONED`):
+    /// what it guarded is verified by whoever takes it, not assumed from it. A lock that exists and
+    /// belongs to an account other than SYSTEM, Administrators or TrustedInstaller is
+    /// [`Error::ShimLockForeign`], before any wait.
     pub(crate) fn acquire() -> Result<Self> {
         let descriptor = Descriptor::for_lock()?;
         let attributes = descriptor.attributes();
@@ -74,15 +74,13 @@ impl InstallLock {
     }
 }
 
-/// What a command that has to wait for the lock says on stderr, as the removal of run records says what it
-/// waits for: the library has no channel for a notice. It claims no holder: any program that embeds the
-/// library, or another thread, can hold the lock.
+/// Says on stderr that the command waits for the lock; the library has no other channel for a notice. It
+/// claims no holder: any program that embeds the library, or another thread, can hold the lock.
 fn waiting_for_lock() {
     say_waiting(&mut io::stderr());
 }
 
-/// [`waiting_for_lock`] written to `out`. A failed write is ignored, as for a warning: this notice is
-/// written where nothing may fail for it (a closed stderr must not turn a wait that succeeds into a panic).
+/// Writes the notice to `out`, ignoring a failed write: a closed stderr must not fail a wait that succeeds.
 fn say_waiting(out: &mut impl Write) {
     let _ = writeln!(out, "waiting for the install lock `{NAME}` to be released");
 }

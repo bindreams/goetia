@@ -159,8 +159,7 @@ fn the_note_names_the_lock_and_claims_no_holder() {
     );
 }
 
-/// A stderr that cannot be written (a closed or broken pipe) does not fail the wait: `eprintln!` would
-/// panic on it, in an `uninstall` that has removed the records already, or in a cleanup guard's `Drop`.
+/// A write to the given writer that fails (a closed or broken pipe) is ignored; `eprintln!` would panic.
 #[skuld::test]
 fn a_note_that_cannot_be_written_is_dropped() {
     struct Broken;
@@ -241,7 +240,7 @@ fn a_waiter_that_finds_the_lock_free_says_nothing() {
     assert!(taken.is_ok(), "{:?}", taken.err());
 }
 
-/// A lock whose holder died is the next one's at once, as it was before the note: nothing is waited for.
+/// A lock whose holder died is the next one's at once: nothing is waited for.
 #[skuld::test]
 fn a_waiter_that_finds_the_lock_abandoned_says_nothing_and_takes_it() {
     let mutex = private_mutex();
