@@ -137,7 +137,7 @@ static void do_path(pid_t p, char *out, size_t n) {
 }
 
 static void do_rusage(pid_t p, char *out, size_t n) {
-    rusage_info_v0 u;
+    struct rusage_info_v0 u;
     errno = 0;
     int r = proc_pid_rusage(p, RUSAGE_INFO_V0, (rusage_info_t *)&u);
     int e = errno;
