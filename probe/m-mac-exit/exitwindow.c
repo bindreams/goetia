@@ -34,6 +34,15 @@
 #endif
 #define P_WEXIT_BIT 0x00002000
 
+/* Not in the public header: the layout cosca and the knowledge base's token probe use. */
+#define PROC_PIDUNIQIDENTIFIERINFO 17
+struct proc_uniqidentifierinfo {
+    uint8_t uuid[16];
+    uint64_t p_uniqueid, p_puniqueid;
+    int32_t p_idversion, p_orig_ppidversion;
+    uint64_t r2, r3;
+};
+
 static void say(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
