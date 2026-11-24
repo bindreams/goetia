@@ -1198,8 +1198,13 @@ fn a_refused_simple_install_never_reaches_the_provider() {
     }
 }
 
+/// The id of every daemon a test gives [`snapshot_with_config`]: a name no host installs a service under, so
+/// a regression that reached `ScmSnapshot::service` would open it by name and fail with `NotInstalled`
+/// whatever the host runs.
+const SNAPSHOT_ID: &str = "goetia-unit-test-no-such-service";
+
 /// A snapshot that has never opened a service, with `config` already queried: any further SCM
-/// access would fail or find no such service, so a test that gets an answer shows there was none.
+/// access would find no service named [`SNAPSHOT_ID`], so a test that gets an answer shows there was none.
 fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
     let blob = Blob {
         schema: crate::blob::SCHEMA,
@@ -1224,7 +1229,9 @@ fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
 
 #[skuld::test]
 fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
-    let spec = simple_daemon();
+    let mut fields = simple_fields();
+    fields.common.id = Id::try_from(SNAPSHOT_ID).unwrap();
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let snapshot = snapshot_with_config(&spec, r#""C:\Program Files\App\app.exe" --service-host"#);
     let (provider, calls) = FakeProvider::new(command(r"C:\elsewhere\host.exe"), command(r"C:\elsewhere\host.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);

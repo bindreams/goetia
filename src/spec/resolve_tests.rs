@@ -181,30 +181,64 @@ fn a_control_character_in_the_id_is_refused() {
 }
 
 #[skuld::test]
-fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(#[fixture(temp_dir)] dir: &Path) {
-    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value.
-    let predicate = "field `user.name` contains a control character";
-    let base = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
-    write_fixture(dir, base, Some("U=svc\0x\n"));
-    for &native in HOST_BACKENDS {
-        let msg = resolve_as(parse_manifest(base), dir, Some(native))
-            .expect_err("a NUL in a substituted value is refused")
-            .to_string();
-        assert!(msg.contains("after substituting from .env"), "native `{native}`: {msg}");
-        assert!(msg.contains(predicate), "native `{native}`: {msg}");
-        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
-        assert!(
-            !msg.contains("backend-specific"),
-            "no override wrote it, native `{native}`: {msg}"
-        );
+fn a_control_character_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value. The
+    // `.env` grammar admits a newline in no value, so a newline is refused by the file instead.
+    // No row for an `env` key or `user.id`: a reference in either is refused before `.env` is read.
+    let rows: [(&str, &str); 7] = [
+        ("name", "name: ${U}"),
+        ("command", r#"command: ["/bin/frpc", "${U}"]"#),
+        ("cwd", "cwd: ${U}"),
+        ("logs", "logs: ${U}"),
+        ("env[K]", r#"env: {K: "${U}"}"#),
+        ("user.name", "user: ${U}"),
+        ("user.name", r#"user: {name: "${U}"}"#),
+    ];
+    for (c, _) in CONTROL_CHARACTERS {
+        write_fixture(dir, "", Some(&format!("U='svc{c}x'\n")));
+        for (field, row_line) in rows {
+            let predicate = format!("field `{field}` contains a control character");
+            // A `command` row replaces the base command, so the base omits it.
+            let base = if row_line.starts_with("command:") {
+                "id: frpc\n"
+            } else {
+                "id: frpc\ncommand: [/bin/frpc]\n"
+            };
+            let plain = format!("{base}{row_line}\n");
+            for &native in HOST_BACKENDS {
+                let context = format!("{c:?} in `{field}` as native `{native}`");
+                let overridden = format!("{base}backend-specific:\n  {native}:\n    {row_line}\n");
 
-        let overridden = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    user: ${{U}}\n");
-        let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
-            .expect_err("a NUL substituted into the native override is refused")
-            .to_string();
-        let blamed = format!("backend-specific.{native}: after substituting from .env: {predicate}");
-        assert!(msg.contains(&blamed), "native `{native}`: {msg}");
-        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
+                if c == '\n' {
+                    for yaml in [&plain, &overridden] {
+                        let err = resolve_as(parse_manifest(yaml), dir, Some(native)).expect_err(&context);
+                        assert!(matches!(err, Error::EnvFile { .. }), "{context}: {err}");
+                        assert!(err.to_string().contains("unterminated"), "{context}: {err}");
+                    }
+                    continue;
+                }
+
+                let msg = resolve_as(parse_manifest(&plain), dir, Some(native))
+                    .expect_err(&context)
+                    .to_string();
+                assert!(msg.contains("after substituting from .env"), "{context}: {msg}");
+                assert!(msg.contains(&predicate), "{context}: {msg}");
+                assert!(!msg.contains(c), "{context}: {msg:?}");
+                assert!(
+                    !msg.contains("backend-specific"),
+                    "no override wrote it, {context}: {msg}"
+                );
+
+                let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
+                    .expect_err(&context)
+                    .to_string();
+                let blamed = format!("backend-specific.{native}: after substituting from .env: {predicate}");
+                assert!(msg.contains(&blamed), "{context}: {msg}");
+                assert!(!msg.contains(c), "{context}: {msg:?}");
+            }
+        }
     }
 }
 

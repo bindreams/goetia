@@ -155,21 +155,13 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
     let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
 
-    // A blocking read that ends when the shell writes, so the descendant's
-    // pid is learned without racing the capture for it.
-    let fd3 = child.child.fd_read_end(3.into()).unwrap();
-    let mut line = String::new();
-    io::BufReader::new(fd3).read_line(&mut line).unwrap();
-    let descendant: libc::pid_t = line.trim().parse().unwrap();
+    // A blocking read that ends when the shell writes, so the descendant's pid is learned without
+    // racing the capture for it. The guard kills it however the test ends.
+    let _descendant = descendant_on_fd3(&mut child.child);
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
-
-    // Leave nothing behind.
-    unsafe {
-        libc::kill(descendant, libc::SIGKILL);
-    }
 }
 
 /// Kills a process on drop, so a descendant a test let escape dies however the test ends. It kills
