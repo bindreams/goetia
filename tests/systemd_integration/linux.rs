@@ -2046,6 +2046,59 @@ fn install_makes_cwd_for_the_account_and_a_log_directory_root_keeps(#[fixture(sy
     assert!(logs.join("out.log").is_file(), "systemd opened the log");
 }
 
+/// A log directory that was deleted after the install is made again by the next one, which finds the
+/// definition up to date and writes nothing: the unit fails at start without it.
+#[skuld::test]
+fn an_up_to_date_install_makes_a_deleted_log_directory_again(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let logs = under_root("/var/log", &id, "logs");
+    let _rm_logs = DirGuard::new(logs.clone());
+    let guard = ServiceGuard::new(&id);
+    let spec = nobody_spec(guard.id(), None, Some(&logs.join("out.log")));
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    fs::remove_dir(&logs).expect("delete the log directory");
+
+    let outcome = mgr.install(&spec, false).expect("install again");
+
+    assert!(matches!(outcome, Outcome::UpToDate), "{outcome:?}");
+    assert!(logs.is_dir(), "the second install made the log directory again");
+}
+
+/// A write whose `daemon-reload` did not happen leaves the manager holding a running unit as it was
+/// loaded: it reads `NeedDaemonReload=yes`. The install that follows finds the files up to date, and
+/// reloads. The state is made as a write whose reload failed leaves it: the unit file of the new
+/// definition on disk, nothing reloaded.
+#[skuld::test]
+fn an_up_to_date_install_reloads_a_manager_that_holds_the_old_unit(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    mgr.start(&Id::try_from(guard.id()).unwrap(), Budget::DEFAULT).expect("start");
+    let newer = ServiceSpec::new(ServiceFields {
+        restart: Restart::OnFailure,
+        protocol: Protocol::Plain,
+        ..support::base_fields(guard.id(), vec!["/bin/sleep".to_string(), "1000000".to_string()])
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let text = generate::units(&newer, &Identity { user: "0".to_string() })
+        .unwrap()
+        .service;
+    fs::write(unit_path(guard.id()), text).expect("write the new unit without reloading");
+    let [reload] = show_properties(&unit_of(guard.id()), ["NeedDaemonReload"]);
+    assert_eq!(reload, "yes", "the manager holds the unit as it was loaded");
+
+    let outcome = mgr.install(&newer, false).expect("install the new definition again");
+
+    assert!(matches!(outcome, Outcome::UpToDate), "{outcome:?}");
+    let [reload, exec] = show_properties(&unit_of(guard.id()), ["NeedDaemonReload", "ExecStart"]);
+    assert_eq!(reload, "no");
+    assert!(exec.contains("1000000"), "the manager loaded the new unit: {exec}");
+}
+
 #[skuld::test]
 fn install_refuses_a_missing_directory_outside_the_roots_and_makes_nothing(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
