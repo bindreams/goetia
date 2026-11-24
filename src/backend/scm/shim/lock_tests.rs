@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::mpsc;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER, ERROR_NOT_ENOUGH_MEMORY};
@@ -142,6 +143,120 @@ fn open_lock() -> OwnedHandle {
     assert!(!raw.is_null(), "open the lock: {}", io::Error::last_os_error());
     // SAFETY: a valid handle `OpenMutexW` just returned and nothing else owns.
     unsafe { OwnedHandle::from_raw_handle(raw) }
+}
+
+/// The note names the lock and says the command waits for its release: nothing of who holds it, which
+/// the waiter does not know.
+#[skuld::test]
+fn the_note_names_the_lock_and_claims_no_holder() {
+    let mut out = Vec::new();
+
+    say_waiting(&mut out);
+
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "waiting for the install lock `Global\\goetia-shim` to be released\n"
+    );
+}
+
+/// A write to the given writer that fails (a closed or broken pipe) is ignored; `eprintln!` would panic.
+#[skuld::test]
+fn a_note_that_cannot_be_written_is_dropped() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    say_waiting(&mut Broken);
+}
+
+/// A mutex of the test's own, with no name and so no system state: [`take`] is the lock's wait, whichever
+/// mutex it waits on.
+fn private_mutex() -> OwnedHandle {
+    // SAFETY: null attributes and name are valid: the mutex is unnamed, not owned by the caller, and
+    // goes with its last handle.
+    let raw = unsafe { CreateMutexW(std::ptr::null(), 0, std::ptr::null()) };
+    assert!(!raw.is_null(), "create a mutex: {}", io::Error::last_os_error());
+    // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
+    unsafe { OwnedHandle::from_raw_handle(raw) }
+}
+
+/// Runs `body` with a holder thread that has taken `mutex` and keeps it until the `release` it is handed
+/// is sent on, or dropped (a body that panics lets the holder go, so the test fails instead of
+/// hanging). The holder releases the mutex itself: a mutex is released by the thread that holds it.
+fn with_holder<R>(mutex: &OwnedHandle, body: impl FnOnce(mpsc::Sender<()>) -> R) -> R {
+    let (held, is_held) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            // SAFETY: `mutex` is a live handle with `SYNCHRONIZE`.
+            assert_eq!(
+                unsafe { WaitForSingleObject(mutex.as_raw_handle(), INFINITE) },
+                WAIT_OBJECT_0
+            );
+            held.send(()).expect("the test is listening");
+            // A sent release and a dropped sender both end the hold.
+            let _ = released.recv();
+            // SAFETY: this thread holds the mutex, taken above.
+            assert_ne!(unsafe { ReleaseMutex(mutex.as_raw_handle()) }, 0);
+        });
+        is_held.recv().expect("the holder took the mutex");
+        body(release)
+    })
+}
+
+/// A waiter behind a held lock says so once, before it has the lock, and has it when the holder lets go.
+/// The holder lets go from inside the note, so the wait ends on that event and on nothing timed.
+#[skuld::test]
+fn a_waiter_behind_a_held_lock_says_so_once_and_then_takes_it() {
+    let mutex = private_mutex();
+    let mut said = 0;
+
+    let taken = with_holder(&mutex, |release| {
+        take(&mutex, || {
+            said += 1;
+            release.send(()).expect("the holder is waiting");
+        })
+    });
+
+    assert!(taken.is_ok(), "{:?}", taken.err());
+    assert_eq!(said, 1);
+    // SAFETY: the test thread took the mutex in `take`.
+    assert_ne!(unsafe { ReleaseMutex(mutex.as_raw_handle()) }, 0);
+}
+
+/// A lock nobody holds is taken without a word.
+#[skuld::test]
+fn a_waiter_that_finds_the_lock_free_says_nothing() {
+    let mutex = private_mutex();
+
+    let taken = take(&mutex, || panic!("nothing is waited for"));
+
+    assert!(taken.is_ok(), "{:?}", taken.err());
+}
+
+/// A lock whose holder died is the next one's at once: nothing is waited for.
+#[skuld::test]
+fn a_waiter_that_finds_the_lock_abandoned_says_nothing_and_takes_it() {
+    let mutex = private_mutex();
+    // A thread that takes it and exits without releasing abandons it.
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                take(&mutex, || panic!("nothing is waited for")).unwrap();
+            })
+            .join()
+            .unwrap();
+    });
+
+    let taken = take(&mutex, || panic!("an abandoned lock is not waited for"));
+
+    assert!(taken.is_ok(), "{:?}", taken.err());
 }
 
 /// A holder that exits without releasing leaves the mutex abandoned, which the next to take it

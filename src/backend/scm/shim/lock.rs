@@ -9,13 +9,14 @@
 //! any install does. The refusal above is all the defence there is: a global name specific enough
 //! to avoid an accidental collision needs none against a deliberate one, as with an environment
 //! variable.
-use std::io;
+use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, OpenMutexW, ReleaseMutex, WaitForSingleObject};
@@ -39,9 +40,10 @@ pub(crate) struct InstallLock {
 
 impl InstallLock {
     /// Takes the lock, waiting for whoever holds it, with no bound: the holder's release is the
-    /// event. A lock whose holder died is taken all the same (`WAIT_ABANDONED`): what it guarded is
-    /// verified by whoever takes it, not assumed from it. A lock that exists and belongs to an
-    /// account other than SYSTEM, Administrators or TrustedInstaller is
+    /// event. Each time it has to wait, however briefly, it says so on stderr first, naming the lock
+    /// (a failed write is ignored). A lock whose holder died is taken all the same (`WAIT_ABANDONED`):
+    /// what it guarded is verified by whoever takes it, not assumed from it. A lock that exists and
+    /// belongs to an account other than SYSTEM, Administrators or TrustedInstaller is
     /// [`Error::ShimLockForeign`], before any wait.
     pub(crate) fn acquire() -> Result<Self> {
         let descriptor = Descriptor::for_lock()?;
@@ -64,17 +66,43 @@ impl InstallLock {
                 });
             }
         }
+        take(&mutex, waiting_for_lock)?;
+        Ok(Self {
+            mutex,
+            _thread: PhantomData,
+        })
+    }
+}
+
+/// Says on stderr that the command waits for the lock; the library has no other channel for a notice. It
+/// claims no holder: any program that embeds the library, or another thread, can hold the lock.
+fn waiting_for_lock() {
+    say_waiting(&mut io::stderr());
+}
+
+/// Writes the notice to `out`, ignoring a failed write: a closed stderr must not fail a wait that succeeds.
+fn say_waiting(out: &mut impl Write) {
+    let _ = writeln!(out, "waiting for the install lock `{NAME}` to be released");
+}
+
+/// Takes `mutex`: at once if nobody holds it (or its holder died, `WAIT_ABANDONED`), else after calling
+/// `waiting` once, and then with no bound, until the holder releases it.
+fn take(mutex: &OwnedHandle, waiting: impl FnOnce()) -> Result<()> {
+    let wait = |milliseconds| {
         // SAFETY: `mutex` is a live handle with `SYNCHRONIZE`.
-        match unsafe { WaitForSingleObject(mutex.as_raw_handle(), INFINITE) } {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self {
-                mutex,
-                _thread: PhantomData,
-            }),
-            _ => Err(Error::os(
-                format!("wait for the install lock `{NAME}`"),
-                io::Error::last_os_error(),
-            )),
-        }
+        unsafe { WaitForSingleObject(mutex.as_raw_handle(), milliseconds) }
+    };
+    let mut state = wait(0);
+    if state == WAIT_TIMEOUT {
+        waiting();
+        state = wait(INFINITE);
+    }
+    match state {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(()),
+        _ => Err(Error::os(
+            format!("wait for the install lock `{NAME}`"),
+            io::Error::last_os_error(),
+        )),
     }
 }
 
