@@ -911,7 +911,6 @@ fn a_task_whose_command_has_a_backslash_quote_or_trailing_space_installs_and_run
 
 /// What a run shows and how it ends, through the library and through `goetia daemon run`: stdout and
 /// stderr lines in order, and the program's own exit code.
-#[cfg(feature = "cli")]
 #[skuld::test]
 fn run_streams_journal_output_and_returns_the_exit_code(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -929,13 +928,16 @@ fn run_streams_journal_output_and_returns_the_exit_code(#[fixture(systemd_group)
     assert_eq!(status.common.state, State::Idle, "{status:?}");
     assert_eq!(status.last_result, Some(Exit::Code(3)), "{status:?}");
 
-    let args = goetia::cli::run::Args { id: id.clone() };
-    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    // Truthful, not a stub: the group's elevation check is this test's own precondition.
-    let code = goetia::cli::run::run(&args, &get_manager, &|| true, &mut out, &mut err);
-    assert_eq!(code, ExitCode::Run(3), "stderr:\n{}", String::from_utf8_lossy(&err));
-    assert_eq!(String::from_utf8_lossy(&out), "out-line\nerr-line\n");
+    #[cfg(feature = "cli")]
+    {
+        let args = goetia::cli::run::Args { id: id.clone() };
+        let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        // Truthful, not a stub: the group's elevation check is this test's own precondition.
+        let code = goetia::cli::run::run(&args, &get_manager, &|| true, &mut out, &mut err);
+        assert_eq!(code, ExitCode::Run(3), "stderr:\n{}", String::from_utf8_lossy(&err));
+        assert_eq!(String::from_utf8_lossy(&out), "out-line\nerr-line\n");
+    }
 }
 
 /// What a run shows is what the program wrote: a last line with no newline has none, and a line longer
@@ -1358,8 +1360,10 @@ fn a_runs_marker_follows_its_starting_entry_and_no_journalctl_is_left(#[fixture(
 }
 
 /// Removes the local account `name` on drop.
+#[cfg(feature = "cli")]
 struct AccountGuard(String);
 
+#[cfg(feature = "cli")]
 impl Drop for AccountGuard {
     fn drop(&mut self) {
         warn_left_behind(cmd::run_cleanup("userdel", &[&[&self.0]], &[6]));
@@ -1370,6 +1374,7 @@ impl Drop for AccountGuard {
 /// that says the task never ran: even with a user journal of its own, which `journalctl` without
 /// `--system` would open and answer from with nothing. (The raw `journalctl` facts are in the
 /// knowledge base.) A service's status needs no journal.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn status_of_a_task_for_an_account_that_cannot_read_the_system_journal_is_the_error(
     #[fixture(systemd_group)] _group: &Group,

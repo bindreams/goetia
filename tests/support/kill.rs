@@ -138,7 +138,6 @@ pub fn killing_a_stopped_daemon_is_not_running(
         "{result:?}"
     );
 
-    // The CLI half needs a build with the `cli` feature.
     #[cfg(feature = "cli")]
     {
         let args = goetia::cli::kill::Args {

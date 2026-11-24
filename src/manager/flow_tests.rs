@@ -1418,10 +1418,10 @@ fn a_wait_error_and_a_stream_error_are_both_reported_and_an_open_outcome_stays_o
             reason: "the manager refused (seeded)".to_string(),
         }
     }
-    for (what, wait, code) in [
-        ("an unrecorded exit", unrecorded as fn() -> Error, 4),
-        ("a lost journal", in_doubt, 4),
-        ("a run that did not start", not_started, 1),
+    for (what, wait, indeterminate) in [
+        ("an unrecorded exit", unrecorded as fn() -> Error, true),
+        ("a lost journal", in_doubt, true),
+        ("a run that did not start", not_started, false),
     ] {
         let fake = Fake::new();
         fake.install(&a_task("nightly"), false).unwrap();
@@ -1440,7 +1440,7 @@ fn a_wait_error_and_a_stream_error_are_both_reported_and_an_open_outcome_stays_o
             report.contains(&wait().report().to_string()),
             "{what}: the wait's failure is said: {report}"
         );
-        assert_eq!(e.is_indeterminate(), code == 4, "{what}: {report}");
+        assert_eq!(e.is_indeterminate(), indeterminate, "{what}: {report}");
     }
 }
 

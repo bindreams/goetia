@@ -232,7 +232,7 @@ name = "marker_inertness"
 path = "tests/marker_inertness.rs"
 harness = false
 
-# `cli_dispatch` and `cli_binary` are the CLI's own tests: a build without the `cli` feature does not build them.
+# `cli_dispatch` and `cli_binary` test the CLI itself.
 [[test]]
 name = "cli_dispatch"
 path = "tests/cli_dispatch.rs"

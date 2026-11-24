@@ -8,6 +8,7 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cli")]
 use std::process::Command;
 use std::time::Duration;
 
@@ -112,6 +113,7 @@ fn write_dropin_text(id: &str, text: &str) {
 /// The same drop-in, in a directory no unprivileged process can open. Mode `000` on a directory the
 /// (root) test process owns is enough: `EACCES` applies to every uid but root's, and root is exactly
 /// the uid the reader in these tests is not.
+#[cfg(feature = "cli")]
 fn write_unreadable_dropin(id: &str) {
     write_dropin(id);
     fs::set_permissions(dropin_dir(id), fs::Permissions::from_mode(0o000)).expect("chmod 0000");
@@ -180,6 +182,7 @@ fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmInRoot<DirGuard>) {
 
 /// A manifest at a path an unprivileged process can actually reach: `tempfile`'s own directory is
 /// 0700, which `runuser -u nobody` cannot traverse.
+#[cfg(feature = "cli")]
 pub(crate) fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod the tempdir 0755");
@@ -1012,6 +1015,7 @@ fn a_stop_of_a_unit_systemd_cannot_load_has_nothing_to_stop(#[fixture(systemd_gr
 }
 
 /// `goetia <args>`, elevated as this test is, with `SYSTEMD_COLORS=<colors>` in its environment.
+#[cfg(feature = "cli")]
 fn goetia_coloured(colors: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_goetia"))
         .args(args)
@@ -1023,6 +1027,7 @@ fn goetia_coloured(colors: &str, args: &[&str]) -> std::process::Output {
 /// `SYSTEMD_COLORS` forces colour into a pipe, and `systemctl --version` wraps its number in escapes
 /// under it. None of its values may make goetia misread a supported systemd as one it refuses, on
 /// any verb the version gate guards.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_coloured_environment_does_not_fail_the_version_gate(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1070,6 +1075,7 @@ fn this_hosts_systemd_is_supported(#[fixture(systemd_group)] _group: &Group) {
 /// Written by a child `sh`, not by this process: a descriptor this process held open for writing
 /// could be inherited by a `fork` on another test thread, and `exec`ing the file would then fail
 /// with `ETXTBSY`.
+#[cfg(feature = "cli")]
 fn goetia_on_systemd(manager: u32, client: u32, args: &[&str]) -> std::process::Output {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = dir.path().join("systemctl");
@@ -1105,6 +1111,7 @@ fn goetia_on_systemd(manager: u32, client: u32, args: &[&str]) -> std::process::
 /// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, fail every start
 /// and stop on an unrecognized option, or fail a task's `disable` for want of `clean` on a timer. The
 /// running systemd and the client each count: an old one is refused next to a new other, and named.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1148,6 +1155,7 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(syste
 /// runs: the version gate refuses, naming what `systemctl` said, before anything is written. Its
 /// own mount namespace hides the manager's private socket, and the bus address points at nothing,
 /// so `systemctl show` fails at once while `/run/systemd/system` stays.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_running_systemd_that_cannot_be_asked_is_refused(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1188,6 +1196,7 @@ fn a_running_systemd_that_cannot_be_asked_is_refused(#[fixture(systemd_group)] _
 /// `goetia <args>` with a `systemctl` first on its `PATH` that appends every argv it is run with to
 /// `log`, one per line, and then runs the real one. Written by a child `sh`, as
 /// [`goetia_on_systemd`]'s stand-in is, and for the same reason.
+#[cfg(feature = "cli")]
 fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
     let path = std::env::var("PATH").expect("PATH is set");
     let real = std::env::split_paths(&path)
@@ -1221,6 +1230,7 @@ fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
 /// `restart`'s stop and start, `install --start`'s install, `--enable` and start, `uninstall`'s
 /// stop, `disable` and `daemon-reload`, share one pair of probes, and so one share of the budget.
 /// `enable` and `disable` ask it too: no request is sent before the manager is asked.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn the_version_gate_probes_once_per_daemon_per_verb(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1258,6 +1268,7 @@ fn the_version_gate_probes_once_per_daemon_per_verb(#[fixture(systemd_group)] _g
 
 /// Exit code of [`SCOPE_PIDS_PREAMBLE`] when the scope's `pids.max` is not `$EXPECTED_TASKS_MAX`;
 /// the script hardcodes it.
+#[cfg(feature = "cli")]
 const CAP_NOT_IN_FORCE: i32 = 97;
 
 /// Shell builtins only, so it forks nothing and the scope's task count is unchanged: prints the
@@ -1270,6 +1281,7 @@ const CAP_NOT_IN_FORCE: i32 = 97;
 /// missing from the root at boot (`root.controllers`) from the parent failing to enable it for its
 /// children (`parent.subtree` lacking `pids` while `root.subtree` has it). `parent.subtree` and
 /// `root.subtree` exist only on cgroup v2; on v1/hybrid they read `unreadable`.
+#[cfg(feature = "cli")]
 const SCOPE_PIDS_PREAMBLE: &str = r#"
 cg=; v1=; v1ctl=; seen=
 while read -r line; do
@@ -1300,8 +1312,10 @@ exec "$0" "$@"
 /// that outlives its `TimeoutStopSec` stays loaded in that state until `reset-failed`). `stop`, then
 /// `reset-failed`, each retried for `CLEANUP_BOUND` and then let go with a warning; never panics, so
 /// it also runs while the test unwinds. A scope that never was, or is gone already, is "not loaded".
+#[cfg(feature = "cli")]
 struct ScopeGuard(String);
 
+#[cfg(feature = "cli")]
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
         warn_left_behind(cmd::run_cleanup("systemctl", &[&["stop", &self.0]], &[5]));
@@ -1315,6 +1329,7 @@ impl Drop for ScopeGuard {
 
 /// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes
 /// alike — so that making a thread, or spawning a process, fails once they are spent.
+#[cfg(feature = "cli")]
 fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Output {
     Command::new("systemd-run")
         .args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")])
@@ -1330,6 +1345,7 @@ fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Out
 /// controllers, uptime, whether the unit is still loaded and PID 1's recent journal. It runs after
 /// the scope exited, so it cannot show the cap at start; the scope's own stderr line is the only
 /// start-time evidence.
+#[cfg(feature = "cli")]
 fn cap_evidence(unit: &str) -> String {
     let script = format!(
         "cd /sys/fs/cgroup; for f in cgroup.controllers cgroup.subtree_control system.slice/cgroup.controllers \
@@ -1362,6 +1378,7 @@ fn cap_evidence(unit: &str) -> String {
 /// cosca's threads are not reserved, and one joined (like a goetia listener detached) may still hold
 /// its `TasksMax` slot, so a waited restart's `start` leg can fail after its `stop` was sent. That
 /// race is open: the untouched-daemon assertion on a restart can fail on it.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1659,6 +1676,7 @@ fn list_reports_a_sid_account_as_ours_unusable(#[fixture(systemd_group)] _group:
 /// installed at the id. Reporting `unusable` for it — "goetia owns the id but cannot report on
 /// it", whose published remedy is `uninstall` — would put goetia's name and destructive advice on
 /// what is just as plausibly an administrator's override of a unit shipped elsewhere.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1695,6 +1713,7 @@ fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read(#[fixture(s
 /// complete. `4`, not the `1` `diff`'s catch-all `Err` arm gives: it was asked a question and could
 /// not determine the answer — the same reasoning that already puts `Outcome::RefuseUnusable` at
 /// `4` there.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1755,6 +1774,7 @@ fn install_refuses_an_unreadable_dropin_over_our_own_fragment(#[fixture(systemd_
 
 /// The same state seen by an unprivileged reader, through the CLI: `diff` must refuse it as an id
 /// goetia owns (exit `4`), never report that it cannot tell whether the id is installed.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn diff_refuses_our_own_fragment_with_an_unreadable_dropin(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1784,6 +1804,7 @@ fn diff_refuses_our_own_fragment_with_an_unreadable_dropin(#[fixture(systemd_gro
 /// `lstat` succeeds for an unreadable regular file on directory-search permission alone, so
 /// classifying it from "the open failed and the `lstat` did not" reported `foreign` — "demonstrably
 /// not managed by goetia" — about a file whose contents nobody had looked at.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_reports_undetermined_for_a_fragment_it_cannot_read(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -1983,6 +2004,7 @@ fn list_ignores_foreign_units(#[fixture(systemd_group)] _group: &Group) {
 
 /// `list` needs no elevation: an unprivileged run reports an install it can read as ours, not as
 /// `undetermined`. The ids of other daemons on the host are not asserted about.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -2482,6 +2504,7 @@ fn an_executable_path_with_dollars_runs_with_the_path_as_argv0(#[fixture(systemd
 /// `LoadCredential=` commonly are 0600) is what it meets. Skipping it certifies "no such daemon" off
 /// a read that never happened — the id may be a stranger's *or* goetia's own, and the listing cannot
 /// tell which. One unreadable unit still must not take down the listing of every other daemon.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_unit_it_cannot_read_as_undetermined(#[fixture(systemd_group)] _group: &Group) {
     let readable = support::random_test_id();
@@ -2519,6 +2542,7 @@ fn unelevated_list_reports_a_unit_it_cannot_read_as_undetermined(#[fixture(syste
 /// The same denial at the same privilege boundary, over a unit goetia *does* own. The end-to-end
 /// proof that an unelevated `daemon list` on a populated host stops exiting `0` with the daemon
 /// missing from its document.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_root_only_unit_as_undetermined(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -2653,6 +2677,7 @@ fn undetermined_for(listed: &[Installed], id: &str) -> Vec<String> {
 /// shipped `0700` for a unit that lives in `/usr/lib`, met by an unelevated `list` — and stated as
 /// the CLI answers it: `show` may never call an id absent on a listing that did not establish
 /// absence.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_show_cannot_call_absent_an_id_whose_dropin_it_could_not_read(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -2688,6 +2713,7 @@ fn unelevated_show_cannot_call_absent_an_id_whose_dropin_it_could_not_read(#[fix
 /// The runnable half of the same defect this branch fixes on Windows, where an aggregate entry
 /// standing for one denied service dropped the name it was holding and made `show` answer "could
 /// not be determined" for every id on the host, permanently, over one stranger's ACL.
+#[cfg(feature = "cli")]
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_named_undetermined_entry_blocks_only_its_own_id(#[fixture(systemd_group)] _group: &Group) {
     let denied = support::random_test_id();
@@ -2801,11 +2827,13 @@ fn list_does_not_hang_on_a_fifo_in_the_unit_directory(#[fixture(systemd_group)] 
 /// `runuser` (util-linux), not `sudo`: invoked by root it never prompts, and
 /// it has none of `sudo`'s `requiretty`/PAM-session pitfalls when spawned from
 /// a test process with no controlling terminal.
+#[cfg(feature = "cli")]
 fn run_unelevated(args: &[&str]) -> std::process::Output {
     run_as("nobody", args)
 }
 
 /// [`run_unelevated`] as the account `account`.
+#[cfg(feature = "cli")]
 pub(crate) fn run_as(account: &str, args: &[&str]) -> std::process::Output {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Per call, not per process: three tests stage a binary now, and skuld runs them concurrently —
