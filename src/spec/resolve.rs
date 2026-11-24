@@ -783,8 +783,13 @@ pub(crate) fn parse_protocol(id: &Id, raw: &str) -> Result<Protocol, Error> {
 pub(crate) fn parse_type(id: &Id, raw: &str) -> Result<DaemonKind, Error> {
     DaemonKind::parse(raw).ok_or_else(|| {
         renamed_type(id, raw)
-            .unwrap_or_else(|| invalid(id, &format!("`type` must be `service` or `task`, not `{raw}`")))
+            .unwrap_or_else(|| invalid(id, &format!("`type` must be {}, not `{raw}`", the_kinds_written())))
     })
+}
+
+/// The values `type` takes, as the messages write them: "`service` or `task`".
+fn the_kinds_written() -> String {
+    DaemonKind::ALL.map(|kind| format!("`{kind}`")).join(" or ")
 }
 
 /// The refusal of `type: simple` and `type: managed`, which became `protocol: plain` and `protocol: native`.
@@ -796,7 +801,10 @@ fn renamed_type(id: &Id, raw: &str) -> Option<Error> {
     };
     Some(invalid(
         id,
-        &format!("`type: {raw}` is now `protocol: {protocol}`; `type` is `service` or `task`"),
+        &format!(
+            "`type: {raw}` is now `protocol: {protocol}`; `type` is {}",
+            the_kinds_written()
+        ),
     ))
 }
 

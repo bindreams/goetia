@@ -278,7 +278,8 @@ impl DaemonKind {
     /// The one spelling of the kind: the `--json` and text forms of `status` and `list`, the
     /// manifest's `type:` value that [`parse`](DaemonKind::parse) accepts, the `type` line of `show`
     /// and of the diff, and the noun in error messages. [`Serialize`](serde::Serialize) and
-    /// [`Display`](std::fmt::Display) go through here, so they cannot drift.
+    /// [`Display`](std::fmt::Display) go through here, so they cannot drift. The spelling a blob
+    /// persists is separate: it is a serde attribute in `blob.rs`, which needs a literal.
     pub fn as_str(self) -> &'static str {
         match self {
             DaemonKind::Service => "service",

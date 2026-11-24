@@ -52,15 +52,29 @@ fn a_daemon_kind_serializes_as_service_or_task() {
 
 #[skuld::test]
 fn a_daemon_kind_parses_from_the_spelling_it_prints_as() {
-    for kind in DaemonKind::ALL {
-        assert_eq!(DaemonKind::parse(kind.as_str()), Some(kind));
-        assert_eq!(kind.to_string(), kind.as_str());
+    for (kind, spelling) in [(DaemonKind::Service, "service"), (DaemonKind::Task, "task")] {
+        assert_eq!(DaemonKind::parse(spelling), Some(kind));
+        assert_eq!(kind.to_string(), spelling);
     }
+}
+
+/// Adding a variant fails to compile at the `match`: add it to the match, to `ALL` and to the list below.
+#[skuld::test]
+fn every_daemon_kind_is_in_all_once() {
+    let _exhaustive = |kind: DaemonKind| match kind {
+        DaemonKind::Service | DaemonKind::Task => (),
+    };
+    for kind in [DaemonKind::Service, DaemonKind::Task] {
+        assert_eq!(DaemonKind::ALL.iter().filter(|listed| **listed == kind).count(), 1);
+    }
+    assert_eq!(DaemonKind::ALL.len(), 2);
 }
 
 #[skuld::test]
 fn a_daemon_kind_does_not_parse_from_any_other_text() {
-    for text in ["", "Service", "TASK", " task", "service ", "services", "simple", "managed"] {
+    for text in [
+        "", "Service", "TASK", " task", "service ", "services", "simple", "managed",
+    ] {
         assert_eq!(DaemonKind::parse(text), None, "{text:?}");
     }
 }
@@ -69,10 +83,6 @@ fn a_daemon_kind_does_not_parse_from_any_other_text() {
 fn the_other_daemon_kind_is_the_one_that_is_not_this() {
     assert_eq!(DaemonKind::Service.other(), DaemonKind::Task);
     assert_eq!(DaemonKind::Task.other(), DaemonKind::Service);
-    for kind in DaemonKind::ALL {
-        assert_ne!(kind.other(), kind);
-        assert_eq!(kind.other().other(), kind);
-    }
 }
 
 #[skuld::test]
