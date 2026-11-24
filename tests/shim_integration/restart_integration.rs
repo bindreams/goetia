@@ -19,8 +19,8 @@ use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
 use crate::common::{
-    LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, fixture_command, kill_process, manager, recorded_exit,
-    scm_status, simple_spec,
+    LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, fixture_command, kill_process, manager, preshutdown_of,
+    recorded_exit, scm_status, set_preshutdown, simple_spec,
 };
 use crate::simple::SCM_DENIAL;
 use crate::support::registry::parameters_key;
@@ -565,4 +565,36 @@ fn reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions(#
     // were written.
     let again = mgr.install(&spec, false).expect("install again");
     assert_eq!(again, Outcome::UpToDate);
+}
+
+/// A service installed before the pre-shutdown time was part of the registration reads Windows' default, 10 s: the
+/// next `install` brings it up to date, as a version refresh and not as a hand-edit.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
+fn reinstalling_an_earlier_version_simple_service_sets_its_preshutdown_time(#[fixture(scm_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let logs = LogDir::new();
+    let mgr = manager();
+    let _guard = ShimGuard::new(&id);
+
+    let spec = on_failure(&id, fixture_command("report", &["1"]), ONE_SECOND, &logs);
+    mgr.install(&spec, false).expect("install");
+    set_preshutdown(&id, Duration::from_secs(10));
+    register_as_earlier_version(&id, goetia::version());
+    assert_eq!(preshutdown_of(&id), Duration::from_secs(10));
+
+    let outcome = mgr
+        .install(&spec, false)
+        .expect("re-install over the earlier registration");
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: EARLIER_VERSION.to_string()
+        }
+    );
+    assert_eq!(
+        preshutdown_of(&id),
+        Duration::from_secs(40),
+        "the default stop action's `timeout` and the teardown's 10 s"
+    );
+    assert_eq!(mgr.install(&spec, false).expect("install again"), Outcome::UpToDate);
 }

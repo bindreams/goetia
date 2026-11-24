@@ -763,7 +763,7 @@ impl Drop for EndTree {
 /// has written its marker and exited, which a tree kill at the root's exit would have prevented.
 #[skuld::test]
 fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixture(temp_dir)] dir: &Path) {
-    use crate::backend::scm::shim::run::stop_bus::{StopPlan, Supervisor, WaitOutcome};
+    use crate::backend::scm::shim::run::stop_bus::{PROGRESS_PERIOD, StopPlan, Supervisor, WaitOutcome};
     use std::sync::mpsc::{self, TryRecvError};
 
     let script_path = |name: &str| dir.join(name).to_str().expect("a UTF-8 path").replace('\\', "/");
@@ -807,7 +807,7 @@ fn a_descendant_that_outlives_the_root_keeps_the_supervisors_wait_going(#[fixtur
     cmd.graceful_stop(move |_| File::create(&release).map(drop).map_err(cosca::error::Error::Io));
 
     let fake = FakeGuard::new();
-    let supervisor = Arc::new(Supervisor::new(Arc::new(Real::default()), fake.log()));
+    let supervisor = Arc::new(Supervisor::new(Arc::new(Real::default()), fake.log(), PROGRESS_PERIOD));
     let waiter = supervisor.waiter(ID).expect("make the waiter thread");
     let child: Arc<dyn Spawned> = Arc::from(Real::default().spawn(cmd).expect("spawn the daemon"));
     let _end = EndTree(Arc::clone(&child));

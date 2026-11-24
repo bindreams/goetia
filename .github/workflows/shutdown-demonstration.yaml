@@ -1,0 +1,96 @@
+name: Shutdown demonstration
+
+# The one run of the whole path at a real Windows shutdown: goetia's own shim, in a Windows Server Core container
+# on the runner, stops a service when the container shuts down, as `goetia daemon stop` does (the script says
+# what passes). It runs for every pull request to `main`, for a pull request to any branch that touches what
+# the path is made of, and on dispatch.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # A workflow's `branches` and `paths` filters are both required, so "every pull request to `main`, or one that
+  # touches these paths" cannot be written as filters: the paths are matched here.
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          PULL: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" != pull_request || "$BASE" == main ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(gh api -X GET "repos/$REPO/pulls/$PULL/files" --paginate --jq '.[].filename')"
+          paths='^(src/|build\.rs$|Cargo\.toml$|Cargo\.lock$|\.github/workflows/shutdown-demonstration\.yaml$|\.github/scripts/shutdown-demonstration/)'
+          if grep -Eq "$paths" <<< "$files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  demonstration:
+    name: Demonstration (windows-latest, Server Core container)
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: shutdown-demonstration
+
+      # The static C runtime, so that the container (which has no Visual C++ runtime) runs them.
+      - name: Build goetia and the shim
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --locked --release --bins
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+
+      - name: Run the demonstration
+        shell: pwsh
+        run: ./.github/scripts/shutdown-demonstration/run.ps1 -Release target\release -Work "$env:RUNNER_TEMP\shutdown-demonstration"
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: shutdown-demonstration-logs
+          path: ${{ runner.temp }}/shutdown-demonstration/out/
+          if-no-files-found: ignore

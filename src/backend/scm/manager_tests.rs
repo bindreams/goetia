@@ -26,6 +26,7 @@ fn dummy_reg(account: Option<&str>) -> ScmRegistration {
         arguments: vec![],
         account: account.map(str::to_string),
         failure_actions: None,
+        preshutdown: None,
         environment: vec![],
         parameters: BTreeMap::new(),
         stray_parameters: Vec::new(),
@@ -1748,6 +1749,77 @@ fn a_service_uninstall_with_an_unusable_task_scheduler_reports_the_leftover_shim
     assert!(said.contains("the Schedule service stopped"), "{said}");
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "nothing was swept");
     fake.finish();
+}
+
+// the writes after the service ========================================================================================
+
+/// The order of the writes after the service ([`writes_after_service`] says why): the marker first on a create, the
+/// pre-shutdown time first on an update.
+#[skuld::test]
+fn a_create_writes_the_marker_before_the_preshutdown_time_and_an_update_after_it() {
+    let time = Duration::from_secs(40);
+    assert_eq!(
+        writes_after_service(Some(time), true),
+        [
+            Write::Parameters,
+            Write::Preshutdown(time),
+            Write::Environment,
+            Write::FailureActions
+        ]
+    );
+    assert_eq!(
+        writes_after_service(Some(time), false),
+        [
+            Write::Preshutdown(time),
+            Write::Parameters,
+            Write::Environment,
+            Write::FailureActions
+        ]
+    );
+    for create in [true, false] {
+        assert_eq!(
+            writes_after_service(None, create),
+            [Write::Parameters, Write::Environment, Write::FailureActions],
+            "no pre-shutdown time to write (create: {create})"
+        );
+    }
+}
+
+/// A snapshot of the service `frpc` with the blob a read left it: `Ok` for one that decoded, `Err` for one that did not.
+fn snapshot_of(blob: Decoded) -> ScmSnapshot {
+    ScmSnapshot::new(Id::try_from("frpc").unwrap(), blob, (Parameters::default(), None))
+}
+
+/// The pre-shutdown time of an installed service is read where goetia sets one, so that its drift shows, and not for a
+/// native service, whose time is its own. A service whose blob does not decode is read: what it has is shown as it is.
+#[skuld::test]
+fn the_preshutdown_time_is_read_of_a_plain_service_and_of_one_whose_blob_does_not_decode() {
+    let undecodable = snapshot_of(Err(Arc::new(Error::blob("corrupt"))));
+
+    assert!(reads_preshutdown(&snapshot_of(Ok(blob_of(Protocol::Plain)))), "plain");
+    assert!(
+        !reads_preshutdown(&snapshot_of(Ok(blob_of(Protocol::Native)))),
+        "native"
+    );
+    assert!(reads_preshutdown(&undecodable), "a blob that does not decode");
+}
+
+/// The service an install replaces counts as one whose time goetia set only when its blob says it was plain: with
+/// none (a create) or a blob that does not decode it is not known to have been, and the value it has is left alone.
+#[skuld::test]
+fn a_service_is_known_to_have_had_its_preshutdown_time_set_only_by_a_blob_that_says_plain() {
+    let undecodable = snapshot_of(Err(Arc::new(Error::blob("corrupt"))));
+
+    assert!(
+        preshutdown_was_set(Some(&snapshot_of(Ok(blob_of(Protocol::Plain))))),
+        "plain"
+    );
+    assert!(
+        !preshutdown_was_set(Some(&snapshot_of(Ok(blob_of(Protocol::Native))))),
+        "native"
+    );
+    assert!(!preshutdown_was_set(Some(&undecodable)), "a blob that does not decode");
+    assert!(!preshutdown_was_set(None), "a create");
 }
 
 // apply refuses an account that is no user ============================================================================

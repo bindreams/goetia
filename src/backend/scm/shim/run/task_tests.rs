@@ -113,7 +113,7 @@ impl Run {
         std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join(ID)).unwrap();
         runs.ensure(&[process_user_sid()]).unwrap();
         let fake = FakeGuard::new();
-        let supervisor = Arc::new(Supervisor::new(fake.os(), fake.task_log()));
+        let supervisor = Arc::new(Supervisor::new(fake.os(), fake.task_log(), PROGRESS_PERIOD));
         Run {
             fake,
             supervisor,

@@ -22,7 +22,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
 };
 use windows_sys::Win32::System::Services::{
-    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE,
+    SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
 use super::*;
@@ -31,9 +32,10 @@ use crate::backend::scm::shim::run::os::fake::{
     AskReply, ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, ProcessCall,
     TreeWaitReply, WaitReply, WaiterEnd, tree_kill_refused, wait_failed, wait_failed_with_code,
 };
-use crate::backend::scm::shim::run::stop_bus::WaitEnd;
+use crate::backend::scm::shim::run::stop_bus::{PROGRESS_PERIOD, StopEvent, WaitEnd};
 use crate::backend::scm::shim::run::test_support::{
-    assert_failures, assert_one_failure, chained, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
+    assert_failures, assert_one_failure, began, chained, fallback_refused_failure, not_found, supervisor,
+    tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
@@ -394,7 +396,11 @@ fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs()
     // What `from_program_data` said of itself.
     assert_eq!(fake.take_failures().len(), 1);
 
-    let launched = launch(&spec_logging_to(None), &Supervisor::new(fake.os(), log), ID);
+    let launched = launch(
+        &spec_logging_to(None),
+        &Supervisor::new(fake.os(), log, PROGRESS_PERIOD),
+        ID,
+    );
 
     assert!(launched.is_ok(), "a daemon with nowhere to log was not run");
     assert_one_failure(&fake.take_failures(), ID, NO_LOG_FILE);
@@ -813,7 +819,7 @@ fn run_daemon_is_run_pass_then_reported() {
 }
 
 /// One pass whose stop is accepted as the daemon is running, with the process the `Fake` spawns, the plan the pass runs
-/// and the `WaitEnd` `on_stopping` was told.
+/// and the `WaitEnd` that `Began` told.
 fn stopped_pass(plan: StopPlan, process: FakeProcess) -> (PassOutcome, Vec<WaitEnd>) {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
@@ -827,7 +833,7 @@ fn stopped_pass(plan: StopPlan, process: FakeProcess) -> (PassOutcome, Vec<WaitE
         &supervisor,
         ID,
         || assert!(bus.request_stop()),
-        |end| told.push(end),
+        |event| told.extend(began(event)),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
@@ -926,8 +932,8 @@ fn a_stop_accepted_after_the_exit_was_seen_carries_the_exit_code_and_is_clean() 
         &supervisor,
         ID,
         || {},
-        |end| {
-            assert_eq!(end, WaitEnd::Exit);
+        |event| {
+            assert_eq!(event, StopEvent::Began(WaitEnd::Exit));
             assert!(bus.request_stop());
         },
     );
@@ -988,12 +994,79 @@ fn run_recording_stopping(
 /// while a host holds it (measured), which is what keeps `start` from reading the service as up.
 #[skuld::test]
 fn the_stopping_status_accepts_no_control_and_records_no_exit() {
-    let status = stopping_status(Duration::from_secs(10));
+    let status = stopping_status(Duration::from_secs(10), 1);
 
     assert_eq!(status.dwCurrentState, SERVICE_STOP_PENDING);
     assert_eq!(status.dwControlsAccepted, 0);
     assert_eq!((status.dwWin32ExitCode, status.dwServiceSpecificExitCode), (0, 0));
     assert_eq!((status.dwCheckPoint, status.dwWaitHint), (1, 10_000));
+}
+
+/// The first report is checkpoint 1; each report that the stop is still going on is one higher, with the hint the
+/// stop began with.
+#[skuld::test]
+fn each_report_that_the_stop_is_going_on_has_the_checkpoint_one_higher() {
+    let mut progress = StopProgress::default();
+
+    let first = progress.begin(Duration::from_secs(40));
+    let second = progress.advance();
+    let third = progress.advance();
+
+    for status in [first, second, third] {
+        assert_eq!(status.dwCurrentState, SERVICE_STOP_PENDING);
+        assert_eq!(status.dwControlsAccepted, 0);
+        assert_eq!(status.dwWaitHint, 40_000);
+    }
+    assert_eq!([first.dwCheckPoint, second.dwCheckPoint, third.dwCheckPoint], [1, 2, 3]);
+}
+
+/// A run tells its observer that the stop began, once, and then that it goes on while the stop's wait does: a daemon
+/// that is still there after two slices of a long `timeout` is progress twice, once after each, and not after the
+/// slice that saw it exit.
+#[skuld::test]
+fn a_run_reports_progress_while_its_stop_waits() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    let service = stopping_by(StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(Duration::from_secs(3600)),
+    });
+    fake.will_make_thread();
+    fake.will_spawn(
+        FakeProcess::new()
+            .wait(WaitReply::Blocks)
+            // The read of the exit status of the daemon that the stop ended.
+            .wait(WaitReply::Blocks)
+            .ask(AskReply::Sent)
+            .wait_tree(TreeWaitReply::Remain)
+            .wait_tree(TreeWaitReply::Remain)
+            .wait_tree(TreeWaitReply::Drained)
+            .send_kill_tree(KillReply::Ends),
+    );
+    let bus = Arc::clone(&supervisor.bus);
+    let mut events = Vec::new();
+
+    let reported = super::run_daemon(
+        &service,
+        StopPlan::of(&service),
+        &supervisor,
+        ID,
+        || assert!(bus.request_stop()),
+        |event| events.push(event),
+    );
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(
+        events,
+        [
+            StopEvent::Began(WaitEnd::Stop),
+            StopEvent::Progress,
+            StopEvent::Progress
+        ],
+        "began before any progress, and a progress after each slice but the last"
+    );
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    let _ = (fake.take_warnings(), fake.take_infos());
 }
 
 /// The hint covers what the stop can take: the `timeout` and the teardown, in milliseconds, and for no
@@ -1002,20 +1075,65 @@ fn the_stopping_status_accepts_no_control_and_records_no_exit() {
 fn the_stopping_hint_is_the_stops_longest_wait_in_milliseconds() {
     let longest = StopAction::MAX_TIMEOUT + StopAction::TEARDOWN_MARGIN;
 
-    assert_eq!(stopping_status(Duration::from_secs(40)).dwWaitHint, 40_000);
-    assert_eq!(stopping_status(longest).dwWaitHint, 86_410_000);
-    assert_eq!(stopping_status(Duration::MAX).dwWaitHint, u32::MAX);
+    assert_eq!(stopping_status(Duration::from_secs(40), 1).dwWaitHint, 40_000);
+    assert_eq!(stopping_status(longest, 1).dwWaitHint, 86_410_000);
+    assert_eq!(stopping_status(Duration::MAX, 1).dwWaitHint, u32::MAX);
     assert_eq!(
-        stopping_status(Duration::from_secs(u64::from(u32::MAX))).dwWaitHint,
+        stopping_status(Duration::from_secs(u64::from(u32::MAX)), 1).dwWaitHint,
         u32::MAX
     );
 }
 
-/// A run reports the hint of its plan to the status setter: a stop reports the stop's, an exit the exit's.
+/// The hint of a stop is the stop action's longest wait ([`StopAction::longest_stop`], the one rule the pre-shutdown
+/// time and the CLI's wait read too); the exit of the daemon by itself is torn down, not asked, so it is the teardown.
 #[skuld::test]
-fn a_run_reports_the_hint_of_its_plan_for_what_ended_it() {
+fn the_hint_is_the_stop_actions_longest_wait_and_an_exit_is_the_teardown() {
+    let action = |send_signal, timeout: Option<u64>| StopAction {
+        send_signal,
+        timeout: timeout.map(Duration::from_secs),
+    };
+    let secs = Duration::from_secs;
+    for (action, stop) in [
+        (action(StopSignal::Terminate, Some(30)), secs(40)),
+        (action(StopSignal::Quit, None), Duration::MAX),
+        (action(StopSignal::Kill, None), secs(10)),
+        (action(StopSignal::WmClose, Some(30)), secs(40)),
+    ] {
+        assert_eq!(stop_hint(&action, WaitEnd::Stop), stop, "{action:?}");
+        assert_eq!(stop_hint(&action, WaitEnd::Exit), secs(10), "{action:?}");
+    }
+}
+
+/// The status a run reports for what its stop's observer is told: a stop that began reports `STOP_PENDING` with the
+/// stop's hint and checkpoint 1, and progress the checkpoint one higher with the same hint.
+#[skuld::test]
+fn a_stop_began_is_reported_with_its_hint_and_progress_with_the_checkpoint_one_higher() {
+    let action = StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(Duration::from_secs(30)),
+    };
+    let mut progress = StopProgress::default();
+
+    let reports = [
+        stop_report(StopEvent::Began(WaitEnd::Stop), &action, &mut progress),
+        stop_report(StopEvent::Progress, &action, &mut progress),
+        stop_report(StopEvent::Progress, &action, &mut progress),
+    ];
+
+    for report in reports {
+        assert_eq!(report.dwCurrentState, SERVICE_STOP_PENDING);
+        assert_eq!(report.dwControlsAccepted, 0);
+        assert_eq!(report.dwWaitHint, 40_000, "the `timeout` and the teardown");
+    }
+    assert_eq!(reports.map(|report| report.dwCheckPoint), [1, 2, 3]);
+}
+
+/// A run reports the hint of its stop action to the status setter: a stop reports the stop's, an exit the exit's.
+#[skuld::test]
+fn a_run_reports_the_hint_of_its_stop_action_for_what_ended_it() {
     let service = spec();
     let plan = StopPlan::of(&service);
+    let mut progress = StopProgress::default();
     let mut hints = Vec::new();
 
     let fake = FakeGuard::new();
@@ -1026,7 +1144,7 @@ fn a_run_reports_the_hint_of_its_plan_for_what_ended_it() {
             .wait(WaitReply::Blocks)
             // The read of the exit status of a daemon that exited by itself.
             .wait(WaitReply::Blocks)
-            .ask(AskReply::SentAndExits(0))
+            .ask(AskReply::Sent)
             .wait_tree(TreeWaitReply::Drained)
             .send_kill_tree(KillReply::Ends),
     );
@@ -1037,20 +1155,27 @@ fn a_run_reports_the_hint_of_its_plan_for_what_ended_it() {
         &stopped,
         ID,
         || assert!(bus.request_stop()),
-        |hint| hints.push(hint),
+        |event| hints.push(stop_report(event, service.stop_action(), &mut progress).dwWaitHint),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     let _ = fake.take_infos();
-    assert_eq!(hints, [plan.wait_hint(WaitEnd::Stop)]);
-    assert_eq!(hints, [Duration::from_secs(40)], "the `timeout` and the teardown");
+    assert_eq!(hints, [40_000], "the `timeout` and the teardown");
 
+    let mut progress = StopProgress::default();
     let mut hints = Vec::new();
     let fake = FakeGuard::new();
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
-    super::run_daemon(&service, plan, &supervisor(&fake), ID, || {}, |hint| hints.push(hint));
+    super::run_daemon(
+        &service,
+        plan,
+        &supervisor(&fake),
+        ID,
+        || {},
+        |event| hints.push(stop_report(event, service.stop_action(), &mut progress).dwWaitHint),
+    );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert_eq!(hints, [Duration::from_secs(10)], "the teardown alone");
+    assert_eq!(hints, [10_000], "the teardown alone");
 }
 
 // The host that can ask -----------------------------------------------------------------------------------------------
@@ -1375,6 +1500,34 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
         supervisor.bus.settle(Reported::DaemonExit(7)),
         Reported::Clean,
         "the stop did not reach the bus"
+    );
+}
+
+/// A system shutdown's `PRESHUTDOWN` is a stop: the bus accepts it as it accepts `STOP`, so the plan of the
+/// `stop-action` runs and the run ends clean, with no path of its own for a shutdown.
+#[skuld::test]
+fn a_preshutdown_is_a_stop() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+
+    assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_PRESHUTDOWN), NO_ERROR);
+
+    assert_eq!(
+        supervisor.bus.settle(Reported::DaemonExit(7)),
+        Reported::Clean,
+        "the preshutdown did not reach the bus as a stop"
+    );
+}
+
+/// A running service accepts `STOP` and `PRESHUTDOWN`: without the second, Windows sends a shutdown nothing.
+#[skuld::test]
+fn a_running_service_accepts_stop_and_preshutdown() {
+    let status = running_status();
+
+    assert_eq!(status.dwCurrentState, SERVICE_RUNNING);
+    assert_eq!(
+        status.dwControlsAccepted,
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN
     );
 }
 

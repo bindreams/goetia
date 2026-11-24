@@ -3,6 +3,7 @@
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
@@ -12,6 +13,9 @@ use goetia::spec::{DaemonFields, DaemonSpec, Protocol, ServiceFields, ServiceSpe
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Services::{
+    QueryServiceConfig2W, SERVICE_CONFIG_PRESHUTDOWN_INFO, SERVICE_PRESHUTDOWN_INFO,
+};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     WaitForSingleObject,
@@ -188,6 +192,50 @@ pub fn conformance_mk(logs: &LogDir, id: &str) -> DaemonSpec {
 }
 
 // SCM records and the shim process ====================================================================================
+
+/// The time Windows waits for `id` to stop at a system shutdown, as SCM holds it: `QueryServiceConfig2W` with
+/// `SERVICE_CONFIG_PRESHUTDOWN_INFO`, which a service that never set one reads as 10 s. Read here and not through the
+/// library, so that what an install wrote is checked by something other than the code that wrote it.
+pub fn preshutdown_of(id: &str) -> Duration {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .expect("connect to the service manager");
+    let service = manager
+        .open_service(id, ServiceAccess::QUERY_CONFIG)
+        .unwrap_or_else(|e| panic!("open service {id}: {e}"));
+    let mut info = SERVICE_PRESHUTDOWN_INFO {
+        dwPreshutdownTimeout: 0,
+    };
+    let mut needed = 0;
+    // SAFETY: `service` is a live handle with `SERVICE_QUERY_CONFIG`, the buffer is a `SERVICE_PRESHUTDOWN_INFO` of
+    // the size passed, and `needed` is a valid out-parameter.
+    let read = unsafe {
+        QueryServiceConfig2W(
+            service.raw_handle(),
+            SERVICE_CONFIG_PRESHUTDOWN_INFO,
+            (&raw mut info).cast::<u8>(),
+            size_of::<SERVICE_PRESHUTDOWN_INFO>() as u32,
+            &mut needed,
+        )
+    };
+    assert_ne!(
+        read,
+        0,
+        "QueryServiceConfig2W on {id}: {}",
+        std::io::Error::last_os_error()
+    );
+    Duration::from_millis(info.dwPreshutdownTimeout.into())
+}
+
+/// Sets the time Windows waits for `id` to stop at a system shutdown, as a service from before goetia set one has it.
+pub fn set_preshutdown(id: &str, timeout: Duration) {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .expect("connect to the service manager");
+    manager
+        .open_service(id, ServiceAccess::CHANGE_CONFIG)
+        .unwrap_or_else(|e| panic!("open service {id}: {e}"))
+        .set_preshutdown_timeout(timeout)
+        .unwrap_or_else(|e| panic!("set the pre-shutdown time of {id}: {e}"));
+}
 
 /// SCM's own record of `id`: state, exit code, and the pid of the process hosting it.
 pub fn scm_status(id: &str) -> ServiceStatus {

@@ -76,6 +76,15 @@ pub(crate) const FIELDS: [&str; 4] = [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION,
 /// relaunch loop, short enough that a benign flap recovers quickly.
 const DEFAULT_RESTART_DELAY: Duration = Duration::from_secs(1);
 
+/// The pre-shutdown time of a service that never set one, which is what Windows (build 15063 and later) gives a
+/// service that accepts `PRESHUTDOWN`, and what an install puts back when a plain service becomes a native one.
+pub const DEFAULT_PRESHUTDOWN: Duration = Duration::from_millis(10_000);
+
+/// The pre-shutdown time of a stop that has no `timeout`: the largest value the field holds, which Windows waits for
+/// as long as the service's checkpoint moves (still waited for at 900 s when measured). `Duration` has the
+/// value in milliseconds, which is what `windows-service`'s setter reads without panicking.
+const PRESHUTDOWN_NO_TIMEOUT: Duration = Duration::from_millis(u32::MAX as u64);
+
 /// `dwResetPeriod`: the window of health after which SCM's failure counter
 /// resets to zero — **not** the restart delay, which is `SC_ACTION.Delay`
 /// (`FailureActions::delay` below). Not spec data: `goetia.yaml` has no
@@ -107,6 +116,10 @@ pub struct ScmRegistration {
     /// `None` => `LocalSystem`.
     pub account: Option<String>,
     pub failure_actions: Option<FailureActions>,
+    /// How long Windows waits for the service to stop at a system shutdown (`SERVICE_CONFIG_PRESHUTDOWN_INFO`): the
+    /// stop action's longest wait ([`StopAction::longest_stop`](crate::spec::StopAction::longest_stop)). `None` for a
+    /// service that goetia does not stop (`protocol: native`), which keeps whatever value it has.
+    pub preshutdown: Option<Duration>,
     /// The `Services\<name>\Environment` `REG_MULTI_SZ` lines, as written and as read back: raw,
     /// so a hand-reordered or malformed value compares as it stands. Empty for a `hosted` service
     /// — see [`registration`].
@@ -322,10 +335,28 @@ fn build(
         arguments,
         account,
         failure_actions,
+        preshutdown: sets_preshutdown(spec).then(|| {
+            s.stop_action
+                .longest_stop()
+                .map_or(PRESHUTDOWN_NO_TIMEOUT, |longest| longest.min(PRESHUTDOWN_NO_TIMEOUT))
+        }),
         environment,
         parameters,
         stray_parameters: Vec::new(),
     })
+}
+
+/// Whether goetia sets the pre-shutdown time of the service `spec` describes: a service the shim hosts
+/// ([`hosted`]), whose stop it runs. A native service runs its own stop, and a task is not a service.
+pub(crate) fn sets_preshutdown(spec: &DaemonSpec) -> bool {
+    matches!(spec, DaemonSpec::Service(_)) && hosted(spec)
+}
+
+/// The pre-shutdown time an install writes: `wanted`, else [`DEFAULT_PRESHUTDOWN`] when `was_set` (a plain service
+/// becoming native gives back the value goetia wrote), else nothing. `was_set` is `false` for a definition that cannot
+/// be decoded.
+pub fn preshutdown_to_write(wanted: Option<Duration>, was_set: bool) -> Option<Duration> {
+    wanted.or(was_set.then_some(DEFAULT_PRESHUTDOWN))
 }
 
 /// [`registration`], for an install or its preview: also refuses a `protocol: plain` daemon when the
@@ -557,6 +588,13 @@ impl fmt::Display for ScmRegistration {
                 writeln!(out, "  ResetPeriod: {}", humantime::format_duration(fa.reset_period))?;
                 writeln!(out, "  OnNonCrashFailures: {}", fa.on_non_crash_failures)?;
             }
+        }
+        match self.preshutdown {
+            None => {}
+            Some(PRESHUTDOWN_NO_TIMEOUT) => {
+                writeln!(out, "PreshutdownTimeout: none (the largest value the field holds)")?;
+            }
+            Some(preshutdown) => writeln!(out, "PreshutdownTimeout: {}", humantime::format_duration(preshutdown))?,
         }
         writeln!(out, "Environment:")?;
         for line in &self.environment {

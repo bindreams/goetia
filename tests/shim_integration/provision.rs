@@ -10,6 +10,7 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, mpsc};
+use std::time::Duration;
 
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
@@ -18,7 +19,7 @@ use goetia::manager::{Budget, RunInFlight, ServiceManager as _, State};
 use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
-use goetia::spec::{DaemonFields, DaemonSpec, Protocol, ServiceFields, ServiceSpec, User};
+use goetia::spec::{DaemonFields, DaemonSpec, Protocol, ServiceFields, ServiceSpec, StopAction, StopSignal, User};
 use goetia::testing::{Ace, FakeProvider, command, service_fields, units_until_nul, wide_null};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -37,7 +38,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::common::{
     LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, embedded_manager, embedded_shim, fixture_command,
-    fixture_command_with_exe, other_shim_bytes, shim_bytes, simple_spec,
+    fixture_command_with_exe, other_shim_bytes, preshutdown_of, shim_bytes, simple_spec,
 };
 use crate::install_helper::INSTALL_AS;
 use crate::support::cleanup::{self, DirGuard};
@@ -703,6 +704,132 @@ fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
             String::from_utf8_lossy(&output.stderr)
         );
     });
+}
+
+// The pre-shutdown time ===============================================================================================
+
+/// A `protocol: plain` service of `user` whose stop is `stop_action`, never started.
+fn plain_stopping_by(id: &str, user: User, stop_action: StopAction, logs: &LogDir) -> DaemonSpec {
+    let command = fixture_command("report", &["1"]);
+    let plain = simple_spec(id, command.clone(), logs);
+    support::run_as(support::stopping_by(plain, command, stop_action), user)
+}
+
+fn stopping(send_signal: StopSignal, timeout: Option<u64>) -> StopAction {
+    StopAction {
+        send_signal,
+        timeout: timeout.map(Duration::from_secs),
+    }
+}
+
+/// The pre-shutdown time is part of the registration: after an `install` it reads back as the stop action's longest wait
+/// (`timeout` and the teardown's 10 s; the largest value for no `timeout`; the teardown's 10 s for `kill`), for every
+/// account the suite runs a shim as, and an `install` with another `timeout` changes it. A local user is installed by
+/// a child, which holds its password, with the default stop action.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn every_account_type_gets_the_preshutdown_time_of_its_stop_action(#[fixture(scm_group)] _group: &Group) {
+    let (_folder, _folder_guard) = default_folder();
+    let logs = LogDir::new();
+    let mgr = embedded_manager(None, CheckPermissions::Enable);
+    let secs = Duration::from_secs;
+
+    let as_user = |label: &str, user: fn(&str) -> User| {
+        let id = support::random_test_id();
+        let _guard = ShimGuard::new(&id);
+        for (stop_action, expected) in [
+            (StopAction::default(), secs(40)),
+            (stopping(StopSignal::Terminate, Some(90)), secs(100)),
+            (
+                stopping(StopSignal::Terminate, None),
+                Duration::from_millis(u64::from(u32::MAX)),
+            ),
+            (stopping(StopSignal::Kill, None), secs(10)),
+            (StopAction::default(), secs(40)),
+        ] {
+            let spec = plain_stopping_by(&id, user(&id), stop_action, &logs);
+            mgr.install(&spec, false)
+                .unwrap_or_else(|e| panic!("{label}: install: {}", e.report()));
+            assert_eq!(preshutdown_of(&id), expected, "{label}: {stop_action:?}");
+        }
+    };
+    as_user("LocalSystem", |_| User::Root);
+    as_user("LocalService", |_| User::Name("LocalService".to_string()));
+    as_user("NetworkService", |_| User::Name("NetworkService".to_string()));
+    as_user("NT SERVICE\\<id>", |id| User::Name(format!(r"NT SERVICE\{id}")));
+
+    // <=14 chars: longer ones make `net user ... /add` prompt about pre-Windows-2000 compatibility.
+    let password = "Goetia!Test12";
+    let account = format!("gt{:08x}", rand::random::<u32>());
+    let _user = LocalUserGuard::create(&account, password);
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let exe = WorldReadableExe::new(&id);
+    let output = Command::new(support::current_exe_str())
+        .arg(INSTALL_AS)
+        .args([&id, &account, &exe.path_str()])
+        .arg(logs.path_for(&id))
+        .arg("1")
+        .env("GOETIA_SERVICE_PASSWORD", password)
+        .output()
+        .expect("spawn the install helper");
+    assert!(
+        output.status.success(),
+        "install as a local user failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(preshutdown_of(&id), secs(40), "a local user");
+}
+
+/// goetia does not run a `protocol: native` service's stop, so it sets none: a new native service keeps Windows'
+/// default whatever its `timeout`. A plain service that becomes native has the value it set put back to that default,
+/// once, and becomes plain again with its own.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_native_service_gets_no_preshutdown_time_and_a_plain_one_that_becomes_native_loses_its_own(
+    #[fixture(scm_group)] _group: &Group,
+) {
+    let (_folder, _folder_guard) = default_folder();
+    let logs = LogDir::new();
+    let mgr = embedded_manager(None, CheckPermissions::Enable);
+    let secs = Duration::from_secs;
+    let default = secs(10);
+    let native = |id: &str, timeout: u64| {
+        ServiceSpec::new(ServiceFields {
+            stop_action: stopping(StopSignal::Terminate, Some(timeout)),
+            ..support::base_fields(id, fixture_command("report", &["1"]))
+        })
+        .map(DaemonSpec::from)
+        .unwrap()
+    };
+
+    let fresh = support::random_test_id();
+    let _fresh_guard = ShimGuard::new(&fresh);
+    mgr.install(&native(&fresh, 120), false)
+        .expect("install a native service");
+    assert_eq!(
+        preshutdown_of(&fresh),
+        default,
+        "a new native service keeps the default"
+    );
+
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let plain = plain_stopping_by(&id, User::Root, StopAction::default(), &logs);
+    mgr.install(&plain, false).expect("install as plain");
+    assert_eq!(preshutdown_of(&id), secs(40), "plain");
+    mgr.install(&native(&id, 120), false).expect("install as native");
+    assert_eq!(
+        preshutdown_of(&id),
+        default,
+        "the value goetia set is put back when the service becomes native"
+    );
+    assert_eq!(
+        mgr.install(&native(&id, 120), false).expect("install as native again"),
+        Outcome::UpToDate,
+        "a native service's value is not read, so it is no drift"
+    );
+    mgr.install(&plain, false).expect("install as plain again");
+    assert_eq!(preshutdown_of(&id), secs(40), "plain again");
 }
 
 // What `begin_install` checks of a provider ===========================================================================

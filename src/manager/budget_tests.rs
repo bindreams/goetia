@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::spec::StopSignal;
 
 // Budget ==============================================================================================================
 

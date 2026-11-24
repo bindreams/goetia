@@ -71,9 +71,15 @@ impl StopAction {
     }
 
     /// The longest a stop of this action takes, from the request to the manager's record: the `timeout`
-    /// and the [`TEARDOWN_MARGIN`](Self::TEARDOWN_MARGIN); `None` where there is no timeout.
+    /// and the [`TEARDOWN_MARGIN`](Self::TEARDOWN_MARGIN); `None` where there is no timeout. A `kill` waits for
+    /// nothing, so it is the margin alone. The one rule that the CLI's wait for a stop, `STOP_PENDING`'s wait
+    /// hint and a Windows service's pre-shutdown time all read. For `wm-close` on Windows the figure is an upper
+    /// bound until its stop asks: it sends nothing yet, so its stop takes at most the margin.
     pub fn longest_stop(&self) -> Option<Duration> {
-        self.timeout.map(|timeout| timeout + Self::TEARDOWN_MARGIN)
+        match self.send_signal {
+            StopSignal::Kill => Some(Self::TEARDOWN_MARGIN),
+            _ => self.timeout.map(|timeout| timeout + Self::TEARDOWN_MARGIN),
+        }
     }
 
     /// Why this stop action cannot be a daemon's, or `None`: the rules of every field, shared by

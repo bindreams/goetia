@@ -8,7 +8,8 @@
 //! reads that daemon's real `DaemonSpec` back out of the same
 //! `Services\<name>\Parameters` metadata blob the SCM backend wrote it into, and
 //! does everything a real service host needs: spawn the daemon once, capture
-//! its output, report its exit as the service's exit, and on `SERVICE_STOP` stop it as its
+//! its output, report its exit as the service's exit, and on `SERVICE_CONTROL_STOP` or `SERVICE_CONTROL_PRESHUTDOWN` (a
+//! system shutdown's) stop it as its
 //! `stop-action` says: ask it to exit with a console event, wait for its whole process tree for the
 //! `timeout`, then kill what is left (`stop_bus::StopPlan`). The event is sent through a copy of the
 //! host program (cosca's proxy), so a host that hosts the shim itself calls `shim::init_host` first in

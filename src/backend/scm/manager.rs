@@ -105,6 +105,7 @@ pub(crate) use registry::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use windows_service::service::{
     Service, ServiceAccess, ServiceActionType, ServiceConfig, ServiceErrorControl, ServiceFailureResetPeriod,
@@ -112,7 +113,10 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree};
-use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
+use windows_sys::Win32::System::Services::{
+    ChangeServiceConfigW, QueryServiceConfig2W, SERVICE_CONFIG_PRESHUTDOWN_INFO, SERVICE_NO_CHANGE,
+    SERVICE_PRESHUTDOWN_INFO,
+};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
@@ -427,7 +431,13 @@ impl Scm {
     fn service_installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
         let id = snapshot.id();
         let config = snapshot.config()?;
-        let definition = read_live_registration(config, snapshot.service()?, id.as_str(), &snapshot.parameters)?;
+        let definition = read_live_registration(
+            config,
+            snapshot.service()?,
+            id.as_str(),
+            &snapshot.parameters,
+            reads_preshutdown(snapshot),
+        )?;
         Ok(InstalledDefinition {
             definition,
             external: ExternalConfig::Absent,
@@ -1048,11 +1058,17 @@ fn read_live_registration(
     service: &Service,
     name: &str,
     live_params: &Parameters,
+    reads_preshutdown: bool,
 ) -> Result<ScmRegistration> {
     let cmdline = cfg.executable_path.to_string_lossy().into_owned();
     let (executable, arguments) = split_command_line(&cmdline);
     let account = registered_account(cfg);
     let failure_actions = read_failure_actions(service, name)?;
+    let preshutdown = if reads_preshutdown {
+        Some(read_preshutdown(service, name)?)
+    } else {
+        None
+    };
     let environment = held_service(name, registry::read_environment(name)?)?;
 
     Ok(ScmRegistration {
@@ -1062,6 +1078,7 @@ fn read_live_registration(
         arguments,
         account,
         failure_actions,
+        preshutdown,
         environment,
         parameters: live_params.fields.clone(),
         stray_parameters: live_params.strays.clone(),
@@ -1116,6 +1133,33 @@ fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailu
         },
         on_non_crash_failures,
     }))
+}
+
+/// The time Windows waits for `service` to stop at a system shutdown (`SERVICE_CONFIG_PRESHUTDOWN_INFO`), which a
+/// service that never set one reads as [`generate::DEFAULT_PRESHUTDOWN`]. `windows-service` has a setter and no getter.
+fn read_preshutdown(service: &Service, name: &str) -> Result<Duration> {
+    let mut info = SERVICE_PRESHUTDOWN_INFO {
+        dwPreshutdownTimeout: 0,
+    };
+    let mut needed = 0;
+    // SAFETY: `service` is a live handle with `SERVICE_QUERY_CONFIG`; the buffer is a `SERVICE_PRESHUTDOWN_INFO`,
+    // which is what this info level fills, and its size is passed; `needed` is a valid out-parameter.
+    let read = unsafe {
+        QueryServiceConfig2W(
+            service.raw_handle(),
+            SERVICE_CONFIG_PRESHUTDOWN_INFO,
+            (&raw mut info).cast::<u8>(),
+            size_of::<SERVICE_PRESHUTDOWN_INFO>() as u32,
+            &mut needed,
+        )
+    };
+    if read == 0 {
+        return Err(Error::os(
+            format!("query the pre-shutdown time of `{name}`"),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(Duration::from_millis(u64::from(info.dwPreshutdownTimeout)))
 }
 
 /// `windows-service`'s `ServiceConfig::executable_path` is the raw
@@ -1193,10 +1237,9 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// log, and the next install corrects what a failure left. The names come from what install knows (the snapshot's account, the new account), never from the file.
 /// A failure of the log after a create leaves the new service, and the next `install` finds it up to date and
 /// makes the log ([`Backend::ensure_beside`]).
-/// `Parameters` follows create/update immediately, minimizing the window in which a crash leaves a service
-/// with no marker; a failure in the two writes after it leaves a registration the next `install` reads as
-/// hand-edited (`Conflict`, cleared by `--force`). An update restates the start type the service has, rather
-/// than resetting it; see `service_info`. `written` is what [`written_user`] says of the account's spec value.
+/// `Parameters` follows a create immediately, minimizing the window in which a crash leaves a service
+/// with no marker; the order and the failure states are in [`writes_after_service`]. An update restates the
+/// start type the service has, rather than resetting it; see `service_info`. `written` is what [`written_user`] says of the account's spec value.
 fn apply(
     spec: &DaemonSpec,
     reg: &ScmRegistration,
@@ -1222,8 +1265,25 @@ fn apply(
         let change = make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
         after = change.map_or(default_log::Step::Narrow, |change| change.step_after());
     }
-    apply_gated(reg, gated.password, installed.is_none())?;
+    apply_gated(reg, gated.password, installed.is_none(), preshutdown_was_set(installed))?;
     make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
+}
+
+/// Whether the pre-shutdown time of the installed service is read: only where goetia sets one, since a native
+/// service's is its own and is no drift. A blob that does not decode is read, so that what the service has shows.
+fn reads_preshutdown(snapshot: &ScmSnapshot) -> bool {
+    snapshot
+        .blob()
+        .map_or(true, |blob| generate::sets_preshutdown(&blob.spec))
+}
+
+/// Whether the service an install replaces was one whose pre-shutdown time goetia set, so that a plain service
+/// that becomes native has the value taken back ([`generate::preshutdown_to_write`]). A blob that does not decode
+/// does not say so, and its value is left alone.
+fn preshutdown_was_set(installed: Option<&ScmSnapshot>) -> bool {
+    installed
+        .and_then(|installed| installed.blob().ok())
+        .is_some_and(|blob| generate::sets_preshutdown(&blob.spec))
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of
@@ -1351,13 +1411,14 @@ fn service_run(id: &Id) -> Result<default_log::Run> {
 }
 
 /// The service itself, written once [`service_gate`] has seen to what it needs: `password` is what it
-/// returned.
-fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool) -> Result<()> {
-    if create {
+/// returned. `was_set` says that the service it replaces was a plain one, whose pre-shutdown time goetia set
+/// ([`generate::preshutdown_to_write`]).
+fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool, was_set: bool) -> Result<()> {
+    let service = if create {
         let scm = open_scm(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
         let info = service_info(reg, password, None);
         scm.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
-            .map_err(|e| to_error(&format!("create service `{}`", reg.name), e))?;
+            .map_err(|e| to_error(&format!("create service `{}`", reg.name), e))?
     } else {
         let scm = open_scm(ServiceManagerAccess::CONNECT)?;
         let service = scm
@@ -1371,11 +1432,57 @@ fn apply_gated(reg: &ScmRegistration, password: Option<String>, create: bool) ->
         service
             .change_config(&info)
             .map_err(|e| to_error(&format!("update service `{}`", reg.name), e))?;
+        service
+    };
+    for write in writes_after_service(generate::preshutdown_to_write(reg.preshutdown, was_set), create) {
+        match write {
+            Write::Preshutdown(preshutdown) => service
+                .set_preshutdown_timeout(preshutdown)
+                .map_err(|e| to_error(&format!("set the pre-shutdown time of `{}`", reg.name), e))?,
+            Write::Parameters => registry::write_parameters(&reg.name, &reg.parameters)?,
+            Write::Environment => registry::write_environment(&reg.name, &reg.environment)?,
+            Write::FailureActions => apply_failure_actions(&reg.name, reg.failure_actions.as_ref())?,
+        }
     }
+    Ok(())
+}
 
-    registry::write_parameters(&reg.name, &reg.parameters)?;
-    registry::write_environment(&reg.name, &reg.environment)?;
-    apply_failure_actions(&reg.name, reg.failure_actions.as_ref())
+/// One write [`apply_gated`] makes once the service exists.
+#[derive(Debug, PartialEq, Eq)]
+enum Write {
+    Preshutdown(Duration),
+    Parameters,
+    Environment,
+    FailureActions,
+}
+
+/// The writes that follow the service's own create (`create`) or update, in order; the first that fails ends the
+/// install, and nothing already written is undone. `Parameters` is the marker that says a service is goetia's, so a
+/// failure leaves:
+/// - on a create, `Parameters` first. If it is a later write that fails: a goetia service with its marker and the new
+///   blob, lacking that write and those after it. Unless what it lacks is what a new service already has (for example
+///   a plain service with `stop-action: kill`, no environment and no restart policy), in which case the next `install`
+///   reads it as up to date, that `install` finds it equal to neither the wanted registration nor the one the blob
+///   regenerates and answers `Conflict`, cleared by `--force`. If `Parameters` itself fails: the service as far as the
+///   write got, which with no `Marker` is foreign (only deleting it recovers it, [`read_marker`]) and with the
+///   `Marker` but not the rest is goetia's with a blob that does not decode. Without `Parameters` first, a failed
+///   later write would leave a service that reads as foreign;
+/// - on an update, the pre-shutdown time first: the old blob stays. If `change_config` changed nothing the
+///   registration shows (only the `stop-action` changed), the next `install` finds the service equal to what the old
+///   blob regenerates and updates again ([`generate::preshutdown_to_write`]); otherwise it answers `Conflict`, as after
+///   any write that fails once `change_config` has changed the service.
+fn writes_after_service(preshutdown: Option<Duration>, create: bool) -> Vec<Write> {
+    let mut writes = Vec::with_capacity(4);
+    let preshutdown = preshutdown.map(Write::Preshutdown);
+    if create {
+        writes.push(Write::Parameters);
+        writes.extend(preshutdown);
+    } else {
+        writes.extend(preshutdown);
+        writes.push(Write::Parameters);
+    }
+    writes.extend([Write::Environment, Write::FailureActions]);
+    writes
 }
 
 /// `ServiceInfo` for `reg`, for either `create_service` or `change_config`.

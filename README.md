@@ -303,7 +303,22 @@ records the end as it does.
     another daemon waits behind it. For `timeout: null` and a tree that never exits it waits until
     `goetia daemon kill` ends the daemon; a `stop --timeout` ends only goetia's own wait.
   - The service reports `STOP_PENDING` with a wait hint that covers the `timeout` and the teardown (the
-    largest value the field holds for `null`); SCM does nothing when a hint runs out.
+    largest value the field holds for `null`); SCM does nothing when a hint runs out. While the stop waits for
+    the daemon's tree it reports `STOP_PENDING` again every 5 s, with the checkpoint one higher; nothing is
+    reported while the ask itself is being made.
+  - **At a system shutdown** a `protocol: plain` service is stopped as `stop` stops it: it accepts `PRESHUTDOWN`,
+    and `install` sets its pre-shutdown time from the `stop-action`: the `timeout` plus 10 s, the largest value
+    for `null`, 10 s for `kill`. A `protocol: native` service's is its own, which `install` leaves alone, except
+    that changing a service from `plain` to `native` puts it back to Windows' default of 10 s, once. Windows waits
+    for a `plain` service at least its pre-shutdown time, which is what goetia promises at a shutdown. Windows also
+    ends a service whose checkpoint stays put for about 45 s, which is why the stop reports one that moves (both
+    measured in Server Core containers of Windows Server 2025, build 26100; not measured on other machines).
+    - A service whose `timeout` is `null` and whose daemon does not exit holds the shutdown for as long as the
+      daemon runs (still waited for at 900 s when measured), and the waits of services that do not exit add up.
+      Write a finite `timeout`.
+    - A `stop`, `restart` or `uninstall` of a service that is still in flight when the shutdown begins is cut
+      within about two seconds, whatever its `timeout`: a limit of the platform.
+    - A task's run at a shutdown is as it was: see [Stopping and killing a task](#stopping-and-killing-a-task).
   - A program that hosts the shim itself calls `goetia::shim::init_host()` first in its `main` (see
     [Shipping the shim from a library](#shipping-the-shim-from-a-library)); a host that does not is refused when the service starts, with an error that names the
     call. `send-signal: kill` and `wm-close` need no such host.

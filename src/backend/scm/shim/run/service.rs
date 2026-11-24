@@ -18,24 +18,24 @@ use crate::backend::scm::wide::wide_null;
 use crate::backend::scm::win32::winapi_io;
 use crate::blob::Blob;
 use crate::error::{Chain, Error};
-use crate::spec::{DaemonSpec, Restart};
+use crate::spec::{DaemonSpec, Restart, StopAction};
 use cosca::error::ChildFate;
 use cosca::{ContainMode, Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, FALSE, NO_ERROR};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Services::{
-    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP,
-    SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
+    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
+    SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
 use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{
-    NOT_RESTARTED, RootExit, StopBus, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop,
-    terminate_exited_tree,
+    NOT_RESTARTED, PROGRESS_PERIOD, RootExit, StopBus, StopEvent, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter,
+    kill_for_stop, terminate_exited_tree,
 };
 
 // Entry ===============================================================================================================
@@ -91,7 +91,7 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
     // narrows them once it reads any other state, since a handle opened now keeps working.
     log.hold_default(id);
     exit::name_run(id);
-    let supervisor = Supervisor::new(real, Arc::clone(&log));
+    let supervisor = Supervisor::new(real, Arc::clone(&log), PROGRESS_PERIOD);
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
@@ -118,13 +118,18 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
     if plan.asks() {
         clear_ctrl_c_ignored(&log, id);
     }
+    let mut progress = StopProgress::default();
     let reported = run_daemon(
         &blob.spec,
         plan,
         &supervisor,
         id,
         || report_running(&log, id, status_handle),
-        |hint| report_stopping(&log, id, status_handle, hint),
+        // Nothing is reported while the ask itself is being made: cosca's `terminate_tree` has no bound.
+        |event| {
+            let status = stop_report(event, blob.spec.stop_action(), &mut progress);
+            report_stopping(&log, id, status_handle, &status);
+        },
     );
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
@@ -212,6 +217,16 @@ pub(super) fn finish(log: &Log, id: &str, reported: Reported, report: impl FnOnc
     }
 }
 
+/// What a stop that ended the wait with `end` tells SCM it can take, as `STOP_PENDING`'s wait hint: the stop action's
+/// longest wait ([`StopAction::longest_stop`]; the largest the field holds for none), or, for the daemon's own exit,
+/// the teardown alone. Only a service reports a hint: task mode reports to no SCM.
+fn stop_hint(action: &StopAction, end: WaitEnd) -> Duration {
+    match end {
+        WaitEnd::Stop => action.longest_stop().unwrap_or(Duration::MAX),
+        WaitEnd::Exit => StopAction::TEARDOWN_MARGIN,
+    }
+}
+
 /// `hint` as the wait hint field holds it: milliseconds, at most `u32::MAX`, which is what a stop with no `timeout`
 /// reports.
 fn wait_hint_millis(hint: Duration) -> u32 {
@@ -221,19 +236,51 @@ fn wait_hint_millis(hint: Duration) -> u32 {
 /// The `STOP_PENDING` status held while the shim stops the daemon, accepting no control. SCM
 /// then refuses a second `STOP` (1061) and a `START` (1056) itself, and a `STOPPED` that follows
 /// restarts or not exactly as one that follows `RUNNING` (measured). The hint is the stop's longest wait
-/// ([`StopPlan::wait_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is a constant 1.
+/// ([`stop_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is [`StopProgress`]'s.
 /// Measured: SCM does nothing when the hint expires (the status, a refused STOP (1061) and a refused START (1056) held
-/// for 10 s past a 1 s hint). Not measured: a `STOP_PENDING` held for longer than that with a checkpoint that does not
-/// move.
-fn stopping_status(hint: Duration) -> SERVICE_STATUS {
+/// for 10 s past a 1 s hint), nor does it with a checkpoint that moves, held for 150 s on a plain `STOP`.
+fn stopping_status(hint: Duration, checkpoint: u32) -> SERVICE_STATUS {
     SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: SERVICE_STOP_PENDING,
         dwControlsAccepted: 0,
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
-        dwCheckPoint: 1,
+        dwCheckPoint: checkpoint,
         dwWaitHint: wait_hint_millis(hint),
+    }
+}
+
+/// The `STOP_PENDING` reports of one stop: checkpoint 1, then one higher per report, with the hint the stop began
+/// with. Windows ends a service at a shutdown whose checkpoint stays put for about 45 s; SCM ignores the checkpoint on
+/// any other stop.
+#[derive(Default)]
+struct StopProgress {
+    hint: Duration,
+    checkpoint: u32,
+}
+
+impl StopProgress {
+    /// The first report, of a stop that can take `hint`: checkpoint 1.
+    fn begin(&mut self, hint: Duration) -> SERVICE_STATUS {
+        self.hint = hint;
+        self.checkpoint = 1;
+        stopping_status(hint, self.checkpoint)
+    }
+
+    /// The report that the stop is still going on.
+    fn advance(&mut self) -> SERVICE_STATUS {
+        self.checkpoint = self.checkpoint.wrapping_add(1);
+        stopping_status(self.hint, self.checkpoint)
+    }
+}
+
+/// The status to report for what the stop's observer was told ([`StopEvent`]): the first `STOP_PENDING` with the stop's
+/// hint when it began, and the same hint with the checkpoint one higher while it goes on.
+fn stop_report(event: StopEvent, action: &StopAction, progress: &mut StopProgress) -> SERVICE_STATUS {
+    match event {
+        StopEvent::Began(end) => progress.begin(stop_hint(action, end)),
+        StopEvent::Progress => progress.advance(),
     }
 }
 
@@ -291,13 +338,14 @@ unsafe extern "system" fn control_handler(
     handle_control(stop_bus, control)
 }
 
-/// The handler's answer to `control`. SCM acknowledges every `STOP` it delivers whatever the
+/// The handler's answer to `control`. A system shutdown's `PRESHUTDOWN` is a stop: one path, whichever control began it.
+/// SCM acknowledges every `STOP` it delivers whatever the
 /// handler answers, so a stop the bus does not accept (the exit is already decided) is answered
 /// `NO_ERROR` too. The decided exit is reported as it is; SCM restarts it if the restart policy
 /// covers it.
 fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
     match control {
-        SERVICE_CONTROL_STOP => {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_PRESHUTDOWN => {
             stop_bus.request_stop();
             NO_ERROR
         }
@@ -306,17 +354,24 @@ fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
     }
 }
 
-/// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
-fn report_running(log: &Log, id: &str, handle: StatusHandle) {
-    let status = SERVICE_STATUS {
+/// The `RUNNING` status. `PRESHUTDOWN` is accepted beside `STOP`: without it Windows sends a shutdown nothing and ends
+/// the service within seconds; with it, Windows waits as long as the pre-shutdown time
+/// ([`crate::backend::scm::generate`]).
+fn running_status() -> SERVICE_STATUS {
+    SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: SERVICE_RUNNING,
-        dwControlsAccepted: SERVICE_ACCEPT_STOP,
+        dwControlsAccepted: SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN,
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: 0,
         dwWaitHint: 0,
-    };
+    }
+}
+
+/// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
+fn report_running(log: &Log, id: &str, handle: StatusHandle) {
+    let status = running_status();
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
         let e = std::io::Error::last_os_error();
@@ -341,11 +396,11 @@ fn clear_ctrl_c_ignored(log: &Log, id: &str) {
     }
 }
 
-/// Report `STOP_PENDING`. A failure is logged: the teardown goes on and `STOPPED` is still reported.
-fn report_stopping(log: &Log, id: &str, handle: StatusHandle, hint: Duration) {
-    let status = stopping_status(hint);
+/// Report `STOP_PENDING`, as `status` ([`StopProgress`]) says. A failure is logged: the teardown goes on and
+/// `STOPPED` is still reported.
+fn report_stopping(log: &Log, id: &str, handle: StatusHandle, status: &SERVICE_STATUS) {
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
-    if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
+    if unsafe { SetServiceStatus(handle.0, status) } == 0 {
         let e = std::io::Error::last_os_error();
         log.failure(id, &format!("report SERVICE_STOP_PENDING to SCM: {}", Chain(&e)));
     }
@@ -384,12 +439,9 @@ pub(super) fn run_daemon(
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(Duration),
+    observe: impl FnMut(StopEvent),
 ) -> Reported {
-    run_pass(spec, plan, supervisor, id, on_running, |end| {
-        on_stopping(plan.wait_hint(end))
-    })
-    .reported()
+    run_pass(spec, plan, supervisor, id, on_running, observe).reported()
 }
 
 /// How one pass ended, before it is read as anything: what the service tells SCM
@@ -431,10 +483,11 @@ impl PassOutcome {
 /// stop, and say how it ended. `plan` is the run's [`StopPlan`]: the daemon is spawned for it, and it is the stop the
 /// supervisor runs.
 ///
-/// `on_stopping` is called exactly once, after `on_running` and before anything is asked of the daemon or its tree
-/// is torn down, whatever ends the run; never when `on_running` was not. It is told by a [`WaitEnd`] whether an
-/// accepted stop or the daemon's own end ended the wait. The service reads `STOP_PENDING` through the teardown, so
-/// a `start` is refused rather than answered "running" for a service that is about to stop.
+/// `observe` is told [`StopEvent::Began`] exactly once, after `on_running` and before anything is asked of the daemon
+/// or its tree is torn down, whatever ends the run; never when `on_running` was not. It says by a [`WaitEnd`] whether
+/// an accepted stop or the daemon's own end ended the wait. The service reads `STOP_PENDING` through the teardown, so
+/// a `start` is refused rather than answered "running" for a service that is about to stop. Any
+/// [`StopEvent::Progress`] follows it ([`Supervisor::wait_for_child_or_stop`]).
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
@@ -453,7 +506,7 @@ pub(super) fn run_pass(
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(WaitEnd),
+    observe: impl FnMut(StopEvent),
 ) -> PassOutcome {
     let log = &*supervisor.log;
     let (child, waiter) = match launch(spec, plan, supervisor, id) {
@@ -464,7 +517,7 @@ pub(super) fn run_pass(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
-    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, observe) {
         WaitOutcome::ChildExited => {
             let code = exit_code(child.as_ref(), log, id);
             // A stop accepted before this decision wins over a failure: `settle` then says something

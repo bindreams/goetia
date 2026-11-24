@@ -45,10 +45,8 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use failed_install::assert_failed_on_a_path_under_a_file;
-#[cfg(unix)]
-use goetia::spec::{DaemonSpec, ServiceSpec, StopAction};
+use goetia::spec::{DaemonSpec, ServiceSpec, StopAction, User};
 pub use goetia::testing::groups::{Group, launchd_group, scm_group, systemd_group};
-#[cfg(unix)]
 use goetia::testing::service_fields;
 #[cfg(windows)]
 pub use goetia::testing::wide_null;
@@ -105,13 +103,18 @@ pub fn require_system_dir(dir: &std::path::Path) {
     assert!(dir.is_dir(), "the system directory {} is missing", dir.display());
 }
 
-/// `base`, a service, run as `command` and stopping by `stop_action`: the daemon the stop-action tests of
-/// the launchd and systemd suites start.
-#[cfg(unix)]
+/// `base`, a service, run as `command` and stopping by `stop_action`: the daemon the stop-action tests start.
 pub fn stopping_by(base: DaemonSpec, command: Vec<String>, stop_action: StopAction) -> DaemonSpec {
     let mut fields = service_fields(base);
     fields.common.command = command;
     fields.stop_action = stop_action;
+    ServiceSpec::new(fields).map(DaemonSpec::from).unwrap()
+}
+
+/// `spec`, a service, run by `user`.
+pub fn run_as(spec: DaemonSpec, user: User) -> DaemonSpec {
+    let mut fields = service_fields(spec);
+    fields.common.user = user;
     ServiceSpec::new(fields).map(DaemonSpec::from).unwrap()
 }
 
