@@ -265,7 +265,8 @@ pub enum Error {
         path: PathBuf,
         account: String,
         right: &'static str,
-        role: FolderRole,
+        /// Boxed, so that the error stays small: see `clippy::result_large_err`.
+        role: Box<FolderRole>,
     },
 
     /// A folder goetia makes for itself exists and is not as goetia makes it (its owner, whether its

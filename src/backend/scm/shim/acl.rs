@@ -298,7 +298,7 @@ impl Unsafe {
             account: account_name(&self.account),
             path: self.path,
             right: self.right,
-            role,
+            role: Box::new(role),
         }
     }
 }

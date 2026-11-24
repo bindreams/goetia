@@ -478,7 +478,7 @@ fn the_nearest_object_to_the_target_is_reported_first() {
     assert_eq!(refused(&chain).path, PathBuf::from(r"C:\Program Files"));
 }
 
-// The daemon's account and the folder a daemon's own log is made in -----------------------------------------------------
+// The daemon's account and the folder a daemon's own log is made in ---------------------------------------------------
 
 /// `C:\Logs\app` as an administrator makes it for a daemon: nobody but SYSTEM and Administrators holds
 /// anything, and what is made in it inherits that.

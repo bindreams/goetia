@@ -112,8 +112,9 @@ fn a_logs_folder_others_can_add_to_is_refused_at_install_and_at_an_up_to_date_re
                 path,
                 account,
                 right,
-                role: FolderRole::DaemonLog { .. },
+                role,
             } => {
+                assert!(matches!(**role, FolderRole::DaemonLog { .. }), "{kind:?}: {role:?}");
                 assert_eq!(*right, ADD_ENTRIES_TO, "{kind:?}: {said}");
                 assert!(account.ends_with("Users"), "{kind:?}: {said}");
                 assert_eq!(path.file_name(), folder.path().file_name(), "{kind:?}: {said}");

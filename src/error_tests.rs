@@ -197,7 +197,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             path: PathBuf::new(),
             account: String::new(),
             right: OWN,
-            role: FolderRole::Shim,
+            role: Box::new(FolderRole::Shim),
         },
         Error::FolderNotAsMade { path: PathBuf::new() },
         Error::TaskFolderKept {
@@ -1066,7 +1066,7 @@ fn report_of_an_unsafe_folder_names_the_path_the_account_and_the_right() {
         path: PathBuf::from("/p"),
         account: "Users".to_string(),
         right: CHANGE_PERMISSIONS_OF,
-        role: FolderRole::Shim,
+        role: Box::new(FolderRole::Shim),
     };
     assert_eq!(
         e.report().to_string(),
@@ -1081,11 +1081,11 @@ fn report_of_an_unsafe_daemon_log_names_the_daemon_and_the_icacls_line_that_fixe
         path: PathBuf::from(r"C:\logs\app"),
         account: "Users".to_string(),
         right: "add entries to",
-        role: FolderRole::DaemonLog {
+        role: Box::new(FolderRole::DaemonLog {
             folder: PathBuf::from(r"C:\logs\app"),
             daemon: "Daemon".to_string(),
             daemon_sid: daemon_sid.to_string(),
-        },
+        }),
     };
     assert_eq!(
         unsafe_log("S-1-5-19").report().to_string(),

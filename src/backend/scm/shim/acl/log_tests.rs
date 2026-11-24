@@ -54,8 +54,11 @@ fn unsafe_refusal(log: &Path) -> (PathBuf, &'static str, String) {
             path,
             right,
             account,
-            role: FolderRole::DaemonLog { daemon: named, .. },
+            role,
         }) => {
+            let FolderRole::DaemonLog { daemon: named, .. } = *role else {
+                panic!("a daemon's log is refused as one: {role:?}");
+            };
             assert_eq!(named, account_name(&daemon()), "the refusal names the daemon's account");
             (path, right, account)
         }
@@ -235,7 +238,7 @@ fn a_folder_at_the_logs_name_is_refused(#[fixture(temp_dir)] dir: &Path) {
     assert!(said.contains("is a folder"), "{said}");
 }
 
-// the final folder -----------------------------------------------------------------------------------------------------
+// the final folder ----------------------------------------------------------------------------------------------------
 
 /// A junction on the way is judged through to the folder the log's name is looked up in, which is the final one:
 /// the strict rule applies to it, whatever the junction's own permissions are.
