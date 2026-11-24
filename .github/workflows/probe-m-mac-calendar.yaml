@@ -17,7 +17,18 @@ jobs:
       max-parallel: 3
       matrix:
         include:
-          - { zone: lh, kind: gap, reps: 1 }
+          - { zone: lh, kind: gap, reps: 3 }
+          - { zone: lh, kind: foldA, reps: 3 }
+          - { zone: lh, kind: foldB, reps: 3 }
+          - { zone: sc, kind: gap, reps: 3 }
+          - { zone: sc, kind: foldA, reps: 3 }
+          - { zone: sc, kind: foldB, reps: 3 }
+          - { zone: bt, kind: gap, reps: 3 }
+          - { zone: bt, kind: foldA, reps: 3 }
+          - { zone: bt, kind: foldB, reps: 3 }
+          - { zone: tr, kind: gap, reps: 3 }
+          - { zone: tr, kind: foldA, reps: 3 }
+          - { zone: tr, kind: foldB, reps: 3 }
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -26,39 +37,5 @@ jobs:
           cd probe-m-mac-calendar
           rc=0
           sudo -E env "PATH=$PATH" python3 dst.py "${{ matrix.zone }}" "${{ matrix.kind }}" "${{ matrix.reps }}" > "$RUNNER_TEMP/out.txt" 2>&1 || rc=$?
-          cat "$RUNNER_TEMP/out.txt"
-          exit "$rc"
-
-  stream:
-    name: stream
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Probe
-        run: |
-          cd probe-m-mac-calendar
-          rc=0
-          sudo -E env "PATH=$PATH" python3 stream.py 2 1 1 1 > "$RUNNER_TEMP/out.txt" 2>&1 || rc=$?
-          cat "$RUNNER_TEMP/out.txt"
-          exit "$rc"
-
-  tz:
-    name: tz ${{ matrix.mode }}
-    runs-on: macos-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [restart]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Probe
-        run: |
-          cd probe-m-mac-calendar
-          rc=0
-          sudo -E env "PATH=$PATH" python3 tz.py "${{ matrix.mode }}" 1 > "$RUNNER_TEMP/out.txt" 2>&1 || rc=$?
           cat "$RUNNER_TEMP/out.txt"
           exit "$rc"

@@ -199,7 +199,8 @@ def use_zone(jobs: Jobs, zone: str) -> None:
     current = run(["systemsetup", "-gettimezone"]).stdout
     if zone not in current:
         say(f"systemsetup did not set {zone} ({current.strip()}); relinking /etc/localtime")
-        Path("/etc/localtime").unlink()
+        say(run(["ls", "-l", "/etc/localtime"]).stdout.strip() or "/etc/localtime does not exist")
+        Path("/etc/localtime").unlink(missing_ok=True)
         os.symlink(f"/var/db/timezone/zoneinfo/{zone}", "/etc/localtime")
     say(f"zone now: {run(['systemsetup', '-gettimezone']).stdout.strip()}; localtime -> {os.readlink('/etc/localtime')}")
     restart_uea()
