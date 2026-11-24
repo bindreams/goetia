@@ -1740,10 +1740,11 @@ fn a_service_uninstall_with_an_unusable_task_scheduler_reports_the_leftover_shim
 
 // the writes after the service ========================================================================================
 
-/// A create writes the marker before the pre-shutdown time, so that a failure of the second leaves a goetia service
-/// the next `install` repairs, not one with no `Parameters` that it reads as foreign. An update writes the time first,
-/// so that a failure leaves the old blob and the next `install` finds the time still to be written. The order shows
-/// what a failed call leaves; the SCM integration tests cover the calls succeeding.
+/// A create writes the marker before the pre-shutdown time, so that a failure of the second leaves a goetia service the
+/// next `install` calls a `Conflict` (as it does a failed `Environment` or failure actions write), not one with no
+/// `Parameters` that it reads as foreign. An update writes the time first, so that a failure leaves the old blob, and
+/// when the update changed nothing else the registration shows, the next `install` finds the time still to be written.
+/// The order shows what a failed call leaves; the SCM integration tests cover the calls succeeding.
 #[skuld::test]
 fn a_create_writes_the_marker_before_the_preshutdown_time_and_an_update_after_it() {
     let time = Duration::from_secs(40);
