@@ -109,6 +109,32 @@ env:
 /// double-quoted scalar takes for each.
 const CONTROL_CHARACTERS: [(char, &str); 2] = [('\n', r"\n"), ('\0', r"\0")];
 
+/// Every field a `${EVIL}` reference can sit in and reach a generated artifact: the field the gate must blame, and
+/// the YAML that writes the reference. A `command` row is the whole command, so its manifest has no other
+/// ([`base_command_for`]). `command[0]` has a row of its own: it alone goes on to path resolution. There is none
+/// for an `env` key or `user.id`: a reference in either is refused before `.env` is read.
+const SUBSTITUTED_LEAVES: [(&str, &str); 8] = [
+    ("name", "name: ${EVIL}\n"),
+    ("command", "command: [/bin/frpc, \"${EVIL}\"]\n"),
+    ("command", "command: [\"${EVIL}\"]\n"),
+    ("cwd", "cwd: ${EVIL}\n"),
+    ("logs", "logs: ${EVIL}\n"),
+    ("env[LOG]", "env:\n  LOG: ${EVIL}\n"),
+    ("user.name", "user: ${EVIL}\n"),
+    // The struct form too: it is the syntax the `RawUser` split introduced, and it reaches the gate by a
+    // different arm.
+    ("user.name", "user:\n  name: ${EVIL}\n"),
+];
+
+/// The base command a [`SUBSTITUTED_LEAVES`] row of `field` is written beside.
+fn base_command_for(field: &str) -> &'static str {
+    if field == "command" {
+        ""
+    } else {
+        "command: [/bin/frpc]\n"
+    }
+}
+
 #[skuld::test]
 fn a_control_character_in_a_free_text_field_is_refused_on_every_backend() {
     // A newline ends one systemd directive and starts another; a NUL cuts a string short wherever
@@ -184,60 +210,59 @@ fn a_control_character_in_the_id_is_refused() {
 fn a_control_character_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(
     #[fixture(temp_dir)] dir: &Path,
 ) {
-    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value. The
-    // `.env` grammar admits a newline in no value, so a newline is refused by the file instead.
-    // No row for an `env` key or `user.id`: a reference in either is refused before `.env` is read.
-    let rows: [(&str, &str); 7] = [
-        ("name", "name: ${U}"),
-        ("command", r#"command: ["/bin/frpc", "${U}"]"#),
-        ("cwd", "cwd: ${U}"),
-        ("logs", "logs: ${U}"),
-        ("env[K]", r#"env: {K: "${U}"}"#),
-        ("user.name", "user: ${U}"),
-        ("user.name", r#"user: {name: "${U}"}"#),
-    ];
+    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value; the gate is
+    // looped over the control characters `.env` can carry, each as an unquoted and a quoted value.
     for (c, _) in CONTROL_CHARACTERS {
-        write_fixture(dir, "", Some(&format!("U='svc{c}x'\n")));
-        for (field, row_line) in rows {
-            let predicate = format!("field `{field}` contains a control character");
-            // A `command` row replaces the base command, so the base omits it.
-            let base = if row_line.starts_with("command:") {
-                "id: frpc\n"
-            } else {
-                "id: frpc\ncommand: [/bin/frpc]\n"
-            };
-            let plain = format!("{base}{row_line}\n");
-            for &native in HOST_BACKENDS {
-                let context = format!("{c:?} in `{field}` as native `{native}`");
-                let overridden = format!("{base}backend-specific:\n  {native}:\n    {row_line}\n");
+        // `.env` refuses a newline itself, so no value carries one to the gate:
+        // `a_newline_cannot_arrive_through_env_substitution`.
+        if c == '\n' {
+            continue;
+        }
+        for env_file in [format!("EVIL=svc{c}x\n"), format!("EVIL='svc{c}x'\n")] {
+            write_fixture(dir, "", Some(&env_file));
+            for (field, fragment) in SUBSTITUTED_LEAVES {
+                let predicate = format!("field `{field}` contains a control character");
+                let base = format!("id: frpc\n{}", base_command_for(field));
+                let plain = format!("{base}{fragment}");
+                let indented: String = fragment.lines().map(|line| format!("    {line}\n")).collect();
+                for &native in HOST_BACKENDS {
+                    let context = format!("{env_file:?} in `{field}` ({fragment:?}) as native `{native}`");
+                    let overridden = format!("{base}backend-specific:\n  {native}:\n{indented}");
 
-                if c == '\n' {
-                    for yaml in [&plain, &overridden] {
-                        let err = resolve_as(parse_manifest(yaml), dir, Some(native)).expect_err(&context);
-                        assert!(matches!(err, Error::EnvFile { .. }), "{context}: {err}");
-                        assert!(err.to_string().contains("unterminated"), "{context}: {err}");
-                    }
-                    continue;
+                    let msg = resolve_as(parse_manifest(&plain), dir, Some(native))
+                        .expect_err(&context)
+                        .to_string();
+                    assert!(msg.contains("after substituting from .env"), "{context}: {msg}");
+                    assert!(msg.contains(&predicate), "{context}: {msg}");
+                    assert!(!msg.contains(c), "{context}: {msg:?}");
+                    assert!(
+                        !msg.contains("backend-specific"),
+                        "no override wrote it, {context}: {msg}"
+                    );
+
+                    let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
+                        .expect_err(&context)
+                        .to_string();
+                    let blamed = format!("backend-specific.{native}: after substituting from .env: {predicate}");
+                    assert!(msg.contains(&blamed), "{context}: {msg}");
+                    assert!(!msg.contains(c), "{context}: {msg:?}");
                 }
-
-                let msg = resolve_as(parse_manifest(&plain), dir, Some(native))
-                    .expect_err(&context)
-                    .to_string();
-                assert!(msg.contains("after substituting from .env"), "{context}: {msg}");
-                assert!(msg.contains(&predicate), "{context}: {msg}");
-                assert!(!msg.contains(c), "{context}: {msg:?}");
-                assert!(
-                    !msg.contains("backend-specific"),
-                    "no override wrote it, {context}: {msg}"
-                );
-
-                let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
-                    .expect_err(&context)
-                    .to_string();
-                let blamed = format!("backend-specific.{native}: after substituting from .env: {predicate}");
-                assert!(msg.contains(&blamed), "{context}: {msg}");
-                assert!(!msg.contains(c), "{context}: {msg:?}");
             }
+        }
+    }
+}
+
+#[skuld::test]
+fn a_newline_cannot_arrive_through_env_substitution(#[fixture(temp_dir)] dir: &Path) {
+    // No `.env` value carries a newline: unquoted, it ends the line and what follows is no `NAME=VALUE`; quoted,
+    // the value does not close on its line. So the gate above never sees one, and the file is what refuses it.
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nname: ${EVIL}\n";
+    for env_file in ["EVIL=svc\nx\n", "EVIL='svc\nx'\n"] {
+        write_fixture(dir, yaml, Some(env_file));
+        for &native in HOST_BACKENDS {
+            let context = format!("{env_file:?} as native `{native}`");
+            let err = resolve_as(parse_manifest(yaml), dir, Some(native)).expect_err(&context);
+            assert!(matches!(err, Error::EnvFile { .. }), "{context}: {err:?}");
         }
     }
 }
@@ -2292,19 +2317,8 @@ fn interpolated_values_pass_through_the_injection_gate(#[fixture(temp_dir)] dir:
     // Each row names the field the error must blame. Asserting only
     // "control character" would let a row pass on a *different* leaf's
     // rejection than the one it claims to exercise.
-    let leaves = [
-        ("name", "name: ${EVIL}\ncommand: [/bin/frpc]\n"),
-        ("command", "command: [/bin/frpc, \"${EVIL}\"]\n"),
-        ("cwd", "command: [/bin/frpc]\ncwd: ${EVIL}\n"),
-        ("logs", "command: [/bin/frpc]\nlogs: ${EVIL}\n"),
-        ("env[LOG]", "command: [/bin/frpc]\nenv:\n  LOG: ${EVIL}\n"),
-        ("user.name", "command: [/bin/frpc]\nuser: ${EVIL}\n"),
-        // The struct form too: it is the syntax the `RawUser` split
-        // introduced, and it reaches the gate by a different arm.
-        ("user.name", "command: [/bin/frpc]\nuser:\n  name: ${EVIL}\n"),
-    ];
-
-    for (leaf, body) in leaves {
+    for (leaf, fragment) in SUBSTITUTED_LEAVES {
+        let body = format!("{}{fragment}", base_command_for(leaf));
         write_fixture(dir, &format!("id: frpc\n{body}"), Some("EVIL='evil\u{1b}[2Jclear'\n"));
 
         let err = load(dir).unwrap_err();
