@@ -352,12 +352,9 @@ pub(crate) fn sets_preshutdown(spec: &DaemonSpec) -> bool {
     matches!(spec, DaemonSpec::Service(_)) && hosted(spec)
 }
 
-/// The pre-shutdown time an install writes for a service whose registration wants `wanted`, given whether the
-/// service it replaces was one whose time goetia set (`was_set`). A wanted value is written. Without one, a service
-/// that was plain and is now native has the value put back to [`DEFAULT_PRESHUTDOWN`] (goetia wrote the old one and
-/// leaves none of its own behind), once: the service that follows is native, and is not read. Any other has nothing
-/// written. A service whose installed definition cannot be decoded is not known to have been plain (`was_set` is
-/// `false`), so it keeps whatever value it has.
+/// The pre-shutdown time an install writes: `wanted`, else [`DEFAULT_PRESHUTDOWN`] when `was_set` (a plain service
+/// becoming native gives back the value goetia wrote), else nothing. `was_set` is `false` for a definition that cannot
+/// be decoded.
 pub fn preshutdown_to_write(wanted: Option<Duration>, was_set: bool) -> Option<Duration> {
     wanted.or(was_set.then_some(DEFAULT_PRESHUTDOWN))
 }

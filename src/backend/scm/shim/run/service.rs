@@ -125,8 +125,7 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
         &supervisor,
         id,
         || report_running(&log, id, status_handle),
-        // Progress is reported from this thread, between the slices of the stop's own waits: nothing is reported
-        // while the ask itself is being made, which cosca's `terminate_tree` bounds by nothing.
+        // Nothing is reported while the ask itself is being made: cosca's `terminate_tree` has no bound.
         |event| {
             let status = stop_report(event, blob.spec.stop_action(), &mut progress);
             report_stopping(&log, id, status_handle, &status);
@@ -252,10 +251,9 @@ fn stopping_status(hint: Duration, checkpoint: u32) -> SERVICE_STATUS {
     }
 }
 
-/// The `STOP_PENDING` reports of one stop: the first, and each one after it that says the stop is still going on,
-/// with the checkpoint one higher and the hint the stop began with. Windows ends a service at a shutdown whose
-/// checkpoint stays put for about 45 s, and waits for as long as it moves (measured in Server Core containers of
-/// Windows Server 2025, build 26100); SCM does nothing with it on any other stop.
+/// The `STOP_PENDING` reports of one stop: checkpoint 1, then one higher per report, with the hint the stop began
+/// with. Windows ends a service at a shutdown whose checkpoint stays put for about 45 s; SCM ignores the checkpoint on
+/// any other stop.
 #[derive(Default)]
 struct StopProgress {
     hint: Duration,
@@ -356,10 +354,9 @@ fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
     }
 }
 
-/// The `RUNNING` status. `PRESHUTDOWN` is accepted beside `STOP`: a service that accepts it is sent it when the system
-/// shuts down, and is waited for as long as its pre-shutdown time ([`crate::backend::scm::generate`] gives it);
-/// one that does not is sent nothing and ended within seconds (measured in Server Core containers of Windows
-/// Server 2025, build 26100).
+/// The `RUNNING` status. `PRESHUTDOWN` is accepted beside `STOP`: without it Windows sends a shutdown nothing and ends
+/// the service within seconds; with it, Windows waits as long as the pre-shutdown time
+/// ([`crate::backend::scm::generate`]).
 fn running_status() -> SERVICE_STATUS {
     SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,

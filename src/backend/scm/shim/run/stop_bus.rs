@@ -79,7 +79,8 @@ pub enum WaitEnd {
 pub enum StopEvent {
     /// The wait has ended, by `WaitEnd`, and nothing has been asked, waited for or torn down yet.
     Began(WaitEnd),
-    /// The stop is going on: the plan has waited a slice of its time and is waiting further.
+    /// The stop is going on: an ask-and-wait plan has waited a slice of its time and is waiting further. Never after
+    /// the wait has ended, and never for another plan.
     Progress,
 }
 
@@ -429,11 +430,10 @@ impl Supervisor {
     ///
     /// It is told [`StopEvent::Progress`], from the calling thread and only after `Began`, while an ask-and-wait plan
     /// goes on: after each slice of the wait for the tree (at most the supervisor's period, [`PROGRESS_PERIOD`] in a run)
-    /// that left members and had a next one, and after each pause of the re-ask loop that is followed by another ask. Never after the wait has ended,
-    /// and never for a plan that asks nothing or waits for the program alone. The service reports `STOP_PENDING` with
-    /// a higher checkpoint in it, which is what keeps Windows from ending a service whose stop takes long at a
-    /// shutdown. Nothing is told while the ask itself is being made: cosca 0.10's `terminate_tree` waits for its proxy
-    /// with no bound.
+    /// that left members and had a next one, and after each pause of the re-ask loop that is followed by another ask.
+    /// The service reports `STOP_PENDING` with a higher checkpoint in it, which is what keeps Windows from ending a
+    /// service whose stop takes long at a shutdown. Nothing is told while the ask itself is being made: cosca 0.10's
+    /// `terminate_tree` waits for its proxy with no bound.
     ///
     /// **The read** of the process, once, where the stop is seen and before `Began` (a read that fails counts as
     /// gone if the waiter has reported the exit): a root already gone is
@@ -836,9 +836,8 @@ impl Supervisor {
 /// Wait for the whole tree to exit by `deadline` (`seen + timeout`, fixed when the wait begins; `None`: as long as it
 /// takes), in slices that each re-check the tree: the period or what the clock says is left to the deadline, whichever
 /// is shorter. After a slice that left members, the wait ends at the deadline if it has passed, and otherwise calls
-/// `on_progress` and goes on, so the wait lasts the `timeout` plus the overshoot of its last slice, as one call for the
-/// whole of it would. With no deadline members left are no verdict, and the slices go on until the tree exits or the wait
-/// fails.
+/// `on_progress` and goes on, so the wait lasts the `timeout` plus the overshoot of its last slice. With no deadline
+/// members left are no verdict, and the slices go on until the tree exits or the wait fails.
 fn wait_for_tree(
     child: &dyn Spawned,
     deadline: Option<Instant>,

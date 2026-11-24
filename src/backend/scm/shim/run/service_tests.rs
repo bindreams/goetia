@@ -1002,10 +1002,8 @@ fn the_stopping_status_accepts_no_control_and_records_no_exit() {
     assert_eq!((status.dwCheckPoint, status.dwWaitHint), (1, 10_000));
 }
 
-/// The checkpoint is what the status says of progress: SCM and Windows read a checkpoint that moves as a service that
-/// is still stopping, and end one whose checkpoint stays put for about 45 s at a shutdown (measured in Server Core
-/// containers of Windows Server 2025, build 26100). The first report is checkpoint 1; each report that the stop is
-/// still going on is one higher, with the hint the stop began with.
+/// The first report is checkpoint 1; each report that the stop is still going on is one higher, with the hint the
+/// stop began with.
 #[skuld::test]
 fn each_report_that_the_stop_is_going_on_has_the_checkpoint_one_higher() {
     let mut progress = StopProgress::default();
@@ -1521,8 +1519,7 @@ fn a_preshutdown_is_a_stop() {
     );
 }
 
-/// A running service accepts `STOP` and `PRESHUTDOWN`: without the second, Windows sends a shutdown nothing and
-/// ends the service within a few seconds (measured in containers of Windows Server 2025, build 26100).
+/// A running service accepts `STOP` and `PRESHUTDOWN`: without the second, Windows sends a shutdown nothing.
 #[skuld::test]
 fn a_running_service_accepts_stop_and_preshutdown() {
     let status = running_status();

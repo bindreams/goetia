@@ -431,16 +431,12 @@ impl Scm {
     fn service_installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
         let id = snapshot.id();
         let config = snapshot.config()?;
-        // The pre-shutdown time is read only where goetia sets one: a native service's is its own, and is no drift.
-        let reads_preshutdown = snapshot
-            .blob()
-            .map_or(true, |blob| generate::sets_preshutdown(&blob.spec));
         let definition = read_live_registration(
             config,
             snapshot.service()?,
             id.as_str(),
             &snapshot.parameters,
-            reads_preshutdown,
+            reads_preshutdown(snapshot),
         )?;
         Ok(InstalledDefinition {
             definition,
@@ -1242,9 +1238,7 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// A failure of the log after a create leaves the new service, and the next `install` finds it up to date and
 /// makes the log ([`Backend::ensure_beside`]).
 /// `Parameters` follows a create immediately, minimizing the window in which a crash leaves a service
-/// with no marker ([`writes_after_service`]); a failure in the writes after it (the pre-shutdown time, `Environment` or
-/// the failure actions) leaves a registration the next `install` reads as hand-edited (`Conflict`, cleared by
-/// `--force`), as nothing is rolled back and the service lacks what its `Parameters` render. An update restates the
+/// with no marker; the order and the failure states are in [`writes_after_service`]. An update restates the
 /// start type the service has, rather than resetting it; see `service_info`. `written` is what [`written_user`] says of the account's spec value.
 fn apply(
     spec: &DaemonSpec,
@@ -1271,12 +1265,25 @@ fn apply(
         let change = make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
         after = change.map_or(default_log::Step::Narrow, |change| change.step_after());
     }
-    // A plain service that becomes a native one has the value goetia wrote taken back, once ([`generate::preshutdown_to_write`]).
-    let was_set = installed
-        .and_then(|installed| installed.blob().ok())
-        .is_some_and(|blob| generate::sets_preshutdown(&blob.spec));
-    apply_gated(reg, gated.password, installed.is_none(), was_set)?;
+    apply_gated(reg, gated.password, installed.is_none(), preshutdown_was_set(installed))?;
     make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
+}
+
+/// Whether the pre-shutdown time of the installed service is read: only where goetia sets one, since a native
+/// service's is its own and is no drift. A blob that does not decode is read, so that what the service has shows.
+fn reads_preshutdown(snapshot: &ScmSnapshot) -> bool {
+    snapshot
+        .blob()
+        .map_or(true, |blob| generate::sets_preshutdown(&blob.spec))
+}
+
+/// Whether the service an install replaces was one whose pre-shutdown time goetia set, so that a plain service
+/// that becomes native has the value taken back ([`generate::preshutdown_to_write`]). A blob that does not decode
+/// does not say so, and its value is left alone.
+fn preshutdown_was_set(installed: Option<&ScmSnapshot>) -> bool {
+    installed
+        .and_then(|installed| installed.blob().ok())
+        .is_some_and(|blob| generate::sets_preshutdown(&blob.spec))
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of
@@ -1452,10 +1459,12 @@ enum Write {
 /// The writes that follow the service's own create (`create`) or update, in order; the first that fails ends the
 /// install, and nothing already written is undone. `Parameters` is the marker that says a service is goetia's, so a
 /// failure leaves:
-/// - on a create, `Parameters` first: a goetia service with its marker, the new blob, and not what the blob renders
-///   (the pre-shutdown time reads 10 s). The next `install` finds it equal to neither the wanted registration nor the
-///   one the blob regenerates and answers `Conflict`, cleared by `--force`: as for a failed `Environment` or failure
-///   actions write. Without the marker first the service would read as foreign;
+/// - on a create, `Parameters` first: a goetia service with its marker and the new blob, lacking the writes that
+///   failed and those after them. Unless what it lacks is what a new service already has (a plain service with
+///   `stop-action: kill`, no environment and no restart policy: the next `install` reads it as up to date), the next
+///   `install` finds it equal to neither the wanted registration nor the one the blob regenerates and answers
+///   `Conflict`, cleared by `--force`, as for a failed `Environment` or failure actions write. Without the marker
+///   first the service would read as foreign;
 /// - on an update, the pre-shutdown time first: the old blob stays. If `change_config` changed nothing the
 ///   registration shows (only the `stop-action` changed), the next `install` finds the service equal to what the old
 ///   blob regenerates and updates again ([`generate::preshutdown_to_write`]); otherwise it answers `Conflict`, as after

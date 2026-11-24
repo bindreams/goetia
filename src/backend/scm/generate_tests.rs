@@ -1507,10 +1507,14 @@ fn written(signal: &str, timeout: Option<u64>) -> StopAction {
     }
 }
 
-/// The stop action is carried in the blob, and reaches SCM only as the pre-shutdown time of a plain service.
+/// The stop action is carried in the blob, and reaches SCM only as the pre-shutdown time of a plain service: the
+/// timeout changes that, and nothing else of the registration; a native service's has none.
 #[skuld::test]
-fn a_stop_action_is_carried_in_the_blob_and_changes_nothing_else() {
-    for spec in [managed_spec(), simple_spec()] {
+fn a_stop_action_is_carried_in_the_blob_and_changes_only_the_preshutdown_time_of_a_plain_service() {
+    for (spec, before, after) in [
+        (managed_spec(), None, None),
+        (simple_spec(), millis(40_000), millis(100_000)),
+    ] {
         let plain = build(&spec);
         let spec = with_stop_action(spec, written("terminate", Some(90)));
         let with = build(&spec);
@@ -1519,6 +1523,8 @@ fn a_stop_action_is_carried_in_the_blob_and_changes_nothing_else() {
         assert_eq!(with.arguments, plain.arguments);
         assert_eq!(with.failure_actions, plain.failure_actions);
         assert_eq!(with.environment, plain.environment);
+        assert_eq!(plain.preshutdown, before);
+        assert_eq!(with.preshutdown, after);
         let blob = crate::blob::decode(&with.parameters[FIELD_SPEC]).unwrap();
         assert_eq!(blob.spec, spec);
     }
@@ -1532,8 +1538,7 @@ fn millis(n: u64) -> Option<Duration> {
 
 /// A plain service is given as long to stop at a system shutdown as a `stop` gives it
 /// ([`StopAction::longest_stop`]): the `timeout` and the teardown margin, the largest value the field holds for no
-/// timeout, and the margin alone for `kill`. Windows waits at least this long, as measured in Server Core containers
-/// of Windows Server 2025, build 26100.
+/// timeout, and the margin alone for `kill`.
 #[skuld::test]
 fn a_plain_services_preshutdown_time_is_its_stop_actions_longest_wait() {
     for (action, expected) in [

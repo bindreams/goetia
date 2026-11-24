@@ -247,7 +247,7 @@ pub(super) fn run_in(
         || {},
         |event| {
             // Before the wait, which Windows may cut short by ending the shim; the pin stays held, since the run is
-            // alive. Nothing reports a task's stop to SCM, and its plan waits for the program alone: no progress.
+            // alive.
             if event == StopEvent::Began(WaitEnd::Stop)
                 && let Err(e) = pin.write_stopping(&instance, started)
             {

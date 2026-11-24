@@ -3,8 +3,7 @@ name: Shutdown demonstration
 # The one run of the whole path at a real Windows shutdown: goetia's own shim, in a Windows Server Core container
 # on the runner, stops a service when the container shuts down, as `goetia daemon stop` does (the script says
 # what passes). It runs for every pull request to `main`, for a pull request to any branch that touches what
-# the path is made of, and on dispatch. It is not a required check: a red run is a defect to fix, and the
-# merge gate is the owner's.
+# the path is made of, and on dispatch.
 on:
   pull_request:
   workflow_dispatch:

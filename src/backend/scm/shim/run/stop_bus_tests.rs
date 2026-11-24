@@ -1681,6 +1681,31 @@ fn an_exit_that_cannot_be_read_leaves_an_unassessable_ask_waited_for() {
     );
 }
 
+/// The tree wait's deadline counts from when the stop was seen, not from when the wait begins: the time the re-asks
+/// took is spent. One `Unsupported` answer is followed by the first pause, which never ends before it is over, so the
+/// first slice, which the period does not cut here, is at most the `timeout` less that pause.
+#[skuld::test]
+fn the_tree_wait_counts_its_timeout_from_when_the_stop_was_seen() {
+    let fake = FakeGuard::new();
+    let timeout = Duration::from_millis(200);
+    let daemon = asked(AskReply::Unsupported)
+        .ask(AskReply::Sent)
+        .wait_tree(TreeWaitReply::Expires(Duration::ZERO));
+    let (supervisor, waiter, child) = launched_with_period(&fake, &daemon, HOUR);
+    assert!(supervisor.bus.request_stop());
+
+    supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(timeout)), |_| {});
+
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    let slices = slices_of(&daemon);
+    let first = *slices.first().expect("the tree was waited for");
+    assert!(
+        first <= timeout - REASK_PACE_FIRST,
+        "the wait did not count the pause before it: {first:?} of {timeout:?}"
+    );
+    let _ = (fake.take_warnings(), fake.take_infos(), fake.take_failures());
+}
+
 /// Every pass of `Unsupported` starts a proxy, so the pauses between passes grow: the first re-ask is fast, and
 /// the pauses stop growing at the ceiling.
 #[skuld::test]
