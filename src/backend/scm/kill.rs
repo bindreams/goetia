@@ -158,6 +158,7 @@ pub(crate) fn hold_if_possible<T: KillTarget>(
         Err(HoldError::Refused(e)) => Ok(HoldOutcome::Refused(e)),
         Err(HoldError::Expired { pid }) => Ok(HoldOutcome::Expired { pid }),
         Err(HoldError::Unread(e) | HoldError::Read(e)) => Err(e),
+        Err(e @ HoldError::Unrecorded { .. }) => Err(e.into()),
     }
 }
 

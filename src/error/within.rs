@@ -45,8 +45,7 @@ fn layer(e: &io::Error) -> Layer<'_> {
     }
 }
 
-/// The goetia [`Error`] that `e` carries, directly or under [`within`] contexts: the one read of what an error
-/// carries, which [`target_failed`] and `debug_privilege_also_failed` (Windows) both take their answers from.
+/// The goetia [`Error`] that `e` carries, directly or under [`within`] contexts.
 pub(super) fn look(e: &io::Error) -> Option<&Error> {
     match layer(e) {
         Layer::Context(within) => look(&within.source),
@@ -130,14 +129,20 @@ pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
     }
 }
 
-/// The failure of a wait after the signal to the process `pid` was sent, `source`, as a target reports it
-/// through [`io::Error`] with its kind kept: an [`Error::KillUnconfirmed`] over `source` as an [`Error`].
-/// `exited` is whether the wait for the process to exit had succeeded.
-pub(crate) fn kill_unconfirmed(pid: u32, exited: bool, source: io::Error) -> io::Error {
+/// The failure of a wait of a kill of the process `pid`, `source`, as a target reports it through
+/// [`io::Error`] with its kind kept: an [`Error::KillUnconfirmed`] over `source` as an [`Error`]. `signalled`
+/// is whether the signal was sent, `exited` whether the process is known to have exited: a process not
+/// signalled is only ever one that had exited.
+pub(crate) fn kill_unconfirmed(pid: u32, signalled: bool, exited: bool, source: io::Error) -> io::Error {
+    debug_assert!(
+        signalled || exited,
+        "a process that was not signalled is known to have exited"
+    );
     io::Error::new(
         source.kind(),
         Error::KillUnconfirmed {
             pid,
+            signalled,
             exited,
             source: Box::new(told(source)),
         },

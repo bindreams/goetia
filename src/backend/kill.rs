@@ -55,10 +55,9 @@ pub enum KillOutcome {
 /// failure carries, or an OS failure of the kill. A target that talks to a manager through calls that fail
 /// with goetia's own [`Error`] wraps it in an [`io::Error`] to pass it through [`KillTarget`]; it is the
 /// step's source, with its class, so before the signal a caller matching on `NoManager` or `Command` finds it
-/// with [`Error::cause`]. A failure of a wait after the signal was delivered ([`kill_unconfirmed`]: the
-/// process may well have exited) is an [`Error::KillUnconfirmed`] under the kill, with no claim that the
-/// kill failed: it is indeterminate, and its cause is itself, not what failed after the signal, which it
-/// carries as its source. Any other error is an OS failure of the kill.
+/// with [`Error::cause`]. A failed wait after the signal was delivered, or after the process was found gone
+/// ([`kill_unconfirmed`]), is an [`Error::KillUnconfirmed`] under the kill, with no claim that the kill
+/// failed. Any other error is an OS failure of the kill.
 pub(crate) fn kill_failed(id: &str, e: io::Error) -> Error {
     target_failed(format!("kill `{id}`"), e)
 }
@@ -184,9 +183,10 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             wait_unbounded_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, None, d)
             })
-            .map_err(|e| of_process(pid, Step::Recording, e))?;
+            .map_err(|e| kill_unconfirmed(pid, false, true, e))?;
             Ok(KillOutcome::Ended)
         }
+        Err(HoldError::Unrecorded { pid, error }) => Err(kill_unconfirmed(pid, false, true, error)),
         Err(HoldError::Unread(e) | HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
         Ok(None) => Ok(KillOutcome::NotRunning),
         // The process held is not the service's, or was gone: it is not signalled, and a manager may
@@ -195,17 +195,17 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             wait_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, held.as_ref(), d)
             })
-            .map_err(|e| of_process(pid, Step::Recording, e))?;
+            .map_err(|e| kill_unconfirmed(pid, false, true, e))?;
             Ok(KillOutcome::Ended)
         }
         Ok(Some(Hold::Held { pid, process })) => {
             target.force_end(&process).map_err(|e| not_signalled(pid, e))?;
             wait_saying(target, &waiting_notice(id, pid, None), |t, d| t.await_exit(&process, d))
-                .map_err(|e| kill_unconfirmed(pid, false, e))?;
+                .map_err(|e| kill_unconfirmed(pid, true, false, e))?;
             wait_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, Some(&process), d)
             })
-            .map_err(|e| kill_unconfirmed(pid, true, e))?;
+            .map_err(|e| kill_unconfirmed(pid, true, true, e))?;
             Ok(KillOutcome::Ended)
         }
     }
@@ -242,7 +242,7 @@ pub(crate) fn hold_once<T: KillTarget>(
         // The process is gone and the manager has not yet recorded it.
         None => match target
             .await_recorded(pid, None, deadline)
-            .map_err(|e| HoldError::Read(of_process(pid, Step::Recording, e)))?
+            .map_err(|error| HoldError::Unrecorded { pid, error })?
         {
             Waited::Confirmed => Ok(Some(Hold::Ended { pid, held: None })),
             Waited::Expired => Err(HoldError::Expired { pid }),
@@ -334,12 +334,17 @@ pub(crate) enum HoldError {
     /// [`hold_once`] only: the manager still reported `pid`, whose process is gone, when the deadline ran
     /// out.
     Expired { pid: u32 },
+    /// [`hold_once`] only: `pid`'s process is gone, and the wait for the manager to record that failed with
+    /// `error`. A caller that waits on the process reports it as any failure of a hold; `kill` tells it as
+    /// one whose outcome is open.
+    Unrecorded { pid: u32, error: io::Error },
 }
 
 impl From<HoldError> for io::Error {
     fn from(error: HoldError) -> Self {
         match error {
             HoldError::Unread(e) | HoldError::Refused(e) | HoldError::Read(e) => e,
+            HoldError::Unrecorded { pid, error } => of_process(pid, Step::Recording, error),
             HoldError::Expired { pid } => io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("the manager still reported process {pid} as the daemon's when the wait ended"),

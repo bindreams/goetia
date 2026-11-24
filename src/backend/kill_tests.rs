@@ -436,25 +436,6 @@ fn a_held_process_the_manager_does_not_name_is_not_signalled_and_the_record_is_w
     );
 }
 
-/// The wait for the record of a process the manager moved off, which is not known to be gone, fails:
-/// that is the kill's error, plain, for nothing was signalled, and it says no more than the notice of
-/// the same wait does.
-#[skuld::test]
-fn a_failed_record_wait_for_a_process_that_ended_is_not_called_a_signal() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found])
-        .disowning()
-        .failing_recorded();
-
-    let e = kill_service(&mut target, ID).unwrap_err();
-
-    assert_eq!(e.kind(), READ_FAILED_KIND);
-    assert_eq!(
-        kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
-    );
-    assert!(!target.log().iter().any(|call| call.starts_with("force_end")));
-}
-
 /// The manager reports another process by the confirmation: it has moved off the one held, which is
 /// either gone or a stranger that took its pid, so it is not signalled. The hold is let go once the
 /// manager's record of the pid has been read, the new process is not opened and nothing is signalled.
@@ -696,7 +677,7 @@ const EXIT_UNCONFIRMED: &str = "process 100 was signalled, but goetia could not 
 
 /// What a failed wait for the manager's record says: the exit was confirmed.
 const RECORD_UNREAD: &str =
-    "process 100 was signalled and has exited, but goetia could not read the manager's record of it";
+    "process 100 was signalled and has exited, but goetia could not confirm that the manager recorded it";
 
 /// What a failure after the signal reports: it was delivered, so the error must not read as a failed
 /// kill. The cause and its kind are kept.
@@ -741,8 +722,7 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
 }
 
 /// The signal stands and the process may well have exited, so a failed wait after it leaves the outcome
-/// open, whichever wait failed and whatever its error: an OS failure, or a goetia error that on its own
-/// is an established failure. The CLI exits `4`, not `1`.
+/// open, whichever wait failed. The CLI exits `4`, not `1`.
 #[skuld::test]
 fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
     for (what, target, exited) in [
@@ -763,7 +743,7 @@ fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
 
         assert!(failed.is_indeterminate(), "{what}: {failed:?}");
         assert!(
-            matches!(failed.cause(), Error::KillUnconfirmed { pid: 100, exited: e, .. } if *e == exited),
+            matches!(failed.cause(), Error::KillUnconfirmed { pid: 100, signalled: true, exited: e, .. } if *e == exited),
             "{what}: {failed:?}"
         );
         #[cfg(feature = "cli")]
@@ -775,17 +755,15 @@ fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
     }
 }
 
-/// An error of goetia's own after the signal is open too, though it alone is an established failure: the
-/// cause is the kill's, which classifies, and the carried error is what the report prints under it. A
-/// caller matching on `cause()` does not find `UnitNotLoaded`: what failed after the signal does not say
-/// what the kill came to.
+/// A goetia error after the signal is open too, though alone it is an established failure: `cause()` is the
+/// kill's, and the report prints the carried error under it.
 #[skuld::test]
 fn a_determinate_error_after_the_signal_is_open_and_is_carried_under_the_cause() {
     let alone = || Error::UnitNotLoaded { unit: "x".to_string() };
     assert!(!alone().is_indeterminate());
 
     for exited in [false, true] {
-        let failed = kill_failed("x", kill_unconfirmed(7, exited, io::Error::other(alone())));
+        let failed = kill_failed("x", kill_unconfirmed(7, true, exited, io::Error::other(alone())));
 
         assert!(failed.is_indeterminate(), "{failed:?}");
         let Error::KillUnconfirmed { source, .. } = failed.cause() else {
@@ -801,8 +779,8 @@ fn a_determinate_error_after_the_signal_is_open_and_is_carried_under_the_cause()
 }
 
 /// What a person reads, for each wait: the signal was delivered, and either the exit is not established, or
-/// the process exited and only the manager's record could not be read. The OS code of the failed wait is
-/// kept for whoever reads it.
+/// the process exited and only the manager's record of it could not be confirmed. The OS code of the failed
+/// wait is kept.
 #[skuld::test]
 fn a_failed_wait_after_the_signal_says_which_wait_failed() {
     const CODE: i32 = 1722;
@@ -814,28 +792,55 @@ fn a_failed_wait_after_the_signal_says_which_wait_failed() {
         ),
         (
             true,
-            "process 100 was signalled and has exited, but goetia could not read the manager's record of it",
+            "process 100 was signalled and has exited, but goetia could not confirm that the manager recorded it",
         ),
     ] {
-        let failed = kill_failed(ID, kill_unconfirmed(100, exited, io::Error::from_raw_os_error(CODE)));
+        let failed = kill_failed(
+            ID,
+            kill_unconfirmed(100, true, exited, io::Error::from_raw_os_error(CODE)),
+        );
 
         assert_eq!(failed.raw_os_error(), Some(CODE));
         assert_eq!(failed.report().to_string(), format!("kill `{ID}`: {lead}: {os}"));
     }
 }
 
-/// A process that was never signalled keeps the plain error: it is not a signalled one.
+/// A process that ended on its own before any signal is gone, and only the manager's record of it is
+/// unconfirmed, so the kill is open (exit `4`) as one that signalled is, and its text claims no signal. The
+/// three ways the record wait is reached: the process gone before it could be opened, the manager's pid
+/// lagging past the first wait, and the process held not being the service's.
 #[skuld::test]
-fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
-    let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+fn a_failed_record_wait_for_a_process_found_gone_is_open_and_claims_no_signal() {
+    let gone = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
+    let lagging = Scripted::new([Some(100)], [Open::Gone])
+        .lagging_record()
+        .failing_recorded();
+    let disowned = Scripted::new([Some(100)], [Open::Found]).disowning().failing_recorded();
+    for (what, mut target) in [("gone", gone), ("lagging", lagging), ("disowned", disowned)] {
+        let e = kill_service(&mut target, ID).unwrap_err();
 
-    let e = kill_service(&mut target, ID).unwrap_err();
-
-    assert_eq!(e.kind(), READ_FAILED_KIND);
-    assert_eq!(
-        kill_failed(ID, e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed"
-    );
+        assert_eq!(e.kind(), READ_FAILED_KIND, "{what}");
+        let failed = kill_failed(ID, e);
+        assert!(failed.is_indeterminate(), "{what}: {failed:?}");
+        assert!(
+            matches!(
+                failed.cause(),
+                Error::KillUnconfirmed {
+                    pid: 100,
+                    signalled: false,
+                    exited: true,
+                    ..
+                }
+            ),
+            "{what}: {failed:?}"
+        );
+        assert_eq!(
+            failed.report().to_string(),
+            "kill `frpc`: process 100 had already exited, but goetia could not confirm that the manager recorded it: manager read failed",
+            "{what}"
+        );
+        assert!(!target.log().iter().any(|step| step.starts_with("force_end")), "{what}");
+    }
 }
 
 /// A kill that fails after the manager named the process says which process, whichever step failed and
@@ -1055,11 +1060,11 @@ fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
     for (e, lead) in [
         (
-            kill_unconfirmed(7, false, io::Error::other("wait failed")),
+            kill_unconfirmed(7, true, false, io::Error::other("wait failed")),
             "kill `x`: process 7 was signalled, but goetia could not establish",
         ),
         (
-            kill_unconfirmed(7, true, wrapped()),
+            kill_unconfirmed(7, true, true, wrapped()),
             "kill `x`: process 7 was signalled and has exited",
         ),
         (

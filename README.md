@@ -2039,8 +2039,9 @@ ends the wait and the signal stands. On every platform, when the process has sti
 not exited a second after it was signalled, goetia prints
 `<id>: waiting for process <pid> to exit` to stderr.
 
-A failure after the signal was sent exits `4`, and the error says whether the process's exit is not
-established or the process exited and only the manager's record of it could not be read.
+A failure after the signal was sent, or to confirm that the manager recorded the end of a process that had already
+exited, exits `4`, and the error says which of the exit and the manager's record could not be established; for a
+Windows task with several runs in flight the result is indeterminate only when no run's kill failed outright.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed. A launchd task whose

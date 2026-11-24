@@ -529,18 +529,25 @@ fn a_kill_is_done_when_scm_reports_a_new_pid() {
 // A failed read of SCM ------------------------------------------------------------------------------------------------
 
 /// What a failure after a delivered termination reports: the process is dead, so the error must not
-/// read as a failed kill. The cause and its kind are kept.
-fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str, kind: io::ErrorKind) {
-    let text = crate::error::Chain(e).to_string();
+/// read as a failed kill. The cause and its kind are kept, and the kill is open (exit `4`): its cause is
+/// `KillUnconfirmed`, the manager's record unconfirmed.
+fn assert_terminated_but_unconfirmed(e: io::Error, cause: &str, kind: io::ErrorKind) {
+    let text = crate::error::Chain(&e).to_string();
     assert!(
         text.starts_with(
-            "process 100 was signalled and has exited, but goetia could not read the manager's record of it"
+            "process 100 was signalled and has exited, but goetia could not confirm that the manager recorded it"
         ),
         "{text}"
     );
     assert!(text.ends_with(cause), "{text}");
     assert!(!text.contains("kill failed"), "{text}");
     assert_eq!(e.kind(), kind);
+    let failed = crate::backend::kill::kill_failed("frpc", e);
+    assert!(failed.is_indeterminate(), "{failed:?}");
+    assert!(
+        matches!(failed.cause(), crate::Error::KillUnconfirmed { exited: true, .. }),
+        "{failed:?}"
+    );
 }
 
 /// The read after the termination: the kill cannot say SCM has let go, but the process is gone.
@@ -550,7 +557,7 @@ fn a_failed_read_after_the_termination_says_the_signal_was_delivered() {
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
-    assert_terminated_but_unconfirmed(&e, "scm read failed", READ_FAILED_KIND);
+    assert_terminated_but_unconfirmed(e, "scm read failed", READ_FAILED_KIND);
     assert_eq!(
         target.log(),
         steps([
@@ -572,20 +579,22 @@ fn a_failed_registration_after_the_termination_says_the_signal_was_delivered() {
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
-    assert_terminated_but_unconfirmed(&e, "notifier could not be opened", io::ErrorKind::Other);
+    assert_terminated_but_unconfirmed(e, "notifier could not be opened", io::ErrorKind::Other);
 }
 
-/// A process that was never terminated by this kill keeps the plain error: it is not a terminated one.
+/// A process that ended before any termination is gone, and only SCM's record of it is unconfirmed: the
+/// kill is open, and its text claims no termination.
 #[skuld::test]
-fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() {
+fn a_failed_registration_for_a_process_found_gone_is_open_and_claims_no_termination() {
     let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_arm();
 
     let e = kill_service(&mut target, "frpc").unwrap_err();
 
+    let failed = crate::backend::kill::kill_failed("frpc", e);
+    assert!(failed.is_indeterminate(), "{failed:?}");
     assert_eq!(
-        crate::backend::kill::kill_failed("frpc", e).report().to_string(),
-        "failed to kill `frpc`: waiting for the manager to stop reporting process 100: notifier could not be \
-         opened"
+        failed.report().to_string(),
+        "kill `frpc`: process 100 had already exited, but goetia could not confirm that the manager recorded it: notifier could not be opened"
     );
 }
 

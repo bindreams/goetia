@@ -61,6 +61,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         },
         Error::KillUnconfirmed {
             pid: 1,
+            signalled: true,
             exited: false,
             source: Box::new(not_installed()),
         },
@@ -933,23 +934,31 @@ fn report_of_a_stop_that_cannot_tell_no_process_is_left() {
     );
 }
 
-/// A kill whose signal was sent says which of the two things it could not establish: the exit, or (the
-/// process having exited) the manager's record of it. What failed is printed under it; the variant is
-/// indeterminate whatever that was.
+/// A kill says what is known of the process: signalled with its exit not established, signalled and
+/// exited with the manager's record unconfirmed, or already exited before any signal with the record
+/// unconfirmed. What failed is printed under it; the variant is indeterminate whatever that was.
 #[skuld::test]
-fn report_of_a_kill_that_signalled_says_which_wait_failed() {
-    for (exited, text) in [
+fn report_of_a_kill_says_what_is_known_of_the_process() {
+    for (signalled, exited, text) in [
         (
+            true,
             false,
             "process 7 was signalled, but goetia could not establish that it exited: daemon `x` is not installed",
         ),
         (
             true,
-            "process 7 was signalled and has exited, but goetia could not read the manager's record of it: daemon `x` is not installed",
+            true,
+            "process 7 was signalled and has exited, but goetia could not confirm that the manager recorded it: daemon `x` is not installed",
+        ),
+        (
+            false,
+            true,
+            "process 7 had already exited, but goetia could not confirm that the manager recorded it: daemon `x` is not installed",
         ),
     ] {
         let e = Error::KillUnconfirmed {
             pid: 7,
+            signalled,
             exited,
             source: Box::new(not_installed()),
         };
