@@ -51,35 +51,6 @@ jobs:
           cp cosca-probe/target/release/cosca-probe ./cosca-probe-bin
           grep -A1 '^name = "cosca"' cosca-probe/Cargo.lock
 
-      # Questions 1 and 2: the three libproc reads and kqueue registration, in the exit window and on a zombie.
-      - name: Q1 Q2 exit window and zombie reads
-        if: ${{ !cancelled() }}
-        run: |
-          set -uo pipefail
-          exec 2>&1
-          for rep in 1 2 3; do
-            echo "--- root, rep $rep"
-            sudo ./exitwindow window 10000 1000 150
-            sudo ./exitwindow zombie 300
-          done
-          for rep in 1 2 3; do
-            echo "--- runner user, rep $rep"
-            ./exitwindow window 10000 1000 150
-            ./exitwindow zombie 300
-          done
-
-      # Question 6: which thread runs a process-directed signal.
-      - name: Q6 signal thread selection
-        if: ${{ !cancelled() }}
-        run: |
-          set -uo pipefail
-          exec 2>&1
-          for rep in 1 2 3; do
-            for variant in busy sleep none; do
-              ./signalthread "$variant" 100000
-            done
-          done
-
       # Question 3: Child::kill in the exit window, cosca 0.10.0.
       - name: Q3 Child::kill in the exit window
         if: ${{ !cancelled() }}

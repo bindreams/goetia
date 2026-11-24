@@ -293,16 +293,13 @@ static void report(int mode, struct tally *t) {
     for (int e = 0; e < MAXERR; e++)
         if (t->killz[e]) printf("  kill(pid,0) answer  %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->killz[e]);
     for (int e = 0; e < MAXERR; e++) {
-        if (t->zombie_token[e]) printf("  to a zombie: token-signal answer %3d (%s): %ld
-", e, e ? strerror(e) : "ok", t->zombie_token[e]);
-        if (t->zombie_kill[e]) printf("  to a zombie: kill(pid,0) answer  %3d (%s): %ld
-", e, e ? strerror(e) : "ok", t->zombie_kill[e]);
+        if (t->zombie_token[e]) printf("  to a zombie: token-signal answer %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->zombie_token[e]);
+        if (t->zombie_kill[e]) printf("  to a zombie: kill(pid,0) answer  %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->zombie_kill[e]);
     }
     for (int n = 1; n < MAXERR; n++)
         if (t->streak_hist[n]) printf("  a run of %d EPERM answers, then another answer: %ld times\n", n, t->streak_hist[n]);
     for (int e = 0; e < MAXERR; e++) {
-        if (t->gone_kill[e]) printf("  at the ending ESRCH, kill(pid,0) answered %d: %ld times
-", e, t->gone_kill[e]);
+        if (t->gone_kill[e]) printf("  at the ending ESRCH, kill(pid,0) answered %d: %ld times\n", e, t->gone_kill[e]);
     }
     printf("  passes with a token-signal EPERM: %ld; passes with a kill() EPERM: %ld\n", t->eperm_passes,
            t->kill_eperm_passes);
