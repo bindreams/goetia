@@ -116,7 +116,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_beside, which};
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, refuse_held_records_at, task_beside, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
@@ -721,7 +721,12 @@ impl Backend for Scm {
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         match (definition, snapshot) {
-            (WindowsDefinition::Service(definition), None) => self.service_write(spec, definition, None),
+            (WindowsDefinition::Service(definition), None) => {
+                // Before anything is registered: a task of the id that was uninstalled with `--no-stop` may still
+                // have a run that holds its records.
+                refuse_held_records_at(&spec.common().id)?;
+                self.service_write(spec, definition, None)
+            }
             (WindowsDefinition::Service(definition), Some(WindowsSnapshot::Service(snapshot))) => {
                 self.service_write(spec, definition, Some(snapshot))
             }
@@ -789,7 +794,7 @@ impl Backend for Scm {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => {
                 if in_flight == RunInFlight::Leave {
-                    return Err(leave_not_built(snapshot.id(), "Windows"));
+                    return Err(leave_not_built(snapshot.id(), "a Windows service"));
                 }
                 self.service_uninstall(snapshot)
             }

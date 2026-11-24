@@ -2125,18 +2125,27 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
   conflicting action, and goetia does not guard against it.
 
 **Windows task.** `uninstall --no-stop` disables the task, so nothing starts another run, and deletes it, so the id is
-not installed. It lists no run, sends nothing to one and waits for none. Task Scheduler lists no run of a deleted
-task, so a run that removed its own task goes on to its own exit and shows in no listing.
+not installed. It lists no run, sends nothing to one and waits for no run and for no pin a run holds. With no pin
+held it is a plain `uninstall`, and like one it waits for any other holder of a run record (a `run` or `stop` of
+the task, or another program) and says on stderr what it waits for. Task Scheduler lists no run of a deleted task,
+so a run that removed its own task goes on to its own exit and shows in no listing.
 
 - The shim of a run holds the task's run records (`%ProgramData%\Goetia\runs\<id>`) for as long as the run lives.
   `uninstall --no-stop` removes them only when nothing holds them. A run that removes its own task therefore leaves
   its run records, the removal's marker (`runs\<id>~removing`) and the shim file it is using until an `uninstall` or
   an `install` of that id after the run has ended.
 - `uninstall` of the id without the flag waits, with no time limit, for the run to end and says on stderr what it
-  waits for; it then removes the records and the marker. `uninstall --no-stop` of the id removes them only if the
-  run has ended, and otherwise returns at once with them as they were.
-- An `install` of the id while that run lives is refused, and nothing is changed: the run holds the records, and the
-  install would hand them to the new account and take the marker away. The install goes on once the run has ended.
+  waits for; it then removes the records and the marker. The wait holds no lock, so no other install or uninstall
+  waits for it. `uninstall --no-stop` of the id removes the records only if the run has ended, and otherwise
+  returns at once with them as they were.
+- A run that is starting when `--no-stop` runs counts as a run in flight. If its shim has pinned the records it is
+  left like any run; if not, it finds the marker and starts no program. The uninstall does not tell the two apart,
+  which would mean waiting, so records that a starting run's pin holds at that moment are left the same way, for
+  the next `install` or `uninstall` of the id.
+- An `install` of the id, of a task or of a service, while that run lives is refused: the run holds the records,
+  and the install would hand them to the new account and take the marker away. The refused install registers
+  nothing and leaves the records and the marker as they were; it has made the Goetia folders and swept the shim
+  files first, as any install does. The install goes on once the run has ended.
 - `uninstall` needs elevation whatever account the task runs as. The flag was measured with a task that runs as
   SYSTEM only; the other accounts were not measured.
 

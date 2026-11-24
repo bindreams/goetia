@@ -209,8 +209,9 @@ impl Scm {
     /// records (its shim still writes its record), then the registration alone is deleted (its records stay,
     /// narrowed to the new account) and created, under a fresh token, armed as the old one's triggers say.
     ///
-    /// A create (no `snapshot`) over run records that something holds is refused first, with nothing asked of the
-    /// machine ([`refuse_held_records`]).
+    /// A create (no `snapshot`) over run records that something holds is refused first, before `prepare` has seen
+    /// to the account ([`refuse_held_records`]): it registers nothing and leaves the records and the marker as they
+    /// were.
     ///
     /// A stored registration whose XML cannot be read at all, or whose account lookup failed for a reason other
     /// than "no such account", fails the write before anything is sent to Task Scheduler: that is not a change of
@@ -450,10 +451,18 @@ fn whose(accounts: &[Sid]) -> &'static str {
     }
 }
 
+/// [`refuse_held_records`] over the records of `id` under the machine's `%ProgramData%`, for an install of a service
+/// at an id that no daemon has: a task of that id may have left records a run still holds.
+pub(in crate::backend::scm) fn refuse_held_records_at(id: &Id) -> Result<()> {
+    refuse_held_records(id, &Runs::of(&program_data()?, id))
+}
+
 /// Refuses an install of `id` as a new task over run records something holds ([`Error::RunRecordsHeld`]): a run of
 /// an earlier task of the id that was uninstalled with `--no-stop` and is still going, or another program. The
-/// install would narrow the records to its account and take the removal's marker away under it. One pass over the
-/// pins ([`Runs::held_pin`], as an account change reads them); it does not wait, and changes nothing.
+/// install would narrow the records to its account and take the removal's marker away under it; a service
+/// installed at the id would be started beside a run that still uses them. One pass over the
+/// pins ([`Runs::held_pin`], as an account change reads them); it does not wait, and leaves the records and the
+/// marker as they were.
 fn refuse_held_records(id: &Id, runs: &Runs) -> Result<()> {
     match runs.held_pin()? {
         Some(pin) => Err(Error::RunRecordsHeld {

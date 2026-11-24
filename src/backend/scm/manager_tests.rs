@@ -800,6 +800,7 @@ fn leaving_a_service_run_is_refused_naming_the_flag_and_that_nothing_was_changed
     match Backend::uninstall(&Scm::new(), snapshot, RunInFlight::Leave, &mut ()) {
         Err(Error::Invalid { message, .. }) => {
             assert!(message.contains("--no-stop"), "{message}");
+            assert!(message.contains("not built for a Windows service yet"), "{message}");
             assert!(message.contains("nothing was changed"), "{message}");
         }
         other => panic!("expected a refusal, got {other:?}"),

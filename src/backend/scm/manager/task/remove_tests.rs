@@ -1140,6 +1140,55 @@ fn leaving_an_absent_id_does_not_wait_for_a_held_pin_and_removes_the_records_onc
     );
 }
 
+/// A plain `uninstall` of an absent id waits, with no bound, for a pin a left run holds; the install lock is a
+/// machine-wide one, so it is taken for each pass and not held across the pauses: another install or uninstall
+/// gets it while this one waits. The lock here is a counter that fails if it is taken while held, and the run's pin
+/// is released at its third taking (the marker's, a first pass that finds the pin, a second that does not).
+#[skuld::test]
+fn a_plain_uninstall_of_an_absent_id_waits_for_a_held_pin_without_holding_the_install_lock() {
+    struct Taken<'a>(&'a Cell<bool>);
+    impl Drop for Taken<'_> {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
+    }
+    let (dir, records_dir, runs) = records();
+    shim_writes(&Runs::of(dir.path(), &id()), &record(1, RunOutcome::Exited(0)));
+    let run_pin = std::cell::RefCell::new(Some(runs.hold().unwrap()));
+    runs.close().unwrap();
+    let (takings, held) = (Cell::new(0), Cell::new(false));
+    let swept = Cell::new(false);
+
+    scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            RunInFlight::Stop,
+            || {
+                assert!(!held.get(), "the lock was held across a pause");
+                takings.set(takings.get() + 1);
+                if takings.get() == 3 {
+                    drop(run_pin.borrow_mut().take());
+                }
+                held.set(true);
+                Ok(Taken(&held))
+            },
+            || {
+                assert!(!held.get(), "the lock was still held when the sweep began");
+                swept.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(takings.get(), 3, "the marker, a pass that waited, a pass that finished");
+    assert!(!held.get() && swept.get());
+    assert!(
+        !records_dir.exists() && !runs.is_closed().unwrap(),
+        "released, nothing is left"
+    );
+}
+
 /// With the choice and no pin held, the removal of an absent id's records is what it is without it.
 #[skuld::test]
 fn leaving_an_absent_id_with_no_pin_held_removes_the_records_under_the_install_lock() {
@@ -1161,6 +1210,67 @@ fn leaving_an_absent_id_with_no_pin_held_removes_the_records_under_the_install_l
 
     assert!(locked.get());
     assert!(!records_dir.exists() && !runs.is_closed().unwrap());
+}
+
+/// A `--no-stop` uninstall that fails names `--no-stop` in the retry it asks for: the retry without it would stop
+/// the run the caller asked to keep, or wait for the caller's own pin. One test per message of the four `Left`s.
+#[skuld::test]
+fn a_failed_leaving_uninstall_asks_for_its_retry_with_no_stop() {
+    let retry = "Re-run `goetia daemon uninstall --no-stop nightly`";
+    let spec = task_spec(Some("30 3 * * *"));
+
+    // The disable failed: whether the task is still enabled is not known.
+    let (_dir, _records_dir, runs) = records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Err(Error::os("disable `nightly`", io::Error::other("refused"))));
+    let mut machine = Machine::new(&fake, &[]);
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Leave, &mut machine)
+        .unwrap_err();
+    let text = failed.to_string();
+    assert!(
+        text.contains("whether it is still enabled is not known") && text.contains(retry),
+        "{text}"
+    );
+
+    // The delete failed: the task is registered and disabled.
+    let (_dir, _records_dir, runs) = records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_delete(Err(Error::os("delete `nightly`", io::Error::other("refused"))));
+    let mut machine = Machine::new(&fake, &[]);
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Leave, &mut machine)
+        .unwrap_err();
+    let text = failed.to_string();
+    assert!(text.contains("It is disabled") && text.contains(retry), "{text}");
+
+    // The records could not be removed after the delete.
+    let (_dir, records_dir, runs) = records();
+    let _held = crate::backend::scm::test_support::directory_held_open(&records_dir.join("stuck"));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(())).on_delete(Ok(true));
+    let mut machine = Machine::new(&fake, &[]);
+    let failed = scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Leave, &mut machine)
+        .unwrap_err();
+    let text = failed.to_string();
+    assert!(
+        text.contains("is deleted, but its run records could not be removed") && text.contains(retry),
+        "{text}"
+    );
+
+    // No task, and the records left for the id could not be removed.
+    let (_dir, records_dir, runs) = records();
+    let _held = crate::backend::scm::test_support::directory_held_open(&records_dir.join("stuck"));
+    let failed = scm(&Fake::new())
+        .uninstall_absent_with(&id(), &runs, RunInFlight::Leave, || -> Result<()> { Ok(()) }, || Ok(()))
+        .unwrap_err();
+    let text = failed.to_string();
+    assert!(
+        text.contains("run records left for it could not be removed") && text.contains(retry),
+        "{text}"
+    );
 }
 
 // Retype ==============================================================================================================

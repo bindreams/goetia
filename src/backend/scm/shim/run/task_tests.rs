@@ -158,7 +158,7 @@ impl Run {
     /// the test's use of the records.
     fn no_pin_is_left(&self) {
         self.runs
-            .remove_all(|path, _| panic!("the shim still holds {}", path.display()))
+            .remove_all(|path, _| panic!("the shim still holds {}", path.display()), || Ok(()))
             .unwrap();
     }
 

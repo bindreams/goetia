@@ -11,13 +11,13 @@ use std::time::Duration;
 use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::{Budget, RunInFlight, ServiceManager as _};
-use goetia::spec::{DaemonSpec, Id, User};
+use goetia::spec::{DaemonSpec, Id, Protocol, User};
 
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::UNINSTALL_SELF_THEN_RELEASE;
 use crate::support::windows_tasks::{ProcessHandle, task_spec};
 use crate::support::{self, ConnectBack, Group, scm_group, wait};
-use crate::tasks::{TaskGuard, records_of, task_exists};
+use crate::tasks::{TaskGuard, records_of, service_as, task_exists};
 
 /// The task `id`, whose program is this binary told to uninstall `id` with `--no-stop` and then go on until
 /// released, writing `after`.
@@ -122,6 +122,17 @@ fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixt
     );
     assert!(marker_of(id).exists(), "the refused install changed nothing");
     assert!(!task_exists(id), "and registered nothing");
+    // A service at the id is the same install over the same records.
+    let refused = mgr
+        .install(&service_as(id, Protocol::Native), false)
+        .expect_err("the run holds the records");
+    assert!(
+        matches!(refused.cause(), Error::RunRecordsHeld { .. }),
+        "{}",
+        refused.report()
+    );
+    let absent = mgr.status(id).expect_err("no service was registered");
+    assert!(matches!(absent.cause(), Error::NotInstalled { .. }), "{absent:?}");
 
     run.release_and_wait_for_its_exit();
 

@@ -93,8 +93,8 @@ pub trait ServiceManager {
     ///
     /// **Windows task**: the task is disabled and deleted with no listing, hold or stop of a run. A run still
     /// going keeps its run records, the removal's marker and the shim file it uses until an `uninstall` or
-    /// `install` of the id after it has ended, and an `install` of the id meanwhile is refused with
-    /// [`Error::RunRecordsHeld`]. A Windows service refuses `Leave`, with nothing changed.
+    /// `install` of the id after it has ended, and an `install` of the id meanwhile (a task or a service) is
+    /// refused with [`Error::RunRecordsHeld`], registering nothing. A Windows service refuses `Leave`, with nothing changed.
     ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other

@@ -47,24 +47,27 @@ enum Left {
     LeftoverRecords,
 }
 
-/// An `uninstall` of `id` that failed with `cause`, led by what it left and the retry that finishes it.
-fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
+/// An `uninstall` of `id` that failed with `cause`, led by what it left and the retry that finishes it. The retry
+/// is made as the failed call was: a `Leave` that is retried without the flag would stop the run it was asked to
+/// keep, or wait on the caller's own pin.
+fn uninstall_failed(id: &Id, left: Left, in_flight: RunInFlight, cause: Error) -> Error {
+    let command = match in_flight {
+        RunInFlight::Stop => format!("goetia daemon uninstall {id}"),
+        RunInFlight::Leave => format!("goetia daemon uninstall --no-stop {id}"),
+    };
     let what = match left {
-        Left::Unknown => format!(
-            "`{id}` was NOT deleted, and whether it is still enabled is not known. Re-run `goetia daemon uninstall \
-             {id}` to retry"
-        ),
-        Left::Disabled => format!(
-            "`{id}` was NOT deleted. It is disabled, so nothing starts it. Re-run `goetia daemon uninstall {id}` to \
-             retry"
-        ),
-        Left::Records => format!(
-            "`{id}` is deleted, but its run records could not be removed. Re-run `goetia daemon uninstall {id}` to \
-             remove them"
-        ),
+        Left::Unknown => {
+            format!("`{id}` was NOT deleted, and whether it is still enabled is not known. Re-run `{command}` to retry")
+        }
+        Left::Disabled => {
+            format!("`{id}` was NOT deleted. It is disabled, so nothing starts it. Re-run `{command}` to retry")
+        }
+        Left::Records => {
+            format!("`{id}` is deleted, but its run records could not be removed. Re-run `{command}` to remove them")
+        }
         Left::LeftoverRecords => format!(
-            "`{id}` is not installed, and run records left for it could not be removed. Re-run `goetia daemon \
-             uninstall {id}` to remove them"
+            "`{id}` is not installed, and run records left for it could not be removed. Re-run `{command}` to remove \
+             them"
         ),
     };
     Error::Step {
@@ -89,14 +92,21 @@ fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
 /// holds them, and nothing is waited for. The marker is placed first and the pins read after, the order
 /// `remove_all` keeps: no pin is made once it stands ([`Runs::hold`]), so a pin read as absent stays absent, and a
 /// pin that is held is a run (or another program) that the removal does not wait for.
-fn remove_records(runs: &Runs, in_flight: RunInFlight) -> Result<()> {
+///
+/// `lock` is what the removal takes for each of its steps and lets go of before it waits (`remove_all`): the
+/// install lock for an id that is not installed, whose wait can last as long as a left run, and nothing for a
+/// caller that holds the install lock already.
+fn remove_records<G>(runs: &Runs, in_flight: RunInFlight, mut lock: impl FnMut() -> Result<G>) -> Result<()> {
     if in_flight == RunInFlight::Leave {
-        runs.close()?;
-        if runs.held_pin()?.is_some() {
+        let held = lock().and_then(|_held| {
+            runs.close()?;
+            runs.held_pin()
+        })?;
+        if held.is_some() {
             return Ok(());
         }
     }
-    runs.remove_all(waiting_for_records)
+    runs.remove_all(waiting_for_records, lock)
 }
 
 /// The shim file the stored task runs, when its file name is that of one a provider placed (the one
@@ -137,14 +147,15 @@ impl Scm {
     }
 
     /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes
-    /// the install lock. The records are removed under it: an install that has just made them holds it,
-    /// and would lose them. With no records there is nothing to guard, and nothing is taken. A removal
-    /// that fails says that the id is not installed and that records left for it could not be removed;
-    /// some may be gone by then.
+    /// the install lock. The records are removed under it, a step at a time, and it is not held while the
+    /// removal waits for a pin: an install that has just made the records holds it, and would lose them,
+    /// but an install or uninstall of another id must not wait for a run that lives on. With no records there
+    /// is nothing to guard, and nothing is taken. A removal that fails (a `lock` that cannot be taken too)
+    /// says that the id is not installed and that records left for it could not be removed; some may be
+    /// gone by then.
     ///
     /// `sweep` runs whether or not the records were removed, after the lock is released. If both fail,
-    /// both errors are kept, the records' first. A `lock` that fails ends the call: the sweep takes the
-    /// same lock.
+    /// both errors are kept, the records' first.
     ///
     /// Without [`RunInFlight::Leave`] the removal waits, with no bound, for a pin that holds the records; with
     /// it, it removes them only when none does and returns at once otherwise, the marker placed and the records
@@ -154,12 +165,11 @@ impl Scm {
         id: &Id,
         runs: &Runs,
         in_flight: RunInFlight,
-        lock: impl FnOnce() -> Result<L>,
+        lock: impl FnMut() -> Result<L>,
         sweep: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let removed = if runs.is_present() {
-            let _lock = lock()?;
-            remove_records(runs, in_flight).map_err(|e| uninstall_failed(id, Left::LeftoverRecords, e))
+            remove_records(runs, in_flight, lock).map_err(|e| uninstall_failed(id, Left::LeftoverRecords, in_flight, e))
         } else {
             Ok(())
         };
@@ -213,13 +223,13 @@ impl Scm {
         let left = match self.tasks.set_enabled(&path, false) {
             Ok(()) => Left::Disabled,
             Err(e) if gone(&e) => Left::LeftoverRecords,
-            Err(e) => return Err(uninstall_failed(id, Left::Unknown, e)),
+            Err(e) => return Err(uninstall_failed(id, Left::Unknown, in_flight, e)),
         };
 
-        runs.close().map_err(|e| uninstall_failed(id, left, e))?;
+        runs.close().map_err(|e| uninstall_failed(id, left, in_flight, e))?;
         if in_flight == RunInFlight::Stop {
-            let pin =
-                pin_records("uninstall", id, runs, MarkerCheck::Ignore).map_err(|e| uninstall_failed(id, left, e))?;
+            let pin = pin_records("uninstall", id, runs, MarkerCheck::Ignore)
+                .map_err(|e| uninstall_failed(id, left, in_flight, e))?;
             self.task_stop_with(
                 "uninstall",
                 id,
@@ -228,7 +238,7 @@ impl Scm {
                 StopPin::Caller(pin),
                 processes,
             )
-            .map_err(|e| uninstall_failed(id, left, e))?;
+            .map_err(|e| uninstall_failed(id, left, in_flight, e))?;
         }
 
         match self.tasks.delete(&path) {
@@ -236,9 +246,9 @@ impl Scm {
             // The task is gone, and an empty folder is the scheduler's own: the uninstall is done. The
             // manager has no channel for a warning, so it is said on stderr as its other warnings are.
             Err(e @ Error::TaskFolderKept { .. }) => eprintln!("warning: {}", e.report()),
-            Err(e) => return Err(uninstall_failed(id, left, e)),
+            Err(e) => return Err(uninstall_failed(id, left, in_flight, e)),
         }
-        remove_records(runs, in_flight).map_err(|e| uninstall_failed(id, Left::Records, e))
+        remove_records(runs, in_flight, || Ok(())).map_err(|e| uninstall_failed(id, Left::Records, in_flight, e))
     }
 }
 

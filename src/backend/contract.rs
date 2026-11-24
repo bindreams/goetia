@@ -436,15 +436,16 @@ pub(crate) struct Scan<S> {
     pub reported: Vec<Installed>,
 }
 
-// RunInFlight::Leave, until every backend honours it ==================================================================
+// RunInFlight::Leave, where it is not built yet =======================================================================
 
-/// The refusal of [`RunInFlight::Leave`] by `manager`, a backend that does not honour it yet: nothing
-/// was read or changed, and `uninstall` without `--no-stop` still works.
+/// The refusal of [`RunInFlight::Leave`] for `what`, a kind of daemon that does not honour it yet (launchd, a
+/// Windows service): the removal has changed nothing (the id's snapshot was read, and nothing written), and
+/// `uninstall` without `--no-stop` still works. Systemd and a Windows task honour it.
 #[cfg(any(target_os = "macos", windows))]
-pub(crate) fn leave_not_built(id: &Id, manager: &str) -> Error {
+pub(crate) fn leave_not_built(id: &Id, what: &str) -> Error {
     Error::Invalid {
         daemon: id.to_string(),
-        message: format!("`--no-stop` is not built for {manager} yet, so nothing was changed: uninstall without it"),
+        message: format!("`--no-stop` is not built for {what} yet, so nothing was changed: uninstall without it"),
         source: None,
     }
 }

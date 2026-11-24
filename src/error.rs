@@ -598,8 +598,9 @@ pub enum Error {
 
     /// `install` of an id whose earlier task was uninstalled with `--no-stop` while a run of it went on, or whose
     /// run records another program holds: `pin` is what holds them. Installing would narrow the records to the new
-    /// account and take the removal's marker away under that holder. Determinate: nothing was changed; the same
-    /// classifications as [`Error::AccountChangeHeld`].
+    /// account and take the removal's marker away under that holder. Determinate: nothing was registered and the records
+    /// and the marker are as they were (the install had made the Goetia folders and swept the shim files, as any
+    /// install does first); the same classifications as [`Error::AccountChangeHeld`].
     #[error("{}", run_records_held(id, pin))]
     RunRecordsHeld { id: String, pin: PathBuf },
 
@@ -1618,7 +1619,8 @@ fn standin_blocked(id: &str, path: &Path) -> String {
 }
 
 /// What can hold a task's run records, worded for a message.
-pub(crate) const RECORD_HOLDERS: &str = "a run that is starting, a `run` or `stop` of the task, or another program";
+pub(crate) const RECORD_HOLDERS: &str = "a run that is starting, a run still going after `uninstall --no-stop`, a `run` or `stop` of the task, or another \
+     program";
 
 /// The message of [`Error::AccountChangeHeld`].
 fn account_change_held(id: &str, pin: &Path) -> String {

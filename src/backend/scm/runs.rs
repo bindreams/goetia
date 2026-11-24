@@ -641,6 +641,10 @@ impl Runs {
     /// marker, for a `run` to keep backing off while records may be partly gone; an install clears it
     /// ([`Runs::ensure`]).
     ///
+    /// `lock` is taken for the marker and for each pass and let go before each pause, so that a wait for a held
+    /// pin blocks nothing that needs it: the pass's own listing of the pins is the re-check. A caller that holds
+    /// what `lock` stands for already passes one that takes nothing.
+    ///
     /// **A limit, stated:** a directory someone placed in the task's directory that a program holds open
     /// (a handle on a file in it, say) fails the removal, which names that directory; once the program
     /// lets go, or the directory is removed by hand, run the removal again.
@@ -650,14 +654,18 @@ impl Runs {
     /// does it while the removal runs (deleting it while it holds it open, say) is the user's own concurrent
     /// action. The removal does not tell a delete that is pending from a refusal: it fails, naming the
     /// path and the error Windows gave, and a re-run finishes once the program has let go.
-    pub(crate) fn remove_all(&self, mut waiting: impl FnMut(&Path, PauseKind)) -> Result<()> {
+    pub(crate) fn remove_all<G>(
+        &self,
+        mut waiting: impl FnMut(&Path, PauseKind),
+        mut lock: impl FnMut() -> Result<G>,
+    ) -> Result<()> {
         // The marker first, then the pins: see [`Runs::hold`]. With `runs` gone so is everything in it.
-        if self.close()? == Closed::NoRecords {
+        if { lock().and_then(|_held| self.close())? } == Closed::NoRecords {
             return Ok(());
         }
         let mut said = Said::Nothing;
         loop {
-            let pass = self.remove_pass()?;
+            let pass = lock().and_then(|_held| self.remove_pass())?;
             if matches!(pass, PassOutcome::Done) {
                 return Ok(());
             }

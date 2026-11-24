@@ -202,6 +202,26 @@ fn install_over_records_a_run_still_holds_is_refused_and_changes_nothing() {
     fake.finish();
 }
 
+/// The check a task's create and a retype make, and a service's create at an id whose task left records: records a
+/// pin holds are refused with that pin named, and records nothing holds, or none, are not.
+#[skuld::test]
+fn held_records_are_refused_and_free_or_missing_ones_are_not() {
+    let (dir, runs) = made_records();
+    refuse_held_records(&id(), &runs).expect("nothing holds the records");
+
+    let pin = runs.hold().unwrap();
+    let Err(Error::RunRecordsHeld { id: held, pin: named }) = refuse_held_records(&id(), &runs) else {
+        panic!("a pin holds the records")
+    };
+    assert_eq!(held, ID);
+    assert_eq!(named.parent(), Some(records_dir(&dir).as_path()));
+    drop(pin);
+    refuse_held_records(&id(), &runs).expect("the pin is released");
+
+    let (_dir, none) = records();
+    refuse_held_records(&id(), &none).expect("no records, nothing held");
+}
+
 /// Once the run is over and its pin is gone, the install goes on as it does over any leftover records: it creates
 /// the task, narrows the records and takes the marker away.
 #[skuld::test]
