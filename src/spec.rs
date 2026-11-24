@@ -272,8 +272,13 @@ pub enum DaemonKind {
 }
 
 impl DaemonKind {
-    /// How the kind is written in `--json` and in the text forms of `status` and `list`.
-    /// [`Serialize`](serde::Serialize) goes through here, so the two cannot drift.
+    /// Every variant, in declaration order.
+    pub const ALL: [DaemonKind; 2] = [DaemonKind::Service, DaemonKind::Task];
+
+    /// The one spelling of the kind: the `--json` and text forms of `status` and `list`, the
+    /// manifest's `type:` value that [`parse`](DaemonKind::parse) accepts, the `type` line of `show`
+    /// and of the diff, and the noun in error messages. [`Serialize`](serde::Serialize) and
+    /// [`Display`](std::fmt::Display) go through here, so they cannot drift.
     pub fn as_str(self) -> &'static str {
         match self {
             DaemonKind::Service => "service",
@@ -283,9 +288,7 @@ impl DaemonKind {
 
     /// The kind [`as_str`](DaemonKind::as_str) spells as `text`, and `None` for any other text.
     pub fn parse(text: &str) -> Option<DaemonKind> {
-        [DaemonKind::Service, DaemonKind::Task]
-            .into_iter()
-            .find(|kind| kind.as_str() == text)
+        DaemonKind::ALL.into_iter().find(|kind| kind.as_str() == text)
     }
 
     /// The kind that is not this one.

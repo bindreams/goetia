@@ -58,6 +58,7 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
         ("env", Value::Mapping(env_value(&common.env))),
         ("id", Value::from(common.id.as_str().to_owned())),
         ("name", Value::from(common.name.clone())),
+        ("type", Value::from(spec.kind().as_str())),
         ("user", user_value(&common.user)),
     ];
     if let Some(stop_action) = stop_action_value(spec.stop_action()) {
@@ -71,7 +72,6 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
     }
     match spec {
         DaemonSpec::Service(s) => {
-            fields.push(("type", Value::from(spec.kind().as_str())));
             fields.push(("protocol", Value::from(kind_key(s.protocol))));
             fields.push(("restart", Value::from(restart_key(s.restart))));
             if let Some(delay) = s.restart_delay {
@@ -82,7 +82,6 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
             }
         }
         DaemonSpec::Task(t) => {
-            fields.push(("type", Value::from(spec.kind().as_str())));
             if let Some(schedule) = &t.schedule {
                 fields.push(("schedule", Value::from(schedule.text().to_owned())));
             }
