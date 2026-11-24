@@ -2129,9 +2129,9 @@ alone only by leaving its label loaded. Whether that is possible depends on the 
 all the same. A plist edited by hand since launchd loaded the job is the user's own change, and goetia does not
 guard against it.
 
-- A job launchd does not keep alive (a task's job, or a service with `restart: never`) can be left. `uninstall
-  --no-stop` boots out a task's timer, then reads the job. A job with no process and no start launchd has accepted
-  is booted out as `uninstall` does, which signals nothing. A job with a process, with an accepted start, or in a
+- A job launchd does not keep alive (a task's job, or a service with `restart: never`) can be left.
+  With `--no-stop`, `uninstall` boots out a task's timer, then reads the job. A job with no process and no start
+  launchd has accepted is booted out as `uninstall` does, which signals nothing. A job with a process, with an accepted start, or in a
   state goetia does not read as idle keeps its label loaded, and nothing is sent to it. Then the plists are
   removed. The id is not installed, and the process is the caller's.
 - After a left process exits, launchd keeps the label, idle, until a reboot or the next `install` of the id.
