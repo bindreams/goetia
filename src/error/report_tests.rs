@@ -606,7 +606,7 @@ fn a_composite_no_walk_names_is_told_and_searched_through_its_carrier() {
 
 /// `carried_composite::<T>` finds a `T` and nothing else: not a plain error, not another payload, not a
 /// carrier of another composite. A carrier is read only as the direct payload: one under a `within` context
-/// is not found. No path in goetia wraps one before it is read.
+/// is not found.
 #[skuld::test]
 fn a_carried_composite_is_found_only_as_the_type_it_carries() {
     #[derive(Debug)]
@@ -643,7 +643,6 @@ fn a_carried_composite_is_found_only_as_the_type_it_carries() {
         "an error with no payload"
     );
 
-    // A payload that is a composite itself but was not put through `carry`, so no `Carrier` wraps it.
     let uncarried = std::io::Error::other(Wanted);
     assert!(
         carried_composite::<Wanted>(&uncarried).is_none(),

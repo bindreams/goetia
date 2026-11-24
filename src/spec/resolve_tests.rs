@@ -105,14 +105,14 @@ env:
     assert!(msg.contains('='), "error should call out the `=`: {msg}");
 }
 
-/// The characters that cut a string short or start a new directive, as the escape a YAML
+/// The characters that cut a string short, end a line or start a new directive, as the escape a YAML
 /// double-quoted scalar takes for each.
-const CONTROL_CHARACTERS: [(char, &str); 2] = [('\n', r"\n"), ('\0', r"\0")];
+const CONTROL_CHARACTERS: [(char, &str); 3] = [('\n', r"\n"), ('\r', r"\r"), ('\0', r"\0")];
 
-/// Every field a `${EVIL}` reference can sit in and reach a generated artifact: the field the gate must blame, and
-/// the YAML that writes the reference. A `command` row is the whole command, so its manifest has no other
-/// ([`base_command_for`]). `command[0]` has a row of its own: it alone goes on to path resolution. There is none
-/// for an `env` key or `user.id`: a reference in either is refused before `.env` is read.
+/// Each field a `${EVIL}` reference can reach a generated artifact through: the field the gate must blame, and the
+/// YAML that writes it. A `command` row is the whole command, so its manifest has no other
+/// ([`base_command_for`]). There is none for an `env` key or `user.id`: a reference in either is refused before
+/// `.env` is read.
 const SUBSTITUTED_LEAVES: [(&str, &str); 8] = [
     ("name", "name: ${EVIL}\n"),
     ("command", "command: [/bin/frpc, \"${EVIL}\"]\n"),
@@ -121,8 +121,7 @@ const SUBSTITUTED_LEAVES: [(&str, &str); 8] = [
     ("logs", "logs: ${EVIL}\n"),
     ("env[LOG]", "env:\n  LOG: ${EVIL}\n"),
     ("user.name", "user: ${EVIL}\n"),
-    // The struct form too: it is the syntax the `RawUser` split introduced, and it reaches the gate by a
-    // different arm.
+    // The struct form reaches the gate by a different arm.
     ("user.name", "user:\n  name: ${EVIL}\n"),
 ];
 
@@ -210,15 +209,20 @@ fn a_control_character_in_the_id_is_refused() {
 fn a_control_character_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(
     #[fixture(temp_dir)] dir: &Path,
 ) {
-    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value; the gate is
-    // looped over the control characters `.env` can carry, each as an unquoted and a quoted value.
+    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value. `.env` carries
+    // NUL and a mid-line `\r` (it strips only a trailing one) in an unquoted, a single-quoted and a double-quoted
+    // value.
     for (c, _) in CONTROL_CHARACTERS {
         // `.env` refuses a newline itself, so no value carries one to the gate:
         // `a_newline_cannot_arrive_through_env_substitution`.
         if c == '\n' {
             continue;
         }
-        for env_file in [format!("EVIL=svc{c}x\n"), format!("EVIL='svc{c}x'\n")] {
+        for env_file in [
+            format!("EVIL=svc{c}x\n"),
+            format!("EVIL='svc{c}x'\n"),
+            format!("EVIL=\"svc{c}x\"\n"),
+        ] {
             write_fixture(dir, "", Some(&env_file));
             for (field, fragment) in SUBSTITUTED_LEAVES {
                 let predicate = format!("field `{field}` contains a control character");
@@ -255,9 +259,10 @@ fn a_control_character_that_arrives_through_env_substitution_is_refused_before_a
 #[skuld::test]
 fn a_newline_cannot_arrive_through_env_substitution(#[fixture(temp_dir)] dir: &Path) {
     // No `.env` value carries a newline: unquoted, it ends the line and what follows is no `NAME=VALUE`; quoted,
-    // the value does not close on its line. So the gate above never sees one, and the file is what refuses it.
+    // the value does not close on its line, in either quote. So the gate above never sees one, and the file is what
+    // refuses it.
     let yaml = "id: frpc\ncommand: [/bin/frpc]\nname: ${EVIL}\n";
-    for env_file in ["EVIL=svc\nx\n", "EVIL='svc\nx'\n"] {
+    for env_file in ["EVIL=svc\nx\n", "EVIL='svc\nx'\n", "EVIL=\"svc\nx\"\n"] {
         write_fixture(dir, yaml, Some(env_file));
         for &native in HOST_BACKENDS {
             let context = format!("{env_file:?} as native `{native}`");

@@ -1198,9 +1198,8 @@ fn a_refused_simple_install_never_reaches_the_provider() {
     }
 }
 
-/// The id [`snapshot_with_config`] gives its daemon: a name no host installs a service under, so a regression
-/// that reached `ScmSnapshot::service` would open it by name and fail with `NotInstalled` whatever the host
-/// runs.
+/// The id [`snapshot_with_config`] gives its daemon: a name no host installs a service under, so any SCM access by
+/// name fails with `NotInstalled`.
 const SNAPSHOT_ID: &str = "goetia-unit-test-no-such-service";
 
 /// The daemon `fields` describe, under [`SNAPSHOT_ID`], and a snapshot of it that has never opened a service,

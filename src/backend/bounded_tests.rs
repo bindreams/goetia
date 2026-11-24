@@ -202,7 +202,7 @@ fn descendant_on_fd3(child: &mut cosca::Child) -> KillOnDrop {
 
 /// A descendant a test owns the life of before it exists: it blocks reading its fd 4, a pipe whose write
 /// end the test holds ([`held_pipe`]), so it ends at that pipe's EOF however the test ends, a panic
-/// included. A script starts it with this, and its command has `fd(4, pipe_in())`.
+/// included.
 const HELD_DESCENDANT: &str = "( read held <&4 ) &";
 
 /// The write end of the child's fd 4, to be held until the test is over. The child owns it from the
