@@ -14,7 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::*;
 use crate::backend::scm::instance::InstanceId;
-use crate::backend::scm::manager::identity::account_name_of_sid;
+use crate::backend::scm::manager::Lsa;
 use crate::backend::scm::manager::task::api::{Instance, Registration};
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::shim::acl::acl_tests::windows::junction;
@@ -2191,7 +2191,10 @@ fn an_up_to_date_install_of_an_unresolvable_spec_account_quotes_the_spec_field(#
     let spec = task_spec_as(User::Name(name.to_owned()), Some("30 3 * * *"));
     let snapshot = snapshot_of(&spec, false);
 
-    let failed = beside_of(&dir, &spec, &snapshot, prepare).unwrap_err();
+    let failed = beside_of(&dir, &spec, &snapshot, |account, written, reads| {
+        prepare(&Lsa, account, written, reads)
+    })
+    .unwrap_err();
 
     let text = failed.to_string();
     assert!(text.contains("user.name") && text.contains(name), "{text}");
@@ -2741,7 +2744,7 @@ fn undecodable(mut registered: Registered) -> TaskSnapshot {
 /// account's own (read-only); the account it registers again as is the second value.
 fn own_task(armed: bool) -> (TaskAccount, TaskSnapshot) {
     let sid = process_user_sid();
-    let name = account_name_of_sid(&sid).expect("the account this test runs as has a name");
+    let name = Lsa.by_sid(&sid).expect("the account this test runs as has a name").name;
     let spec = task_spec_as(User::Name(name.clone()), Some("30 3 * * *"));
     let mut registered = registered_task(&spec, armed);
     let text = sid_display(&sid);
@@ -3408,7 +3411,7 @@ const NO_SUCH_ACCOUNT: &str = "goetia-no-such-account-7f3a";
 fn a_native_service_has_no_account_the_log_keeps() {
     let native = service_registered_as(crate::spec::Protocol::Native, Some(LOCAL_SERVICE_NAME), false);
 
-    let kept = kept_service_account(&native, &TaskAccount::User(NO_SUCH_ACCOUNT.to_string()));
+    let kept = kept_service_account(&Lsa, &native, &TaskAccount::User(NO_SUCH_ACCOUNT.to_string()));
 
     assert_eq!(kept.unwrap(), None);
 }
@@ -3419,7 +3422,7 @@ fn a_native_service_has_no_account_the_log_keeps() {
 fn a_service_whose_account_is_gone_has_no_account_the_log_keeps() {
     let gone = service_registered_as(crate::spec::Protocol::Plain, Some(NO_SUCH_ACCOUNT), true);
 
-    let kept = kept_service_account(&gone, &TaskAccount::Service("S-1-5-19".to_string()));
+    let kept = kept_service_account(&Lsa, &gone, &TaskAccount::Service("S-1-5-19".to_string()));
 
     assert_eq!(kept.unwrap(), None);
 }
@@ -3435,7 +3438,7 @@ fn a_service_that_runs_as_the_tasks_account_has_no_account_the_log_keeps() {
     ] {
         let service = service_registered_as(crate::spec::Protocol::Plain, registered, true);
 
-        let kept = kept_service_account(&service, &task);
+        let kept = kept_service_account(&Lsa, &service, &task);
 
         assert_eq!(kept.unwrap(), None, "{registered:?} for {task:?}");
     }
@@ -3447,7 +3450,7 @@ fn a_service_that_runs_as_the_tasks_account_has_no_account_the_log_keeps() {
 fn a_service_that_runs_as_another_account_than_the_tasks_has_its_account_kept() {
     let service = service_registered_as(crate::spec::Protocol::Plain, Some(LOCAL_SERVICE_NAME), true);
 
-    let kept = kept_service_account(&service, &TaskAccount::Service("S-1-5-20".to_string()));
+    let kept = kept_service_account(&Lsa, &service, &TaskAccount::Service("S-1-5-20".to_string()));
 
     assert_eq!(kept.unwrap(), Some(local_service()));
 }

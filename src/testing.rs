@@ -76,7 +76,11 @@ pub fn shown_sid(sid: &[u8]) -> String {
 /// daemon that runs as it.
 #[cfg(windows)]
 pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
-    crate::backend::scm::manager::sid_for_account_name(account_name, None).map(|(sid, _kind)| sid)
+    use crate::backend::scm::manager::{Accounts as _, Lsa};
+
+    Lsa.by_name(account_name)
+        .map(|account| account.sid)
+        .map_err(|e| crate::error::Error::os(format!("resolve SID for account `{account_name}`"), e))
 }
 
 /// Whether the account `sid` holds the logon right `right` (`"SeBatchLogonRight"`), as the local security

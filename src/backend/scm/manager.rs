@@ -52,7 +52,7 @@
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
 //! (`ERROR_LOGON_FAILURE`) while `install` has already reported success. See
-//! `identity::grant_logon_right`, called before the service is
+//! `Accounts::grant`, called before the service is
 //! created or changed, for every account [`generate::account_needs_password`]
 //! says needs a password — every other account (`LocalSystem`, a built-in, or an
 //! `NT SERVICE\<id>` virtual account) already holds the right, and
@@ -60,7 +60,8 @@
 //! resolve the first three by those spellings. The grant does no lookup: first
 //! `identity::require_user_account` refuses such an account that is not a user (a group, a
 //! domain), because the right would reach every account in it, and the grant takes the SID that
-//! check found. Both come before the password is read.
+//! check found. The order is the check, then the password, then the grant: a missing password
+//! grants nothing.
 //!
 //! **5. Create with `SERVICE_DEMAND_START`, write `Parameters` immediately
 //! after.** Not `SERVICE_DISABLED` (which would block an explicit `start`),
@@ -94,11 +95,11 @@
 //! reach `CreateServiceW`/`ChangeServiceConfigW` for one that needs none —
 //! Windows rejects a password outright for those accounts.
 
+pub(in crate::backend::scm) mod accounts;
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
 pub(crate) mod task;
-#[cfg(any(test, feature = "testing"))]
-pub(crate) use identity::sid_for_account_name;
+pub(crate) use accounts::{Accounts, Lsa};
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use registry::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED};
 
@@ -156,13 +157,20 @@ use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Protocol, User};
 
 /// The Windows service manager. Holds no state of its own — every operation opens exactly the
 /// SCM/registry handles it needs and closes them again — only the source of `protocol: plain`
-/// services' host, the check on the folder it lives in, and the boundary to Task Scheduler.
+/// services' host, the check on the folder it lives in, the boundary to Task Scheduler and the one to the
+/// machine's accounts.
 pub struct Scm {
     /// `None` for [`Scm::new`]: no host to provide, and no files of the manager's own to sweep.
     shim: Option<Box<dyn ShimProvider>>,
     folders: FolderCheck,
     /// Task Scheduler: the real one, unless an in-crate test put a [`TaskApi`] in its place.
     tasks: Box<dyn TaskApi>,
+    /// The machine's account database: the real one, unless an in-crate test put an [`Accounts`] in its place.
+    accounts: Box<dyn Accounts>,
+    /// Where the password of a real user's logon is read from: the environment
+    /// ([`identity::service_password`]), unless an in-crate test put another source in its place. A command's
+    /// input, not an account fact, so it is not on [`Accounts`].
+    password: fn() -> Result<Option<String>>,
 }
 
 impl Scm {
@@ -174,6 +182,8 @@ impl Scm {
             shim: None,
             folders: FolderCheck::new(CheckPermissions::Enable),
             tasks: Box::new(Com),
+            accounts: Box::new(Lsa),
+            password: identity::service_password,
         }
     }
 
@@ -186,6 +196,8 @@ impl Scm {
             shim: Some(Box::new(provider)),
             folders: FolderCheck::new(check),
             tasks: Box::new(Com),
+            accounts: Box::new(Lsa),
+            password: identity::service_password,
         }
     }
 
@@ -194,6 +206,18 @@ impl Scm {
     #[cfg(test)]
     pub(crate) fn with_tasks(self, tasks: Box<dyn TaskApi>) -> Self {
         Self { tasks, ..self }
+    }
+
+    /// This manager over `accounts` in place of the real account database, for in-crate tests.
+    #[cfg(test)]
+    pub(crate) fn with_accounts(self, accounts: Box<dyn Accounts>) -> Self {
+        Self { accounts, ..self }
+    }
+
+    /// This manager reading the password from `password` in place of the environment, for in-crate tests.
+    #[cfg(test)]
+    pub(crate) fn with_password(self, password: fn() -> Result<Option<String>>) -> Self {
+        Self { password, ..self }
     }
 
     /// The provider, or [`Error::NoShimProvider`] for a manager built without one.
@@ -378,7 +402,7 @@ impl Scm {
     }
 
     fn service_render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
-        let identity = identity::resolve(&spec.common().user)?;
+        let identity = identity::resolve(&*self.accounts, &spec.common().user)?;
         service_registration(spec, || {
             generate::registration(spec, &identity, &|| self.provider()?.preview())
         })
@@ -389,7 +413,7 @@ impl Scm {
     /// spec, and no provider is consulted. `protocol: native` has no host, so its snapshot's config is
     /// never read.
     fn service_regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
-        let identity = identity::resolve(&spec.common().user)?;
+        let identity = identity::resolve(&*self.accounts, &spec.common().user)?;
         service_registration(spec, || {
             generate::registration(spec, &identity, &|| {
                 let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
@@ -404,7 +428,7 @@ impl Scm {
 
     /// The host is previewed once, for the check and the registration alike.
     fn service_render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
-        let identity = identity::resolve(&spec.common().user)?;
+        let identity = identity::resolve(&*self.accounts, &spec.common().user)?;
         service_registration(spec, || {
             generate::install_registration(spec, &identity, &|| self.provider()?.preview())
         })
@@ -440,7 +464,14 @@ impl Scm {
         definition: &ScmRegistration,
         snapshot: Option<&ScmSnapshot>,
     ) -> Result<WriteOutcome> {
-        apply(spec, definition, written_user(&spec.common().user), snapshot)?;
+        apply(
+            &*self.accounts,
+            self.password,
+            spec,
+            definition,
+            written_user(&spec.common().user),
+            snapshot,
+        )?;
         Ok(WriteOutcome::Done)
     }
 
@@ -748,11 +779,25 @@ impl Backend for Scm {
     ) -> Result<()> {
         match (definition, snapshot) {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {
-                let gated = service_gate(definition, written_user(&spec.common().user), Password::Unneeded)?;
-                make_default_log(spec, definition, gated.checked.as_ref(), &[], default_log::Step::Narrow).map(drop)
+                let gated = service_gate(
+                    &*self.accounts,
+                    self.password,
+                    definition,
+                    written_user(&spec.common().user),
+                    Password::Unneeded,
+                )?;
+                make_default_log(
+                    &*self.accounts,
+                    spec,
+                    definition,
+                    gated.checked.as_ref(),
+                    &[],
+                    default_log::Step::Narrow,
+                )
+                .map(drop)
             }
             (WindowsDefinition::Task(definition), WindowsSnapshot::Task(installed)) => {
-                task_beside(spec, definition, installed)
+                task_beside(&*self.accounts, spec, definition, installed)
             }
             (WindowsDefinition::Service(_), WindowsSnapshot::Task(_))
             | (WindowsDefinition::Task(_), WindowsSnapshot::Service(_)) => Ok(()),
@@ -1079,10 +1124,10 @@ fn registered_account(cfg: &ServiceConfig) -> Option<String> {
         .and_then(|a| generate::canonical_account(&a))
 }
 
-/// The SID of the account the service `cfg` describes is registered as. `None` when no account has that
+/// The SID of the account a service is `registered` as ([`registered_account`]). `None` when no account has that
 /// name (a deleted account): nothing runs as it, so there is no one to name. Any other failure is an error.
-fn registered_account_sid(cfg: &ServiceConfig) -> Result<Option<Sid>> {
-    match identity::service_account_sid(registered_account(cfg).as_deref(), None) {
+fn registered_account_sid(accounts: &dyn Accounts, registered: Option<&str>) -> Result<Option<Sid>> {
+    match identity::service_account_sid(accounts, registered, None) {
         Ok(sid) => Ok(Some(sid)),
         Err(Error::AccountLookup { .. }) => Ok(None),
         Err(e) => Err(e),
@@ -1198,46 +1243,48 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the start type the service has, rather
 /// than resetting it; see `service_info`. `written` is what [`written_user`] says of the account's spec value.
 fn apply(
+    accounts: &dyn Accounts,
+    password: fn() -> Result<Option<String>>,
     spec: &DaemonSpec,
     reg: &ScmRegistration,
     written: Option<identity::Written>,
     installed: Option<&ScmSnapshot>,
 ) -> Result<()> {
-    let gated = service_gate(reg, written, Password::Read)?;
+    let gated = service_gate(accounts, password, reg, written, Password::Read)?;
     let mut before = None;
     let mut after = default_log::Step::Narrow;
     if let Some(installed) = installed {
         let config = installed.config()?;
         before = accounts_kept_before_change(
+            accounts,
             generate::hosted(spec),
             &registered_account(config),
             &reg.account,
-            || registered_account_sid(config),
         )?;
         let step = if before.is_some() {
             default_log::Step::Widen
         } else {
             default_log::Step::Narrow
         };
-        let change = make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
+        let change = make_default_log(accounts, spec, reg, gated.checked.as_ref(), before.as_slice(), step)?;
         after = change.map_or(default_log::Step::Narrow, |change| change.step_after());
     }
     apply_gated(reg, gated.password, installed.is_none())?;
-    make_default_log(spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
+    make_default_log(accounts, spec, reg, gated.checked.as_ref(), before.as_slice(), after).map(drop)
 }
 
 /// The registered account of a service, which its default log names beside the new account until a change of
-/// account lands: `lookup` is asked for it only where a log names it, a hosted service (`hosted`) whose
-/// account `new` differs from the `registered` one. Any other install names the new account alone, and asks the
-/// system nothing of the old one.
+/// account lands: `accounts` is asked for it only where a log names it, a hosted service (`hosted`) whose
+/// account `new` differs from the `registered` one ([`registered_account_sid`]). Any other install names the new
+/// account alone, and asks the system nothing of the old one.
 fn accounts_kept_before_change(
+    accounts: &dyn Accounts,
     hosted: bool,
     registered: &Option<String>,
     new: &Option<String>,
-    lookup: impl FnOnce() -> Result<Option<Sid>>,
 ) -> Result<Option<Sid>> {
     if hosted && registered != new {
-        lookup()
+        registered_account_sid(accounts, registered.as_deref())
     } else {
         Ok(None)
     }
@@ -1261,8 +1308,30 @@ enum Password {
 
 /// What a service of `reg` needs before it is written, which a change of a task into a service sees to
 /// before it removes the task: the account is a user and its right is granted, the password is read,
-/// and the event source is registered. See [`apply`].
-fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads: Password) -> Result<Gated> {
+/// and the event source is registered. See [`apply`] and [`gate_account`].
+fn service_gate(
+    accounts: &dyn Accounts,
+    password: fn() -> Result<Option<String>>,
+    reg: &ScmRegistration,
+    written: Option<identity::Written>,
+    reads: Password,
+) -> Result<Gated> {
+    let gated = gate_account(accounts, password, reg, written, reads)?;
+    // Here rather than in the shim: it writes under HKLM, and the shim may run as an unprivileged
+    // account.
+    registry::register_event_source()?;
+    Ok(gated)
+}
+
+/// The account half of [`service_gate`], which asks `accounts` and `password` and writes no registry: the
+/// account is a user, the password is read from `password`, and the right is granted, in that order.
+fn gate_account(
+    accounts: &dyn Accounts,
+    password: fn() -> Result<Option<String>>,
+    reg: &ScmRegistration,
+    written: Option<identity::Written>,
+    reads: Password,
+) -> Result<Gated> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -1272,8 +1341,8 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads
     // `LocalSystem`, `LocalService` or `NetworkService` by those spellings
     // at all, and every such account already holds the right.
     //
-    // The `false` arm must never call `identity::service_password()`:
-    // `service_password` is a bare read of `GOETIA_SERVICE_PASSWORD` with
+    // The `false` arm must never call `password()`:
+    // `identity::service_password` is a bare read of `GOETIA_SERVICE_PASSWORD` with
     // no knowledge of which account is being installed, so it returns
     // `Some(pw)` whenever that variable happens to be set for any reason —
     // a value left over from installing a different daemon in the same
@@ -1292,23 +1361,19 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads
         // right is granted to the SID that check found. Without a password, install would report
         // success and every start would fail with error 1069 (`ERROR_LOGON_FAILURE`), so a missing
         // one is refused.
-        let user = identity::require_user_account(account, written)?;
+        let user = identity::require_user_account(accounts, account, written)?;
         let pw = match reads {
-            Password::Read => Some(identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
+            Password::Read => Some(password()?.ok_or_else(|| Error::PasswordRequired {
                 account: account.to_string(),
                 kind: DaemonKind::Service,
             })?),
             Password::Unneeded => None,
         };
-        identity::grant_logon_right(&user, identity::Right::Service)?;
+        accounts.grant(&user, identity::Right::Service)?;
         (pw, Some(user.sid().clone()))
     } else {
         (None, None)
     };
-
-    // Here rather than in the shim: it writes under HKLM, and the shim may run as an unprivileged
-    // account.
-    registry::register_event_source()?;
     Ok(Gated { password, checked })
 }
 
@@ -1323,6 +1388,7 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads
 /// service that exists. The change it returns says what the install's
 /// next step does with the file ([`default_log::LogChange::step_after`]); `None` for a service with no default log.
 fn make_default_log(
+    accounts: &dyn Accounts,
     spec: &DaemonSpec,
     reg: &ScmRegistration,
     checked: Option<&Sid>,
@@ -1335,7 +1401,7 @@ fn make_default_log(
     let id = &spec.common().id;
     let account = match checked {
         Some(sid) => sid.clone(),
-        None => identity::service_account_sid(reg.account.as_deref(), written_user(&spec.common().user))?,
+        None => identity::service_account_sid(accounts, reg.account.as_deref(), written_user(&spec.common().user))?,
     };
     let program_data = program_data()?;
     default_log::make(&program_data, id, step, service_run(id)?, kept, &account).map(Some)

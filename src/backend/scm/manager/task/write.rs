@@ -28,10 +28,11 @@ use crate::backend::scm::default_log::{self, Naming, Step};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
+use crate::backend::scm::manager::accounts::Accounts;
 use crate::backend::scm::manager::identity::{self, Right, Written};
 use crate::backend::scm::manager::{
     Password, Scm, ScmSnapshot, accounts_kept_before_change, apply_gated, make_default_log, registered_account,
-    registered_account_sid, registry, service_gate, written_user,
+    registry, service_gate, written_user,
 };
 use crate::backend::scm::runs::{Runs, unfinished_change};
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
@@ -112,16 +113,21 @@ fn runs_for_write(id: &Id) -> Result<Runs> {
 /// password is read, and `SeBatchLogonRight` is granted to the SID that check found (without
 /// it a first start starts nothing and raises nothing). For every account, the `Goetia` event source, which
 /// the shim logs to and which only an elevated process can register.
-pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>, reads: Password) -> Result<Prepared> {
+pub(super) fn prepare(
+    accounts: &dyn Accounts,
+    account: &TaskAccount,
+    written: Option<Written<'_>>,
+    reads: Password,
+) -> Result<Prepared> {
     let (principal, password) = match account {
         TaskAccount::Service(sid) => (well_known_sid(sid)?, None),
         TaskAccount::User(name) => {
-            let user = identity::require_user_account(name, written)?;
+            let user = identity::require_user_account(accounts, name, written)?;
             let password = match reads {
                 Password::Read => password_of(account, identity::service_password)?,
                 Password::Unneeded => None,
             };
-            identity::grant_logon_right(&user, Right::Batch)?;
+            accounts.grant(&user, Right::Batch)?;
             (user.sid().clone(), password)
         }
     };
@@ -191,7 +197,12 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let runs = runs_for_write(&spec.common().id)?;
         self.task_write_with(spec, definition, snapshot, &runs, &mut System, |account| {
-            prepare(account, written_user(&spec.common().user), Password::Read)
+            prepare(
+                &*self.accounts,
+                account,
+                written_user(&spec.common().user),
+                Password::Read,
+            )
         })
     }
 
@@ -224,7 +235,7 @@ impl Scm {
         let id = &spec.common().id;
         // Read before `prepare` touches the machine.
         let stored = snapshot
-            .map(|old| old.stored().map(|stored| (old, stored)))
+            .map(|old| old.stored(&*self.accounts).map(|stored| (old, stored)))
             .transpose()?;
         let prepared = prepare(&definition.account())?;
         let registering = match stored {
@@ -467,14 +478,12 @@ fn check_records(id: &Id, runs: &Runs) -> Result<()> {
 /// retype lands: the one rule of a service's account change ([`accounts_kept_before_change`]). A native service has
 /// no default log, a service whose account is gone has no one to name, and one that runs as the task's account has
 /// no other; the system is asked of the account only for a hosted service that runs as another one.
-fn kept_service_account(old: &ScmSnapshot, task: &TaskAccount) -> Result<Option<Sid>> {
+fn kept_service_account(accounts: &dyn Accounts, old: &ScmSnapshot, task: &TaskAccount) -> Result<Option<Sid>> {
     if old.blob().is_ok_and(|blob| !generate::hosted(&blob.spec)) {
         return Ok(None);
     }
     let config = old.config()?;
-    accounts_kept_before_change(true, &registered_account(config), &service_account_name(task), || {
-        registered_account_sid(config)
-    })
+    accounts_kept_before_change(accounts, true, &registered_account(config), &service_account_name(task))
 }
 
 /// The account `task` runs as, as the registration of a service that runs as it spells it: `None` is LocalSystem.
@@ -492,6 +501,7 @@ fn service_account_name(task: &TaskAccount) -> Option<String> {
 /// under the machine's `%ProgramData%`: the folders above the record directory are always judged, as a write
 /// does ([`runs_for_write`]).
 pub(in crate::backend::scm) fn task_beside(
+    accounts: &dyn Accounts,
     spec: &DaemonSpec,
     definition: &TaskXml,
     installed: &TaskSnapshot,
@@ -502,7 +512,7 @@ pub(in crate::backend::scm) fn task_beside(
         spec,
         definition,
         installed,
-        prepare,
+        |account, written, reads| prepare(accounts, account, written, reads),
     )
 }
 
@@ -583,7 +593,9 @@ impl Scm {
         };
         let account = match stored_account(registered)? {
             StoredAccount::Blob(account) => {
-                if let Some(shown) = snapshot.other_account(sid_of_account)? {
+                if let Some(shown) =
+                    snapshot.other_account(|name, written| sid_of_account(&*self.accounts, name, written))?
+                {
                     return Err(Error::os(
                         format!("{verb} `{id}`"),
                         std::io::Error::other(registered_for_another_account(id, &shown)),
@@ -632,10 +644,17 @@ impl Scm {
             old,
             &runs,
             &mut System,
-            || service_gate(definition, written, Password::Read),
+            || service_gate(&*self.accounts, self.password, definition, written, Password::Read),
             |gated| {
                 apply_gated(definition, gated.password, true)?;
-                make_default_log(spec, definition, gated.checked.as_ref(), &[], Step::Narrow)?;
+                make_default_log(
+                    &*self.accounts,
+                    spec,
+                    definition,
+                    gated.checked.as_ref(),
+                    &[],
+                    Step::Narrow,
+                )?;
                 Ok(WriteOutcome::Done)
             },
         )?;
@@ -687,14 +706,21 @@ impl Scm {
             spec,
             definition,
             &runs,
-            |account| prepare(account, written_user(&spec.common().user), Password::Read),
+            |account| {
+                prepare(
+                    &*self.accounts,
+                    account,
+                    written_user(&spec.common().user),
+                    Password::Read,
+                )
+            },
             || {
                 refuse_running(
                     old.id(),
                     DaemonKind::Service,
                     self.service_live_status(old)?.common().state,
                 )?;
-                kept_service_account(old, &definition.account())
+                kept_service_account(&*self.accounts, old, &definition.account())
             },
             || self.service_retire(old),
         )?;

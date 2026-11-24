@@ -44,7 +44,7 @@ pub(crate) use system::{
 use std::path::Path;
 
 #[cfg(windows)]
-use crate::backend::scm::manager::identity;
+use crate::backend::scm::manager::{Accounts as _, Lsa};
 #[cfg(windows)]
 use crate::error::{Error, Result};
 
@@ -257,7 +257,8 @@ impl Unsafe {
 /// The name of the account `sid` is, or the SID's text when no account has it (a deleted one).
 #[cfg(windows)]
 pub(crate) fn account_name(sid: &Sid) -> String {
-    identity::account_name_of_sid(sid).unwrap_or_else(|_| sid_display(sid))
+    Lsa.by_sid(sid)
+        .map_or_else(|_| sid_display(sid), |account| account.name)
 }
 
 // The filesystem ======================================================================================================

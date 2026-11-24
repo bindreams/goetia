@@ -14,6 +14,7 @@ use super::status::{run_state, task_status};
 use super::{TaskApi, TaskPath};
 use crate::backend::scm::generate::{self, WindowsDefinition};
 use crate::backend::scm::instance::TaskAccount;
+use crate::backend::scm::manager::accounts::Accounts;
 use crate::backend::scm::manager::identity::Written;
 use crate::backend::scm::manager::{Scm, ScmSnapshot, WindowsSnapshot, identity, open_refused, written_user};
 use crate::backend::scm::sid::{Sid, sid_display};
@@ -60,10 +61,10 @@ impl TaskSnapshot {
     /// path alone. An error when the XML cannot be read, or the account could not be looked up for any other
     /// reason than "no such account" (a transient RPC or domain controller failure): the registration is then
     /// not known to be another account's.
-    pub(super) fn stored(&self) -> Result<StoredRegistration> {
+    pub(super) fn stored(&self, accounts: &dyn Accounts) -> Result<StoredRegistration> {
         let stored = TaskXml::stored(&self.registered.xml, self.id.as_str())?;
         let principal = match principal_text(stored.principal) {
-            Some(text) => known_account(identity::sid_of_principal(&text)).map_err(|e| Error::Step {
+            Some(text) => known_account(identity::sid_of_principal(accounts, &text)).map_err(|e| Error::Step {
                 what: format!("look up the account of the registration of `{}`", self.id),
                 source: Box::new(e),
             })?,
@@ -187,10 +188,10 @@ fn unmapped(text: &str) -> String {
 /// wrote it) it resolves as an install does for each form: a `user.id` is the SID its string spells, with no
 /// account looked up, and a `user.name` is looked up by name. With none, `name` is a registration's principal,
 /// as Task Scheduler stores it ([`identity::sid_of_principal`]).
-pub(super) fn sid_of_account(name: &str, written: Option<Written<'_>>) -> Result<Sid> {
+pub(super) fn sid_of_account(accounts: &dyn Accounts, name: &str, written: Option<Written<'_>>) -> Result<Sid> {
     match written {
-        Some(_) => identity::service_account_sid(Some(name), written),
-        None => identity::sid_of_principal(name),
+        Some(_) => identity::service_account_sid(accounts, Some(name), written),
+        None => identity::sid_of_principal(accounts, name),
     }
 }
 
@@ -228,7 +229,7 @@ impl Scm {
         &self,
         snapshot: &TaskSnapshot,
     ) -> Result<InstalledDefinition<WindowsDefinition>> {
-        self.task_installed_with(snapshot, sid_of_account)
+        self.task_installed_with(snapshot, |name, written| sid_of_account(&*self.accounts, name, written))
     }
 
     /// The definition as installed: the stored XML read back, showing the account the task is registered for
