@@ -596,6 +596,13 @@ pub enum Error {
     #[error("{}", account_change_held(id, pin))]
     AccountChangeHeld { id: String, pin: PathBuf },
 
+    /// `install` of an id whose earlier task was uninstalled with `--no-stop` while a run of it went on, or whose
+    /// run records another program holds: `pin` is what holds them. Installing would narrow the records to the new
+    /// account and take the removal's marker away under that holder. Determinate: nothing was changed; the same
+    /// classifications as [`Error::AccountChangeHeld`].
+    #[error("{}", run_records_held(id, pin))]
+    RunRecordsHeld { id: String, pin: PathBuf },
+
     /// `uninstall --no-stop` on systemd found a file that is not goetia's at the path of the unit that
     /// keeps a left run alive, and refused: raised whether or not a run is in flight, since the next run
     /// may be, and only for an id whose job goetia removes (a timer alone gets no such unit). Determinate:
@@ -918,6 +925,7 @@ impl Error {
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
+            | Error::RunRecordsHeld { .. }
             | Error::StandinBlocked { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
@@ -1128,6 +1136,7 @@ impl Error {
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
+            | Error::RunRecordsHeld { .. }
             | Error::StandinBlocked { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
@@ -1617,6 +1626,15 @@ fn account_change_held(id: &str, pin: &Path) -> String {
         "`{id}` cannot change its account now: its run records are held (`{}`) by {RECORD_HOLDERS}, and installing \
          it as another account registers it again, which hands them to the new account: wait for that to end, then \
          re-run install",
+        pin.display()
+    )
+}
+
+/// The message of [`Error::RunRecordsHeld`].
+fn run_records_held(id: &str, pin: &Path) -> String {
+    format!(
+        "`{id}` cannot be installed now: the run records of the task uninstalled at that id are held (`{}`) by a run \
+         of it that is still going, or by another program: wait for that to end, then re-run install",
         pin.display()
     )
 }

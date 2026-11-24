@@ -168,6 +168,66 @@ fn install_of_a_task_creates_it_disarmed() {
     fake.finish();
 }
 
+/// An `uninstall --no-stop` from inside a run leaves the run's records, its pin and the removal's marker. An install
+/// of the id while that run lives would narrow the records to its own account and take the marker away under it:
+/// it is refused, before anything is asked of the machine or Task Scheduler, and changes nothing.
+#[skuld::test]
+fn install_over_records_a_run_still_holds_is_refused_and_changes_nothing() {
+    let (dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let before = trustees_of(&records_dir(&dir));
+    let run_pin = runs.hold().unwrap();
+    runs.close().unwrap();
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .task_write_with(&spec, &definition(&spec), None, &runs, &mut Running(vec![]), |_| {
+            panic!("nothing is acquired for an install that is refused")
+        })
+        .unwrap_err();
+
+    let Error::RunRecordsHeld { id, pin } = &refused else {
+        panic!("a pin holds the records of the removed task: {refused:?}")
+    };
+    assert_eq!(id, ID);
+    assert_eq!(pin.parent(), Some(records_dir(&dir).as_path()));
+    assert_eq!(fake.calls(), [], "nothing was sent to Task Scheduler");
+    assert!(runs.is_closed().unwrap(), "the marker stands");
+    assert_eq!(
+        trustees_of(&records_dir(&dir)),
+        before,
+        "the permissions are not touched"
+    );
+    drop(run_pin);
+    fake.finish();
+}
+
+/// Once the run is over and its pin is gone, the install goes on as it does over any leftover records: it creates
+/// the task, narrows the records and takes the marker away.
+#[skuld::test]
+fn install_over_leftover_records_nothing_holds_goes_on_and_takes_the_marker_away() {
+    let (_dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    runs.close().unwrap();
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+
+    let outcome = scm(&fake)
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            None,
+            &runs,
+            &mut Running(vec![]),
+            prepared(system(), None),
+        )
+        .unwrap();
+
+    assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
+    assert!(!runs.is_closed().unwrap(), "no marker of the old removal is left");
+    fake.finish();
+}
+
 #[skuld::test]
 fn reinstall_keeps_the_armed_state() {
     let spec = task_spec(Some("30 3 * * *"));
@@ -3137,6 +3197,36 @@ fn a_service_that_runs_is_not_changed_into_a_task() {
     );
     assert_eq!(fake.calls(), []);
     assert!(!records_dir(&dir).exists());
+}
+
+/// A service changed into a task is an install over the id's leftover records too: while a run of a removed task
+/// holds them it is refused, with the service still installed and nothing acquired.
+#[skuld::test]
+fn a_service_is_not_changed_into_a_task_over_records_a_run_still_holds() {
+    let (dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let run_pin = runs.hold().unwrap();
+    runs.close().unwrap();
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            |_| panic!("nothing is acquired for a retype that is refused"),
+            || Ok(None),
+            || panic!("the service is not removed"),
+        )
+        .unwrap_err();
+
+    let Error::RunRecordsHeld { pin, .. } = &refused else {
+        panic!("a pin holds the records of the removed task: {refused:?}")
+    };
+    assert_eq!(pin.parent(), Some(records_dir(&dir).as_path()));
+    assert_eq!(fake.calls(), []);
+    assert!(runs.is_closed().unwrap(), "the marker stands");
+    drop(run_pin);
 }
 
 /// A real account's password, logon right and the record directory are acquired before the service is

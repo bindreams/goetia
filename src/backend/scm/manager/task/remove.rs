@@ -11,6 +11,11 @@
 //! step that places it until the re-run (or an install run again with `--force`) finishes: a failure
 //! before it leaves the task disabled with `enable` and `disable` working, and the verbs refuse after it
 //! with the message of [`unfinished_change`](crate::backend::scm::runs::unfinished_change).
+//!
+//! [`RunInFlight::Leave`] is the same removal without the stop of the runs, and with the records removed only
+//! if no pin holds them ([`remove_records`]): a run that is still going keeps its pin, so its records and the
+//! marker stay, which is the second state above, until an `uninstall` or an `install` of the id after the run
+//! has ended.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +30,7 @@ use crate::backend::scm::runs::{MarkerCheck, PauseKind, Runs};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
 use crate::error::{Error, RECORD_HOLDERS, Result};
-use crate::manager::Budget;
+use crate::manager::{Budget, RunInFlight};
 use crate::spec::Id;
 
 /// Where a failed removal left the task, which is what its message may promise.
@@ -79,6 +84,21 @@ fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
     }
 }
 
+/// The run records of a task that is removed, or of an id that is not installed: removed, waiting for any pin
+/// ([`Runs::remove_all`]); except under [`RunInFlight::Leave`], where they are left, with the marker, when a pin
+/// holds them, and nothing is waited for. The marker is placed first and the pins read after, the order
+/// `remove_all` keeps: no pin is made once it stands ([`Runs::hold`]), so a pin read as absent stays absent, and a
+/// pin that is held is a run (or another program) that the removal does not wait for.
+fn remove_records(runs: &Runs, in_flight: RunInFlight) -> Result<()> {
+    if in_flight == RunInFlight::Leave {
+        runs.close()?;
+        if runs.held_pin()?.is_some() {
+            return Ok(());
+        }
+    }
+    runs.remove_all(waiting_for_records)
+}
+
 /// The shim file the stored task runs, when its file name is that of one a provider placed (the one
 /// file an uninstall may sweep). `None` for any other host.
 fn task_shim_host(registered: &Registered) -> Result<Option<PathBuf>> {
@@ -91,10 +111,10 @@ impl Scm {
     /// `uninstall` of a task: under the install lock, the task and its records are removed
     /// ([`Self::task_remove`]), and the shim file nothing references is swept as a service's uninstall
     /// sweeps it.
-    pub(in crate::backend::scm) fn task_uninstall(&self, snapshot: TaskSnapshot) -> Result<()> {
+    pub(in crate::backend::scm) fn task_uninstall(&self, snapshot: TaskSnapshot, in_flight: RunInFlight) -> Result<()> {
         let _lock = InstallLock::acquire()?;
         let host = task_shim_host(snapshot.registered());
-        self.task_remove(&snapshot)?;
+        self.task_remove(&snapshot, in_flight)?;
         self.after_uninstall(
             snapshot.id(),
             Uninstalled::Deleted {
@@ -106,10 +126,14 @@ impl Scm {
 
     /// What `uninstall` of an id that is absent does for a task: the run records an `uninstall` that
     /// deleted the task could not remove, and the sweep a service's does.
-    pub(in crate::backend::scm) fn task_uninstall_absent(&self, id: &Id) -> Result<()> {
-        self.uninstall_absent_with(id, &Runs::of(&program_data()?, id), InstallLock::acquire, || {
-            self.service_uninstall_absent()
-        })
+    pub(in crate::backend::scm) fn task_uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
+        self.uninstall_absent_with(
+            id,
+            &Runs::of(&program_data()?, id),
+            in_flight,
+            InstallLock::acquire,
+            || self.service_uninstall_absent(),
+        )
     }
 
     /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes
@@ -121,17 +145,21 @@ impl Scm {
     /// `sweep` runs whether or not the records were removed, after the lock is released. If both fail,
     /// both errors are kept, the records' first. A `lock` that fails ends the call: the sweep takes the
     /// same lock.
+    ///
+    /// Without [`RunInFlight::Leave`] the removal waits, with no bound, for a pin that holds the records; with
+    /// it, it removes them only when none does and returns at once otherwise, the marker placed and the records
+    /// left ([`remove_records`]). The sweep is no stop and runs under either.
     pub(super) fn uninstall_absent_with<L>(
         &self,
         id: &Id,
         runs: &Runs,
+        in_flight: RunInFlight,
         lock: impl FnOnce() -> Result<L>,
         sweep: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let removed = if runs.is_present() {
             let _lock = lock()?;
-            runs.remove_all(waiting_for_records)
-                .map_err(|e| uninstall_failed(id, Left::LeftoverRecords, e))
+            remove_records(runs, in_flight).map_err(|e| uninstall_failed(id, Left::LeftoverRecords, e))
         } else {
             Ok(())
         };
@@ -141,9 +169,9 @@ impl Scm {
 
     /// The task and its records removed, with nothing swept: the caller holds the install lock. See
     /// [`Self::task_remove_with`].
-    pub(in crate::backend::scm) fn task_remove(&self, snapshot: &TaskSnapshot) -> Result<()> {
+    pub(in crate::backend::scm) fn task_remove(&self, snapshot: &TaskSnapshot, in_flight: RunInFlight) -> Result<()> {
         let runs = Runs::of(&program_data()?, snapshot.id());
-        self.task_remove_with(snapshot, &runs, &mut System)
+        self.task_remove_with(snapshot, &runs, in_flight, &mut System)
     }
 
     /// Removes `snapshot`'s task, in an order whose every prefix a re-run finishes:
@@ -163,6 +191,10 @@ impl Scm {
     /// 5. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder
     ///    (a shim that pinned before the marker leaves once it reads the task gone).
     ///
+    /// Under [`RunInFlight::Leave`] steps 3 and 4 are left out (nothing is listed, held, stopped or waited for),
+    /// and step 5 removes the records only if no pin holds them ([`remove_records`]); a pin that is held is a run
+    /// that went on, and it keeps its records and the marker.
+    ///
     /// A task that is gone has nothing to disable or stop; a failure after that says it is not installed
     /// and records are what is left. A task with no directory of records has no pin to take; its marker
     /// is placed all the same, unless the `runs` folder is gone too
@@ -171,6 +203,7 @@ impl Scm {
         &self,
         snapshot: &TaskSnapshot,
         runs: &Runs,
+        in_flight: RunInFlight,
         processes: &mut P,
     ) -> Result<()> {
         let id = snapshot.id();
@@ -184,16 +217,19 @@ impl Scm {
         };
 
         runs.close().map_err(|e| uninstall_failed(id, left, e))?;
-        let pin = pin_records("uninstall", id, runs, MarkerCheck::Ignore).map_err(|e| uninstall_failed(id, left, e))?;
-        self.task_stop_with(
-            "uninstall",
-            id,
-            Budget::Unbounded,
-            runs,
-            StopPin::Caller(pin),
-            processes,
-        )
-        .map_err(|e| uninstall_failed(id, left, e))?;
+        if in_flight == RunInFlight::Stop {
+            let pin =
+                pin_records("uninstall", id, runs, MarkerCheck::Ignore).map_err(|e| uninstall_failed(id, left, e))?;
+            self.task_stop_with(
+                "uninstall",
+                id,
+                Budget::Unbounded,
+                runs,
+                StopPin::Caller(pin),
+                processes,
+            )
+            .map_err(|e| uninstall_failed(id, left, e))?;
+        }
 
         match self.tasks.delete(&path) {
             Ok(_) => {}
@@ -202,8 +238,7 @@ impl Scm {
             Err(e @ Error::TaskFolderKept { .. }) => eprintln!("warning: {}", e.report()),
             Err(e) => return Err(uninstall_failed(id, left, e)),
         }
-        runs.remove_all(waiting_for_records)
-            .map_err(|e| uninstall_failed(id, Left::Records, e))
+        remove_records(runs, in_flight).map_err(|e| uninstall_failed(id, Left::Records, e))
     }
 }
 

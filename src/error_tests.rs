@@ -110,6 +110,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             pin: PathBuf::new(),
         },
+        Error::RunRecordsHeld {
+            id: id(),
+            pin: PathBuf::new(),
+        },
         Error::StandinBlocked {
             id: id(),
             path: PathBuf::new(),
@@ -1710,6 +1714,16 @@ fn error_messages_and_exit_class() {
              by a run that is starting, a `run` or `stop` of the task, or another program, and installing it as another \
              account registers it again, which hands them to the new account: wait for that to end, then re-run \
              install",
+            false,
+        ),
+        (
+            Error::RunRecordsHeld {
+                id: id(),
+                pin: PathBuf::from(r"C:\ProgramData\Goetia\runs\nightly\pin-1.pin"),
+            },
+            "`nightly` cannot be installed now: the run records of the task uninstalled at that id are held \
+             (`C:\\ProgramData\\Goetia\\runs\\nightly\\pin-1.pin`) by a run of it that is still going, or by \
+             another program: wait for that to end, then re-run install",
             false,
         ),
         (

@@ -50,6 +50,14 @@ pub const PRINT_AND_EXIT: &str = "--goetia-print-and-exit";
 #[cfg(windows)]
 pub const RUN_UNTIL_RELEASED: &str = "--goetia-run-until-released";
 
+/// `<exe> --goetia-uninstall-self-then-release <goetia> <id> <port> <file>`: a run that removes its own task. It runs
+/// `<goetia> daemon uninstall --no-stop <id>` and waits for it, connects to the test's listener, sends its pid, the
+/// uninstall's exit code and its output (the first two on a line each), and shuts its writing half down; then blocks
+/// reading the connection until the test closes its end, writes `<file>` and exits 0. The test chooses when the run
+/// goes on, and the file is written only after the uninstall has returned.
+#[cfg(windows)]
+pub const UNINSTALL_SELF_THEN_RELEASE: &str = "--goetia-uninstall-self-then-release";
+
 /// `<exe> --goetia-print-when-released <port> <text>`: print `<text> first <pid>` on a line, connect to the
 /// test's listener, and block reading the connection until the test shuts its writing half down; then print
 /// `<text> released <pid>`, answer with one byte (so the test knows the line was written) and block forever.
@@ -99,6 +107,11 @@ pub fn run_if_requested() -> bool {
         }
         #[cfg(windows)]
         Some(PRINT_WHEN_RELEASED) => print_when_released(args[2].parse().expect("port argument"), &args[3]),
+        #[cfg(windows)]
+        Some(UNINSTALL_SELF_THEN_RELEASE) => {
+            uninstall_self_then_release(&args[2], &args[3], args[4].parse().expect("port argument"), &args[5]);
+            true
+        }
         #[cfg(windows)]
         Some(PRINT_AND_EXIT) => {
             println!("{} {}", args[3], std::process::id());
@@ -159,6 +172,38 @@ fn run_until_released(port: u16) {
 
     if let Some(mut stream) = open(port) {
         log_failure(port, "read", stream.read_to_end(&mut Vec::new()).map(drop));
+    }
+}
+
+/// [`UNINSTALL_SELF_THEN_RELEASE`]. A connection that cannot be made ends the run without the file, as for
+/// [`connect`]: the test, which holds the listener, is the one that sees no connection.
+#[cfg(windows)]
+fn uninstall_self_then_release(goetia: &str, id: &str, port: u16, file: &str) {
+    use std::io::Read as _;
+
+    let uninstalled = std::process::Command::new(goetia)
+        .args(["daemon", "uninstall", "--no-stop", id])
+        .output();
+    let report = match uninstalled {
+        Ok(output) => format!(
+            "{}\n{}\n{}{}",
+            std::process::id(),
+            output
+                .status
+                .code()
+                .map_or_else(|| "none".to_string(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(e) => format!("{}\nnot run\n{e}", std::process::id()),
+    };
+    if let Some(mut stream) = open(port) {
+        log_failure(port, "write", stream.write_all(report.as_bytes()));
+        log_failure(port, "shutdown", stream.shutdown(std::net::Shutdown::Write));
+        log_failure(port, "read", stream.read_to_end(&mut Vec::new()).map(drop));
+        if let Err(e) = std::fs::write(file, b"released") {
+            eprintln!("write {file}: {e}");
+        }
     }
 }
 

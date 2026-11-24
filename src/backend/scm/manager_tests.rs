@@ -786,11 +786,18 @@ fn new_has_no_provider() {
         .expect("a managed service needs none");
 }
 
-/// `Leave` is not built on Windows: it is refused as an invalid request that names the flag and says nothing was
-/// changed.
+/// `Leave` is built for a task and not yet for a service: a service is refused as an invalid request that names the
+/// flag and says nothing was changed (nothing was read of the SCM: the snapshot is a table).
 #[skuld::test]
-fn leaving_a_run_is_refused_naming_the_flag_and_that_nothing_was_changed() {
-    match Scm::new().uninstall_absent(&Id::try_from("never-installed").unwrap(), RunInFlight::Leave) {
+fn leaving_a_service_run_is_refused_naming_the_flag_and_that_nothing_was_changed() {
+    let id = Id::try_from("frpc").unwrap();
+    let snapshot = WindowsSnapshot::Service(ScmSnapshot::new(
+        id,
+        Ok(blob_of(crate::spec::Protocol::Plain)),
+        Default::default(),
+    ));
+
+    match Backend::uninstall(&Scm::new(), snapshot, RunInFlight::Leave, &mut ()) {
         Err(Error::Invalid { message, .. }) => {
             assert!(message.contains("--no-stop"), "{message}");
             assert!(message.contains("nothing was changed"), "{message}");

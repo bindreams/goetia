@@ -31,6 +31,9 @@ mod install_helper;
 #[path = "scm_integration/kill.rs"]
 mod kill;
 #[cfg(windows)]
+#[path = "scm_integration/leave.rs"]
+mod leave;
+#[cfg(windows)]
 #[path = "scm_integration/managed.rs"]
 mod managed;
 #[cfg(windows)]

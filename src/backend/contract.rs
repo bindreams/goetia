@@ -192,8 +192,10 @@ pub(crate) trait Backend {
     /// the CLI renders as success, so that re-running `uninstall` is how a failed cleanup is retried.
     /// Never called for an id that is foreign or whose state is undetermined.
     ///
-    /// `in_flight` as for [`ServiceManager::uninstall`], for a backend whose leftover has a run (systemd's
-    /// stand-in: see its `standin` module); a backend with none ignores it.
+    /// `in_flight` as for [`ServiceManager::uninstall`], for a backend whose leftover has a run: systemd's
+    /// stand-in (see its `standin` module), and a Windows task's run records, which `Leave` removes only if
+    /// no run holds them and never waits for, where `Stop` waits for the run to release them. A backend
+    /// with none ignores it.
     fn uninstall_absent(&self, _id: &Id, _in_flight: RunInFlight) -> Result<()> {
         Ok(())
     }

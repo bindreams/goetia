@@ -2060,6 +2060,7 @@ manager. It reads the installed artifact, so it works where the manifest is gone
 flight and waits for nothing of it. The caller may be the run itself, or a process it started. With several ids,
 `--no-stop` applies to each. With no run in flight it is a plain `uninstall`: it does all that `uninstall` does,
 so nothing is left behind for want of a run, except, on systemd, a service waiting to be restarted (below).
+On Windows `--no-stop` is built for a task and not yet for a service: a service refuses it, and nothing is changed.
 
 What is left while the run lives is the manager's to report, and goetia reports it as it is.
 
@@ -2122,6 +2123,22 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
   which can end a run that is still starting.
 - A run somebody else starts between goetia's reading that a run is in flight and the reload is that caller's own
   conflicting action, and goetia does not guard against it.
+
+**Windows task.** `uninstall --no-stop` disables the task, so nothing starts another run, and deletes it, so the id is
+not installed. It lists no run, sends nothing to one and waits for none. Task Scheduler lists no run of a deleted
+task, so a run that removed its own task goes on to its own exit and shows in no listing.
+
+- The shim of a run holds the task's run records (`%ProgramData%\Goetia\runs\<id>`) for as long as the run lives.
+  `uninstall --no-stop` removes them only when nothing holds them. A run that removes its own task therefore leaves
+  its run records, the removal's marker (`runs\<id>~removing`) and the shim file it is using until an `uninstall` or
+  an `install` of that id after the run has ended.
+- `uninstall` of the id without the flag waits, with no time limit, for the run to end and says on stderr what it
+  waits for; it then removes the records and the marker. `uninstall --no-stop` of the id removes them only if the
+  run has ended, and otherwise returns at once with them as they were.
+- An `install` of the id while that run lives is refused, and nothing is changed: the run holds the records, and the
+  install would hand them to the new account and take the marker away. The install goes on once the run has ended.
+- `uninstall` needs elevation whatever account the task runs as. The flag was measured with a task that runs as
+  SYSTEM only; the other accounts were not measured.
 
 ## Exit codes
 

@@ -50,7 +50,7 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
     machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::Stopped)));
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(
@@ -91,7 +91,7 @@ fn uninstall_of_a_task_whose_records_directory_is_a_link_stops_the_run_and_delet
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert!(fake.calls().contains(&Call::Stop(PATH.to_owned(), instance_id(1))));
@@ -115,7 +115,7 @@ fn uninstall_of_an_idle_disarmed_task_disables_it_before_it_deletes_it() {
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(
@@ -146,7 +146,7 @@ fn a_folder_left_after_the_delete_does_not_fail_the_uninstall() {
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert!(!records_dir.exists(), "the records go with the task");
@@ -170,7 +170,7 @@ fn uninstall_of_an_incomplete_stop_leaves_the_task_disabled() {
     machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::IncompleteStop)));
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap_err();
 
     let text = failed.to_string();
@@ -211,7 +211,7 @@ fn a_record_that_cannot_be_read_fails_the_uninstall_and_keeps_the_task() {
     machine.on_exit = Box::new(move |_| std::fs::write(&garbage, b"not a record").unwrap());
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap_err();
 
     let text = failed.to_string();
@@ -236,7 +236,7 @@ fn uninstall_of_an_armed_real_user_task_needs_no_password() {
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(
@@ -272,7 +272,9 @@ fn uninstall_of_a_task_whose_blob_will_not_decode_needs_nothing_of_it() {
         .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[]);
 
-    scm(&fake).task_remove_with(&broken, &runs, &mut machine).unwrap();
+    scm(&fake)
+        .task_remove_with(&broken, &runs, RunInFlight::Stop, &mut machine)
+        .unwrap();
 
     assert!(!records_dir.exists());
 }
@@ -295,7 +297,7 @@ fn every_live_instance_is_stopped() {
     let mut machine = Machine::new(&fake, &[100, 200]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     let stops: Vec<Call> = fake
@@ -330,7 +332,7 @@ fn a_listed_instance_whose_process_is_gone_is_not_stopped() {
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(
@@ -359,7 +361,7 @@ fn a_run_that_ended_after_it_was_held_is_not_stopped_or_waited_for() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(machine.held, [4242]);
@@ -385,7 +387,7 @@ fn a_stop_that_finds_the_run_ended_is_a_stop() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(machine.waited.len(), 1);
@@ -403,7 +405,7 @@ fn any_other_failure_of_a_stop_fails_the_uninstall_and_deletes_nothing() {
         .on_stop(Err(Error::os("stop an instance", io::Error::other("denied"))));
     let mut machine = Machine::new(&fake, &[4242]);
 
-    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine);
+    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine);
 
     assert!(failed.is_err());
     assert!(machine.waited.is_empty());
@@ -437,7 +439,7 @@ fn a_process_that_cannot_be_judged_fails_the_uninstall_before_a_stop() {
     }
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut Denied)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut Denied)
         .unwrap_err();
 
     let report = failed.report().to_string();
@@ -458,7 +460,7 @@ fn a_task_that_went_meanwhile_is_uninstalled_all_the_same() {
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert!(!records_dir.exists());
@@ -475,7 +477,7 @@ fn a_failed_disable_fails_the_uninstall_before_anything_else() {
     let mut machine = Machine::new(&fake, &[]);
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap_err();
 
     assert!(failed.to_string().contains("NOT deleted"), "{failed}");
@@ -493,7 +495,7 @@ fn a_failed_delete_leaves_the_records_for_the_retry() {
         .on_delete(Err(Error::os("delete the task", io::Error::other("denied"))));
     let mut machine = Machine::new(&fake, &[]);
 
-    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine);
+    let failed = scm(&fake).task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine);
 
     assert!(failed.is_err());
     assert!(records_dir.exists());
@@ -512,7 +514,7 @@ fn a_marker_that_cannot_be_placed_fails_the_uninstall_before_any_run_is_read() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap_err();
 
     let text = failed.to_string();
@@ -543,7 +545,7 @@ fn a_pin_the_uninstall_cannot_take_fails_it_before_any_stop() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap_err();
 
     let text = failed.to_string();
@@ -628,7 +630,7 @@ fn uninstall_order() {
     });
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(
@@ -663,7 +665,7 @@ fn uninstall_does_not_refuse_itself_with_its_own_marker() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(machine.waited.len(), 1, "the run was stopped and waited for");
@@ -690,7 +692,7 @@ fn uninstall_of_a_task_with_no_records_directory_waits_for_nothing() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(
@@ -722,7 +724,7 @@ fn uninstall_whose_own_pin_found_no_records_is_not_refused_by_its_marker() {
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert!(fake.calls().contains(&Call::Stop(PATH.to_owned(), instance_id(1))));
@@ -745,7 +747,7 @@ fn a_failure_after_a_disable_that_found_the_task_gone_does_not_say_it_is_disable
     let mut machine = Machine::new(&fake, &[]);
 
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap_err();
 
     let text = failed.to_string();
@@ -772,7 +774,7 @@ fn rerun_after_an_incomplete_stop_finishes() {
     let shim = Runs::of(dir.path(), &id());
     machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::IncompleteStop)));
     let failed = scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap_err();
     let text = failed.to_string();
     assert!(
@@ -802,7 +804,7 @@ fn rerun_after_an_incomplete_stop_finishes() {
         .on_delete(Ok(true));
     let mut machine = Machine::new(&again, &[]);
     scm(&again)
-        .task_remove_with(&snapshot_of(&spec, false), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert!(!records_dir.exists() && !watch.marker_stands());
@@ -831,7 +833,7 @@ fn a_pin_taken_before_the_marker_is_held_across_the_delete() {
     let mut machine = Machine::new(&fake, &[]);
 
     scm(&fake)
-        .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert_eq!(
@@ -858,6 +860,7 @@ fn uninstall_of_an_id_that_is_absent_removes_the_records_under_the_install_lock(
         .uninstall_absent_with(
             &id(),
             &runs,
+            RunInFlight::Stop,
             || {
                 assert!(records_dir.exists(), "the lock is taken before the records go");
                 locked.set(true);
@@ -893,6 +896,7 @@ fn the_sweep_of_an_absent_id_runs_after_the_install_lock_is_released() {
         .uninstall_absent_with(
             &id(),
             &runs,
+            RunInFlight::Stop,
             || Ok(Lock(&released)),
             || {
                 assert!(released.get(), "the lock was still held when the sweep began");
@@ -920,6 +924,7 @@ fn uninstall_of_an_id_that_is_absent_clears_a_marker_left_beside_no_records() {
         .uninstall_absent_with(
             &id(),
             &runs,
+            RunInFlight::Stop,
             || {
                 locked.set(true);
                 Ok(())
@@ -943,6 +948,7 @@ fn uninstall_of_an_id_with_no_records_takes_no_lock() {
         .uninstall_absent_with(
             &id(),
             &runs,
+            RunInFlight::Stop,
             || -> Result<()> { panic!("there is nothing to guard") },
             || Ok(()),
         )
@@ -957,7 +963,7 @@ fn uninstall_of_an_id_that_is_absent_says_what_it_was_removing_when_the_removal_
     let _held = crate::backend::scm::test_support::directory_held_open(&records_dir.join("stuck"));
 
     let failed = scm(&Fake::new())
-        .uninstall_absent_with(&id(), &runs, || -> Result<()> { Ok(()) }, || Ok(()))
+        .uninstall_absent_with(&id(), &runs, RunInFlight::Stop, || -> Result<()> { Ok(()) }, || Ok(()))
         .unwrap_err();
 
     let text = failed.to_string();
@@ -989,6 +995,7 @@ fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_remo
         .uninstall_absent_with(
             &id(),
             &runs,
+            RunInFlight::Stop,
             || -> Result<()> { Ok(()) },
             || {
                 swept.set(true);
@@ -1010,6 +1017,7 @@ fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_remo
         .uninstall_absent_with(
             &id(),
             &runs,
+            RunInFlight::Stop,
             || -> Result<()> { Ok(()) },
             || {
                 swept.set(true);
@@ -1025,6 +1033,134 @@ fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_remo
         said.contains("sweep the shim files"),
         "the sweep's failure is kept: {said}"
     );
+}
+
+// Leaving the run -----------------------------------------------------------------------------------------------------
+
+/// `uninstall --no-stop` from inside a run: the run is listed and its pin is held (a shim pins before the marker
+/// and holds it for the whole run). The removal disables the task, places the marker, deletes the registration
+/// and waits for nothing: it lists nothing, holds nothing, stops nothing and takes no pin of its own. The run's
+/// pin, the records and the marker stay, which is "the task gone, its records left".
+#[skuld::test]
+fn leaving_a_run_whose_pin_is_held_deletes_the_task_and_keeps_marker_and_records() {
+    let (dir, records_dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let watch = Watch::new(dir.path(), &records_dir);
+    let run_pin = runs.hold().unwrap();
+    shim_writes(&Runs::of(dir.path(), &id()), &record(1, RunOutcome::Exited(0)));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_delete(Ok(true))
+        .during(watch.at("delete"));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Leave, &mut machine)
+        .unwrap();
+
+    assert_eq!(
+        fake.calls(),
+        [disable_call(), Call::Delete(PATH.to_owned())],
+        "no listing of the runs and no stop; the disable and the delete are all there"
+    );
+    assert!(
+        machine.held.is_empty() && machine.waited.is_empty(),
+        "no process is held or waited for"
+    );
+    assert_eq!(
+        watch.seen(),
+        ["delete: marker=true pins=1"],
+        "the marker stood at the delete, and the uninstall took no pin of its own"
+    );
+    assert!(watch.marker_stands(), "the marker stays");
+    assert!(
+        records_dir.join(format!("{}.json", instance_id(1).hex())).exists(),
+        "the records stay"
+    );
+    assert_eq!(pins_in(&records_dir), 1, "the run's pin stays");
+    drop(run_pin);
+    fake.finish();
+}
+
+/// With no pin held there is no run to leave (or none that holds the records), and `--no-stop` removes
+/// everything a plain uninstall does: no marker, no records.
+#[skuld::test]
+fn leaving_with_no_pin_held_leaves_nothing() {
+    let (dir, records_dir, runs) = records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let watch = Watch::new(dir.path(), &records_dir);
+    shim_writes(&Runs::of(dir.path(), &id()), &record(1, RunOutcome::Exited(0)));
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(())).on_delete(Ok(true));
+    let mut machine = Machine::new(&fake, &[]);
+
+    scm(&fake)
+        .task_remove_with(&snapshot_of(&spec, true), &runs, RunInFlight::Leave, &mut machine)
+        .unwrap();
+
+    assert_eq!(fake.calls(), [disable_call(), Call::Delete(PATH.to_owned())]);
+    assert!(!records_dir.exists() && !watch.marker_stands(), "nothing is left");
+    fake.finish();
+}
+
+/// `uninstall --no-stop` of an id that is absent does not wait for a held pin: the records of the earlier
+/// `--no-stop` uninstall stay while the run lives, and the sweep, which stops nothing, runs all the same. Once the
+/// run's pin is gone the same call removes the records and the marker.
+#[skuld::test]
+fn leaving_an_absent_id_does_not_wait_for_a_held_pin_and_removes_the_records_once_it_is_released() {
+    let (dir, records_dir, runs) = records();
+    shim_writes(&Runs::of(dir.path(), &id()), &record(1, RunOutcome::Exited(0)));
+    let run_pin = runs.hold().unwrap();
+    runs.close().unwrap();
+    let swept = Cell::new(0);
+    let sweep = || {
+        swept.set(swept.get() + 1);
+        Ok(())
+    };
+    let scm = scm(&Fake::new());
+
+    scm.uninstall_absent_with(&id(), &runs, RunInFlight::Leave, || Ok(()), sweep)
+        .unwrap();
+
+    assert_eq!(swept.get(), 1, "the sweep is no stop, and runs");
+    assert!(
+        records_dir.exists() && runs.is_closed().unwrap(),
+        "the held records stay"
+    );
+    assert_eq!(pins_in(&records_dir), 1);
+
+    drop(run_pin);
+    scm.uninstall_absent_with(&id(), &runs, RunInFlight::Leave, || Ok(()), sweep)
+        .unwrap();
+
+    assert_eq!(swept.get(), 2);
+    assert!(
+        !records_dir.exists() && !runs.is_closed().unwrap(),
+        "released, nothing is left"
+    );
+}
+
+/// With the choice and no pin held, the removal of an absent id's records is what it is without it.
+#[skuld::test]
+fn leaving_an_absent_id_with_no_pin_held_removes_the_records_under_the_install_lock() {
+    let (_dir, records_dir, runs) = records();
+    let locked = Cell::new(false);
+
+    scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            RunInFlight::Leave,
+            || {
+                locked.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+    assert!(locked.get());
+    assert!(!records_dir.exists() && !runs.is_closed().unwrap());
 }
 
 // Retype ==============================================================================================================
@@ -1043,7 +1179,7 @@ fn a_crash_between_removal_and_creation_reads_as_absent_and_install_finishes() {
         .on_register(Ok(Registration::Created));
     let scm = scm(&fake);
     let mut machine = Machine::new(&fake, &[]);
-    scm.task_remove_with(&snapshot_of(&old, false), &runs, &mut machine)
+    scm.task_remove_with(&snapshot_of(&old, false), &runs, RunInFlight::Stop, &mut machine)
         .unwrap();
 
     assert!(matches!(scm.task_read(&id()).unwrap(), ReadOutcome::Absent));

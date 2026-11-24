@@ -786,22 +786,23 @@ impl Backend for Scm {
     }
 
     fn uninstall(&self, snapshot: WindowsSnapshot, in_flight: RunInFlight, _reservation: &mut ()) -> Result<()> {
-        if in_flight == RunInFlight::Leave {
-            return Err(leave_not_built(snapshot.id(), "Windows"));
-        }
         match snapshot {
-            WindowsSnapshot::Service(snapshot) => self.service_uninstall(snapshot),
-            WindowsSnapshot::Task(snapshot) => self.task_uninstall(snapshot),
+            WindowsSnapshot::Service(snapshot) => {
+                if in_flight == RunInFlight::Leave {
+                    return Err(leave_not_built(snapshot.id(), "Windows"));
+                }
+                self.service_uninstall(snapshot)
+            }
+            WindowsSnapshot::Task(snapshot) => self.task_uninstall(snapshot, in_flight),
         }
     }
 
     /// The id is in neither store, so what is left of it is a task's run records, which a task's
-    /// uninstall that could not remove them leaves, and what a service's uninstall leaves to sweep.
+    /// uninstall that could not remove them leaves (and a `--no-stop` one leaves while its run lives), and
+    /// what a service's uninstall leaves to sweep. Under `Leave` the records a run still holds are left and
+    /// nothing is waited for; everything else is as it is under `Stop`.
     fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
-        if in_flight == RunInFlight::Leave {
-            return Err(leave_not_built(id, "Windows"));
-        }
-        self.task_uninstall_absent(id)
+        self.task_uninstall_absent(id, in_flight)
     }
 
     fn enable(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {

@@ -40,7 +40,7 @@ use crate::backend::scm::sid::{Sid, distinct, sid_from_parts};
 use crate::backend::scm::task_xml::{TaskXml, Token, builtin_sid};
 use crate::backend::{Identity, InstalledService, WriteOutcome};
 use crate::error::{Error, Result};
-use crate::manager::State;
+use crate::manager::{RunInFlight, State};
 use crate::spec::{Builtin, DaemonKind, DaemonSpec, Id};
 
 /// What the machine holds for a task's account once an install has seen to it.
@@ -209,6 +209,9 @@ impl Scm {
     /// records (its shim still writes its record), then the registration alone is deleted (its records stay,
     /// narrowed to the new account) and created, under a fresh token, armed as the old one's triggers say.
     ///
+    /// A create (no `snapshot`) over run records that something holds is refused first, with nothing asked of the
+    /// machine ([`refuse_held_records`]).
+    ///
     /// A stored registration whose XML cannot be read at all, or whose account lookup failed for a reason other
     /// than "no such account", fails the write before anything is sent to Task Scheduler: that is not a change of
     /// account.
@@ -222,6 +225,10 @@ impl Scm {
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
+        // A create is an install over whatever records the id left; refused before `prepare` touches the machine.
+        if snapshot.is_none() {
+            refuse_held_records(id, runs)?;
+        }
         // Read before `prepare` touches the machine.
         let stored = snapshot
             .map(|old| old.stored().map(|stored| (old, stored)))
@@ -443,6 +450,20 @@ fn whose(accounts: &[Sid]) -> &'static str {
     }
 }
 
+/// Refuses an install of `id` as a new task over run records something holds ([`Error::RunRecordsHeld`]): a run of
+/// an earlier task of the id that was uninstalled with `--no-stop` and is still going, or another program. The
+/// install would narrow the records to its account and take the removal's marker away under it. One pass over the
+/// pins ([`Runs::held_pin`], as an account change reads them); it does not wait, and changes nothing.
+fn refuse_held_records(id: &Id, runs: &Runs) -> Result<()> {
+    match runs.held_pin()? {
+        Some(pin) => Err(Error::RunRecordsHeld {
+            id: id.to_string(),
+            pin,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// What a write of a task makes besides its registration, and what an up-to-date install makes again
 /// ([`task_beside_with`]): the record directory naming `principal`, and the default log naming `principal` and
 /// `kept_log`, the accounts a service that is being retyped to this task still runs as
@@ -658,7 +679,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         self.refuse_running_task_with(old, |pid| processes.alive(pid))?;
         let gated = gate()?;
-        self.task_remove_with(old, runs, processes)?;
+        self.task_remove_with(old, runs, RunInFlight::Stop, processes)?;
         create(gated)
     }
 
@@ -727,6 +748,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
         let service = inspect()?;
+        refuse_held_records(id, runs)?;
         let prepared = prepare(&definition.account())?;
         task_records(id, runs, &prepared.principal, service.as_slice())?;
         retire()?;
