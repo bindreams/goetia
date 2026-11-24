@@ -1,0 +1,124 @@
+name: Probe m-mac-exit
+
+on:
+  push:
+    branches: [probe/m-mac-exit]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15]
+    defaults:
+      run:
+        shell: bash
+        working-directory: probe/m-mac-exit
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Platform
+        run: |
+          exec 2>&1
+          sw_vers
+          uname -a
+          sysctl -n hw.ncpu hw.model
+          echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          id
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          exec 2>&1
+          cc -O1 -Wall -o exitwindow exitwindow.c
+          cc -O1 -Wall -pthread -o signalthread signalthread.c
+          cc -o sigterm-logger sigterm-logger.c
+          (cd cosca-probe && cargo build --release --locked)
+          cp cosca-probe/target/release/cosca-probe ./cosca-probe-bin
+          grep -A1 '^name = "cosca"' cosca-probe/Cargo.lock
+
+      # Questions 1 and 2: the three libproc reads and kqueue registration, in the exit window and on a zombie.
+      - name: Q1 Q2 exit window and zombie reads
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          exec 2>&1
+          for rep in 1 2 3; do
+            echo "--- root, rep $rep"
+            sudo ./exitwindow window 10000 1000 150
+            sudo ./exitwindow zombie 300
+          done
+          for rep in 1 2 3; do
+            echo "--- runner user, rep $rep"
+            ./exitwindow window 10000 1000 150
+            ./exitwindow zombie 300
+          done
+
+      # Question 6: which thread runs a process-directed signal.
+      - name: Q6 signal thread selection
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          exec 2>&1
+          for rep in 1 2 3; do
+            for variant in busy sleep none; do
+              ./signalthread "$variant" 100000
+            done
+          done
+
+      # Question 3: Child::kill in the exit window, cosca 0.10.0.
+      - name: Q3 Child::kill in the exit window
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          exec 2>&1
+          for rep in 1 2 3; do
+            for variant in first self; do
+              echo "--- root, rep $rep"
+              sudo ./cosca-probe-bin kill "$variant" 3000
+              echo "--- runner user, rep $rep"
+              ./cosca-probe-bin kill "$variant" 3000
+            done
+          done
+
+      # Question 5: Child::detach after a kill, cosca 0.10.0.
+      - name: Q5 Child::detach after a kill
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          exec 2>&1
+          for rep in 1 2 3; do
+            for case in a b c d; do
+              echo "--- root, rep $rep"
+              sudo ./cosca-probe-bin detach "$case" 30
+              echo "--- runner user, rep $rep"
+              ./cosca-probe-bin detach "$case" 30
+            done
+          done
+
+      # Question 4: ExitTimeOut 0 on this macOS (bootout of a job that blocks SIGTERM).
+      - name: Q4 ExitTimeOut 0
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          exec 2>&1
+          cp sigterm-logger /tmp/sigterm-logger
+          for rep in 1 2 3 4 5; do
+            sudo rm -rf /tmp/gs
+            echo "--- rep $rep"
+            sudo python3 exittimeout.py /tmp/sigterm-logger
+          done
+          sudo rm -rf /tmp/gs /tmp/sigterm-logger
