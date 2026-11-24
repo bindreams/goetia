@@ -76,10 +76,10 @@ jobs:
 
       # Clippy is defined in prek.toml: the default build (with the `testing` feature, which the
       # self dev-dependency turns on) of the whole workspace and
-      # the library-only build.
+      # the library-only build, and every target without the `cli` feature.
       - name: Clippy
         if: matrix.toolchain != 'stable'
-        run: prek run --all-files cargo-clippy cargo-clippy-lib-only
+        run: prek run --all-files cargo-clippy cargo-clippy-lib-only cargo-clippy-no-cli
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
@@ -197,7 +197,7 @@ jobs:
       # single-platform clippy run would miss them).
       - name: Run linters
         env:
-          SKIP: cargo-clippy,cargo-clippy-lib-only
+          SKIP: cargo-clippy,cargo-clippy-lib-only,cargo-clippy-no-cli
         run: prek run --all-files
 
       - name: Test release helper scripts
