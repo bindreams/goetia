@@ -65,7 +65,7 @@ use serde::{Deserialize, Serialize};
 
 use self::dir::Dir;
 use self::files::DeleteOutcome;
-use super::folder::{ensure_as_made, goetia_folder, make_goetia_folders};
+use super::folder::{ensure_as_made, goetia_folder, is_as_made, make_goetia_folders};
 use super::shim::acl::{Descriptor, FolderCheck};
 use super::sid::{Sid, distinct};
 use crate::error::{Error, Result};
@@ -440,6 +440,28 @@ impl Runs {
         self.reopen()
     }
 
+    /// Whether `Goetia` and `runs` are goetia's own folders as an install makes them, judged as
+    /// [`Runs::ensure_roots`] judges them but making nothing: `false` for a folder that is missing, that `folders`
+    /// refuses ([`Error::FolderUnsafe`]) or that is not as made. Records under a chain that is not goetia's can be
+    /// no left run's of goetia's, and are not to be read: an elevated read of them would follow what a standard user
+    /// put there. A folder that cannot be read is an error.
+    pub(crate) fn chain_is_goetias(&self, folders: &FolderCheck) -> Result<bool> {
+        let goetia = self.root.parent().expect("`runs` is in `Goetia`");
+        for folder in [goetia, self.root.as_path()] {
+            match fs::symlink_metadata(folder) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(Error::os_at("look at", folder, e)),
+            }
+            match folders.check(folder) {
+                Ok(()) => {}
+                Err(Error::FolderUnsafe { .. }) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        is_as_made(&self.root, &Descriptor::for_folder()?)
+    }
+
     /// Read-only: refuses what [`Runs::ensure`] would refuse of an existing directory (a link: NotADirectory). A
     /// missing directory passes; so does a permissions write that later fails.
     pub(crate) fn check_directory(&self) -> io::Result<()> {
@@ -641,9 +663,11 @@ impl Runs {
     /// marker, for a `run` to keep backing off while records may be partly gone; an install clears it
     /// ([`Runs::ensure`]).
     ///
-    /// `lock` is taken for the marker and for each pass and let go before each pause, so that a wait for a held
-    /// pin blocks nothing that needs it: the pass's own listing of the pins is the re-check. A caller that holds
-    /// what `lock` stands for already passes one that takes nothing.
+    /// `lock` is taken to place the marker and for each pass, and let go before each pause, so that a wait for a
+    /// held pin blocks nothing that needs it. No decision is carried across the release: each pass first checks,
+    /// under its own taking, that the marker still stands. One that is gone means an install took the id back, and
+    /// the removal ends at once with [`Error::InstalledAgain`], deleting and placing nothing. A caller that holds
+    /// what `lock` stands for already, and so cannot have an install clear the marker, passes one that takes nothing.
     ///
     /// **A limit, stated:** a directory someone placed in the task's directory that a program holds open
     /// (a handle on a file in it, say) fails the removal, which names that directory; once the program
@@ -665,13 +689,40 @@ impl Runs {
         }
         let mut said = Said::Nothing;
         loop {
-            let pass = lock().and_then(|_held| self.remove_pass())?;
+            let pass = lock().and_then(|_held| {
+                if self
+                    .is_closed()
+                    .map_err(|e| Error::os_at("look for the removal's marker", &self.marker, e))?
+                {
+                    self.remove_pass()
+                } else {
+                    Err(Error::InstalledAgain { id: self.id.clone() })
+                }
+            })?;
             if matches!(pass, PassOutcome::Done) {
                 return Ok(());
             }
             said.note(&self.dir, &pass, &mut waiting);
             thread::sleep(REMOVE_PACE);
         }
+    }
+
+    /// The removal that waits for nothing: places the marker, and then, if no pin holds the records, makes one pass
+    /// ([`Runs::remove_pass`]). What the pass could not remove (a record or the directory another program holds)
+    /// is left with the marker, and so is everything when a pin is held: the path of what is left is returned. The
+    /// caller makes this one call under one taking of the install lock; there is no wait and no re-check to make.
+    pub(crate) fn remove_unheld(&self) -> Result<Removal> {
+        if self.close()? == Closed::NoRecords {
+            return Ok(Removal::Done);
+        }
+        if let Some(pin) = self.held_pin()? {
+            return Ok(Removal::Left(pin));
+        }
+        Ok(match self.remove_pass()? {
+            PassOutcome::Done => Removal::Done,
+            PassOutcome::Waiting(path) => Removal::Left(path),
+            PassOutcome::Retry => Removal::Left(self.dir.clone()),
+        })
     }
 
     /// One pass of [`Runs::remove_all`]: the pins, then the rest of the directory, then the directory,
@@ -995,6 +1046,14 @@ fn entries(dir: &Dir) -> io::Result<Vec<Entry>> {
             }
         })
         .collect())
+}
+
+/// How [`Runs::remove_unheld`] went.
+pub(crate) enum Removal {
+    /// The directory and the marker are gone.
+    Done,
+    /// This path held the removal back, and what is under it and the marker are left.
+    Left(PathBuf),
 }
 
 /// How one pass of [`Runs::remove_all`] went.

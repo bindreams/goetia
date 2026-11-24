@@ -787,7 +787,7 @@ fn new_has_no_provider() {
 }
 
 /// `Leave` is built for a task and not yet for a service: a service is refused as an invalid request that names the
-/// flag and says nothing was changed (nothing was read of the SCM: the snapshot is a table).
+/// flag and says nothing was changed.
 #[skuld::test]
 fn leaving_a_service_run_is_refused_naming_the_flag_and_that_nothing_was_changed() {
     let id = Id::try_from("frpc").unwrap();

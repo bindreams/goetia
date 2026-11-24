@@ -73,13 +73,18 @@ pub(crate) fn ensure_as_made(folder: &Path, wanted: &Descriptor) -> Result<()> {
     if !missing.is_empty() {
         return wanted.create_each(&missing);
     }
-    if is_as_wanted(&read_path(folder)?, &wanted.wanted()?) {
+    if is_as_made(folder, wanted)? {
         Ok(())
     } else {
         Err(Error::FolderNotAsMade {
             path: folder.to_path_buf(),
         })
     }
+}
+
+/// Whether `folder`, which is there, is as `wanted` makes it (owner, protection and entries). Reads only.
+pub(crate) fn is_as_made(folder: &Path, wanted: &Descriptor) -> Result<bool> {
+    Ok(is_as_wanted(&read_path(folder)?, &wanted.wanted()?))
 }
 
 /// The folder `id` names, for the machine. `name` stands for it in an error.

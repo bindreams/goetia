@@ -1037,10 +1037,8 @@ fn uninstall_of_an_id_that_is_absent_sweeps_even_when_the_records_cannot_be_remo
 
 // Leaving the run -----------------------------------------------------------------------------------------------------
 
-/// `uninstall --no-stop` from inside a run: the run is listed and its pin is held (a shim pins before the marker
-/// and holds it for the whole run). The removal disables the task, places the marker, deletes the registration
-/// and waits for nothing: it lists nothing, holds nothing, stops nothing and takes no pin of its own. The run's
-/// pin, the records and the marker stay, which is "the task gone, its records left".
+/// `uninstall --no-stop` from inside a run (its shim holds the pin): the task is deleted and the pin, records and
+/// marker stay.
 #[skuld::test]
 fn leaving_a_run_whose_pin_is_held_deletes_the_task_and_keeps_marker_and_records() {
     let (dir, records_dir, runs) = records();
@@ -1111,7 +1109,7 @@ fn leaving_an_absent_id_does_not_wait_for_a_held_pin_and_removes_the_records_onc
     let (dir, records_dir, runs) = records();
     shim_writes(&Runs::of(dir.path(), &id()), &record(1, RunOutcome::Exited(0)));
     let run_pin = runs.hold().unwrap();
-    runs.close().unwrap();
+    assert!(!runs.is_closed().unwrap(), "no marker stands before the call");
     let swept = Cell::new(0);
     let sweep = || {
         swept.set(swept.get() + 1);
@@ -1138,6 +1136,113 @@ fn leaving_an_absent_id_does_not_wait_for_a_held_pin_and_removes_the_records_onc
         !records_dir.exists() && !runs.is_closed().unwrap(),
         "released, nothing is left"
     );
+}
+
+/// `Leave` waits for nothing, in one taking of the lock: with a held pin it ends there, and with no pin it makes one
+/// pass and leaves what the pass could not remove (a record another program holds), with the marker, and says what
+/// it left. It never enters the waiting loop, so there is no pause and the lock is taken exactly once.
+#[skuld::test]
+fn leaving_takes_the_lock_once_and_leaves_what_a_pass_could_not_remove() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let (dir, records_dir, runs) = records();
+    shim_writes(&Runs::of(dir.path(), &id()), &record(1, RunOutcome::Exited(0)));
+    shim_writes(&Runs::of(dir.path(), &id()), &record(2, RunOutcome::Exited(0)));
+    let stuck = records_dir.join(format!("{}.json", instance_id(2).hex()));
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&stuck)
+        .unwrap();
+    let takings = Cell::new(0);
+    let left = std::cell::RefCell::new(Vec::new());
+
+    remove_records(
+        &runs,
+        RunInFlight::Leave,
+        || {
+            takings.set(takings.get() + 1);
+            Ok(())
+        },
+        |path| left.borrow_mut().push(path.to_owned()),
+    )
+    .unwrap();
+
+    assert_eq!(takings.get(), 1, "one taking, no pause");
+    assert_eq!(*left.borrow(), [stuck.clone()], "it said what it left");
+    assert!(
+        stuck.exists() && runs.is_closed().unwrap(),
+        "the held record and the marker stay"
+    );
+
+    // A held pin ends it before any pass: nothing is deleted, and the pin is what is left.
+    let (_dir, records_dir, runs) = records();
+    let pin = runs.hold().unwrap();
+    takings.set(0);
+    left.borrow_mut().clear();
+    remove_records(
+        &runs,
+        RunInFlight::Leave,
+        || {
+            takings.set(takings.get() + 1);
+            Ok(())
+        },
+        |path| left.borrow_mut().push(path.to_owned()),
+    )
+    .unwrap();
+    assert_eq!(takings.get(), 1);
+    assert_eq!(left.borrow().len(), 1);
+    assert_eq!(
+        left.borrow()[0].parent(),
+        Some(records_dir.as_path()),
+        "the pin is named"
+    );
+    assert!(runs.is_closed().unwrap());
+    drop(pin);
+}
+
+/// A plain uninstall of an absent id that waits does not carry its decision across the release of the lock: every
+/// pass first checks that the removal's marker still stands. An `install` of the id that takes the lock during a pause
+/// clears the marker and makes the id its own, and the next pass then removes nothing of it, places no marker, and
+/// fails saying so.
+#[skuld::test]
+fn a_waiting_uninstall_whose_id_is_installed_again_removes_nothing_of_the_new_install() {
+    let (dir, records_dir, runs) = records();
+    let run_pin = std::cell::RefCell::new(Some(runs.hold().unwrap()));
+    let takings = Cell::new(0);
+
+    let failed = scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            RunInFlight::Stop,
+            || -> Result<()> {
+                takings.set(takings.get() + 1);
+                // The third taking is the second pass: an install took the lock during the pause before it, after
+                // the run had ended (its `Runs::ensure` ends in `reopen`).
+                if takings.get() == 3 {
+                    drop(run_pin.borrow_mut().take());
+                    runs.reopen().unwrap();
+                    std::fs::write(records_dir.join("new-install"), "kept").unwrap();
+                }
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+    assert!(matches!(failed.cause(), Error::InstalledAgain { .. }), "{failed:?}");
+    assert_eq!(
+        takings.get(),
+        3,
+        "the marker, a pass that waited, the pass that found the id taken"
+    );
+    assert!(
+        records_dir.join("new-install").exists(),
+        "nothing of the new install was removed"
+    );
+    assert!(!runs.is_closed().unwrap(), "and no marker was placed on it");
+    drop(dir);
 }
 
 /// A plain `uninstall` of an absent id waits, with no bound, for a pin a left run holds; the install lock is a
@@ -1189,6 +1294,35 @@ fn a_plain_uninstall_of_an_absent_id_waits_for_a_held_pin_without_holding_the_in
     );
 }
 
+/// An install lock that cannot be taken is the call's own error, once: the sweep takes the same lock, so it is
+/// not tried, and the error is not wrapped as a failure to remove records.
+#[skuld::test]
+fn an_absent_id_uninstall_whose_install_lock_cannot_be_taken_reports_that_once() {
+    let (_dir, records_dir, runs) = records();
+    let swept = Cell::new(false);
+
+    let failed = scm(&Fake::new())
+        .uninstall_absent_with(
+            &id(),
+            &runs,
+            RunInFlight::Stop,
+            || -> Result<()> {
+                Err(Error::ElevationRequired {
+                    what: "take the install lock".into(),
+                })
+            },
+            || {
+                swept.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(failed, Error::ElevationRequired { .. }), "{failed:?}");
+    assert!(!swept.get(), "the sweep needs the same lock");
+    assert!(records_dir.exists(), "nothing was removed");
+}
+
 /// With the choice and no pin held, the removal of an absent id's records is what it is without it.
 #[skuld::test]
 fn leaving_an_absent_id_with_no_pin_held_removes_the_records_under_the_install_lock() {
@@ -1212,8 +1346,7 @@ fn leaving_an_absent_id_with_no_pin_held_removes_the_records_under_the_install_l
     assert!(!records_dir.exists() && !runs.is_closed().unwrap());
 }
 
-/// A `--no-stop` uninstall that fails names `--no-stop` in the retry it asks for: the retry without it would stop
-/// the run the caller asked to keep, or wait for the caller's own pin. One test per message of the four `Left`s.
+/// A failed `--no-stop` uninstall asks for a retry that keeps `--no-stop`; one test per `Left` message.
 #[skuld::test]
 fn a_failed_leaving_uninstall_asks_for_its_retry_with_no_stop() {
     let retry = "Re-run `goetia daemon uninstall --no-stop nightly`";

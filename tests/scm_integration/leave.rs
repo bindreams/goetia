@@ -1,7 +1,5 @@
 //! `uninstall --no-stop` of a task on the real Task Scheduler: a run that uninstalls its own id through the `goetia`
-//! binary is not ended by it, and goes on until the test releases it through its connection. While it is held the
-//! tests assert what the system reports, never that time has passed; the run's end is waited for through a handle
-//! on its process.
+//! binary is not ended by it, and goes on until the test releases it through its connection.
 
 use std::io::Read as _;
 use std::net::TcpStream;
@@ -78,10 +76,8 @@ fn marker_of(id: &Id) -> PathBuf {
     records_of(id).with_file_name(format!("{id}~removing"))
 }
 
-/// The run removes its own task and goes on: the task is not registered, its process is alive and has written
-/// nothing after the uninstall, and its records and the marker stay. An `install` of the id is refused while the run
-/// holds the records. Released, the run writes its file and exits by itself, and then the id is not installed and the
-/// next `install` of it succeeds and leaves no marker of the old removal.
+/// A run that uninstalls its own task with `--no-stop` keeps its records while it lives (an `install` is refused);
+/// once it exits, the id is clean and installs.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixture(scm_group)] _group: &Group) {
     // Declared first, so they go last: the task and its records are removed before the directory the run writes in.
@@ -113,6 +109,10 @@ fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixt
     );
     assert!(records_of(id).is_dir(), "the run's records stay");
     assert!(marker_of(id).exists(), "and so does the removal's marker");
+    assert!(
+        std::path::Path::new(env!("CARGO_BIN_EXE_goetia-shim")).exists(),
+        "the shim file the run uses is still there after the uninstall's sweep"
+    );
 
     let refused = mgr.install(&spec, false).expect_err("the run holds the records");
     assert!(
@@ -142,8 +142,7 @@ fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixt
     );
     let gone = mgr.status(id).expect_err("the task is still not installed");
     assert!(matches!(gone.cause(), Error::NotInstalled { .. }), "{gone:?}");
-    // The run's shim holds its pin until it exits, a moment after the program: a refusal changes nothing, and each
-    // attempt re-reads whether the records are still held.
+    // The shim's pin outlives the program, so install is retried until it stops being refused.
     let mut created = None;
     wait::until_paced(Duration::from_millis(50), || match mgr.install(&spec, false) {
         Ok(outcome) => {

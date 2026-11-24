@@ -12,11 +12,11 @@
 //! before it leaves the task disabled with `enable` and `disable` working, and the verbs refuse after it
 //! with the message of [`unfinished_change`](crate::backend::scm::runs::unfinished_change).
 //!
-//! [`RunInFlight::Leave`] is the same removal without the stop of the runs, and with the records removed only
-//! if no pin holds them ([`remove_records`]): a run that is still going keeps its pin, so its records and the
-//! marker stay, which is the second state above, until an `uninstall` or an `install` of the id after the run
-//! has ended.
+//! [`RunInFlight::Leave`] is the same removal without the stop of the runs and without any wait ([`remove_records`]):
+//! a run that is still going keeps its pin, so its records and the marker stay, which is the second state above,
+//! until an `uninstall` or an `install` of the id after the run has ended.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use super::api::Registered;
@@ -26,7 +26,7 @@ use crate::backend::InstalledService;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::kill::HoldOutcome;
 use crate::backend::scm::manager::{Scm, Uninstalled, shim_exe};
-use crate::backend::scm::runs::{MarkerCheck, PauseKind, Runs};
+use crate::backend::scm::runs::{MarkerCheck, PauseKind, Removal, Runs};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
 use crate::error::{Error, RECORD_HOLDERS, Result};
@@ -87,26 +87,39 @@ fn waiting_for_records(waits_for: &Path, kind: PauseKind) {
     }
 }
 
-/// The run records of a task that is removed, or of an id that is not installed: removed, waiting for any pin
-/// ([`Runs::remove_all`]); except under [`RunInFlight::Leave`], where they are left, with the marker, when a pin
-/// holds them, and nothing is waited for. The marker is placed first and the pins read after, the order
-/// `remove_all` keeps: no pin is made once it stands ([`Runs::hold`]), so a pin read as absent stays absent, and a
-/// pin that is held is a run (or another program) that the removal does not wait for.
+/// What a `--no-stop` uninstall says on stderr when it leaves run records, in the style of
+/// [`waiting_for_records`]: what holds them and what removes them.
+fn left_records(id: &Id, held: &Path) {
+    eprintln!(
+        "the run records of `{id}` were left: {} is held by {RECORD_HOLDERS}; `goetia daemon uninstall {id}` removes          them once it is released",
+        held.display()
+    );
+}
+
+/// The run records of a task that is removed, or of an id that is not installed. Under [`RunInFlight::Stop`] they
+/// are removed, waiting with no bound for whatever holds them ([`Runs::remove_all`]). Under
+/// [`RunInFlight::Leave`] nothing is waited for: one taking of `lock` places the marker and makes one pass
+/// ([`Runs::remove_unheld`]), and what holds the records is left with the marker, its path told to `left`.
 ///
-/// `lock` is what the removal takes for each of its steps and lets go of before it waits (`remove_all`): the
-/// install lock for an id that is not installed, whose wait can last as long as a left run, and nothing for a
-/// caller that holds the install lock already.
-fn remove_records<G>(runs: &Runs, in_flight: RunInFlight, mut lock: impl FnMut() -> Result<G>) -> Result<()> {
-    if in_flight == RunInFlight::Leave {
-        let held = lock().and_then(|_held| {
-            runs.close()?;
-            runs.held_pin()
-        })?;
-        if held.is_some() {
-            return Ok(());
+/// `lock` is what the removal takes for each step and lets go of before it waits: the install lock for an id that
+/// is not installed, whose wait can last as long as a left run, and nothing for a caller that holds the install
+/// lock for its whole call (and so cannot have the marker it placed cleared). Every locked pass of a wait first
+/// checks that the marker stands: an install that took the lock meanwhile is never undone.
+fn remove_records<G>(
+    runs: &Runs,
+    in_flight: RunInFlight,
+    mut lock: impl FnMut() -> Result<G>,
+    left: impl FnOnce(&Path),
+) -> Result<()> {
+    match in_flight {
+        RunInFlight::Stop => runs.remove_all(waiting_for_records, lock),
+        RunInFlight::Leave => {
+            if let Removal::Left(held) = lock().and_then(|_held| runs.remove_unheld())? {
+                left(&held);
+            }
+            Ok(())
         }
     }
-    runs.remove_all(waiting_for_records, lock)
 }
 
 /// The shim file the stored task runs, when its file name is that of one a provider placed (the one
@@ -146,33 +159,39 @@ impl Scm {
         )
     }
 
-    /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes
-    /// the install lock. The records are removed under it, a step at a time, and it is not held while the
-    /// removal waits for a pin: an install that has just made the records holds it, and would lose them,
-    /// but an install or uninstall of another id must not wait for a run that lives on. With no records there
-    /// is nothing to guard, and nothing is taken. A removal that fails (a `lock` that cannot be taken too)
-    /// says that the id is not installed and that records left for it could not be removed; some may be
-    /// gone by then.
+    /// [`Self::task_uninstall_absent`] over the record directory `runs` of `id`, and `lock`, which takes the
+    /// install lock for each step of the removal and is not held while it waits for a pin ([`remove_records`]),
+    /// so that no install or uninstall waits for a run that lives on. A removal that fails says that the id is not
+    /// installed and that records left for it could not be removed; some may be gone by then. A `lock` that
+    /// cannot be taken is the call's own error, and the sweep, which takes the same lock, is not tried.
     ///
-    /// `sweep` runs whether or not the records were removed, after the lock is released. If both fail,
-    /// both errors are kept, the records' first.
-    ///
-    /// Without [`RunInFlight::Leave`] the removal waits, with no bound, for a pin that holds the records; with
-    /// it, it removes them only when none does and returns at once otherwise, the marker placed and the records
-    /// left ([`remove_records`]). The sweep is no stop and runs under either.
+    /// `sweep` runs whether or not the records were removed, after the lock is released. If both fail, both
+    /// errors are kept, the records' first. It is no stop and runs under either choice.
     pub(super) fn uninstall_absent_with<L>(
         &self,
         id: &Id,
         runs: &Runs,
         in_flight: RunInFlight,
-        lock: impl FnMut() -> Result<L>,
+        mut lock: impl FnMut() -> Result<L>,
         sweep: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        // A lock that cannot be taken is the call's own error, once: the sweep takes the same lock.
+        let lock_failed = Cell::new(false);
         let removed = if runs.is_present() {
-            remove_records(runs, in_flight, lock).map_err(|e| uninstall_failed(id, Left::LeftoverRecords, in_flight, e))
+            let lock = || lock().inspect_err(|_| lock_failed.set(true));
+            remove_records(runs, in_flight, lock, |held| left_records(id, held)).map_err(|e| {
+                if lock_failed.get() {
+                    e
+                } else {
+                    uninstall_failed(id, Left::LeftoverRecords, in_flight, e)
+                }
+            })
         } else {
             Ok(())
         };
+        if lock_failed.get() {
+            return removed;
+        }
         let swept = sweep();
         Error::both_all(removed.err().into_iter().chain(swept.err())).map_or(Ok(()), Err)
     }
@@ -201,9 +220,8 @@ impl Scm {
     /// 5. The task is deleted, then its run records ([`Runs::remove_all`]), which waits for any holder
     ///    (a shim that pinned before the marker leaves once it reads the task gone).
     ///
-    /// Under [`RunInFlight::Leave`] steps 3 and 4 are left out (nothing is listed, held, stopped or waited for),
-    /// and step 5 removes the records only if no pin holds them ([`remove_records`]); a pin that is held is a run
-    /// that went on, and it keeps its records and the marker.
+    /// Under [`RunInFlight::Leave`] steps 3 and 4 are skipped, and step 5 is one pass that leaves what holds the
+    /// records ([`remove_records`]).
     ///
     /// A task that is gone has nothing to disable or stop; a failure after that says it is not installed
     /// and records are what is left. A task with no directory of records has no pin to take; its marker
@@ -248,7 +266,8 @@ impl Scm {
             Err(e @ Error::TaskFolderKept { .. }) => eprintln!("warning: {}", e.report()),
             Err(e) => return Err(uninstall_failed(id, left, in_flight, e)),
         }
-        remove_records(runs, in_flight, || Ok(())).map_err(|e| uninstall_failed(id, Left::Records, in_flight, e))
+        remove_records(runs, in_flight, || Ok(()), |held| left_records(id, held))
+            .map_err(|e| uninstall_failed(id, Left::Records, in_flight, e))
     }
 }
 

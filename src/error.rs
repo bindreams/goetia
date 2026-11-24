@@ -599,10 +599,17 @@ pub enum Error {
     /// `install` of an id whose earlier task was uninstalled with `--no-stop` while a run of it went on, or whose
     /// run records another program holds: `pin` is what holds them. Installing would narrow the records to the new
     /// account and take the removal's marker away under that holder. Determinate: nothing was registered and the records
-    /// and the marker are as they were (the install had made the Goetia folders and swept the shim files, as any
-    /// install does first); the same classifications as [`Error::AccountChangeHeld`].
+    /// and the marker are as they were; the same classifications as [`Error::AccountChangeHeld`].
     #[error("{}", run_records_held(id, pin))]
     RunRecordsHeld { id: String, pin: PathBuf },
+
+    /// An `uninstall` of an id that is not installed was waiting for the run records a left run holds, and an
+    /// `install` took the id back meanwhile (the removal's marker is gone). The uninstall ended at once and removed
+    /// nothing of the new install. Determinate, like [`Error::RunRecordsHeld`].
+    #[error(
+        "`{id}` was installed again while this uninstall waited for its old run records: the new install was left as it is, and nothing of it was removed"
+    )]
+    InstalledAgain { id: String },
 
     /// `uninstall --no-stop` on systemd found a file that is not goetia's at the path of the unit that
     /// keeps a left run alive, and refused: raised whether or not a run is in flight, since the next run
@@ -927,6 +934,7 @@ impl Error {
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
             | Error::RunRecordsHeld { .. }
+            | Error::InstalledAgain { .. }
             | Error::StandinBlocked { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
@@ -1138,6 +1146,7 @@ impl Error {
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
             | Error::RunRecordsHeld { .. }
+            | Error::InstalledAgain { .. }
             | Error::StandinBlocked { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }

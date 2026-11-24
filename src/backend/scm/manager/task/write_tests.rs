@@ -222,6 +222,47 @@ fn held_records_are_refused_and_free_or_missing_ones_are_not() {
     refuse_held_records(&id(), &none).expect("no records, nothing held");
 }
 
+/// A native service's install makes no Goetia folders and judges none, so the check it makes for a left run reads
+/// nothing under a chain nobody judged: a missing one has no records, and one that fails the folder check (here, a
+/// folder an untrusted account owns and can write) is not read either, so a pin in it is neither named nor deleted.
+#[skuld::test]
+fn a_service_create_reads_nothing_under_folders_nobody_judged() {
+    let folders = FolderCheck::new(CheckPermissions::Enable);
+
+    let missing = tempfile::tempdir().unwrap();
+    refuse_held_records_in(missing.path(), &id(), &folders).expect("no `Goetia` folder, no records");
+
+    let (dir, runs) = made_records();
+    let pin = runs.hold().unwrap();
+    refuse_held_records_in(dir.path(), &id(), &folders)
+        .expect("a chain this test made is not goetia's, so it is not read");
+    assert_eq!(
+        std::fs::read_dir(records_dir(&dir)).unwrap().count(),
+        1,
+        "the pin in it is still there"
+    );
+    drop(pin);
+}
+
+/// Folders made as an install makes them are judged and read: a held pin in them refuses the service's install.
+/// Making them needs an elevated token (the `scm` group).
+#[skuld::test]
+fn a_service_create_over_judged_folders_with_a_held_pin_is_refused(#[fixture(scm_group)] _group: &Group) {
+    let dir = tempfile::tempdir().unwrap();
+    let folders = FolderCheck::new(CheckPermissions::Enable);
+    let runs = Runs::of(dir.path(), &id());
+    runs.ensure_roots(&folders).unwrap();
+    runs.ensure(&[system()]).unwrap();
+    refuse_held_records_in(dir.path(), &id(), &folders).expect("no pin is held");
+
+    let pin = runs.hold().unwrap();
+    let Err(Error::RunRecordsHeld { pin: named, .. }) = refuse_held_records_in(dir.path(), &id(), &folders) else {
+        panic!("a pin holds the records in judged folders")
+    };
+    assert_eq!(named.parent(), Some(records_dir(&dir).as_path()));
+    drop(pin);
+}
+
 /// Once the run is over and its pin is gone, the install goes on as it does over any leftover records: it creates
 /// the task, narrows the records and takes the marker away.
 #[skuld::test]
