@@ -99,8 +99,11 @@ try {
             $r.RunRet = [DateTime]::UtcNow
             $r.RunGuid = "$($rt.InstanceGuid)"
             $r.Pid = [int]$rt.EnginePID
-            $proc = if ($r.Pid -ne 0) { [Diagnostics.Process]::GetProcessById($r.Pid) } else { $null }
-            if ($proc) { $null = $proc.Handle }
+            $proc = $null
+            if ($r.Pid -ne 0) {
+                try { $proc = [Diagnostics.Process]::GetProcessById($r.Pid); $null = $proc.Handle }
+                catch { "B pid $($r.Pid) from Run is not a running process right after Run; action log: [$((Get-Content $log -ErrorAction SilentlyContinue) -join ' | ')]" }
+            }
             if ($spec.Ready -gt 0) {
                 $t1 = Get-Date
                 while (@(Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match ' ready$' }).Count -lt $spec.Ready) {
