@@ -10,8 +10,8 @@ Claim measured: `print` never shows `state = running` (or xpcproxy / trampoline)
 
     print_sample.py <config> <amount>
 
-configs (amount = launches per driver, or seconds for the timed ones):
-  kick-true    /usr/bin/true, drivers `kickstart` it back to back, throttle 0
+configs (amount = launches per job, KICK_JOBS jobs at once, or seconds for the timed ones):
+  kick-true    /usr/bin/true, one driver per job `kickstarts` it back to back, throttle 0
   kick-wrap    /bin/sh -c 'exec /usr/bin/true' (a longer xpcproxy stage), the same
   kick-sleepy  /bin/sleep 0.05 (a visible `running` stage), the same
   kick-k       /bin/sleep 600 restarted by `kickstart -k` (a kill and a start in one call)
@@ -32,7 +32,9 @@ import sys
 import threading
 
 LABEL = "goetia.probe.printsample"
-SAMPLERS = 3
+SAMPLERS = 4
+# launchd starts a job at most once a second whatever ThrottleInterval says, so launches come from many jobs at once.
+KICK_JOBS = 24
 STATE = re.compile(r"^\tstate = (.*)$", re.M)
 PID = re.compile(r"^\tpid = (\d+)$", re.M)
 SUSP = re.compile(r"^\tstarted suspended = (\d+)$", re.M)
@@ -154,7 +156,7 @@ def kick_driver(label, n, flags):
 
 
 def cfg_kick(args, amount, flags=()):
-    labels = [f"{LABEL}.{i}" for i in range(2)]
+    labels = [f"{LABEL}.{i}" for i in range(KICK_JOBS)]
     for l in labels:
         write_plist(l, args, "<key>ThrottleInterval</key><integer>0</integer>")
         bootstrap(l)

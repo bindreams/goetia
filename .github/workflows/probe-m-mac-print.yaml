@@ -20,8 +20,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15]
-        part: [kick, timed]
+        include:
+          - {os: macos-latest, part: kick}
+          - {os: macos-15, part: kick}
+          - {os: macos-15, part: timed}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -38,7 +40,7 @@ jobs:
           set -uo pipefail
           exec 2>&1
           if [[ "${{ matrix.part }}" == kick ]]; then
-            for c in "kick-true 3000" "kick-wrap 3000" "kick-sleepy 3000" "kick-k 1500"; do
+            for c in "kick-true 150" "kick-wrap 150" "kick-sleepy 150" "kick-k 150"; do
               sudo python3 -I "$PROBES/print_sample.py" $c
             done
           else
@@ -55,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15]
+        os: [macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -71,31 +73,3 @@ jobs:
         run: |
           exec 2>&1
           sudo python3 -I "$PROBES/hold_soak.py" 1500 3
-
-  # Question 5: the lost-hold answers crossed with the older launch's start time.
-  race:
-    name: race ${{ matrix.print }} (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, macos-15]
-        print: [0, 1]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Machine
-        run: |
-          exec 2>&1
-          sw_vers; uname -a; echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
-          csrutil status || true
-
-      - name: Build
-        run: cc -O1 -Wall -o "$RUNNER_TEMP/race-cross" "$PROBES/race-cross.c"
-
-      - name: Race
-        run: |
-          exec 2>&1
-          sudo "$RUNNER_TEMP/race-cross" race 4000 30000 ${{ matrix.print }}
