@@ -144,11 +144,29 @@ static void do_rusage(pid_t p, char *out, size_t n) {
     describe(out, n, r, e, r == 0);
 }
 
+static void do_uniq(pid_t p, char *out, size_t n) {
+    struct proc_uniqidentifierinfo u;
+    errno = 0;
+    int r = proc_pidinfo(p, PROC_PIDUNIQIDENTIFIERINFO, 1, &u, sizeof u);
+    int e = errno;
+    describe(out, n, r, e, r == (int)sizeof u);
+}
+
+static void do_short(pid_t p, char *out, size_t n) {
+    struct proc_bsdshortinfo b;
+    errno = 0;
+    int r = proc_pidinfo(p, PROC_PIDT_SHORTBSDINFO, 1, &b, sizeof b);
+    int e = errno;
+    describe(out, n, r, e, r == (int)sizeof b);
+}
+
 typedef void (*readfn)(pid_t, char *, size_t);
 static const struct {
     const char *name;
     readfn fn;
-} reads[] = {{"proc_pidinfo(PROC_PIDTBSDINFO)", do_info}, {"proc_pidpath", do_path}, {"proc_pid_rusage(V0)", do_rusage}};
+} reads[] = {{"proc_pidinfo(PROC_PIDTBSDINFO)", do_info}, {"proc_pidpath", do_path}, {"proc_pid_rusage(V0)", do_rusage},
+   {"proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO)", do_uniq}, {"proc_pidinfo(PROC_PIDT_SHORTBSDINFO)", do_short}};
+#define NREADS ((int)(sizeof reads / sizeof reads[0]))
 
 /* Bracket one read with two sysctl reads; record under the state class only when both agree. */
 static int bracketed(pid_t pid, int which, const char *what) {
@@ -158,7 +176,7 @@ static int bracketed(pid_t pid, int which, const char *what) {
     int s1 = kclass(pid);
     (void)what;
     char line[200];
-    snprintf(line, sizeof line, "%-22s %-32s %s", s0 == s1 ? kname[s0] : "state moved during the call", reads[which].name, res);
+    snprintf(line, sizeof line, "%-22s %-42s %s", s0 == s1 ? kname[s0] : "state moved during the call", reads[which].name, res);
     tally("%s", line);
     return s1;
 }
@@ -260,7 +278,7 @@ static void run_window(int passes, int64_t d_us, int64_t lead_us) {
         spin_until((int64_t)s + D_ticks - ticks_of(lead_us * 1000));
         for (;;) {
             int last = 0;
-            for (int w = 0; w < 3; w++) last = bracketed(pid, w, "");
+            for (int w = 0; w < NREADS; w++) last = bracketed(pid, w, "");
             if (last == K_GONE) break;
         }
         wait_reaped();
@@ -290,7 +308,7 @@ static void run_zombie(int passes) {
         pid_t pid = begin_pass(&s);
         while (kclass(pid) != K_ZOMBIE) {} /* the helper holds the reap, so this ends once the target has exited */
         for (int rep = 0; rep < 3; rep++)
-            for (int w = 0; w < 3; w++) bracketed(pid, w, "");
+            for (int w = 0; w < NREADS; w++) bracketed(pid, w, "");
         for (int es = 0; es < 2; es++) {
             int kq = kqueue();
             int s0 = kclass(pid);
@@ -305,7 +323,7 @@ static void run_zombie(int passes) {
         wait_reaped();
     }
     char title[128];
-    snprintf(title, sizeof title, "zombie passes=%d (state class, read, answer; 9 reads and 2 registrations per pass)", passes);
+    snprintf(title, sizeof title, "zombie passes=%d (state class, read, answer; 15 reads and 2 registrations per pass)", passes);
     dump(title);
 }
 

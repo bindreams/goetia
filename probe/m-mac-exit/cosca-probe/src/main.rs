@@ -195,7 +195,7 @@ fn run_kill(first: bool, passes: u32) {
                 Err(e) => format!("Err: {}", describe_error(e)),
             };
             let which = if first && call == 1 { "first kill" } else { "later kill" };
-            let mut cosca_lines = lines.iter().map(|l| l.as_str()).filter(|l| l.contains("EPERM") || l.contains("refused")).collect::<Vec<_>>();
+            let mut cosca_lines = lines.iter().map(|l| l.as_str()).collect::<Vec<_>>();
             cosca_lines.dedup();
             tally.add(format!("{which}; child {class}; {answer}; cosca debug: [{}]", cosca_lines.join(" | ")));
             if cosca_lines.iter().any(|l| l.contains("exit has begun")) {
