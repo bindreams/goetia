@@ -114,7 +114,8 @@ fn wait_for(what: &str, bound_ms: f64, mut cond: impl FnMut() -> bool) -> bool {
             println!("B waiting for {what}: failure bound of {bound_ms} ms reached");
             return false;
         }
-        std::hint::spin_loop();
+        // The condition is read again each time; the pause only keeps this thread off the samplers' cores.
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -231,6 +232,7 @@ pub fn run(a: &[String]) -> i32 {
                 inside += 1;
             }
         }
+        let early = samples.iter().filter(|sm| sm.t0 >= ct && ms(ct, sm.t0) <= 100.0).count();
         let first_t1 = first.map(|f| rel(ct, f.t1));
         let first_t0 = first.map(|f| rel(ct, f.t0));
         // The last sample that began after Run was called (or the recording began) and did not list it, before the first that did.
@@ -240,7 +242,7 @@ pub fn run(a: &[String]) -> i32 {
             .map(|sm| rel(ct, sm.t1))
             .fold(f64::NEG_INFINITY, f64::max);
         println!(
-            "A {row} {i} pid={pid} first-listed={} first-listed-t0={} call={} ret={} last-unlisted-before-first={} listed-before-ct={before_ct} viol={viol}/{inside} alive={:.1} epid-at-run={epid} pid0-listed={pid0} samples={}",
+            "A {row} {i} pid={pid} first-listed={} first-listed-t0={} call={} ret={} last-unlisted-before-first={} listed-before-ct={before_ct} viol={viol}/{inside} alive={:.1} epid-at-run={epid} pid0-listed={pid0} samples={} begun-within-100ms-after-ct={early}",
             first_t1.map(|v| format!("{v:.3}")).unwrap_or("NEVER".into()),
             first_t0.map(|v| format!("{v:.3}")).unwrap_or("NEVER".into()),
             if t_call == 0 { "-".into() } else { format!("{:.3}", rel(ct, t_call)) },

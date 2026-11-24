@@ -11,9 +11,14 @@
 #   rep-to-lone      S0 a repetition, S1 a lone daily trigger L minutes before Tu
 #   lone-moved       S0 a lone trigger before it, S1 a lone trigger L minutes before Tu (KB bc18321's case)
 #   lone-identical   S0 = S1 (a lone trigger)
-# S1's most recent tick (or its trigger time) is L minutes and 30 s before Tu, L in 1, 3, 8; two tasks per cell. Each action appends
+#   min-identical    S0 = S1, a repetition PT1M that has been ticking every minute (goetia's `* * * * *` shape)
+#   min-interval     S0 a PT1M repetition ticking every minute, S1 PT2M from the hour's start
+#   min-duration     S0 a PT1M repetition of PT30M that has run its duration, S1 the same with PT3H
+#   min-to-lone      S0 a PT1M repetition ticking every minute, S1 a lone daily trigger L minutes before Tu
+# S1's most recent tick (or its trigger time) is L minutes and 30 s before Tu, L in 1, 3, 8; three tasks per cell. Each action appends
 # a line with its start time. Runs are read after the window and classified: `made-up` = within 10 s after the update call and not on S1's
 # grid; `tick` = within 5 s after one of S1's grid ticks after Tu; other = `unexplained`. A lone S1 trigger has no tick until tomorrow.
+# Three tasks per cell.
 # Throwaway Windows CI runner only.
 . "$PSScriptRoot\common.ps1"
 Section "platform"; Show-Platform
@@ -41,15 +46,17 @@ $hh = $tu.Date.AddHours($tu.Hour)
 $window = 24   # minutes watched after Tu
 "Tu = $($tu.ToString('o')); watching until +$window min"
 
-$kinds = 'rep-interval', 'lone-to-rep', 'rep-start-moved', 'rep-duration', 'rep-identical', 'rep-to-lone', 'lone-moved', 'lone-identical'
+$kinds = 'rep-interval', 'lone-to-rep', 'rep-start-moved', 'rep-duration', 'rep-identical', 'rep-to-lone', 'lone-moved', 'lone-identical', 'min-identical', 'min-interval', 'min-duration', 'min-to-lone'
 $tasks = @()
 foreach ($k in $kinds) {
     foreach ($L in 1, 3, 8) {
-        foreach ($rep in 1..2) {
+        foreach ($rep in 1..3) {
             $name = "u-$k-L$L-r$rep"
             $tick = $hh.AddMinutes($tu.Minute - $L)       # S1's most recent tick or trigger time, L min 30 s before Tu
             $s1rep = Rep (Sb $tick) 'PT10M' 'PT3H'
             $s1lone = Lone (Sb $tick)
+            $step = 10; $gridStart = $tick
+            $hourStart = $hh
             switch ($k) {
                 'rep-interval'    { $s0 = Rep (Sb $tick.AddMinutes(-3)) 'PT20M' 'PT3H'; $s1 = $s1rep; $grid = $true }
                 'lone-to-rep'     { $s0 = Lone (Sb $tick.AddMinutes(-3)); $s1 = $s1rep; $grid = $true }
@@ -59,11 +66,15 @@ foreach ($k in $kinds) {
                 'rep-to-lone'     { $s0 = Rep (Sb $tick.AddMinutes(-3)) 'PT10M' 'PT3H'; $s1 = $s1lone; $grid = $false }
                 'lone-moved'      { $s0 = Lone (Sb $tick.AddMinutes(-3)); $s1 = $s1lone; $grid = $false }
                 'lone-identical'  { $s0 = $s1lone; $s1 = $s1lone; $grid = $false }
+                'min-identical'   { $s1 = Rep (Sb $hourStart) 'PT1M' 'PT3H'; $s0 = $s1; $grid = $true; $step = 1; $gridStart = $hourStart }
+                'min-interval'    { $s0 = Rep (Sb $hourStart) 'PT1M' 'PT3H'; $s1 = Rep (Sb $hourStart) 'PT2M' 'PT3H'; $grid = $true; $step = 2; $gridStart = $hourStart }
+                'min-duration'    { $s0 = Rep (Sb $hourStart) 'PT1M' 'PT30M'; $s1 = Rep (Sb $hourStart) 'PT1M' 'PT3H'; $grid = $true; $step = 1; $gridStart = $hourStart }
+                'min-to-lone'     { $s0 = Rep (Sb $hourStart) 'PT1M' 'PT3H'; $s1 = $s1lone; $grid = $false }
             }
             $log = "$Logs\u-$k-L$L-r$rep.log"; Remove-Item $log -ErrorAction SilentlyContinue
             $mk = { param($trig) New-TaskXml -P $P -Command $Script:Exe -Arguments "act rec $log 0" -Triggers $trig -StartWhenAvailable $true }
             $null = Register-ProbeTask $folder $name (& $mk $s0) $P
-            $tasks += [pscustomobject]@{ Name = $name; Kind = $k; L = $L; Rep = $rep; Log = $log; Tick = $tick; Grid = $grid; Xml1 = (& $mk $s1); CallStart = $null; CallEnd = $null; Err = $null }
+            $tasks += [pscustomobject]@{ Name = $name; Kind = $k; L = $L; Rep = $rep; Log = $log; Tick = $tick; Grid = $grid; Step = $step; GridStart = $gridStart; Xml1 = (& $mk $s1); CallStart = $null; CallEnd = $null; Err = $null }
         }
     }
 }
@@ -98,10 +109,9 @@ foreach ($t in $tasks) {
         $off = ($r - $t.CallStart).TotalSeconds
         $kind = 'unexplained'
         if ($t.Grid) {
-            foreach ($j in 1..4) {
-                $g = $t.Tick.AddMinutes(10 * $j)
-                if ($g -gt $tu -and $r -ge $g -and $r -lt $g.AddSeconds(5)) { $kind = 'tick' }
-            }
+            $k = [Math]::Floor(($r - $t.GridStart).TotalMinutes / $t.Step)
+            $g = $t.GridStart.AddMinutes($t.Step * $k)
+            if ($g -gt $tu -and ($r - $g).TotalSeconds -lt 5) { $kind = 'tick' }
         }
         if ($kind -ne 'tick' -and $off -lt 10) { $kind = 'made-up' }
         $cls += "{0:N2}s:{1}" -f $off, $kind

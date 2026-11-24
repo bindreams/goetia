@@ -68,6 +68,10 @@ fn rec(a: &[String]) -> i32 {
         if let Some(n) = opt.strip_prefix("spin_ms=") {
             spin_ms(n.parse().unwrap_or(0.0));
         }
+        if let Some(n) = opt.strip_prefix("sleep_ms=") {
+            // The alive time is the experiment's own variable; sleeping leaves the core to the samplers.
+            std::thread::sleep(std::time::Duration::from_millis(n.parse().unwrap_or(0)));
+        }
     }
     code as i32
 }

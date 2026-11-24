@@ -20,7 +20,7 @@ try {
     $folder = Get-ProbeFolder $svc
 
     $logR = "$Logs\appear-run.log"
-    $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments "act rec $logR 0 spin_ms=1500"
+    $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments "act rec $logR 0 sleep_ms=1500"
     $t = Register-ProbeTask $folder 'apr' $xml $P
     # A new local user's first Run builds its profile: one run not counted.
     Section "warm-up"
@@ -34,7 +34,7 @@ try {
     Section "fire mode ($Kind), $FireRounds ticks"
     $logF = "$Logs\appear-fire.log"
     $trig = "<CalendarTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><Duration>PT23H59M</Duration></Repetition><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"
-    $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments "act rec $logF 0 spin_ms=1500" -Triggers $trig
+    $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments "act rec $logF 0 sleep_ms=1500" -Triggers $trig
     $null = Register-ProbeTask $folder 'apf' $xml $P
     "registered at $([DateTime]::UtcNow.ToString('o'))"
     & $Script:Exe appear "$Script:TaskFolder\apf" $logF fire $FireRounds "$Kind/fire" *>&1 | ForEach-Object { "$_" }

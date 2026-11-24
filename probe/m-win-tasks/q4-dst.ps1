@@ -2,7 +2,7 @@
 # the day after. Adapted from the knowledge base's `dsthours.ps1` (same zone key, same hours, same shapes and action), spring only, with the
 # change placed by -Leg relative to the registration (the clock is never moved; a custom zone selected with tzutil, every task registered
 # after it):
-#   ctrl    no zone change (UTC), the hours of d68 as if there were one
+#   ctrl    the zone of d68 (same bias) with no daylight rules, so nothing changes; the hours of d68
 #   d10 d30 d68 d130 d250   the change U0 is that many minutes after the registration (d68 is the earlier probe's distance)
 #   after   the zone's change was 24 h before d68's U0 (registered the day after the change, the same wall-clock hours)
 #   before  the zone's change is 24 h after d68's U0 (registered the day before it)
@@ -49,6 +49,7 @@ public static class Tz {
 $dist = switch ($Leg) { 'd10' { 10 } 'd30' { 30 } 'd130' { 130 } 'd250' { 250 } default { 68 } }
 $shiftDays = switch ($Leg) { 'after' { -1 } 'before' { 1 } default { 0 } }
 $zoneChange = $Leg -ne 'ctrl'
+$noDst = $Leg -eq 'ctrl'   # ctrl selects the same zone, with the same bias, and no daylight rules: the hours are those of d68, nothing changes
 
 # U0: $dist minutes ahead (24 h earlier or later for after, before), on a whole minute. The reference U0 (before the shift) puts the first
 # hour A at $dist - 60 minutes from now.
@@ -58,7 +59,7 @@ $u0 = $u0ref.AddDays($shiftDays)
 $bias = $u0.Minute - 60          # standard local time = UTC - bias: a whole hour at U0, 1 to 60 minutes ahead of UTC
 $l0 = $u0.AddMinutes(-$bias)
 $day = $l0.ToString('yyyy-MM-dd'); $nextDay = $l0.AddDays(1).ToString('yyyy-MM-dd')
-function Civ([DateTime]$u) { $s = $u.AddMinutes(-$bias); if ($u -lt $u0) { $s } else { $s.AddMinutes(60) } }   # spring
+function Civ([DateTime]$u) { $s = $u.AddMinutes(-$bias); if ($noDst -or $u -lt $u0) { $s } else { $s.AddMinutes(60) } }   # spring
 $aStart = $u0ref.AddMinutes(-60)                                   # real start of hour A, on the registration's day
 $endReal = if ($Leg -in 'd10', 'd30') { $u0ref.AddMinutes(4) } else { $aStart.AddMinutes(8) }
 "leg $Leg; clock $($now0.ToString('o')); U0 = $($u0.ToString('yyyy-MM-dd HH:mm')) UTC (reference $($u0ref.ToString('HH:mm'))); bias $bias; L0 = $($l0.ToString('yyyy-MM-dd HH:mm')); A starts at $($aStart.ToString('HH:mm')) UTC; window ends at $($endReal.ToString('HH:mm')) UTC"
@@ -89,8 +90,12 @@ $tzi = [byte[]]::new(0)
 $tzi += [BitConverter]::GetBytes([int]$bias)
 $tzi += [BitConverter]::GetBytes([int]0)
 $tzi += [BitConverter]::GetBytes([int]-60)
-$tzi += (Rule-Other $l0 3)       # StandardDate, three months away
-$tzi += (Rule $l0)               # DaylightDate: the change, in standard local time
+if ($noDst) {
+    $tzi += [byte[]]::new(16); $tzi += [byte[]]::new(16)
+} else {
+    $tzi += (Rule-Other $l0 3)       # StandardDate, three months away
+    $tzi += (Rule $l0)               # DaylightDate: the change, in standard local time
+}
 function New-Zone {
     $k = New-Item -Path "$zoneRoot\$zoneKey" -Force
     New-ItemProperty -Path $k.PSPath -Name Display -Value '(UTC) Goetia probe hours' -PropertyType String -Force | Out-Null
@@ -133,7 +138,8 @@ try {
         "expected by the zone's rule: zB2 at $((Civ $u0.AddMinutes(30)).ToString('HH:mm')); the service follows it: $($b2 -match [regex]::Escape((Civ $u0.AddMinutes(30)).ToString('HH:mm')))"
     }
     Section "register"
-    $hours = -60, 0, 60
+    # The hours are civil times of day. After the change (the zone is in daylight time) the civil time of the real instant A starts at is L0.
+    $hours = if ($Leg -eq 'after') { 0, 60, 120 } else { -60, 0, 60 }
     $shapes = [ordered]@{
         'rep'   = { param($h) Rep (Boundary $l0.AddMinutes($h)) 'PT15M' 'PT45M' }
         'prog'  = { param($h) Rep (Boundary $l0.AddMinutes($h + 5)) 'PT5M' 'PT5M' }
@@ -174,7 +180,7 @@ try {
     "marker fired; clock $([DateTime]::UtcNow.ToString('o')) UTC"
     Zone-Line 'zone at the end'
 
-    Section "runs per shape: per real hour relative to U0 (-1 is [U0-60 min, U0)); runs before A starts at $($aStart.ToString('HH:mm')) UTC are marked extra"
+    Section "runs per shape: per real hour relative to the reference U0 (-1 is [U0-60 min, U0)); runs before A starts at $($aStart.ToString('HH:mm')) UTC are marked extra"
     foreach ($s in $shapes.Keys) {
         $ls = @(Get-Content "$Logs\dst-$s.log" -ErrorAction SilentlyContinue)
         $buckets = @{}
@@ -182,7 +188,7 @@ try {
         $times = foreach ($l in $ls) {
             if ($l -match ' t=(\d+)') {
                 $u = [DateTime]::FromFileTimeUtc([long]$Matches[1])
-                $k = [int][Math]::Floor(($u - $u0).TotalMinutes / 60)
+                $k = [int][Math]::Floor(($u - $u0ref).TotalMinutes / 60)
                 $buckets[$k] = 1 + [int]$buckets[$k]
                 if ($u -lt $aStart) { $extra++ }
                 $u.ToString('HH:mm:ss')
