@@ -4,7 +4,7 @@ use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
 use crate::testing::{base_fields, service_fields};
 
-fn spec_fixture() -> DaemonSpec {
+pub(in crate::backend::launchd) fn spec_fixture() -> DaemonSpec {
     ServiceSpec::new({
         let base = base_fields("frpc", vec![program("frpc")]);
         ServiceFields {
@@ -26,7 +26,7 @@ fn identity(user: &str) -> Identity {
 }
 
 /// The plist `install` would write for `spec` as `user`.
-fn rendered(spec: &DaemonSpec, user: &str) -> String {
+pub(in crate::backend::launchd) fn rendered(spec: &DaemonSpec, user: &str) -> String {
     generate::plists(spec, &identity(user)).unwrap().job
 }
 
@@ -431,29 +431,48 @@ fn a_plist_changed_during_install_is_a_plain_failure_that_says_to_rerun() {
 
 // kept_alive ==========================================================================================================
 
-fn kept_alive_of(restart: Restart) -> Result<()> {
-    let mut fields = service_fields(spec_fixture());
+/// `spec` with its restart policy set to `restart`.
+pub(in crate::backend::launchd) fn with_restart(spec: &DaemonSpec, restart: Restart) -> DaemonSpec {
+    let mut fields = service_fields(spec.clone());
     fields.restart = restart;
-    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
-    let text = rendered(&spec, "root");
+    ServiceSpec::new(fields).map(DaemonSpec::from).unwrap()
+}
+
+fn kept_alive_of(restart: Restart) -> Result<bool> {
+    let text = rendered(&with_restart(&spec_fixture(), restart), "root");
     kept_alive(
         &Id::try_from("frpc").unwrap(),
         Ok((std::path::Path::new("/p/frpc.plist"), &text)),
     )
 }
 
-/// `--no-stop` is refused for a job launchd keeps alive, with the error that names the id, and for no other.
+/// What each restart policy makes of the plist's `KeepAlive`: only `never` is not kept alive.
 #[skuld::test]
-fn a_job_launchd_keeps_alive_is_refused_and_one_it_does_not_is_not() {
-    for (restart, refused) in [
+fn a_job_launchd_keeps_alive_is_decided_from_its_plist() {
+    for (restart, decided) in [
         (Restart::Never, false),
         (Restart::Always, true),
         (Restart::OnFailure, true),
     ] {
-        match kept_alive_of(restart) {
-            Ok(()) => assert!(!refused, "{restart:?} was not refused"),
-            Err(Error::KeptAlive { id }) => assert!(refused && id == "frpc", "{restart:?} was refused"),
-            Err(other) => panic!("{restart:?}: {other:?}"),
+        assert_eq!(kept_alive_of(restart).unwrap(), decided, "{restart:?}");
+    }
+}
+
+/// `--no-stop` is refused for a job launchd keeps alive only while launchd holds its label: with the label
+/// not loaded there is nothing to restart and no run, and the uninstall is a plain one.
+#[skuld::test]
+fn a_kept_alive_job_is_refused_only_while_launchd_holds_it() {
+    let id = Id::try_from("frpc").unwrap();
+    for (kept, held, refused) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+        (false, false, false),
+    ] {
+        match kept_alive_refusal(&id, kept, held) {
+            Ok(()) => assert!(!refused, "kept alive {kept}, held {held}: not refused"),
+            Err(Error::KeptAlive { id }) => assert!(refused && id == "frpc", "kept alive {kept}, held {held}"),
+            Err(other) => panic!("{other:?}"),
         }
     }
 }

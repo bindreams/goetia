@@ -20,9 +20,10 @@ use crate::backend::bounded;
 use crate::backend::client::ClientError;
 use crate::backend::client::fake::{Entry, Fake, exited, fail, reply};
 use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
+use crate::backend::launchd::refuse::refuse_tests::with_restart;
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::{RunInFlight, Step};
-use crate::spec::{Restart, ServiceFields, ServiceSpec, TaskSpec, User};
+use crate::spec::{Restart, ServiceSpec, TaskSpec, User};
 use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::root_dirs;
 use crate::testing::service_fields;
@@ -1377,12 +1378,7 @@ fn leave(tree: &Tree, fake: &Fake) -> Result<()> {
 }
 
 fn service_restarting(restart: Restart) -> DaemonSpec {
-    ServiceSpec::new(ServiceFields {
-        restart,
-        ..service_fields(service_spec())
-    })
-    .map(DaemonSpec::from)
-    .unwrap()
+    with_restart(&service_spec(), restart)
 }
 
 /// A service's job plist with `KeepAlive` set to `value`, goetia's metadata kept (so it still decodes).
@@ -1513,24 +1509,41 @@ fn leaving_a_service_that_is_not_kept_alive_and_has_no_process_boots_it_out_as_t
     assert!(!exists(&tree, true, ID));
 }
 
-/// launchd restarts a job it keeps alive from memory whatever is removed, so `Leave` is refused before
-/// anything is called or changed, whether or not the label is loaded, or a run is in flight.
+/// launchd restarts a job it keeps alive from memory whatever is removed, so `Leave` is refused while launchd
+/// holds the label, whether or not a run is in flight: after the two reads, which change nothing, and
+/// before anything is changed.
 #[skuld::test]
-fn leaving_a_job_launchd_keeps_alive_is_refused_with_nothing_called_or_changed() {
-    for restart in [Restart::Always, Restart::OnFailure] {
+fn leaving_a_job_launchd_keeps_alive_is_refused_while_it_holds_the_label() {
+    for (restart, body) in [(Restart::Always, BUSY), (Restart::OnFailure, IDLE)] {
         let tree = Tree::new();
         let plists = installed(&tree, &service_restarting(restart), true);
-        let fake = Fake::new([]);
+        let fake = Fake::new([print(job_label(), LOADED, body), print(timer_target(), UNLOADED, "")]);
 
         let e = leave(&tree, &fake).expect_err("a job launchd keeps alive");
 
         assert!(matches!(&e, Error::KeptAlive { id } if id == ID), "{restart:?}: {e:?}");
-        fake.assert_spent("nothing was called");
+        fake.assert_spent("only the two reads");
         assert_eq!(
             text_at(&tree, true, ID),
             plists.job,
             "{restart:?}: the plist is as it was"
         );
+    }
+}
+
+/// With no run in flight `--no-stop` is a plain uninstall: a job launchd keeps alive but does not hold (booted
+/// out, or never started) has nothing to restart, and is uninstalled as `Stop` uninstalls it.
+#[skuld::test]
+fn leaving_a_job_launchd_keeps_alive_and_does_not_hold_is_a_plain_uninstall() {
+    for restart in [Restart::Always, Restart::OnFailure] {
+        let tree = Tree::new();
+        installed(&tree, &service_restarting(restart), true);
+        let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+
+        leave(&tree, &fake).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
+
+        fake.assert_spent("only the two reads");
+        assert!(!exists(&tree, true, ID), "{restart:?}");
     }
 }
 
@@ -1541,8 +1554,10 @@ fn the_decision_is_read_from_the_plist_when_the_metadata_will_not_decode() {
     let tree = Tree::new();
     let always = plists_of(&service_restarting(Restart::Always)).job;
     tree.put(true, ID, damaged(&always));
-    let e = leave(&tree, &Fake::new([])).expect_err("a job launchd keeps alive, with metadata that is damaged");
+    let fake = Fake::new([print(job_label(), LOADED, IDLE), print(timer_target(), UNLOADED, "")]);
+    let e = leave(&tree, &fake).expect_err("a job launchd keeps alive, with metadata that is damaged");
     assert!(matches!(&e, Error::KeptAlive { .. }), "{e:?}");
+    fake.assert_spent("only the two reads");
 
     let tree = Tree::new();
     let never = plists_of(&service_restarting(Restart::Never)).job;

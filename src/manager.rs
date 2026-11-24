@@ -93,8 +93,8 @@ pub trait ServiceManager {
     ///
     /// **launchd**: a run can be left only by leaving its label loaded, so a job with a process keeps its label
     /// and an idle one is booted out. A job launchd keeps alive (its plist's `KeepAlive`) would be restarted from
-    /// memory whatever is removed: `Leave` is refused with [`Error::KeptAlive`], before anything is changed. A
-    /// plist whose `KeepAlive` cannot be read is that read's own error.
+    /// memory whatever is removed: while launchd holds its label, `Leave` is refused with [`Error::KeptAlive`],
+    /// before anything is changed. A plist whose `KeepAlive` cannot be read is that read's own error.
     ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other

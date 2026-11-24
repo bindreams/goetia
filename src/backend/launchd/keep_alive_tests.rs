@@ -1,9 +1,8 @@
 use super::*;
-use crate::backend::Identity;
-use crate::backend::launchd::generate::plists;
+use crate::backend::launchd::refuse::refuse_tests::{rendered, spec_fixture, with_restart};
+use crate::spec::Restart;
 use crate::spec::test_support::program;
-use crate::spec::{DaemonSpec, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{base_fields, task};
+use crate::testing::task;
 
 /// A job's plist whose dict holds `body`, with goetia's metadata comment above it.
 fn plist_with(body: &str) -> String {
@@ -15,54 +14,23 @@ fn plist_with(body: &str) -> String {
     )
 }
 
-fn rendered(spec: &DaemonSpec) -> String {
-    plists(
-        spec,
-        &Identity {
-            user: "root".to_string(),
-        },
-    )
-    .unwrap()
-    .job
-}
-
-fn service(restart: Restart) -> DaemonSpec {
-    ServiceSpec::new(ServiceFields {
-        restart,
-        ..base_fields("job", vec![program("true")])
-    })
-    .map(DaemonSpec::from)
-    .unwrap()
-}
-
 /// What each form the generator writes means: `restart: never` and a task write no key, `always` writes
 /// `true`, and `on-failure` a dict.
 #[skuld::test]
 fn the_forms_the_generator_writes_are_decided() {
+    let service = |restart| rendered(&with_restart(&spec_fixture(), restart), "root");
     let cases = [
-        (
-            "a service with restart: never",
-            rendered(&service(Restart::Never)),
-            false,
-        ),
-        (
-            "a service with restart: always",
-            rendered(&service(Restart::Always)),
-            true,
-        ),
-        (
-            "a service with restart: on-failure",
-            rendered(&service(Restart::OnFailure)),
-            true,
-        ),
+        ("a service with restart: never", service(Restart::Never), false),
+        ("a service with restart: always", service(Restart::Always), true),
+        ("a service with restart: on-failure", service(Restart::OnFailure), true),
         (
             "a task",
-            rendered(&task("job", vec![program("true")], Some("30 3 * * *"))),
+            rendered(&task("job", vec![program("true")], Some("30 3 * * *")), "root"),
             false,
         ),
         (
             "a task with no schedule",
-            rendered(&task("job", vec![program("true")], None)),
+            rendered(&task("job", vec![program("true")], None), "root"),
             false,
         ),
     ];

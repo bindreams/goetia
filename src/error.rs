@@ -605,7 +605,8 @@ pub enum Error {
 
     /// `uninstall --no-stop` on launchd found a job launchd keeps alive (its plist's `KeepAlive`), and refused:
     /// launchd restarts such a job from its own memory whatever is removed, so the run cannot be left alone.
-    /// Raised whether or not a run is in flight. Determinate: nothing was changed. No source, so the message
+    /// Raised whether or not a run is in flight, while launchd holds the job's label (a job it does not hold has
+    /// nothing to restart). Determinate: nothing was changed. No source, so the message
     /// says what happened and [`remedy`](Error::remedy) what to do instead, which [`report`](Error::report)
     /// prints after it.
     #[error(
@@ -1041,8 +1042,8 @@ impl Error {
                 Some("Pass `--timeout <duration>` or `--no-timeout` to name the wait yourself.")
             }
             Error::KeptAlive { .. } => Some(
-                "Uninstall it without `--no-stop`, which stops the job: a caller inside the job is ended with it \
-                 unless it runs in a session of its own (`setsid`).",
+                "Uninstall it without `--no-stop`, from a process that is not part of the job: that stops the job, and \
+                 its main process is ended with it.",
             ),
             Error::Kept(kept) => kept.remedy(),
             _ => None,

@@ -1631,19 +1631,19 @@ impl backend::Backend for Launchd {
     /// A task is uninstalled as two plists (see `write`); a service as one, unless its run is left alone,
     /// which boots the job out only when it has no process, and so reads it first (see `uninstall_plan`).
     ///
-    /// [`RunInFlight::Leave`] is refused for a job launchd keeps alive, before anything is read from launchd
-    /// or changed.
+    /// [`RunInFlight::Leave`] is refused for a job launchd keeps alive while launchd holds its label, before
+    /// anything is changed (see `uninstall_task`); the plist is read first, and a plist that cannot say is an
+    /// error whether or not the label is held.
     fn uninstall(&self, snapshot: Plist, in_flight: RunInFlight, reservation: &mut Reservation) -> Result<()> {
-        if in_flight == RunInFlight::Leave {
-            refuse::kept_alive(
+        let kept_alive = in_flight == RunInFlight::Leave
+            && refuse::kept_alive(
                 &snapshot.id,
                 snapshot
                     .job()
                     .map(|job| (job.location.path.as_path(), job.text.as_str())),
             )?;
-        }
         if in_flight == RunInFlight::Leave || snapshot.has_two_plists() {
-            return self.uninstall_task(snapshot, in_flight, reservation);
+            return self.uninstall_task(snapshot, in_flight, kept_alive, reservation);
         }
         let location = &snapshot.job()?.location;
 

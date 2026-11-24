@@ -190,15 +190,20 @@ impl Launchd {
     }
 
     /// `uninstall` of a task, or of an id that has a timer, or of any id that leaves its run alone: see
-    /// `uninstall_plan`. Unbounded, like a service's: it has no `--timeout`, and bounding the job's
-    /// `bootout` would turn a slow-stopping run into a failed uninstall.
+    /// `uninstall_plan`. `kept_alive` is whether launchd keeps the job alive, read from its plist for
+    /// [`RunInFlight::Leave`]: refused while launchd holds the job's label. Unbounded, like a service's: it
+    /// has no `--timeout`, and bounding the job's `bootout` would turn a slow-stopping run into a failed
+    /// uninstall.
     pub(super) fn uninstall_task(
         &self,
         snapshot: Plist,
         in_flight: RunInFlight,
+        kept_alive: bool,
         reservation: &mut Reservation,
     ) -> Result<()> {
         let old = self.old_of(&snapshot, reservation)?;
+        // The reads of which labels launchd holds change nothing, so this is still before any change.
+        refuse::kept_alive_refusal(&snapshot.id, kept_alive, old.job_loaded)?;
         let executed = Executor {
             launchd: self,
             id: &snapshot.id,

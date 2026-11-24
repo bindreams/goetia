@@ -2126,7 +2126,8 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
 **launchd.** launchd keeps a loaded job's definition in memory and never rereads its plist, so a run can be left
 alone only by leaving its label loaded. Whether that is possible depends on the job's own plist: goetia reads the
 `KeepAlive` key of the installed file, not its own metadata, so an id whose metadata cannot be decoded is decided
-all the same.
+all the same. A plist edited by hand since launchd loaded the job is the user's own change, and goetia does not
+guard against it.
 
 - A job launchd does not keep alive (a task's job, or a service with `restart: never`) can be left. `uninstall
   --no-stop` boots out a task's timer, then reads the job. A job with no process and no start launchd has accepted
@@ -2137,13 +2138,19 @@ all the same.
   `launchctl bootout system/<id>` removes it by hand. `uninstall` of an id nothing is installed at does nothing on
   launchd, with or without `--no-stop`, and leaves that label alone.
 - A job launchd keeps alive (`restart: always` or `restart: on-failure`, in the plist `KeepAlive` as `true` or a
-  dict) is refused, whether or not a run is in flight, with nothing changed: launchd restarts it from memory when
-  its process ends, whatever is removed. Uninstall without `--no-stop`, which boots the job out. A caller that is
-  the job itself is ended with it unless it runs in a session of its own (`setsid`).
+  dict) is refused while launchd holds its label, with nothing changed: launchd restarts it from memory when its
+  process ends, whatever is removed. A kept-alive job launchd does not hold (booted out, or never started) has no
+  run and nothing to restart, and its `--no-stop` is a plain `uninstall`. To uninstall a held one, run `uninstall`
+  without `--no-stop` from a process that is not part of the job: that boots the job out, which ends its main
+  process. A descendant of the job that has left its process group and session survives the boot-out.
 - A plist whose `KeepAlive` is neither a boolean nor a dict, or that is not an XML plist, is refused with that
   reason and nothing changed, as is a timer whose job plist is missing.
 - An `install` of the same id while a left run lives boots the label out, which ends the left run: launchd would
-  otherwise refuse to load the new plist under the same label.
+  otherwise refuse to load the new plist under the same label. That includes an installer that is itself a process
+  of the run: a run that uninstalls with `--no-stop` and then installs the same id can be ended by its own install
+  before the plist is written. Install from a process outside the job, or after the run has ended.
+- A run somebody else starts between goetia's read of the idle job and its boot-out is ended by that boot-out: that
+  caller's own conflicting action, and goetia does not guard against it.
 
 ## Exit codes
 

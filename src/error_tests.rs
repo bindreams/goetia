@@ -392,15 +392,15 @@ fn a_kept_alive_job_says_what_to_do_instead_as_its_remedy() {
     assert_eq!(
         refusal.remedy(),
         Some(
-            "Uninstall it without `--no-stop`, which stops the job: a caller inside the job is ended with it \
-             unless it runs in a session of its own (`setsid`)."
+            "Uninstall it without `--no-stop`, from a process that is not part of the job: that stops the job, and \
+             its main process is ended with it."
         )
     );
     assert_eq!(
         refusal.report().to_string(),
         "`nightly` cannot be uninstalled with `--no-stop`: launchd keeps its job alive and would restart it from \
-         memory whatever is removed, so nothing was changed. Uninstall it without `--no-stop`, which stops the \
-         job: a caller inside the job is ended with it unless it runs in a session of its own (`setsid`)."
+         memory whatever is removed, so nothing was changed. Uninstall it without `--no-stop`, from a process \
+         that is not part of the job: that stops the job, and its main process is ended with it."
     );
     assert!(!refusal.is_indeterminate());
 }
