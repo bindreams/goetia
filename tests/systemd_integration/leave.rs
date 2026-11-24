@@ -13,59 +13,13 @@ use goetia::manager::{Budget, RunInFlight, ServiceManager};
 use goetia::spec::{DaemonSpec, Restart, ServiceFields, ServiceSpec};
 
 use crate::linux::{show_properties, unit_of};
-use crate::support::tasks::{Held, id_of, sh};
+use crate::support::tasks::{Held, SelfUninstalling, id_of, sh};
 use crate::support::{self, Group, SYSTEMD_RUNTIME_UNIT_DIR, SYSTEMD_UNIT_DIR, ServiceGuard, cmd, systemd_group, wait};
 
 /// A daily schedule that does not come due while a test runs.
 const DAILY: &str = "0 3 * * *";
 
-/// A run that writes its pid and then uninstalls its own `id` with `--no-stop`, through the `goetia`
-/// binary, before it announces itself and waits to be released.
-struct SelfUninstalling {
-    held: Held,
-    pid: PathBuf,
-    _dir: tempfile::TempDir,
-}
-
-impl SelfUninstalling {
-    /// A run that exits 0 when released.
-    fn new(id: &str) -> Self {
-        Self::exiting(id, 0)
-    }
-
-    /// A run that exits with `code` when released.
-    fn exiting(id: &str, code: u8) -> Self {
-        Self::after("", id, code)
-    }
-
-    /// A run that exits 0 on SIGTERM: a stop of it reads as a success, not a failure.
-    fn exiting_on_sigterm(id: &str) -> Self {
-        Self::after("trap 'exit 0' TERM; ", id, 0)
-    }
-
-    /// A run that does `prelude` (shell commands, each ending in `;`) before it uninstalls its own `id`.
-    fn after(prelude: &str, id: &str, code: u8) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid = dir.path().join("pid");
-        let held = Held::after_exiting(
-            &format!(
-                "{prelude}echo $$ > \"{}\"; \"{}\" daemon uninstall --no-stop {id} 2>&1; ",
-                pid.display(),
-                env!("CARGO_BIN_EXE_goetia"),
-            ),
-            code,
-        );
-        SelfUninstalling { held, pid, _dir: dir }
-    }
-
-    /// The run's pid, once it has announced itself.
-    fn pid(&self) -> String {
-        fs::read_to_string(&self.pid)
-            .expect("the run wrote its pid before it announced itself")
-            .trim()
-            .to_string()
-    }
-}
+const GOETIA: &str = env!("CARGO_BIN_EXE_goetia");
 
 /// A service that systemd restarts whenever its process ends, after `delay`.
 fn restarting_service(id: &str, command: Vec<String>, delay: Option<Duration>) -> DaemonSpec {
@@ -129,7 +83,7 @@ fn assert_not_installed(mgr: &Systemd, id: &str) {
 fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let mut run = SelfUninstalling::new(&id);
+    let mut run = SelfUninstalling::new(GOETIA, &id);
     let spec = goetia::testing::task(&id, run.held.command.clone(), Some(DAILY));
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -180,9 +134,9 @@ fn an_uninstall_that_stops_the_run_a_standin_keeps_leaves_nothing_listed(#[fixtu
         let id = support::random_test_id();
         let _guard = ServiceGuard::new(&id);
         let mut run = if failing {
-            SelfUninstalling::new(&id)
+            SelfUninstalling::new(GOETIA, &id)
         } else {
-            SelfUninstalling::exiting_on_sigterm(&id)
+            SelfUninstalling::exiting_on_sigterm(GOETIA, &id)
         };
         let spec = goetia::testing::task(&id, run.held.command.clone(), Some(DAILY));
         let mgr = Systemd::new();
@@ -242,7 +196,7 @@ fn a_service_that_uninstalls_itself_with_no_stop_keeps_running_and_is_not_restar
 ) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let mut run = SelfUninstalling::exiting(&id, 3);
+    let mut run = SelfUninstalling::exiting(GOETIA, &id, 3);
     let spec = restarting_service(&id, run.held.command.clone(), None);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -375,7 +329,7 @@ fn a_retry_after_a_removal_with_no_reload_reloads_and_leaves_the_run(#[fixture(s
 fn the_standin_carries_the_stop_settings_a_drop_in_gave_the_job(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let mut run = SelfUninstalling::new(&id);
+    let mut run = SelfUninstalling::new(GOETIA, &id);
     let spec = goetia::testing::task(&id, run.held.command.clone(), None);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");

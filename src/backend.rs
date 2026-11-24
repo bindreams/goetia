@@ -27,7 +27,7 @@ pub mod systemd;
 pub(crate) mod test_allowance;
 mod unreaped;
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(windows)]
 pub(crate) use contract::leave_not_built;
 pub(crate) use contract::{
     Backend, Decoded, InstalledDefinition, InstalledService, Marker, NativeRestart, OutputSource, ReadOutcome,

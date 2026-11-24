@@ -29,7 +29,7 @@ use crate::backend::launchd::task::{Action, Old, OnDisk, disable_plan, enable_pl
 use crate::backend::{Backend as _, WriteOutcome};
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
-use crate::manager::Budget;
+use crate::manager::{Budget, RunInFlight};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 /// What an install of a task draws on and makes: the reservation it sends requests under, and the
@@ -189,11 +189,21 @@ impl Launchd {
         }
     }
 
-    /// `uninstall` of a task, or of an id that has a timer: see `uninstall_plan`. Unbounded, like a
-    /// service's: it has no `--timeout`, and bounding the job's `bootout` would turn a slow-stopping run
-    /// into a failed uninstall.
-    pub(super) fn uninstall_task(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+    /// `uninstall` of a task, or of an id that has a timer, or of any id that leaves its run alone: see
+    /// `uninstall_plan`. `kept_alive` is whether launchd keeps the job alive, read from its plist for
+    /// [`RunInFlight::Leave`]: refused while launchd holds the job's label. Unbounded, like a service's: it
+    /// has no `--timeout`, and bounding the job's `bootout` would turn a slow-stopping run into a failed
+    /// uninstall.
+    pub(super) fn uninstall_task(
+        &self,
+        snapshot: Plist,
+        in_flight: RunInFlight,
+        kept_alive: bool,
+        reservation: &mut Reservation,
+    ) -> Result<()> {
         let old = self.old_of(&snapshot, reservation)?;
+        // The reads of which labels launchd holds change nothing, so this is still before any change.
+        refuse::kept_alive_refusal(&snapshot.id, kept_alive, old.job_loaded)?;
         let executed = Executor {
             launchd: self,
             id: &snapshot.id,
@@ -208,7 +218,7 @@ impl Launchd {
             timer_out: false,
             prepare: None,
         }
-        .run(&uninstall_plan(&old), reservation)?;
+        .run(&uninstall_plan(&old, in_flight), reservation)?;
         debug_assert!(matches!(executed, WriteOutcome::Done), "an uninstall refuses nothing");
         Ok(())
     }
@@ -405,20 +415,7 @@ impl Executor<'_> {
                         Verdict::InFlight
                     }
                     DaemonKind::Service => Verdict::Idle,
-                    DaemonKind::Task => {
-                        let print = launchctl.read_task_print(id, deadline, Role::Query, reservation)?;
-                        // A state of `running` is a run, as launchd reports it; any other print with no
-                        // pid is read as `stop` reads it.
-                        if print.pid.is_some() || print.state == State::Running {
-                            Verdict::InFlight
-                        } else {
-                            match verbs::quiet(self.id, &print) {
-                                Ok(Quiet::Queued) => Verdict::InFlight,
-                                Ok(Quiet::Idle) => Verdict::Idle,
-                                Err(_) => Verdict::Unknown(print.shown.describe(print.state)),
-                            }
-                        }
-                    }
+                    DaemonKind::Task => self.job_verdict(reservation)?,
                 };
                 match verdict {
                     Verdict::Idle => {}
@@ -439,6 +436,15 @@ impl Executor<'_> {
                         };
                         return Err(self.refuse(refusal, reservation));
                     }
+                }
+            }
+            Action::BootoutJobIfIdle => {
+                // Only a job shown idle is booted out, which signals nothing. A process, a start
+                // launchd has accepted, or a state that is not shown to be idle is left alone, and the
+                // label stays loaded: that is launchd's only way to leave a run, so the files go but
+                // the label stays until a reboot or the next `install` of the id.
+                if matches!(self.job_verdict(reservation)?, Verdict::Idle) {
+                    never_expires(launchctl.bootout(id, deadline, reservation)?);
                 }
             }
             Action::CreateTimerFirst | Action::CreateTimerEnabled => {
@@ -523,6 +529,29 @@ impl Executor<'_> {
             }
         }
         Ok(None)
+    }
+
+    /// What one `print` of the job says of its run, read as a task's: a process, `running`, or a start
+    /// launchd has accepted is a run; anything else with no process is idle only where `stop` would read it
+    /// so (see [`verbs::quiet`]), and is otherwise `Unknown`, saying what launchd showed.
+    fn job_verdict(&self, reservation: &mut Reservation) -> Result<Verdict> {
+        let print = self.launchd.launchctl.read_task_print(
+            self.id.as_str(),
+            Budget::Unbounded.start(),
+            Role::Query,
+            reservation,
+        )?;
+        // A state of `running` is a run, as launchd reports it; any other print with no pid is read as
+        // `stop` reads it.
+        Ok(if print.pid.is_some() || print.state == State::Running {
+            Verdict::InFlight
+        } else {
+            match verbs::quiet(self.id, &print) {
+                Ok(Quiet::Queued) => Verdict::InFlight,
+                Ok(Quiet::Idle) => Verdict::Idle,
+                Err(_) => Verdict::Unknown(print.shown.describe(print.state)),
+            }
+        })
     }
 
     /// Load `label` from `path`, after the plists were replaced or moved: a failure says what is left to
@@ -619,12 +648,12 @@ fn files_written(rest: &[Action]) -> bool {
     })
 }
 
-/// What `CheckJobIdle` read of the job.
+/// What `CheckJobIdle` and `BootoutJobIfIdle` read of the job.
 enum Verdict {
     Idle,
     /// A service that is loaded, or a task with a process, in state `running`, or with an accepted start.
     InFlight,
-    /// A task whose `print` shows a state that is neither, or could not be read: what launchd showed, as
+    /// A job whose `print` shows a state that is neither, or could not be read: what launchd showed, as
     /// [`super::task::Shown::describe`] words it.
     Unknown(String),
 }

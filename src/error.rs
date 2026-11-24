@@ -603,6 +603,18 @@ pub enum Error {
     #[error("{}", standin_blocked(id, path))]
     StandinBlocked { id: String, path: PathBuf },
 
+    /// `uninstall --no-stop` on launchd found a job launchd keeps alive (its plist's `KeepAlive`), and refused:
+    /// launchd restarts such a job from its own memory whatever is removed, so the run cannot be left alone.
+    /// Raised whether or not a run is in flight, while launchd holds the job's label (a job it does not hold has
+    /// nothing to restart). Determinate: nothing was changed. No source, so the message
+    /// says what happened and [`remedy`](Error::remedy) what to do instead, which [`report`](Error::report)
+    /// prints after it.
+    #[error(
+        "`{id}` cannot be uninstalled with `--no-stop`: launchd keeps its job alive and would restart it from \
+         memory whatever is removed, so nothing was changed"
+    )]
+    KeptAlive { id: String },
+
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
@@ -919,6 +931,7 @@ impl Error {
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
             | Error::StandinBlocked { .. }
+            | Error::KeptAlive { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -1028,6 +1041,10 @@ impl Error {
             Error::StopActionUnreadable { .. } => {
                 Some("Pass `--timeout <duration>` or `--no-timeout` to name the wait yourself.")
             }
+            Error::KeptAlive { .. } => Some(
+                "Uninstall it without `--no-stop`, from a process that is not part of the job: that stops the job, and \
+                 its main process is ended with it.",
+            ),
             Error::Kept(kept) => kept.remedy(),
             _ => None,
         }
@@ -1129,6 +1146,7 @@ impl Error {
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
             | Error::StandinBlocked { .. }
+            | Error::KeptAlive { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }

@@ -4,7 +4,7 @@ use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
 use crate::testing::{base_fields, service_fields};
 
-fn spec_fixture() -> DaemonSpec {
+pub(in crate::backend::launchd) fn spec_fixture() -> DaemonSpec {
     ServiceSpec::new({
         let base = base_fields("frpc", vec![program("frpc")]);
         ServiceFields {
@@ -26,7 +26,7 @@ fn identity(user: &str) -> Identity {
 }
 
 /// The plist `install` would write for `spec` as `user`.
-fn rendered(spec: &DaemonSpec, user: &str) -> String {
+pub(in crate::backend::launchd) fn rendered(spec: &DaemonSpec, user: &str) -> String {
     generate::plists(spec, &identity(user)).unwrap().job
 }
 
@@ -427,4 +427,77 @@ fn a_plist_changed_during_install_is_a_plain_failure_that_says_to_rerun() {
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains(&path.display().to_string()), "{message}");
     assert!(message.contains("re-run"), "{message}");
+}
+
+// kept_alive ==========================================================================================================
+
+/// `spec` with its restart policy set to `restart`.
+pub(in crate::backend::launchd) fn with_restart(spec: &DaemonSpec, restart: Restart) -> DaemonSpec {
+    let mut fields = service_fields(spec.clone());
+    fields.restart = restart;
+    ServiceSpec::new(fields).map(DaemonSpec::from).unwrap()
+}
+
+fn kept_alive_of(restart: Restart) -> Result<bool> {
+    let text = rendered(&with_restart(&spec_fixture(), restart), "root");
+    kept_alive(
+        &Id::try_from("frpc").unwrap(),
+        Ok((std::path::Path::new("/p/frpc.plist"), &text)),
+    )
+}
+
+/// What each restart policy makes of the plist's `KeepAlive`: only `never` is not kept alive.
+#[skuld::test]
+fn a_job_launchd_keeps_alive_is_decided_from_its_plist() {
+    for (restart, decided) in [
+        (Restart::Never, false),
+        (Restart::Always, true),
+        (Restart::OnFailure, true),
+    ] {
+        assert_eq!(kept_alive_of(restart).unwrap(), decided, "{restart:?}");
+    }
+}
+
+/// `--no-stop` is refused for a job launchd keeps alive only while launchd holds its label: with the label
+/// not loaded there is nothing to restart and no run, and the uninstall is a plain one.
+#[skuld::test]
+fn a_kept_alive_job_is_refused_only_while_launchd_holds_it() {
+    let id = Id::try_from("frpc").unwrap();
+    for (kept, held, refused) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+        (false, false, false),
+    ] {
+        match kept_alive_refusal(&id, kept, held) {
+            Ok(()) => assert!(!refused, "kept alive {kept}, held {held}: not refused"),
+            Err(Error::KeptAlive { id }) => assert!(refused && id == "frpc", "kept alive {kept}, held {held}"),
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+}
+
+/// A plist whose key cannot be read, and an id with no job plist to read, are each a step that says what
+/// was being decided over the failure, never a refusal for a job that is kept alive.
+#[skuld::test]
+fn a_key_that_cannot_be_read_is_a_step_over_the_reads_own_error() {
+    let id = Id::try_from("frpc").unwrap();
+    let path = std::path::Path::new("/p/frpc.plist");
+
+    let e = kept_alive(&id, Ok((path, "this is not a plist"))).expect_err("not a plist");
+    let Error::Step { what, source } = &e else {
+        panic!("expected a step, got {e:?}")
+    };
+    assert!(what.contains("`frpc`") && what.contains("KeepAlive"), "{what}");
+    assert!(what.contains("nothing was changed"), "{what}");
+    assert!(
+        matches!(&**source, Error::Os { path: Some(p), .. } if p == path),
+        "{source:?}"
+    );
+
+    let e = kept_alive(&id, Err(Error::blob("the job's plist is missing"))).expect_err("no plist");
+    assert!(
+        matches!(&e, Error::Step { what, source } if what.contains("KeepAlive") && matches!(**source, Error::Blob { .. })),
+        "{e:?}"
+    );
 }

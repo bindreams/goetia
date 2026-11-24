@@ -438,7 +438,7 @@ pub(crate) struct Scan<S> {
 
 /// The refusal of [`RunInFlight::Leave`] by `manager`, a backend that does not honour it yet: nothing
 /// was read or changed, and `uninstall` without `--no-stop` still works.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(windows)]
 pub(crate) fn leave_not_built(id: &Id, manager: &str) -> Error {
     Error::Invalid {
         daemon: id.to_string(),

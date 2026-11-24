@@ -10,6 +10,7 @@ use std::io;
 use std::path::Path;
 
 use crate::backend::launchd::generate;
+use crate::backend::launchd::keep_alive::keeps_alive;
 use crate::backend::launchd::state::exit_of;
 use crate::error::{Error, Occupant, Result};
 use crate::spec::{DaemonKind, Id};
@@ -74,6 +75,34 @@ pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
         id: id.to_string(),
         path: Some(path.to_path_buf()),
     }
+}
+
+// A run `uninstall --no-stop` cannot leave ============================================================================
+
+/// Whether launchd keeps the job of `id` alive, for `uninstall --no-stop`: its job's plist is `job`,
+/// `(path, text)`, or the error that says it cannot be had. The installed plist's `KeepAlive` decides, never
+/// goetia's metadata; a plist edited by hand since launchd loaded it is the user's own change, which goetia
+/// does not guard against. Where the plist cannot say, a step over the read's own error.
+pub(crate) fn kept_alive(id: &Id, job: Result<(&Path, &str)>) -> Result<bool> {
+    let undecided = |source: Error| Error::Step {
+        what: format!(
+            "`--no-stop` was refused and nothing was changed: whether launchd keeps `{id}` alive could not be \
+             read from its job's plist (the `KeepAlive` key)"
+        ),
+        source: Box::new(source),
+    };
+    let (path, text) = job.map_err(undecided)?;
+    keeps_alive(text).map_err(|unreadable| undecided(Error::os_at("read the `KeepAlive` key of", path, unreadable)))
+}
+
+/// The refusal of `uninstall --no-stop` for a job that `kept_alive` says launchd keeps alive, while launchd
+/// holds its label: launchd restarts the job from memory whatever is removed. A label launchd does not hold
+/// has no run and nothing to restart, and its uninstall is a plain one.
+pub(crate) fn kept_alive_refusal(id: &Id, kept_alive: bool, job_loaded: bool) -> Result<()> {
+    if kept_alive && job_loaded {
+        return Err(Error::KeptAlive { id: id.to_string() });
+    }
+    Ok(())
 }
 
 // A run `begin_run` could not carry through ===========================================================================
@@ -203,4 +232,4 @@ pub(crate) fn run_lost(id: &Id, source: Error) -> Error {
 
 #[cfg(test)]
 #[path = "refuse_tests.rs"]
-mod refuse_tests;
+pub(in crate::backend::launchd) mod refuse_tests;

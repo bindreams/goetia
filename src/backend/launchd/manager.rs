@@ -1304,9 +1304,10 @@ const SERVICE_STOP_CALLS: usize = SERVICE_STOP_REQUESTS + 1;
 /// start's pid is no longer: the read, and the wait.
 const TASK_STOP_CALLS: usize = 2;
 const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
-/// A task's `uninstall`: the two reads of which labels launchd holds, then both `bootout`s and their
-/// waits.
-const TASK_UNINSTALL_CALLS: usize = 2 + (1 + 1) + (1 + 1);
+/// An `uninstall` that stops a task: the two reads of which labels launchd holds, then both `bootout`s
+/// and their waits. One that leaves the run reads the job between them, which makes its longest path
+/// one call longer, and is the one counted.
+const TASK_UNINSTALL_CALLS: usize = 2 + (1 + 1) + 1 + (1 + 1);
 const UNINSTALL_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_UNINSTALL_CALLS);
 /// A service's `kill`: the confirmation's `procinfo` and the wait for launchd to stop showing the killed
 /// pid, one call's files however many reads they make. Its other reads are of no reservation, as
@@ -1627,13 +1628,22 @@ impl backend::Backend for Launchd {
         scan_in(DIRS)
     }
 
-    /// A task is uninstalled as two plists (see `write`); a service as one.
+    /// A task is uninstalled as two plists (see `write`); a service as one, unless its run is left alone,
+    /// which boots the job out only when it has no process, and so reads it first (see `uninstall_plan`).
+    ///
+    /// [`RunInFlight::Leave`] is refused for a job launchd keeps alive while launchd holds its label, before
+    /// anything is changed (see `uninstall_task`); the plist is read first, and a plist that cannot say is an
+    /// error whether or not the label is held.
     fn uninstall(&self, snapshot: Plist, in_flight: RunInFlight, reservation: &mut Reservation) -> Result<()> {
-        if in_flight == RunInFlight::Leave {
-            return Err(backend::leave_not_built(&snapshot.id, "launchd"));
-        }
-        if snapshot.has_two_plists() {
-            return self.uninstall_task(snapshot, reservation);
+        let kept_alive = in_flight == RunInFlight::Leave
+            && refuse::kept_alive(
+                &snapshot.id,
+                snapshot
+                    .job()
+                    .map(|job| (job.location.path.as_path(), job.text.as_str())),
+            )?;
+        if in_flight == RunInFlight::Leave || snapshot.has_two_plists() {
+            return self.uninstall_task(snapshot, in_flight, kept_alive, reservation);
         }
         let location = &snapshot.job()?.location;
 
@@ -1646,12 +1656,10 @@ impl backend::Backend for Launchd {
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
-    /// Nothing of launchd's outlives its id, so there is nothing to do, and no run to leave.
-    fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
-        match in_flight {
-            RunInFlight::Stop => Ok(()),
-            RunInFlight::Leave => Err(backend::leave_not_built(id, "launchd")),
-        }
+    /// Nothing of launchd's outlives its id but the label a left run keeps loaded, which a reboot or the
+    /// next `install` of the id removes: there is nothing to do, whichever choice, and no run to stop.
+    fn uninstall_absent(&self, _id: &Id, _in_flight: RunInFlight) -> Result<()> {
+        Ok(())
     }
 
     /// A task is enabled as two plists, loaded (see `write`); a service's is the move of its plist.

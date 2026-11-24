@@ -91,6 +91,11 @@ pub trait ServiceManager {
     /// stand-in's path is refused with [`Error::StandinBlocked`] whenever the job goetia removes is there. Other
     /// states: README "Uninstalling a daemon".
     ///
+    /// **launchd**: a run can be left only by leaving its label loaded, so a job with a process keeps its label
+    /// and an idle one is booted out. A job launchd keeps alive (its plist's `KeepAlive`) would be restarted from
+    /// memory whatever is removed: while launchd holds its label, `Leave` is refused with [`Error::KeptAlive`],
+    /// before anything is changed. A plist whose `KeepAlive` cannot be read is that read's own error.
+    ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other
     /// service or process uses once its own host has exited. If that cleanup fails the service is

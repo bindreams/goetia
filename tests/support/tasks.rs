@@ -126,6 +126,53 @@ impl Held {
     }
 }
 
+/// A run that writes its pid and then uninstalls its own `id` with `--no-stop`, through the `goetia` binary
+/// at `goetia`, before it announces itself and waits to be released.
+pub struct SelfUninstalling {
+    pub held: Held,
+    pid: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl SelfUninstalling {
+    /// A run that exits 0 when released.
+    pub fn new(goetia: &str, id: &str) -> Self {
+        Self::exiting(goetia, id, 0)
+    }
+
+    /// A run that exits with `code` when released.
+    pub fn exiting(goetia: &str, id: &str, code: u8) -> Self {
+        Self::after(goetia, "", id, code)
+    }
+
+    /// A run that exits 0 on SIGTERM: a stop of it reads as a success, not a failure.
+    pub fn exiting_on_sigterm(goetia: &str, id: &str) -> Self {
+        Self::after(goetia, "trap 'exit 0' TERM; ", id, 0)
+    }
+
+    /// A run that does `prelude` (shell commands, each ending in `;`) before it uninstalls its own `id`.
+    pub fn after(goetia: &str, prelude: &str, id: &str, code: u8) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid = dir.path().join("pid");
+        let held = Held::after_exiting(
+            &format!(
+                "{prelude}echo $$ > \"{}\"; \"{goetia}\" daemon uninstall --no-stop {id} 2>&1; ",
+                pid.display(),
+            ),
+            code,
+        );
+        SelfUninstalling { held, pid, _dir: dir }
+    }
+
+    /// The run's pid, once it has announced itself.
+    pub fn pid(&self) -> String {
+        std::fs::read_to_string(&self.pid)
+            .expect("the run wrote its pid before it announced itself")
+            .trim()
+            .to_string()
+    }
+}
+
 /// An `io::Write` that sends what it is given down a channel, for a `run` on a thread whose output the
 /// test reads as it comes.
 pub struct Lines(pub mpsc::Sender<Vec<u8>>);
