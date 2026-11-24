@@ -498,8 +498,10 @@ impl DirWatch {
                 let word = |offset: usize| u32::from_ne_bytes(bytes[at + offset..at + offset + 4].try_into().unwrap());
                 let (next, action, length) = (word(0) as usize, word(4), word(8) as usize);
                 let name: Vec<u16> = bytes[at + 12..at + 12 + length]
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_ne_bytes(*pair))
                     .collect();
                 let name = String::from_utf16(&name).unwrap();
                 changes.push(match action {

@@ -58,6 +58,16 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
+[[repos.hooks]]
+id = "cargo-clippy-no-cli"
+name = "cargo clippy (without cli)"
+# Consumers that embed only the library build the tests without `cli`, and nothing else builds them.
+# No `--workspace`: `tools/verify-hardening` has no `cli` feature.
+entry = "cargo clippy --all-targets --no-default-features --features testing --locked -- -D warnings"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
 # Manual stage: CI and the local lanes ask for these (`prek run --stage manual --all-files cargo-doc
 # ...`); a commit does not run them.
 

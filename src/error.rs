@@ -186,9 +186,8 @@ pub enum Error {
     /// A real account needs a password that was not given: to install, and for a task, to `enable` and
     /// `disable` it too, which register it again. `kind` is what the account runs.
     #[error(
-        "{} account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
-         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again",
-        daemon_noun(*kind)
+        "{kind} account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
+         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD and run the command again"
     )]
     PasswordRequired {
         account: String,
@@ -1156,7 +1155,7 @@ impl Error {
     }
 
     /// [`report`](Error::report) with every character as it is: the exact text for `--json`.
-    #[cfg(feature = "cli")]
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn report_unescaped(&self) -> impl fmt::Display + '_ {
         Report {
             error: self,
@@ -1623,20 +1622,9 @@ fn loaded_job(id: &str, kind: crate::spec::DaemonKind) -> String {
     }
 }
 
-/// What a daemon of `kind` is called in a message.
-fn daemon_noun(kind: crate::spec::DaemonKind) -> &'static str {
-    match kind {
-        crate::spec::DaemonKind::Service => "service",
-        crate::spec::DaemonKind::Task => "task",
-    }
-}
-
 /// The message of [`Error::RetypeRunning`].
 fn retype_running(id: &str, old: crate::spec::DaemonKind) -> String {
-    let (old, new) = match old {
-        crate::spec::DaemonKind::Service => ("service", "task"),
-        crate::spec::DaemonKind::Task => ("task", "service"),
-    };
+    let new = old.other();
     format!(
         "`{id}` is running as a {old}, and changing it to a {new} removes it first: run `goetia daemon stop {id}`, \
          then re-run install"

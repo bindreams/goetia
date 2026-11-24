@@ -590,13 +590,11 @@ impl Selection {
                     .ok_or_else(|| lacks("the stream of the run's marker line"))?;
                 self.found = Some((stream.to_string(), entry.cursor()?));
             }
-            None => {}
-            Some((stream, last)) => {
-                if entry.get("_STREAM_ID") == Some(stream.as_str()) {
-                    *last = entry.cursor()?;
-                    push_line(into, entry);
-                }
+            Some((stream, last)) if entry.get("_STREAM_ID") == Some(stream.as_str()) => {
+                *last = entry.cursor()?;
+                push_line(into, entry);
             }
+            _ => {}
         }
         Ok(())
     }
