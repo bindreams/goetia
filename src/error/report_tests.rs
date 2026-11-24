@@ -644,13 +644,13 @@ fn a_carried_composite_is_found_only_as_the_type_it_carries() {
     );
 
     // A payload that is a composite itself but was not put through `carry`, so no `Carrier` wraps it.
-    let uncarried = std::io::Error::new(kind, Wanted);
+    let uncarried = std::io::Error::other(Wanted);
     assert!(
         carried_composite::<Wanted>(&uncarried).is_none(),
         "a payload no carrier wraps"
     );
 
-    let other = std::io::Error::new(kind, "some other payload");
+    let other = std::io::Error::other("some other payload");
     assert!(carried_composite::<Wanted>(&other).is_none(), "another error's payload");
 
     let one_level_down = crate::error::within("ctx", carry(kind, Wanted));

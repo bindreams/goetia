@@ -207,7 +207,7 @@ const HELD_DESCENDANT: &str = "( read held <&4 ) &";
 
 /// The write end of the child's fd 4, to be held until the test is over. The child owns it from the
 /// spawn, so a test that fails before this call drops it with the child.
-fn held_pipe(child: &mut cosca::Child) -> impl io::Write {
+fn held_pipe(child: &mut cosca::Child) -> cosca::PipeWriter {
     child.fd_write_end(4.into()).unwrap()
 }
 
