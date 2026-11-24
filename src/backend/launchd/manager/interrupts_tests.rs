@@ -232,6 +232,7 @@ struct Running;
 
 impl Running {
     fn enter() -> Running {
+        assert!(HOLDS.get(), "this thread holds SERIAL");
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         Running
     }
@@ -478,12 +479,12 @@ fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
 
 /// The last drop un-publishes the write end and then waits for a handler that is running before it closes
 /// the pipe, so a handler never writes to a closed descriptor. A running handler is stood in for by a count
-/// that the test holds, and the window's pipe reports how its close went ([`test_hook::Probe`]): the wait
-/// loop reports each pass, and the pipe reports its own drop, wherever that is. The test waits for the
-/// close to leave idle, or for the closing thread to end, which it must not do. A close that waits is
-/// waiting with the pipe open and the descriptor un-published; a close that does not wait, or drops the
-/// pipe before it, is in another state, whatever the schedule. After the handler is out, the pipe is closed,
-/// after the wait.
+/// that the test holds, and the window reports how its close went ([`test_hook::Probe`]): the wait
+/// loop reports each pass, and the window reports when its pipe is closed, wherever that is. The test waits
+/// for the close to leave idle, or for the closing thread to end, which it must not do. A close that waits is
+/// waiting with the pipe open and the descriptor un-published; a close that does not wait, or closes the pipe
+/// before it, is in another state, whatever the schedule. After the handler is out, the pipe is closed, after
+/// the wait.
 #[skuld::test]
 fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     use test_hook::Closing::{Idle, Waiting};
@@ -497,7 +498,7 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
         .as_ref()
         .expect("the window is open")
         .wake
-        .probe
+        .probe()
         .clone();
     let mut closing = Joined::default();
     let running = Running::enter();
@@ -532,11 +533,11 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     before.assert_back();
 }
 
-/// What [`IN_FLIGHT`] was when the probe ran.
-static COUNTED_BY_PROBE: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// What [`IN_FLIGHT`] was when `count_in_flight` ran.
+static IN_FLIGHT_SEEN: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-extern "C" fn probe(_: libc::c_int) {
-    COUNTED_BY_PROBE.store(IN_FLIGHT.load(Ordering::SeqCst), Ordering::SeqCst);
+extern "C" fn count_in_flight(_: libc::c_int) {
+    IN_FLIGHT_SEEN.store(IN_FLIGHT.load(Ordering::SeqCst), Ordering::SeqCst);
 }
 
 /// A handler is counted in only for the load of the pipe and the write, so a close never waits on what a
@@ -545,19 +546,19 @@ extern "C" fn probe(_: libc::c_int) {
 #[skuld::test]
 fn a_handler_is_not_counted_in_when_it_raises_to_the_previous_handler() {
     let _before = StandIn::install();
-    let probing = action(probe as extern "C" fn(libc::c_int) as libc::sighandler_t);
-    // SAFETY: `probing` is a valid `sigaction`, and a null old action is allowed; the stand-in's drop puts
+    let counting = action(count_in_flight as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    // SAFETY: `counting` is a valid `sigaction`, and a null old action is allowed; the stand-in's drop puts
     // the earlier handler back.
-    let set = unsafe { libc::sigaction(libc::SIGTERM, &probing, std::ptr::null_mut()) };
-    assert_eq!(set, 0, "install the probe");
-    COUNTED_BY_PROBE.store(usize::MAX, Ordering::SeqCst);
+    let set = unsafe { libc::sigaction(libc::SIGTERM, &counting, std::ptr::null_mut()) };
+    assert_eq!(set, 0, "install count_in_flight");
+    IN_FLIGHT_SEEN.store(usize::MAX, Ordering::SeqCst);
 
     record(libc::SIGTERM);
 
     assert_eq!(
-        COUNTED_BY_PROBE.load(Ordering::SeqCst),
+        IN_FLIGHT_SEEN.load(Ordering::SeqCst),
         0,
-        "the probe ran, and nothing was counted in"
+        "count_in_flight ran, and nothing was counted in"
     );
 }
 
