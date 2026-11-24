@@ -135,3 +135,40 @@ fn a_host_with_no_manager_is_refused_before_busctl_runs() {
     assert!(matches!(e, Error::NoManager { .. }), "{e:?}");
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
 }
+
+/// What each tool goetia runs against the manager has removed from its inherited environment, as root
+/// and not. Only the `busctl` of a root loses `DBUS_SYSTEM_BUS_ADDRESS`: root's `systemctl` ignores
+/// it and answers from the system manager, so root's `busctl` is made to as well, while any other
+/// user's `systemctl` follows it and so does their `busctl`. `DBUS_SESSION_BUS_ADDRESS` is no tool's
+/// concern, and the names under systemd's own prefixes go from both. The environment itself cannot be
+/// set here (it would race every other test thread), so the inherited names are given as a list.
+#[skuld::test]
+fn only_a_root_busctl_loses_the_system_bus_address() {
+    let inherited = || {
+        [
+            "SYSTEMD_OFFLINE",
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "PATH",
+        ]
+        .map(String::from)
+        .into_iter()
+    };
+    let table: [(&str, Vec<String>, &[&str]); 4] = [
+        ("systemctl, root", systemctl::removals(inherited()), &["SYSTEMD_OFFLINE"]),
+        ("systemctl, not root", systemctl::removals(inherited()), &["SYSTEMD_OFFLINE"]),
+        ("busctl, not root", removals(false, inherited()), &["SYSTEMD_OFFLINE"]),
+        (
+            "busctl, root",
+            removals(true, inherited()),
+            &["SYSTEMD_OFFLINE", "DBUS_SYSTEM_BUS_ADDRESS"],
+        ),
+    ];
+    for (who, removed, expected) in table {
+        assert_eq!(removed, expected, "{who}");
+    }
+    assert!(
+        removals(true, ["PATH"].map(String::from).into_iter()).is_empty(),
+        "a name that was not inherited is not removed"
+    );
+}

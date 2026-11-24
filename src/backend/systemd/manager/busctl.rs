@@ -12,7 +12,8 @@ use crate::backend::bounded::{Finished, Reservation};
 use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::error::{Error, Result};
 
-use super::systemctl::{Host, environment, refuse_unreachable};
+use super::systemctl::{Host, refuse_unreachable};
+use super::systemctl;
 
 const SYSTEMD1: &str = "org.freedesktop.systemd1";
 
@@ -20,6 +21,18 @@ const SYSTEMD1: &str = "org.freedesktop.systemd1";
 /// was never armed reads as (measured on systemd 255). `0` is the other reading of "none", and means
 /// the same.
 const NEVER: u64 = u64::MAX;
+
+/// The inherited names removed from a `busctl`'s environment: a `systemctl`'s
+/// ([`systemctl::removals`]), and, when goetia runs as root, `DBUS_SYSTEM_BUS_ADDRESS`.
+fn removals(root: bool, inherited: impl Iterator<Item = String>) -> Vec<String> {
+    let _ = root;
+    systemctl::removals(inherited)
+}
+
+/// `cmd`'s environment as a `busctl` goetia runs gets it.
+fn environment(cmd: &mut cosca::Command) {
+    systemctl::environment(cmd);
+}
 
 /// `busctl`, reached through a [`Client`], on the system `host` reads: the same door and the same
 /// environment as [`Systemctl`](super::systemctl::Systemctl).

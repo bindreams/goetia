@@ -250,7 +250,7 @@ const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 /// [`ENVIRONMENT`] does not set. The two are kept disjoint here — a name goetia sets is never also
 /// removed — rather than by the order the calls happen to be made in, so `Command`'s own rule for a
 /// key both set and removed cannot decide what the child gets.
-fn removals(inherited: impl Iterator<Item = String>) -> Vec<String> {
+pub(super) fn removals(inherited: impl Iterator<Item = String>) -> Vec<String> {
     let given = |key: &str| ENVIRONMENT.iter().any(|(name, _)| *name == key);
     let denied = |key: &str| DENIED.iter().any(|prefix| key.starts_with(prefix));
     inherited.filter(|key| denied(key) && !given(key)).collect()
