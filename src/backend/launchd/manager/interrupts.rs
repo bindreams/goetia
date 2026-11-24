@@ -81,18 +81,16 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// The pipe a window's handler writes to and a wait reads, both ends non-blocking and close-on-exec.
 struct Wake {
     read: OwnedFd,
-    write: OwnedFd,
-    /// What the close of this window did, for the test of its order.
-    #[cfg(test)]
-    probe: std::sync::Arc<test_hook::Probe>,
+    write: WriteEnd,
 }
 
-/// The window's pipe is closed by dropping it: a test sees that happen, wherever the drop is.
-#[cfg(test)]
-impl Drop for Wake {
-    fn drop(&mut self) {
-        self.probe.closed();
-    }
+/// The write end of the pipe, the one descriptor a handler writes to.
+struct WriteEnd {
+    fd: OwnedFd,
+    /// Marks, when it drops after `fd` is closed, how the close went: for the test of its order. It is
+    /// declared after `fd` so that it drops after it, and sits here so that it moves with the descriptor.
+    #[cfg(test)]
+    closed: test_hook::CloseMark,
 }
 
 impl Wake {
@@ -110,9 +108,11 @@ impl Wake {
         }
         Ok(Wake {
             read,
-            write,
-            #[cfg(test)]
-            probe: Default::default(),
+            write: WriteEnd {
+                fd: write,
+                #[cfg(test)]
+                closed: Default::default(),
+            },
         })
     }
 }
@@ -238,7 +238,7 @@ impl Deferred {
         if shared.holders == 0 {
             let refused = |source| Error::os("hold back interrupts while a run is held", source);
             let wake = Wake::new().map_err(refused)?;
-            WAKE.store(wake.write.as_raw_fd(), Ordering::SeqCst);
+            WAKE.store(wake.write.fd.as_raw_fd(), Ordering::SeqCst);
             OPEN.store(true, Ordering::SeqCst);
             match install() {
                 Ok((previous, taken)) => {
@@ -317,12 +317,10 @@ impl Drop for Deferred {
 /// so that a handler that finds it clear raises to the previous handlers, and every recorded bit is
 /// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
-    #[cfg(test)]
-    let probe = wake.probe.clone();
     WAKE.store(-1, Ordering::SeqCst);
     while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
         #[cfg(test)]
-        probe.waited();
+        wake.write.closed.probe.waited();
         std::thread::yield_now();
     }
     drop(wake);
@@ -431,6 +429,7 @@ fn restore(previous: &[libc::sigaction], taken: u32) {
 #[cfg(test)]
 mod test_hook {
     use std::cell::Cell;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     use crate::backend::test_allowance::{Allowance, spend};
@@ -449,18 +448,37 @@ mod test_hook {
         spend(&STEPS, "no step of opening a window may be taken (test hook)")
     }
 
-    /// How the close of one window went, as far as its order: set by the wait loop and by the drop of the
-    /// window's pipe, so it says what happened and not where a call sits.
+    /// How the close of one window went, as far as its order: set by the wait loop and by the close of the
+    /// window's write end, so it says what happened and not where a call sits.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
     pub(super) enum Closing {
         /// Neither a wait nor the close has happened.
-        Idle,
+        Idle = 0,
         /// The close is waiting for a handler, and the pipe is open.
-        Waiting,
+        Waiting = 1,
         /// The pipe was closed after the close waited.
-        ClosedAfterWait,
+        ClosedAfterWait = 2,
         /// The pipe was closed with no wait before it.
-        ClosedFirst,
+        ClosedFirst = 3,
+    }
+
+    impl Closing {
+        const ALL: [Closing; 4] = [
+            Closing::Idle,
+            Closing::Waiting,
+            Closing::ClosedAfterWait,
+            Closing::ClosedFirst,
+        ];
+
+        /// The `Closing` stored as `value`. [`Probe`] stores only the discriminants of this enum, so any
+        /// other value is a bug in it.
+        fn from_stored(value: u8) -> Closing {
+            Self::ALL
+                .into_iter()
+                .find(|closing| *closing as u8 == value)
+                .unwrap_or_else(|| unreachable!("{value} is not a stored Closing"))
+        }
     }
 
     /// One window's [`Closing`]: the window's `Wake` carries it, so a close of another window cannot touch
@@ -469,41 +487,49 @@ mod test_hook {
     pub(super) struct Probe(AtomicU8);
 
     impl Probe {
-        const IDLE: u8 = 0;
-        const WAITING: u8 = 1;
-        const CLOSED_AFTER_WAIT: u8 = 2;
-        const CLOSED_FIRST: u8 = 3;
-
         /// A pass of the wait for a handler: called on each, so a close that does not wait never calls it. A
         /// wait after the pipe is closed changes nothing.
         pub(super) fn waited(&self) {
-            _ = self
-                .0
-                .compare_exchange(Self::IDLE, Self::WAITING, Ordering::SeqCst, Ordering::SeqCst);
+            _ = self.0.compare_exchange(
+                Closing::Idle as u8,
+                Closing::Waiting as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
         }
 
         /// The pipe is being closed.
         pub(super) fn closed(&self) {
             let after = self.0.compare_exchange(
-                Self::WAITING,
-                Self::CLOSED_AFTER_WAIT,
+                Closing::Waiting as u8,
+                Closing::ClosedAfterWait as u8,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
             if after.is_err() {
-                _ = self
-                    .0
-                    .compare_exchange(Self::IDLE, Self::CLOSED_FIRST, Ordering::SeqCst, Ordering::SeqCst);
+                _ = self.0.compare_exchange(
+                    Closing::Idle as u8,
+                    Closing::ClosedFirst as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
             }
         }
 
         pub(super) fn state(&self) -> Closing {
-            match self.0.load(Ordering::SeqCst) {
-                Self::IDLE => Closing::Idle,
-                Self::WAITING => Closing::Waiting,
-                Self::CLOSED_AFTER_WAIT => Closing::ClosedAfterWait,
-                _ => Closing::ClosedFirst,
-            }
+            Closing::from_stored(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    /// Reports the close of the descriptor declared before it in a struct, by dropping after it.
+    #[derive(Default)]
+    pub(super) struct CloseMark {
+        pub(super) probe: Arc<Probe>,
+    }
+
+    impl Drop for CloseMark {
+        fn drop(&mut self) {
+            self.probe.closed();
         }
     }
 }
