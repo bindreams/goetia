@@ -1169,7 +1169,11 @@ fn leaving_takes_the_lock_once_and_leaves_what_a_pass_could_not_remove() {
     .unwrap();
 
     assert_eq!(takings.get(), 1, "one taking, no pause");
-    assert_eq!(*left.borrow(), [stuck.clone()], "it said what it left");
+    assert_eq!(
+        left.borrow().as_slice(),
+        std::slice::from_ref(&stuck),
+        "it said what it left"
+    );
     assert!(
         stuck.exists() && runs.is_closed().unwrap(),
         "the held record and the marker stay"
