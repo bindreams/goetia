@@ -974,6 +974,16 @@ impl Systemctl {
         Ok(map)
     }
 
+    /// Whether the manager must `daemon-reload` to run `unit` as its file on disk says, for a unit goetia
+    /// finds installed. Measured on systemd 243, 249 and 255: a unit the manager holds loaded whose file
+    /// changed reads `NeedDaemonReload=yes` and starts the old text; one it holds a record of whose file
+    /// was written again reads `LoadState=not-found` (243) or `error` (249, 255) and does not start; one it
+    /// holds nothing of is loaded on demand. `masked` is the user's own act and is not reloaded for.
+    pub(super) fn needs_reload(&self, unit: &str) -> Result<bool> {
+        let shown = self.show_properties(unit, &["LoadState", "NeedDaemonReload"])?;
+        Ok(shown["NeedDaemonReload"] == "yes" || matches!(shown["LoadState"].as_str(), "not-found" | "error"))
+    }
+
     /// `props` of `unit`, which goetia finds installed, and `LoadState` with them.
     ///
     /// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit

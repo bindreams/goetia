@@ -216,15 +216,20 @@ pub(crate) fn install<B: Backend>(
                     WriteOutcome::Raced => {}
                 }
             }
-            // The desired definition stands here, so what an earlier write made for it is kept.
+            // The desired definition stands here, so what an earlier write made for it is kept, and so is
+            // what the hook makes now, whether or not it then fails: it runs before the settle so that
+            // what it made is in the scope, and its error is returned after.
             Outcome::UpToDate => {
-                scope.settle(|| Standing::Yes);
                 // `decide` finds an install up to date only over a marked snapshot.
-                let Some(snapshot) = found.snapshot.as_ref() else {
-                    debug_assert!(false, "an install is up to date only over a snapshot");
-                    return Ok(outcome);
+                let beside = match found.snapshot.as_ref() {
+                    Some(snapshot) => b.ensure_beside(spec, &desired, snapshot, &mut scope, reservation),
+                    None => {
+                        debug_assert!(false, "an install is up to date only over a snapshot");
+                        Ok(())
+                    }
                 };
-                b.ensure_beside(spec, &desired, snapshot)?;
+                scope.settle(|| Standing::Yes);
+                beside?;
                 return Ok(outcome);
             }
             Outcome::Conflict { .. }

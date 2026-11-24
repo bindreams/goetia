@@ -625,6 +625,51 @@ fn an_update_with_nothing_to_change_still_makes_the_specs_directories(#[fixture(
     assert!(cwd.is_dir(), "the directory the spec names was made");
 }
 
+/// An install that finds the definition up to date makes the directories the spec names again, as a write
+/// does: the `cwd` and the log's directory a job needs at launch, once they were deleted.
+#[skuld::test(labels = [ELEVATED])]
+fn an_up_to_date_install_makes_a_deleted_cwd_and_log_directory_again(#[fixture(root_dirs)] _root: &()) {
+    let tree = Tree::new();
+    // Under `/tmp`, which root owns on every host: directories are made only where root's own are.
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("work");
+    let logs = root.path().join("logs");
+    let DaemonSpec::Task(task) = task_spec(Some(SCHEDULE)) else {
+        unreachable!("`task_spec` builds a task");
+    };
+    let mut fields = task.into_fields();
+    fields.common.cwd = Some(cwd.clone());
+    fields.common.logs = Some(logs.join("out.log"));
+    fields.common.user = User::Root;
+    let spec = DaemonSpec::from(TaskSpec::new(fields).unwrap());
+    let rendered = installed(&tree, &spec, true);
+    let snapshot = marked(tree.read());
+    let fake = Fake::new([]);
+    let mgr = manager(&fake);
+
+    for round in ["first", "after a deletion"] {
+        let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+
+        mgr.ensure_beside(
+            &spec,
+            &rendered,
+            &snapshot,
+            &mut created,
+            &mut reserved(&mgr, Step::Install),
+        )
+        .unwrap_or_else(|e| panic!("{round}: {e}"));
+
+        assert!(cwd.is_dir() && logs.is_dir(), "{round}");
+        created.settle(|| crate::backend::Standing::Yes);
+        std::fs::remove_dir(&cwd).unwrap();
+        std::fs::remove_dir(&logs).unwrap();
+    }
+    fake.assert_spent("it sends launchd nothing");
+}
+
 /// `spec` run as `user` in `cwd`.
 fn in_cwd(spec: DaemonSpec, cwd: &Path, user: User) -> DaemonSpec {
     let DaemonSpec::Task(task) = spec else {

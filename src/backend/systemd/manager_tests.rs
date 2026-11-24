@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::discover::{RawState, raw_state};
 use super::systemctl::systemctl_tests::{booted, gate_then};
+use super::task::task_tests::{fragment, service_spec, task_spec, units_of};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
+use crate::backend::Settle as _;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::{bounded, standby};
 use crate::manager::ServiceManager as _;
@@ -20,8 +22,10 @@ use crate::manager::conformance::fresh_id;
 use crate::spec::{DaemonSpec, Protocol, ServiceFields, ServiceSpec};
 use crate::testing::base_fields;
 
+use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
 use crate::testing::cleanup::{FileGuard, remove_or_warn};
-use crate::testing::groups::{Group, systemd_group};
+use crate::testing::elevation::ELEVATED;
+use crate::testing::groups::{Group, root_dirs, systemd_group};
 
 /// On drop, removes every quarantine file of either unit of `id` the test's scenario left behind.
 /// Production deliberately leaves one on an unrecoverable double-race so a human can find it, and a
@@ -580,4 +584,152 @@ fn the_unit_read_back_is_what_was_written_or_is_not_or_cannot_be_told() {
         Standing::Unknown(reason) => assert!(reason.contains("could not read the unit"), "{reason}"),
         other => panic!("expected an unknown standing, got {other:?}"),
     }
+}
+
+// ensure_beside -------------------------------------------------------------------------------------------------------
+
+/// An up-to-date install of `spec` over `fake`, as `flow::install` drives it: the gate is passed in
+/// `begin_install`, then the hook runs on the same reservation.
+fn up_to_date(fake: &Fake, spec: &DaemonSpec) -> Result<()> {
+    up_to_date_in(fake, spec, &mut CreatedDirs::default())
+}
+
+/// [`up_to_date`] making the directories in `scope`, which a test roots where it may.
+fn up_to_date_in(fake: &Fake, spec: &DaemonSpec, scope: &mut CreatedDirs) -> Result<()> {
+    let mgr = over(fake.clone());
+    let definition = units_of(spec);
+    let mut held = Backend::reserve(&mgr, &[Step::Install], Budget::DEFAULT).expect("reserve");
+    Backend::begin_install(&mgr, spec, &definition, &mut held).expect("begin");
+    mgr.ensure_beside(spec, &definition, &fragment(spec), scope, &mut held)
+}
+
+/// What `systemctl show` says of a unit with `load_state` and `reload` (`NeedDaemonReload`).
+fn shown(load_state: &str, reload: &str) -> Entry {
+    reply(
+        &["show"],
+        exited(0, &format!("LoadState={load_state}\nNeedDaemonReload={reload}\n"), ""),
+    )
+}
+
+fn reload_ok() -> Entry {
+    reply(&["daemon-reload"], exited(0, "", ""))
+}
+
+/// The manager holds a unit goetia found on disk as it was loaded (`NeedDaemonReload=yes`), or has no
+/// unit for a file that is there (`not-found` on systemd 243, `error` on 249 and 255): an install that
+/// finds the definition up to date reloads, once, and reads nothing after it. A unit it loads as it is
+/// on disk, or that the user masked, is left.
+#[skuld::test]
+fn an_up_to_date_install_reloads_for_a_unit_the_manager_cannot_run_as_written_and_for_no_other() {
+    let spec = service_spec("x");
+    for (load_state, reload, reloads) in [
+        ("loaded", "yes", true),
+        ("not-found", "no", true),
+        ("error", "no", true),
+        ("loaded", "no", false),
+        ("masked", "no", false),
+    ] {
+        let mut script = vec![shown(load_state, reload)];
+        script.extend(reloads.then(reload_ok));
+        let fake = gate_then(script);
+
+        up_to_date(&fake, &spec).unwrap_or_else(|e| panic!("{load_state} {reload}: {e}"));
+
+        fake.assert_spent(&format!("{load_state} {reload}"));
+        let calls = fake.calls();
+        assert_eq!(
+            calls.last().map(|call| call[0].as_str()),
+            Some(if reloads { "daemon-reload" } else { "show" }),
+            "{load_state} {reload}: {calls:?}"
+        );
+    }
+}
+
+/// A task's timer is read as well as its job: either one the manager cannot run as written is a reason to
+/// reload, and a reload is made once for both.
+#[skuld::test]
+fn an_up_to_date_install_of_a_task_reads_its_timer_too() {
+    let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
+    let fake = gate_then([shown("loaded", "no"), shown("loaded", "yes"), reload_ok()]);
+
+    up_to_date(&fake, &spec).expect("the timer is stale");
+
+    fake.assert_spent("the job, the timer, one reload");
+    let units: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call[0] == "show" && call.contains(&"--".to_string()))
+        .map(|call| call.last().unwrap().clone())
+        .collect();
+    assert_eq!(units, ["x.service", "x.timer"]);
+}
+
+/// A reload that fails fails the install with what a write's failed reload says: the unit file is on
+/// disk and systemd has not picked it up.
+#[skuld::test]
+fn a_failed_reload_fails_an_up_to_date_install_as_a_writes_failed_reload_does() {
+    let fake = gate_then([
+        shown("loaded", "yes"),
+        reply(&["daemon-reload"], exited(1, "", "Access denied\n")),
+    ]);
+
+    let e = up_to_date(&fake, &service_spec("x")).expect_err("the reload fails");
+
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    let msg = e.report().to_string();
+    assert!(msg.contains("the unit file for `x` is on disk"), "{msg}");
+    assert!(msg.contains("Access denied"), "{msg}");
+    fake.assert_spent("the reload");
+}
+
+/// `service_spec("x")` that runs in `cwd` and logs to `logs`.
+fn in_dirs(cwd: &Path, logs: &Path) -> DaemonSpec {
+    let mut fields = crate::testing::service_fields(service_spec("x"));
+    fields.common.cwd = Some(cwd.to_path_buf());
+    fields.common.logs = Some(logs.to_path_buf());
+    DaemonSpec::from(ServiceSpec::new(fields).expect("a service"))
+}
+
+/// A `cwd` or a log directory that was deleted after the install is made again by the next install, as
+/// the first one made it: a unit whose log directory is gone fails at start.
+#[skuld::test(labels = [ELEVATED])]
+fn an_up_to_date_install_makes_a_deleted_cwd_and_log_directory_again(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let cwd = layout.system().join("work");
+    let logs = layout.system().join("logs/out.log");
+    let spec = in_dirs(&cwd, &logs);
+
+    for round in ["first", "after a deletion"] {
+        let fake = gate_then([shown("loaded", "no")]);
+        let mut created = CreatedDirs::under(vec![layout.system()]);
+
+        up_to_date_in(&fake, &spec, &mut created).unwrap_or_else(|e| panic!("{round}: {e}"));
+
+        assert!(cwd.is_dir() && layout.system().join("logs").is_dir(), "{round}");
+        created.settle(|| Standing::Yes);
+        std::fs::remove_dir(&cwd).unwrap();
+        std::fs::remove_dir(layout.system().join("logs")).unwrap();
+    }
+}
+
+/// An install that finds the definition up to date judges the log directory as it is when `install`
+/// runs: one an account other than root can change now is refused before the manager is asked anything.
+#[skuld::test(labels = [ELEVATED])]
+fn an_up_to_date_install_refuses_a_log_directory_another_user_can_change(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("logs");
+    std::fs::create_dir(&dir).unwrap();
+    give_to_a_stranger(&dir);
+    let spec = in_dirs(&layout.system().join("work"), &dir.join("out.log"));
+    let fake = gate_then([]);
+
+    let e = up_to_date_in(&fake, &spec, &mut CreatedDirs::under(vec![layout.system()]))
+        .expect_err("an account can change the directory");
+
+    assert!(matches!(e, Error::DirectoryRefused { .. }), "{e:?}");
+    fake.assert_spent("the gate's probes, and no read of a unit after the refusal");
+    assert!(
+        !layout.system().join("work").exists(),
+        "nothing was made for a refused install"
+    );
 }

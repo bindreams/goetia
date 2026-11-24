@@ -745,6 +745,8 @@ impl Backend for Scm {
         spec: &DaemonSpec,
         definition: &WindowsDefinition,
         snapshot: &WindowsSnapshot,
+        _scope: &mut Option<InstallLock>,
+        _reservation: &mut (),
     ) -> Result<()> {
         match (definition, snapshot) {
             (WindowsDefinition::Service(definition), WindowsSnapshot::Service(_)) => {

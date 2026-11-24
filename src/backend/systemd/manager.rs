@@ -53,7 +53,8 @@
 //!    systemd opens the log file as root before it drops privileges, and follows a symlink there: so
 //!    the log directory stays root's, and one the account can write is the way for it to make root
 //!    append to any file. The unit `chdir`s into `cwd` after the switch, so `cwd` is the account's.
-//!    What is made is removed again, deepest first, unless the unit is in place when `write` ends.
+//!    What is made is removed again, deepest first, unless the unit is in place when `write` ends. An install
+//!    that finds the unit up to date makes and judges them again (`ensure_beside`).
 //! 6. **Uninstall order** is stop (not with `--no-stop`: see `standin`) -> `systemctl disable` -> remove ->
 //!    `daemon-reload`. Disabling after the fragment is gone is impossible (no `[Install]` section left to
 //!    read), which would leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's
@@ -228,6 +229,33 @@ impl Backend for Systemd {
             }
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
         }
+    }
+
+    /// What a write makes or does besides the units, for an install that finds them up to date: the
+    /// directories (`dirs::ensure_parent_dirs`, judged again as a first install judges them), and a
+    /// `daemon-reload` when the manager cannot run one of the installed units as its file says: a write
+    /// whose reload failed leaves that, and nothing else would reload for it. The units are read once
+    /// and not again after the reload.
+    fn ensure_beside(
+        &self,
+        spec: &DaemonSpec,
+        _definition: &Units,
+        snapshot: &Fragment,
+        scope: &mut CreatedDirs,
+        reservation: &mut Held,
+    ) -> Result<()> {
+        dirs::ensure_parent_dirs(spec, scope)?;
+        let id = spec.common().id.as_str();
+        let installed = [
+            snapshot.service_text().map(|_| UnitKind::Service),
+            snapshot.timer().map(|_| UnitKind::Timer),
+        ];
+        for kind in installed.into_iter().flatten() {
+            if self.systemctl.needs_reload(&unit_name(id, kind))? {
+                return self.systemctl.daemon_reload_or_report(id, reservation);
+            }
+        }
+        Ok(())
     }
 
     /// Whether the job's unit is `definition`'s, as `discover` reads it: the unit is what names the

@@ -138,14 +138,18 @@ pub(crate) trait Backend {
         reservation: &mut Self::Reservation,
     ) -> Result<WriteOutcome>;
 
-    /// What an install that found the definition up to date still sees to: what a [`Self::write`] makes
-    /// besides the definition, and nothing else would make again if it were gone. `snapshot` is what `read`
-    /// found. A failure fails the install. Nothing by default.
+    /// What an install that found the definition up to date still sees to: what a [`Self::write`] makes or
+    /// does besides the definition, and nothing else would make or do again if it were gone or undone.
+    /// `snapshot` is what `read` found; `scope` and `reservation` are the install's, as `write` gets
+    /// them. Called before the scope settles, and the scope settles as standing whatever this returns,
+    /// so what it made is kept: the definition stands. A failure fails the install. Nothing by default.
     fn ensure_beside(
         &self,
         _spec: &DaemonSpec,
         _definition: &Self::Definition,
         _snapshot: &Self::Snapshot,
+        _scope: &mut Self::InstallScope,
+        _reservation: &mut Self::Reservation,
     ) -> Result<()> {
         Ok(())
     }

@@ -180,6 +180,10 @@ struct Store {
     write_races: BTreeMap<String, usize>,
     /// Ids whose writes make something besides the entry: see [`Fake::seed_write_makes_something`].
     write_makes: BTreeSet<String>,
+    /// What `ensure_beside` fails with at an id, if seeded: see [`Fake::seed_ensure_fails`].
+    ensure_fails: BTreeMap<String, Failure>,
+    /// Installs whose scope was dropped holding something made and not kept: see [`Fake::taken_back`].
+    taken_back: usize,
     /// Ids whose service is gone by the time it is regenerated against or its live state is queried.
     live_status_gone: BTreeSet<String>,
     /// Text another process puts at an id just before this Fake's next write there, by id.
@@ -558,12 +562,20 @@ impl Fake {
         state.write_races.insert(id.to_string(), times);
     }
 
-    /// Test-only seeding: every write at `id` makes something besides the entry, as a systemd write
-    /// makes a directory, so its scope is asked whether the definition stands when it is settled
-    /// after a write that did not land (a write that landed is not read back).
+    /// Test-only seeding: every write at `id`, and every `ensure_beside` of an up-to-date install of
+    /// it, makes something besides the entry, as a systemd write makes a directory, so its scope is
+    /// asked whether the definition stands when it is settled after a write that did not land (a write
+    /// that landed is not read back).
     pub fn seed_write_makes_something(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.write_makes.insert(id.to_string());
+    }
+
+    /// Test-only seeding: `ensure_beside` at `id` fails with what `error` makes, after it has made what
+    /// [`Fake::seed_write_makes_something`] says, as a backend's does for a directory it refuses.
+    pub fn seed_ensure_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.ensure_fails.insert(id.to_string(), Failure(Arc::new(error)));
     }
 
     /// Test-only seeding: `id` is found gone when its live state is queried, as when a concurrent
@@ -679,6 +691,13 @@ impl Fake {
     pub fn ensures(&self) -> usize {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.ensures
+    }
+
+    /// How many installs ended with what a write or `ensure_beside` made not kept, which a real scope
+    /// takes back when it drops.
+    pub fn taken_back(&self) -> usize {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.taken_back
     }
 
     /// How many times an install asked whether the definition it wrote stands: a read-back a write
@@ -856,6 +875,14 @@ impl crate::backend::Settle for FakeScope {
     }
 }
 
+impl Drop for FakeScope {
+    fn drop(&mut self) {
+        if self.made {
+            self.state.lock().expect("Fake mutex poisoned").taken_back += 1;
+        }
+    }
+}
+
 impl crate::backend::Backend for Fake {
     type Definition = String;
     type Snapshot = Artifact;
@@ -1026,9 +1053,21 @@ impl crate::backend::Backend for Fake {
         Ok(WriteOutcome::Done)
     }
 
-    fn ensure_beside(&self, _spec: &DaemonSpec, _definition: &String, _snapshot: &Artifact) -> Result<()> {
-        self.state.lock().expect("Fake mutex poisoned").ensures += 1;
-        Ok(())
+    fn ensure_beside(
+        &self,
+        spec: &DaemonSpec,
+        _definition: &String,
+        _snapshot: &Artifact,
+        scope: &mut FakeScope,
+        _reservation: &mut (),
+    ) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.ensures += 1;
+        scope.made |= state.write_makes.contains(spec.common().id.as_str());
+        match state.ensure_fails.get(spec.common().id.as_str()) {
+            Some(failure) => Err(failure.0()),
+            None => Ok(()),
+        }
     }
 
     /// Counts the asks: the scope asks only after a write that made something.

@@ -256,6 +256,44 @@ fn an_install_sees_to_what_stands_beside_the_definition_only_when_it_is_up_to_da
     assert_eq!(fake.ensures(), 1);
 }
 
+/// What the up-to-date install makes beside the definition is kept: the definition stands, so the scope
+/// settles it as standing before anything can take it back.
+#[skuld::test]
+fn what_an_up_to_date_install_makes_beside_the_definition_is_kept() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_write_makes_something("frpc");
+
+    assert_eq!(fake.install(&mk("frpc"), false).unwrap(), Outcome::UpToDate);
+
+    assert_eq!(fake.taken_back(), 0);
+    assert_eq!(
+        fake.standings(),
+        0,
+        "the definition stands: nothing is read back to ask"
+    );
+}
+
+/// What the hook made before it failed is kept as well, and its error is the install's: the scope settles
+/// whatever the hook returned, and the error comes back after.
+#[skuld::test]
+fn a_failed_hook_keeps_what_it_made_and_its_error_is_the_installs() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_write_makes_something("frpc");
+    fake.seed_ensure_fails("frpc", || Error::DirectoryRefused {
+        path: "/var/log/frpc".into(),
+        why: "seeded".to_string(),
+    });
+
+    let err = fake.install(&mk("frpc"), false).expect_err("the hook fails");
+
+    assert!(matches!(err, Error::DirectoryRefused { .. }), "{err:?}");
+    assert_eq!(fake.ensures(), 1);
+    assert_eq!(fake.taken_back(), 0, "the directory it made is kept");
+    assert_eq!(fake.settles(), 2, "the install's own settle ran on the failing path");
+}
+
 /// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.
 #[skuld::test]
 fn a_write_that_loses_to_an_ours_entry_follows_that_entry() {

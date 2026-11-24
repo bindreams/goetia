@@ -1593,6 +1593,20 @@ impl backend::Backend for Launchd {
         Ok(WriteOutcome::Done)
     }
 
+    /// What a write makes besides the plists, for an install that finds them up to date: the directories
+    /// `write` makes, made again if they were deleted and judged again as a first install judges them.
+    fn ensure_beside(
+        &self,
+        spec: &DaemonSpec,
+        _desired: &Plists,
+        _snapshot: &Plist,
+        created: &mut CreatedDirs,
+        _reservation: &mut Reservation,
+    ) -> Result<()> {
+        let account = resolve_account(&spec.common().user)?;
+        prepare_parent_dirs(spec, &account, created)
+    }
+
     /// Whether the job's plist, read as `read` reads it, is `desired`'s: the plist is what names the
     /// directories. A timer's names none.
     fn standing(&self, spec: &DaemonSpec, desired: &Plists) -> Standing {

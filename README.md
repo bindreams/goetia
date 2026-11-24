@@ -599,9 +599,11 @@ owns it, since `install` is not a start and you may still be preparing it.
   [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not)). A file system
   that cannot rename a directory without replacing what is at the name (Linux's `RENAME_NOREPLACE`,
   macOS's `RENAME_EXCL`) fails it with an error that says so.
-- **What is judged, and when.** The checks above judge the paths as they are when `install` runs. A change
-  made during or after it, by hand or by another goetia command running at the same time, is not judged;
-  see [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
+- **What is judged, and when.** The checks above judge the paths as they are when `install` runs. An
+  install that finds the definition up to date still makes a missing directory again and judges the paths
+  again, so it can refuse where it used to answer "up to date". A change made during or after it, by hand or
+  by another goetia command running at the same time, is not judged; see
+  [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
 - **The log directory of a job whose log root opens.** On systemd that is every daemon (it opens `append:`
   as root, before it drops privileges); on launchd it is a job whose `user` is root (uid 0, by any
   spelling), since launchd opens `StandardOutPath` as the job's user. A launchd job that runs as another
@@ -2482,11 +2484,18 @@ sources are not interchangeable, and the remedies do not transfer:
   `goetia daemon uninstall <id>` is the remedy for the first two, and needs
   neither the blob nor a live state. It is not a remedy for the other: its
   `disable` goes through the manager too, and fails the same way, exit `1`,
-  leaving the artifact where it was. Nor is `systemctl daemon-reload`, and
-  the reason is what the case is: systemd loads a unit file it can see on
-  demand, so having none for a name goetia found a file for means the two
+  leaving the artifact where it was. Nor is `systemctl daemon-reload` for a
+  unit the manager holds no record of: systemd loads a unit file it can see
+  on demand, so having none for a name goetia found a file for means the two
   are not reading the same directory — goetia's own mount namespace, say —
-  which no goetia verb changes.
+  which no goetia verb changes. A unit the manager does hold a record of (it
+  is running or failed, or an armed timer holds it) whose file was written
+  again reads `not-found` or `error` too, depending on the systemd version, until
+  a reload, and the reload fixes it. Run `install` again: it reads each
+  installed unit's `LoadState` and `NeedDaemonReload` and runs
+  `systemctl daemon-reload` when one reads `NeedDaemonReload=yes`,
+  `not-found` or `error`, also when it finds the definition up to date and
+  writes nothing. A `masked` unit is left as it is.
 - **`undetermined`** — a name goetia could not classify at all. The read
   that would have said whose it is never completed, so ownership is
   unestablished. Remedy: read it with more privilege.
