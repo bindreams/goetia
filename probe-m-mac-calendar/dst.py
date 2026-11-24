@@ -62,8 +62,8 @@ ZONES = {
         dict(U="2027-10-31T01:00:00", date=(10, 31, 0), f0=(1, 0), f1=(3, 0), mid=(2, 30)),
     ),
 }
-MARGIN = timedelta(seconds=75)
-FIRE_BOUND = 200.0
+MARGIN = timedelta(seconds=50)
+FIRE_BOUND = 150.0
 
 
 def minutes(hm: tuple[int, int]) -> int:
@@ -156,20 +156,17 @@ def report_fires(jobs: Jobs, zone: str, tag: str, entries: dict[str, dict[str, i
         say(f"FIRES {tag} {name}: {len(fires)} {shown}")
 
 
-def report_log(tag: str, start: str) -> None:
-    for line in log_show(f"goetia.probe.{tag}.", start=start):
+def report_log(tag: str, since: datetime) -> None:
+    """The Running and Rescheduling lines of the step's jobs; the clock only moved forward since `since`."""
+    window = f"{int((datetime.now(timezone.utc) - since).total_seconds() // 60) + 3}m"
+    for line in log_show(f"goetia.probe.{tag}.", window=window):
         if "Running StartCalendarInterval" in line or "Rescheduling StartCalendarInterval" in line:
             say(f"LOG {line}")
-
-
-def now_local() -> str:
-    return run(["date", "+%Y-%m-%d %H:%M:%S"]).stdout.strip()
 
 
 def gap_rep(jobs: Jobs, clock: Clock, zone: str, spec: dict, rep: int) -> None:
     entries = gap_entries(spec)
     transition = utc(spec["U"])
-    start = now_local()
 
     tag = f"r{rep}a"
     say(f"=== REP {rep} gap, registered 12 h before the transition")
@@ -182,12 +179,13 @@ def gap_rep(jobs: Jobs, clock: Clock, zone: str, spec: dict, rep: int) -> None:
     tag = f"r{rep}b"
     say(f"=== REP {rep} gap, registered {MARGIN.seconds} s before the transition")
     clock.set(transition - MARGIN)
+    since = datetime.now(timezone.utc)
     labels = register(jobs, tag, entries)
     say(f"registered at {datetime.now(timezone.utc):%H:%M:%S} UTC; transition at {transition:%H:%M:%S} UTC")
     report_registered(tag, entries, labels)
     wait_fires(jobs, labels["tF"], 1, FIRE_BOUND)
     report_fires(jobs, zone, tag, entries, labels)
-    report_log(tag, start)
+    report_log(tag, since)
     for label in labels.values():
         jobs.drop(label)
 
@@ -201,11 +199,11 @@ def fold_pass_instant(spec: dict, second: bool) -> datetime:
 
 def fold_rep(jobs: Jobs, clock: Clock, zone: str, spec: dict, rep: int, kind: str) -> None:
     entries = fold_entries(spec)
-    start = now_local()
     tag = f"r{rep}{kind[-1].lower()}"
     first_pass = kind == "foldA"
     say(f"=== REP {rep} {kind}, registered {MARGIN.seconds} s before the entries' time in the {'first' if first_pass else 'second'} pass")
     clock.set(fold_pass_instant(spec, second=not first_pass) - MARGIN)
+    since = datetime.now(timezone.utc)
     labels = register(jobs, tag, entries)
     say(f"registered at {datetime.now(timezone.utc):%H:%M:%S} UTC")
     report_registered(tag, entries, labels)
@@ -216,7 +214,7 @@ def fold_rep(jobs: Jobs, clock: Clock, zone: str, spec: dict, rep: int, kind: st
         clock.set(fold_pass_instant(spec, second=True) - MARGIN)
         wait_fires(jobs, labels["c"], 2, FIRE_BOUND)
         report_fires(jobs, zone, tag, entries, labels)
-    report_log(tag, start)
+    report_log(tag, since)
     for label in labels.values():
         jobs.drop(label)
 

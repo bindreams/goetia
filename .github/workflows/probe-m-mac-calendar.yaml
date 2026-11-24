@@ -39,3 +39,55 @@ jobs:
           sudo -E env "PATH=$PATH" python3 dst.py "${{ matrix.zone }}" "${{ matrix.kind }}" "${{ matrix.reps }}" > "$RUNNER_TEMP/out.txt" 2>&1 || rc=$?
           cat "$RUNNER_TEMP/out.txt"
           exit "$rc"
+      - name: Keep the output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: out-dst-${{ matrix.zone }}-${{ matrix.kind }}
+          path: ${{ runner.temp }}/out.txt
+
+  stream:
+    name: stream
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Probe
+        run: |
+          cd probe-m-mac-calendar
+          rc=0
+          sudo -E env "PATH=$PATH" python3 stream.py 30 10 5 10 > "$RUNNER_TEMP/out.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/out.txt"
+          exit "$rc"
+      - name: Keep the output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: out-stream
+          path: ${{ runner.temp }}/out.txt
+
+  tz:
+    name: tz ${{ matrix.mode }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [norestart, restart]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Probe
+        run: |
+          cd probe-m-mac-calendar
+          rc=0
+          sudo -E env "PATH=$PATH" python3 tz.py "${{ matrix.mode }}" 3 > "$RUNNER_TEMP/out.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/out.txt"
+          exit "$rc"
+      - name: Keep the output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: out-tz-${{ matrix.mode }}
+          path: ${{ runner.temp }}/out.txt

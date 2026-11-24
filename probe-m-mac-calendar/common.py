@@ -29,8 +29,17 @@ def say(*parts: object) -> None:
     print(*parts, flush=True)
 
 
+COMMAND_BOUND = 240.0
+
+
 def run(args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, env=env, check=False)
+    """Runs a command; one that is still running after COMMAND_BOUND seconds is killed and reported as exit 124."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True, env=env, check=False, timeout=COMMAND_BOUND)
+    except subprocess.TimeoutExpired as expired:
+        say(f"COMMAND TIMED OUT after {COMMAND_BOUND:.0f} s: {args}")
+        partial = expired.stdout.decode() if isinstance(expired.stdout, bytes) else (expired.stdout or "")
+        return subprocess.CompletedProcess(args, 124, partial, "timed out")
 
 
 def platform_header() -> None:
@@ -125,10 +134,9 @@ def install_cleanup(jobs: Jobs, clock: Clock) -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 
-def log_show(prefix: str, window: str = "3m", start: str | None = None) -> list[str]:
-    when = ["--start", start] if start else ["--last", window]
+def log_show(prefix: str, window: str = "3m") -> list[str]:
     result = run(
-        ["log", "show", *when, "--info", "--debug", "--style", "compact", "--predicate", f'eventMessage CONTAINS "{prefix}"']
+        ["log", "show", "--last", window, "--info", "--debug", "--style", "compact", "--predicate", f'eventMessage CONTAINS "{prefix}"']
     )
     return result.stdout.splitlines()
 
