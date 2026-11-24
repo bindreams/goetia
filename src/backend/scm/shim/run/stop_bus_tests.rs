@@ -29,7 +29,16 @@ fn spawn_child(fake: &Fake) -> Arc<dyn Spawned> {
 /// A supervisor, then the waiter, then the daemon: the order `service::launch` makes them in. See
 /// [`Waiter`].
 fn launched(fake: &FakeGuard, daemon: &FakeProcess) -> (Arc<Supervisor>, Waiter, Arc<dyn Spawned>) {
-    let supervisor = supervisor(fake);
+    launched_with_period(fake, daemon, PROGRESS_PERIOD)
+}
+
+/// [`launched`] with slices of the wait for the tree no longer than `period`.
+fn launched_with_period(
+    fake: &FakeGuard,
+    daemon: &FakeProcess,
+    period: Duration,
+) -> (Arc<Supervisor>, Waiter, Arc<dyn Spawned>) {
+    let supervisor = Arc::new(Supervisor::new(fake.os(), fake.log()).with_progress_period(period));
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
     let waiter = supervisor.waiter(ID).expect("make the waiter thread");
@@ -570,8 +579,9 @@ fn service_stopping_by(signal: crate::spec::StopSignal, timeout: Option<Duration
 /// read off the duration the tree wait was given.
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
-/// A `timeout` shorter than [`PROGRESS_PERIOD`]: one slice of the wait for the tree is the whole wait.
-const BRIEF: Duration = Duration::from_secs(2);
+/// A `timeout` shorter than [`PROGRESS_PERIOD`]: one slice of the wait for the tree is the whole wait. The `Fake`'s
+/// `Expires` blocks for that slice, so a test that waits it out takes this long.
+const BRIEF: Duration = Duration::from_millis(50);
 
 /// One accepted stop over the `Fake`, in the order `service::launch` makes the pieces: the stop is accepted
 /// before the wait, so it is seen at once. What `Began` told, and the outcome.
@@ -634,19 +644,25 @@ fn told_asking(mut infos: Vec<String>, event: &str) -> (Duration, Vec<String>) {
     (given, infos)
 }
 
-/// [`told_asking`] for a `timeout`: what is left of it is a time a little under it.
+/// [`told_asking`] for a `timeout`: what is left of it is at most it, as it counts from the moment the stop was seen.
 fn told_asking_within(timeout: Duration, infos: Vec<String>, event: &str) -> Vec<String> {
     let (given, rest) = told_asking(infos, event);
     assert!(
-        given <= timeout && given > timeout / 2,
+        given <= timeout,
         "the line says {given:?} are given of {timeout:?}, which counts from the moment the stop was seen"
     );
     rest
 }
 
-/// [`told_asking_within`] a `timeout` of an hour.
+/// [`told_asking_within`] a `timeout` of an hour, of which more than half is left: nothing a stop does before its first
+/// ask takes half an hour.
 fn told_asking_within_the_hour(infos: Vec<String>, event: &str) -> Vec<String> {
-    told_asking_within(HOUR, infos, event)
+    let (given, rest) = told_asking(infos, event);
+    assert!(
+        given <= HOUR && given > HOUR / 2,
+        "the line says {given:?} are given of {HOUR:?}, which counts from the moment the stop was seen"
+    );
+    rest
 }
 
 /// The line of an asked stop whose daemon exited before the event could be sent.
@@ -980,35 +996,75 @@ fn stopped_recording_progress(fake: &FakeGuard, daemon: &FakeProcess, plan: Stop
     (outcome, waits)
 }
 
-/// The time left is read once, when the tree wait begins, and the slices are cut from that amount by arithmetic
-/// alone: they add up to it, none is longer than a period, and a report follows each slice that left members and was
-/// not the last. Whatever the scheduler does between the slices, a `timeout` is neither lengthened nor shortened.
-#[skuld::test]
-fn the_slices_of_a_wait_add_up_to_the_time_read_at_its_start() {
-    let fake = FakeGuard::new();
-    let left = Duration::from_secs(12);
-    let daemon = FakeProcess::new()
-        .wait_tree(TreeWaitReply::Remain)
-        .wait_tree(TreeWaitReply::Remain)
-        .wait_tree(TreeWaitReply::Remain);
-    fake.will_spawn(daemon.clone());
-    let child = spawn_child(&fake);
-    let mut reports = 0;
-
-    let answer = wait_for_tree(&*child, Some(left), &mut || reports += 1);
-
-    assert!(matches!(answer, Ok(TreeDrain::MembersRemain)));
-    let slices: Vec<Duration> = daemon
+/// The slices each wait for the tree was cut into, in order.
+fn slices_of(daemon: &FakeProcess) -> Vec<Duration> {
+    daemon
         .calls()
         .into_iter()
         .filter_map(|call| match call {
             ProcessCall::WaitTree(slice) => Some(slice),
             _ => None,
         })
-        .collect();
-    assert_eq!(slices.iter().sum::<Duration>(), left, "the amount given");
-    assert!(slices.iter().all(|slice| *slice <= PROGRESS_PERIOD), "{slices:?}");
-    assert_eq!(reports, slices.len() - 1, "a report after each slice but the last");
+        .collect()
+}
+
+/// A short period and a deadline, over a daemon whose every slice expires with members left after `late` more than it
+/// was asked for. What the answer, the slices and the reports hold, whatever the scheduler does.
+fn wait_to_a_deadline(
+    timeout: Duration,
+    period: Duration,
+    late: Duration,
+) -> (Result<TreeDrain, cosca::error::Error>, Vec<Duration>, usize) {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new().wait_tree(TreeWaitReply::Expires(late));
+    fake.will_spawn(daemon.clone());
+    let child = spawn_child(&fake);
+    let mut reports = 0;
+
+    let deadline = Instant::now() + timeout;
+    let answer = wait_for_tree(&*child, Some(deadline), period, &mut || reports += 1);
+
+    (answer, slices_of(&daemon), reports)
+}
+
+/// No slice is longer than the period, nor than what was left to the deadline when it was asked. Every slice that
+/// returns blocks for at least its length, so what was left when one was asked is at most the `timeout` less the
+/// slices before it. A report follows each slice that left members but not the one after which the deadline had
+/// passed, which is the last.
+#[skuld::test]
+fn no_slice_is_longer_than_the_period_or_than_what_was_left_to_the_deadline() {
+    let period = Duration::from_millis(10);
+    let timeout = Duration::from_millis(55);
+
+    let (answer, slices, reports) = wait_to_a_deadline(timeout, period, Duration::ZERO);
+
+    assert!(matches!(answer, Ok(TreeDrain::MembersRemain)));
+    let mut before = Duration::ZERO;
+    for slice in &slices {
+        assert!(*slice <= period, "{slices:?}");
+        assert!(*slice <= timeout - before, "{slices:?}");
+        before += *slice;
+    }
+    assert_eq!(
+        reports,
+        slices.len() - 1,
+        "a report after each slice but the last: {slices:?}"
+    );
+}
+
+/// A wait ends once its deadline has passed, however long its slices took: a slice that woke late is not made up for by
+/// another. Two slices that overshoot by 15 ms already pass a deadline of 40 ms, however much the scheduler adds.
+#[skuld::test]
+fn a_wait_ends_once_its_deadline_has_passed_whatever_its_slices_took() {
+    let (answer, slices, reports) = wait_to_a_deadline(
+        Duration::from_millis(40),
+        Duration::from_millis(10),
+        Duration::from_millis(15),
+    );
+
+    assert!(matches!(answer, Ok(TreeDrain::MembersRemain)));
+    assert!(slices.len() <= 2, "{slices:?}");
+    assert_eq!(reports, slices.len() - 1, "{slices:?}");
 }
 
 /// A tree that drains ends the wait at the slice that sees it: no report is made after it.
@@ -1064,7 +1120,7 @@ fn with_no_timeout_the_slices_go_on_until_the_tree_exits() {
 #[skuld::test]
 fn a_timeout_within_one_period_is_one_slice_and_no_report() {
     let fake = FakeGuard::new();
-    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
+    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Expires(Duration::ZERO));
 
     let (_, progress) = stopped_recording_progress(&fake, &daemon, ask_and_wait(Some(BRIEF)));
 
@@ -1079,6 +1135,32 @@ fn a_timeout_within_one_period_is_one_slice_and_no_report() {
     assert!(slice <= BRIEF, "{slice:?}");
     assert_eq!(progress, Vec::<usize>::new());
     assert_eq!(fake.take_warnings(), [did_not_exit_line(BRIEF)]);
+    let _ = fake.take_infos();
+}
+
+/// The period is the supervisor's: a short one cuts a short `timeout` into slices, none longer than it, and the wait
+/// ends with the timeout over once the deadline has passed. No count of slices is stated: it depends on the scheduler.
+#[skuld::test]
+fn a_short_period_cuts_a_short_timeout_into_slices_and_ends_it_at_its_deadline() {
+    let fake = FakeGuard::new();
+    let period = Duration::from_millis(5);
+    let timeout = Duration::from_millis(30);
+    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Expires(Duration::ZERO));
+    let (supervisor, waiter, child) = launched_with_period(&fake, &daemon, period);
+    assert!(supervisor.bus.request_stop());
+    let mut reports = 0;
+
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, ask_and_wait(Some(timeout)), |event| {
+        reports += usize::from(event == StopEvent::Progress)
+    });
+
+    assert!(matches!(outcome, WaitOutcome::Stopping { .. }));
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    let slices = slices_of(&daemon);
+    assert!(slices.iter().all(|slice| *slice <= period), "{slices:?}");
+    assert_eq!(reports, slices.len() - 1, "{slices:?}");
+    assert_eq!(fake.take_warnings(), [did_not_exit_line(timeout)]);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
     let _ = fake.take_infos();
 }
 
@@ -1103,7 +1185,7 @@ fn the_reasks_report_the_stop_as_going_on_at_their_own_pace() {
 #[skuld::test]
 fn a_daemon_that_ignores_the_ask_is_killed_when_the_wait_expires() {
     let fake = FakeGuard::new();
-    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
+    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Expires(Duration::ZERO));
 
     let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(BRIEF)));
 
@@ -1158,7 +1240,7 @@ fn an_asked_stop_with_no_timeout_says_it_waits_without_a_limit() {
 #[skuld::test]
 fn an_asked_stop_that_ends_the_daemon_at_the_end_of_the_wait_says_so_in_one_warning() {
     let fake = FakeGuard::new();
-    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Remain);
+    let daemon = asked(AskReply::Sent).wait_tree(TreeWaitReply::Expires(Duration::ZERO));
 
     stopped_by(&fake, &daemon, ask_and_wait(Some(BRIEF)));
 
@@ -1391,7 +1473,7 @@ fn an_ask_that_may_have_been_sent_is_waited_for() {
     ];
     for ((reply, error), (event, named)) in answers.into_iter().flat_map(|a| events.map(|e| (a, e))) {
         let fake = FakeGuard::new();
-        let daemon = asked(reply).wait_tree(TreeWaitReply::Remain);
+        let daemon = asked(reply).wait_tree(TreeWaitReply::Expires(Duration::ZERO));
 
         let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait_with(event, Some(BRIEF)));
 
@@ -1574,7 +1656,7 @@ fn an_exit_that_cannot_be_read_leaves_an_unassessable_ask_waited_for() {
     let fake = FakeGuard::new();
     let daemon = asked(AskReply::Unassessable)
         .try_wait_fails()
-        .wait_tree(TreeWaitReply::Remain);
+        .wait_tree(TreeWaitReply::Expires(Duration::ZERO));
 
     let (outcome, _) = stopped_by(&fake, &daemon, ask_and_wait(Some(BRIEF)));
 

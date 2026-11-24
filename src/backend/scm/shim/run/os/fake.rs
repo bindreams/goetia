@@ -195,6 +195,10 @@ pub(crate) enum TreeWaitReply {
     MarkersClosed,
     /// Fail with [`wait_tree_failed`].
     Fails,
+    /// `MembersRemain` for every call from here on, each after it has blocked for the time it was given and this much
+    /// longer (a wake-up that overshoots), as the real call blocks until its bound. Never used up, so it is the last
+    /// reply of a script.
+    Expires(Duration),
 }
 
 /// A call on a process the supervisor made, in order, with what it carried.
@@ -598,7 +602,13 @@ impl Spawned for Instance {
     fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, cosca::error::Error> {
         self.count(Op::WaitTree);
         self.record(ProcessCall::WaitTree(timeout));
-        let reply = lock(&self.proc.state).tree_waits.pop_front();
+        let reply = {
+            let mut state = lock(&self.proc.state);
+            match state.tree_waits.front() {
+                Some(&expires @ TreeWaitReply::Expires(_)) => Some(expires),
+                _ => state.tree_waits.pop_front(),
+            }
+        };
         match reply {
             None => self.unstated("wait_tree_timeout"),
             Some(TreeWaitReply::Drained) => {
@@ -608,6 +618,10 @@ impl Spawned for Instance {
             Some(TreeWaitReply::Remain) => Ok(TreeDrain::MembersRemain),
             Some(TreeWaitReply::MarkersClosed) => Ok(TreeDrain::AllMarkersClosed),
             Some(TreeWaitReply::Fails) => Err(wait_tree_failed()),
+            Some(TreeWaitReply::Expires(late)) => {
+                std::thread::sleep(timeout + late);
+                Ok(TreeDrain::MembersRemain)
+            }
         }
     }
 }
@@ -937,7 +951,14 @@ impl Fake {
                 ("kill", state.kills.len()),
                 ("send_kill_tree", state.send_kill_tree_replies.len()),
                 ("ask", state.asks.len()),
-                ("wait_tree_timeout", state.tree_waits.len()),
+                (
+                    "wait_tree_timeout",
+                    state
+                        .tree_waits
+                        .iter()
+                        .filter(|reply| !matches!(reply, TreeWaitReply::Expires(_)))
+                        .count(),
+                ),
             ] {
                 if left > 0 {
                     problems.push(format!("process {n}: {left} stated {what} replies never used"));

@@ -390,6 +390,8 @@ pub struct Supervisor {
     pub(crate) os: Arc<dyn Os>,
     pub(crate) log: Arc<Log>,
     pub(crate) bus: Arc<StopBus>,
+    /// The longest one slice of the wait for the tree is ([`PROGRESS_PERIOD`] in a run).
+    progress_period: Duration,
 }
 
 impl Supervisor {
@@ -400,6 +402,15 @@ impl Supervisor {
             os,
             log,
             bus: Arc::new(StopBus::new()),
+            progress_period: PROGRESS_PERIOD,
+        }
+    }
+
+    /// The same supervisor with slices of the wait for the tree no longer than `period`.
+    pub fn with_progress_period(self, period: Duration) -> Supervisor {
+        Supervisor {
+            progress_period: period,
+            ..self
         }
     }
 
@@ -425,8 +436,8 @@ impl Supervisor {
     /// and where a task records the stop before the wait that may outlast the shim.
     ///
     /// It is told [`StopEvent::Progress`], from the calling thread and only after `Began`, while an ask-and-wait plan
-    /// goes on: after each slice of [`PROGRESS_PERIOD`] of the wait for the tree that left members and had a next
-    /// one, and after each pause of the re-ask loop that is followed by another ask. Never after the wait has ended,
+    /// goes on: after each slice of the wait for the tree (at most the supervisor's period, [`PROGRESS_PERIOD`] in a run)
+    /// that left members and had a next one, and after each pause of the re-ask loop that is followed by another ask. Never after the wait has ended,
     /// and never for a plan that asks nothing or waits for the program alone. The service reports `STOP_PENDING` with
     /// a higher checkpoint in it, which is what keeps Windows from ending a service whose stop takes long at a
     /// shutdown. Nothing is told while the ask itself is being made: cosca 0.10's `terminate_tree` waits for its proxy
@@ -792,7 +803,8 @@ impl Supervisor {
                 }
             }
         }
-        match wait_for_tree(child, left(), on_progress) {
+        let deadline = timeout.and_then(|timeout| seen.checked_add(timeout));
+        match wait_for_tree(child, deadline, self.progress_period, on_progress) {
             // The job is empty, so the root has exited and its report is on its way.
             Ok(TreeDrain::AllMembersExited) => {
                 self.log.info(id, EXITED_WITHIN_THE_WAIT);
@@ -829,24 +841,25 @@ impl Supervisor {
     }
 }
 
-/// Wait for the whole tree to exit within `left` (the time left of the `timeout`, read once by the caller when this
-/// wait begins; `None`: as long as it takes), in slices of [`PROGRESS_PERIOD`] that each re-check the tree, calling
-/// `on_progress` after each slice that left members and had a next one. The slices are cut from `left` by arithmetic
-/// alone, each the period or what remains, so they add up to it and never exceed it: a slice that answers members
-/// remain is taken as slept in full, which is `wait_tree_timeout`'s contract. With no `timeout` members left are no
-/// verdict, and the slices go on until the tree exits or the wait fails.
+/// Wait for the whole tree to exit by `deadline` (`seen + timeout`, fixed when the wait begins; `None`: as long as it
+/// takes), in slices that each re-check the tree: the period or what the clock says is left to the deadline, whichever
+/// is shorter. After a slice that left members, the wait ends at the deadline if it has passed, and otherwise calls
+/// `on_progress` and goes on, so the wait lasts the `timeout` plus the overshoot of its last slice, as one call for the
+/// whole of it would. With no deadline members left are no verdict, and the slices go on until the tree exits or the wait
+/// fails.
 fn wait_for_tree(
     child: &dyn Spawned,
-    left: Option<Duration>,
+    deadline: Option<Instant>,
+    period: Duration,
     on_progress: &mut impl FnMut(),
 ) -> Result<TreeDrain, cosca::error::Error> {
-    let mut remaining = left;
     loop {
-        let slice = remaining.map_or(PROGRESS_PERIOD, |remaining| remaining.min(PROGRESS_PERIOD));
+        let slice = deadline.map_or(period, |deadline| {
+            deadline.saturating_duration_since(Instant::now()).min(period)
+        });
         match child.wait_tree_timeout(slice) {
             Ok(TreeDrain::MembersRemain) => {
-                remaining = remaining.map(|remaining| remaining - slice);
-                if remaining == Some(Duration::ZERO) {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Ok(TreeDrain::MembersRemain);
                 }
                 on_progress();
