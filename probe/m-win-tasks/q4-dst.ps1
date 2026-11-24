@@ -3,7 +3,7 @@
 # change placed by -Leg relative to the registration (the clock is never moved; a custom zone selected with tzutil, every task registered
 # after it):
 #   ctrl    the zone of d68 (same bias) with no daylight rules, so nothing changes; the hours of d68
-#   d10 d30 d68 d130 d250   the change U0 is that many minutes after the registration (d68 is the earlier probe's distance)
+#   d10 d30 d68 d90 d110 d130 d250   the change U0 is that many minutes after the registration (d68 is the earlier probe's distance)
 #   after   the zone's change was 24 h before d68's U0 (registered the day after the change, the same wall-clock hours)
 #   before  the zone's change is 24 h after d68's U0 (registered the day before it)
 # Hours: L0 is the civil hour boundary at which the change happens; A = [L0-1h, L0), B = [L0, L0+1h) skipped, C = [L0+1h, L0+2h). Shapes, one
@@ -12,7 +12,7 @@
 #   rep1 PT1M/PT58M @:01   p2 PT2M/PT58M @:00   p5 PT5M/PT55M @:00   p10 PT10M/PT50M @:00   p30 PT30M/PT30M @:00
 # The window ends at a marker (one-time trigger with a Z start) a few minutes after the hour the question concerns; the counts are read when
 # its line appears. Output per task: the runs per real hour relative to U0 and every run's UTC minute. Throwaway Windows CI runner only.
-param([Parameter(Mandatory)][ValidateSet('ctrl', 'd10', 'd30', 'd68', 'd130', 'd250', 'after', 'before')][string]$Leg)
+param([Parameter(Mandatory)][ValidateSet('ctrl', 'd10', 'd30', 'd68', 'd90', 'd110', 'd130', 'd250', 'after', 'before')][string]$Leg)
 . "$PSScriptRoot\common.ps1"
 Section "platform"; Show-Platform
 Initialize-Probe
@@ -46,9 +46,9 @@ public static class Tz {
 }
 '@
 
-$dist = switch ($Leg) { 'd10' { 10 } 'd30' { 30 } 'd130' { 130 } 'd250' { 250 } default { 68 } }
+$dist = switch ($Leg) { 'd10' { 10 } 'd30' { 30 } 'd90' { 90 } 'd110' { 110 } 'd130' { 130 } 'd250' { 250 } default { 68 } }
 $shiftDays = switch ($Leg) { 'after' { -1 } 'before' { 1 } default { 0 } }
-$zoneChange = $Leg -ne 'ctrl'
+$zoneChange = $true   # every leg selects the custom zone; ctrl's has no daylight rules
 $noDst = $Leg -eq 'ctrl'   # ctrl selects the same zone, with the same bias, and no daylight rules: the hours are those of d68, nothing changes
 
 # U0: $dist minutes ahead (24 h earlier or later for after, before), on a whole minute. The reference U0 (before the shift) puts the first
