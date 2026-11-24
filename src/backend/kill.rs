@@ -347,11 +347,22 @@ impl From<HoldError> for io::Error {
 }
 
 /// `e`, an error from the waits after the signal to `pid` was delivered: the error must not read as a
-/// failed kill.
+/// failed kill, and it does not say the kill failed, for the process may well have exited. It is a
+/// request goetia lost track of ([`Error::RequestInDoubt`], reached), whatever `e` is on its own, so the
+/// kill exits `4`; `e`'s kind and OS code are kept.
 fn signalled_but(pid: u32, e: io::Error) -> io::Error {
+    let kind = e.kind();
     within_delivered(
         format!("process {pid} was signalled, but waiting for it to exit and for the manager to record that failed"),
-        e,
+        io::Error::new(
+            kind,
+            Error::RequestInDoubt {
+                request: format!("kill process {pid}"),
+                reached: true,
+                note: None,
+                source: Box::new(e),
+            },
+        ),
     )
 }
 

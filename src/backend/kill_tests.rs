@@ -736,6 +736,71 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
     assert!(!target.log().contains(&"await_recorded 100".to_string()));
 }
 
+/// The signal stands and the process may well have exited, so a failed wait after it leaves the outcome
+/// open, whichever wait failed and whatever its error: an OS failure, or a goetia error that on its own
+/// is an established failure. The CLI exits `4`, not `1`.
+#[skuld::test]
+fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
+    for (what, target) in [
+        (
+            "the exit wait",
+            Scripted::new([Some(100), Some(100)], [Open::Found]).failing_exit(),
+        ),
+        (
+            "the record wait",
+            Scripted::new([Some(100), Some(100)], [Open::Found]).failing_recorded(),
+        ),
+    ] {
+        let mut target = target;
+
+        let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
+
+        assert!(failed.is_indeterminate(), "{what}: {failed:?}");
+        #[cfg(feature = "cli")]
+        assert_eq!(
+            crate::cli::ExitCode::of(&failed),
+            crate::cli::ExitCode::Indeterminate,
+            "{what}"
+        );
+    }
+}
+
+/// An error of goetia's own under the signal context is open too, though it alone is an established
+/// failure; its variant stays the cause of the report.
+#[skuld::test]
+fn a_determinate_error_after_the_signal_is_open_and_stays_the_cause() {
+    let alone = Error::UnitNotLoaded { unit: "x".to_string() };
+    assert!(!alone.is_indeterminate());
+
+    let failed = kill_failed("x", signalled_but(7, io::Error::other(alone)));
+
+    assert!(failed.is_indeterminate(), "{failed:?}");
+    assert!(
+        failed.report().to_string().contains("LoadState=not-found"),
+        "{}",
+        failed.report()
+    );
+}
+
+/// What a person reads: the signal was delivered and what failed after it; the OS code of the failed wait
+/// is kept for whoever reads it.
+#[skuld::test]
+fn a_failed_wait_after_the_signal_is_reported_as_one_whose_outcome_is_unknown() {
+    const CODE: i32 = 1722;
+    let failed = kill_failed(ID, signalled_but(100, io::Error::from_raw_os_error(CODE)));
+
+    assert_eq!(failed.raw_os_error(), Some(CODE));
+    assert_eq!(
+        failed.report().to_string(),
+        format!(
+            "kill `{ID}`: process 100 was signalled, but waiting for it to exit and for the manager to record \
+             that failed: `kill process 100` reached the service manager, but goetia lost track of it before \
+             its outcome was confirmed: {}",
+            io::Error::from_raw_os_error(CODE)
+        )
+    );
+}
+
 /// A process that was never signalled keeps the plain error: it is not a signalled one.
 #[skuld::test]
 fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
@@ -994,17 +1059,24 @@ fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
     }
 }
 
-/// A failure of goetia's own after the signal was delivered keeps its variant, as the source of a step
-/// that says the signal was delivered, under the kill; the same for one that came before it.
+/// A failure of goetia's own after the signal was delivered is told under a step that says the signal was
+/// delivered, under the kill, as the failure of a request goetia lost track of, which keeps it as its
+/// source; one that came before the signal is the step's source itself.
 #[skuld::test]
-fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
+fn a_wrapped_error_under_a_signal_context_is_the_steps_source_or_the_in_doubt_requests() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
-    for (e, kill_what, context) in [
-        (signalled_but(7, wrapped()), "kill `x`", "was signalled"),
+    for (e, kill_what, context, is_source) in [
+        (
+            signalled_but(7, wrapped()),
+            "kill `x`",
+            "was signalled",
+            (|source| matches!(source, Error::RequestInDoubt { .. })) as fn(&Error) -> bool,
+        ),
         (
             not_signalled(7, wrapped()),
             "failed to kill `x`",
             "signalling it failed",
+            |source| matches!(source, Error::UnitNotLoaded { .. }),
         ),
     ] {
         let failed = kill_failed("x", e);
@@ -1017,6 +1089,6 @@ fn a_wrapped_error_under_a_signal_context_keeps_its_variant_as_the_source() {
         };
         assert_eq!(kill, kill_what);
         assert!(what.contains(context), "{what}");
-        assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
+        assert!(is_source(source), "{source:?}");
     }
 }
