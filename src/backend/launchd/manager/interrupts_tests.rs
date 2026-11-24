@@ -480,10 +480,11 @@ fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
 /// The last drop un-publishes the write end and then waits for a handler that is running before it closes
 /// the pipe, so a handler never writes to a closed descriptor. A running handler is stood in for by a count
 /// that the test holds, and the window reports how its close went ([`test_hook::Probe`]): the wait
-/// loop reports each pass, and the window reports when its pipe is closed, wherever that is. The test waits for the close to leave idle, or for the closing thread
-/// to end, which it must not do. A close that waits is waiting with the pipe open and the descriptor
-/// un-published; a close that does not wait, or closes the pipe before it, is in another state, whatever the
-/// schedule. After the handler is out, the pipe is closed, after the wait.
+/// loop reports each pass, and the window reports when its pipe is closed, wherever that is. The test waits
+/// for the close to leave idle, or for the closing thread to end, which it must not do. A close that waits is
+/// waiting with the pipe open and the descriptor un-published; a close that does not wait, or closes the pipe
+/// before it, is in another state, whatever the schedule. After the handler is out, the pipe is closed, after
+/// the wait.
 #[skuld::test]
 fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     use test_hook::Closing::{Idle, Waiting};
