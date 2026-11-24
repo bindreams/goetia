@@ -43,6 +43,7 @@
 //! A timer without its job (a crash of an older goetia, or a hand removal) is ours and unusable: its
 //! blob is the error `read` gives it, and `uninstall` removes it.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::systemd::generate::{self, Units};
@@ -51,15 +52,18 @@ use crate::blob::Blob;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::flow::NOTHING_TO_ARM;
-use crate::manager::{Budget, DaemonStatus, State, Status, TaskStatus};
+use crate::manager::{Budget, DaemonStatus, RunInFlight, State, Status, TaskStatus};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{self, foreign_timer_recovery, timer_is_foreign};
+use super::standin::{self, Call, Known, Standin, StandinFile, Target, standin_file, standin_path};
 use super::systemctl::{Held, TimerArming};
-use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
+use super::write::{
+    CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, remove_verified, replace_unit_verified,
+};
 use super::{
-    Systemd, UnitKind, dropin_dir, identity_for, journal, remove_dir_if_present, remove_file_if_present, unit_name,
-    unit_path,
+    Systemd, UNIT_DIR, UnitKind, dropin_dir, identity_for, journal, remove_dir_if_present, remove_file_if_present,
+    unit_name, unit_path,
 };
 
 // Fragment ============================================================================================================
@@ -350,44 +354,120 @@ fn left_disabled(id: &str, cause: Option<Error>, arming: Error) -> Error {
 // uninstall ===========================================================================================================
 
 impl Systemd {
-    /// The timer disarmed, the job stopped, then the timer and the job removed, each verified against
-    /// what `read` saw. A plain service keeps its order: stop, disable, remove, reload.
-    pub(super) fn uninstall_units(&self, snapshot: Fragment, held: &mut Held) -> Result<()> {
-        let id = snapshot.id.as_str();
-        let owns_timer = snapshot.owns_timer_slot();
+    /// A task or service removed, with the run it has: see [`Systemd::settle`].
+    pub(super) fn uninstall_units(&self, snapshot: Fragment, in_flight: RunInFlight, held: &mut Held) -> Result<()> {
+        self.settle(snapshot.id.as_str(), in_flight, Target::Installed(&snapshot), held)
+    }
 
-        if snapshot.timer().is_some() {
+    /// The one executor of `uninstall` and `install` over a run and a stand-in. What is done is
+    /// [`standin::plan`]'s, from what is known before the one read of the job's unit ([`Known`]) and what the
+    /// read shows; this does it in one order, which each caller shares. `target` says which caller this is, and
+    /// an installed id's snapshot is the files this removes.
+    ///
+    /// The version gate is passed before the first change: for an installed id, which always changes something,
+    /// at the start; for the others, once the plan reloads, which every plan that changes anything does (a read
+    /// asks no gate).
+    ///
+    /// No `systemctl enable` or `disable` comes between the first removal and the reload, since both reload the
+    /// manager at once and a reload that finds the unit's file gone and no stand-in ends a run in its start job.
+    pub(super) fn settle(&self, id: &str, in_flight: RunInFlight, target: Target<'_>, held: &mut Held) -> Result<()> {
+        let installed = match target {
+            Target::Installed(snapshot) => Some(snapshot),
+            Target::Sweep | Target::Install | Target::Update => None,
+        };
+        let file = standin_file(id)?;
+        let known = Known {
+            in_flight,
+            call: target.call(),
+            file: &file,
+        };
+        if known.blocked() {
+            return Err(Error::StandinBlocked {
+                id: id.to_string(),
+                path: standin_path(id),
+            });
+        }
+
+        // Before the first change, whichever the choice and whether or not there is a timer to disarm: a refusal
+        // met first at the final reload would come after the files are gone.
+        if installed.is_some() {
+            self.systemctl.require_supported(held)?;
+        }
+        if let Some(snapshot) = installed
+            && snapshot.timer().is_some()
+        {
             self.systemctl.disable_timer(id, held)?;
         }
-        // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop is a
-        // means rather than an end, and bounding it would turn a slow-stopping service into a failed
-        // uninstall where today it succeeds.
-        if snapshot.service_text().is_some() {
+        let seen = match self.look(id, &known) {
+            // Nothing can be asked, so nothing is held: as before a held definition could be asked about.
+            Err(Error::NoManager { .. }) if known.call == Call::Sweep => return Ok(()),
+            seen => seen?,
+        };
+        let plan = standin::plan(&known, seen.as_ref());
+        // Before the first change, on every path: a plan that reloads is one that changes something, and the
+        // absent path's read was no change.
+        if plan.reload {
+            self.systemctl.require_supported(held)?;
+        }
+
+        if plan.stop {
+            // `Budget::Unbounded`: `uninstall` has no `--timeout`, and bounding the stop would fail the
+            // uninstall of a slow-stopping service.
             self.systemctl
                 .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), held)?;
-            // A task's job has no `[Install]`: there is nothing to disable.
-            if !snapshot.is_task() {
-                self.systemctl.disable_impl(id, held)?;
+            // A stand-in of ours goes with the run it kept, which the stop leaves `failed` as a stopped oneshot
+            // is: cleared, so the removal does not leave it listed `not-found failed`.
+            if plan.clears_after_stop && self.systemctl.run_of(&unit_name(id, UnitKind::Service))?.failed {
+                self.systemctl.reset_failed(id, UnitKind::Service, held)?;
             }
         }
+        // A task's job has no `[Install]`: there is nothing to disable.
+        if let Some(snapshot) = installed
+            && snapshot.service_text().is_some()
+            && !snapshot.is_task()
+        {
+            self.systemctl.disable_impl(id, held)?;
+        }
+        if let Standin::Write {
+            kill_signal,
+            stop_timeout,
+        } = &plan.standin
+        {
+            self.write_standin(id, &file, kill_signal, stop_timeout)?;
+        }
 
-        // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file
-        // spans `systemctl` round-trips, wide enough for something else to have replaced it.
-        if let Some(timer) = snapshot.timer() {
-            remove_verified(id, UnitKind::Timer, &timer.text)?;
+        // A verified removal of the timer or the job that fails aborts here with its own error. A stand-in this
+        // call wrote stays: whether it is stale would take a second, racy look at the job's path, and the README
+        // says what removes it. Past them the removals are all attempted and every failure is reported together,
+        // so the reload still runs.
+        let mut removed = Ok(());
+        if let Some(snapshot) = installed {
+            // Verified removals, mirroring `replace_unit_verified`: the gap since `read` saw each file spans
+            // `systemctl` round-trips, wide enough for something else to have replaced it.
+            if let Some(timer) = snapshot.timer() {
+                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Timer, &timer.text)?;
+            }
+            if let Some(job) = snapshot.service_text() {
+                remove_verified(Path::new(UNIT_DIR), id, UnitKind::Service, job)?;
+            }
+            removed = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
+            if snapshot.owns_timer_slot() {
+                removed = both(removed, remove_dir_if_present(&dropin_dir(id, UnitKind::Timer)));
+            }
         }
-        if let Some(job) = snapshot.service_text() {
-            remove_verified(id, UnitKind::Service, job)?;
+        if let Standin::Remove { reset_failed } = plan.standin {
+            let StandinFile::Ours(text) = &file else {
+                unreachable!("a stand-in is removed only where one of ours was read");
+            };
+            removed = both(removed, self.remove_standin(id, text, reset_failed, held));
         }
-
-        // Both attempted regardless of whether the first failed, and every failure reported
-        // together: a partial failure here must not leave systemd's loaded view silently stale.
-        let mut dropins = remove_dir_if_present(&dropin_dir(id, UnitKind::Service));
-        if owns_timer {
-            dropins = both(dropins, remove_dir_if_present(&dropin_dir(id, UnitKind::Timer)));
-        }
-        match both(dropins, self.systemctl.daemon_reload(held)) {
-            Err(e @ Error::Both { .. }) => Err(Error::Step {
+        let reloaded = if plan.reload {
+            self.systemctl.daemon_reload(held)
+        } else {
+            Ok(())
+        };
+        match both(removed, reloaded) {
+            Err(e @ Error::Both { .. }) if installed.is_some() => Err(Error::Step {
                 what: format!("uninstall for `{id}` partially failed, and the unit fragment is already gone"),
                 source: Box::new(e),
             }),
@@ -404,17 +484,6 @@ fn both(first: Result<()>, then: Result<()>) -> Result<()> {
         (Err(first), Err(then)) => Err(Error::Both {
             first: Box::new(first),
             then: Box::new(then),
-        }),
-    }
-}
-
-/// `id`'s `kind` unit removed, if it is still the file `read` saw.
-fn remove_verified(id: &str, kind: UnitKind, expected: &str) -> Result<()> {
-    match quarantine_if_still_ours(id, kind, expected)? {
-        Some(backup) => remove_file_if_present(&backup),
-        None => Err(Error::ConcurrentChange {
-            id: id.to_string(),
-            path: Some(unit_path(id, kind)),
         }),
     }
 }

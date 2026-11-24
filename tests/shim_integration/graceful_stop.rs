@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use goetia::backend::scm::exit_status::{RecordedExit, SHIM_REFUSED};
 use goetia::backend::scm::manager::Scm;
 use goetia::backend::scm::wait::StopSeen;
-use goetia::manager::{Budget, ServiceManager as _};
+use goetia::manager::{Budget, RunInFlight, ServiceManager as _};
 use goetia::shim::{CheckPermissions, StandaloneShim};
 use goetia::spec::{StopAction, StopSignal, User};
 use windows_service::service::ServiceState;
@@ -575,7 +575,7 @@ fn a_host_that_did_not_initialise_is_refused_at_start(#[fixture(scm_group)] _gro
         "the log has no refusal that names the call:\n{log}"
     );
     // Read once the service is gone, so that no shim of it can still be starting a daemon.
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
     assert!(
         !started_marker(&record).exists(),
         "the daemon was started by a host that was refused"

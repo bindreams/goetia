@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
+use goetia::manager::RunInFlight;
 use goetia::shim::{CheckPermissions, EmbeddedStockShim};
 use goetia::spec::{DaemonFields, DaemonSpec, Protocol, ServiceFields, ServiceSpec};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
@@ -113,7 +114,7 @@ impl ShimGuard {
             Ok(id) => id,
             Err(e) => return fail("parse the id", &e),
         };
-        match Scm::new().uninstall(&id) {
+        match Scm::new().uninstall(&id, RunInFlight::Stop) {
             Ok(()) | Err(Error::NotInstalled { .. }) => {}
             Err(e) => fail("uninstall", &e),
         }

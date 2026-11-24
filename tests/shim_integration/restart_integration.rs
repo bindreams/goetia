@@ -12,7 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
+use goetia::manager::{Budget, Installed, RunInFlight, ServiceManager as _, Step};
 use goetia::spec::{DaemonSpec, Restart, ServiceFields, ServiceSpec};
 use goetia::testing::service_fields;
 use windows_service::service::{ServiceExitCode, ServiceState};
@@ -205,7 +205,7 @@ fn uninstall_leaves_no_restarted_daemon_behind(#[fixture(scm_group)] _group: &Gr
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon to have run");
 
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("connect to SCM");
     match scm.open_service(&id, ServiceAccess::QUERY_STATUS) {
@@ -533,7 +533,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     reported.accept("the daemon of the restarted service to report in");
 
     mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert_eq!(query.code, Some(1060), "the service should no longer exist:\n{query}");

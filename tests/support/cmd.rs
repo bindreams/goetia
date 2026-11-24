@@ -23,6 +23,12 @@ impl Run {
         self.code == Some(0)
     }
 
+    /// Whether this failed `systemctl` run says its unit is not loaded: `stop` exits 5, while `kill` and
+    /// `reset-failed` pass the bus error through as exit 1.
+    pub fn systemctl_says_not_loaded(&self) -> bool {
+        self.code == Some(5) || (self.code == Some(1) && self.stderr.contains("not loaded"))
+    }
+
     #[track_caller]
     pub fn expect_ok(self) -> Self {
         assert!(self.ok(), "{self}");

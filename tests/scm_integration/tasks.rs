@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
-use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, conformance};
+use goetia::manager::{Budget, Exit, RunInFlight, ServiceManager as _, State, Status, conformance};
 use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 use goetia::testing::{remove_task, service_fields};
 
@@ -166,7 +166,7 @@ fn a_task_installs_and_uninstalls(#[fixture(scm_group)] _group: &Group) {
     let again = mgr.install(&spec, false).expect("install again");
     assert!(matches!(again, Outcome::UpToDate), "{again:?}");
 
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 
     let gone = mgr.status(id).expect_err("the task is gone");
     assert!(matches!(gone.cause(), Error::NotInstalled { .. }), "{gone:?}");
@@ -200,7 +200,7 @@ fn enable_arms_and_disable_disarms_on_the_real_scheduler(#[fixture(scm_group)] _
     assert!(!disarmed.common.enabled);
     assert_eq!(disarmed.next_run, None);
 
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// A task's principal is written as a SID, and registered as it: the three accounts that need no
@@ -223,7 +223,7 @@ fn each_well_known_account_installs_arms_and_uninstalls_a_task(#[fixture(scm_gro
         mgr.enable(id)
             .unwrap_or_else(|e| panic!("enable as {user:?}: {}", e.report()));
         assert!(task_status(&mgr, id).common.enabled, "{user:?}");
-        mgr.uninstall(id)
+        mgr.uninstall(id, RunInFlight::Stop)
             .unwrap_or_else(|e| panic!("uninstall of an armed task as {user:?}: {}", e.report()));
         assert!(mgr.status(id).is_err(), "{user:?}");
     }
@@ -255,7 +255,7 @@ fn a_service_changes_to_a_task_and_back(#[fixture(scm_group)] _group: &Group) {
             !records_of(id).exists(),
             "the task's records went with it: {protocol:?}"
         );
-        mgr.uninstall(id).expect("uninstall");
+        mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
     }
 }
 
@@ -311,7 +311,7 @@ fn run_returns_the_programs_exit_and_its_lines(#[fixture(scm_group)] _group: &Gr
         "the run's line, and no marker: {out:?}"
     );
     assert_eq!(task_status(&mgr, id).common.state, State::Idle);
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -334,7 +334,7 @@ fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(scm_group)] _group:
     assert_eq!(first.lines().count(), 1, "{first:?}");
     assert_eq!(second.lines().count(), 1, "only the second run's own line: {second:?}");
     assert_ne!(first, second, "each run prints its own process's id");
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// A stop ends the run through Task Scheduler, which gives the program its close event: the program ends
@@ -360,7 +360,7 @@ fn stop_ends_a_run_and_run_reports_the_stopped_code(#[fixture(scm_group)] _group
         assert_eq!(exit, Exit::Code(0xC000_013A_u32 as i32), "a stopped run's code");
     });
     assert_eq!(task_status(&mgr, id).common.state, State::Idle);
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// A kill ends the shim's process, which writes no record: the run's exit is unknown.
@@ -388,7 +388,7 @@ fn kill_ends_a_run_and_run_reports_unrecorded(#[fixture(scm_group)] _group: &Gro
         assert!(matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
     });
     assert_eq!(task_status(&mgr, id).common.state, State::Idle);
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -408,7 +408,7 @@ fn run_refuses_a_run_in_flight(#[fixture(scm_group)] _group: &Group) {
 
     mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
     assert_eq!(task_status(&mgr, id).common.state, State::Idle);
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -429,7 +429,7 @@ fn start_returns_before_the_run_ends(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(status.common.state, State::Running);
     assert_eq!(status.last_result, None, "no run has ended");
     mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// `restart --timeout 0` sends the stop and asks for the start without waiting for the run to end. A
@@ -456,7 +456,7 @@ fn a_start_after_an_unwaited_stop_is_refused_while_the_run_is_alive(#[fixture(sc
     assert_eq!(status.common.state, State::Running);
     assert_eq!(status.common.pid, Some(pid), "the run it refused to start over");
     mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// `run` of a task with no `logs` shows why it shows nothing, and still returns the run's exit.
@@ -481,7 +481,7 @@ fn run_of_a_task_without_logs_says_why_it_shows_no_output(#[fixture(scm_group)] 
         !out.contains("hello"),
         "the program's line has nowhere to be read from: {out:?}"
     );
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// An ended run stays in Task Scheduler's listing for a few milliseconds, and a `run` straight after it
@@ -500,7 +500,7 @@ fn run_right_after_a_finished_run_is_not_refused_while_the_listing_lingers(#[fix
             .unwrap_or_else(|e| panic!("the {which} run, straight after the one before: {}", e.report()));
         assert_eq!(exit, Exit::Code(0), "{which}");
     }
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// A task whose definition changes after it has run is rewritten, and its next run is the new one's.
@@ -522,7 +522,7 @@ fn editing_a_task_after_it_ran_works(#[fixture(scm_group)] _group: &Group) {
         mgr.run(id, &mut Vec::new()).expect("a run of the edited task"),
         Exit::Code(2)
     );
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// An uninstall of a task that is armed and running disarms it, ends the run and waits for the shim to
@@ -541,7 +541,8 @@ fn uninstall_of_a_running_armed_task_ends_it(#[fixture(scm_group)] _group: &Grou
     let pid = task_status(&mgr, id).common.pid.expect("a running task has a pid");
     let shim = ProcessHandle::open(pid);
 
-    mgr.uninstall(id).expect("uninstall of a running, armed task");
+    mgr.uninstall(id, RunInFlight::Stop)
+        .expect("uninstall of a running, armed task");
 
     let gone = mgr.status(id).expect_err("the task is gone");
     assert!(matches!(gone.cause(), Error::NotInstalled { .. }), "{gone:?}");
@@ -613,7 +614,7 @@ fn uninstall_removes_the_task_its_records_and_the_empty_folder(#[fixture(scm_gro
     );
     assert!(records_of(id).is_dir(), "precondition: the run left its records");
 
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 
     assert!(!task_exists(id), "the task");
     assert!(!records_of(id).exists(), "its records");

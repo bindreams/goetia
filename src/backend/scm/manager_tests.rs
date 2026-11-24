@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::*;
 use crate::backend::scm::parameters::Stray;
 use crate::backend::scm::test_support::{SHIM_HEX, blob_of};
-use crate::manager::ServiceManager;
+use crate::manager::{RunInFlight, ServiceManager};
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::{AccountId, DaemonFields, DaemonSpec, Restart, ServiceFields, ServiceSpec, User};
 use crate::testing::{FakeProvider, command};
@@ -787,6 +787,19 @@ fn new_has_no_provider() {
         .expect("a managed service needs none");
 }
 
+/// `Leave` is not built on Windows: it is refused as an invalid request that names the flag and says nothing was
+/// changed.
+#[skuld::test]
+fn leaving_a_run_is_refused_naming_the_flag_and_that_nothing_was_changed() {
+    match Scm::new().uninstall_absent(&Id::try_from("never-installed").unwrap(), RunInFlight::Leave) {
+        Err(Error::Invalid { message, .. }) => {
+            assert!(message.contains("--no-stop"), "{message}");
+            assert!(message.contains("nothing was changed"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
 /// With no provider there is nothing of the manager's own to sweep, so the retry of an uninstall
 /// for an absent id succeeds without taking the machine-wide lock or reading anything: a library
 /// caller that is not elevated keeps getting `NotInstalled` from `uninstall`. (A regression would
@@ -794,7 +807,7 @@ fn new_has_no_provider() {
 #[skuld::test]
 fn uninstall_of_an_absent_id_without_a_provider_takes_no_lock() {
     Scm::new()
-        .uninstall_absent(&Id::try_from("never-installed").unwrap())
+        .uninstall_absent(&Id::try_from("never-installed").unwrap(), RunInFlight::Stop)
         .expect("nothing to sweep");
 }
 

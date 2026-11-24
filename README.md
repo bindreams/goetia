@@ -891,7 +891,8 @@ All under `goetia daemon`, as for a service:
   ([Stopping and killing a task](#stopping-and-killing-a-task)). **`restart`**
   is a `stop` and then a `start`.
 - **`run`** starts a run and follows it ([below](#run)).
-- **`uninstall`** ends a run in flight and removes the task. On Windows it also
+- **`uninstall`** ends a run in flight and removes the task, or with `--no-stop`
+  leaves the run alone ([Uninstalling a daemon](#uninstalling-a-daemon)). On Windows it also
   removes the task's run records, and never needs the account's password.
 
 ### `run`
@@ -2065,6 +2066,79 @@ A task has no restart policy: its `kill` ends the run in flight and leaves its
 schedule armed, and a task with no run in flight is "not running" like any
 other daemon with no process. What it sends on each platform is in
 [Stopping and killing a task](#stopping-and-killing-a-task).
+
+## Uninstalling a daemon
+
+`goetia daemon uninstall <ID...>` stops each daemon's run in flight, removes its definition, and reloads the
+manager. It reads the installed artifact, so it works where the manifest is gone, and it needs elevation.
+
+**`--no-stop`** is for a program that uninstalls its own daemon from inside a run and must not be ended by it.
+`uninstall` then removes the definition and everything that would start another run, sends nothing to a run in
+flight and waits for nothing of it. The caller may be the run itself, or a process it started. With several ids,
+`--no-stop` applies to each. With no run in flight it is a plain `uninstall`: it does all that `uninstall` does,
+so nothing is left behind for want of a run, except, on systemd, a service waiting to be restarted (below).
+
+What is left while the run lives is the manager's to report, and goetia reports it as it is.
+
+**systemd.** The unit files are gone, so the id is not installed, and the process is the caller's. systemd keeps a
+loaded unit with no file (`LoadState=not-found`) while the process lives, and never restarts it.
+
+- `--no-stop` sends nothing in any state: no stop and no signal, a unit with no process included.
+- A run still in its start job is ended by a reload that drops its unit file, at systemd's default start timeout.
+  For goetia's units that is a task's run (a service is past its start phase). So when systemd reports the run
+  of the definition goetia is removing still in its start job, `uninstall --no-stop` first writes a stand-in unit
+  of the same name under `/run/systemd/system/` (a tmpfs, so a reboot removes it) with no start timeout. It
+  carries the `KillSignal=` and `TimeoutStopSec=` systemd was applying to the job, a drop-in's included, and
+  goetia's `[X-Goetia]` section and the id, which is how goetia knows the file is its own. Any other stop setting
+  a drop-in gave the job (`KillMode=`, `ExecStop=`, `SendSIGKILL=` and the like) is not carried: a hand
+  `systemctl stop` of the left run uses systemd's defaults for those. A hand `systemctl start` of the stand-in
+  fails. A start job that is queued and not yet running (systemd reads the unit `inactive` with a job
+  pending) gets the stand-in too. If it began before the reload, its run is kept; if it was still queued at the
+  reload, it runs the stand-in, fails on its assertion and starts nothing, and the stand-in stays until the next
+  `install` or `uninstall` of the id or a reboot. A run past its start phase needs none and is left as it is. A
+  task whose job is gone and whose timer alone is installed gets none either: the unit under its name may be
+  somebody else's.
+- A service that is waiting to be restarted is not restarted, and nothing is sent to it. The reload fails the
+  restart on the missing unit, so systemd lists the unit as `not-found failed`, and the machine reads `degraded`,
+  until `systemctl reset-failed <id>` or a reboot. If systemd restarted it before the reload, that run began after
+  goetia read the unit: nothing is sent to it and nothing restarts it again; it gets no stand-in, so one that
+  has not finished starting when the manager reloads is ended by systemd at its start timeout. To cancel the
+  restart instead, uninstall without `--no-stop`.
+- Nothing removes the stand-in while its run has a process. The next `install` or `uninstall` of the id, an id
+  nobody installed included, removes it once its run is over, reloads the manager, and clears a failed run of it
+  with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and
+  the run. `uninstall` without the flag of an id nobody installed stops the run, clears it with
+  `systemctl reset-failed` only if the stopped run failed, then removes the file. Once the id is installed again,
+  the installed file outranks the stand-in, which is stale. The next `install` that rewrites the unit and the
+  next `uninstall` of the id, with or without the flag, remove it whatever the run is doing (with `--no-stop`, a
+  run still in its start job gets a fresh one), and clear nothing of the run, which is the installed job's. An
+  `install` that finds the definition up to date does not touch it: the installed unit shadows it, and a reboot
+  removes it. An `uninstall --no-stop` that fails after writing the stand-in leaves it, and it is then removed as
+  above: while goetia's unit file is still installed the file shadows it, and with the file gone the stand-in is
+  the unit's definition. If another program put its own unit file at the id during the call, goetia refuses the id
+  as not its own, and the stand-in stays in `/run/systemd/system/` until a reboot, until you remove it, or until
+  that file is gone and the next `uninstall` of the id removes it.
+- A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an id whose job
+  goetia removes refuses with an error naming the path, whether or not a run is in flight, and before anything
+  is changed, the timer included. Remove the file, or uninstall without `--no-stop`. For a task whose timer alone
+  is installed (it gets no stand-in), for an id nothing is installed at, or for `uninstall` without the flag, the
+  file is left alone and changes nothing.
+- `uninstall` of an id nothing is installed at stops nothing, with or without `--no-stop`, except the run a
+  stand-in of goetia's keeps, which `uninstall` without the flag stops. Whatever else is left running is the
+  caller's process, and `systemctl stop <id>` ends it. It reloads the manager when systemd still holds a
+  definition loaded from goetia's own unit path whose file is gone (a `--no-stop` uninstall whose last reload
+  failed), so the retry finishes it and the unit is not restarted from memory; it does no more for it, since
+  goetia cannot show that a definition whose file is gone was its own. Where no manager can be asked it reads
+  nothing and answers "not installed".
+- `systemctl reset-failed` clears a unit that failed, even when its file is gone: such a unit is in memory. A unit
+  that is not in memory has nothing to clear. goetia clears only what it can tell is its own: the failed run of a
+  stand-in it removes. A left run that fails later stays listed as
+  `not-found failed`, and the machine reads `degraded`, until `systemctl reset-failed <id>` or a reboot.
+- An `install` of the same id while the left run lives is not refused: systemd adopts the process under the new
+  definition until it exits. The left run is then governed by the new definition, its start timeout included,
+  which can end a run that is still starting.
+- A run somebody else starts between goetia's reading that a run is in flight and the reload is that caller's own
+  conflicting action, and goetia does not guard against it.
 
 ## Exit codes
 

@@ -20,7 +20,9 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
-use crate::manager::{Budget, DaemonStatus, Exit, Installed, ServiceManager, State, Status, Step, TaskStatus};
+use crate::manager::{
+    Budget, DaemonStatus, Exit, Installed, RunInFlight, ServiceManager, State, Status, Step, TaskStatus,
+};
 use crate::spec::{DaemonFields, DaemonKind, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
 
 /// The fake's own artifact marker, deliberately not any real backend's
@@ -1099,15 +1101,21 @@ impl crate::backend::Backend for Fake {
         }
     }
 
-    fn uninstall(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
+    /// A run in flight is stopped first, and recorded as `stop`, unless `in_flight` leaves it alone: the
+    /// Fake has no process to keep, so what it models of a left run is that nothing was sent to it.
+    fn uninstall(&self, snapshot: Artifact, in_flight: RunInFlight, _reservation: &mut ()) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.confirm(&snapshot)?;
+        let running = state.confirm(&snapshot)?.state == State::Running;
+        if running && in_flight == RunInFlight::Stop {
+            state.calls.push(("stop", snapshot.id().as_str().to_string()));
+        }
         state.entries.remove(snapshot.id().as_str());
         Ok(())
     }
 
-    /// Recorded as `uninstall_absent`, and fails where [`Fake::seed_absent_cleanup_fails`] says.
-    fn uninstall_absent(&self, id: &Id) -> Result<()> {
+    /// Recorded as `uninstall_absent`, and fails where [`Fake::seed_absent_cleanup_fails`] says. An absent
+    /// id has no run to stop or leave, so `in_flight` changes nothing.
+    fn uninstall_absent(&self, id: &Id, _in_flight: RunInFlight) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("uninstall_absent", id.as_str().to_string()));
         match &state.absent_cleanup_fails {
