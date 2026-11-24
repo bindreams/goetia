@@ -8,23 +8,94 @@ on:
 permissions:
   contents: read
 
+env:
+  PROBES: probes/m-mac-print
+
 jobs:
-  recon:
-    name: recon (${{ matrix.os }})
+  # Questions 1 to 3: `launchctl print` read as fast as it answers around launches that were never held.
+  sample:
+    name: print samples ${{ matrix.part }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, macos-15]
+        part: [kick, timed]
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Machine
         run: |
           exec 2>&1
           sw_vers; uname -a; echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
           csrutil status || true
-          sysctl hw.memsize hw.ncpu hw.model machdep.cpu.brand_string || true
-          python3 --version; which uv || echo "no uv"; cc --version | head -1
-          memory_pressure -h 2>&1 | head -40 || true
-          sysctl kern.memorystatus_vm_pressure_level kern.memorystatus_level || true
-          vm_stat | head -5
+          sysctl hw.ncpu hw.memsize; python3 --version
+
+      - name: Samples
+        run: |
+          set -uo pipefail
+          exec 2>&1
+          if [[ "${{ matrix.part }}" == kick ]]; then
+            for c in "kick-true 3000" "kick-wrap 3000" "kick-sleepy 3000" "kick-k 1500"; do
+              sudo python3 -I "$PROBES/print_sample.py" $c
+            done
+          else
+            for c in "held-control 100" "keepalive 300" "interval 600" "bootstrap 1500"; do
+              sudo python3 -I "$PROBES/print_sample.py" $c
+            done
+          fi
+
+  # Question 4: held launches left stopped, then memory pressure.
+  soak:
+    name: hold soak (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Machine
+        run: |
+          exec 2>&1
+          sw_vers; uname -a; echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          csrutil status || true
+          sysctl hw.ncpu hw.memsize; sysctl kern.memorystatus_vm_pressure_level; memory_pressure -h 2>&1 | head -30 || true
+
+      - name: Soak
+        run: |
+          exec 2>&1
+          sudo python3 -I "$PROBES/hold_soak.py" 1500 3
+
+  # Question 5: the lost-hold answers crossed with the older launch's start time.
+  race:
+    name: race ${{ matrix.print }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15]
+        print: [0, 1]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Machine
+        run: |
+          exec 2>&1
+          sw_vers; uname -a; echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          csrutil status || true
+
+      - name: Build
+        run: cc -O1 -Wall -o "$RUNNER_TEMP/race-cross" "$PROBES/race-cross.c"
+
+      - name: Race
+        run: |
+          exec 2>&1
+          sudo "$RUNNER_TEMP/race-cross" race 4000 30000 ${{ matrix.print }}
