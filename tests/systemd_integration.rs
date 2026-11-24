@@ -21,11 +21,11 @@ mod leave;
 #[path = "systemd_integration/linux.rs"]
 mod linux;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "cli"))]
 #[path = "systemd_integration/no_manager.rs"]
 mod no_manager;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "cli"))]
 #[path = "systemd_integration/not_loaded.rs"]
 mod not_loaded;
 
