@@ -934,7 +934,7 @@ fn a_goetia_waiting_for_the_install_lock_says_so_on_stderr(#[fixture(scm_group)]
     let status = child.expect("the probe ran").wait().expect("wait for the child");
     assert_eq!(
         status.code(),
-        Some(goetia::cli::ExitCode::Success.code()),
+        Some(0),
         "the child must end as an uninstall of an absent id that succeeds; it said after the note: {after:?}"
     );
 }
