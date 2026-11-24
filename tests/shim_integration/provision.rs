@@ -14,7 +14,7 @@ use std::sync::{Mutex, mpsc};
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
-use goetia::manager::{Budget, ServiceManager as _, State};
+use goetia::manager::{Budget, RunInFlight, ServiceManager as _, State};
 use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
@@ -47,7 +47,7 @@ use crate::support::{self, ConnectBack, Group, LocalUserGuard, WorldReadableExe,
 
 /// `%ProgramFiles%\Goetia`, emptied of an earlier run's leftovers, and removed when the guard drops.
 /// Made before anything is written into it.
-fn default_folder() -> (PathBuf, DirGuard) {
+pub(crate) fn default_folder() -> (PathBuf, DirGuard) {
     let exe = embedded_shim(None).preview().expect("locate the default folder").exe;
     let folder = exe.parent().expect("the shim has a folder").to_path_buf();
     cleanup::remove_or_warn(&folder, true);
@@ -1106,7 +1106,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     started.accept("the daemon to report in under the shim in Program Files");
 
     // The shim is running its own file, which cannot be deleted while it does.
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     assert!(
         !folder.exists(),
@@ -1148,11 +1148,15 @@ fn uninstall_keeps_a_running_old_shim(#[fixture(scm_group)] _group: &Group) {
     let b_spec = simple_spec(&b_id, fixture_command("report", &["1"]), &logs);
     second.install(&b_spec, false).expect("install B on the second file");
 
-    second.uninstall(&b_spec.common().id).expect("uninstall B");
+    second
+        .uninstall(&b_spec.common().id, RunInFlight::Stop)
+        .expect("uninstall B");
 
     assert!(old.is_file(), "the file A's process runs is kept");
     assert!(new.is_file(), "the file A is registered with is kept");
-    second.uninstall(&a_spec.common().id).expect("uninstall A");
+    second
+        .uninstall(&a_spec.common().id, RunInFlight::Stop)
+        .expect("uninstall A");
     assert!(running.has_exited(), "uninstall returns once A's process is gone");
     assert!(!old.exists() && !new.exists(), "nothing references either file now");
 }
@@ -1175,7 +1179,7 @@ fn uninstall_of_one_of_two_on_a_file_returns(#[fixture(scm_group)] _group: &Grou
     started.accept("B to report in");
     let running = ShimProcess::attach(&b_id);
 
-    mgr.uninstall(&a_spec.common().id)
+    mgr.uninstall(&a_spec.common().id, RunInFlight::Stop)
         .expect("uninstall A, which does not wait for B");
 
     assert!(shim_in(&folder).is_file(), "B still runs the file");
@@ -1227,7 +1231,7 @@ fn uninstall_right_after_stop_leaves_no_file(#[fixture(scm_group)] _group: &Grou
     let file = shim_in(&folder);
     mgr.stop(&spec.common().id, Some(Budget::DEFAULT)).expect("stop");
 
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     assert!(
         !file.exists(),
@@ -1258,10 +1262,10 @@ fn uninstall_right_after_an_unwaited_stop_succeeds_and_the_next_sweep_takes_the_
     mgr.stop(&spec.common().id, Some(Budget::Immediate))
         .expect("request the stop");
 
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     running.wait_for_exit();
-    let retry = mgr.uninstall(&spec.common().id);
+    let retry = mgr.uninstall(&spec.common().id, RunInFlight::Stop);
     assert!(matches!(retry, Err(Error::NotInstalled { .. })), "{retry:?}");
     assert!(!file.exists(), "the sweep after the process exited removes it");
 }
@@ -1293,7 +1297,7 @@ fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file(#[fixtur
     assert!(matches!(moved, Outcome::Update { .. }), "{moved:?}");
 
     second
-        .uninstall(&a_spec.common().id)
+        .uninstall(&a_spec.common().id, RunInFlight::Stop)
         .expect("uninstall A, which does not wait for B");
 
     assert!(old.is_file(), "B's process still runs the first file");
@@ -1315,7 +1319,7 @@ fn uninstall_sweeps_the_default_folder_when_it_is_not_the_providers(#[fixture(sc
     theirs.install(&spec, false).expect("install in the default folder");
     assert!(default.is_dir());
 
-    ours.uninstall(&spec.common().id).expect("uninstall");
+    ours.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     assert!(!default.exists(), "the default folder is swept, and removed once empty");
 }
@@ -1334,7 +1338,7 @@ fn uninstall_leaves_a_folder_that_is_neither_the_default_nor_the_providers(#[fix
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     theirs.install(&spec, false).expect("install under the other folder");
 
-    ours.uninstall(&spec.common().id).expect("uninstall");
+    ours.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     assert!(
         shim_in(&folder).is_file(),
@@ -1350,7 +1354,7 @@ fn uninstall_retry_sweeps(#[fixture(scm_group)] _group: &Group) {
     let mgr = embedded_manager(Some(folder), CheckPermissions::Disable);
     let id = goetia::spec::Id::try_from(support::random_test_id().as_str()).expect("a test id is an Id");
 
-    let result = mgr.uninstall(&id);
+    let result = mgr.uninstall(&id, RunInFlight::Stop);
 
     assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
     assert!(!stray.exists(), "the retry sweeps");
@@ -1366,7 +1370,7 @@ fn uninstall_retry_checks_the_folder_as_the_manager_does(#[fixture(scm_group)] _
     let mgr = embedded_manager(Some(folder), CheckPermissions::Enable);
     let id = goetia::spec::Id::try_from(support::random_test_id().as_str()).expect("a test id is an Id");
 
-    let result = mgr.uninstall(&id);
+    let result = mgr.uninstall(&id, RunInFlight::Stop);
 
     assert!(matches!(result, Err(Error::FolderUnsafe { .. })), "{result:?}");
     assert!(stray.exists(), "a refused folder is not swept");

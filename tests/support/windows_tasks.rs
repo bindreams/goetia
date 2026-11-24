@@ -5,7 +5,7 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use goetia::backend::scm::manager::Scm;
 use goetia::manager::{ServiceManager as _, State, Status, TaskStatus};
@@ -125,6 +125,14 @@ impl ProcessHandle {
     pub fn has_exited(&self) -> bool {
         // SAFETY: the handle is live with `SYNCHRONIZE` access.
         unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+    }
+
+    /// Waits until the process has exited, with no cap: its exit is the state waited for, so a process that never
+    /// exits hangs the test. Returns at once for one that has.
+    pub fn wait_for_exit(&self) {
+        // SAFETY: the handle is live with `SYNCHRONIZE` access.
+        let waited = unsafe { WaitForSingleObject(self.0.as_raw_handle(), INFINITE) };
+        assert_eq!(waited, WAIT_OBJECT_0, "{}", std::io::Error::last_os_error());
     }
 }
 

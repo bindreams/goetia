@@ -71,6 +71,8 @@ pub use world_readable_exe::WorldReadableExe;
 // symptom is a straggler left behind rather than an error.
 
 pub const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
+/// Where systemd reads runtime unit files, which a stand-in for a left run is written to.
+pub const SYSTEMD_RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
 /// Where systemd keeps a `Persistent=yes` timer's stamp, `stamp-<id>.timer`.
 pub const SYSTEMD_STAMP_DIR: &str = "/var/lib/systemd/timers";
 pub const LAUNCHD_DAEMON_DIR: &str = "/Library/LaunchDaemons";

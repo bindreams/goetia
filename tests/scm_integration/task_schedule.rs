@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::error::Error;
-use goetia::manager::{Budget, Exit, ServiceManager as _, State};
+use goetia::manager::{Budget, Exit, RunInFlight, ServiceManager as _, State};
 use goetia::spec::{HashSeed, Schedule, User};
 use goetia::testing::{FIRING_SCHEDULES, cron_matches, task_run_times};
 use jiff::civil::{self, DateTime};
@@ -52,7 +52,7 @@ fn the_scheduler_fires_the_task_by_itself(#[fixture(scm_group)] _group: &Group) 
     assert_eq!(status.last_result, Some(Exit::Code(0)));
     assert!(status.last_run.is_some(), "{status:?}");
     mgr.disable(id).expect("disable");
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// A fire while a run is alive starts nothing (`IgnoreNew`): the run is the one that was there, and its
@@ -86,7 +86,7 @@ fn a_fire_during_a_run_starts_nothing(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(after.common.pid, pid, "the run that was there");
     assert!(!listener.connected_yet(), "no second program was started");
     mgr.stop(id, Some(Budget::DEFAULT)).expect("stop");
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// `disable` stops a repetition in progress: a disabled `* * * * *` task starts nothing at later boundaries.
@@ -160,7 +160,7 @@ fn start_of_a_disarmed_task_runs_it(#[fixture(scm_group)] _group: &Group) {
     let status = status_once_ended(&mgr, id);
     assert_eq!(status.last_result, Some(Exit::Code(0)));
     assert!(!status.common.enabled, "a start does not arm it");
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 /// A date no month has (`30 2`) cannot be written as a trigger, so it is a one-time trigger in the past:
@@ -182,7 +182,7 @@ fn a_date_no_month_has_is_installed_armed_and_never_fires(#[fixture(scm_group)] 
     assert_eq!(armed.last_run, None, "and nothing has run");
     let again = mgr.install(&spec, false).expect("install again");
     assert!(matches!(again, goetia::decide::Outcome::UpToDate), "{again:?}");
-    mgr.uninstall(id).expect("uninstall");
+    mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
 }
 
 // The run times =======================================================================================================
@@ -290,7 +290,7 @@ fn assert_runs_as_cron_says(texts: &[&str]) {
                 wrong.len()
             );
         }
-        mgr.uninstall(id).expect("uninstall");
+        mgr.uninstall(id, RunInFlight::Stop).expect("uninstall");
     }
 }
 

@@ -16,7 +16,7 @@ use goetia::Error;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
+use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 
 use crate::linux::{
@@ -409,7 +409,7 @@ fn a_stamp_left_by_uninstall_is_cleared_by_the_next_arm_of_the_id(#[fixture(syst
     let spec = task(&id, vec!["/bin/true".to_string()], Some(&schedule));
     mgr.install(&spec, false).expect("install");
     mgr.enable(&task_id).expect("enable");
-    mgr.uninstall(&task_id).expect("uninstall");
+    mgr.uninstall(&task_id, RunInFlight::Stop).expect("uninstall");
     assert!(stamp_path(&id).exists(), "systemd keeps the stamp: the precondition");
     plant_stale_stamp(&id);
 
@@ -473,7 +473,7 @@ fn a_timer_with_persistence_turned_off_still_arms_disarms_and_uninstalls(#[fixtu
     mgr.disable(&task_id).expect("disable");
     assert!(!task_status(&mgr, &task_id).common.enabled);
     mgr.enable(&task_id).expect("enable again");
-    mgr.uninstall(&task_id).expect("uninstall");
+    mgr.uninstall(&task_id, RunInFlight::Stop).expect("uninstall");
     assert!(!timer_path(&id).exists());
 }
 
@@ -839,7 +839,7 @@ fn uninstall_of_a_running_armed_task_stops_it_first(#[fixture(systemd_group)] _g
     let pid: u32 = main_pid(&id).parse().expect("a pid");
     assert_ne!(pid, 0, "the run has a process");
 
-    mgr.uninstall(&task_id).expect("uninstall");
+    mgr.uninstall(&task_id, RunInFlight::Stop).expect("uninstall");
 
     assert!(
         !Path::new(&format!("/proc/{pid}")).exists(),

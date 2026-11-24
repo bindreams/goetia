@@ -5,7 +5,7 @@ use crate::decide::{self, ExternalConfig, Outcome};
 use crate::error::Error;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::fake::{Fake, generate};
-use crate::manager::{Budget, Exit, Installed, ServiceManager, State, Step};
+use crate::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State, Step};
 use crate::spec::{DaemonFields, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
 use crate::testing::service_fields;
 
@@ -712,7 +712,7 @@ fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
     let mgr: &dyn ServiceManager = &fake;
     type Verb<'a> = (&'a str, &'a dyn Fn(&Id) -> Result<()>);
     let verbs: [Verb; 9] = [
-        ("uninstall", &|id| mgr.uninstall(id)),
+        ("uninstall", &|id| mgr.uninstall(id, RunInFlight::Stop)),
         ("enable", &|id| mgr.enable(id)),
         ("disable", &|id| mgr.disable(id)),
         ("start", &|id| mgr.start(id, budget).map(drop)),
@@ -901,7 +901,7 @@ fn single_verbs<'a>(
             "uninstall",
             Step::Uninstall,
             Budget::Unbounded,
-            Box::new(|| mgr.uninstall(id)),
+            Box::new(|| mgr.uninstall(id, RunInFlight::Stop)),
         ),
         (
             "request_start_after_stop",

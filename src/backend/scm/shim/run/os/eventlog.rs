@@ -1,7 +1,8 @@
 //! The Windows Event Log write behind [`Channels::event_log`](super::Channels::event_log).
 
 use windows_sys::Win32::System::EventLog::{
-    DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_WARNING_TYPE, RegisterEventSourceW, ReportEventW,
+    DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_INFORMATION_TYPE, EVENTLOG_WARNING_TYPE, RegisterEventSourceW,
+    ReportEventW,
 };
 
 use windows_sys::core::w;
@@ -24,6 +25,7 @@ pub(super) fn report(severity: Severity, message: &str) {
     let event_type = match severity {
         Severity::Error => EVENTLOG_ERROR_TYPE,
         Severity::Warning => EVENTLOG_WARNING_TYPE,
+        Severity::Information => EVENTLOG_INFORMATION_TYPE,
     };
     // SAFETY: `w!` yields a valid, null-terminated UTF-16 string with static lifetime.
     let handle = unsafe { RegisterEventSourceW(std::ptr::null(), w!("Goetia")) };

@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 
 use goetia::decide::Outcome;
 use goetia::error::Error;
-use goetia::manager::{Budget, Exit, ServiceManager as _, State};
+use goetia::manager::{Budget, Exit, RunInFlight, ServiceManager as _, State};
 use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 use goetia::testing::{shown_sid, sid_for_account_name, sid_of};
 
@@ -105,7 +105,8 @@ fn a_real_user_task_installs_arms_and_runs(#[fixture(scm_group)] _group: &Group)
     );
     listener.accept("the user's program to have run");
 
-    mgr.uninstall(id).expect("uninstall without the password");
+    mgr.uninstall(id, RunInFlight::Stop)
+        .expect("uninstall without the password");
     assert!(!task_exists(id));
     assert!(!records_of(id).exists());
 }
@@ -306,7 +307,7 @@ fn a_service_of_a_standard_account_leaves_no_folder_that_refuses_a_task_install(
         assert!(log.is_file(), "the shim of {account} opened {}", log.display());
         mgr.stop(&service, Some(Budget::DEFAULT))
             .unwrap_or_else(|e| panic!("stop the service as {account}: {}", e.report()));
-        mgr.uninstall(&service)
+        mgr.uninstall(&service, RunInFlight::Stop)
             .unwrap_or_else(|e| panic!("uninstall the service as {account}: {}", e.report()));
         assert!(log.is_file(), "an uninstall keeps {}", log.display());
 

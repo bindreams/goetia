@@ -54,10 +54,10 @@
 //!    the log directory stays root's, and one the account can write is the way for it to make root
 //!    append to any file. The unit `chdir`s into `cwd` after the switch, so `cwd` is the account's.
 //!    What is made is removed again, deepest first, unless the unit is in place when `write` ends.
-//! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
-//!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
-//!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's order puts
-//!    its timer first, so that nothing starts the job again: see the `task` module.
+//! 6. **Uninstall order** is stop (not with `--no-stop`: see `standin`) -> `systemctl disable` -> remove ->
+//!    `daemon-reload`. Disabling after the fragment is gone is impossible (no `[Install]` section left to
+//!    read), which would leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's
+//!    order puts its timer first, so that nothing starts the job again: see the `task` module.
 //! 7. **Absence is about the id, not about the fragment file.** `cli::uninstall` maps
 //!    [`Error::NotInstalled`] — and only that variant — to exit `0` and "nothing to do", so a
 //!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an
@@ -75,6 +75,7 @@ mod discover;
 mod journal;
 mod kill;
 mod run;
+mod standin;
 mod systemctl;
 mod task;
 mod write;
@@ -101,7 +102,7 @@ use crate::backend::{
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, State, Status, Step, flow};
+use crate::manager::{Budget, Installed, RunInFlight, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -215,6 +216,10 @@ impl Backend for Systemd {
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         dirs::ensure_parent_dirs(spec, scope)?;
+        // Over an installed job file a stand-in is stale and goes; with none it is the unit's definition, and one
+        // with a run in flight stays: systemd adopts the run under the new definition.
+        let over_job = snapshot.is_some_and(|old| old.service_text().is_some());
+        self.release_standin(spec.common().id.as_str(), over_job, reservation)?;
         match outcome {
             Outcome::Create => self.create_units(spec.common().id.as_str(), definition, reservation),
             Outcome::Update { .. } | Outcome::Stale { .. } => {
@@ -284,8 +289,14 @@ impl Backend for Systemd {
 
     /// A task, or a service with a timer of goetia's: the timer disarmed, the job stopped, the timer
     /// then the job removed. A plain service: stop, disable, remove, reload. See [`task`].
-    fn uninstall(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
-        self.uninstall_units(snapshot, reservation)
+    fn uninstall(&self, snapshot: Fragment, in_flight: RunInFlight, reservation: &mut Held) -> Result<()> {
+        self.uninstall_units(snapshot, in_flight, reservation)
+    }
+
+    /// What systemd keeps of an id nothing installed: a stand-in left by `uninstall --no-stop`, and a
+    /// definition whose file is gone: see [`standin`].
+    fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
+        self.uninstall_leftovers(id.as_str(), in_flight, &mut Held::default())
     }
 
     // `disable` is handed none and asks the gate for itself.

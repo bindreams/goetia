@@ -9,7 +9,7 @@ use goetia::backend::scm::wait::{Armed, Observed, QueriedState, ScmActor as _, S
 use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::conformance;
-use goetia::manager::{Budget, Installed, ServiceManager as _, State};
+use goetia::manager::{Budget, Installed, RunInFlight, ServiceManager as _, State};
 use goetia::shim::{CheckPermissions, StandaloneShim};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -157,7 +157,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "service should no longer exist:\n{query}");
