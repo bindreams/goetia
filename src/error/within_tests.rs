@@ -112,20 +112,17 @@ fn a_failure_said_within_a_context_by_a_target_is_still_a_failure_of_the_operati
     assert_eq!(plain.report().to_string(), "failed to kill `x`: stdout: denied");
 }
 
-/// The delivered signal is the chain's: a context said around the one that says it keeps the report from
-/// reading as a failed operation.
+/// A kill that signalled is the chain's: a context said around it keeps the report from reading as a failed
+/// operation.
 #[skuld::test]
-fn a_context_around_a_delivered_signal_still_says_it_was_delivered() {
+fn a_context_around_a_kill_that_signalled_still_says_it_was_signalled() {
     for source in [denied(), io::Error::other(Error::blob("carried"))] {
-        let wrapped = within(
-            "outer",
-            within_delivered("process 7 was signalled, but waiting failed", source),
-        );
+        let wrapped = within("outer", kill_unconfirmed(7, false, source));
 
         let report = target_failed("kill `x`", wrapped).report().to_string();
 
         assert!(
-            report.starts_with("kill `x`: outer: process 7 was signalled, but waiting failed: "),
+            report.starts_with("kill `x`: outer: process 7 was signalled, but goetia could not establish"),
             "{report}"
         );
     }
@@ -146,7 +143,7 @@ fn carried_in_each_payload(carried: fn() -> Error) -> Vec<(&'static str, io::Err
 }
 
 fn carries_error(e: &io::Error) -> bool {
-    look(e).carried.is_some()
+    look(e).is_some()
 }
 
 fn blob() -> Error {
@@ -210,23 +207,39 @@ fn an_indeterminate_error_is_indeterminate_in_whatever_payload_it_is_carried() {
     }
 }
 
-/// A delivered signal and a carried error are read from one look at the failure: the verdict is the same
-/// whatever the payload.
+/// A kill that signalled is told with no verdict on the kill and is indeterminate, in whatever payload it
+/// is carried, over whatever failed after the signal.
 #[skuld::test]
-fn a_delivered_signal_over_a_carried_error_in_whatever_payload_is_told_with_no_verdict() {
-    for (how, e) in carried_in_each_payload(in_doubt) {
-        let failed = target_failed(
-            "kill `x`",
-            within_delivered("process 7 was signalled, but waiting failed", e),
-        );
+fn a_kill_that_signalled_is_told_with_no_verdict_in_whatever_payload() {
+    for (how, e) in carried_in_each_payload(|| Error::KillUnconfirmed {
+        pid: 7,
+        exited: true,
+        source: Box::new(blob()),
+    }) {
+        let failed = target_failed("kill `x`", e);
+
         assert!(failed.is_indeterminate(), "{how}: {failed:?}");
-        assert!(
-            failed
-                .report()
-                .to_string()
-                .starts_with("kill `x`: process 7 was signalled, but waiting failed: "),
-            "{how}: {}",
-            failed.report()
+        assert_eq!(
+            failed.report().to_string(),
+            "kill `x`: process 7 was signalled and has exited, but goetia could not read the manager's record of \
+             it: blob: carried",
+            "{how}"
         );
     }
+}
+
+/// The failure after the signal is carried as the typed error `told` makes of it, and the kind is kept.
+#[skuld::test]
+fn what_failed_after_the_signal_is_carried_typed_with_its_kind() {
+    let e = kill_unconfirmed(7, false, io::Error::new(io::ErrorKind::TimedOut, "wait"));
+
+    assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+    let failed = target_failed("kill `x`", e);
+    let Error::Step { source, .. } = &failed else {
+        panic!("a step: {failed:?}");
+    };
+    let Error::KillUnconfirmed { source, .. } = &**source else {
+        panic!("the kill's variant: {failed:?}");
+    };
+    assert!(matches!(**source, Error::RawOs { .. }), "{source:?}");
 }

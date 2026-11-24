@@ -59,6 +59,11 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             shown: String::new(),
         },
+        Error::KillUnconfirmed {
+            pid: 1,
+            exited: false,
+            source: Box::new(not_installed()),
+        },
         Error::RunStateUnknown { id: id() },
         Error::RunUnrecorded {
             id: id(),
@@ -926,6 +931,33 @@ fn report_of_a_stop_that_cannot_tell_no_process_is_left() {
         .to_string(),
         "`x` may not have stopped: launchd shows its job with no process and no state"
     );
+}
+
+/// A kill whose signal was sent says which of the two things it could not establish: the exit, or (the
+/// process having exited) the manager's record of it. What failed is printed under it; the variant is
+/// indeterminate whatever that was.
+#[skuld::test]
+fn report_of_a_kill_that_signalled_says_which_wait_failed() {
+    for (exited, text) in [
+        (
+            false,
+            "process 7 was signalled, but goetia could not establish that it exited: daemon `x` is not installed",
+        ),
+        (
+            true,
+            "process 7 was signalled and has exited, but goetia could not read the manager's record of it: daemon `x` is not installed",
+        ),
+    ] {
+        let e = Error::KillUnconfirmed {
+            pid: 7,
+            exited,
+            source: Box::new(not_installed()),
+        };
+
+        assert!(e.is_indeterminate());
+        assert!(matches!(e.cause(), Error::KillUnconfirmed { .. }));
+        assert_eq!(e.report().to_string(), text);
+    }
 }
 
 #[skuld::test]

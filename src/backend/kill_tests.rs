@@ -690,15 +690,19 @@ fn a_failed_confirming_read_closes_the_process_and_signals_nothing() {
     );
 }
 
+/// What a failed wait for the exit says of process 100, which every test here signals: the signal was
+/// delivered and the exit is not established.
+const EXIT_UNCONFIRMED: &str = "process 100 was signalled, but goetia could not establish that it exited";
+
+/// What a failed wait for the manager's record says: the exit was confirmed.
+const RECORD_UNREAD: &str =
+    "process 100 was signalled and has exited, but goetia could not read the manager's record of it";
+
 /// What a failure after the signal reports: it was delivered, so the error must not read as a failed
 /// kill. The cause and its kind are kept.
-fn assert_signalled_but_unconfirmed(e: &io::Error, cause: &str, kind: io::ErrorKind) {
+fn assert_signalled_but_unconfirmed(e: &io::Error, lead: &str, cause: &str, kind: io::ErrorKind) {
     let text = crate::error::Chain(e).to_string();
-    assert!(text.contains("was signalled"), "{text}");
-    assert!(
-        text.contains("waiting for it to exit and for the manager to record that failed"),
-        "{text}"
-    );
+    assert!(text.starts_with(lead), "{text}");
     assert!(text.ends_with(cause), "{text}");
     assert!(!text.contains("kill failed"), "{text}");
     assert_eq!(e.kind(), kind);
@@ -711,7 +715,7 @@ fn a_failed_record_wait_after_the_signal_says_the_signal_was_delivered() {
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_signalled_but_unconfirmed(&e, "manager read failed", READ_FAILED_KIND);
+    assert_signalled_but_unconfirmed(&e, RECORD_UNREAD, "manager read failed", READ_FAILED_KIND);
     assert_eq!(
         target.log(),
         steps([
@@ -732,7 +736,7 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
 
     let e = kill_service(&mut target, ID).unwrap_err();
 
-    assert_signalled_but_unconfirmed(&e, "wait on the process failed", io::ErrorKind::Other);
+    assert_signalled_but_unconfirmed(&e, EXIT_UNCONFIRMED, "wait on the process failed", io::ErrorKind::Other);
     assert!(!target.log().contains(&"await_recorded 100".to_string()));
 }
 
@@ -741,14 +745,16 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
 /// is an established failure. The CLI exits `4`, not `1`.
 #[skuld::test]
 fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
-    for (what, target) in [
+    for (what, target, exited) in [
         (
             "the exit wait",
             Scripted::new([Some(100), Some(100)], [Open::Found]).failing_exit(),
+            false,
         ),
         (
             "the record wait",
             Scripted::new([Some(100), Some(100)], [Open::Found]).failing_recorded(),
+            true,
         ),
     ] {
         let mut target = target;
@@ -756,6 +762,10 @@ fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
         let failed = kill_failed(ID, kill_service(&mut target, ID).unwrap_err());
 
         assert!(failed.is_indeterminate(), "{what}: {failed:?}");
+        assert!(
+            matches!(failed.cause(), Error::KillUnconfirmed { pid: 100, exited: e, .. } if *e == exited),
+            "{what}: {failed:?}"
+        );
         #[cfg(feature = "cli")]
         assert_eq!(
             crate::cli::ExitCode::of(&failed),
@@ -765,40 +775,53 @@ fn a_failed_wait_after_the_signal_leaves_the_outcome_open() {
     }
 }
 
-/// An error of goetia's own under the signal context is open too, though it alone is an established
-/// failure; its variant stays the cause of the report.
+/// An error of goetia's own after the signal is open too, though it alone is an established failure: the
+/// cause is the kill's, which classifies, and the carried error is what the report prints under it. A
+/// caller matching on `cause()` does not find `UnitNotLoaded`: what failed after the signal does not say
+/// what the kill came to.
 #[skuld::test]
-fn a_determinate_error_after_the_signal_is_open_and_stays_the_cause() {
-    let alone = Error::UnitNotLoaded { unit: "x".to_string() };
-    assert!(!alone.is_indeterminate());
+fn a_determinate_error_after_the_signal_is_open_and_is_carried_under_the_cause() {
+    let alone = || Error::UnitNotLoaded { unit: "x".to_string() };
+    assert!(!alone().is_indeterminate());
 
-    let failed = kill_failed("x", signalled_but(7, io::Error::other(alone)));
+    for exited in [false, true] {
+        let failed = kill_failed("x", kill_unconfirmed(7, exited, io::Error::other(alone())));
 
-    assert!(failed.is_indeterminate(), "{failed:?}");
-    assert!(
-        failed.report().to_string().contains("LoadState=not-found"),
-        "{}",
-        failed.report()
-    );
+        assert!(failed.is_indeterminate(), "{failed:?}");
+        let Error::KillUnconfirmed { source, .. } = failed.cause() else {
+            panic!("the cause is the kill's: {failed:?}");
+        };
+        assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
+        assert!(
+            failed.report().to_string().contains("LoadState=not-found"),
+            "{}",
+            failed.report()
+        );
+    }
 }
 
-/// What a person reads: the signal was delivered and what failed after it; the OS code of the failed wait
-/// is kept for whoever reads it.
+/// What a person reads, for each wait: the signal was delivered, and either the exit is not established, or
+/// the process exited and only the manager's record could not be read. The OS code of the failed wait is
+/// kept for whoever reads it.
 #[skuld::test]
-fn a_failed_wait_after_the_signal_is_reported_as_one_whose_outcome_is_unknown() {
+fn a_failed_wait_after_the_signal_says_which_wait_failed() {
     const CODE: i32 = 1722;
-    let failed = kill_failed(ID, signalled_but(100, io::Error::from_raw_os_error(CODE)));
+    let os = io::Error::from_raw_os_error(CODE);
+    for (exited, lead) in [
+        (
+            false,
+            "process 100 was signalled, but goetia could not establish that it exited",
+        ),
+        (
+            true,
+            "process 100 was signalled and has exited, but goetia could not read the manager's record of it",
+        ),
+    ] {
+        let failed = kill_failed(ID, kill_unconfirmed(100, exited, io::Error::from_raw_os_error(CODE)));
 
-    assert_eq!(failed.raw_os_error(), Some(CODE));
-    assert_eq!(
-        failed.report().to_string(),
-        format!(
-            "kill `{ID}`: process 100 was signalled, but waiting for it to exit and for the manager to record \
-             that failed: `kill process 100` reached the service manager, but goetia lost track of it before \
-             its outcome was confirmed: {}",
-            io::Error::from_raw_os_error(CODE)
-        )
-    );
+        assert_eq!(failed.raw_os_error(), Some(CODE));
+        assert_eq!(failed.report().to_string(), format!("kill `{ID}`: {lead}: {os}"));
+    }
 }
 
 /// A process that was never signalled keeps the plain error: it is not a signalled one.
@@ -1032,12 +1055,12 @@ fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
     let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
     for (e, lead) in [
         (
-            signalled_but(7, io::Error::other("wait failed")),
-            "kill `x`: process 7 was signalled, but waiting",
+            kill_unconfirmed(7, false, io::Error::other("wait failed")),
+            "kill `x`: process 7 was signalled, but goetia could not establish",
         ),
         (
-            signalled_but(7, wrapped()),
-            "kill `x`: process 7 was signalled, but waiting",
+            kill_unconfirmed(7, true, wrapped()),
+            "kill `x`: process 7 was signalled and has exited",
         ),
         (
             not_signalled(7, io::Error::other("terminate failed")),
@@ -1059,36 +1082,22 @@ fn only_a_delivered_signal_keeps_the_report_from_reading_as_a_failed_kill() {
     }
 }
 
-/// A failure of goetia's own after the signal was delivered is told under a step that says the signal was
-/// delivered, under the kill, as the failure of a request goetia lost track of, which keeps it as its
-/// source; one that came before the signal is the step's source itself.
+/// A failure of goetia's own that came before the signal is the step's source itself, so a caller matching
+/// on `cause()` finds it.
 #[skuld::test]
-fn a_wrapped_error_under_a_signal_context_is_the_steps_source_or_the_in_doubt_requests() {
-    let wrapped = || io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
-    for (e, kill_what, context, is_source) in [
-        (
-            signalled_but(7, wrapped()),
-            "kill `x`",
-            "was signalled",
-            (|source| matches!(source, Error::RequestInDoubt { .. })) as fn(&Error) -> bool,
-        ),
-        (
-            not_signalled(7, wrapped()),
-            "failed to kill `x`",
-            "signalling it failed",
-            |source| matches!(source, Error::UnitNotLoaded { .. }),
-        ),
-    ] {
-        let failed = kill_failed("x", e);
+fn a_wrapped_error_before_the_signal_is_the_cause_of_the_failed_kill() {
+    let wrapped = io::Error::other(Error::UnitNotLoaded { unit: "x".to_string() });
 
-        let Error::Step { what: kill, source } = &failed else {
-            panic!("a step: {failed:?}");
-        };
-        let Error::Step { what, source } = &**source else {
-            panic!("a step under the kill: {failed:?}");
-        };
-        assert_eq!(kill, kill_what);
-        assert!(what.contains(context), "{what}");
-        assert!(is_source(source), "{source:?}");
-    }
+    let failed = kill_failed("x", not_signalled(7, wrapped));
+
+    let Error::Step { what: kill, source } = &failed else {
+        panic!("a step: {failed:?}");
+    };
+    let Error::Step { what, source } = &**source else {
+        panic!("a step under the kill: {failed:?}");
+    };
+    assert_eq!(kill, "failed to kill `x`");
+    assert!(what.contains("signalling it failed"), "{what}");
+    assert!(matches!(**source, Error::UnitNotLoaded { .. }), "{source:?}");
+    assert!(matches!(failed.cause(), Error::UnitNotLoaded { .. }), "{failed:?}");
 }

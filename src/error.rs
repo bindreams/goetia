@@ -28,7 +28,7 @@ pub(crate) use report::find;
 #[cfg(windows)]
 pub(crate) use report::os_error_in;
 pub(crate) use report::{Chain, Pieces};
-pub(crate) use within::{target_failed, unread_after_open_refused, within, within_delivered};
+pub(crate) use within::{kill_unconfirmed, target_failed, unread_after_open_refused, within};
 
 use report::Report;
 
@@ -166,6 +166,21 @@ pub enum Error {
     /// sentence.
     #[error("`{id}` may not have stopped: {shown}")]
     StopUnconfirmed { id: String, shown: String },
+
+    /// A `kill` signalled the service's process `pid`, through its hold, and a wait after the signal failed:
+    /// `exited` is `false` when the wait for the process to exit did, so that whether it exited is not
+    /// established, and `true` when the process exited and the wait for the manager's record of that did.
+    /// The signal stands, so the kill is not a failed one, and the failure under it, `source`, does not say
+    /// what the kill came to, whatever it is on its own: this is indeterminate (exit `4`) by its own arm,
+    /// and no wrapper, so [`cause`](Error::cause) stops here. Like
+    /// [`StopUnconfirmed`](Error::StopUnconfirmed), it says what is known and not what failed.
+    #[error("{}", kill_unconfirmed_message(*pid, *exited))]
+    KillUnconfirmed {
+        pid: u32,
+        exited: bool,
+        #[source]
+        source: Box<Error>,
+    },
 
     /// launchd cannot update a loaded job, so the changed definition was not installed. `kind` is the
     /// kind of the loaded job: a service is refused while it is loaded at all, a task only while it
@@ -866,6 +881,7 @@ impl Error {
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. }
             | Error::StopUnconfirmed { .. }
+            | Error::KillUnconfirmed { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunUnrecorded { .. } => true,
             wrapper!(source)
@@ -1089,6 +1105,7 @@ impl Error {
             | Error::NotStarted { .. }
             | Error::StartUnconfirmed { .. }
             | Error::StopUnconfirmed { .. }
+            | Error::KillUnconfirmed { .. }
             | Error::LoadedJob { .. }
             | Error::PutBackBlocked { .. }
             | Error::InvalidPassword { .. }
@@ -1449,6 +1466,15 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
         format!(
             "`{request}` may have started before it failed, so it may or may not have reached the service manager{note}"
         )
+    }
+}
+
+/// [`Error::KillUnconfirmed`]'s message: what is known of a process that was signalled.
+fn kill_unconfirmed_message(pid: u32, exited: bool) -> String {
+    if exited {
+        format!("process {pid} was signalled and has exited, but goetia could not read the manager's record of it")
+    } else {
+        format!("process {pid} was signalled, but goetia could not establish that it exited")
     }
 }
 

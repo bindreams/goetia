@@ -20,7 +20,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::error::{
-    Error, Pieces, target_failed, terminating_failed, unread_after_open_refused, within, within_delivered,
+    Error, Pieces, kill_unconfirmed, target_failed, terminating_failed, unread_after_open_refused, within,
 };
 use crate::manager::budget::{Budget, Deadline};
 
@@ -54,9 +54,11 @@ pub enum KillOutcome {
 /// The failure of a kill of `id`, as the verb reports it: a [`Step`](Error::Step) around the error the
 /// failure carries, or an OS failure of the kill. A target that talks to a manager through calls that fail
 /// with goetia's own [`Error`] wraps it in an [`io::Error`] to pass it through [`KillTarget`]; it is the
-/// step's source, with its class, so a caller matching on `NoManager` or `Command` finds it with
-/// [`Error::cause`]. A failure after the signal was delivered ([`signalled_but`]) is told under the kill
-/// with no claim that the kill failed. Any other error is an OS failure of the kill.
+/// step's source, with its class, so before the signal a caller matching on `NoManager` or `Command` finds it
+/// with [`Error::cause`]. A failure of a wait after the signal was delivered ([`kill_unconfirmed`]: the
+/// process may well have exited) is an [`Error::KillUnconfirmed`] under the kill, with no claim that the
+/// kill failed: it is indeterminate, and its cause is itself, not what failed after the signal, which it
+/// carries as its source. Any other error is an OS failure of the kill.
 pub(crate) fn kill_failed(id: &str, e: io::Error) -> Error {
     target_failed(format!("kill `{id}`"), e)
 }
@@ -199,11 +201,11 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
         Ok(Some(Hold::Held { pid, process })) => {
             target.force_end(&process).map_err(|e| not_signalled(pid, e))?;
             wait_saying(target, &waiting_notice(id, pid, None), |t, d| t.await_exit(&process, d))
-                .map_err(|e| signalled_but(pid, e))?;
+                .map_err(|e| kill_unconfirmed(pid, false, e))?;
             wait_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, Some(&process), d)
             })
-            .map_err(|e| signalled_but(pid, e))?;
+            .map_err(|e| kill_unconfirmed(pid, true, e))?;
             Ok(KillOutcome::Ended)
         }
     }
@@ -344,26 +346,6 @@ impl From<HoldError> for io::Error {
             ),
         }
     }
-}
-
-/// `e`, an error from the waits after the signal to `pid` was delivered: the error must not read as a
-/// failed kill, and it does not say the kill failed, for the process may well have exited. It is a
-/// request goetia lost track of ([`Error::RequestInDoubt`], reached), whatever `e` is on its own, so the
-/// kill exits `4`; `e`'s kind and OS code are kept.
-fn signalled_but(pid: u32, e: io::Error) -> io::Error {
-    let kind = e.kind();
-    within_delivered(
-        format!("process {pid} was signalled, but waiting for it to exit and for the manager to record that failed"),
-        io::Error::new(
-            kind,
-            Error::RequestInDoubt {
-                request: format!("kill process {pid}"),
-                reached: true,
-                note: None,
-                source: Box::new(e),
-            },
-        ),
-    )
 }
 
 /// `e`, the failure to signal the process `pid`, which was held and confirmed as the daemon's: the

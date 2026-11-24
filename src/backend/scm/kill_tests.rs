@@ -532,9 +532,10 @@ fn a_kill_is_done_when_scm_reports_a_new_pid() {
 /// read as a failed kill. The cause and its kind are kept.
 fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str, kind: io::ErrorKind) {
     let text = crate::error::Chain(e).to_string();
-    assert!(text.contains("was signalled"), "{text}");
     assert!(
-        text.contains("waiting for it to exit and for the manager to record that failed"),
+        text.starts_with(
+            "process 100 was signalled and has exited, but goetia could not read the manager's record of it"
+        ),
         "{text}"
     );
     assert!(text.ends_with(cause), "{text}");

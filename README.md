@@ -2039,6 +2039,9 @@ ends the wait and the signal stands. On every platform, when the process has sti
 not exited a second after it was signalled, goetia prints
 `<id>: waiting for process <pid> to exit` to stderr.
 
+A failure after the signal was sent exits `4`, and the error says whether the process's exit is not
+established or the process exited and only the manager's record of it could not be read.
+
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed. A launchd task whose
 start launchd has accepted and not yet forked (`goetia daemon start`, then
