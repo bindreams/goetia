@@ -300,8 +300,9 @@ records the end as it does.
     that never has a console is asked again, about once a second, until `goetia daemon kill`.
   - `stop` and `restart` wait the `timeout` plus 10 s, as above. `uninstall` waits up to the `timeout`
     too, holding the machine-wide install lock as it does for any stop, so an `install` or `uninstall` of
-    another daemon waits behind it, saying on stderr what it waits for. For `timeout: null` and a tree that never exits it waits until
-    `goetia daemon kill` ends the daemon; a `stop --timeout` ends only goetia's own wait.
+    another daemon waits behind it, saying on stderr that it waits for the lock. The uninstall, for
+    `timeout: null` and a tree that never exits, waits until `goetia daemon kill` ends the daemon; a
+    `stop --timeout` ends only goetia's own wait.
   - The service reports `STOP_PENDING` with a wait hint that covers the `timeout` and the teardown (the
     largest value the field holds for `null`); SCM does nothing when a hint runs out.
   - A program that hosts the shim itself calls `goetia::shim::init_host()` first in its `main` (see
@@ -1265,6 +1266,10 @@ could not parse.
 **The invariant:** whenever `--json` is given together with a subcommand
 that clap accepted, stdout is exactly one JSON document, and nothing else.
 Warnings and human-readable errors go to stderr.
+So do notices from a command that goes on to succeed: on Windows, a command
+that has to wait for the machine-wide install lock writes
+``waiting for the install lock `Global\goetia-shim` to be released`` each time
+it waits, and then waits for as long as the holder keeps it.
 
 The carve-out is what clap short-circuits before goetia's dispatcher runs:
 `--json --help` and `--json --version` print their own text and exit `0`,

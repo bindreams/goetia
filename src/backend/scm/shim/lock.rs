@@ -9,7 +9,7 @@
 //! any install does. The refusal above is all the defence there is: a global name specific enough
 //! to avoid an accidental collision needs none against a deliberate one, as with an environment
 //! variable.
-use std::io;
+use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
@@ -40,8 +40,9 @@ pub(crate) struct InstallLock {
 
 impl InstallLock {
     /// Takes the lock, waiting for whoever holds it, with no bound: the holder's release is the
-    /// event. A caller that has to wait says so once on stderr, naming the lock, before it waits. A
-    /// lock whose holder died is taken all the same (`WAIT_ABANDONED`): what it guarded is verified by
+    /// event. Each time it has to wait, however briefly, it says so on stderr first, naming the lock
+    /// (a failed write is ignored), so a command that takes the lock twice can say so twice. A lock
+    /// whose holder died is taken all the same (`WAIT_ABANDONED`): what it guarded is verified by
     /// whoever takes it, not assumed from it. A lock that exists and belongs to an account other than
     /// SYSTEM, Administrators or TrustedInstaller is [`Error::ShimLockForeign`], before any wait.
     pub(crate) fn acquire() -> Result<Self> {
@@ -74,9 +75,16 @@ impl InstallLock {
 }
 
 /// What a command that has to wait for the lock says on stderr, as the removal of run records says what it
-/// waits for: the library has no channel for a notice.
+/// waits for: the library has no channel for a notice. It claims no holder: any program that embeds the
+/// library, or another thread, can hold the lock.
 fn waiting_for_lock() {
-    eprintln!("waiting for the install lock `{NAME}`, held by another goetia command; going on when it has finished");
+    say_waiting(&mut io::stderr());
+}
+
+/// [`waiting_for_lock`] written to `out`. A failed write is ignored, as for a warning: this notice is
+/// written where nothing may fail for it (a closed stderr must not turn a wait that succeeds into a panic).
+fn say_waiting(out: &mut impl Write) {
+    let _ = writeln!(out, "waiting for the install lock `{NAME}` to be released");
 }
 
 /// Takes `mutex`: at once if nobody holds it (or its holder died, `WAIT_ABANDONED`), else after calling

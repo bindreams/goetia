@@ -145,6 +145,37 @@ fn open_lock() -> OwnedHandle {
     unsafe { OwnedHandle::from_raw_handle(raw) }
 }
 
+/// The note names the lock and says the command waits for its release: nothing of who holds it, which
+/// the waiter does not know.
+#[skuld::test]
+fn the_note_names_the_lock_and_claims_no_holder() {
+    let mut out = Vec::new();
+
+    say_waiting(&mut out);
+
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "waiting for the install lock `Global\\goetia-shim` to be released\n"
+    );
+}
+
+/// A stderr that cannot be written (a closed or broken pipe) does not fail the wait: `eprintln!` would
+/// panic on it, in an `uninstall` that has removed the records already, or in a cleanup guard's `Drop`.
+#[skuld::test]
+fn a_note_that_cannot_be_written_is_dropped() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    say_waiting(&mut Broken);
+}
+
 /// A mutex of the test's own, with no name and so no system state: [`take`] is the lock's wait, whichever
 /// mutex it waits on.
 fn private_mutex() -> OwnedHandle {

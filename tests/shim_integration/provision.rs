@@ -6,9 +6,10 @@
 //! `%ProgramFiles%\Goetia` for their length: each empties it first and removes it after, and
 //! `UNIT_DIR_EXCLUSIVE` keeps them from running beside each other.
 
+use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, mpsc};
 
 use goetia::backend::scm::manager::Scm;
@@ -883,6 +884,34 @@ fn lock_is_exclusive(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(free, WAIT_OBJECT_0, "a finished install must release the lock");
     // SAFETY: taken by this thread just above.
     assert_ne!(unsafe { ReleaseMutex(lock.as_raw_handle()) }, 0);
+}
+
+/// A `goetia` that has to wait for the lock an install holds says so on stderr before it waits. The child is
+/// an `uninstall` of an id that is not installed, which takes the lock for its sweep. The install is let go
+/// only once the child's note has been read, so the child cannot have finished without waiting; a child that
+/// ends with no note ends the stream, and the assertion fails.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_goetia_waiting_for_the_install_lock_says_so_on_stderr(#[fixture(scm_group)] _group: &Group) {
+    let mut child = None;
+    probing_the_lock_during_an_install(|_lock| {
+        let spawned = Command::new(env!("CARGO_BIN_EXE_goetia"))
+            .args(["daemon", "uninstall", &support::random_test_id()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn goetia: {e}"));
+        let child = child.insert(spawned);
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let said = BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+            .find(|line| line.contains(r"Global\goetia-shim"));
+        assert!(said.is_some(), "the child ended without saying what it waits for");
+    });
+
+    // The install has let go, so the child has the lock and ends.
+    child.expect("the probe ran").wait().expect("wait for the child");
 }
 
 /// The DACL of the kernel object `handle` (open with `READ_CONTROL`): whether it is protected, and
