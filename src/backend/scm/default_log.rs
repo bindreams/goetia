@@ -11,19 +11,15 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt as _;
-use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 
 use windows_service::service::ServiceState;
 use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, STATUS_DELETE_PENDING};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_STANDARD_INFO, FileStandardInfo,
-    GetFileInformationByHandleEx,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, STATUS_DELETE_PENDING};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES};
 
 use super::folder::logs_folder;
-use super::link::is_link;
+use super::link::{is_link, standard_info};
 use super::runs::dir::{Dir, SHARE_ALL};
 use super::shim::acl::{DEFAULT_LOG_ACCESS, Descriptor, ObjectId, index_at};
 use super::sid::{Sid, distinct};
@@ -337,19 +333,7 @@ fn lies_in(path: &Path, folder: ObjectId) -> Result<bool> {
 /// file at the same path. A file that was only moved is not deleted: the handle follows it. `file` must have
 /// been opened for `FILE_READ_ATTRIBUTES`, as [`open_for_append`] does.
 pub(crate) fn is_deleted(file: &File) -> io::Result<bool> {
-    let mut info = FILE_STANDARD_INFO::default();
-    // SAFETY: `info` is `size_of::<FILE_STANDARD_INFO>()` writable bytes; the handle is live.
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileStandardInfo,
-            (&raw mut info).cast(),
-            size_of::<FILE_STANDARD_INFO>() as u32,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let info = standard_info(file)?;
     Ok(info.DeletePending || info.NumberOfLinks == 0)
 }
 

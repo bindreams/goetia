@@ -32,6 +32,33 @@ fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     }
 }
 
+/// The SID the check of a service's own log trusts is found by lookups alone, and for an account that has no
+/// service yet: LocalSystem, a built-in and a virtual account by the SID the system computes for them, a `user.id`
+/// as it was written, and a real user by the check that it is a user account.
+#[skuld::test]
+fn a_services_account_sid_for_the_check_is_found_without_the_service() {
+    use crate::backend::scm::sid::{sid_display, sid_from_parts};
+    use crate::elevation::test_support::process_user_sid;
+
+    let sid = |account: Option<&str>, written| service_account_for_check(&dummy_reg(account), written).unwrap();
+    assert_eq!(sid(None, None), sid_from_parts(5, &[18]));
+    assert_eq!(sid(Some(r"NT AUTHORITY\LocalService"), None), sid_from_parts(5, &[19]));
+    let virtual_account = sid(Some(r"NT SERVICE\goetia-not-installed-yet"), None);
+    assert_eq!(
+        (virtual_account[7], virtual_account[1]),
+        (5, 6),
+        "S-1-5-80-... with five more"
+    );
+
+    let token = process_user_sid();
+    let written = sid_display(&token);
+    let name = identity::account_name_of_sid(&token).expect("the token user has a name");
+    match service_account_for_check(&dummy_reg(Some(&name)), Some(identity::Written::Sid(&written))) {
+        Ok(found) => assert_eq!(found, token),
+        Err(refused) => assert!(refused.to_string().contains("is not a user account"), "{refused}"),
+    }
+}
+
 #[skuld::test]
 fn map_state_maps_running_and_stopped_directly() {
     assert_eq!(map_state(WinState::Running), State::Running);

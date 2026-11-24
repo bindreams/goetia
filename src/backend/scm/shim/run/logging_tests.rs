@@ -23,7 +23,7 @@ fn appended_default(path: &Path, ok: bool) -> ChannelCall {
     appended(path, LogKind::Default, ok)
 }
 
-/// The daemon's own `logs` path, whose folders are the user's to name and so are made.
+/// The daemon's own `logs` path, whose folder the user names and `install` judged: the shim makes the file only.
 fn appended_own(path: &Path, ok: bool) -> ChannelCall {
     appended(path, LogKind::Own, ok)
 }

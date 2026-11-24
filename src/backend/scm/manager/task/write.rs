@@ -67,6 +67,16 @@ pub(super) fn well_known_sid(sid: &str) -> Result<Sid> {
     }
 }
 
+/// The SID of the account a task runs as, for the check of its own log: a well-known account's ([`well_known_sid`]),
+/// or the SID that [`identity::require_user_account`] finds for a real user. A lookup only: no right is granted, no
+/// password read, no event source registered, as [`prepare`] does.
+pub(in crate::backend::scm) fn task_account_sid(account: &TaskAccount, written: Option<Written<'_>>) -> Result<Sid> {
+    match account {
+        TaskAccount::Service(sid) => well_known_sid(sid),
+        TaskAccount::User(name) => identity::require_user_account(name, written).map(|user| user.sid().clone()),
+    }
+}
+
 /// The password a registration of a task that runs as `account` logs on with: a real user's, read by
 /// `read` (`GOETIA_SERVICE_PASSWORD`); never any for a service account, so that a value left over from
 /// installing another daemon cannot reach a built-in account, which Windows refuses one for.

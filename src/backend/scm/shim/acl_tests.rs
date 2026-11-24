@@ -10,7 +10,6 @@ const MODIFY: u32 = 0x13_01BF;
 /// `icacls` (RX), which is not `FILE_GENERIC_EXECUTE` alone.
 pub(super) const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 const GENERIC_READ_EXECUTE: u32 = GENERIC_READ | GENERIC_EXECUTE;
-const FILE_ADD_FILE: u32 = 0x2;
 const FILE_WRITE_EA: u32 = 0x10;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
 
@@ -57,7 +56,7 @@ fn object(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
         path: PathBuf::from(path),
         owner,
         protected: false,
-        directory: true,
+        kind: ObjectKind::Folder,
         dacl: Some(dacl),
     }
 }
@@ -65,9 +64,22 @@ fn object(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
 /// `object`, as a file.
 fn file(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
     ObjectSecurity {
-        directory: false,
+        kind: ObjectKind::File,
         ..object(path, owner, dacl)
     }
+}
+
+/// `object`, as the folder a daemon's own log is made in.
+fn log_folder(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
+    ObjectSecurity {
+        kind: ObjectKind::LogFolder,
+        ..object(path, owner, dacl)
+    }
+}
+
+/// The account a test daemon runs as: a local user, none of the fixed three.
+fn daemon() -> Sid {
+    sid_from_parts(5, &[21, 1, 2, 3, 1001])
 }
 
 /// The stock shim file, as a provider creates it.
@@ -144,17 +156,17 @@ fn stock_chain() -> Vec<ObjectSecurity> {
 }
 
 fn refused(chain: &[ObjectSecurity]) -> Unsafe {
-    verdict(chain).expect_err("the chain must be refused")
+    verdict(chain, None).expect_err("the chain must be refused")
 }
 
 #[skuld::test]
 fn the_stock_program_files_chain_is_accepted() {
-    assert!(verdict(&stock_chain()).is_ok());
+    assert!(verdict(&stock_chain(), None).is_ok());
 }
 
 #[skuld::test]
 fn a_target_that_is_an_existing_stock_folder_is_judged_as_one() {
-    assert!(verdict(&[stock_program_files(), stock_root()]).is_ok());
+    assert!(verdict(&[stock_program_files(), stock_root()], None).is_ok());
 }
 
 #[skuld::test]
@@ -165,7 +177,7 @@ fn an_account_that_may_only_add_files_is_accepted() {
         .as_mut()
         .unwrap()
         .push(allow(users(), FILE_ADD_FILE | FILE_APPEND_DATA, OI_CI));
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
@@ -177,12 +189,12 @@ fn an_untrusted_account_with_only_generic_write_is_accepted() {
         .as_mut()
         .unwrap()
         .push(allow(users(), GENERIC_WRITE, OI_CI));
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
 fn the_stock_host_file_and_its_folders_are_accepted() {
-    assert!(verdict(&stock_host_chain()).is_ok());
+    assert!(verdict(&stock_host_chain(), None).is_ok());
 }
 
 #[skuld::test]
@@ -216,7 +228,7 @@ fn a_file_whose_extended_attributes_and_attributes_alone_can_be_written_is_accep
         .as_mut()
         .unwrap()
         .push(allow(users(), FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES, 0));
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
@@ -227,14 +239,14 @@ fn delete_child_means_nothing_on_a_file() {
         .as_mut()
         .unwrap()
         .push(allow(users(), FILE_DELETE_CHILD, 0));
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
 fn an_inherit_only_ace_on_a_file_grants_nothing() {
     let mut chain = stock_host_chain();
     chain[0].dacl.as_mut().unwrap().push(allow(users(), FULL, OI_CI_IO));
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
@@ -293,7 +305,7 @@ fn a_file_the_chain_reaches_through_a_link_is_judged_as_a_file() {
 fn an_inherit_only_ace_grants_nothing_to_the_object_it_is_on() {
     let mut chain = stock_chain();
     chain[0].dacl.as_mut().unwrap().push(allow(users(), FULL, OI_CI_IO));
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
@@ -307,7 +319,7 @@ fn trusted_accounts_may_do_anything() {
             allow(trusted_installer(), FULL, 0),
         ],
     )];
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
@@ -415,7 +427,7 @@ fn a_conditional_entry_is_judged_as_a_plain_one() {
     assert_eq!(refused(&with(conditional(true))), plain);
     assert_eq!(plain.right, CHANGE_PERMISSIONS_OF);
     assert_eq!(plain.account, users());
-    assert!(verdict(&with(conditional(false))).is_ok());
+    assert!(verdict(&with(conditional(false)), None).is_ok());
 }
 
 /// An untrusted account's entry granting `WRITE_DAC`.
@@ -446,13 +458,16 @@ fn the_masks_and_phrases_are_these_literals() {
     assert_eq!(DELETE_OR_RENAME, "delete or rename");
     assert_eq!(DELETE_OR_RENAME_ENTRIES_IN, "delete or rename entries in");
     assert_eq!(WRITE_TO, "write to");
+    assert_eq!(ADD_ENTRIES_TO, "add entries to");
+    assert_eq!(FILE_ADD_FILE, 0x2);
+    assert_eq!(FILE_ADD_SUBDIRECTORY, 0x4);
 }
 
 #[skuld::test]
 fn a_deny_ace_alone_refuses_nothing() {
     let mut chain = stock_chain();
     chain[0].dacl.as_mut().unwrap().insert(0, deny(users(), FULL, 0));
-    assert!(verdict(&chain).is_ok());
+    assert!(verdict(&chain, None).is_ok());
 }
 
 #[skuld::test]
@@ -461,6 +476,137 @@ fn the_nearest_object_to_the_target_is_reported_first() {
     chain[2].owner = users();
     chain[1].owner = users();
     assert_eq!(refused(&chain).path, PathBuf::from(r"C:\Program Files"));
+}
+
+// The daemon's account and the folder a daemon's own log is made in ---------------------------------------------------
+
+/// `C:\Logs\app` as an administrator makes it for a daemon: nobody but SYSTEM and Administrators holds
+/// anything, and what is made in it inherits that.
+fn stock_log_folder() -> ObjectSecurity {
+    log_folder(
+        r"C:\Logs\app",
+        administrators(),
+        vec![allow(system(), FULL, OI_CI), allow(administrators(), FULL, OI_CI)],
+    )
+}
+
+/// The log's own folder first, then the folders above it.
+fn log_chain() -> Vec<ObjectSecurity> {
+    vec![stock_log_folder(), stock_root()]
+}
+
+#[skuld::test]
+fn the_daemons_account_is_trusted_beside_the_fixed_three() {
+    let mut chain = stock_chain();
+    chain[0].owner = daemon();
+    chain[0].dacl.as_mut().unwrap().push(allow(daemon(), FULL, OI_CI));
+
+    assert!(verdict(&chain, Some(&daemon())).is_ok());
+    let refusal = refused_by(&chain, None);
+    assert_eq!((refusal.right, refusal.account), (OWN, daemon()));
+}
+
+#[skuld::test]
+fn only_the_daemons_own_account_is_credited_and_no_one_in_its_group() {
+    let mut chain = stock_chain();
+    chain[0].dacl.as_mut().unwrap().push(allow(users(), WRITE_DAC, 0));
+
+    let refusal = refused_by(&chain, Some(&daemon()));
+
+    assert_eq!(refusal.account, users());
+    assert_eq!(refusal.right, CHANGE_PERMISSIONS_OF);
+}
+
+#[skuld::test]
+fn a_log_folder_refuses_each_right_that_adds_an_entry_to_an_untrusted_account() {
+    let cases = [
+        FILE_ADD_FILE,
+        FILE_ADD_SUBDIRECTORY,
+        FILE_ADD_FILE | FILE_APPEND_DATA,
+        GENERIC_WRITE,
+    ];
+    for mask in cases {
+        let mut chain = log_chain();
+        chain[0].dacl.as_mut().unwrap().push(allow(users(), mask, OI_CI));
+        let refusal = refused_by(&chain, Some(&daemon()));
+        assert_eq!(refusal.right, ADD_ENTRIES_TO, "mask {mask:#x}");
+        assert_eq!(refusal.account, users(), "mask {mask:#x}");
+        assert_eq!(refusal.path, PathBuf::from(r"C:\Logs\app"), "mask {mask:#x}");
+    }
+}
+
+/// Where an account may add files, a folder is fine for an ordinary one and not for the log's own.
+#[skuld::test]
+fn the_same_entry_is_refused_in_the_logs_folder_and_accepted_in_a_folder_above_it() {
+    let add = allow(users(), FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY, OI_CI);
+    let mut chain = log_chain();
+    chain[1].dacl.as_mut().unwrap().push(add.clone());
+    assert!(verdict(&chain, Some(&daemon())).is_ok());
+
+    chain[0].dacl.as_mut().unwrap().push(add);
+    assert_eq!(refused_by(&chain, Some(&daemon())).right, ADD_ENTRIES_TO);
+}
+
+#[skuld::test]
+fn a_log_folder_lets_the_daemon_and_the_fixed_three_add_entries() {
+    let mut chain = log_chain();
+    let dacl = chain[0].dacl.as_mut().unwrap();
+    for account in [daemon(), system(), administrators(), trusted_installer()] {
+        dacl.push(allow(account, MODIFY, OI_CI));
+    }
+    assert!(verdict(&chain, Some(&daemon())).is_ok());
+    assert_eq!(refused_by(&chain, None).account, daemon());
+}
+
+#[skuld::test]
+fn a_log_folder_is_still_refused_for_every_right_any_folder_is() {
+    let cases = [
+        (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+        (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+        (DELETE, DELETE_OR_RENAME),
+        (FILE_DELETE_CHILD, DELETE_OR_RENAME_ENTRIES_IN),
+        // The right to add entries is reported last.
+        (FILE_ADD_FILE | WRITE_DAC, CHANGE_PERMISSIONS_OF),
+    ];
+    for (mask, right) in cases {
+        let mut chain = log_chain();
+        chain[0].dacl.as_mut().unwrap().push(allow(users(), mask, 0));
+        assert_eq!(refused_by(&chain, Some(&daemon())).right, right, "mask {mask:#x}");
+    }
+    let mut chain = log_chain();
+    chain[0].owner = users();
+    assert_eq!(refused_by(&chain, Some(&daemon())).right, OWN);
+    let mut chain = log_chain();
+    chain[0].dacl = None;
+    assert_eq!(refused_by(&chain, Some(&daemon())).right, DO_ANYTHING_TO);
+}
+
+/// An inherit-only entry grants nothing to the folder it is on, whatever it will grant what is made in it: that is
+/// judged on the file the shim will make, not here.
+#[skuld::test]
+fn an_inherit_only_entry_adds_nothing_to_the_log_folder_itself() {
+    let mut chain = log_chain();
+    chain[0].dacl.as_mut().unwrap().push(allow(users(), MODIFY, OI_CI_IO));
+    assert!(verdict(&chain, Some(&daemon())).is_ok());
+}
+
+/// A log's folder is judged before the file the log is, as any folder is, and a folder of any kind before a file.
+#[skuld::test]
+fn a_log_folder_is_judged_with_the_folders_before_the_file() {
+    let mut chain = vec![
+        file(
+            r"C:\Logs\app\app.log",
+            administrators(),
+            vec![allow(users(), FILE_WRITE_DATA, 0)],
+        ),
+        stock_log_folder(),
+    ];
+    chain[1].dacl.as_mut().unwrap().push(allow(users(), FILE_ADD_FILE, 0));
+    assert_eq!(refused_by(&chain, Some(&daemon())).path, PathBuf::from(r"C:\Logs\app"));
+}
+
+fn refused_by(chain: &[ObjectSecurity], daemon: Option<&Sid>) -> Unsafe {
+    verdict(chain, daemon).expect_err("the chain must be refused")
 }
 
 #[cfg(windows)]
@@ -556,8 +702,11 @@ pub(in crate::backend::scm) mod windows {
         std::fs::write(&exe, b"x").unwrap();
         let chain = read_chain(&exe).unwrap();
         assert_eq!(chain[0].path, display_path(&exe));
-        assert!(!chain[0].directory);
-        assert!(chain[1..].iter().all(|object| object.directory), "{chain:?}");
+        assert_eq!(chain[0].kind, ObjectKind::File);
+        assert!(
+            chain[1..].iter().all(|object| object.kind == ObjectKind::Folder),
+            "{chain:?}"
+        );
     }
 
     /// The folder is judged before the file in it, so a file's check refuses for the folder.
@@ -582,7 +731,7 @@ pub(in crate::backend::scm) mod windows {
         let paths: Vec<&Path> = chain.iter().map(|o| o.path.as_path()).collect();
         let want: Vec<PathBuf> = target.ancestors().map(display_path).collect();
         assert_eq!(paths, want.iter().map(PathBuf::as_path).collect::<Vec<_>>());
-        assert!(chain.iter().all(|object| object.directory));
+        assert!(chain.iter().all(|object| object.kind == ObjectKind::Folder));
         for object in &chain {
             assert!(!object.owner.is_empty(), "{}", object.path.display());
             crate::testing::shown_sid(&object.owner);
@@ -799,7 +948,10 @@ pub(in crate::backend::scm) mod windows {
         let dir = tempfile::tempdir().unwrap();
         let target = world_writable_folder(dir.path());
 
-        let Err(Error::FolderUnsafe { path, account, right }) = enabled().check(&target) else {
+        let Err(Error::FolderUnsafe {
+            path, account, right, ..
+        }) = enabled().check(&target)
+        else {
             panic!("a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&target));

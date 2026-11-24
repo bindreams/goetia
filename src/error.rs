@@ -257,17 +257,16 @@ pub enum Error {
     DirectoryRefused { path: PathBuf, why: String },
 
     /// A folder goetia keeps what runs as `LocalSystem` or what it reads back in (the shim's folder, a
-    /// task's run records), one of its ancestors, or the shim host file itself, can be modified by an
-    /// account goetia does not trust, so that account could replace what is in it. No OS call failed.
-    #[error(
-        "refusing to use {}: {account} can {right} it, so it could replace what goetia keeps in it; fix its \
-         permissions",
-        path.display()
-    )]
+    /// task's run records), one of its ancestors, or the shim host file itself, or the folder a daemon's own
+    /// `logs:` path is in, one of its ancestors, or the log itself, can be modified by an account goetia does
+    /// not trust, so that account could replace what is in it. No OS call failed.
+    #[error("refusing to use {}: {account} can {right} it, {role}", path.display())]
     FolderUnsafe {
         path: PathBuf,
         account: String,
         right: &'static str,
+        /// Boxed, so that the error stays small: see `clippy::result_large_err`.
+        role: Box<FolderRole>,
     },
 
     /// A folder goetia makes for itself exists and is not as goetia makes it (its owner, whether its
@@ -1272,6 +1271,60 @@ impl Error {
             source: source.into(),
         }
     }
+}
+
+/// What an object that [`Error::FolderUnsafe`] refuses is for, which decides what the refusal says follows from
+/// it and what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderRole {
+    /// What the shim, which runs as `LocalSystem`, is read from, or what goetia reads back.
+    Shim,
+    /// The path of the `logs:` of a daemon that runs as `daemon`, whose shim appends to it.
+    DaemonLog {
+        /// The folder the log's name is looked up in, which the remedy makes safe.
+        folder: PathBuf,
+        /// The name of the account the daemon runs as.
+        daemon: String,
+        /// That account's SID as `S-1-5-...`, which `icacls` takes after `*`.
+        daemon_sid: String,
+    },
+}
+
+impl fmt::Display for FolderRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FolderRole::Shim => f.write_str("so it could replace what goetia keeps in it; fix its permissions"),
+            FolderRole::DaemonLog {
+                folder,
+                daemon,
+                daemon_sid,
+            } => write!(
+                f,
+                "so it could point the log of the daemon, which runs as {daemon}, at any file {daemon} can write; {}",
+                log_folder_remedy(folder, daemon, daemon_sid)
+            ),
+        }
+    }
+}
+
+/// What to do about a `logs:` whose folder others can change, or that does not exist: make a folder that
+/// passes, or drop `logs:`. `folder` is the folder the log's name is looked up in; the `icacls` line leaves only
+/// SYSTEM, Administrators and the daemon's account (`daemon`, `daemon_sid`) with rights in it, and what is made in
+/// it inherits them. It is written with SIDs, which no language of Windows changes.
+pub(crate) fn log_folder_remedy(folder: &Path, daemon: &str, daemon_sid: &str) -> String {
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    let daemon_grant = if [SYSTEM, ADMINISTRATORS].contains(&daemon_sid) {
+        String::new()
+    } else {
+        format!(" *{daemon_sid}:(OI)(CI)M")
+    };
+    format!(
+        "put `logs:` in a folder that only administrators and {daemon} can change (for a folder that exists, run in \
+         an elevated prompt `icacls \"{}\" /inheritance:r /grant:r *{SYSTEM}:(OI)(CI)F *{ADMINISTRATORS}:(OI)(CI)F\
+         {daemon_grant}`), or remove `logs:` to use goetia's own log",
+        folder.display()
+    )
 }
 
 /// What `install`'s put-back found at the plist's path.

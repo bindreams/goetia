@@ -424,3 +424,18 @@ fn a_service_whose_spec_gave_a_sid_is_that_sid_with_no_lookup() {
     let built_in = service_account_sid(Some("NetworkService"), Some(Written::Name("NetworkService")));
     assert_eq!(built_in.unwrap(), sid_from_parts(5, &[20]));
 }
+
+/// A virtual account's SID is computed from its service's name by the system, so it is had before the service
+/// exists, with no lookup (`LookupAccountNameW` knows only names of services that exist). The name `Spooler` gives
+/// what `NT SERVICE\Spooler` translates to, in any case.
+#[skuld::test]
+fn a_virtual_accounts_sid_is_had_before_its_service_exists() {
+    let spooler = sid_from_parts(5, &[80, 3951239711, 1671533544, 1416304335, 3763227691, 3930497994]);
+    assert_eq!(service_account_sid(Some(r"NT SERVICE\Spooler"), None).unwrap(), spooler);
+    assert_eq!(service_account_sid(Some(r"nt service\SPOOLER"), None).unwrap(), spooler);
+
+    let none = service_account_sid(Some(r"NT SERVICE\goetia-no-such-service"), None).unwrap();
+    assert_eq!(none.len(), 8 + 4 * 6, "{none:?}");
+    assert_eq!(none[..8], spooler[..8]);
+    assert_ne!(none, spooler);
+}

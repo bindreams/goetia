@@ -3,7 +3,7 @@
 //! [`Real`] implements them; tests use `fake::Fake`.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -39,8 +39,8 @@ pub(crate) trait Os: Send + Sync {
 /// Which log a file is, which decides how the shim opens it. The default log,
 /// `%ProgramData%\Goetia\logs\<id>.log`, is an elevated install's: it made the folder and the file, and
 /// judged them, so the shim makes nothing there and opens the file for appending alone
-/// ([`LogKind::Default`]). A `logs:` path of the daemon's own is the user's to name, so its folders and the
-/// file are made ([`LogKind::Own`]).
+/// ([`LogKind::Default`]). A `logs:` path of the daemon's own is the user's to name: `install` judged its folders,
+/// which must be there, and the shim makes the file ([`LogKind::Own`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogKind {
     Own,
@@ -212,10 +212,10 @@ pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
     })
 }
 
+/// Opens a `logs:` path of the daemon's own for appending, making the file if it is not there. No folder is made:
+/// `install` judged the path as it was and refused a folder that was missing, and a folder made here would be
+/// made as the daemon's account with whatever its parent grants.
 fn open_own(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     OpenOptions::new().create(true).append(true).open(path)
 }
 

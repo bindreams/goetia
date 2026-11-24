@@ -649,8 +649,9 @@ owns it, since `install` is not a start and you may still be preparing it.
   writing, in one handed to it) is left, and named, and so are the directories above it.
 - **An install stopped abruptly** (power loss, `SIGKILL`) may leave a `.goetia-*` directory beside the
   path, holding only the empty directories it was making. Nothing uses it, and `rm -r` removes it.
-- **scm** makes none of these at `install`. The shim makes the missing parent of a user's own `logs:` path
-  when the daemon starts.
+- **scm** makes none of these at `install`, and the shim makes no directory either: the directory of a user's
+  own `logs:` path must exist, and `install` refuses it unless only administrators and the daemon's account can
+  change it (see [the shim's log on Windows](#restarts-on-windows)).
 
 ## Per-backend overrides
 
@@ -1829,6 +1830,33 @@ names (the folder is the shim's default logs, which a daemon's own account canno
 Remove `logs:` to use the default log, or name a file elsewhere. A manifest that named
 `%ProgramData%\Goetia\logs\<id>.log` as its `logs:` must drop it; its output then goes to the same
 file. A service installed with that `logs:` by an earlier goetia keeps writing the default log.
+
+A `logs:` of the daemon's own, anywhere else, is judged at every `install` of a `protocol: plain` service or a
+task, up to date or not, before anything is registered. The shim runs as the daemon's account, often SYSTEM, and
+opens the file without making a folder; an account that could add or replace an entry on the path would make
+that account create or append to any file it names. SYSTEM, Administrators, TrustedInstaller and the account the
+daemon runs as are trusted. `install` refuses the path when:
+
+- a directory on the way to the log (links resolved, a junction followed to where it leads) is owned by another
+  account, or another account can change its permissions, take it over, delete or rename it, or delete or
+  rename entries in it;
+- another account can add an entry to the directory the log is in, since it could plant a link, a hard link or
+  a junction at the log's name;
+- the log is there and is a link, a directory or a file with more than one name, or another account can write
+  it, change its permissions, take it over or delete it; or it is not there and would inherit such a right from
+  its directory;
+- the directory the log is in does not exist.
+
+The error names the object, the account and the right. A directory that passes is made in an elevated prompt:
+
+```
+icacls "C:\logs\app" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *<daemon's SID>:(OI)(CI)M
+```
+
+A directory made with a plain `mkdir` under `C:\` or `%ProgramData%` does not pass: it inherits rights for other
+users. Changes made after `install` are not judged. Earlier versions let the shim make the missing directories
+of `logs:` when the daemon started; an install whose `logs:` directory is missing, or one that other accounts
+can change, is now refused. Make the directory as above, or remove `logs:` to use goetia's own log.
 
 Goetia before this change left `%ProgramData%\Goetia\logs` readable by every
 user, and `goetia daemon install` refuses a folder it did not make this way. To

@@ -127,6 +127,27 @@ pub fn program_data() -> PathBuf {
     goetia::testing::program_data()
 }
 
+/// A new folder under `%ProgramData%` that the check of a daemon's own `logs:` passes: owned by Administrators
+/// (this process is elevated), and only SYSTEM, Administrators and the accounts `modify` (SIDs as `S-1-5-...`)
+/// hold rights in it, inherited by what is made in it. The folder is removed when the guard drops; the guard is
+/// made before the folder, so a failed creation still leaves nothing. A temporary directory of the user's cannot
+/// serve: the user's profile is a folder that user can change, which the check refuses on the way to the log.
+#[cfg(windows)]
+pub fn protected_dir(modify: &[String]) -> cleanup::DirGuard {
+    let path = program_data().join(random_test_id());
+    let guard = cleanup::DirGuard::new(path.clone());
+    std::fs::create_dir(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    let path_str = path
+        .to_str()
+        .unwrap_or_else(|| panic!("{} is not UTF-8", path.display()));
+    let mut grants = vec!["*S-1-5-18:(OI)(CI)F".to_string(), "*S-1-5-32-544:(OI)(CI)F".to_string()];
+    grants.extend(modify.iter().map(|sid| format!("*{sid}:(OI)(CI)M")));
+    let mut args = vec![path_str, "/inheritance:r", "/grant:r"];
+    args.extend(grants.iter().map(String::as_str));
+    cmd::run("icacls", &args).expect_ok();
+    guard
+}
+
 /// Where the shim of task `id` writes its run records: `<program_data>\Goetia\runs\<id>`.
 #[cfg(windows)]
 pub fn task_records(id: &str) -> PathBuf {

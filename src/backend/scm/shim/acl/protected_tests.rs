@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::backend::scm::shim::acl::ObjectSecurity;
 use crate::backend::scm::shim::acl::acl_tests::{CONTAINER_INHERIT, FULL, OBJECT_INHERIT, READ_EXECUTE, allow, users};
+use crate::backend::scm::shim::acl::{ObjectKind, ObjectSecurity};
 use crate::backend::scm::sid::{administrators, everyone, system};
 
 /// What the stock shim file has, with `path` as the label an existing file is read under.
@@ -14,7 +14,7 @@ fn stock_file(path: &str) -> ObjectSecurity {
         path: PathBuf::from(path),
         owner: administrators(),
         protected: true,
-        directory: false,
+        kind: ObjectKind::File,
         dacl: Some(vec![
             allow(system(), FULL, 0),
             allow(administrators(), FULL, 0),

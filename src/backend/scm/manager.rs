@@ -98,7 +98,7 @@ pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
 pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
-pub(crate) use identity::sid_for_account_name;
+pub(crate) use identity::{service_account_sid, sid_for_account_name};
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use registry::{EVENT_SOURCE_KEY, EVENT_TYPES_SUPPORTED};
 
@@ -345,12 +345,14 @@ impl Scm {
         if !generate::hosted(spec) {
             return Ok(None);
         }
+        let written = written_user(&spec.common().user);
         self.begin_hosted_install(
             HostCommand {
                 exe: desired.executable.clone(),
                 args: desired.arguments.clone(),
             },
             spec,
+            || service_account_for_check(desired, written),
         )
         .map(Some)
     }
@@ -358,8 +360,15 @@ impl Scm {
     /// What an install of a daemon that runs under the shim host does first, for a service and a task
     /// alike: see [`Self::service_begin_install`]. `rendered` is the host the definition names. A `logs:` of
     /// `spec` in goetia's logs folder is refused here, for every install, up to date or not: see
-    /// [`default_log::refuse_logs_in_folder`].
-    fn begin_hosted_install(&self, rendered: HostCommand, spec: &DaemonSpec) -> Result<InstallLock> {
+    /// [`default_log::refuse_logs_in_folder`]. So is one that others can change the path of, or whose folder is
+    /// missing: see [`FolderCheck::check_log`], which `daemon` serves with the SID of the account the daemon runs
+    /// as. `daemon` is called only for a `logs:`, and is a lookup that changes nothing.
+    fn begin_hosted_install(
+        &self,
+        rendered: HostCommand,
+        spec: &DaemonSpec,
+        daemon: impl FnOnce() -> Result<Sid>,
+    ) -> Result<InstallLock> {
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
         // Made here, by an elevated process, for the shim to write in: it runs as the daemon's account
@@ -368,6 +377,9 @@ impl Scm {
         let program_data = program_data()?;
         make_goetia_folders(&program_data, |path| judge.check(path))?;
         default_log::refuse_logs_in_folder(&program_data, &spec.common().id, spec.common().logs.as_deref())?;
+        if let Some(logs) = spec.common().logs.as_deref() {
+            judge.check_log(&spec.common().id, logs, &daemon()?)?;
+        }
         self.sweep_before_install(shim);
         let provided = shim.provide(&self.folders)?;
         let provided = confirm_provided(rendered, provided)?;
@@ -656,7 +668,11 @@ impl Backend for Scm {
     ) -> Result<Option<InstallLock>> {
         match desired {
             WindowsDefinition::Service(desired) => self.service_begin_install(spec, desired),
-            WindowsDefinition::Task(desired) => self.begin_hosted_install(desired.host(), spec).map(Some),
+            WindowsDefinition::Task(desired) => self
+                .begin_hosted_install(desired.host(), spec, || {
+                    task::task_account_sid(&desired.account(), written_user(&spec.common().user))
+                })
+                .map(Some),
         }
     }
 
@@ -1186,7 +1202,7 @@ fn written_user(user: &User) -> Option<identity::Written<'_>> {
 /// create or an update, as systemd and launchd do. The daemon's default log
 /// ([`make_default_log`]) is not a precondition: an update makes it for the new account before the
 /// configuration changes, so that no start finds a shim that cannot open it, and a create makes it once the
-/// service exists, since a virtual account's SID resolves only then, before any start. An update that
+/// service exists, before any start. An update that
 /// changes the account names the registered account and the new one before the configuration changes, and the
 /// new one alone once it has landed, unless a start is in progress or this install made the log under a live run
 /// ([`default_log::naming`]), so that a change that fails leaves the account the service still runs as its
@@ -1312,15 +1328,27 @@ fn service_gate(reg: &ScmRegistration, written: Option<identity::Written>, reads
     Ok(Gated { password, checked })
 }
 
+/// The SID of the account the service `reg` runs as, for the check of its own `logs:` before anything is
+/// registered, with the dispatch the gate and the default log use: a real user (the account needs a password) is
+/// found by [`identity::require_user_account`], which only looks it up, and any other account (LocalSystem, a
+/// built-in, a virtual account, a SID the spec gave) by [`identity::service_account_sid`], which needs no service.
+fn service_account_for_check(reg: &ScmRegistration, written: Option<identity::Written>) -> Result<Sid> {
+    match reg.account.as_deref() {
+        Some(account) if generate::account_needs_password(Some(account)) => {
+            identity::require_user_account(account, written).map(|user| user.sid().clone())
+        }
+        account => identity::service_account_sid(account, written),
+    }
+}
+
 /// The default log of the service `reg` registers, for the account it runs as, made or set to name it:
 /// the shim opens it and never makes it ([`default_log`]). Only a service that runs the shim host has one.
 /// The account is the gate's SID (`checked`, for a real user, which the log names rather than looking the
 /// account up again), else the one the spec gave as a SID, else the registered name's. `kept` is the account
 /// it names beside it, the one this install changes the service from, at `step` ([`default_log::naming`]), by how
 /// far the service's run is ([`default_log::Run`]), which SCM is asked once: a shim holds its log from before its
-/// first status report, and reopens by path one that was deleted. Call it once the service exists (a virtual
-/// account's SID resolves only then) and before it starts, or for the account an update is about to give a
-/// service that exists. The change it returns says what the install's
+/// first status report, and reopens by path one that was deleted. Call it once the service exists and before it
+/// starts, or for the account an update is about to give a service that exists. The change it returns says what the install's
 /// next step does with the file ([`default_log::LogChange::step_after`]); `None` for a service with no default log.
 fn make_default_log(
     spec: &DaemonSpec,
