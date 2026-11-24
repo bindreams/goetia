@@ -23,13 +23,15 @@
 
 use std::fmt;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-
 use crate::error::{Error, Result};
+
+mod wake;
+
+use wake::Wake;
 
 /// The signals a terminal, a session or a service manager ends a process with, and their names. Bit `i` of
 /// [`RECORDED`] is `SIGNALS[i]`.
@@ -77,45 +79,6 @@ static WAKE: AtomicI32 = AtomicI32::new(-1);
 /// close, which un-publishes the descriptor first, knows when none can write to it, and waits for no more
 /// than one `write` of each, never for the code of a previous handler, which may not return.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-
-/// The pipe a window's handler writes to and a wait reads, both ends non-blocking and close-on-exec.
-struct Wake {
-    read: OwnedFd,
-    write: OwnedFd,
-    /// What the close of this window did, for the test of its order.
-    #[cfg(test)]
-    probe: std::sync::Arc<test_hook::Probe>,
-}
-
-/// The window's pipe is closed by dropping it: a test sees that happen, wherever the drop is.
-#[cfg(test)]
-impl Drop for Wake {
-    fn drop(&mut self) {
-        self.probe.closed();
-    }
-}
-
-impl Wake {
-    fn new() -> io::Result<Wake> {
-        #[cfg(test)]
-        test_hook::step()?;
-        // Apple has no `pipe2`, so `std` sets close-on-exec on each end after the pipe is made, not with
-        // it. A program started in between would inherit the ends, but nothing in goetia starts one while
-        // a window opens: `run` starts its child from its own thread, in sequence after the window.
-        let (read, write) = io::pipe()?;
-        let (read, write): (OwnedFd, OwnedFd) = (read.into(), write.into());
-        for end in [&read, &write] {
-            let flags = OFlag::from_bits_truncate(fcntl(end, FcntlArg::F_GETFL).map_err(io::Error::from)?);
-            fcntl(end, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
-        }
-        Ok(Wake {
-            read,
-            write,
-            #[cfg(test)]
-            probe: Default::default(),
-        })
-    }
-}
 
 /// Takes the bits of `mask` out of [`RECORDED`], and answers those that were set: the caller that took a
 /// bit is the one to re-raise it, so each recorded signal is re-raised exactly once.
@@ -238,7 +201,7 @@ impl Deferred {
         if shared.holders == 0 {
             let refused = |source| Error::os("hold back interrupts while a run is held", source);
             let wake = Wake::new().map_err(refused)?;
-            WAKE.store(wake.write.as_raw_fd(), Ordering::SeqCst);
+            WAKE.store(wake.write_fd(), Ordering::SeqCst);
             OPEN.store(true, Ordering::SeqCst);
             match install() {
                 Ok((previous, taken)) => {
@@ -259,7 +222,7 @@ impl Deferred {
             .open
             .as_ref()
             .expect("the window is open: it was opened above or has a holder");
-        let (taken, wake) = (open.taken, open.wake.read.as_raw_fd());
+        let (taken, wake) = (open.taken, open.wake.read_fd());
         Ok(hold(&mut shared, taken, wake))
     }
 
@@ -317,12 +280,10 @@ impl Drop for Deferred {
 /// so that a handler that finds it clear raises to the previous handlers, and every recorded bit is
 /// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
-    #[cfg(test)]
-    let probe = wake.probe.clone();
     WAKE.store(-1, Ordering::SeqCst);
     while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
         #[cfg(test)]
-        probe.waited();
+        wake.probe().waited();
         std::thread::yield_now();
     }
     drop(wake);
@@ -431,7 +392,7 @@ fn restore(previous: &[libc::sigaction], taken: u32) {
 #[cfg(test)]
 mod test_hook {
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use crate::backend::test_allowance::{Allowance, spend};
 
@@ -449,61 +410,60 @@ mod test_hook {
         spend(&STEPS, "no step of opening a window may be taken (test hook)")
     }
 
-    /// How the close of one window went, as far as its order: set by the wait loop and by the drop of the
-    /// window's pipe, so it says what happened and not where a call sits.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    /// How the close of one window went, as far as its order. The wait loop and the drop of the window's
+    /// pipe set it, so it says what happened and not where a call sits.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(super) enum Closing {
         /// Neither a wait nor the close has happened.
+        #[default]
         Idle,
-        /// The close is waiting for a handler, and the pipe is open.
+        /// The close is waiting for a handler: the pipe is not closed yet.
         Waiting,
-        /// The pipe was closed after the close waited.
+        /// Both ends of the pipe were closed after the close waited.
         ClosedAfterWait,
-        /// The pipe was closed with no wait before it.
+        /// Both ends of the pipe were closed with no wait before it.
         ClosedFirst,
     }
 
-    /// One window's [`Closing`]: the window's `Wake` carries it, so a close of another window cannot touch
-    /// it.
+    /// One window's [`Closing`]: its `Wake` carries it, so a close of another window cannot touch it. No
+    /// signal handler reaches it (`waited` runs in `shut`, `closed` in a drop), so a mutex is safe here.
     #[derive(Default)]
-    pub(super) struct Probe(AtomicU8);
+    pub(super) struct Probe(Mutex<Closing>);
 
     impl Probe {
-        const IDLE: u8 = 0;
-        const WAITING: u8 = 1;
-        const CLOSED_AFTER_WAIT: u8 = 2;
-        const CLOSED_FIRST: u8 = 3;
-
         /// A pass of the wait for a handler: called on each, so a close that does not wait never calls it. A
         /// wait after the pipe is closed changes nothing.
         pub(super) fn waited(&self) {
-            _ = self
-                .0
-                .compare_exchange(Self::IDLE, Self::WAITING, Ordering::SeqCst, Ordering::SeqCst);
+            let mut closing = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if *closing == Closing::Idle {
+                *closing = Closing::Waiting;
+            }
         }
 
-        /// The pipe is being closed.
+        /// Both ends of the pipe are closed: after a wait, or with none.
         pub(super) fn closed(&self) {
-            let after = self.0.compare_exchange(
-                Self::WAITING,
-                Self::CLOSED_AFTER_WAIT,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
-            if after.is_err() {
-                _ = self
-                    .0
-                    .compare_exchange(Self::IDLE, Self::CLOSED_FIRST, Ordering::SeqCst, Ordering::SeqCst);
-            }
+            let mut closing = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            *closing = match *closing {
+                Closing::Idle => Closing::ClosedFirst,
+                Closing::Waiting => Closing::ClosedAfterWait,
+                closed => closed,
+            };
         }
 
         pub(super) fn state(&self) -> Closing {
-            match self.0.load(Ordering::SeqCst) {
-                Self::IDLE => Closing::Idle,
-                Self::WAITING => Closing::Waiting,
-                Self::CLOSED_AFTER_WAIT => Closing::ClosedAfterWait,
-                _ => Closing::ClosedFirst,
-            }
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    /// Reports to its [`Probe`], by dropping, that the descriptors declared before it in a struct are closed.
+    #[derive(Default)]
+    pub(super) struct CloseMark {
+        pub(super) probe: Arc<Probe>,
+    }
+
+    impl Drop for CloseMark {
+        fn drop(&mut self) {
+            self.probe.closed();
         }
     }
 }
