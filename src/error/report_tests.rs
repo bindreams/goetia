@@ -176,6 +176,7 @@ fn a_commands_stderr_keeps_its_layout_and_loses_the_rest_of_the_set() {
 }
 
 /// The exact text for `--json`.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn the_unescaped_report_carries_every_character_as_it_is() {
     let e = Error::Step {
@@ -266,6 +267,7 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
         "{text:?}"
     );
     // The report for JSON keeps it as it came.
+    #[cfg(feature = "cli")]
     assert!(e.report_unescaped().to_string().contains(": a\nb), so goetia"));
 }
 

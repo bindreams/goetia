@@ -1418,6 +1418,8 @@ fn a_wait_error_and_a_stream_error_are_both_reported_and_an_open_outcome_stays_o
             reason: "the manager refused (seeded)".to_string(),
         }
     }
+    // `code` is the exit code the CLI maps the error to; without the `cli` feature nothing reads it.
+    #[cfg_attr(not(feature = "cli"), allow(unused_variables))]
     for (what, wait, code) in [
         ("an unrecorded exit", unrecorded as fn() -> Error, 4),
         ("a lost journal", in_doubt, 4),
@@ -1440,6 +1442,7 @@ fn a_wait_error_and_a_stream_error_are_both_reported_and_an_open_outcome_stays_o
             report.contains(&wait().report().to_string()),
             "{what}: the wait's failure is said: {report}"
         );
+        #[cfg(feature = "cli")]
         assert_eq!(crate::cli::ExitCode::of(&e).code(), code, "{what}: {report}");
     }
 }

@@ -1161,6 +1161,7 @@ fn report_of_a_host_version_holds_the_file_supplied_bytes_exactly_and_the_sink_e
         "/h.exe is a goetia service host of version \\u{1b}[31m\\u{a}\\, and this goetia is version 0.2.0: rebuild \
          the host with this version"
     );
+    #[cfg(feature = "cli")]
     assert_eq!(
         e.report_unescaped().to_string(),
         "/h.exe is a goetia service host of version \u{1b}[31m\n\\, and this goetia is version 0.2.0: rebuild the \
