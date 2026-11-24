@@ -1,7 +1,7 @@
 use std::io;
 
-use super::{Error, KillProgress};
 use super::report::{Seen, seen};
+use super::{Error, KillProgress};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]

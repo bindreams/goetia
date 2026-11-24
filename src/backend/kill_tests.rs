@@ -419,11 +419,7 @@ fn a_process_gone_before_it_was_opened_is_waited_for_in_the_manager_and_not_foll
     assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
-        steps([
-            "service_pid",
-            "open 100",
-            "await_recorded 100 unheld",
-        ]),
+        steps(["service_pid", "open 100", "await_recorded 100 unheld"]),
         "the hold's own wait is the only one: it has seen the record"
     );
 }
@@ -891,8 +887,7 @@ fn a_failed_record_wait_for_a_process_the_manager_moved_off_is_a_failed_kill_wit
         assert!(!failed.is_indeterminate(), "{what}: {failed:?}");
         let report = failed.report().to_string();
         assert_eq!(
-            report,
-            "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed",
+            report, "failed to kill `frpc`: waiting for the manager to stop reporting process 100: manager read failed",
             "{what}"
         );
         assert!(!report.contains("exited"), "{what}: {report}");

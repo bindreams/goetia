@@ -540,7 +540,13 @@ fn assert_terminated_but_unconfirmed(e: io::Error, cause: &str, kind: io::ErrorK
     let failed = crate::backend::kill::kill_failed("frpc", e);
     assert!(failed.is_indeterminate(), "{failed:?}");
     assert!(
-        matches!(failed.cause(), crate::Error::KillUnconfirmed { progress: crate::KillProgress::Exited, .. }),
+        matches!(
+            failed.cause(),
+            crate::Error::KillUnconfirmed {
+                progress: crate::KillProgress::Exited,
+                ..
+            }
+        ),
         "{failed:?}"
     );
 }

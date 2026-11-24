@@ -231,7 +231,11 @@ fn a_kill_that_signalled_is_told_with_no_verdict_in_whatever_payload() {
 /// The failure after the signal is carried as the typed error `told` makes of it, and the kind is kept.
 #[skuld::test]
 fn what_failed_after_the_signal_is_carried_typed_with_its_kind() {
-    let e = kill_unconfirmed(7, KillProgress::Signalled, io::Error::new(io::ErrorKind::TimedOut, "wait"));
+    let e = kill_unconfirmed(
+        7,
+        KillProgress::Signalled,
+        io::Error::new(io::ErrorKind::TimedOut, "wait"),
+    );
 
     assert_eq!(e.kind(), io::ErrorKind::TimedOut);
     let failed = target_failed("kill `x`", e);
