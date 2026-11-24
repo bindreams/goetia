@@ -272,13 +272,36 @@ pub enum DaemonKind {
 }
 
 impl DaemonKind {
-    /// How the kind is written in `--json` and in the text forms of `status` and `list`.
-    /// [`Serialize`](serde::Serialize) goes through here, so the two cannot drift.
+    /// Every variant.
+    pub const ALL: [DaemonKind; 2] = [DaemonKind::Service, DaemonKind::Task];
+
+    /// The one spelling of the kind, used for `--json`, text output, the manifest's `type:` value and
+    /// error messages. [`Serialize`](serde::Serialize) and [`Display`](std::fmt::Display) go through
+    /// here, so they cannot drift. A blob persists a task's `type` separately: a serde attribute in
+    /// `blob.rs`, which needs a literal.
     pub fn as_str(self) -> &'static str {
         match self {
             DaemonKind::Service => "service",
             DaemonKind::Task => "task",
         }
+    }
+
+    /// The kind whose [`as_str`](DaemonKind::as_str) is exactly `text`.
+    pub fn parse(text: &str) -> Option<DaemonKind> {
+        DaemonKind::ALL.into_iter().find(|kind| kind.as_str() == text)
+    }
+
+    pub fn other(self) -> DaemonKind {
+        match self {
+            DaemonKind::Service => DaemonKind::Task,
+            DaemonKind::Task => DaemonKind::Service,
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

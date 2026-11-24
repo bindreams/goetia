@@ -138,12 +138,15 @@ pub fn killing_a_stopped_daemon_is_not_running(
         "{result:?}"
     );
 
-    let args = goetia::cli::kill::Args {
-        ids: vec![id.as_str().to_string()],
-    };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = goetia::cli::kill::run(&args, get_manager, &|| true, &mut out, &mut err);
-    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
-    assert_eq!(code, goetia::cli::ExitCode::Error, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(err.contains("not running"), "{err}");
+    #[cfg(feature = "cli")]
+    {
+        let args = goetia::cli::kill::Args {
+            ids: vec![id.as_str().to_string()],
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = goetia::cli::kill::run(&args, get_manager, &|| true, &mut out, &mut err);
+        let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+        assert_eq!(code, goetia::cli::ExitCode::Error, "stdout:\n{out}\nstderr:\n{err}");
+        assert!(err.contains("not running"), "{err}");
+    }
 }

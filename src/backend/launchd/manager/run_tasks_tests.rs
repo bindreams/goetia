@@ -18,7 +18,6 @@ use crate::backend::Backend as _;
 use crate::backend::bounded::{self, Role};
 use crate::backend::client::ClientError;
 use crate::backend::client::fake::{Entry, Fake, exited, fail, reply, reply_at};
-use crate::cli::ExitCode;
 use crate::spec::{DaemonSpec, TaskFields, TaskSpec};
 use crate::testing::base_fields;
 
@@ -393,11 +392,7 @@ fn assert_ended_unfollowed(e: &Error) {
             if id == ID && reason.starts_with("its launch ended before goetia could follow it")),
         "expected the launch that ended before goetia could follow it, got {e:?}"
     );
-    assert_eq!(
-        ExitCode::of(e),
-        ExitCode::Indeterminate,
-        "exit 4, as `RunUnrecorded` is"
-    );
+    assert!(e.is_indeterminate(), "exit 4, as `RunUnrecorded` is: {e:?}");
 }
 
 fn assert_unfollowed(e: &Error, pid: u32) {
@@ -410,11 +405,7 @@ fn assert_unfollowed(e: &Error, pid: u32) {
             )),
         "expected the unfollowed launch of {pid}, got {e:?}"
     );
-    assert_eq!(
-        ExitCode::of(e),
-        ExitCode::Indeterminate,
-        "exit 4, as `RunUnrecorded` is"
-    );
+    assert!(e.is_indeterminate(), "exit 4, as `RunUnrecorded` is: {e:?}");
 }
 
 // The order of a run ==================================================================================================

@@ -15,7 +15,7 @@ mod support;
 #[cfg(windows)]
 #[path = "scm_integration/common.rs"]
 mod common;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "cli"))]
 #[path = "scm_integration/demonstration.rs"]
 mod demonstration;
 #[cfg(windows)]
