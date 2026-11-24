@@ -267,7 +267,11 @@ fn what_an_up_to_date_install_makes_beside_the_definition_is_kept() {
     assert_eq!(fake.install(&mk("frpc"), false).unwrap(), Outcome::UpToDate);
 
     assert_eq!(fake.taken_back(), 0);
-    assert_eq!(fake.standings(), 0, "the definition stands: nothing is read back to ask");
+    assert_eq!(
+        fake.standings(),
+        0,
+        "the definition stands: nothing is read back to ask"
+    );
 }
 
 /// What the hook made before it failed is kept as well, and its error is the install's: the scope settles

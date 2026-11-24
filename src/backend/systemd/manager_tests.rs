@@ -14,8 +14,8 @@ use super::systemctl::systemctl_tests::{booted, gate_then};
 use super::task::task_tests::{fragment, service_spec, task_spec, units_of};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
-use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::Settle as _;
+use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::{bounded, standby};
 use crate::manager::ServiceManager as _;
 use crate::manager::conformance::fresh_id;
@@ -607,9 +607,7 @@ fn up_to_date_in(fake: &Fake, spec: &DaemonSpec, scope: &mut CreatedDirs) -> Res
 fn shown(load_state: &str, reload: &str) -> Entry {
     reply(
         &["show"],
-        exited(0, &format!("LoadState={load_state}
-NeedDaemonReload={reload}
-"), ""),
+        exited(0, &format!("LoadState={load_state}\nNeedDaemonReload={reload}\n"), ""),
     )
 }
 
@@ -672,8 +670,7 @@ fn an_up_to_date_install_of_a_task_reads_its_timer_too() {
 fn a_failed_reload_fails_an_up_to_date_install_as_a_writes_failed_reload_does() {
     let fake = gate_then([
         shown("loaded", "yes"),
-        reply(&["daemon-reload"], exited(1, "", "Access denied
-")),
+        reply(&["daemon-reload"], exited(1, "", "Access denied\n")),
     ]);
 
     let e = up_to_date(&fake, &service_spec("x")).expect_err("the reload fails");
@@ -731,5 +728,8 @@ fn an_up_to_date_install_refuses_a_log_directory_another_user_can_change(#[fixtu
 
     assert!(matches!(e, Error::DirectoryRefused { .. }), "{e:?}");
     fake.assert_spent("the gate's probes, and no read of a unit after the refusal");
-    assert!(!layout.system().join("work").exists(), "nothing was made for a refused install");
+    assert!(
+        !layout.system().join("work").exists(),
+        "nothing was made for a refused install"
+    );
 }

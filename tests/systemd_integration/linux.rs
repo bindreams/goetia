@@ -2076,7 +2076,8 @@ fn an_up_to_date_install_reloads_a_manager_that_holds_the_old_unit(#[fixture(sys
     let guard = ServiceGuard::new(&id);
     let mgr = Systemd::new();
     mgr.install(&mk(guard.id()), false).expect("install");
-    mgr.start(&Id::try_from(guard.id()).unwrap(), Budget::DEFAULT).expect("start");
+    mgr.start(&Id::try_from(guard.id()).unwrap(), Budget::DEFAULT)
+        .expect("start");
     let newer = ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         protocol: Protocol::Plain,
