@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use goetia::Error;
 use goetia::backend::systemd::manager::Systemd;
+#[cfg(feature = "cli")]
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, RunInFlight, ServiceManager};
 use goetia::spec::{DaemonSpec, Restart, ServiceFields, ServiceSpec};
@@ -21,12 +22,14 @@ const DAILY: &str = "0 3 * * *";
 
 /// A run that writes its pid and then uninstalls its own `id` with `--no-stop`, through the `goetia`
 /// binary, before it announces itself and waits to be released.
+#[cfg(feature = "cli")]
 struct SelfUninstalling {
     held: Held,
     pid: PathBuf,
     _dir: tempfile::TempDir,
 }
 
+#[cfg(feature = "cli")]
 impl SelfUninstalling {
     /// A run that exits 0 when released.
     fn new(id: &str) -> Self {
@@ -125,6 +128,7 @@ fn assert_not_installed(mgr: &Systemd, id: &str) {
 /// The run removes its own task and goes on: systemd still has it in its start job with its own pid and
 /// no start timeout, the id is not installed, and the stand-in is the only file left. When the run exits
 /// by itself the stand-in stays, a hand start of it fails, and the next `install` of the id removes it.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -174,6 +178,7 @@ fn a_run_that_uninstalls_its_own_task_with_no_stop_goes_on_until_it_exits(#[fixt
 /// The run a stand-in keeps is stopped by the next `uninstall` without `--no-stop`, which then removes the
 /// stand-in: afterwards nothing of the id is listed, whether the stopped run read as failed (it died of SIGTERM) or
 /// not (it exited 0 on SIGTERM).
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn an_uninstall_that_stops_the_run_a_standin_keeps_leaves_nothing_listed(#[fixture(systemd_group)] _group: &Group) {
     for failing in [true, false] {
@@ -236,6 +241,7 @@ fn no_stop_on_a_task_that_is_not_running_leaves_nothing(#[fixture(systemd_group)
 /// The run removes its own service and goes on: it keeps its main pid, the unit is loaded with no file,
 /// and when the run exits by itself with a failure it is not restarted, although the removed unit said
 /// `Restart=always`.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_service_that_uninstalls_itself_with_no_stop_keeps_running_and_is_not_restarted_when_it_fails(
     #[fixture(systemd_group)] _group: &Group,
@@ -371,6 +377,7 @@ fn a_retry_after_a_removal_with_no_reload_reloads_and_leaves_the_run(#[fixture(s
 /// A drop-in sets the task's `KillSignal=` and `TimeoutStopSec=`, and the uninstall deletes it with the job:
 /// the stand-in carries the values systemd was applying: the left run's `KillSignal` and `TimeoutStopUSec` are the
 /// drop-in's. (A stop's use of such values was measured on systemd 243, 249 and 255.)
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn the_standin_carries_the_stop_settings_a_drop_in_gave_the_job(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();

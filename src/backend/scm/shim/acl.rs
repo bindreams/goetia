@@ -36,8 +36,8 @@ pub(crate) use protected::{DEFAULT_LOG_ACCESS, Descriptor, is_as_wanted, missing
 pub use system::{Dacl, kernel_object_dacl};
 #[cfg(windows)]
 pub(crate) use system::{
-    ObjectId, display_path, index_at, is_unreadable, kernel_object_owner, normalise as lexical, read_object, read_path,
-    require_acls_under,
+    ObjectId, display_path, file_id, index_at, is_unreadable, kernel_object_owner, normalise as lexical, read_object,
+    read_path, require_acls_under,
 };
 
 #[cfg(windows)]
@@ -428,7 +428,8 @@ mod system {
         by_id.or_else(|_| by_index())
     }
 
-    fn file_id(file: &File) -> io::Result<ObjectId> {
+    /// The volume and file ID of what `file` is open on, which no rename or replacement of its name changes.
+    pub(crate) fn file_id(file: &File) -> io::Result<ObjectId> {
         let mut info = FILE_ID_INFO {
             VolumeSerialNumber: 0,
             FileId: Default::default(),

@@ -3,7 +3,6 @@
 //! tests run on every host this crate builds on, not only macOS.
 
 use super::*;
-use crate::cli::ExitCode;
 use crate::manager::{Exit, State};
 use crate::spec::Id;
 
@@ -407,7 +406,7 @@ fn our_launch_that_is_running_is_unfollowed_and_strands_nothing() {
             if id == "frpc" && reason.contains(&format!("launched process {PID} with no hold on it"))),
         "{e:?}"
     );
-    assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
+    assert!(e.is_indeterminate(), "exit 4: {e:?}");
 }
 
 /// A launch that started at or before `ta` is not this run's, so however it ended, `run` makes another
@@ -444,7 +443,7 @@ fn our_launch_that_is_gone_ended_before_goetia_could_follow_it() {
             matches!(&e, Error::RunUnrecorded { id, reason, .. } if id == "frpc" && reason.starts_with(&expected)),
             "{e:?}"
         );
-        assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
+        assert!(e.is_indeterminate(), "exit 4: {e:?}");
     }
 }
 
@@ -461,7 +460,7 @@ fn a_launch_with_no_start_time_is_in_doubt_in_the_stranded_hold() {
                 if request == "launchctl kickstart -p system/frpc")),
         "{e:?}"
     );
-    assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
+    assert!(e.is_indeterminate(), "exit 4: {e:?}");
 }
 
 /// A pid `launchctl procinfo` does not name as the job's launch is another process's: the same end as a
@@ -476,6 +475,6 @@ fn a_pid_that_is_another_process_is_in_doubt_in_the_stranded_hold() {
             matches!(&e, Error::Step { source, .. } if matches!(**source, Error::RequestInDoubt { .. })),
             "{e:?}"
         );
-        assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
+        assert!(e.is_indeterminate(), "exit 4: {e:?}");
     }
 }
