@@ -228,14 +228,14 @@ entry that writes only `timeout` keeps the base's `send-signal`.
 
 `send-signal` is one of:
 
-| Value                              | systemd                | launchd            | Windows                                  |
-| ---------------------------------- | ---------------------- | ------------------ | ---------------------------------------- |
-| `terminate` (default)              | `SIGTERM`              | SIGTERM            | Ctrl+C                                   |
-| `interrupt`                        | `SIGINT`               | refused            | Ctrl+C                                   |
-| `quit`                             | `SIGQUIT`              | refused            | Ctrl+Break                               |
-| `kill`                             | `SIGKILL`              | `ExitTimeOut` of 1 | ends the daemon at once                  |
-| `sigusr1`, `SIGRTMIN+3`, ...       | that signal (any case) | refused            | refused                                  |
-| `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close` posts `WM_CLOSE`) |
+| Value                              | systemd                | launchd            | Windows                            |
+| ---------------------------------- | ---------------------- | ------------------ | ---------------------------------- |
+| `terminate` (default)              | `SIGTERM`              | SIGTERM            | Ctrl+C                             |
+| `interrupt`                        | `SIGINT`               | refused            | Ctrl+C                             |
+| `quit`                             | `SIGQUIT`              | refused            | Ctrl+Break                         |
+| `kill`                             | `SIGKILL`              | `ExitTimeOut` of 1 | ends the daemon at once            |
+| `sigusr1`, `SIGRTMIN+3`, ...       | that signal (any case) | refused            | refused                            |
+| `ctrl-c`, `ctrl-break`, `wm-close` | refused                | refused            | that event (`wm-close`: see below) |
 
 A value a platform cannot send is refused, naming the platform, and never turned
 into another signal: `sigterrm` is an error, not a `SIGTERM`. `SIGTERM`, `SIGINT`,
@@ -281,9 +281,36 @@ records the end as it does.
   when the wait is spent just as the `timeout` ends, and the error says whether
   a `SIGKILL` had gone out. The wait does not count the time a queued start took
   to fork.
-- **Windows** reads, checks and records the field, and does not apply it yet:
-  the shim still ends the daemon at once on every stop, `stop`, `restart` and
-  `uninstall` included, whatever `stop-action` says. A task is stopped by Task
+- **Windows** applies it to a `protocol: plain` service. A stop, from `stop`, `restart`, `uninstall` or SCM
+  itself (`sc stop`), sends the daemon the console event `send-signal` names (Ctrl+C for `terminate`,
+  `interrupt` and `ctrl-c`; Ctrl+Break for `quit` and `ctrl-break`), through a copy of the shim host that
+  attaches to the daemon's console, and then waits for the daemon's whole process tree to exit for up to
+  `timeout` (as long as it takes for `null`) before it ends what is left. A launcher whose worker needs time
+  to exit, and whatever a daemon that honoured the event left running, have the `timeout` too. A daemon that
+  had exited when the stop looked is not asked, and what it left in the job is ended at once; one that exits
+  as it is being asked is waited for like one that was asked. `kill` sends nothing and ends
+  the daemon at once. `wm-close` still does too: it sends nothing yet. A stop that asks writes its lines to the
+  daemon's log (the file `logs` names, or the default log when it has none) and to the Windows Event Log: one
+  before the first ask, naming the event and how long the daemon and what it started are given, and one saying
+  how the stop ended: that they exited within the wait, or (a warning) that the daemon's process tree had not
+  been seen to exit when the `timeout` was over and is being ended. The limits:
+  - The event reaches every process that shares the daemon's console, not only the daemon.
+  - A program with no console (a GUI program) cannot be sent the event, so it is ended only when its
+    `timeout` is over; write `send-signal: kill` for one. A stop right after a `start` finds the daemon
+    without its console for a few milliseconds: the shim asks again until the daemon has it, exits, or the
+    `timeout` is over. The pause between asks doubles from 25 ms to 1 s, so with `timeout: null` a program
+    that never has a console is asked again, about once a second, until `goetia daemon kill`.
+  - `stop` and `restart` wait the `timeout` plus 10 s, as above. `uninstall` waits up to the `timeout`
+    too, holding the machine-wide install lock as it does for any stop, so an `install` or `uninstall` of
+    another daemon waits behind it. For `timeout: null` and a tree that never exits it waits until
+    `goetia daemon kill` ends the daemon; a `stop --timeout` ends only goetia's own wait.
+  - The service reports `STOP_PENDING` with a wait hint that covers the `timeout` and the teardown (the
+    largest value the field holds for `null`); SCM does nothing when a hint runs out.
+  - A program that hosts the shim itself calls `goetia::shim::init_host()` first in its `main` (see
+    [Shipping the shim from a library](#shipping-the-shim-from-a-library)); a host that does not is refused when the service starts, with an error that names the
+    call. `send-signal: kill` and `wm-close` need no such host.
+
+  A task is stopped by Task
   Scheduler, which decides the signal and the wait, so a task refuses a
   `send-signal` or `timeout` that is not the default; set it under `backend-specific` for systemd and launchd. A
   `protocol: native` service handles SCM's own stop itself, so it refuses
@@ -849,7 +876,8 @@ All under `goetia daemon`, as for a service:
   ([Stopping and killing a task](#stopping-and-killing-a-task)). **`restart`**
   is a `stop` and then a `start`.
 - **`run`** starts a run and follows it ([below](#run)).
-- **`uninstall`** ends a run in flight and removes the task. On Windows it also
+- **`uninstall`** ends a run in flight and removes the task, or with `--no-stop`
+  leaves the run alone ([Uninstalling a daemon](#uninstalling-a-daemon)). On Windows it also
   removes the task's run records, and never needs the account's password.
 
 ### `run`
@@ -998,7 +1026,8 @@ same.
   data that would not decode) or a Windows error number (it failed at something
   else; `31`, `ERROR_GEN_FAILURE`, when it has no number of its own: the task is
   gone, another install registered it again, or a removal marker stands). A program that exits with the same
-  number reads the same. After a stop it is `0xC000013A` whatever happened.
+  number reads the same. After a stop it is `0xC000013A` whatever happened: it is Task Scheduler's, and
+  `run` reports the run's own record (see [Stopping and killing a task](#stopping-and-killing-a-task)).
   An unelevated `status` or `list` of a task that runs as another account (SYSTEM,
   LocalService, or an administrator's own elevated task) cannot open the run's
   process, so it cannot tell running from idle. It reports the id as `unusable`,
@@ -1034,16 +1063,33 @@ with the request standing.
   is still alive is refused with exit `4`, saying that no start was issued:
   launchd starts no new run of a task while one is in flight, and `start`
   after it exits, or a `restart` without `--timeout 0`, does the job.
-- **Windows:** `stop` reaches the host as the console close event, and the host
-  ends the program's whole tree at once; goetia gives the program no time to
-  end itself. The run reports `0xC000013A`. `kill` terminates the host, and its
-  Job Object takes the program's tree with it; a waiting `run` then reports
-  that the run ended without recording its exit (exit `4`), as it does for a
-  shutdown or a host failure. When a stop could not end everything the program
-  started, the command that stopped it says so, and so do the host's log and
-  the Windows Event Log; `status` then shows the run as stopped (exit code
-  `0xC000013A`), as a service shows stopped. `restart --timeout 0` is refused as
-  on launchd.
+- **Windows:** a task's `stop` sends the console close event
+  (`CTRL_CLOSE_EVENT`), as Task Scheduler does to any console program.
+  Measured on Windows Server 2025 (build 26100): Windows allows one second for
+  the whole run, counted from the stop. `run` reports how the program ended:
+  `0xC000013A` when the event ended it, or its own code when it handled the
+  event and exited. `status`'s last result is Task Scheduler's, and reads
+  `0xC000013A` after any stop. A program still running when the second is over
+  is ended by Windows together with the host, and that run leaves no record:
+  `run` says so. A program with no console (a GUI program, or one that
+  detached from it) is sent nothing: the host records the stop and waits for
+  the program's own exit, which is then the run's record, and a program still
+  running when the second is over is ended with the host and its run is
+  recorded as stopped. A `Stopped` record means a stop was accepted and the host
+  never saw the program exit, not that the program's tree has ended. A stop that
+  arrives before the host has started the program starts nothing, and the run is
+  still recorded as stopped. A stop that arrives in the moment between that
+  check and the start still starts the program, which never receives the event
+  and runs until it exits or Windows ends the host and its Job Object takes the
+  program's tree with it. A run in flight at a system shutdown is ended by
+  Windows and may leave no record.
+  `kill` terminates the host, and its Job Object takes the program's tree with
+  it; a waiting `run` then reports that the run ended without recording its exit
+  (exit `4`), as it does for a shutdown or a host failure. When a stop could not
+  end everything the program started, the command that stopped it says so, and
+  so do the host's log and the Windows Event Log; `status` then shows the run as
+  stopped (exit code `0xC000013A`), as a service shows stopped.
+  `restart --timeout 0` is refused as on launchd.
 
 ### The schedule, per platform
 
@@ -1609,6 +1655,8 @@ when it is started as the host:
 
 ```rust
 fn main() {
+    // First, before anything else, whether or not this run is the host.
+    goetia::shim::init_host();
     if std::env::args().nth(1).as_deref() == Some("--service-host") {
         goetia::shim::main()
     }
@@ -1620,6 +1668,13 @@ Scm::with_shim(
     CheckPermissions::Enable,
 )
 ```
+
+`goetia::shim::init_host()` first in `main` is what lets a stop ask a daemon to exit on Windows (see
+[`stop-action`](#stop-action)): the console event is sent by a copy of the host program that cosca starts, which
+runs `main` from the top, and `init_host` is what turns that copy into the sender and ends it. Anything `main`
+does before the call runs in every copy too, so it must not block or wait for something the running host
+holds. A host that did not call it is refused when a service whose stop
+asks starts. The stock shim (`goetia::stock_shim!()`) makes the call itself.
 
 Tasks run under the same host, which Task Scheduler starts with `--goetia-task
 <id> <token>` after the host's own arguments. A program that calls
@@ -1819,7 +1874,8 @@ that sees the service stop with that record is a failed start.
 
 Before the shim reports the service stopped for any reason (the command exiting,
 cleanly or not, or the shim's own wait on it failing), it has the job terminated.
-A `stop` does the same before it reports. If the job cannot
+A `stop` first asks the command to exit and waits for the job to drain, as
+[`stop-action`](#stop-action) says, and then does the same before it reports. If the job cannot
 be terminated, the shim reports `0`, `1003` as for a `stop` it could not
 complete, whatever `stop` follows.
 
@@ -1937,8 +1993,8 @@ going down, or may never have moved.
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is
 refused — for a `protocol: plain` daemon almost always, since its service reads
-`RUNNING` until the shim has taken the stop, then `STOP_PENDING` until its
-child is gone — which leaves the daemon stopped, at exit `4`. To restart a
+`RUNNING` until the shim has taken the stop, then `STOP_PENDING` until the
+daemon's tree has exited or its `timeout` is over — which leaves the daemon stopped, at exit `4`. To restart a
 daemon on Windows, let `restart` wait for the stop: leave `--timeout` at its
 default, or give it a duration other than `0`.
 
@@ -1995,6 +2051,79 @@ A task has no restart policy: its `kill` ends the run in flight and leaves its
 schedule armed, and a task with no run in flight is "not running" like any
 other daemon with no process. What it sends on each platform is in
 [Stopping and killing a task](#stopping-and-killing-a-task).
+
+## Uninstalling a daemon
+
+`goetia daemon uninstall <ID...>` stops each daemon's run in flight, removes its definition, and reloads the
+manager. It reads the installed artifact, so it works where the manifest is gone, and it needs elevation.
+
+**`--no-stop`** is for a program that uninstalls its own daemon from inside a run and must not be ended by it.
+`uninstall` then removes the definition and everything that would start another run, sends nothing to a run in
+flight and waits for nothing of it. The caller may be the run itself, or a process it started. With several ids,
+`--no-stop` applies to each. With no run in flight it is a plain `uninstall`: it does all that `uninstall` does,
+so nothing is left behind for want of a run, except, on systemd, a service waiting to be restarted (below).
+
+What is left while the run lives is the manager's to report, and goetia reports it as it is.
+
+**systemd.** The unit files are gone, so the id is not installed, and the process is the caller's. systemd keeps a
+loaded unit with no file (`LoadState=not-found`) while the process lives, and never restarts it.
+
+- `--no-stop` sends nothing in any state: no stop and no signal, a unit with no process included.
+- A run still in its start job is ended by a reload that drops its unit file, at systemd's default start timeout.
+  For goetia's units that is a task's run (a service is past its start phase). So when systemd reports the run
+  of the definition goetia is removing still in its start job, `uninstall --no-stop` first writes a stand-in unit
+  of the same name under `/run/systemd/system/` (a tmpfs, so a reboot removes it) with no start timeout. It
+  carries the `KillSignal=` and `TimeoutStopSec=` systemd was applying to the job, a drop-in's included, and
+  goetia's `[X-Goetia]` section and the id, which is how goetia knows the file is its own. Any other stop setting
+  a drop-in gave the job (`KillMode=`, `ExecStop=`, `SendSIGKILL=` and the like) is not carried: a hand
+  `systemctl stop` of the left run uses systemd's defaults for those. A hand `systemctl start` of the stand-in
+  fails. A start job that is queued and not yet running (systemd reads the unit `inactive` with a job
+  pending) gets the stand-in too. If it began before the reload, its run is kept; if it was still queued at the
+  reload, it runs the stand-in, fails on its assertion and starts nothing, and the stand-in stays until the next
+  `install` or `uninstall` of the id or a reboot. A run past its start phase needs none and is left as it is. A
+  task whose job is gone and whose timer alone is installed gets none either: the unit under its name may be
+  somebody else's.
+- A service that is waiting to be restarted is not restarted, and nothing is sent to it. The reload fails the
+  restart on the missing unit, so systemd lists the unit as `not-found failed`, and the machine reads `degraded`,
+  until `systemctl reset-failed <id>` or a reboot. If systemd restarted it before the reload, that run began after
+  goetia read the unit: nothing is sent to it and nothing restarts it again; it gets no stand-in, so one that
+  has not finished starting when the manager reloads is ended by systemd at its start timeout. To cancel the
+  restart instead, uninstall without `--no-stop`.
+- Nothing removes the stand-in while its run has a process. The next `install` or `uninstall` of the id, an id
+  nobody installed included, removes it once its run is over, reloads the manager, and clears a failed run of it
+  with `systemctl reset-failed`. `uninstall --no-stop` of an id whose run has a process leaves the stand-in and
+  the run. `uninstall` without the flag of an id nobody installed stops the run, clears it with
+  `systemctl reset-failed` only if the stopped run failed, then removes the file. Once the id is installed again,
+  the installed file outranks the stand-in, which is stale. The next `install` that rewrites the unit and the
+  next `uninstall` of the id, with or without the flag, remove it whatever the run is doing (with `--no-stop`, a
+  run still in its start job gets a fresh one), and clear nothing of the run, which is the installed job's. An
+  `install` that finds the definition up to date does not touch it: the installed unit shadows it, and a reboot
+  removes it. An `uninstall --no-stop` that fails after writing the stand-in leaves it, and it is then removed as
+  above: while goetia's unit file is still installed the file shadows it, and with the file gone the stand-in is
+  the unit's definition. If another program put its own unit file at the id during the call, goetia refuses the id
+  as not its own, and the stand-in stays in `/run/systemd/system/` until a reboot, until you remove it, or until
+  that file is gone and the next `uninstall` of the id removes it.
+- A file at the stand-in's path that is not goetia's is never removed. `uninstall --no-stop` of an id whose job
+  goetia removes refuses with an error naming the path, whether or not a run is in flight, and before anything
+  is changed, the timer included. Remove the file, or uninstall without `--no-stop`. For a task whose timer alone
+  is installed (it gets no stand-in), for an id nothing is installed at, or for `uninstall` without the flag, the
+  file is left alone and changes nothing.
+- `uninstall` of an id nothing is installed at stops nothing, with or without `--no-stop`, except the run a
+  stand-in of goetia's keeps, which `uninstall` without the flag stops. Whatever else is left running is the
+  caller's process, and `systemctl stop <id>` ends it. It reloads the manager when systemd still holds a
+  definition loaded from goetia's own unit path whose file is gone (a `--no-stop` uninstall whose last reload
+  failed), so the retry finishes it and the unit is not restarted from memory; it does no more for it, since
+  goetia cannot show that a definition whose file is gone was its own. Where no manager can be asked it reads
+  nothing and answers "not installed".
+- `systemctl reset-failed` clears a unit that failed, even when its file is gone: such a unit is in memory. A unit
+  that is not in memory has nothing to clear. goetia clears only what it can tell is its own: the failed run of a
+  stand-in it removes. A left run that fails later stays listed as
+  `not-found failed`, and the machine reads `degraded`, until `systemctl reset-failed <id>` or a reboot.
+- An `install` of the same id while the left run lives is not refused: systemd adopts the process under the new
+  definition until it exits. The left run is then governed by the new definition, its start timeout included,
+  which can end a run that is still starting.
+- A run somebody else starts between goetia's reading that a run is in flight and the reload is that caller's own
+  conflicting action, and goetia does not guard against it.
 
 ## Exit codes
 

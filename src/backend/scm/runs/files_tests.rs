@@ -2,6 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -323,4 +324,27 @@ fn a_delete_outcome_that_is_no_deletion_is_an_error() {
         DeleteOutcome::Linked.into_result().unwrap_err().kind(),
         io::ErrorKind::NotADirectory
     );
+}
+
+/// Nothing is renamed onto a name that exists: the operating system refuses it and the target is as it was. A name
+/// that is free is taken.
+#[skuld::test]
+fn a_rename_onto_a_name_that_exists_is_refused_and_one_onto_a_free_name_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let held_in = open(dir.path());
+    let target = dir.path().join("rec.json");
+    fs::write(&target, "old").unwrap();
+    let mut file = create_temp(&held_in, OsStr::new("rec.json.tmp")).unwrap();
+    file.write_all(b"new").unwrap();
+
+    let refused = rename_to(&held_in, &file, OsStr::new("rec.json")).unwrap_err();
+
+    assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused:?}");
+    assert_eq!(fs::read(&target).unwrap(), b"old");
+
+    rename_to(&held_in, &file, OsStr::new("free.json")).unwrap();
+    drop(file);
+
+    assert_eq!(fs::read(dir.path().join("free.json")).unwrap(), b"new");
+    assert!(!dir.path().join("rec.json.tmp").exists());
 }

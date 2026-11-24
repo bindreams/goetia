@@ -5,7 +5,7 @@ use std::fs;
 use std::process::Command;
 
 use goetia::backend::systemd::manager::Systemd;
-use goetia::manager::ServiceManager;
+use goetia::manager::{RunInFlight, ServiceManager};
 use goetia::spec::Id;
 
 use crate::linux::{mk, unit_path};
@@ -45,7 +45,7 @@ fn a_unit_systemd_has_not_loaded_is_never_reported_stopped(#[fixture(systemd_gro
     let dir = tempfile::tempdir().expect("tempdir");
     let unit = dir.path().join(format!("{}.service", guard.id()));
     fs::copy(unit_path(guard.id()), &unit).expect("copy the unit");
-    mgr.uninstall(&Id::try_from(guard.id()).unwrap())
+    mgr.uninstall(&Id::try_from(guard.id()).unwrap(), RunInFlight::Stop)
         .expect("uninstall from the host");
 
     for (args, says) in [

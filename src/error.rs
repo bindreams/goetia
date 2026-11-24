@@ -596,6 +596,13 @@ pub enum Error {
     #[error("{}", account_change_held(id, pin))]
     AccountChangeHeld { id: String, pin: PathBuf },
 
+    /// `uninstall --no-stop` on systemd found a file that is not goetia's at the path of the unit that
+    /// keeps a left run alive, and refused: raised whether or not a run is in flight, since the next run
+    /// may be, and only for an id whose job goetia removes (a timer alone gets no such unit). Determinate:
+    /// nothing was changed. No source, so the advice is in the message.
+    #[error("{}", standin_blocked(id, path))]
+    StandinBlocked { id: String, path: PathBuf },
+
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
@@ -911,6 +918,7 @@ impl Error {
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
+            | Error::StandinBlocked { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -1120,6 +1128,7 @@ impl Error {
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
+            | Error::StandinBlocked { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }
@@ -1587,6 +1596,15 @@ fn account_change_running(id: &str) -> String {
     format!(
         "`{id}` is running, and installing it as another account registers it again, which removes the running \
          task first: run `goetia daemon stop {id}`, then re-run install"
+    )
+}
+
+/// The message of [`Error::StandinBlocked`].
+fn standin_blocked(id: &str, path: &Path) -> String {
+    format!(
+        "`{id}` cannot be uninstalled with `--no-stop`: `{}` is not goetia's, and a run that uninstall leaves \
+         needs that path, whether or not one is running now: remove the file, or uninstall without `--no-stop`",
+        path.display()
     )
 }
 

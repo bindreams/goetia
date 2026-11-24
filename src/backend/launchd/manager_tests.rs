@@ -1044,7 +1044,7 @@ fn drawings() -> [Drawing; 5] {
             plist: marked_plist_restarting,
             calls: |_| fixed(&BOOTOUT),
             drew: (SERVICE_STOP_REQUESTS, SERVICE_STOP_CALLS),
-            run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
+            run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, RunInFlight::Stop, reservation) {
                 Err(Error::Os { what, source, .. })
                     if what == "remove"
                         && source
@@ -1512,7 +1512,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     script.assert_driven("status");
 
     let (mgr, script) = over_sh(&BOOTOUT);
-    mgr.uninstall(&id).expect("uninstall");
+    mgr.uninstall(&id, RunInFlight::Stop).expect("uninstall");
     script.assert_driven("uninstall");
     assert!(!staging_path(&name).exists(), "uninstall left the plist");
 }
@@ -1730,10 +1730,41 @@ fn an_uninstall_removes_the_plist_only_after_the_old_instance_is_gone() {
         ..marked_plist(&never_installed())
     };
 
-    Backend::uninstall(&mgr, plist, &mut reserved(&[Step::Uninstall])).expect("uninstall");
+    Backend::uninstall(&mgr, plist, RunInFlight::Stop, &mut reserved(&[Step::Uninstall])).expect("uninstall");
 
     fake.assert_spent("the wait for the old instance");
     assert!(!path.exists(), "uninstall left the plist");
+}
+
+/// Until launchd's own unit lands, `--no-stop` is refused before anything is read or changed, for an
+/// installed id and an absent one, and `Stop` is unchanged.
+#[skuld::test]
+fn leaving_a_run_is_refused_before_anything_is_called() {
+    use crate::backend::Backend;
+
+    let fake = Fake::new([]);
+    let mgr = launchd_over(fake.clone());
+    let id = never_installed();
+
+    let refused = Backend::uninstall(
+        &mgr,
+        marked_plist(&id),
+        RunInFlight::Leave,
+        &mut reserved(&[Step::Uninstall]),
+    );
+    let refused_absent = Backend::uninstall_absent(&mgr, &id, RunInFlight::Leave);
+
+    for refusal in [refused, refused_absent] {
+        match refusal {
+            Err(Error::Invalid { message, .. }) => {
+                assert!(message.contains("--no-stop"), "{message}");
+                assert!(message.contains("nothing was changed"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+    assert!(Backend::uninstall_absent(&mgr, &id, RunInFlight::Stop).is_ok());
+    fake.assert_spent("nothing was called");
 }
 
 /// A `Create` over a stale job boots it out, and reads the label again after writing. The old instance

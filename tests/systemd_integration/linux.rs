@@ -16,7 +16,7 @@ use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, TaskStatus, conformance};
+use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State, TaskStatus, conformance};
 use goetia::spec::{
     AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, User,
 };
@@ -277,6 +277,7 @@ struct RmInRoot<L> {
 fn uninstall_via_cli(id: &str) -> (ExitCode, String, String) {
     let args = goetia::cli::uninstall::Args {
         ids: vec![id.to_string()],
+        no_stop: false,
     };
     let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
     let mut out = Vec::new();
@@ -732,7 +733,7 @@ impl Drop for Unstoppable {
                 &["stop", &unit],
                 &["reset-failed", &unit],
             ],
-            not_loaded,
+            cmd::Run::systemctl_says_not_loaded,
         ));
     }
 }
@@ -1296,15 +1297,9 @@ impl Drop for ScopeGuard {
         warn_left_behind(cmd::run_cleanup_unless(
             "systemctl",
             &[&["reset-failed", &self.0]],
-            not_loaded,
+            cmd::Run::systemctl_says_not_loaded,
         ));
     }
-}
-
-/// Whether a failed `systemctl` run says its unit is not loaded: `stop` exits 5, while `kill` and
-/// `reset-failed` pass the bus error through as exit 1.
-fn not_loaded(run: &cmd::Run) -> bool {
-    run.code == Some(5) || (run.code == Some(1) && run.stderr.contains("not loaded"))
 }
 
 /// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes
@@ -1481,7 +1476,7 @@ fn uninstall_leaves_nothing(#[fixture(systemd_group)] _group: &Group) {
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     write_dropin(&id);
 
-    mgr.uninstall(&spec.common().id).expect("uninstall");
+    mgr.uninstall(&spec.common().id, RunInFlight::Stop).expect("uninstall");
 
     assert!(!unit_path(&id).exists(), "fragment must be gone");
     assert!(!dropin_dir(&id).exists(), "drop-in directory must be gone");
@@ -3033,7 +3028,7 @@ fn a_task_is_installed_armed_run_reported_and_uninstalled(#[fixture(systemd_grou
     assert!(!timer_wants_symlink(&id).exists());
 
     mgr.enable(&task_id).expect("enable again");
-    mgr.uninstall(&task_id).expect("uninstall");
+    mgr.uninstall(&task_id, RunInFlight::Stop).expect("uninstall");
     assert!(!unit_path(&id).exists(), "the job must be gone");
     assert!(!timer_path(&id).exists(), "the timer must be gone");
     assert!(

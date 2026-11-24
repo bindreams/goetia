@@ -856,16 +856,18 @@ impl Systemctl {
             Stamp::Left => {}
             Stamp::Clean => self.clean_timer(id, held)?,
             Stamp::ResetThenClean => {
-                self.reset_timer(id, held)?;
+                self.reset_failed(id, UnitKind::Timer, held)?;
                 self.clean_timer(id, held)?;
             }
         }
         self.enable_timer(id, held)
     }
 
-    /// `systemctl reset-failed` for `id`'s timer: a failed timer is inactive again.
-    fn reset_timer(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.unit_file_verb(&["reset-failed"], id, UnitKind::Timer, held)
+    /// `systemctl reset-failed` for `id`'s `kind` unit: a unit that failed is inactive again, even when its
+    /// file is gone (`not-found failed`: it is in memory). A unit that is not in memory has nothing to clear,
+    /// so this is asked only for a unit read as failed.
+    pub(super) fn reset_failed(&self, id: &str, kind: UnitKind, held: &mut Held) -> Result<()> {
+        self.unit_file_verb(&["reset-failed"], id, kind, held)
     }
 
     /// `systemctl clean --what=state` for `id`'s timer: its stamp (`/var/lib/systemd/timers/stamp-*`).
@@ -944,6 +946,12 @@ impl Systemctl {
     /// on any unit name, loaded or not (an empty `UnitFileState=` included), so an answer without one
     /// is no answer, and never the state its absence would default to.
     fn show_properties(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
+        self.show_with_optional(unit, props, &[])
+    }
+
+    /// [`Systemctl::show_properties`], except that an answer may leave out any of `optional`: a property systemd
+    /// prints only when it has a value.
+    fn show_with_optional(&self, unit: &str, props: &[&str], optional: &[&str]) -> Result<BTreeMap<String, String>> {
         let joined = props.join(",");
         let (status, capture) = self.completed(
             Purpose::Read,
@@ -964,7 +972,11 @@ impl Systemctl {
                 map.insert(k.to_string(), v.to_string());
             }
         }
-        let missing: Vec<&str> = props.iter().copied().filter(|prop| !map.contains_key(*prop)).collect();
+        let missing: Vec<&str> = props
+            .iter()
+            .copied()
+            .filter(|prop| !map.contains_key(*prop) && !optional.contains(prop))
+            .collect();
         if !missing.is_empty() {
             return Err(Error::IncompleteAnswer {
                 command: format!("systemctl show {unit}"),
@@ -1036,6 +1048,34 @@ impl Systemctl {
         })
     }
 
+    /// `unit`'s run as `uninstall` has to treat it, in one `systemctl show`: see [`UnitRun`]. Any unit
+    /// name is answered, one systemd has no file for included, so nothing here is an error for an absent
+    /// unit.
+    pub(super) fn run_of(&self, unit: &str) -> Result<UnitRun> {
+        let props = self.show_with_optional(unit, &UnitRun::PROPERTIES, &["Job"])?;
+        let active = props["ActiveState"].as_str();
+        // No `Job` line is no job pending, as an empty `Job=` is.
+        let job_pending = props.get("Job").is_some_and(|job| !job.is_empty());
+        Ok(UnitRun {
+            phase: match active {
+                // A start job that is queued and not yet running reads `inactive`: a job pending is a run
+                // that has not forked.
+                "inactive" | "failed" if job_pending => RunPhase::InStartJob,
+                "inactive" | "failed" => RunPhase::None,
+                // Positive evidence: no process is not, since a start job has none before its first fork.
+                "activating" if props["SubState"].starts_with("auto-restart") => RunPhase::PendingRestart,
+                "activating" => RunPhase::InStartJob,
+                // Every other state systemd reports, the ones goetia does not know included.
+                _ => RunPhase::Running,
+            },
+            failed: active == "failed",
+            kill_signal: props["KillSignal"].clone(),
+            stop_timeout: props["TimeoutStopUSec"].clone(),
+            load_state: props["LoadState"].clone(),
+            fragment_path: props["FragmentPath"].clone(),
+        })
+    }
+
     /// Whether the manager still holds the job `job`, queued or running: `systemctl list-jobs` lists
     /// every one. A job that was canceled leaves no journal entry, so this is where its end shows.
     pub(super) fn job_exists(&self, job: u64) -> Result<bool> {
@@ -1060,6 +1100,58 @@ pub(super) struct TaskJob {
     pub pid: Option<u32>,
     /// The `InvocationID` of the run the unit is in, if it has one.
     pub invocation: Option<String>,
+}
+
+/// Whether a unit has a run, and which kind, as `ActiveState`, `SubState` and `Job` say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunPhase {
+    /// `inactive` or `failed`, with no job pending.
+    None,
+    /// `activating` with a `SubState` that begins with `auto-restart` (`auto-restart`, `auto-restart-queued` from
+    /// systemd 254): a restart waiting for its delay. See rule 3 of the stand-in plan.
+    PendingRestart,
+    /// Any other `activating`, the unknown sub-states included, the safe side; or `inactive` or `failed` with a job
+    /// pending, a start job queued and not yet running. A reload that drops its unit file ends it at the start
+    /// timeout.
+    InStartJob,
+    /// Every other state systemd reports, the ones goetia does not know included.
+    Running,
+}
+
+/// What one `systemctl show` of a job's unit says of the run `uninstall` decides about: see
+/// [`Systemctl::run_of`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct UnitRun {
+    pub phase: RunPhase,
+    /// `ActiveState` is `failed`: a run that failed, which `reset-failed` clears.
+    pub failed: bool,
+    /// `KillSignal` as systemd prints it: a number, a drop-in's override included.
+    pub kill_signal: String,
+    /// `TimeoutStopUSec` as systemd prints it (`1min 30s`, `infinity`): a unit file takes it back verbatim as
+    /// `TimeoutStopSec=`.
+    pub stop_timeout: String,
+    pub load_state: String,
+    /// The file systemd loaded the unit from, empty if none.
+    pub fragment_path: String,
+}
+
+impl UnitRun {
+    /// What the read asks, in this order.
+    const PROPERTIES: [&'static str; 7] = [
+        "ActiveState",
+        "SubState",
+        "Job",
+        "KillSignal",
+        "TimeoutStopUSec",
+        "LoadState",
+        "FragmentPath",
+    ];
+
+    /// Whether systemd still holds a definition loaded from `path`: `uninstall` of the unit's file left no
+    /// reload, so the manager still has what the file said and restarts the unit from memory.
+    pub fn loaded_from(&self, path: &std::path::Path) -> bool {
+        self.load_state == "loaded" && std::path::Path::new(&self.fragment_path) == path
+    }
 }
 
 /// Whether systemd has no unit file for the name `shown` is about.

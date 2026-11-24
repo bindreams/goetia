@@ -142,13 +142,13 @@ use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
 use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Settle, Standing, Unnamed,
-    WriteOutcome,
+    WriteOutcome, leave_not_built,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result, carried_composite, os_error_in, target_failed};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
+use crate::manager::{Budget, DaemonStatus, Installed, RunInFlight, State, Status, Step};
 use crate::shim::HostCommand;
 use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Protocol, User};
 
@@ -785,7 +785,10 @@ impl Backend for Scm {
         combined(self.service_scan(), &*self.tasks)
     }
 
-    fn uninstall(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
+    fn uninstall(&self, snapshot: WindowsSnapshot, in_flight: RunInFlight, _reservation: &mut ()) -> Result<()> {
+        if in_flight == RunInFlight::Leave {
+            return Err(leave_not_built(snapshot.id(), "Windows"));
+        }
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_uninstall(snapshot),
             WindowsSnapshot::Task(snapshot) => self.task_uninstall(snapshot),
@@ -794,7 +797,10 @@ impl Backend for Scm {
 
     /// The id is in neither store, so what is left of it is a task's run records, which a task's
     /// uninstall that could not remove them leaves, and what a service's uninstall leaves to sweep.
-    fn uninstall_absent(&self, id: &Id) -> Result<()> {
+    fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
+        if in_flight == RunInFlight::Leave {
+            return Err(leave_not_built(id, "Windows"));
+        }
         self.task_uninstall_absent(id)
     }
 

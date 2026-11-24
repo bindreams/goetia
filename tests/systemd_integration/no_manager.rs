@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use goetia::backend::systemd::manager::Systemd;
-use goetia::manager::{Budget, ServiceManager};
+use goetia::manager::{Budget, RunInFlight, ServiceManager};
 use goetia::spec::Id;
 
 use crate::linux::{
@@ -331,6 +331,36 @@ fn an_uninstall_where_no_manager_can_be_asked_removes_nothing(#[fixture(systemd_
     }
 }
 
+/// `uninstall` of an id nothing is installed at asks nothing of a manager that cannot be asked: it still
+/// answers "not installed", with or without `--no-stop`, as it did before it could look for a definition
+/// systemd holds.
+#[skuld::test]
+fn an_uninstall_of_an_absent_id_where_no_manager_can_be_asked_says_not_installed(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let ghost = support::random_test_id();
+    let _guard = ServiceGuard::new(&ghost);
+
+    for way in EVERY_WAY {
+        for flags in [&[][..], &["--no-stop"][..]] {
+            let mut args = vec!["daemon", "uninstall"];
+            args.extend(flags);
+            args.push(&ghost);
+            let output = way.goetia(&args);
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let context = format!("{way:?} {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert_eq!(output.status.code(), Some(0), "{context}");
+            assert!(
+                stdout.contains(&format!("{ghost}: not installed (nothing to do)")),
+                "{context}"
+            );
+        }
+    }
+}
+
 /// A live-state read is refused rather than read as a state: `status`, by id and for every
 /// daemon, and `list`, which reads each daemon's — and so `show`, which renders what `list` finds.
 /// An empty answer from a `systemctl` that asked no manager once read as "unknown, not enabled"
@@ -540,7 +570,9 @@ fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs(#[f
     let unit_dir = tempfile::tempdir().expect("tempdir");
     let unit = unit_dir.path().join(format!("{}.service", guard.id()));
     fs::copy(unit_path(guard.id()), &unit).expect("copy the unit");
-    Systemd::new().uninstall(&daemon).expect("uninstall from the host");
+    Systemd::new()
+        .uninstall(&daemon, RunInFlight::Stop)
+        .expect("uninstall from the host");
     let unit = unit.to_str().expect("utf-8 temp path");
 
     for (shape, evidence) in [

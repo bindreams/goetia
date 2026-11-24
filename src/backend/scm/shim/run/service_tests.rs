@@ -11,7 +11,10 @@ use std::sync::Arc;
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
-use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
+use crate::spec::{
+    DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal, TaskFields,
+    TaskSpec,
+};
 use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
 use cosca::error::ChildFate;
@@ -25,18 +28,29 @@ use windows_sys::Win32::System::Services::{
 use super::*;
 use crate::backend::scm::shim::run::os::LogKind;
 use crate::backend::scm::shim::run::os::fake::{
-    ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd,
-    tree_kill_refused, wait_failed, wait_failed_with_code,
+    AskReply, ChannelCall, FAKE_LOGS, FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, ProcessCall,
+    TreeWaitReply, WaitReply, WaiterEnd, tree_kill_refused, wait_failed, wait_failed_with_code,
 };
+use crate::backend::scm::shim::run::stop_bus::WaitEnd;
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, chained, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
 
-/// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report.
+/// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report, with the plan of `spec`.
 fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnce()) -> Reported {
-    super::run_daemon(spec, supervisor, ID, on_running, || {})
+    super::run_daemon(spec, StopPlan::of(spec), supervisor, ID, on_running, |_| {})
+}
+
+/// [`super::launch`] with the plan of `spec`.
+fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
+    super::launch(spec, StopPlan::of(spec), supervisor, id)
+}
+
+/// [`super::refuse_unready_host`] with the plan of `spec`.
+fn refuse_unready_host(spec: &DaemonSpec, initialised: bool) -> Result<(), SpecStop> {
+    super::refuse_unready_host(spec, StopPlan::of(spec), initialised)
 }
 
 /// Where [`spec`]'s daemon logs. The `Fake` opens nothing there.
@@ -50,6 +64,28 @@ const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.
 /// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
     spec_logging_to(Some(PathBuf::from(DAEMON_LOG)))
+}
+
+/// [`spec`] that a stop ends at once (`send-signal: kill`): no ask, no wait, which is what the tests of the
+/// teardown and of the reports state replies for.
+fn kill_spec() -> DaemonSpec {
+    stopping_by(StopAction {
+        send_signal: StopSignal::Kill,
+        timeout: None,
+    })
+}
+
+/// [`spec`] whose stop is `action`.
+fn stopping_by(action: StopAction) -> DaemonSpec {
+    let DaemonSpec::Service(service) = spec() else {
+        unreachable!("`spec` is a service")
+    };
+    ServiceSpec::new(ServiceFields {
+        stop_action: action,
+        ..service.into_fields()
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
 }
 
 /// [`spec`], with the `logs:` that is given.
@@ -471,7 +507,7 @@ fn running_is_reported_once_and_after_the_spawn() {
     let mut running_reports = Vec::new();
 
     // The stop ends the pass once the report is made; the daemon runs until then.
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         running_reports.push(fake.calls(Op::Spawn));
         supervisor.bus.request_stop();
     });
@@ -535,7 +571,7 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         supervisor.bus.request_stop();
     });
 
@@ -717,7 +753,7 @@ fn endings() -> Vec<Ending> {
         Ending {
             spawn: || Some(FakeProcess::running()),
             stop: true,
-            outcome: PassOutcome::Stopped,
+            outcome: PassOutcome::Stopped(None),
             reported: Reported::Clean,
         },
         Ending {
@@ -764,16 +800,171 @@ fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) 
 fn run_daemon_is_run_pass_then_reported() {
     for ending in endings() {
         let outcome = pass_of(&ending, |supervisor, on_running| {
-            run_pass(&spec(), supervisor, ID, on_running, || {})
+            run_pass(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {})
         });
         let reported = pass_of(&ending, |supervisor, on_running| {
-            super::run_daemon(&spec(), supervisor, ID, on_running, || {})
+            super::run_daemon(&kill_spec(), StopPlan::AtOnce, supervisor, ID, on_running, |_| {})
         });
 
         assert_eq!(outcome, ending.outcome);
         assert_eq!(outcome.reported(), ending.reported);
         assert_eq!(reported, ending.reported);
     }
+}
+
+/// One pass whose stop is accepted as the daemon is running, with the process the `Fake` spawns, the plan the pass runs
+/// and the `WaitEnd` `on_stopping` was told.
+fn stopped_pass(plan: StopPlan, process: FakeProcess) -> (PassOutcome, Vec<WaitEnd>) {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    fake.will_spawn(process);
+    let bus = Arc::clone(&supervisor.bus);
+    let mut told = Vec::new();
+    let outcome = run_pass(
+        &kill_spec(),
+        plan,
+        &supervisor,
+        ID,
+        || assert!(bus.request_stop()),
+        |end| told.push(end),
+    );
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+    let _ = fake.take_infos();
+    (outcome, told)
+}
+
+/// A daemon that exited by itself, as far as the shim saw, before its teardown, and a stop was accepted: the pass
+/// carries the daemon's own exit code, wherever the stop met the exit. The service reports it clean all the same.
+#[skuld::test]
+fn a_stop_over_a_daemon_that_exited_by_itself_carries_its_exit_code_and_is_clean() {
+    let ask = StopPlan::AskAndWait {
+        event: cosca::CtrlEvent::CtrlC,
+        timeout: Some(Duration::from_secs(30)),
+    };
+    // Gone when the stop is seen, whichever plan.
+    for plan in [StopPlan::AtOnce, StopPlan::WaitOnly, ask] {
+        let gone = FakeProcess::new()
+            .exited_unreported(7)
+            .wait(WaitReply::Blocks)
+            .send_kill_tree(KillReply::Ends);
+        let (outcome, told) = stopped_pass(plan, gone);
+
+        assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "{plan:?}, gone at the stop");
+        assert_eq!(
+            told,
+            [WaitEnd::Exit],
+            "{plan:?}: no stop was seen over a program that is gone"
+        );
+        assert_eq!(outcome.reported(), Reported::Clean);
+    }
+    // Alive at the stop, exits as it is asked.
+    let asked = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .wait(WaitReply::Blocks)
+        .ask(AskReply::SentAndExits(7))
+        .wait_tree(TreeWaitReply::Drained)
+        .send_kill_tree(KillReply::Ends);
+    let (outcome, told) = stopped_pass(ask, asked);
+    assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "exited within the ask");
+    assert_eq!(told, [WaitEnd::Stop]);
+    assert_eq!(outcome.reported(), Reported::Clean);
+}
+
+/// The read at the stop gave the daemon's exit status, and the waiter's wait fails after the read: the exit is the
+/// daemon's all the same, the daemon is not killed, and the service is told a clean stop.
+#[skuld::test]
+fn a_stop_that_read_the_daemon_gone_carries_its_exit_code_when_the_waiter_then_fails() {
+    for plan in [StopPlan::AtOnce, StopPlan::WaitOnly] {
+        let fake = FakeGuard::new();
+        let supervisor = supervisor(&fake);
+        fake.will_make_thread();
+        let gone = FakeProcess::new()
+            .exited_unreported(7)
+            .wait(WaitReply::FailsWhenEnded)
+            .send_kill_tree(KillReply::Ends);
+        fake.will_spawn(gone.clone());
+        let bus = Arc::clone(&supervisor.bus);
+
+        let outcome = run_pass(
+            &kill_spec(),
+            plan,
+            &supervisor,
+            ID,
+            || assert!(bus.request_stop()),
+            |_| {},
+        );
+
+        assert_eq!(outcome, PassOutcome::Stopped(Some(7)), "{plan:?}");
+        assert_eq!(outcome.reported(), Reported::Clean);
+        assert_eq!(
+            gone.calls(),
+            [ProcessCall::SendKillTree],
+            "{plan:?}: the root was killed"
+        );
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+        let failures = fake.take_failures();
+        assert_eq!(failures.len(), 1, "{plan:?}: {failures:?}");
+        assert!(failures[0].contains("background wait on child"), "{failures:?}");
+    }
+}
+
+/// A stop accepted between the wake of the wait and the decision of the exit: the exit was seen first, so the pass
+/// carries its code; the service still reports clean.
+#[skuld::test]
+fn a_stop_accepted_after_the_exit_was_seen_carries_the_exit_code_and_is_clean() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
+    let bus = Arc::clone(&supervisor.bus);
+
+    let outcome = run_pass(
+        &kill_spec(),
+        StopPlan::AtOnce,
+        &supervisor,
+        ID,
+        || {},
+        |end| {
+            assert_eq!(end, WaitEnd::Exit);
+            assert!(bus.request_stop());
+        },
+    );
+
+    assert_eq!(outcome, PassOutcome::Stopped(Some(7)));
+    assert_eq!(outcome.reported(), Reported::Clean);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+}
+
+/// A stop over a daemon the shim never saw exit carries no code: the teardown ended it, or its wait failed, and what
+/// exit status it left is the teardown's.
+#[skuld::test]
+fn a_stop_over_a_daemon_the_shim_never_saw_exit_carries_no_code() {
+    let (outcome, _) = stopped_pass(StopPlan::AtOnce, FakeProcess::running());
+    assert_eq!(outcome, PassOutcome::Stopped(None), "ended by the teardown");
+
+    let failed = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .send_kill_tree(KillReply::Ends);
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    fake.will_spawn(failed);
+    let bus = Arc::clone(&supervisor.bus);
+    let outcome = run_pass(
+        &kill_spec(),
+        StopPlan::WaitOnly,
+        &supervisor,
+        ID,
+        || assert!(bus.request_stop()),
+        |_| {},
+    );
+    assert_eq!(outcome, PassOutcome::Stopped(None), "a failed wait");
+    assert_eq!(outcome.reported(), Reported::Clean);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    let _ = fake.take_failures();
 }
 
 // STOP_PENDING --------------------------------------------------------------------------------------------------------
@@ -787,7 +978,7 @@ fn run_recording_stopping(
     on_running: impl FnOnce(),
 ) -> (Reported, Vec<usize>) {
     let mut stopping = Vec::new();
-    let reported = super::run_daemon(daemon, supervisor, ID, on_running, || {
+    let reported = super::run_daemon(daemon, StopPlan::of(daemon), supervisor, ID, on_running, |_| {
         stopping.push(fake.calls(Op::SendKillTree));
     });
     (reported, stopping)
@@ -797,12 +988,109 @@ fn run_recording_stopping(
 /// while a host holds it (measured), which is what keeps `start` from reading the service as up.
 #[skuld::test]
 fn the_stopping_status_accepts_no_control_and_records_no_exit() {
-    let status = stopping_status();
+    let status = stopping_status(Duration::from_secs(10));
 
     assert_eq!(status.dwCurrentState, SERVICE_STOP_PENDING);
     assert_eq!(status.dwControlsAccepted, 0);
     assert_eq!((status.dwWin32ExitCode, status.dwServiceSpecificExitCode), (0, 0));
     assert_eq!((status.dwCheckPoint, status.dwWaitHint), (1, 10_000));
+}
+
+/// The hint covers what the stop can take: the `timeout` and the teardown, in milliseconds, and for no
+/// `timeout` the largest value the field holds. The longest `timeout` and the margin fit the field.
+#[skuld::test]
+fn the_stopping_hint_is_the_stops_longest_wait_in_milliseconds() {
+    let longest = StopAction::MAX_TIMEOUT + StopAction::TEARDOWN_MARGIN;
+
+    assert_eq!(stopping_status(Duration::from_secs(40)).dwWaitHint, 40_000);
+    assert_eq!(stopping_status(longest).dwWaitHint, 86_410_000);
+    assert_eq!(stopping_status(Duration::MAX).dwWaitHint, u32::MAX);
+    assert_eq!(
+        stopping_status(Duration::from_secs(u64::from(u32::MAX))).dwWaitHint,
+        u32::MAX
+    );
+}
+
+/// A run reports the hint of its plan to the status setter: a stop reports the stop's, an exit the exit's.
+#[skuld::test]
+fn a_run_reports_the_hint_of_its_plan_for_what_ended_it() {
+    let service = spec();
+    let plan = StopPlan::of(&service);
+    let mut hints = Vec::new();
+
+    let fake = FakeGuard::new();
+    let stopped = supervisor(&fake);
+    fake.will_make_thread();
+    fake.will_spawn(
+        FakeProcess::new()
+            .wait(WaitReply::Blocks)
+            // The read of the exit status of a daemon that exited by itself.
+            .wait(WaitReply::Blocks)
+            .ask(AskReply::SentAndExits(0))
+            .wait_tree(TreeWaitReply::Drained)
+            .send_kill_tree(KillReply::Ends),
+    );
+    let bus = Arc::clone(&stopped.bus);
+    super::run_daemon(
+        &service,
+        plan,
+        &stopped,
+        ID,
+        || assert!(bus.request_stop()),
+        |hint| hints.push(hint),
+    );
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    let _ = fake.take_infos();
+    assert_eq!(hints, [plan.wait_hint(WaitEnd::Stop)]);
+    assert_eq!(hints, [Duration::from_secs(40)], "the `timeout` and the teardown");
+
+    let mut hints = Vec::new();
+    let fake = FakeGuard::new();
+    fake.will_make_thread();
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
+    super::run_daemon(&service, plan, &supervisor(&fake), ID, || {}, |hint| hints.push(hint));
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_eq!(hints, [Duration::from_secs(10)], "the teardown alone");
+}
+
+// The host that can ask -----------------------------------------------------------------------------------------------
+
+/// A stop that asks goes through a copy of the host (cosca's proxy), which runs the host's `main`: a host
+/// that did not call `init_helpers` first is refused, with the error naming the call, and not restarted.
+#[skuld::test]
+fn a_host_that_did_not_initialise_is_refused_when_the_stop_asks() {
+    let stop = refuse_unready_host(&spec(), false).expect_err("a stop that asks needs the proxy");
+
+    assert_eq!(stop.reported, Reported::Refused);
+    assert!(
+        stop.message.contains("goetia::shim::init_host()") && stop.message.contains("first"),
+        "the refusal does not name the call: {}",
+        stop.message
+    );
+}
+
+#[skuld::test]
+fn a_host_that_initialised_is_not_refused() {
+    refuse_unready_host(&spec(), true).expect("a host that called `init_helpers`");
+}
+
+/// A stop that asks nothing needs no proxy: `kill` and `wm-close` are not refused, and neither is a task.
+#[skuld::test]
+fn a_host_that_did_not_initialise_is_not_refused_when_the_stop_asks_nothing() {
+    refuse_unready_host(&kill_spec(), false).expect("`send-signal: kill` asks nothing");
+    refuse_unready_host(
+        &stopping_by(StopAction {
+            send_signal: StopSignal::WmClose,
+            timeout: Some(Duration::from_secs(5)),
+        }),
+        false,
+    )
+    .expect("`send-signal: wm-close` asks nothing yet");
+    refuse_unready_host(
+        &crate::testing::task(ID, vec!["C:/daemon.exe".to_string()], None),
+        false,
+    )
+    .expect("a task asks nothing");
 }
 
 #[skuld::test]
@@ -815,13 +1103,14 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
     let mut alive_when_stopping = Vec::new();
 
     let reported = super::run_daemon(
-        &spec(),
+        &kill_spec(),
+        StopPlan::AtOnce,
         &supervisor,
         ID,
         || {
             supervisor.bus.request_stop();
         },
-        || {
+        |_| {
             alive_when_stopping.push((fake.calls(Op::SendKillTree), !daemon.ended()));
         },
     );
@@ -1095,15 +1384,17 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
 fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
-    // The accepted stop is what the pass acts on, so the exit status is never read: one wait.
+    // The daemon is gone when the stop is read (its waiter's report lags), and the read gave its status; the accepted
+    // stop is what the pass reports, whatever the status.
     fake.will_make_thread();
     fake.will_spawn(
         FakeProcess::new()
-            .wait(WaitReply::Exits(7))
+            .exited_unreported(7)
+            .wait(WaitReply::Blocks)
             .send_kill_tree(KillReply::Ends),
     );
 
-    let reported = run_daemon(&spec(), &supervisor, || {
+    let reported = run_daemon(&kill_spec(), &supervisor, || {
         assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_STOP), NO_ERROR)
     });
 

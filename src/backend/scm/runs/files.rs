@@ -43,11 +43,12 @@ pub(super) fn create_temp(dir: &Dir, name: &OsStr) -> io::Result<File> {
     .map_err(|status| dir.open_error(status))
 }
 
-/// Renames the file `file` holds to the name `to` in `dir`, replacing what is there. It is renamed through
-/// the handle, relative to the directory's, so there is no moment at which it is closed and under its
-/// old name: nothing can delete it between its last write and the rename. `file` must have been opened
-/// with `DELETE`, and be in `dir`.
-pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> {
+/// Renames the file `file` holds to the name `to` in `dir`, which must be free: a name that exists is refused
+/// by the operating system ([`io::ErrorKind::AlreadyExists`]) and nothing is replaced, whoever has it open. It is
+/// renamed through the handle, relative to the directory's, so there is no moment at which it is closed and
+/// under its old name: nothing can delete it between its last write and the rename. `file` must have been
+/// opened with `DELETE`, and be in `dir`.
+pub(super) fn rename_to(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> {
     debug_assert!(is_bare(to), "a name, not a path");
     let name: Vec<u16> = to.encode_wide().collect();
     let name_bytes = name.len() * size_of::<u16>();
@@ -58,9 +59,8 @@ pub(super) fn rename_over(dir: &Dir, file: &File, to: &OsStr) -> io::Result<()> 
     let mut buffer = vec![0u64; total.div_ceil(size_of::<u64>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: `buffer` holds `total` zeroed bytes at the alignment of `FILE_RENAME_INFORMATION`: room for
-    // the struct and for the name, which is copied in at the name's own offset.
+    // the struct and for the name, which is copied in at the name's own offset. `ReplaceIfExists` stays zero.
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = true;
         (*info).RootDirectory = dir.file().as_raw_handle() as HANDLE;
         (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), info.cast::<u8>().add(header).cast::<u16>(), name.len());
@@ -104,7 +104,7 @@ pub(super) fn create_pin(dir: &Dir, name: &OsStr) -> io::Result<File> {
 pub(super) const PIN_ACCESS: u32 = DELETE | SYNCHRONIZE;
 
 /// What the handle of a temp file is made with, by the same rule: write and append are the record's bytes,
-/// `DELETE` the rename ([`rename_over`]), `SYNCHRONIZE` the synchronous handle. Not `FILE_GENERIC_WRITE`.
+/// `DELETE` the rename ([`rename_to`]), `SYNCHRONIZE` the synchronous handle. Not `FILE_GENERIC_WRITE`.
 const TEMP_ACCESS: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | SYNCHRONIZE;
 
 /// The bytes of the file `name` in `dir`, or `None` if there is no such file. A link is opened, not

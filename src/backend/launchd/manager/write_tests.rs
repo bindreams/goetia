@@ -20,7 +20,7 @@ use crate::backend::bounded;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
 use crate::decide::{self, ExternalConfig, Ownership};
-use crate::manager::Step;
+use crate::manager::{RunInFlight, Step};
 use crate::spec::{ServiceSpec, TaskSpec, User};
 use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::root_dirs;
@@ -1276,7 +1276,7 @@ fn a_concurrently_changed_plist_is_a_concurrent_change_error() {
 fn uninstall(tree: &Tree, fake: &Fake) -> Result<()> {
     let mgr = manager(fake);
     let snapshot = marked(tree.read());
-    mgr.uninstall(snapshot, &mut reserved(&mgr, Step::Uninstall))
+    mgr.uninstall(snapshot, RunInFlight::Stop, &mut reserved(&mgr, Step::Uninstall))
 }
 
 #[skuld::test]
@@ -1757,7 +1757,8 @@ fn the_verbs_draw_no_more_than_they_reserved() {
     let mgr = manager(&fake);
     let snapshot = marked(tree.read());
     let mut held = reserved(&mgr, Step::Uninstall);
-    mgr.uninstall(snapshot, &mut held).expect("an uninstall");
+    mgr.uninstall(snapshot, RunInFlight::Stop, &mut held)
+        .expect("an uninstall");
     assert_eq!(
         left(&held),
         (0, 0),

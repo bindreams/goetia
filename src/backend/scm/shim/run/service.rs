@@ -6,7 +6,9 @@
 //! new shim, which reads the installed spec afresh.
 
 use std::ffi::{OsString, c_void};
+use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
@@ -20,7 +22,8 @@ use crate::spec::{DaemonSpec, Restart};
 use cosca::error::ChildFate;
 use cosca::{ContainMode, Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
-use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
+use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, FALSE, NO_ERROR};
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP,
     SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
@@ -30,7 +33,10 @@ use windows_sys::Win32::System::Services::{
 use super::exit;
 use super::logging::Log;
 use super::os::{LogKind, Os, Real, Spawned, spawn_error_code};
-use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
+use super::stop_bus::{
+    NOT_RESTARTED, RootExit, StopBus, StopPlan, Supervisor, WaitEnd, WaitOutcome, Waiter, kill_for_stop,
+    terminate_exited_tree,
+};
 
 // Entry ===============================================================================================================
 
@@ -104,12 +110,21 @@ fn run_service(id: &str, log: Arc<Log>, real: Arc<Real>) {
 
     set_daemon_log(&log, id, &blob.spec);
     log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
+    let plan = StopPlan::of(&blob.spec);
+    if let Err(stop) = refuse_unready_host(&blob.spec, plan, cosca::helpers_initialized()) {
+        log.failure(id, &stop.message);
+        return finish(&log, id, stop.reported, |r| report_stopped(status_handle, r));
+    }
+    if plan.asks() {
+        clear_ctrl_c_ignored(&log, id);
+    }
     let reported = run_daemon(
         &blob.spec,
+        plan,
         &supervisor,
         id,
         || report_running(&log, id, status_handle),
-        || report_stopping(&log, id, status_handle),
+        |hint| report_stopping(&log, id, status_handle, hint),
     );
     finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
@@ -120,6 +135,24 @@ pub(super) fn set_daemon_log(log: &Log, id: &str, spec: &DaemonSpec) {
     if let Some((path, LogKind::Own)) = log.daemon_log(id, spec.common().logs.as_deref()) {
         log.set_daemon_log(path);
     }
+}
+
+/// Whether this host can run `spec`'s stop, which `plan` is: a stop that asks goes through cosca's proxy, which is a
+/// copy of the host started with the proxy's arguments, so the host's `main` must have called `init_helpers` first.
+pub(super) fn refuse_unready_host(spec: &DaemonSpec, plan: StopPlan, initialised: bool) -> Result<(), SpecStop> {
+    if initialised || !plan.asks() {
+        return Ok(());
+    }
+    Err(SpecStop {
+        message: format!(
+            "this host did not call `goetia::shim::init_host()` first in its `main`: a stop of {:?} asks the daemon to \
+             exit through a copy of the host that cosca starts as a console-event proxy, which runs the host's `main` and \
+             cannot do it without that call. No daemon was started. Call it before anything else in `main`; \
+             `goetia-shim` does",
+            spec.common().name
+        ),
+        reported: Reported::Refused,
+    })
 }
 
 /// Why the shim reads no spec to run, and what it reports for it.
@@ -179,12 +212,20 @@ pub(super) fn finish(log: &Log, id: &str, reported: Reported, report: impl FnOnc
     }
 }
 
-/// The `STOP_PENDING` status held while the shim tears the daemon down, accepting no control. SCM
+/// `hint` as the wait hint field holds it: milliseconds, at most `u32::MAX`, which is what a stop with no `timeout`
+/// reports.
+fn wait_hint_millis(hint: Duration) -> u32 {
+    u32::try_from(hint.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// The `STOP_PENDING` status held while the shim stops the daemon, accepting no control. SCM
 /// then refuses a second `STOP` (1061) and a `START` (1056) itself, and a `STOPPED` that follows
-/// restarts or not exactly as one that follows `RUNNING` (P18). The hint and checkpoint are those
-/// P18 measured. SCM does nothing when the hint expires or the checkpoint stalls: the status, a refused
-/// STOP (1061) and a refused START (1056) held for 10 s past a 1 s hint (P26).
-fn stopping_status() -> SERVICE_STATUS {
+/// restarts or not exactly as one that follows `RUNNING` (measured). The hint is the stop's longest wait
+/// ([`StopPlan::wait_hint`]): the `timeout` of a stop that asks, and the teardown. The checkpoint is a constant 1.
+/// Measured: SCM does nothing when the hint expires (the status, a refused STOP (1061) and a refused START (1056) held
+/// for 10 s past a 1 s hint). Not measured: a `STOP_PENDING` held for longer than that with a checkpoint that does not
+/// move.
+fn stopping_status(hint: Duration) -> SERVICE_STATUS {
     SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: SERVICE_STOP_PENDING,
@@ -192,7 +233,7 @@ fn stopping_status() -> SERVICE_STATUS {
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: 1,
-        dwWaitHint: 10_000,
+        dwWaitHint: wait_hint_millis(hint),
     }
 }
 
@@ -217,7 +258,7 @@ fn stopped_status(reported: Reported) -> SERVICE_STATUS {
 struct StatusHandle(SERVICE_STATUS_HANDLE);
 
 /// Registered directly rather than through `windows-service` 0.8.1's `register`, which frees its
-/// closure after any Stop, Shutdown or Preshutdown whatever the handler returned (P16 observed it)
+/// closure after any Stop, Shutdown or Preshutdown whatever the handler returned (measured)
 /// while the registration stays live: SCM can deliver a control after that, which would reach freed
 /// memory. No test catches a revert; `clippy.toml` forbids the call.
 fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> std::io::Result<StatusHandle> {
@@ -283,9 +324,26 @@ fn report_running(log: &Log, id: &str, handle: StatusHandle) {
     }
 }
 
+/// Clear this process's own "ignore Ctrl+C" state, which a child created without a process group of its own
+/// inherits: with it set the event the stop sends never arrives (measured). A failure is logged and the
+/// daemon is still run; its stop then ends it when its `timeout` is over.
+fn clear_ctrl_c_ignored(log: &Log, id: &str) {
+    // SAFETY: a null handler routine with `FALSE` clears the calling process's own Ctrl+C-ignore state.
+    if unsafe { SetConsoleCtrlHandler(None, FALSE) } == 0 {
+        let e = std::io::Error::last_os_error();
+        log.warning(
+            id,
+            &format!(
+                "clear the shim's own Ctrl+C-ignore state: {}; a stop's Ctrl+C may not reach the daemon",
+                Chain(&e)
+            ),
+        );
+    }
+}
+
 /// Report `STOP_PENDING`. A failure is logged: the teardown goes on and `STOPPED` is still reported.
-fn report_stopping(log: &Log, id: &str, handle: StatusHandle) {
-    let status = stopping_status();
+fn report_stopping(log: &Log, id: &str, handle: StatusHandle, hint: Duration) {
+    let status = stopping_status(hint);
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
         let e = std::io::Error::last_os_error();
@@ -322,12 +380,16 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 /// stop, and tell SCM how it ended: [`run_pass`], reported.
 pub(super) fn run_daemon(
     spec: &DaemonSpec,
+    plan: StopPlan,
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(),
+    on_stopping: impl FnOnce(Duration),
 ) -> Reported {
-    run_pass(spec, supervisor, id, on_running, on_stopping).reported()
+    run_pass(spec, plan, supervisor, id, on_running, |end| {
+        on_stopping(plan.wait_hint(end))
+    })
+    .reported()
 }
 
 /// How one pass ended, before it is read as anything: what the service tells SCM
@@ -338,8 +400,10 @@ pub(super) enum PassOutcome {
     /// be had, which is already logged.
     Exited(Option<i32>),
     /// A stop was accepted, and the daemon's tree was terminated. It wins over the exit code the
-    /// teardown made the daemon leave, and over a failed wait.
-    Stopped,
+    /// teardown made the daemon leave, and over a failed wait. The code is the daemon's own exit, when the shim had its
+    /// exit status because the daemon had exited by itself, before the teardown; `None` when the teardown ended it
+    /// (or the wait failed, or the status could not be had). A service ignores it; a task's record is that exit.
+    Stopped(Option<i32>),
     /// Something of the daemon's tree may still be running, after a stop, a failure, or an exit
     /// whose tree could not be terminated.
     IncompleteStop,
@@ -355,7 +419,7 @@ impl PassOutcome {
     pub(super) fn reported(self) -> Reported {
         match self {
             PassOutcome::Exited(code) => exit_report(code),
-            PassOutcome::Stopped => Reported::Clean,
+            PassOutcome::Stopped(_) => Reported::Clean,
             PassOutcome::IncompleteStop => Reported::incomplete_stop(),
             PassOutcome::WaitFailed(os_error) => Reported::shim_failure(os_error),
             PassOutcome::NotRun(reported) => reported,
@@ -364,12 +428,13 @@ impl PassOutcome {
 }
 
 /// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
-/// stop, and say how it ended.
+/// stop, and say how it ended. `plan` is the run's [`StopPlan`]: the daemon is spawned for it, and it is the stop the
+/// supervisor runs.
 ///
-/// `on_stopping` is called exactly once, after `on_running` and before the daemon's tree is torn
-/// down, whatever ends the run; never when `on_running` was not. The service reads `STOP_PENDING`
-/// through the teardown, so a `start` is refused rather than answered "running" for a service that
-/// is about to stop.
+/// `on_stopping` is called exactly once, after `on_running` and before anything is asked of the daemon or its tree
+/// is torn down, whatever ends the run; never when `on_running` was not. It is told by a [`WaitEnd`] whether an
+/// accepted stop or the daemon's own end ended the wait. The service reads `STOP_PENDING` through the teardown, so
+/// a `start` is refused rather than answered "running" for a service that is about to stop.
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
@@ -384,13 +449,14 @@ impl PassOutcome {
 /// out (see `Supervisor::wait_for_child_or_stop`).
 pub(super) fn run_pass(
     spec: &DaemonSpec,
+    plan: StopPlan,
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
-    on_stopping: impl FnOnce(),
+    on_stopping: impl FnOnce(WaitEnd),
 ) -> PassOutcome {
     let log = &*supervisor.log;
-    let (child, waiter) = match launch(spec, supervisor, id) {
+    let (child, waiter) = match launch(spec, plan, supervisor, id) {
         Ok(launched) => launched,
         Err(reported) => return PassOutcome::NotRun(reported),
     };
@@ -398,21 +464,9 @@ pub(super) fn run_pass(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running, and `TreeMayRun` its tree.
-    match supervisor.wait_for_child_or_stop(waiter, &child, id, on_stopping) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, plan, on_stopping) {
         WaitOutcome::ChildExited => {
-            let code = match child.wait() {
-                Ok(status) => {
-                    let code = status.code();
-                    if code.is_none() {
-                        log.failure(id, NO_EXIT_CODE);
-                    }
-                    code
-                }
-                Err(e) => {
-                    log.failure(id, &exit_status_unavailable(&e));
-                    None
-                }
-            };
+            let code = exit_code(child.as_ref(), log, id);
             // A stop accepted before this decision wins over a failure: `settle` then says something
             // other than the candidate. A clean exit and a stop accepted after the wait ended read
             // alike.
@@ -421,7 +475,7 @@ pub(super) fn run_pass(
             if !terminate_exited_tree(child.as_ref(), log, id) {
                 PassOutcome::IncompleteStop
             } else if stop_won {
-                PassOutcome::Stopped
+                PassOutcome::Stopped(code)
             } else {
                 PassOutcome::Exited(code)
             }
@@ -433,14 +487,41 @@ pub(super) fn run_pass(
             if supervisor.bus.settle(candidate) == candidate {
                 PassOutcome::WaitFailed(os_error)
             } else {
-                PassOutcome::Stopped
+                PassOutcome::Stopped(None)
             }
         }
-        // `wait_for_child_or_stop` terminated the tree before returning this.
-        WaitOutcome::Stopping => PassOutcome::Stopped,
+        // `wait_for_child_or_stop` terminated the tree before returning this. A daemon that exited by itself first
+        // has its exit status: the one a read of the process gave, or, when none did, the one the waiter's wait
+        // returned (as in the `ChildExited` arm).
+        WaitOutcome::Stopping(root) => PassOutcome::Stopped(match root {
+            RootExit::Status(status) => code_of(status, log, id),
+            RootExit::Unread => exit_code(child.as_ref(), log, id),
+            RootExit::NotSeen => None,
+        }),
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => PassOutcome::IncompleteStop,
     }
+}
+
+/// The exit code of a daemon that has exited and been waited for, or `None` when its exit status could not be had or
+/// carries no code: told in the log.
+fn exit_code(child: &dyn Spawned, log: &Log, id: &str) -> Option<i32> {
+    match child.wait() {
+        Ok(status) => code_of(status, log, id),
+        Err(e) => {
+            log.failure(id, &exit_status_unavailable(&e));
+            None
+        }
+    }
+}
+
+/// The code of an exit status, or `None` when it carries none: told in the log.
+fn code_of(status: ExitStatus, log: &Log, id: &str) -> Option<i32> {
+    let code = status.code();
+    if code.is_none() {
+        log.failure(id, NO_EXIT_CODE);
+    }
+    code
 }
 
 /// How an exited daemon is reported, before [`StopBus::settle`] lets a stop win. `None` is an exit
@@ -459,7 +540,12 @@ fn exit_report(code: Option<i32>) -> Reported {
 ///
 /// The `Err` is what the service reports: the OS error of the failure, `ERROR_GEN_FAILURE`, or the
 /// incomplete stop for a daemon no Job Object contains or a failed spawn may have left running.
-fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
+fn launch(
+    spec: &DaemonSpec,
+    plan: StopPlan,
+    supervisor: &Supervisor,
+    id: &str,
+) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
     let log = &*supervisor.log;
     let waiter = match supervisor.waiter(id) {
         Ok(waiter) => waiter,
@@ -469,7 +555,7 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
         }
     };
     // A waiter that is not handed the daemon is stood down, not dropped: see `Waiter::stand_down`.
-    match supervisor.os.spawn(build_command(spec, &*supervisor.os, log, id)) {
+    match supervisor.os.spawn(build_command(spec, plan, &*supervisor.os, log, id)) {
         Ok(child) => match require_job_object(child, spec, log, id) {
             Ok(child) => Ok((Arc::from(child), waiter)),
             Err(reported) => {
@@ -604,12 +690,13 @@ fn stdio_set<T, E: std::error::Error + 'static>(log: &Log, id: &str, assigned: R
 }
 
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
-/// containment, and stdout+stderr merged into the daemon's log file, which `os` opens. `log`
+/// containment, the stop settings `plan` decides ([`StopPlan::spawn_setup`]), and stdout+stderr merged into the
+/// daemon's log file, which `os` opens. `log`
 /// names that file when the spec does not, and reports a failed open or redirect.
 ///
 /// A service with no `logs` writes the default log. A task with none sends its output to `NUL`
 /// and says nothing of it: that is what such a task asked for.
-pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str) -> cosca::Command {
+pub(crate) fn build_command(spec: &DaemonSpec, plan: StopPlan, os: &dyn Os, log: &Log, id: &str) -> cosca::Command {
     let mut cmd = cosca::run(spec.common().command.iter().cloned());
     if let Some(cwd) = &spec.common().cwd {
         cmd.current_dir(cwd.clone());
@@ -618,6 +705,13 @@ pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str)
     // Best effort, so a daemon no Job Object contains is spawned and then refused by `require_job_object`,
     // which records the incomplete stop. The strongest request would fail the spawn instead.
     cmd.contain_with(ContainMode::BestEffort);
+    let setup = plan.spawn_setup();
+    if let Some(own_group) = setup.process_group {
+        cmd.new_process_group(own_group);
+    }
+    if let Some(event) = setup.ask_with {
+        cmd.graceful_stop(move |target| cosca::stop::send_console_event_via_proxy(target, event));
+    }
 
     let logs = spec.common().logs.as_deref();
     // `Err(None)`: no file, by design, or a failed open that `Log::open_failed` has told.

@@ -110,6 +110,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             pin: PathBuf::new(),
         },
+        Error::StandinBlocked {
+            id: id(),
+            path: PathBuf::new(),
+        },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -1685,6 +1689,16 @@ fn error_messages_and_exit_class() {
             Error::AccountChangeRunning { id: id() },
             "`nightly` is running, and installing it as another account registers it again, which removes the \
              running task first: run `goetia daemon stop nightly`, then re-run install",
+            false,
+        ),
+        (
+            Error::StandinBlocked {
+                id: id(),
+                path: PathBuf::from("/run/systemd/system/nightly.service"),
+            },
+            "`nightly` cannot be uninstalled with `--no-stop`: `/run/systemd/system/nightly.service` is not goetia's, \
+             and a run that uninstall leaves needs that path, whether or not one is running now: remove the file, or \
+             uninstall without `--no-stop`",
             false,
         ),
         (

@@ -41,7 +41,7 @@ pub fn mkfifo(path: &Path) {
 /// announces itself and its number on a FIFO and waits for the test to open the other. The announcing
 /// FIFO is opened read-write here, so the task's write never waits for the test to read it:
 /// [`Held::wait_started`] reads it when it wants to know a run has begun, once per run. Released, the run
-/// exits 0.
+/// exits 0 (or the code [`Held::after_exiting`] names).
 pub struct Held {
     started: BufReader<File>,
     hold: PathBuf,
@@ -60,8 +60,14 @@ impl Held {
         Self::after("trap '' TERM; ")
     }
 
-    /// The task runs `prelude` before anything else.
-    fn after(prelude: &str) -> Held {
+    /// The task runs `prelude` (shell commands, each ending in `;`) before anything else, so a run is
+    /// announced only once they have finished.
+    pub fn after(prelude: &str) -> Held {
+        Self::after_exiting(prelude, 0)
+    }
+
+    /// [`Held::after`], whose run exits with `code` once released.
+    pub fn after_exiting(prelude: &str, code: u8) -> Held {
         let dir = tempfile::tempdir().expect("tempdir");
         let (started, hold) = (dir.path().join("started"), dir.path().join("hold"));
         mkfifo(&started);
@@ -75,7 +81,7 @@ impl Held {
         let count = dir.path().join("count");
         let script = format!(
             "{prelude}n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > \"{c}.new\"; \
-             mv \"{c}.new\" \"{c}\"; echo ready; echo started $n > \"{}\"; read line < \"{}\"; exit 0",
+             mv \"{c}.new\" \"{c}\"; echo ready; echo started $n > \"{}\"; read line < \"{}\"; exit {code}",
             started.display(),
             hold.display(),
             c = count.display()

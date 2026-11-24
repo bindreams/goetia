@@ -16,7 +16,7 @@ use clap::Parser as _;
 use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step};
+use goetia::manager::{Budget, Exit, Installed, RunInFlight, Sequence, ServiceManager, State, Status, Step};
 use goetia::shim::HostCommand;
 use goetia::spec::{DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, StopAction, StopSignal};
 use goetia::testing::service_fields;
@@ -395,7 +395,7 @@ impl ServiceManager for FlakyManager {
         }
         self.inner.preview_install(spec)
     }
-    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> goetia::Result<()> {
         if self.step_over_not_installed_uninstall_for.as_deref() == Some(id.as_str()) {
             return Err(goetia::Error::Step {
                 what: "uninstall".to_string(),
@@ -404,7 +404,7 @@ impl ServiceManager for FlakyManager {
                 }),
             });
         }
-        self.inner.uninstall(id)
+        self.inner.uninstall(id, in_flight)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
         if self.fail_enable_for.as_deref() == Some(id.as_str()) {
@@ -1112,6 +1112,48 @@ fn uninstall_reaches_the_manager() {
     assert!(installed_ids(&fake).is_empty());
 }
 
+/// Without `--no-stop` each id's run is stopped, and with it each id's run is sent nothing: the flag
+/// reaches the manager as `RunInFlight::Leave` for every id it is given, in either position.
+#[skuld::test]
+fn uninstall_stops_each_run_and_no_stop_leaves_each_alone() {
+    for (flag, before_ids, stopped) in [
+        (None, false, true),
+        (Some("--no-stop"), true, false),
+        (Some("--no-stop"), false, false),
+    ] {
+        let fake = Fake::new();
+        for id in ["frpc", "ssh"] {
+            fake.install(&mk(id), false).unwrap();
+            fake.start(&Id::try_from(id).unwrap(), Budget::DEFAULT).unwrap();
+        }
+        let mut argv = vec!["goetia", "daemon", "uninstall"];
+        argv.extend(flag.filter(|_| before_ids));
+        argv.extend(["frpc", "ssh"]);
+        argv.extend(flag.filter(|_| !before_ids));
+        let before = fake.calls().len();
+
+        let (code, out, err) = dispatch_elevated(&argv, &fake);
+
+        assert_eq!(
+            code, 0,
+            "{argv:?}
+stdout:
+{out}
+stderr:
+{err}"
+        );
+        let calls = fake.calls().split_off(before);
+        for id in ["frpc", "ssh"] {
+            assert_eq!(
+                calls.contains(&("stop", id.to_string())),
+                stopped,
+                "{argv:?}: {id}: {calls:?}"
+            );
+        }
+        assert!(installed_ids(&fake).is_empty(), "{argv:?}");
+    }
+}
+
 // Absence and `uninstall`'s exemption =================================================================================
 //
 // `Error::NotInstalled` says the artifact is absent; it says nothing about
@@ -1199,8 +1241,8 @@ impl ServiceManager for PanicsOnStart {
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
         self.0.preview_install(spec)
     }
-    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
-        self.0.uninstall(id)
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> goetia::Result<()> {
+        self.0.uninstall(id, in_flight)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
         self.0.enable(id)
@@ -3622,8 +3664,8 @@ impl ServiceManager for PanicsOnStatus {
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
         self.0.preview_install(spec)
     }
-    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
-        self.0.uninstall(id)
+    fn uninstall(&self, id: &Id, in_flight: RunInFlight) -> goetia::Result<()> {
+        self.0.uninstall(id, in_flight)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
         self.0.enable(id)

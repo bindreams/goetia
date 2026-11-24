@@ -3,7 +3,7 @@ use std::time::Duration;
 use super::*;
 use crate::manager::Budget;
 use crate::manager::conformance;
-use crate::manager::{Exit, TaskStatus};
+use crate::manager::{Exit, RunInFlight, TaskStatus};
 use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
 use crate::testing::{base_fields, service_fields, task};
@@ -133,7 +133,7 @@ fn uninstall_removes_entry() {
     let spec = mk("removable");
     fake.install(&spec, false).unwrap();
 
-    fake.uninstall(&spec.common().id).unwrap();
+    fake.uninstall(&spec.common().id, RunInFlight::Stop).unwrap();
 
     assert!(fake.list().unwrap().is_empty());
     assert!(
@@ -142,12 +142,42 @@ fn uninstall_removes_entry() {
     );
 }
 
+/// `uninstall` stops a run in flight unless it is told to leave it, which sends the run nothing; with no
+/// run in flight the two are the same.
+#[skuld::test]
+fn uninstall_stops_a_run_in_flight_and_leave_sends_it_nothing() {
+    for (in_flight, running, stopped) in [
+        (RunInFlight::Stop, true, true),
+        (RunInFlight::Leave, true, false),
+        (RunInFlight::Stop, false, false),
+        (RunInFlight::Leave, false, false),
+    ] {
+        let fake = Fake::new();
+        let spec = mk("running");
+        fake.install(&spec, false).unwrap();
+        if running {
+            fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
+        }
+        let before = fake.calls().len();
+
+        fake.uninstall(&spec.common().id, in_flight).unwrap();
+
+        let calls: Vec<_> = fake.calls().split_off(before);
+        assert_eq!(
+            calls.contains(&("stop", "running".to_string())),
+            stopped,
+            "{in_flight:?}, running: {running}: {calls:?}"
+        );
+        assert!(fake.list().unwrap().is_empty(), "removed either way");
+    }
+}
+
 #[skuld::test]
 fn operations_on_an_unknown_id_error() {
     let fake = Fake::new();
     let id = Id::try_from("never-installed").unwrap();
 
-    assert!(fake.uninstall(&id).is_err());
+    assert!(fake.uninstall(&id, RunInFlight::Stop).is_err());
     assert!(fake.enable(&id).is_err());
     assert!(fake.disable(&id).is_err());
     assert!(fake.start(&id, Budget::DEFAULT).is_err());
@@ -162,7 +192,7 @@ fn uninstall_of_absent_id_still_sweeps() {
     let fake = Fake::new();
     let id = Id::try_from("never-installed").unwrap();
 
-    let result = fake.uninstall(&id);
+    let result = fake.uninstall(&id, RunInFlight::Stop);
 
     assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
     assert_eq!(fake.calls(), vec![("uninstall_absent", "never-installed".to_string())]);
@@ -176,7 +206,7 @@ fn a_failed_sweep_of_an_absent_id_replaces_not_installed() {
     fake.seed_absent_cleanup_fails(|| Error::os("delete", std::io::Error::other("held")));
     let id = Id::try_from("never-installed").unwrap();
 
-    let result = fake.uninstall(&id);
+    let result = fake.uninstall(&id, RunInFlight::Stop);
 
     assert!(matches!(result, Err(Error::Os { .. })), "{result:?}");
 }
@@ -188,7 +218,10 @@ fn uninstall_of_a_foreign_id_sweeps_nothing() {
     fake.seed_foreign("stranger", "not a goetia artifact at all\n");
     let id = Id::try_from("stranger").unwrap();
 
-    assert!(matches!(fake.uninstall(&id), Err(Error::Foreign { .. })));
+    assert!(matches!(
+        fake.uninstall(&id, RunInFlight::Stop),
+        Err(Error::Foreign { .. })
+    ));
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
 }
 
@@ -202,7 +235,10 @@ fn mutating_verbs_refuse_a_foreign_id() {
     fake.seed_foreign("stranger", "not a goetia artifact at all\n");
     let id = Id::try_from("stranger").unwrap();
 
-    assert!(fake.uninstall(&id).is_err(), "uninstall must refuse a foreign id");
+    assert!(
+        fake.uninstall(&id, RunInFlight::Stop).is_err(),
+        "uninstall must refuse a foreign id"
+    );
     assert!(fake.enable(&id).is_err(), "enable must refuse a foreign id");
     assert!(fake.disable(&id).is_err(), "disable must refuse a foreign id");
     assert!(
@@ -232,7 +268,7 @@ fn uninstall_accepts_an_unusable_entry() {
     fake.seed_foreign("corrupt", format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
     let id = Id::try_from("corrupt").unwrap();
 
-    fake.uninstall(&id)
+    fake.uninstall(&id, RunInFlight::Stop)
         .expect("uninstall must accept a marked-but-undecodable entry");
 }
 
@@ -248,7 +284,7 @@ fn absence_over_a_residual_artifact_is_not_not_installed() {
     let id = Id::try_from("leftover").unwrap();
 
     for (verb, result) in [
-        ("uninstall", fake.uninstall(&id)),
+        ("uninstall", fake.uninstall(&id, RunInFlight::Stop)),
         ("enable", fake.enable(&id)),
         ("disable", fake.disable(&id)),
         ("start", fake.start(&id, Budget::DEFAULT).map(drop)),
@@ -275,7 +311,10 @@ fn install_and_uninstall_agree_about_a_residual_artifact() {
         .expect("install classifies rather than errors");
     assert!(matches!(outcome, Outcome::RefuseForeign { .. }), "{outcome:?}");
     assert!(
-        matches!(fake.uninstall(&spec.common().id), Err(Error::Foreign { .. })),
+        matches!(
+            fake.uninstall(&spec.common().id, RunInFlight::Stop),
+            Err(Error::Foreign { .. })
+        ),
         "uninstall must not call the id empty when install calls it foreign"
     );
 
@@ -305,7 +344,7 @@ fn list_omits_an_id_that_has_only_a_residual_artifact() {
 fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)> {
     vec![
         ("status", fake.status(&spec.common().id).map(drop)),
-        ("uninstall", fake.uninstall(&spec.common().id)),
+        ("uninstall", fake.uninstall(&spec.common().id, RunInFlight::Stop)),
         ("enable", fake.enable(&spec.common().id)),
         ("disable", fake.disable(&spec.common().id)),
         ("start", fake.start(&spec.common().id, Budget::DEFAULT).map(drop)),
@@ -810,7 +849,7 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
     type Verb = fn(&Fake, Artifact) -> Result<()>;
     let verbs: [(&str, Verb); 8] = [
         ("uninstall", |fake, snapshot| {
-            Backend::uninstall(fake, snapshot, &mut ())
+            Backend::uninstall(fake, snapshot, RunInFlight::Stop, &mut ())
         }),
         ("enable", |fake, snapshot| Backend::enable(fake, snapshot, &mut ())),
         ("disable", |fake, snapshot| Backend::disable(fake, snapshot)),
@@ -854,7 +893,7 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
             })
             .collect();
         match stale {
-            "gone" => ServiceManager::uninstall(&fake, &spec.common().id).unwrap(),
+            "gone" => ServiceManager::uninstall(&fake, &spec.common().id, RunInFlight::Stop).unwrap(),
             "foreign" => fake.seed_foreign("frpc", "someone else's\n"),
             _ => fake.seed_foreign("frpc", generate(&other)),
         }

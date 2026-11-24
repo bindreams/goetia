@@ -15,8 +15,12 @@
 //! [`StopBus`] is only the gate. [`Supervisor`] holds it with the [`Os`] and [`Log`] the run uses.
 
 use std::io;
+use std::process::ExitStatus;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use cosca::CtrlEvent;
+use cosca::containment::TreeDrain;
 
 use crate::backend::scm::exit_status::Reported;
 
@@ -24,6 +28,7 @@ use super::logging::Log;
 use super::os::{Os, Spawned};
 use crate::backend::standby::Standby;
 use crate::error::{Chain, os_error_in};
+use crate::spec::{DaemonSpec, StopAction, StopSignal};
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
 /// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM
@@ -59,6 +64,110 @@ pub(crate) struct StopBus {
     cvar: Condvar,
 }
 
+/// What ended [`Supervisor::wait_for_child_or_stop`]'s wait, as `on_stopping` is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitEnd {
+    /// A stop was accepted (even if the daemon exited as well: the stop wins).
+    Stop,
+    /// The daemon exited, or its wait failed, with no stop accepted.
+    Exit,
+}
+
+/// What an accepted stop does before the teardown. One function runs it
+/// ([`Supervisor::wait_for_child_or_stop`]); a plan only says how much of it. A run derives its plan once, from its
+/// spec ([`StopPlan::of`]), and hands it to everything that needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopPlan {
+    /// Ask the daemon to exit with `event`, then wait for its whole tree for `timeout` (`None`: as long as it
+    /// takes), counted from when the supervisor saw the stop. A service whose `send-signal` asks.
+    AskAndWait {
+        event: CtrlEvent,
+        timeout: Option<Duration>,
+    },
+    /// No ask, no wait: the teardown at once. `send-signal: kill` and `wm-close` (it has no send yet).
+    AtOnce,
+    /// No ask; wait for the daemon's own exit with no cap of goetia's, then the teardown. For a task, whose stop is
+    /// the console close event; see the module doc of `shim::run::task`.
+    WaitOnly,
+}
+
+/// What a spawn sets for a stop, decided by the plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SpawnSetup {
+    /// The console event the cooperative stop sends: set only where the plan asks.
+    pub(super) ask_with: Option<CtrlEvent>,
+    /// `Some(false)`: no process group of its own, which is what lets the event reach the daemon (a child that
+    /// leads a group starts with Ctrl+C ignored, and Ctrl+Break reaches either). `None`: cosca's default.
+    pub(super) process_group: Option<bool>,
+}
+
+impl StopPlan {
+    /// The plan a daemon's stop runs.
+    pub(super) fn of(spec: &DaemonSpec) -> StopPlan {
+        match spec {
+            DaemonSpec::Task(_) => StopPlan::WaitOnly,
+            DaemonSpec::Service(service) => match console_event(service.stop_action.send_signal) {
+                Some(event) => StopPlan::AskAndWait {
+                    event,
+                    timeout: service.stop_action.timeout,
+                },
+                None => StopPlan::AtOnce,
+            },
+        }
+    }
+
+    /// What the daemon is spawned with for this plan: the one place the spawn's stop settings are decided.
+    pub(super) fn spawn_setup(self) -> SpawnSetup {
+        match self {
+            StopPlan::AskAndWait { event, .. } => SpawnSetup {
+                ask_with: Some(event),
+                process_group: Some(false),
+            },
+            StopPlan::AtOnce | StopPlan::WaitOnly => SpawnSetup::default(),
+        }
+    }
+
+    /// Whether the stop asks through cosca's proxy, which needs a host that called `init_helpers`.
+    pub(super) fn asks(self) -> bool {
+        matches!(self, StopPlan::AskAndWait { .. })
+    }
+
+    /// How long a stop that ended the wait with `end` can take, for `STOP_PENDING`'s wait hint: the
+    /// teardown, and the `timeout` when a stop asks (the largest the hint's field holds for none). A wait-only
+    /// stop has no timeout of goetia's; nothing reports its hint, since task mode reports to no SCM.
+    pub(super) fn wait_hint(self, end: WaitEnd) -> Duration {
+        match (self, end) {
+            (StopPlan::AskAndWait { timeout, .. }, WaitEnd::Stop) => {
+                timeout.map_or(Duration::MAX, |t| t.saturating_add(StopAction::TEARDOWN_MARGIN))
+            }
+            (StopPlan::WaitOnly, WaitEnd::Stop) => Duration::MAX,
+            _ => StopAction::TEARDOWN_MARGIN,
+        }
+    }
+}
+
+/// The console event a stop of `signal` sends the daemon, or `None` where it sends nothing: the one source for which
+/// signals ask.
+fn console_event(signal: StopSignal) -> Option<CtrlEvent> {
+    match signal {
+        StopSignal::Terminate | StopSignal::Interrupt | StopSignal::CtrlC => Some(CtrlEvent::CtrlC),
+        StopSignal::Quit | StopSignal::CtrlBreak => Some(CtrlEvent::CtrlBreak),
+        // `wm-close` sends nothing yet; a native signal is refused on Windows at install.
+        StopSignal::Kill | StopSignal::WmClose | StopSignal::Native(_) => None,
+    }
+}
+
+/// What a stop saw of the root's own exit: the fact the teardown is chosen by.
+pub enum RootExit {
+    /// The root was not seen to exit before the teardown (or the waiter's wait failed, so it is not known to have).
+    NotSeen,
+    /// The root exited by itself, when the stop was seen or during its plan, and a read of the process gave its
+    /// status.
+    Status(ExitStatus),
+    /// The root exited by itself and no read gave its status: the waiter's `wait()` has it.
+    Unread,
+}
+
 pub enum WaitOutcome {
     ChildExited,
     /// The waiter's `child.wait()` failed, so whether the daemon ended was unknown. The tree kill was
@@ -68,8 +177,9 @@ pub enum WaitOutcome {
     WaitFailed {
         os_error: Option<i32>,
     },
-    /// A stop was requested, and the tree kill was sent.
-    Stopping,
+    /// A stop was requested, and its plan ran: the ask and the wait it made, then the teardown, whose
+    /// tree kill was sent (or the daemon had exited, and its tree was ended).
+    Stopping(RootExit),
     /// The daemon may still be running: `send_kill_tree` and the direct-child fallback both failed, after
     /// a stop or a failed wait. See [`Supervisor::wait_for_child_or_stop`] for why this is a return
     /// rather than a wait, and `Reported::incomplete_stop` for what the caller reports for it.
@@ -188,16 +298,29 @@ impl StopBus {
         true
     }
 
-    /// Waits until a stop has been accepted or `pace` has passed, and says whether one has. The wait
-    /// only paces a loop that re-reads the real condition it waits for between calls; its expiry
-    /// proves nothing.
+    /// The one wait on the gate: until `until` holds of it, or, given a `pace`, until that has passed. Says whether
+    /// `until` holds. A `pace` only spaces a loop that re-reads the real condition it waits for between calls: its
+    /// expiry proves nothing.
+    fn wait_until(&self, pace: Option<Duration>, until: impl Fn(&Gate) -> bool) -> bool {
+        let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let g = match pace {
+            None => self
+                .cvar
+                .wait_while(g, |g| !until(g))
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(pace) => {
+                self.cvar
+                    .wait_timeout_while(g, pace, |g| !until(g))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+        };
+        until(&g)
+    }
+
+    /// Waits until a stop has been accepted or `pace` has passed, and says whether one has.
     pub(super) fn stopped_within(&self, pace: Duration) -> bool {
-        let g = self.state.lock().expect("StopBus mutex poisoned");
-        let (g, _) = self
-            .cvar
-            .wait_timeout_while(g, pace, |g| g.fate != Fate::Stopped)
-            .expect("StopBus mutex poisoned");
-        g.fate == Fate::Stopped
+        self.wait_until(Some(pace), |g| g.fate == Fate::Stopped)
     }
 
     /// Decide how the run ends when `candidate` is what the daemon's end amounts to. An accepted
@@ -226,6 +349,29 @@ impl StopBus {
         if g.fate == Fate::Open {
             g.fate = Fate::Failed;
         }
+    }
+
+    /// Whether a stop has been accepted: for task mode's look right before its spawn.
+    pub(super) fn stop_accepted(&self) -> bool {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).fate == Fate::Stopped
+    }
+
+    /// Whether the waiter has reported its wait over, and with what failure, if any.
+    fn exit_report(&self) -> (bool, Option<Option<i32>>) {
+        let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (g.child_done, g.wait_failure)
+    }
+
+    /// Waits until the waiter has reported its wait over or `pace` has passed, and says whether it has. The report
+    /// is made for a failed wait too: [`StopBus::exit_report`] says which it was.
+    fn exited_within(&self, pace: Duration) -> bool {
+        self.wait_until(Some(pace), |g| g.child_done)
+    }
+
+    /// Blocks until the waiter has reported that its wait is over, whatever it ended in. For a caller that
+    /// knows the root has exited, so the report is on its way.
+    pub(super) fn await_exit_report(&self) {
+        self.wait_until(None, |g| g.child_done);
     }
 
     /// The waiter's report that its wait is over, with the failure it ended in, if any.
@@ -268,16 +414,38 @@ impl Supervisor {
         Waiter::new(&*self.os, &self.log, &self.bus, id)
     }
 
-    /// Block until `child` exits or a stop is requested, returning which. On
-    /// a stop, also tears the whole contained tree down (`send_kill_tree`, with a
+    /// Block until `child` exits or a stop is requested, returning which. On a stop, first runs `plan`
+    /// (the ask and the wait of [`StopPlan::AskAndWait`], the wait for the daemon's own exit of
+    /// [`StopPlan::WaitOnly`], or nothing), then tears the whole contained tree down (`send_kill_tree`, with a
     /// fallback to killing just the direct child — see below) before
     /// returning, and says in its return value whether that teardown
     /// succeeded.
     ///
     /// `on_stopping` is called exactly once, as soon as the wait has ended for any reason (a stop,
-    /// the child exiting, a failed wait) and before anything is torn down, with no lock held. It
-    /// is where the service reports `STOP_PENDING`, so that SCM never reads it as running while
-    /// the tree is being terminated.
+    /// the child exiting, a failed wait) and before anything is asked, waited for or torn down, with no lock held,
+    /// told by a [`WaitEnd`] whether an accepted stop or the daemon's own end ended the wait. It is where the
+    /// service reports `STOP_PENDING`, so that SCM never reads it as running while the daemon is being stopped,
+    /// and where a task records the stop before the wait that may outlast the shim.
+    ///
+    /// **The read** of the process, once, where the stop is seen and before `on_stopping` (a read that fails counts as
+    /// gone if the waiter has reported the exit): a root already gone is
+    /// told as [`WaitEnd::Exit`], not [`WaitEnd::Stop`], and no plan runs for it. The status the read gives is the
+    /// root's exit, whatever the waiter reports after it, and [`WaitOutcome::Stopping`] carries it.
+    ///
+    /// **The plan** runs only for a stop accepted with the daemon not yet read as gone. The
+    /// `timeout` of an ask-and-wait is counted from when this call saw the stop. A daemon that exited
+    /// before the plan is neither asked nor waited for, and the tree it left is ended as after any exit. A
+    /// wait-only plan has no `timeout`: it waits as long as the daemon lives, so what ends the daemon is outside
+    /// this call (a task's close event, which Windows follows by ending the shim).
+    /// The ask's answers are mapped in one place ([`judge_ask`]). The waiter stays in `child.wait()`
+    /// throughout, which cosca supports beside `terminate_tree` and `wait_tree_timeout`.
+    ///
+    /// **Which teardown** is chosen by the status a read gave, the stop's or one the plan made, and with none by the
+    /// waiter's report once the plan is over: after an exit, `terminate_exited_tree` (no direct-child fallback; its
+    /// failure is [`WaitOutcome::TreeMayRun`]), otherwise `kill_for_stop`.
+    ///
+    /// **Not cosca's `graceful_shutdown_tree`**, which ends by waiting with no deadline for every member
+    /// its sweep killed: the standing rule below against that wait would be broken.
     ///
     /// `waiter` is consumed here: it was made before `child` was spawned
     /// ([`Waiter`]), and this is where it is handed the daemon it was made
@@ -374,7 +542,8 @@ impl Supervisor {
         waiter: Waiter,
         child: &Arc<dyn Spawned>,
         id: &str,
-        on_stopping: impl FnOnce(),
+        plan: StopPlan,
+        on_stopping: impl FnOnce(WaitEnd),
     ) -> WaitOutcome {
         debug_assert!(
             Arc::ptr_eq(&waiter.bus, &self.bus),
@@ -398,15 +567,52 @@ impl Supervisor {
             .expect("StopBus mutex poisoned");
         let stopping = g.fate == Fate::Stopped;
         let wait_failure = g.wait_failure;
+        // The `timeout` of an ask-and-wait is counted from here.
+        let seen = Instant::now();
         // Release the lock before calling out — `on_stopping` and `send_kill_tree`/`kill` need it
         // not, and holding it across a kernel call would block `request_stop()`/`settle()`
         // callers (e.g. a second, redundant SCM stop control) for no reason.
         drop(g);
-        on_stopping();
+        // The one read of the live process at the stop, before `on_stopping`. Gone is decided here, once
+        // ([`Supervisor::find_gone`]). A failed wait says nothing of the daemon: no read.
+        let mut unreadable_told = false;
+        let gone = if stopping && wait_failure.is_none() {
+            self.find_gone(child.as_ref(), id, &mut unreadable_told)
+        } else {
+            None
+        };
+        on_stopping(if stopping && gone.is_none() {
+            WaitEnd::Stop
+        } else {
+            WaitEnd::Exit
+        });
         let outcome = if !stopping && wait_failure.is_none() {
             WaitOutcome::ChildExited
         } else {
-            let teardown = kill_for_stop(child.as_ref(), &self.log, id);
+            // A failed wait says nothing of the daemon, and nothing is watching it: no ask, no wait.
+            // The status a read of the process gave, which is the root's exit whatever the waiter reports later.
+            let read_status = if !stopping || wait_failure.is_some() {
+                None
+            } else if let Some(gone) = gone {
+                gone.status
+            } else {
+                self.run_plan(plan, child.as_ref(), id, seen, unreadable_told)
+            };
+            // By the waiter's report when no read gave a status: a daemon that exited, during the plan or before
+            // it, is a tree to end, not a process to kill.
+            let (exited, wait_failure) = match read_status {
+                Some(_) => (true, None),
+                None => self.bus.exit_report(),
+            };
+            let teardown = if exited && wait_failure.is_none() {
+                if terminate_exited_tree(child.as_ref(), &self.log, id) {
+                    Teardown::Tree
+                } else {
+                    Teardown::ExitedTreeLeft
+                }
+            } else {
+                kill_for_stop(child.as_ref(), &self.log, id)
+            };
             match (teardown, wait_failure) {
                 // Returning here is what leaves `waiting` unjoined: nothing
                 // can make the wait it holds return, so joining it would
@@ -419,6 +625,8 @@ impl Supervisor {
                     }
                     return WaitOutcome::DaemonMayRun;
                 }
+                // Logged by `terminate_exited_tree`: the daemon itself exited.
+                (Teardown::ExitedTreeLeft, _) => WaitOutcome::TreeMayRun,
                 (Teardown::ChildOnly, _) => {
                     self.log.failure(id, &tree_unkilled());
                     if !stopping {
@@ -426,7 +634,11 @@ impl Supervisor {
                     }
                     WaitOutcome::TreeMayRun
                 }
-                _ if stopping => WaitOutcome::Stopping,
+                _ if stopping => WaitOutcome::Stopping(match read_status {
+                    Some(status) => RootExit::Status(status),
+                    None if exited && wait_failure.is_none() => RootExit::Unread,
+                    None => RootExit::NotSeen,
+                }),
                 (Teardown::Tree, os_error) => WaitOutcome::WaitFailed {
                     os_error: os_error.flatten(),
                 },
@@ -440,6 +652,184 @@ impl Supervisor {
             self.log.failure(id, WAITER_PANICKED);
         }
         outcome
+    }
+}
+
+// Stop plans ----------------------------------------------------------------------------------------------------------
+
+/// How long the asking pauses after the first answer of `Unsupported`, which says the daemon has no console to be
+/// sent the event on yet. Each such pass starts a proxy process, so the pause doubles ([`grown_pace`]) up to
+/// [`REASK_PACE_CEILING`]: the first re-ask is fast, which is the case that matters (a daemon right after its
+/// start), and a program that never has a console is asked about once a second. A pause only spaces the re-asks of a
+/// question each answer decides; a daemon's exit ends it at once.
+const REASK_PACE_FIRST: Duration = Duration::from_millis(25);
+const REASK_PACE_CEILING: Duration = Duration::from_secs(1);
+
+/// The pause after `pace`: twice as long, up to the ceiling.
+fn grown_pace(pace: Duration) -> Duration {
+    pace.saturating_mul(2).min(REASK_PACE_CEILING)
+}
+
+impl Supervisor {
+    /// What an accepted stop does before the teardown, for a root that was not gone when the stop was seen
+    /// ([`Supervisor::wait_for_child_or_stop`]). `seen` is when the supervisor saw the stop; `unreadable_told` says that
+    /// a failed read of the process was told already. The status a read of the process gave, if one found the root
+    /// gone during the plan.
+    fn run_plan(
+        &self,
+        plan: StopPlan,
+        child: &dyn Spawned,
+        id: &str,
+        seen: Instant,
+        unreadable_told: bool,
+    ) -> Option<ExitStatus> {
+        match plan {
+            StopPlan::AtOnce => None,
+            // No cap of goetia's: the stop that Windows delivered ends the program, or Windows ends the shim. The
+            // waiter's report ends the wait, a failed wait's included ([`StopBus::exit_report`] says which).
+            StopPlan::WaitOnly => {
+                self.bus.await_exit_report();
+                None
+            }
+            StopPlan::AskAndWait { event, timeout } => {
+                self.ask_and_wait(child, id, event, timeout, seen, unreadable_told)
+            }
+        }
+    }
+
+    /// Ask the daemon's tree to exit, then wait for the whole tree to exit within what is left of `timeout`.
+    ///
+    /// The daemon's exit is read before every ask ([`Supervisor::find_gone`]: the process itself, or the waiter's
+    /// report when that read fails): one that has exited is neither asked (again) nor waited for. The first ask is
+    /// told in the log before it is made, so that the line comes before whatever the daemon does in answer.
+    ///
+    /// A tree is waited for after any answer that may mean the event was sent, whether or not the root has exited
+    /// since. That includes a root that exits by itself between the read before an ask and that ask, which is then
+    /// waited for though never asked: waiting is the safe side.
+    ///
+    /// **To delete when cosca ships it.** That window, when bindreams/cosca#1054 tells the two `Unassessable` answers
+    /// apart. The re-ask loop, when bindreams/cosca#1053 answers "no console yet" apart from "never". The ask's own
+    /// bound, when bindreams/cosca#1057 bounds it: `terminate_tree` waits for its proxy with no cap under cosca 0.10.
+    /// This whole composition, when bindreams/cosca#1055 has a graceful stop that does not drain.
+    fn ask_and_wait(
+        &self,
+        child: &dyn Spawned,
+        id: &str,
+        event: CtrlEvent,
+        timeout: Option<Duration>,
+        seen: Instant,
+        mut unreadable_told: bool,
+    ) -> Option<ExitStatus> {
+        let left = || timeout.map(|t| t.saturating_sub(seen.elapsed()));
+        let mut asking_told = false;
+        let mut told = false;
+        let mut pace = REASK_PACE_FIRST;
+        loop {
+            if let Some(gone) = self.find_gone(child, id, &mut unreadable_told) {
+                if asking_told {
+                    self.log.info(id, EXITED_UNASKED);
+                }
+                return gone.status;
+            }
+            if !asking_told {
+                asking_told = true;
+                self.log.info(id, &asking(event, left()));
+            }
+            match judge_ask(child.terminate_tree()) {
+                Ask::Sent => break,
+                Ask::MaySent(e) => {
+                    self.log.warning(id, &may_have_sent(event, &e));
+                    break;
+                }
+                Ask::NothingSent(e) => {
+                    self.log.failure(id, &could_not_ask(&e));
+                    return None;
+                }
+                Ask::NotYet(e) => {
+                    if timeout.is_some_and(|t| seen.elapsed() >= t) {
+                        self.log.failure(id, &never_asked(&e));
+                        return None;
+                    }
+                    if !told {
+                        told = true;
+                        self.log.warning(id, &not_asked_yet(&e));
+                    }
+                    if self.bus.exited_within(left().map_or(pace, |left| left.min(pace))) {
+                        // A wait that failed is reported the same way, and told by its own failure line.
+                        if self.bus.exit_report().1.is_none() {
+                            self.log.info(id, EXITED_UNASKED);
+                        }
+                        return None;
+                    }
+                    pace = grown_pace(pace);
+                    if timeout.is_some_and(|t| seen.elapsed() >= t) {
+                        self.log.failure(id, &never_asked(&e));
+                        return None;
+                    }
+                }
+            }
+        }
+        match child.wait_tree_timeout(left().unwrap_or(Duration::MAX)) {
+            // The job is empty, so the root has exited and its report is on its way.
+            Ok(TreeDrain::AllMembersExited) => {
+                self.log.info(id, EXITED_WITHIN_THE_WAIT);
+                self.bus.await_exit_report();
+            }
+            Ok(TreeDrain::AllMarkersClosed) => self.log.warning(id, MARKERS_CLOSED),
+            Ok(TreeDrain::MembersRemain) => self.log.warning(id, &tree_not_seen_to_exit(timeout)),
+            Err(e) => self.log.failure(id, &wait_tree_failed(&e)),
+        }
+        None
+    }
+
+    /// The daemon's root, if it is gone: the process itself says it has exited (the waiter's report can lag the
+    /// exit), with the status the read gave, or the read of it failed and the waiter has reported the exit, with no
+    /// status. A failed read that the report does not settle says nothing, and is logged the first time it fails
+    /// (`told` says it was); one that the report settles is not logged, since the exit is known.
+    fn find_gone(&self, child: &dyn Spawned, id: &str, told: &mut bool) -> Option<Gone> {
+        match child.try_wait() {
+            Ok(status) => status.map(|status| Gone { status: Some(status) }),
+            Err(e) => {
+                let reported = self.bus.exit_report() == (true, None);
+                if !reported && !std::mem::replace(told, true) {
+                    self.log.warning(id, &exit_unreadable(&e));
+                }
+                reported.then_some(Gone { status: None })
+            }
+        }
+    }
+}
+
+/// A root that is gone. Its exit status is the root's exit whatever the waiter reports after the read that found it.
+#[derive(Clone, Copy)]
+struct Gone {
+    /// What the read of the process gave; `None` when the read failed and the waiter's report said it was gone.
+    status: Option<ExitStatus>,
+}
+
+/// What an ask answered, by the contract of `terminate_tree` with a proxy send.
+enum Ask {
+    /// The event was sent.
+    Sent,
+    /// It may have been sent ([`judge_ask`]), so the wait is made.
+    MaySent(cosca::error::Error),
+    /// Nothing was sent, and asking again cannot help: the proxy could not be started.
+    NothingSent(cosca::error::Error),
+    /// Nothing was sent: the daemon has no console to send it on, yet or ever.
+    NotYet(cosca::error::Error),
+}
+
+/// The one mapping of an ask's answer. `Error` is non-exhaustive and cosca's contract names no other answer, so one it
+/// does not name is read as "may have been sent". That includes `Unassessable`: cosca answers it both for a root that
+/// had exited when it looked (nothing sent) and for an event the proxy generated and could not confirm (sent), and a
+/// launcher that was sent the event and exited at once has a worker that needs its `timeout`. Ending a tree that may be
+/// shutting down is the worse mistake, so the tree is waited for.
+fn judge_ask(answer: Result<(), cosca::error::Error>) -> Ask {
+    match answer {
+        Ok(()) => Ask::Sent,
+        Err(e @ cosca::error::Error::Io(_)) => Ask::NothingSent(e),
+        Err(e @ cosca::error::Error::Unsupported { .. }) => Ask::NotYet(e),
+        Err(e) => Ask::MaySent(e),
     }
 }
 
@@ -468,6 +858,8 @@ pub(super) enum Teardown {
     Tree,
     /// `send_kill_tree` failed and the direct child was killed: its descendants were not reached.
     ChildOnly,
+    /// The daemon had exited and `send_kill_tree` failed: its descendants may still be running.
+    ExitedTreeLeft,
     /// Neither worked, so nothing has told the daemon to exit and no `child.wait()` on it can
     /// return.
     Failed,
@@ -519,6 +911,92 @@ pub(super) const NOT_RESTARTED: &str = " — SCM is told the service stopped wit
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
     format!(
         "fallback kill: {}; the daemon was neither killed nor reaped and may still be running{NOT_RESTARTED}",
+        Chain(e)
+    )
+}
+
+fn could_not_ask(e: &cosca::error::Error) -> String {
+    format!(
+        "the stop could not ask the daemon to exit: {}; nothing was sent, so the daemon is ended without being asked",
+        Chain(e)
+    )
+}
+
+fn may_have_sent(event: CtrlEvent, e: &cosca::error::Error) -> String {
+    format!(
+        "the stop may have sent {} to ask the daemon to exit: {}; waiting for it as if it had been asked",
+        event_name(event),
+        Chain(e)
+    )
+}
+
+fn exit_unreadable(e: &cosca::error::Error) -> String {
+    format!("could not read whether the daemon has exited: {}", Chain(e))
+}
+
+fn not_asked_yet(e: &cosca::error::Error) -> String {
+    format!(
+        "the daemon cannot be sent the exit event yet (it has no console, or never will): {}; asking again until it answers otherwise, the daemon exits or the timeout is over",
+        Chain(e)
+    )
+}
+
+fn never_asked(e: &cosca::error::Error) -> String {
+    format!(
+        "the daemon was never asked to exit: {}; its timeout is over, so it is ended without being asked",
+        Chain(e)
+    )
+}
+
+fn event_name(event: CtrlEvent) -> &'static str {
+    match event {
+        CtrlEvent::CtrlC => "Ctrl+C",
+        CtrlEvent::CtrlBreak => "Ctrl+Break",
+    }
+}
+
+/// The line before the first ask. `left` is what is left of the spec's `timeout`, which counts from when the stop was
+/// seen, to the millisecond: the wait ends at the end of it.
+fn asking(event: CtrlEvent, left: Option<Duration>) -> String {
+    let event = event_name(event);
+    match left {
+        Some(left) => {
+            let left = Duration::new(left.as_secs(), left.subsec_millis() * 1_000_000);
+            format!(
+                "asking the daemon to exit with {event}; the daemon and what it started have {} to exit",
+                humantime::format_duration(left)
+            )
+        }
+        None => format!(
+            "asking the daemon to exit with {event}; the daemon and what it started are waited for with no time limit"
+        ),
+    }
+}
+
+const EXITED_UNASKED: &str = "the daemon exited before it could be asked";
+
+const EXITED_WITHIN_THE_WAIT: &str = "the daemon and what it started exited within the wait";
+
+/// What a wait that ended with members left says: its process tree had not been seen to exit, and the teardown that
+/// follows is told by its own lines. The root may have exited, and a member may be finishing its exit.
+fn tree_not_seen_to_exit(timeout: Option<Duration>) -> String {
+    match timeout {
+        Some(t) => format!(
+            "the daemon's process tree had not been seen to exit when its timeout of {} was over; it is being ended",
+            humantime::format_duration(t)
+        ),
+        // Reached only if cosca's wait returns before the end of a `Duration::MAX` bound.
+        None => "the daemon's process tree had not been seen to exit when the wait for it returned; it is being ended"
+            .to_string(),
+    }
+}
+
+/// `TreeDrain::AllMarkersClosed` is advisory: no member is known to have exited. (A Job Object does not answer it.)
+const MARKERS_CLOSED: &str = "the wait for the daemon's process tree ended when the last copy of its marker was closed, which is no proof that every process in it exited; it is being ended";
+
+fn wait_tree_failed(e: &cosca::error::Error) -> String {
+    format!(
+        "waiting for the daemon's tree to exit failed: {}; the tree is ended now",
         Chain(e)
     )
 }

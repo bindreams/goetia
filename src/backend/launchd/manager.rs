@@ -91,7 +91,7 @@ use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Occupant, PutBackFound, Reason, Result, target_failed};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
+use crate::manager::{Budget, DaemonStatus, Installed, RunInFlight, State, Status, Step, flow};
 use crate::spec::{DaemonKind, DaemonSpec, Id, Restart};
 
 pub use super::{ENABLED_DIR, STAGING_DIR};
@@ -1628,7 +1628,10 @@ impl backend::Backend for Launchd {
     }
 
     /// A task is uninstalled as two plists (see `write`); a service as one.
-    fn uninstall(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+    fn uninstall(&self, snapshot: Plist, in_flight: RunInFlight, reservation: &mut Reservation) -> Result<()> {
+        if in_flight == RunInFlight::Leave {
+            return Err(backend::leave_not_built(&snapshot.id, "launchd"));
+        }
         if snapshot.has_two_plists() {
             return self.uninstall_task(snapshot, reservation);
         }
@@ -1641,6 +1644,14 @@ impl backend::Backend for Launchd {
                 .bootout(snapshot.id.as_str(), Budget::Unbounded.start(), reservation)?,
         );
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
+    }
+
+    /// Nothing of launchd's outlives its id, so there is nothing to do, and no run to leave.
+    fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
+        match in_flight {
+            RunInFlight::Stop => Ok(()),
+            RunInFlight::Leave => Err(backend::leave_not_built(id, "launchd")),
+        }
     }
 
     /// A task is enabled as two plists, loaded (see `write`); a service's is the move of its plist.

@@ -8,13 +8,18 @@
 //! reads that daemon's real `DaemonSpec` back out of the same
 //! `Services\<name>\Parameters` metadata blob the SCM backend wrote it into, and
 //! does everything a real service host needs: spawn the daemon once, capture
-//! its output, report its exit as the service's exit, and kill its whole
-//! process tree on `SERVICE_STOP`.
+//! its output, report its exit as the service's exit, and on `SERVICE_STOP` stop it as its
+//! `stop-action` says: ask it to exit with a console event, wait for its whole process tree for the
+//! `timeout`, then kill what is left (`stop_bus::StopPlan`). The event is sent through a copy of the
+//! host program (cosca's proxy), so a host that hosts the shim itself calls `shim::init_host` first in
+//! its `main`; one that did not is refused at start.
 //!
 //! **Task mode** ([`task`]): Task Scheduler runs the shim as a task's action, and its arguments end
 //! in the task-mode argument, the task's id and the registration's token. It reads its own task, and
 //! starts no program (a shim failure) when the task's registration is not the one it was started
-//! under. Otherwise it runs the program the same way and records how the run ended.
+//! under. Otherwise it runs the program the same way and records how the run ended. A task's stop is the
+//! console close event; what it does to the program and the shim, and what is recorded, is in the module doc of
+//! `shim::run::task`.
 
 use std::ffi::OsString;
 

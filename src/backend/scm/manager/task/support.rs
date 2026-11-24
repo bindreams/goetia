@@ -136,6 +136,13 @@ pub(super) fn shim_writes(shim: &Runs, record: &RunRecord) {
     assert_eq!(shim.write(record, None).unwrap(), Vec::<String>::new());
 }
 
+/// What a shim does as it hears a stop with its program alive: it writes the provisional file of the run `n`'s first
+/// `Stopped`, under its own pin (`Pin::write_stopping`).
+pub(super) fn shim_writes_stopping(shim: &Runs, n: u8) {
+    let pin = shim.hold().unwrap();
+    pin.write_stopping(&instance_id(n), 1).unwrap();
+}
+
 pub(super) fn record(n: u8, outcome: RunOutcome) -> RunRecord {
     RunRecord {
         instance: instance_id(n),

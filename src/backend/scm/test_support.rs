@@ -459,6 +459,13 @@ impl DirWatch {
     /// The test makes `last` itself once the changes it wants are made, so the wait is for a change that
     /// is bound to come. Windows keeps what happens between two requests for the next one.
     pub(crate) fn until_added(&mut self, last: &str) -> Vec<NameChange> {
+        let last = NameChange::Added(last.to_owned());
+        self.until(|changes| changes.contains(&last))
+    }
+
+    /// Every change since the watch began, in order, up to the batch that makes `done` true of all of them. The
+    /// wait is for a change the test knows is bound to come.
+    pub(crate) fn until(&mut self, done: impl Fn(&[NameChange]) -> bool) -> Vec<NameChange> {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -507,7 +514,7 @@ impl DirWatch {
                 }
                 at += next;
             }
-            if changes.contains(&NameChange::Added(last.to_owned())) {
+            if done(&changes) {
                 return changes;
             }
         }
