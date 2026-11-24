@@ -1140,6 +1140,7 @@ fn a_verb_handed_one_item_too_few_trips_the_assertion() {
 /// `restart` reserves both legs before the stop goes out, and when it cannot, nothing is sent:
 /// exit `1`, no `launchctl` called, so a daemon is never left stopped for want of a thread or a
 /// file its start needed. One reaper and one file short each fail it.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_restart_that_cannot_reserve_sends_nothing() {
     use crate::cli::wait::WaitArgs;
@@ -3406,6 +3407,7 @@ fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_call
 /// `install --dry-run` and `diff` read no job state, and `install --start` over a loaded job with a
 /// changed rendering is refused before it bootstraps anything: the table answers one `print`, so
 /// any other call fails the test.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_starts(
     #[fixture(launchd_group)] _group: &Group,

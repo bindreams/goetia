@@ -9,14 +9,19 @@
 //! directories as a whole (`list`, the conformance run).
 
 use std::fs;
+#[cfg(feature = "cli")]
 use std::io::{BufRead as _, BufReader};
+#[cfg(feature = "cli")]
 use std::os::unix::fs::PermissionsExt as _;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(feature = "cli")]
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use goetia::Error;
 use goetia::backend::launchd::manager::Launchd;
+#[cfg(feature = "cli")]
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, RunInFlight, ServiceManager, State};
@@ -53,6 +58,7 @@ fn runs_of(label: &str) -> u64 {
 }
 
 /// The pid `launchctl print` shows for the job `label`, if it has a process.
+#[cfg(feature = "cli")]
 fn pid_of(label: &str) -> Option<u32> {
     print_field(&print_job(label).stdout, "pid = ").and_then(|pid| pid.parse().ok())
 }
@@ -665,6 +671,7 @@ fn stop_of_a_task_with_send_signal_kill_ends_a_run_that_ignores_sigterm(#[fixtur
 /// unwaited form (`--timeout 0`): its stop does not wait for the run to end, and a start requested while
 /// the run is still ending finds the job running, which `kickstart` leaves alone; whether that is lost
 /// is not measured, and no test can place the start after the run's end.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn restart_of_a_running_task_ends_it_and_starts_a_new_run(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -786,13 +793,16 @@ fn run_streams_the_logs_file_and_returns_the_exit_code(#[fixture(launchd_group)]
     let file = fs::read_to_string(&log).expect("read the log");
     assert!(file.contains("goetia-run "), "the file holds the run's marker: {file}");
 
-    let args = goetia::cli::run::Args { id: id.clone() };
-    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Launchd::new())) };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    // Truthful, not a stub: the group's elevation check is this test's own precondition.
-    let code = goetia::cli::run::run(&args, &get_manager, &|| true, &mut out, &mut err);
-    assert_eq!(code, ExitCode::Run(3), "stderr:\n{}", String::from_utf8_lossy(&err));
-    assert_eq!(String::from_utf8_lossy(&out), "out-line\nerr-line\n");
+    #[cfg(feature = "cli")]
+    {
+        let args = goetia::cli::run::Args { id: id.clone() };
+        let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Launchd::new())) };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        // Truthful, not a stub: the group's elevation check is this test's own precondition.
+        let code = goetia::cli::run::run(&args, &get_manager, &|| true, &mut out, &mut err);
+        assert_eq!(code, ExitCode::Run(3), "stderr:\n{}", String::from_utf8_lossy(&err));
+        assert_eq!(String::from_utf8_lossy(&out), "out-line\nerr-line\n");
+    }
     assert_no_hold_pending(&id);
 }
 
@@ -958,6 +968,7 @@ fn a_scheduled_run_beginning_right_after_ours_is_not_shown(#[fixture(launchd_gro
 /// for it to be in flight. The scheduled run is the [`Held`] program: the child says it waits for it, the
 /// test releases it, and `run` then runs the task itself, shows only its own output, and holds nothing
 /// back for the next launch.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_scheduled_run_in_flight_is_waited_for_by_run(#[fixture(launchd_group)] _group: &Group) {
     waits_for_the_launch_that_began_first(false);
@@ -966,6 +977,7 @@ fn a_scheduled_run_in_flight_is_waited_for_by_run(#[fixture(launchd_group)] _gro
 /// The same, where a hold was left pending by hand before: the scheduled launch takes it, so it is started
 /// stopped, and `run` finds it so: it resumes it, says it waits for it, and waits for it to end before it
 /// runs the task itself.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_scheduled_launch_that_took_a_stranded_hold_is_resumed_and_waited_for_by_run(
     #[fixture(launchd_group)] _group: &Group,
@@ -975,6 +987,7 @@ fn a_scheduled_launch_that_took_a_stranded_hold_is_resumed_and_waited_for_by_run
 
 /// The body of the two tests above: `stranded` is whether a hold is pending when the scheduled launch
 /// begins.
+#[cfg(feature = "cli")]
 fn waits_for_the_launch_that_began_first(stranded: bool) {
     let id = support::random_test_id();
     let task_id = id_of(&id);
