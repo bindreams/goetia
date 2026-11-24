@@ -428,3 +428,57 @@ fn a_plist_changed_during_install_is_a_plain_failure_that_says_to_rerun() {
     assert!(message.contains(&path.display().to_string()), "{message}");
     assert!(message.contains("re-run"), "{message}");
 }
+
+// kept_alive ==========================================================================================================
+
+fn kept_alive_of(restart: Restart) -> Result<()> {
+    let mut fields = service_fields(spec_fixture());
+    fields.restart = restart;
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
+    let text = rendered(&spec, "root");
+    kept_alive(
+        &Id::try_from("frpc").unwrap(),
+        Ok((std::path::Path::new("/p/frpc.plist"), &text)),
+    )
+}
+
+/// `--no-stop` is refused for a job launchd keeps alive, with the error that names the id, and for no other.
+#[skuld::test]
+fn a_job_launchd_keeps_alive_is_refused_and_one_it_does_not_is_not() {
+    for (restart, refused) in [
+        (Restart::Never, false),
+        (Restart::Always, true),
+        (Restart::OnFailure, true),
+    ] {
+        match kept_alive_of(restart) {
+            Ok(()) => assert!(!refused, "{restart:?} was not refused"),
+            Err(Error::KeptAlive { id }) => assert!(refused && id == "frpc", "{restart:?} was refused"),
+            Err(other) => panic!("{restart:?}: {other:?}"),
+        }
+    }
+}
+
+/// A plist whose key cannot be read, and an id with no job plist to read, are each a step that says what
+/// was being decided over the failure, never a refusal for a job that is kept alive.
+#[skuld::test]
+fn a_key_that_cannot_be_read_is_a_step_over_the_reads_own_error() {
+    let id = Id::try_from("frpc").unwrap();
+    let path = std::path::Path::new("/p/frpc.plist");
+
+    let e = kept_alive(&id, Ok((path, "this is not a plist"))).expect_err("not a plist");
+    let Error::Step { what, source } = &e else {
+        panic!("expected a step, got {e:?}")
+    };
+    assert!(what.contains("`frpc`") && what.contains("KeepAlive"), "{what}");
+    assert!(what.contains("nothing was changed"), "{what}");
+    assert!(
+        matches!(&**source, Error::Os { path: Some(p), .. } if p == path),
+        "{source:?}"
+    );
+
+    let e = kept_alive(&id, Err(Error::blob("the job's plist is missing"))).expect_err("no plist");
+    assert!(
+        matches!(&e, Error::Step { what, source } if what.contains("KeepAlive") && matches!(**source, Error::Blob { .. })),
+        "{e:?}"
+    );
+}

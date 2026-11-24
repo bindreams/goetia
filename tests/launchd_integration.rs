@@ -6,7 +6,7 @@
 //! crate root) so this binary still links and reports zero tests on
 //! non-macOS CI cells, rather than failing to find `main` at all — the same
 //! shape `tests/marker_inertness.rs` already uses. Every actual test lives
-//! in `calendar`, `launchd` and `tasks`, which are the parts gated to macOS.
+//! in `calendar`, `launchd`, `leave` and `tasks`, which are the parts gated to macOS.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -22,6 +22,10 @@ mod demonstration;
 #[cfg(target_os = "macos")]
 #[path = "launchd_integration/launchd.rs"]
 mod launchd;
+
+#[cfg(target_os = "macos")]
+#[path = "launchd_integration/leave.rs"]
+mod leave;
 
 #[cfg(target_os = "macos")]
 #[path = "launchd_integration/tasks.rs"]

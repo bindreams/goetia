@@ -1736,34 +1736,19 @@ fn an_uninstall_removes_the_plist_only_after_the_old_instance_is_gone() {
     assert!(!path.exists(), "uninstall left the plist");
 }
 
-/// Until launchd's own unit lands, `--no-stop` is refused before anything is read or changed, for an
-/// installed id and an absent one, and `Stop` is unchanged.
+/// Nothing of launchd's outlives its id, so `uninstall` of an id nothing is installed at calls nothing and
+/// succeeds with either choice: a label a left run keeps loaded is not read, and not touched.
 #[skuld::test]
-fn leaving_a_run_is_refused_before_anything_is_called() {
+fn uninstalling_an_absent_id_calls_nothing_with_either_choice() {
     use crate::backend::Backend;
 
     let fake = Fake::new([]);
     let mgr = launchd_over(fake.clone());
     let id = never_installed();
 
-    let refused = Backend::uninstall(
-        &mgr,
-        marked_plist(&id),
-        RunInFlight::Leave,
-        &mut reserved(&[Step::Uninstall]),
-    );
-    let refused_absent = Backend::uninstall_absent(&mgr, &id, RunInFlight::Leave);
-
-    for refusal in [refused, refused_absent] {
-        match refusal {
-            Err(Error::Invalid { message, .. }) => {
-                assert!(message.contains("--no-stop"), "{message}");
-                assert!(message.contains("nothing was changed"), "{message}");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
+    for in_flight in [RunInFlight::Stop, RunInFlight::Leave] {
+        assert!(Backend::uninstall_absent(&mgr, &id, in_flight).is_ok(), "{in_flight:?}");
     }
-    assert!(Backend::uninstall_absent(&mgr, &id, RunInFlight::Stop).is_ok());
     fake.assert_spent("nothing was called");
 }
 

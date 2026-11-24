@@ -2123,6 +2123,28 @@ loaded unit with no file (`LoadState=not-found`) while the process lives, and ne
 - A run somebody else starts between goetia's reading that a run is in flight and the reload is that caller's own
   conflicting action, and goetia does not guard against it.
 
+**launchd.** launchd keeps a loaded job's definition in memory and never rereads its plist, so a run can be left
+alone only by leaving its label loaded. Whether that is possible depends on the job's own plist: goetia reads the
+`KeepAlive` key of the installed file, not its own metadata, so an id whose metadata cannot be decoded is decided
+all the same.
+
+- A job launchd does not keep alive (a task's job, or a service with `restart: never`) can be left. `uninstall
+  --no-stop` boots out a task's timer, then reads the job. A job with no process and no start launchd has accepted
+  is booted out as `uninstall` does, which signals nothing. A job with a process, with an accepted start, or in a
+  state goetia does not read as idle keeps its label loaded, and nothing is sent to it. Then the plists are
+  removed. The id is not installed, and the process is the caller's.
+- After a left process exits, launchd keeps the label, idle, until a reboot or the next `install` of the id.
+  `launchctl bootout system/<id>` removes it by hand. `uninstall` of an id nothing is installed at does nothing on
+  launchd, with or without `--no-stop`, and leaves that label alone.
+- A job launchd keeps alive (`restart: always` or `restart: on-failure`, in the plist `KeepAlive` as `true` or a
+  dict) is refused, whether or not a run is in flight, with nothing changed: launchd restarts it from memory when
+  its process ends, whatever is removed. Uninstall without `--no-stop`, which boots the job out. A caller that is
+  the job itself is ended with it unless it runs in a session of its own (`setsid`).
+- A plist whose `KeepAlive` is neither a boolean nor a dict, or that is not an XML plist, is refused with that
+  reason and nothing changed, as is a timer whose job plist is missing.
+- An `install` of the same id while a left run lives boots the label out, which ends the left run: launchd would
+  otherwise refuse to load the new plist under the same label.
+
 ## Exit codes
 
 Two rules come before the numbers:

@@ -53,7 +53,7 @@ fn runs_of(label: &str) -> u64 {
 }
 
 /// The pid `launchctl print` shows for the job `label`, if it has a process.
-fn pid_of(label: &str) -> Option<u32> {
+pub(crate) fn pid_of(label: &str) -> Option<u32> {
     print_field(&print_job(label).stdout, "pid = ").and_then(|pid| pid.parse().ok())
 }
 

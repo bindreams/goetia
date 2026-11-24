@@ -114,6 +114,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             path: PathBuf::new(),
         },
+        Error::KeptAlive { id: id() },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -379,6 +380,29 @@ fn a_failed_read_of_the_installed_host_is_indeterminate_when_the_read_is() {
     assert!(over(in_doubt()).is_indeterminate());
     assert!(!over(not_installed()).is_indeterminate());
     assert!(matches!(over(not_installed()).cause(), Error::NotInstalled { .. }));
+}
+
+/// A job launchd keeps alive is refused `--no-stop` with nothing changed: the message says what happened, and
+/// what to do instead is the remedy, which the report prints after it.
+#[skuld::test]
+fn a_kept_alive_job_says_what_to_do_instead_as_its_remedy() {
+    let refusal = Error::KeptAlive {
+        id: "nightly".to_string(),
+    };
+    assert_eq!(
+        refusal.remedy(),
+        Some(
+            "Uninstall it without `--no-stop`, which stops the job: a caller inside the job is ended with it \
+             unless it runs in a session of its own (`setsid`)."
+        )
+    );
+    assert_eq!(
+        refusal.report().to_string(),
+        "`nightly` cannot be uninstalled with `--no-stop`: launchd keeps its job alive and would restart it from \
+         memory whatever is removed, so nothing was changed. Uninstall it without `--no-stop`, which stops the \
+         job: a caller inside the job is ended with it unless it runs in a session of its own (`setsid`)."
+    );
+    assert!(!refusal.is_indeterminate());
 }
 
 #[skuld::test]
@@ -1699,6 +1723,12 @@ fn error_messages_and_exit_class() {
             "`nightly` cannot be uninstalled with `--no-stop`: `/run/systemd/system/nightly.service` is not goetia's, \
              and a run that uninstall leaves needs that path, whether or not one is running now: remove the file, or \
              uninstall without `--no-stop`",
+            false,
+        ),
+        (
+            Error::KeptAlive { id: id() },
+            "`nightly` cannot be uninstalled with `--no-stop`: launchd keeps its job alive and would restart it from \
+             memory whatever is removed, so nothing was changed",
             false,
         ),
         (

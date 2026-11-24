@@ -5,6 +5,7 @@ use crate::backend::Identity;
 use crate::backend::launchd::generate::{self, Plists};
 use crate::backend::launchd::{ENABLED_DIR, STAGING_DIR};
 use crate::error::Error;
+use crate::manager::RunInFlight;
 use crate::spec::DaemonSpec;
 use crate::spec::test_support::program;
 use crate::testing::{base_fields, task};
@@ -516,26 +517,95 @@ fn rename(spec: DaemonSpec, name: &str) -> DaemonSpec {
 fn uninstall_plan_boots_out_then_removes_timer_before_job() {
     let task = scheduled("a", "30 3 * * *");
     assert_eq!(
-        uninstall_plan(&installed(&task, true, BOTH)),
+        uninstall_plan(&installed(&task, true, BOTH), RunInFlight::Stop),
         vec![BootoutTimer, BootoutJob, RemoveTimer, RemoveJob]
     );
     assert_eq!(
-        uninstall_plan(&installed(&task, false, NOTHING)),
+        uninstall_plan(&installed(&task, false, NOTHING), RunInFlight::Stop),
         vec![RemoveTimer, RemoveJob],
         "launchd is asked only about what it holds"
     );
     assert_eq!(
-        uninstall_plan(&installed(&unscheduled("a"), false, JOB)),
+        uninstall_plan(&installed(&unscheduled("a"), false, JOB), RunInFlight::Stop),
         vec![BootoutJob, RemoveJob]
     );
     assert_eq!(
-        uninstall_plan(&Old {
-            job: None,
-            ..installed(&task, false, NOTHING)
-        }),
+        uninstall_plan(
+            &Old {
+                job: None,
+                ..installed(&task, false, NOTHING)
+            },
+            RunInFlight::Stop
+        ),
         vec![RemoveTimer],
         "a timer alone at the id"
     );
+}
+
+/// An uninstall that leaves the run alone is the same plan with the job's boot-out turned into one that
+/// reads the job first (`BootoutJobIfIdle`): the timer still goes out first, so that nothing starts another
+/// run, and no plan sends a boot-out to a job unread.
+#[skuld::test]
+fn uninstall_plan_that_leaves_the_run_reads_the_job_before_booting_it_out() {
+    let task = scheduled("a", "30 3 * * *");
+    let cases = [
+        (
+            "a task, both labels held",
+            installed(&task, true, BOTH),
+            vec![BootoutTimer, BootoutJobIfIdle, RemoveTimer, RemoveJob],
+        ),
+        (
+            "a task, the job held and the timer not",
+            installed(&task, true, JOB),
+            vec![BootoutJobIfIdle, RemoveTimer, RemoveJob],
+        ),
+        (
+            "a task, nothing held: no read is needed of a job launchd does not have",
+            installed(&task, false, NOTHING),
+            vec![RemoveTimer, RemoveJob],
+        ),
+        (
+            "a service (no timer), the job held",
+            installed(&unscheduled("a"), false, JOB),
+            vec![BootoutJobIfIdle, RemoveJob],
+        ),
+        (
+            "a service, not held",
+            installed(&service("a"), false, NOTHING),
+            vec![RemoveJob],
+        ),
+        (
+            "a timer alone at the id",
+            Old {
+                job: None,
+                ..installed(&task, false, NOTHING)
+            },
+            vec![RemoveTimer],
+        ),
+        (
+            "a timer alone, held",
+            Old {
+                job: None,
+                ..installed(&task, false, BOTH)
+            },
+            vec![BootoutTimer, BootoutJobIfIdle, RemoveTimer],
+        ),
+    ];
+    for (what, old, expected) in cases {
+        let leave = uninstall_plan(&old, RunInFlight::Leave);
+        assert_eq!(leave, expected, "{what}");
+        assert!(!leave.contains(&BootoutJob), "{what}: the job is booted out unread");
+        // Where nothing is held, or no run is to be left, the two choices are one plan.
+        let stop = uninstall_plan(&old, RunInFlight::Stop);
+        let unread: Vec<_> = stop
+            .iter()
+            .map(|&action| if action == BootoutJob { BootoutJobIfIdle } else { action })
+            .collect();
+        assert_eq!(
+            unread, leave,
+            "{what}: the plans differ in more than the job's boot-out"
+        );
+    }
 }
 
 /// A task is enabled where its timer is, and where its job is when it has no timer.

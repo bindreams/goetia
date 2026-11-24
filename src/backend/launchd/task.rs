@@ -7,6 +7,7 @@
 use crate::backend::Decoded;
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::refuse::changes_loaded_job;
+use crate::manager::RunInFlight;
 use crate::spec::{DaemonKind, DaemonSpec};
 
 /// What one file name (`<id>.plist` or `<id>@timer.plist`) holds in the two directories a plist can
@@ -101,6 +102,9 @@ pub(crate) enum Action {
     /// says what launchd showed.
     CheckJobIdle,
     BootoutJob,
+    /// [`Action::BootoutJob`], unless the job has a process or a start launchd has accepted: then the label
+    /// stays loaded and nothing is sent to it. What an uninstall that leaves the run alone does.
+    BootoutJobIfIdle,
     /// Move the job's plist from the enabled directory to staging, so that a retyped daemon does not
     /// start at boot as the other kind.
     MoveJobToStaging,
@@ -231,7 +235,11 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
 /// What `uninstall` does: boot out the timer, then the job (each only if launchd holds it, and the
 /// job's boot-out ends a run in flight), then remove the timer's file, then the job's. A crash
 /// anywhere leaves a state the read table names, and running the verb again finishes it.
-pub(crate) fn uninstall_plan(old: &Old) -> Vec<Action> {
+///
+/// With [`RunInFlight::Leave`] the job's boot-out is [`Action::BootoutJobIfIdle`], so a run in flight is
+/// sent nothing. The caller has refused a job launchd keeps alive before this: it would be restarted
+/// from memory whatever the plan did.
+pub(crate) fn uninstall_plan(old: &Old, in_flight: RunInFlight) -> Vec<Action> {
     let mut plan = Vec::new();
     let mut push = |condition: bool, action: Action| {
         if condition {
@@ -239,7 +247,13 @@ pub(crate) fn uninstall_plan(old: &Old) -> Vec<Action> {
         }
     };
     push(old.timer_loaded, Action::BootoutTimer);
-    push(old.job_loaded, Action::BootoutJob);
+    push(
+        old.job_loaded,
+        match in_flight {
+            RunInFlight::Stop => Action::BootoutJob,
+            RunInFlight::Leave => Action::BootoutJobIfIdle,
+        },
+    );
     push(old.timer.is_some(), Action::RemoveTimer);
     push(old.job.is_some(), Action::RemoveJob);
     plan

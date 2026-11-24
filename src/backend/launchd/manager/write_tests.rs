@@ -17,11 +17,12 @@ use crate::backend::InstalledService as _;
 use crate::backend::Settle as _;
 use crate::backend::account::Account;
 use crate::backend::bounded;
-use crate::backend::client::fake::{Entry, Fake, exited, reply};
+use crate::backend::client::ClientError;
+use crate::backend::client::fake::{Entry, Fake, exited, fail, reply};
 use crate::backend::created_dirs::created_dirs_tests::{Layout, give_to_a_stranger};
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::{RunInFlight, Step};
-use crate::spec::{ServiceSpec, TaskSpec, User};
+use crate::spec::{Restart, ServiceFields, ServiceSpec, TaskSpec, User};
 use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::root_dirs;
 use crate::testing::service_fields;
@@ -1367,6 +1368,306 @@ fn uninstall_of_a_running_armed_task_ends_the_run() {
     assert!(!exists(&tree, true, ID) && !exists(&tree, true, &timer_name()));
 }
 
+// Uninstall, leaving the run alone ====================================================================================
+
+fn leave(tree: &Tree, fake: &Fake) -> Result<()> {
+    let mgr = manager(fake);
+    let snapshot = marked(tree.read());
+    mgr.uninstall(snapshot, RunInFlight::Leave, &mut reserved(&mgr, Step::Uninstall))
+}
+
+fn service_restarting(restart: Restart) -> DaemonSpec {
+    ServiceSpec::new(ServiceFields {
+        restart,
+        ..service_fields(service_spec())
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+/// A service's job plist with `KeepAlive` set to `value`, goetia's metadata kept (so it still decodes).
+fn with_keep_alive(text: &str, value: &str) -> String {
+    let at = text.rfind("</dict>").expect("a plist ends its dict");
+    format!("{}\t<key>KeepAlive</key>\n\t{value}\n{}", &text[..at], &text[at..])
+}
+
+/// The reads every uninstall of an armed task starts with, and the timer's boot-out: both labels held.
+fn armed_reads(job_body: &str) -> Vec<Entry> {
+    vec![
+        print(job_label(), LOADED, job_body),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+    ]
+}
+
+/// A run in flight is sent nothing: the timer goes out, the job is read, and its label stays loaded. The
+/// fake fails any call it has not scripted, so a `bootout` of the job, a signal, or a wait for the process
+/// would fail here; the files go only after the read.
+#[skuld::test]
+fn leaving_a_task_with_a_run_boots_out_the_timer_and_not_the_job() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let (job, timer) = (at(&tree, true, ID), at(&tree, true, &timer_name()));
+    let both_still_there = move || assert!(job.exists() && timer.exists(), "a file was removed before the read");
+    let fake = Fake::new(
+        armed_reads(BUSY)
+            .into_iter()
+            .chain([print(job_label(), LOADED, BUSY).then(both_still_there)]),
+    );
+
+    leave(&tree, &fake).expect("an uninstall that leaves the run");
+
+    fake.assert_spent("the timer went out, the job was read, and nothing else was called");
+    assert!(!exists(&tree, true, ID) && !exists(&tree, true, &timer_name()));
+}
+
+/// With no process there is no run to leave: the job goes out as an uninstall boots it out, which signals
+/// nothing, and the files go once launchd no longer has it.
+#[skuld::test]
+fn leaving_a_task_with_no_process_boots_out_the_job_as_today() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new(armed_reads(IDLE).into_iter().chain([
+        print(job_label(), LOADED, IDLE),
+        bootout(job_label()),
+        print(job_label(), UNLOADED, ""),
+    ]));
+
+    leave(&tree, &fake).expect("an uninstall that leaves no run");
+
+    fake.assert_spent("the timer, the read of the job, then the job");
+    assert!(!exists(&tree, true, ID) && !exists(&tree, true, &timer_name()));
+}
+
+/// A job launchd does not hold is not read and not booted out: nothing of it is there to leave.
+#[skuld::test]
+fn leaving_a_task_launchd_does_not_hold_calls_nothing_beyond_the_two_reads() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+
+    leave(&tree, &fake).expect("an uninstall of a task that is not loaded");
+
+    fake.assert_spent("only the two reads");
+    assert!(!exists(&tree, false, ID) && !exists(&tree, false, &timer_name()));
+}
+
+/// A start launchd has accepted and not yet forked is a run that is coming: it is left, as a process is.
+/// A state goetia does not know, with no process, is not shown to be idle, and a boot-out would be sent to
+/// a run it cannot rule out: it is left too.
+#[skuld::test]
+fn leaving_a_job_that_is_not_shown_idle_keeps_its_label_loaded() {
+    for (what, body) in [
+        ("a queued start", "\tstate = spawn scheduled\n"),
+        ("running with no pid", "\tstate = running\n"),
+        ("a state goetia does not know", "\tstate = someday-new-apple-state\n"),
+        ("a boot-out that is tearing the process down", TEARING_DOWN),
+    ] {
+        let tree = Tree::new();
+        installed(&tree, &task_spec(Some(SCHEDULE)), true);
+        let fake = Fake::new(armed_reads(IDLE).into_iter().chain([print(job_label(), LOADED, body)]));
+
+        leave(&tree, &fake).unwrap_or_else(|e| panic!("{what}: {e}"));
+
+        fake.assert_spent(what);
+        assert!(
+            !exists(&tree, true, ID) && !exists(&tree, true, &timer_name()),
+            "{what}"
+        );
+    }
+}
+
+/// A service launchd does not keep alive (`restart: never`) is left the same way, with no timer to boot out.
+#[skuld::test]
+fn leaving_a_service_that_is_not_kept_alive_leaves_its_label_when_it_has_a_process() {
+    let tree = Tree::new();
+    installed(&tree, &service_restarting(Restart::Never), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, BUSY),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, BUSY),
+    ]);
+
+    leave(&tree, &fake).expect("an uninstall that leaves the run");
+
+    fake.assert_spent("no boot-out of anything");
+    assert!(!exists(&tree, true, ID));
+}
+
+#[skuld::test]
+fn leaving_a_service_that_is_not_kept_alive_and_has_no_process_boots_it_out_as_today() {
+    let tree = Tree::new();
+    installed(&tree, &service_restarting(Restart::Never), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, IDLE),
+        bootout(job_label()),
+        print(job_label(), UNLOADED, ""),
+    ]);
+
+    leave(&tree, &fake).expect("an uninstall that leaves no run");
+
+    fake.assert_spent("the job's boot-out and its wait");
+    assert!(!exists(&tree, true, ID));
+}
+
+/// launchd restarts a job it keeps alive from memory whatever is removed, so `Leave` is refused before
+/// anything is called or changed, whether or not the label is loaded, or a run is in flight.
+#[skuld::test]
+fn leaving_a_job_launchd_keeps_alive_is_refused_with_nothing_called_or_changed() {
+    for restart in [Restart::Always, Restart::OnFailure] {
+        let tree = Tree::new();
+        let plists = installed(&tree, &service_restarting(restart), true);
+        let fake = Fake::new([]);
+
+        let e = leave(&tree, &fake).expect_err("a job launchd keeps alive");
+
+        assert!(matches!(&e, Error::KeptAlive { id } if id == ID), "{restart:?}: {e:?}");
+        fake.assert_spent("nothing was called");
+        assert_eq!(
+            text_at(&tree, true, ID),
+            plists.job,
+            "{restart:?}: the plist is as it was"
+        );
+    }
+}
+
+/// The job's own plist decides, not goetia's metadata: an id whose blob will not decode is decided from
+/// the key all the same.
+#[skuld::test]
+fn the_decision_is_read_from_the_plist_when_the_metadata_will_not_decode() {
+    let tree = Tree::new();
+    let always = plists_of(&service_restarting(Restart::Always)).job;
+    tree.put(true, ID, damaged(&always));
+    let e = leave(&tree, &Fake::new([])).expect_err("a job launchd keeps alive, with metadata that is damaged");
+    assert!(matches!(&e, Error::KeptAlive { .. }), "{e:?}");
+
+    let tree = Tree::new();
+    let never = plists_of(&service_restarting(Restart::Never)).job;
+    tree.put(true, ID, damaged(&never));
+    let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+    leave(&tree, &fake).expect("a job launchd does not keep alive, with metadata that is damaged");
+    fake.assert_spent("the two reads");
+    assert!(!exists(&tree, true, ID));
+}
+
+/// A `KeepAlive` that is neither a boolean nor a dict is the read's own error, in a step that says what was
+/// being decided; nothing was called or changed, and it is not the refusal for a job that is kept alive.
+#[skuld::test]
+fn an_unreadable_keep_alive_is_the_reads_error_inside_a_step() {
+    let tree = Tree::new();
+    let text = with_keep_alive(
+        &plists_of(&service_restarting(Restart::Never)).job,
+        "<string>yes</string>",
+    );
+    tree.put(true, ID, &text);
+    let fake = Fake::new([]);
+
+    let e = leave(&tree, &fake).expect_err("a key that cannot be read");
+
+    let Error::Step { what, source } = &e else {
+        panic!("expected a step, got {e:?}")
+    };
+    assert!(
+        what.contains(ID) && what.contains("KeepAlive") && what.contains("nothing was changed"),
+        "{what}"
+    );
+    assert!(
+        matches!(&**source, Error::Os { path: Some(path), .. } if *path == at(&tree, true, ID)),
+        "{source:?}"
+    );
+    assert!(e.report().to_string().contains("string"), "{}", e.report());
+    fake.assert_spent("nothing was called");
+    assert_eq!(text_at(&tree, true, ID), text);
+}
+
+/// A timer alone at the id has no job plist to read the key from: that is the read's error too, and the
+/// timer stays.
+#[skuld::test]
+fn leaving_a_timer_with_no_job_plist_is_refused_for_want_of_a_plist_to_read() {
+    let tree = Tree::new();
+    tree.put(
+        false,
+        &timer_name(),
+        plists_of(&task_spec(Some(SCHEDULE))).timer.unwrap(),
+    );
+    let fake = Fake::new([]);
+
+    let e = leave(&tree, &fake).expect_err("no job plist");
+
+    assert!(
+        matches!(&e, Error::Step { what, .. } if what.contains("KeepAlive")),
+        "{e:?}"
+    );
+    fake.assert_spent("nothing was called");
+    assert!(exists(&tree, false, &timer_name()));
+}
+
+/// Without the choice the plist is never read: a service whose `KeepAlive` cannot be read, or that is kept
+/// alive, is uninstalled as before, its job booted out and waited for.
+#[skuld::test]
+fn stopping_does_not_read_the_keep_alive_key() {
+    for value in ["<true/>", "<string>yes</string>"] {
+        let tree = Tree::new();
+        tree.put(
+            true,
+            ID,
+            with_keep_alive(&plists_of(&service_restarting(Restart::Never)).job, value),
+        );
+        let fake = Fake::new([bootout(job_label()), print(job_label(), UNLOADED, "")]);
+
+        uninstall(&tree, &fake).expect("an uninstall that stops");
+
+        fake.assert_spent("the job's boot-out and its wait");
+        assert!(!exists(&tree, true, ID), "{value}");
+    }
+}
+
+/// A `print` that answers with a failure is a state not established, as `stop` reads it: the label is
+/// left, nothing is sent to what may be a run, and the uninstall goes on.
+#[skuld::test]
+fn leaving_a_job_whose_print_failed_keeps_its_label_loaded() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new(
+        armed_reads(BUSY)
+            .into_iter()
+            .chain([reply(&["print", &job_label()], exited(1, "", "boom"))]),
+    );
+
+    leave(&tree, &fake).expect("an uninstall that leaves what it cannot rule out");
+
+    fake.assert_spent("the read, and nothing sent to the job");
+    assert!(!exists(&tree, true, ID) && !exists(&tree, true, &timer_name()));
+}
+
+/// A read of the job that could not be made, after the timer went out, is an uninstall that failed with the
+/// timer unloaded, as a failed boot-out is: both files stay.
+#[skuld::test]
+fn a_read_of_the_job_that_cannot_be_made_after_the_timer_went_out_says_to_rerun_uninstall() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let not_run = ClientError::NotRun(std::io::Error::other("no launchctl").into());
+    let fake = Fake::new(
+        armed_reads(BUSY)
+            .into_iter()
+            .chain([fail(&["print", &job_label()], not_run)]),
+    );
+
+    let e = leave(&tree, &fake).expect_err("the read of the job could not be made");
+
+    assert!(
+        matches!(&e, Error::Step { what, .. } if what.contains("re-run uninstall")),
+        "{e:?}"
+    );
+    assert!(
+        exists(&tree, true, ID) && exists(&tree, true, &timer_name()),
+        "nothing was removed"
+    );
+}
+
 // enable and disable ==================================================================================================
 
 /// The reservation `enable` and `disable` make for themselves, at their counts.
@@ -1750,7 +2051,8 @@ fn the_verbs_draw_no_more_than_they_reserved() {
         "a create over stale labels"
     );
 
-    // An uninstall's longest path.
+    // An uninstall's longest path: the one that leaves the run reads the job before it boots it out, which
+    // the one that stops does not, so it is one call shorter.
     let tree = Tree::new();
     installed(&tree, &task_spec(Some(SCHEDULE)), true);
     let fake = Fake::new(armed_uninstall());
@@ -1759,6 +2061,23 @@ fn the_verbs_draw_no_more_than_they_reserved() {
     let mut held = reserved(&mgr, Step::Uninstall);
     mgr.uninstall(snapshot, RunInFlight::Stop, &mut held)
         .expect("an uninstall");
+    assert_eq!(
+        left(&held),
+        (0, files),
+        "an uninstall that stops draws a call short of its reservation"
+    );
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new(armed_reads(IDLE).into_iter().chain([
+        print(job_label(), LOADED, IDLE),
+        bootout(job_label()),
+        print(job_label(), UNLOADED, ""),
+    ]));
+    let mgr = manager(&fake);
+    let snapshot = marked(tree.read());
+    let mut held = reserved(&mgr, Step::Uninstall);
+    mgr.uninstall(snapshot, RunInFlight::Leave, &mut held)
+        .expect("an uninstall that leaves");
     assert_eq!(
         left(&held),
         (0, 0),

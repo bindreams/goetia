@@ -10,6 +10,7 @@ use std::io;
 use std::path::Path;
 
 use crate::backend::launchd::generate;
+use crate::backend::launchd::keep_alive::keeps_alive;
 use crate::backend::launchd::state::exit_of;
 use crate::error::{Error, Occupant, Result};
 use crate::spec::{DaemonKind, Id};
@@ -73,6 +74,28 @@ pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
     Error::ConcurrentChange {
         id: id.to_string(),
         path: Some(path.to_path_buf()),
+    }
+}
+
+// A run `uninstall --no-stop` cannot leave ============================================================================
+
+/// `uninstall --no-stop` of `id`, whose job's plist is `job`, `(path, text)`, or the error that says it
+/// cannot be had: `Ok` for a job launchd does not keep alive, [`Error::KeptAlive`] for one it does, and a
+/// step over the read's own error where the plist cannot say. launchd restarts a kept-alive job from
+/// memory whatever is removed, so only the plist that launchd loaded decides, never goetia's metadata.
+pub(crate) fn kept_alive(id: &Id, job: Result<(&Path, &str)>) -> Result<()> {
+    let undecided = |source: Error| Error::Step {
+        what: format!(
+            "`--no-stop` was refused and nothing was changed: whether launchd keeps `{id}` alive could not be \
+             read from its job's plist (the `KeepAlive` key)"
+        ),
+        source: Box::new(source),
+    };
+    let (path, text) = job.map_err(undecided)?;
+    match keeps_alive(text) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(Error::KeptAlive { id: id.to_string() }),
+        Err(unreadable) => Err(undecided(Error::os_at("read the `KeepAlive` key of", path, unreadable))),
     }
 }
 
