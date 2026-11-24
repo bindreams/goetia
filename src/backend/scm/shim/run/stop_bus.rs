@@ -79,8 +79,8 @@ pub enum WaitEnd {
 pub enum StopEvent {
     /// The wait has ended, by `WaitEnd`, and nothing has been asked, waited for or torn down yet.
     Began(WaitEnd),
-    /// The stop is going on: an ask-and-wait plan has waited a slice of its time and is waiting further. Never after
-    /// the wait has ended, and never for another plan.
+    /// The stop is going on: an ask-and-wait plan has waited a slice of its time for the tree, or paused before asking
+    /// again, and goes on. Never after the wait for the tree has ended, and never for another plan.
     Progress,
 }
 

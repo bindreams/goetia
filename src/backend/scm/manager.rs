@@ -1459,12 +1459,14 @@ enum Write {
 /// The writes that follow the service's own create (`create`) or update, in order; the first that fails ends the
 /// install, and nothing already written is undone. `Parameters` is the marker that says a service is goetia's, so a
 /// failure leaves:
-/// - on a create, `Parameters` first: a goetia service with its marker and the new blob, lacking the writes that
-///   failed and those after them. Unless what it lacks is what a new service already has (a plain service with
-///   `stop-action: kill`, no environment and no restart policy: the next `install` reads it as up to date), the next
-///   `install` finds it equal to neither the wanted registration nor the one the blob regenerates and answers
-///   `Conflict`, cleared by `--force`, as for a failed `Environment` or failure actions write. Without the marker
-///   first the service would read as foreign;
+/// - on a create, `Parameters` first. If it is a later write that fails: a goetia service with its marker and the new
+///   blob, lacking that write and those after it. Unless what it lacks is what a new service already has (for example
+///   a plain service with `stop-action: kill`, no environment and no restart policy), in which case the next `install`
+///   reads it as up to date, that `install` finds it equal to neither the wanted registration nor the one the blob
+///   regenerates and answers `Conflict`, cleared by `--force`. If `Parameters` itself fails: the service as far as the
+///   write got, which with no `Marker` is foreign (only deleting it recovers it, [`read_marker`]) and with the
+///   `Marker` but not the rest is goetia's with a blob that does not decode. Without `Parameters` first, a failed
+///   later write would leave a service that reads as foreign;
 /// - on an update, the pre-shutdown time first: the old blob stays. If `change_config` changed nothing the
 ///   registration shows (only the `stop-action` changed), the next `install` finds the service equal to what the old
 ///   blob regenerates and updates again ([`generate::preshutdown_to_write`]); otherwise it answers `Conflict`, as after

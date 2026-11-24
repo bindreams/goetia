@@ -1519,14 +1519,21 @@ fn a_stop_action_is_carried_in_the_blob_and_changes_only_the_preshutdown_time_of
         let spec = with_stop_action(spec, written("terminate", Some(90)));
         let with = build(&spec);
 
-        assert_eq!(with.executable, plain.executable);
-        assert_eq!(with.arguments, plain.arguments);
-        assert_eq!(with.failure_actions, plain.failure_actions);
-        assert_eq!(with.environment, plain.environment);
         assert_eq!(plain.preshutdown, before);
         assert_eq!(with.preshutdown, after);
         let blob = crate::blob::decode(&with.parameters[FIELD_SPEC]).unwrap();
         assert_eq!(blob.spec, spec);
+        // The rest of the registration, as a whole: only the time and the blob that carries the action differ.
+        let mut parameters = with.parameters.clone();
+        parameters.insert(FIELD_SPEC.to_string(), plain.parameters[FIELD_SPEC].clone());
+        assert_eq!(
+            ScmRegistration {
+                preshutdown: plain.preshutdown,
+                parameters,
+                ..with
+            },
+            plain
+        );
     }
 }
 
