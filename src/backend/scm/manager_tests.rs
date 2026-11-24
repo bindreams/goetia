@@ -3,11 +3,14 @@
 //! (everything that actually talks to SCM) is covered by
 //! `tests/scm_integration.rs` instead.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::*;
+use crate::backend::scm::manager::accounts::AccountKind;
+use crate::backend::scm::manager::accounts::fake::{Asked, Fake};
 use crate::backend::scm::parameters::Stray;
 use crate::backend::scm::test_support::{SHIM_HEX, blob_of};
 use crate::manager::{RunInFlight, ServiceManager};
@@ -1766,6 +1769,8 @@ fn apply_refuses_an_account_that_is_no_user_before_the_password(#[fixture(env)] 
             "`{name}` needs a password"
         );
         let err = apply(
+            &Lsa,
+            identity::service_password,
             &simple_daemon(),
             &dummy_reg(Some(name)),
             Some(identity::Written::Name(name)),
@@ -1804,24 +1809,246 @@ fn begin_run_of_a_service_is_not_a_task() {
 /// with the install).
 #[skuld::test]
 fn the_registered_account_is_looked_up_only_for_a_hosted_service_whose_account_changes() {
-    let old = Some(r"NT AUTHORITY\LocalService".to_string());
-    let new = Some(r"NT AUTHORITY\NetworkService".to_string());
-    let never = || -> Result<Option<Sid>> { panic!("the registered account was looked up") };
-    let found = crate::backend::scm::sid::sid_from_parts(5, &[19]);
+    let (old, new) = (Some("alice".to_string()), Some("bob".to_string()));
+    // Nothing is stated, so a lookup of either account panics.
+    let accounts = Fake::new();
 
     assert_eq!(
-        accounts_kept_before_change(false, &old, &new, never).unwrap(),
+        accounts_kept_before_change(&accounts, false, &old, &new).unwrap(),
         None,
         "not hosted"
     );
     assert_eq!(
-        accounts_kept_before_change(true, &old, &old, never).unwrap(),
+        accounts_kept_before_change(&accounts, true, &old, &old).unwrap(),
         None,
         "unchanged"
     );
+    assert_eq!(accounts.asked(), []);
+}
+
+#[skuld::test]
+fn the_registered_account_of_a_hosted_service_that_changes_account_is_looked_up_by_name() {
+    let (old, new) = (Some("alice".to_string()), Some("bob".to_string()));
+    let accounts = Fake::new().user("alice", &alice());
+
+    let kept = accounts_kept_before_change(&accounts, true, &old, &new).unwrap();
+
+    assert_eq!(kept, Some(alice()));
+    assert_eq!(accounts.asked(), [Asked::Name("alice".to_string())]);
+}
+
+#[skuld::test]
+fn a_built_in_registered_account_is_its_well_known_sid_and_is_not_looked_up() {
+    let old = Some(r"NT AUTHORITY\LocalService".to_string());
+    let new = Some(r"NT AUTHORITY\NetworkService".to_string());
+    let accounts = Fake::new();
+
+    let kept = accounts_kept_before_change(&accounts, true, &old, &new).unwrap();
+
+    assert_eq!(kept, Some(crate::backend::scm::sid::sid_from_parts(5, &[19])));
+    assert_eq!(accounts.asked(), []);
+}
+
+/// A deleted account is nobody to name; any other failure of the lookup is the install's failure.
+#[skuld::test]
+fn a_registered_account_that_is_gone_is_named_by_nobody_and_any_other_failure_fails() {
+    let (old, new) = (Some("gone".to_string()), Some("bob".to_string()));
+    let gone = Fake::new().no_such_account("gone");
+    assert_eq!(accounts_kept_before_change(&gone, true, &old, &new).unwrap(), None);
+
+    let broken = Fake::new().fails("gone", std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let err = accounts_kept_before_change(&broken, true, &old, &new).expect_err("access denied is no verdict");
+    assert!(matches!(err, Error::Os { .. }), "{err:?}");
+}
+
+// The service gate ====================================================================================================
+
+/// The SID of `alice`, a user the tests of the gate and of the kept account state.
+fn alice() -> Sid {
+    crate::backend::scm::sid::sid_from_parts(5, &[21, 1, 2, 3, 1001])
+}
+
+thread_local! {
+    /// What the database had been asked, and how many grants it had made, when the gate read the password.
+    static AT_PASSWORD: RefCell<Option<(Vec<Asked>, usize)>> = const { RefCell::new(None) };
+    /// The database `password_secret` looks at when it is called.
+    static WATCHED: RefCell<Option<Fake>> = const { RefCell::new(None) };
+}
+
+/// A password that is set, noting how far the gate had got when it was asked for.
+fn password_secret() -> Result<Option<String>> {
+    WATCHED.with_borrow(|watched| {
+        let watched = watched.as_ref().expect("the test watches a database");
+        AT_PASSWORD.set(Some((watched.asked(), watched.granted().len())));
+    });
+    Ok(Some("secret".to_string()))
+}
+
+fn password_stale() -> Result<Option<String>> {
+    Ok(Some("stale".to_string()))
+}
+
+fn password_unset() -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn password_unread() -> Result<Option<String>> {
+    panic!("the password was read")
+}
+
+#[skuld::test]
+fn the_gate_checks_a_user_then_reads_the_password_then_grants_the_right_to_the_sid_it_found() {
+    let accounts = Fake::new().user("alice", &alice());
+    WATCHED.set(Some(accounts.clone()));
+    AT_PASSWORD.set(None);
+
+    let gated = gate_account(
+        &accounts,
+        password_secret,
+        &dummy_reg(Some("alice")),
+        Some(identity::Written::Name("alice")),
+        Password::Read,
+    )
+    .expect("a user with a password passes");
+
+    assert_eq!(gated.password.as_deref(), Some("secret"));
+    assert_eq!(gated.checked, Some(alice()));
     assert_eq!(
-        accounts_kept_before_change(true, &old, &new, || Ok(Some(found.clone()))).unwrap(),
-        Some(found),
-        "hosted, changed"
+        AT_PASSWORD.take(),
+        Some((vec![Asked::Name("alice".to_string())], 0)),
+        "the account was checked before the password was read, and nothing was granted before it"
     );
+    assert_eq!(accounts.granted(), [(alice(), identity::Right::Service)]);
+}
+
+#[skuld::test]
+fn the_gate_refuses_an_account_that_is_no_user_before_it_reads_the_password_and_grants_nothing() {
+    let users = crate::backend::scm::sid::sid_from_parts(5, &[32, 545]);
+    let accounts = Fake::new().account("Users", &users, AccountKind::LocalGroup);
+
+    let err = gate_account(
+        &accounts,
+        password_unread,
+        &dummy_reg(Some("Users")),
+        Some(identity::Written::Name("Users")),
+        Password::Read,
+    )
+    .map(drop)
+    .expect_err("a group is no user");
+
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(accounts.granted(), []);
+}
+
+#[skuld::test]
+fn the_gate_grants_nothing_when_the_password_is_missing() {
+    let accounts = Fake::new().user("alice", &alice());
+
+    let err = gate_account(
+        &accounts,
+        password_unset,
+        &dummy_reg(Some("alice")),
+        Some(identity::Written::Name("alice")),
+        Password::Read,
+    )
+    .map(drop)
+    .expect_err("a real user needs a password");
+
+    assert!(
+        matches!(
+            err,
+            Error::PasswordRequired {
+                kind: DaemonKind::Service,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(accounts.granted(), []);
+}
+
+/// An install that finds the service up to date makes the log and the right again but never reads the password.
+#[skuld::test]
+fn the_gate_reads_no_password_when_it_is_not_asked_to_and_still_grants_the_right() {
+    let accounts = Fake::new().user("alice", &alice());
+
+    let gated = gate_account(
+        &accounts,
+        password_unread,
+        &dummy_reg(Some("alice")),
+        Some(identity::Written::Name("alice")),
+        Password::Unneeded,
+    )
+    .expect("a user passes");
+
+    assert_eq!(gated.password, None);
+    assert_eq!(gated.checked, Some(alice()));
+    assert_eq!(accounts.granted(), [(alice(), identity::Right::Service)]);
+}
+
+/// A password left over from installing another daemon must not reach an account that takes none.
+#[skuld::test]
+fn the_gate_gives_no_password_to_a_built_in_or_virtual_account_asks_the_database_nothing_and_grants_nothing() {
+    for account in [
+        None,
+        Some(r"NT AUTHORITY\LocalService"),
+        Some(r"NT AUTHORITY\NetworkService"),
+        Some(r"NT SERVICE\goetia-test"),
+    ] {
+        let accounts = Fake::new();
+
+        let gated = gate_account(&accounts, password_stale, &dummy_reg(account), None, Password::Read)
+            .unwrap_or_else(|e| panic!("{account:?}: {e}"));
+
+        assert_eq!((gated.password, gated.checked), (None, None), "{account:?}");
+        assert_eq!(accounts.asked(), [], "{account:?}");
+        assert_eq!(accounts.granted(), [], "{account:?}");
+    }
+}
+
+/// A native service of `user`.
+fn daemon_of(user: User) -> DaemonSpec {
+    let fields = ServiceFields {
+        restart: Restart::Never,
+        ..base_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+    };
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields { user, ..fields.common },
+        ..fields
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+#[skuld::test]
+fn a_render_resolves_a_user_id_through_the_managers_accounts() {
+    let accounts = Fake::new().user(r"HOST\alice", &alice());
+    let scm = Scm::new().with_accounts(Box::new(accounts.clone()));
+    let spec = daemon_of(User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string())));
+
+    let WindowsDefinition::Service(reg) = scm.render(&spec).expect("the SID names an account") else {
+        panic!("a service renders as a service");
+    };
+
+    assert_eq!(reg.account.as_deref(), Some(r"HOST\alice"));
+    assert_eq!(accounts.asked(), [Asked::Sid(alice())]);
+}
+
+/// The write reaches the accounts and the password source the manager holds: it checks the account, then asks
+/// for the password, which is unset here, so nothing is granted.
+#[skuld::test]
+fn a_service_write_uses_the_managers_accounts_and_password_source() {
+    let accounts = Fake::new().user("alice", &alice());
+    let scm = Scm::new()
+        .with_accounts(Box::new(accounts.clone()))
+        .with_password(password_unset);
+    let spec = daemon_of(User::Name("alice".to_string()));
+
+    let err = scm
+        .service_write(&spec, &dummy_reg(Some("alice")), None)
+        .expect_err("a real user needs a password");
+
+    assert!(matches!(err, Error::PasswordRequired { .. }), "{err:?}");
+    assert_eq!(accounts.asked(), [Asked::Name("alice".to_string())]);
+    assert_eq!(accounts.granted(), []);
 }
