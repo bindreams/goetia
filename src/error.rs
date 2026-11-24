@@ -167,20 +167,16 @@ pub enum Error {
     #[error("`{id}` may not have stopped: {shown}")]
     StopUnconfirmed { id: String, shown: String },
 
-    /// A `kill` of the service's process `pid` came to no established end. `signalled` is whether its
-    /// signal was sent. `exited` is `false` when the wait for the process to exit failed, so that whether it
-    /// exited is not established; `true` when the process exited (by the signal, or on its own before any,
-    /// `signalled: false`) and goetia could not confirm that the manager recorded it: the manager could not
-    /// be read, still shows the pid, or cannot be waited on. `signalled: false` occurs only with
-    /// `exited: true`. The kill did not fail, and `source` does not say what it came to, whatever it is on
-    /// its own: this is indeterminate (exit `4`) by its own arm, and no wrapper, so [`cause`](Error::cause)
-    /// stops here. A Windows task with several live runs kills each, and their errors fold into a
+    /// A `kill` of the service's process `pid` came to no established end: a wait failed, and `progress` is
+    /// how far the kill had got. The manager could not be read, still shows the pid, or cannot be waited
+    /// on. The kill did not fail, and `source` does not say what it came to, whatever it is on its own:
+    /// this is indeterminate (exit `4`) by its own arm, and no wrapper, so [`cause`](Error::cause) stops
+    /// here. A Windows task with several live runs kills each, and their errors fold into a
     /// [`Both`](Error::Both), which is indeterminate only when no run's kill failed outright.
-    #[error("{}", kill_unconfirmed_message(*pid, *signalled, *exited))]
+    #[error("{}", kill_unconfirmed_message(*pid, *progress))]
     KillUnconfirmed {
         pid: u32,
-        signalled: bool,
-        exited: bool,
+        progress: KillProgress,
         #[source]
         source: Box<Error>,
     },
@@ -1472,14 +1468,28 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
     }
 }
 
+/// How far a `kill` whose outcome is open had got when a wait failed: see [`Error::KillUnconfirmed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillProgress {
+    /// The signal was sent; whether the process exited is not established.
+    Signalled,
+    /// The signal was sent and the process exited; the manager's record of the exit is not confirmed.
+    Exited,
+    /// The process had exited before it could be opened, so nothing was signalled; the manager's record of
+    /// the exit is not confirmed.
+    AlreadyGone,
+}
+
 /// [`Error::KillUnconfirmed`]'s message: what is known of the process.
-fn kill_unconfirmed_message(pid: u32, signalled: bool, exited: bool) -> String {
-    match (signalled, exited) {
-        (true, false) => format!("process {pid} was signalled, but goetia could not establish that it exited"),
-        (true, true) => format!(
+fn kill_unconfirmed_message(pid: u32, progress: KillProgress) -> String {
+    match progress {
+        KillProgress::Signalled => {
+            format!("process {pid} was signalled, but goetia could not establish that it exited")
+        }
+        KillProgress::Exited => format!(
             "process {pid} was signalled and has exited, but goetia could not confirm that the manager recorded it"
         ),
-        (false, _) => {
+        KillProgress::AlreadyGone => {
             format!("process {pid} had already exited, but goetia could not confirm that the manager recorded it")
         }
     }

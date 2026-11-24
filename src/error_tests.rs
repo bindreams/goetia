@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use std::error::Error as _;
 
-use super::{BoxError, Error, Occupant, PutBackFound, SharedError, VersionReading};
+use super::{BoxError, Error, KillProgress, Occupant, PutBackFound, SharedError, VersionReading};
 use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
 use crate::spec::DaemonKind;
 
@@ -61,8 +61,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         },
         Error::KillUnconfirmed {
             pid: 1,
-            signalled: true,
-            exited: false,
+            progress: KillProgress::Signalled,
             source: Box::new(not_installed()),
         },
         Error::RunStateUnknown { id: id() },
@@ -939,27 +938,23 @@ fn report_of_a_stop_that_cannot_tell_no_process_is_left() {
 /// unconfirmed. What failed is printed under it; the variant is indeterminate whatever that was.
 #[skuld::test]
 fn report_of_a_kill_says_what_is_known_of_the_process() {
-    for (signalled, exited, text) in [
+    for (progress, text) in [
         (
-            true,
-            false,
+            KillProgress::Signalled,
             "process 7 was signalled, but goetia could not establish that it exited: daemon `x` is not installed",
         ),
         (
-            true,
-            true,
+            KillProgress::Exited,
             "process 7 was signalled and has exited, but goetia could not confirm that the manager recorded it: daemon `x` is not installed",
         ),
         (
-            false,
-            true,
+            KillProgress::AlreadyGone,
             "process 7 had already exited, but goetia could not confirm that the manager recorded it: daemon `x` is not installed",
         ),
     ] {
         let e = Error::KillUnconfirmed {
             pid: 7,
-            signalled,
-            exited,
+            progress,
             source: Box::new(not_installed()),
         };
 

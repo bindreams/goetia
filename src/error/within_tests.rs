@@ -3,7 +3,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::*;
-use crate::error::Error;
+use crate::error::{Error, KillProgress};
 
 fn denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "denied")
@@ -117,7 +117,7 @@ fn a_failure_said_within_a_context_by_a_target_is_still_a_failure_of_the_operati
 #[skuld::test]
 fn a_context_around_a_kill_that_signalled_still_says_it_was_signalled() {
     for source in [denied(), io::Error::other(Error::blob("carried"))] {
-        let wrapped = within("outer", kill_unconfirmed(7, true, false, source));
+        let wrapped = within("outer", kill_unconfirmed(7, KillProgress::Signalled, source));
 
         let report = target_failed("kill `x`", wrapped).report().to_string();
 
@@ -213,8 +213,7 @@ fn an_indeterminate_error_is_indeterminate_in_whatever_payload_it_is_carried() {
 fn a_kill_that_signalled_is_told_with_no_verdict_in_whatever_payload() {
     for (how, e) in carried_in_each_payload(|| Error::KillUnconfirmed {
         pid: 7,
-        signalled: true,
-        exited: true,
+        progress: KillProgress::Exited,
         source: Box::new(blob()),
     }) {
         let failed = target_failed("kill `x`", e);
@@ -232,7 +231,7 @@ fn a_kill_that_signalled_is_told_with_no_verdict_in_whatever_payload() {
 /// The failure after the signal is carried as the typed error `told` makes of it, and the kind is kept.
 #[skuld::test]
 fn what_failed_after_the_signal_is_carried_typed_with_its_kind() {
-    let e = kill_unconfirmed(7, true, false, io::Error::new(io::ErrorKind::TimedOut, "wait"));
+    let e = kill_unconfirmed(7, KillProgress::Signalled, io::Error::new(io::ErrorKind::TimedOut, "wait"));
 
     assert_eq!(e.kind(), io::ErrorKind::TimedOut);
     let failed = target_failed("kill `x`", e);

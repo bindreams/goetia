@@ -385,8 +385,7 @@ fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {
 }
 
 /// SCM has not yet recorded the exit of a process that is already gone: the kill blocks for SCM's
-/// release rather than re-reading in a loop. The kill then waits for the record of the ended process as
-/// it does for every one, which SCM, having let go, answers at once.
+/// release rather than re-reading in a loop. That wait is the record's, so the kill makes no second one.
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
     let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone]);
@@ -401,9 +400,6 @@ fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
             "service_pid",
             "await_release",
             "service_pid",
-            "arm_release",
-            "service_pid",
-            "cancel_release",
         ])
     );
 }
@@ -425,7 +421,6 @@ fn a_wake_that_shows_scm_let_go_of_the_pid_arms_nothing_again() {
             "service_pid",
             "await_release",
             "service_pid",
-            "arm_release",
         ])
     );
 }
@@ -439,8 +434,8 @@ fn a_service_scm_will_not_watch_and_shows_stopped_is_released() {
     assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "arm_release", "arm_release"]),
-        "the wait for the record of the ended process is refused the same way, and is the release too"
+        steps(["service_pid", "open 100", "arm_release"]),
+        "the arm is refused, and that is the release"
     );
 }
 
@@ -545,7 +540,7 @@ fn assert_terminated_but_unconfirmed(e: io::Error, cause: &str, kind: io::ErrorK
     let failed = crate::backend::kill::kill_failed("frpc", e);
     assert!(failed.is_indeterminate(), "{failed:?}");
     assert!(
-        matches!(failed.cause(), crate::Error::KillUnconfirmed { exited: true, .. }),
+        matches!(failed.cause(), crate::Error::KillUnconfirmed { progress: crate::KillProgress::Exited, .. }),
         "{failed:?}"
     );
 }

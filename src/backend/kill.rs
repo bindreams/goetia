@@ -20,7 +20,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::error::{
-    Error, Pieces, kill_unconfirmed, target_failed, terminating_failed, unread_after_open_refused, within,
+    Error, KillProgress, Pieces, kill_unconfirmed, target_failed, terminating_failed, unread_after_open_refused, within,
 };
 use crate::manager::budget::{Budget, Deadline};
 
@@ -54,10 +54,10 @@ pub enum KillOutcome {
 /// The failure of a kill of `id`, as the verb reports it: a [`Step`](Error::Step) around the error the
 /// failure carries, or an OS failure of the kill. A target that talks to a manager through calls that fail
 /// with goetia's own [`Error`] wraps it in an [`io::Error`] to pass it through [`KillTarget`]; it is the
-/// step's source, with its class, so before the signal a caller matching on `NoManager` or `Command` finds it
-/// with [`Error::cause`]. A failed wait after the signal was delivered, or after the process was found gone
-/// ([`kill_unconfirmed`]), is an [`Error::KillUnconfirmed`] under the kill, with no claim that the kill
-/// failed. Any other error is an OS failure of the kill.
+/// step's source, with its class, so a caller matching on `NoManager` or `Command` finds it with
+/// [`Error::cause`], unless the failure is a [`KillUnconfirmed`](Error::KillUnconfirmed), where `cause` stops.
+/// A failed wait of a kill whose outcome is open ([`kill_unconfirmed`]) is an [`Error::KillUnconfirmed`] under
+/// the kill, with no claim that the kill failed. Any other error is an OS failure of the kill.
 pub(crate) fn kill_failed(id: &str, e: io::Error) -> Error {
     target_failed(format!("kill `{id}`"), e)
 }
@@ -183,29 +183,32 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
             wait_unbounded_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, None, d)
             })
-            .map_err(|e| kill_unconfirmed(pid, false, true, e))?;
+            .map_err(|e| kill_unconfirmed(pid, KillProgress::AlreadyGone, e))?;
             Ok(KillOutcome::Ended)
         }
-        Err(HoldError::Unrecorded { pid, error }) => Err(kill_unconfirmed(pid, false, true, error)),
+        Err(HoldError::Unrecorded { pid, error }) => Err(kill_unconfirmed(pid, KillProgress::AlreadyGone, error)),
         Err(HoldError::Unread(e) | HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
         Ok(None) => Ok(KillOutcome::NotRunning),
-        // The process held is not the service's, or was gone: it is not signalled, and a manager may
-        // still report its pid for a moment, so the kill waits for the record as after a signal.
-        Ok(Some(Hold::Ended { pid, held })) => {
+        // The process was gone, and `hold_once` has seen the manager record it.
+        Ok(Some(Hold::Gone { .. })) => Ok(KillOutcome::Ended),
+        // The manager no longer vouches for `pid` as the daemon's: nothing is signalled, and a manager may
+        // still report the pid for a moment, so the kill waits for the record as after a signal. Whether
+        // that process is alive is not known, so a failed wait is the kill's own, as for any hold.
+        Ok(Some(Hold::Disowned { pid, held })) => {
             wait_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, held.as_ref(), d)
             })
-            .map_err(|e| kill_unconfirmed(pid, false, true, e))?;
+            .map_err(|e| of_process(pid, Step::Recording, e))?;
             Ok(KillOutcome::Ended)
         }
         Ok(Some(Hold::Held { pid, process })) => {
             target.force_end(&process).map_err(|e| not_signalled(pid, e))?;
             wait_saying(target, &waiting_notice(id, pid, None), |t, d| t.await_exit(&process, d))
-                .map_err(|e| kill_unconfirmed(pid, true, false, e))?;
+                .map_err(|e| kill_unconfirmed(pid, KillProgress::Signalled, e))?;
             wait_saying(target, &recording_notice(id, pid), |t, d| {
                 t.await_recorded(pid, Some(&process), d)
             })
-            .map_err(|e| kill_unconfirmed(pid, true, true, e))?;
+            .map_err(|e| kill_unconfirmed(pid, KillProgress::Exited, e))?;
             Ok(KillOutcome::Ended)
         }
     }
@@ -216,20 +219,23 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
 pub(crate) enum Hold<P> {
     /// The daemon's process, opened, and confirmed by a second read of the manager.
     Held { pid: u32, process: P },
-    /// The process `pid` the manager reported is not the daemon's: it was gone before it could be
-    /// opened, the manager moved off the pid between the open and the confirmation, or the process
-    /// opened (`held`) is not the daemon's. Nothing is signalled. The manager may still report `pid`
-    /// for a moment, so a caller who needs its record waits with [`KillTarget::await_recorded`] over
-    /// `pid` and `held`.
-    Ended { pid: u32, held: Option<P> },
+    /// The process `pid` was gone before it could be opened. From [`hold_once`] the manager has also stopped
+    /// reporting it; [`hold_pid`] makes no read for it. Nothing is signalled.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Gone { pid: u32 },
+    /// The manager no longer vouches for `pid` as the daemon's: it moved off the pid, or the open was
+    /// refused after it moved on, or the process opened (`held`) is not the daemon's. Nothing is signalled,
+    /// and whether that process is alive is not known. The manager may still report `pid` for a moment, so
+    /// a caller who needs its record waits with [`KillTarget::await_recorded`] over `pid` and `held`.
+    Disowned { pid: u32, held: Option<P> },
 }
 
 /// The daemon's process and its pid, opened and held, once: what everything that acts on a daemon's
 /// process starts from. `None` when the manager reports the daemon with no process.
 ///
 /// A process gone before the open is waited for in the manager until `deadline`, which ends as
-/// [`HoldError::Expired`]; that is the only wait, and [`hold_pid`] makes none. A daemon that moved on is
-/// [`Hold::Ended`].
+/// [`HoldError::Expired`]; that is the only wait, and [`hold_pid`] makes none. A process gone and recorded is
+/// [`Hold::Gone`]; a daemon that moved on is [`Hold::Disowned`].
 pub(crate) fn hold_once<T: KillTarget>(
     target: &mut T,
     deadline: Deadline,
@@ -244,7 +250,7 @@ pub(crate) fn hold_once<T: KillTarget>(
             .await_recorded(pid, None, deadline)
             .map_err(|error| HoldError::Unrecorded { pid, error })?
         {
-            Waited::Confirmed => Ok(Some(Hold::Ended { pid, held: None })),
+            Waited::Confirmed => Ok(Some(Hold::Gone { pid })),
             Waited::Expired => Err(HoldError::Expired { pid }),
         },
     }
@@ -254,12 +260,12 @@ pub(crate) fn hold_once<T: KillTarget>(
 /// something on the pid (a watch) before it holds it. The manager is asked only whether it still vouches
 /// for `pid`.
 ///
-/// It never waits for the manager to record the end of a process that is gone: that is [`Hold::Ended`], with
+/// It never waits for the manager to record the end of a process that is gone: that is [`Hold::Gone`], with
 /// no read of the manager made for it, so a caller that paces its own next read does not read twice.
 /// [`HoldError::Expired`] and [`HoldError::Unread`] are never its errors.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn hold_pid<T: KillTarget>(target: &mut T, pid: u32) -> std::result::Result<Hold<T::Process>, HoldError> {
-    Ok(hold_open(target, pid)?.unwrap_or(Hold::Ended { pid, held: None }))
+    Ok(hold_open(target, pid)?.unwrap_or(Hold::Gone { pid }))
 }
 
 /// [`hold_pid`], with `None` for a process that was gone before it could be opened: the one case in which
@@ -274,7 +280,7 @@ fn hold_open<T: KillTarget>(target: &mut T, pid: u32) -> std::result::Result<Opt
                 Ok(Some(now)) if now == pid => Err(HoldError::Refused(of_process(pid, Step::Opening, e))),
                 // The manager has moved on: the pid was a process that exited, or somebody else's,
                 // and `e` is superseded by that.
-                Ok(_) => Ok(Some(Hold::Ended { pid, held: None })),
+                Ok(_) => Ok(Some(Hold::Disowned { pid, held: None })),
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => Err(HoldError::Read(unread_after_open_refused(pid, e, read))),
             };
@@ -286,7 +292,7 @@ fn hold_open<T: KillTarget>(target: &mut T, pid: u32) -> std::result::Result<Opt
     Ok(Some(if confirmed {
         Hold::Held { pid, process }
     } else {
-        Hold::Ended {
+        Hold::Disowned {
             pid,
             held: Some(process),
         }

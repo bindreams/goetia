@@ -1,6 +1,6 @@
 use std::io;
 
-use super::Error;
+use super::{Error, KillProgress};
 use super::report::{Seen, seen};
 
 #[derive(Debug, thiserror::Error)]
@@ -103,18 +103,17 @@ fn told(e: io::Error) -> Error {
 /// [`Error`], told under `what`, the operation:
 ///
 /// - an error that carries an [`Error::KillUnconfirmed`], at any depth of contexts, says that the
-///   operation's signal was sent and what is known of it, so `what` names the operation with no verdict on
-///   it;
+///   operation's outcome is open and how far it got, so `what` names the operation with no verdict on it;
 /// - any other failure is one of `what`: `failed to <what>`, over the goetia error it carries, else an OS
 ///   failure.
 pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
     let what = what.into();
-    let (signalled, carried) = match look(&e) {
+    let (open, carried) = match look(&e) {
         Some(Error::KillUnconfirmed { .. }) => (true, true),
         Some(_) => (false, true),
         None => (false, false),
     };
-    if signalled {
+    if open {
         Error::Step {
             what,
             source: Box::new(told(e)),
@@ -130,20 +129,14 @@ pub(crate) fn target_failed(what: impl Into<String>, e: io::Error) -> Error {
 }
 
 /// The failure of a wait of a kill of the process `pid`, `source`, as a target reports it through
-/// [`io::Error`] with its kind kept: an [`Error::KillUnconfirmed`] over `source` as an [`Error`]. `signalled`
-/// is whether the signal was sent, `exited` whether the process is known to have exited: a process not
-/// signalled is only ever one that had exited.
-pub(crate) fn kill_unconfirmed(pid: u32, signalled: bool, exited: bool, source: io::Error) -> io::Error {
-    debug_assert!(
-        signalled || exited,
-        "a process that was not signalled is known to have exited"
-    );
+/// [`io::Error`] with its kind kept: an [`Error::KillUnconfirmed`] over `source` as an [`Error`], with
+/// `progress` how far the kill had got.
+pub(crate) fn kill_unconfirmed(pid: u32, progress: KillProgress, source: io::Error) -> io::Error {
     io::Error::new(
         source.kind(),
         Error::KillUnconfirmed {
             pid,
-            signalled,
-            exited,
+            progress,
             source: Box::new(told(source)),
         },
     )
