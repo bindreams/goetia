@@ -116,7 +116,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, task_beside, which};
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, refuse_held_records_at, task_beside, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
@@ -721,7 +721,12 @@ impl Backend for Scm {
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         match (definition, snapshot) {
-            (WindowsDefinition::Service(definition), None) => self.service_write(spec, definition, None),
+            (WindowsDefinition::Service(definition), None) => {
+                // Before anything is registered: a task of the id that was uninstalled with `--no-stop` may still
+                // have a run that holds its records.
+                refuse_held_records_at(&spec.common().id)?;
+                self.service_write(spec, definition, None)
+            }
             (WindowsDefinition::Service(definition), Some(WindowsSnapshot::Service(snapshot))) => {
                 self.service_write(spec, definition, Some(snapshot))
             }
@@ -786,22 +791,23 @@ impl Backend for Scm {
     }
 
     fn uninstall(&self, snapshot: WindowsSnapshot, in_flight: RunInFlight, _reservation: &mut ()) -> Result<()> {
-        if in_flight == RunInFlight::Leave {
-            return Err(leave_not_built(snapshot.id(), "Windows"));
-        }
         match snapshot {
-            WindowsSnapshot::Service(snapshot) => self.service_uninstall(snapshot),
-            WindowsSnapshot::Task(snapshot) => self.task_uninstall(snapshot),
+            WindowsSnapshot::Service(snapshot) => {
+                if in_flight == RunInFlight::Leave {
+                    return Err(leave_not_built(snapshot.id(), "a Windows service"));
+                }
+                self.service_uninstall(snapshot)
+            }
+            WindowsSnapshot::Task(snapshot) => self.task_uninstall(snapshot, in_flight),
         }
     }
 
     /// The id is in neither store, so what is left of it is a task's run records, which a task's
-    /// uninstall that could not remove them leaves, and what a service's uninstall leaves to sweep.
+    /// uninstall that could not remove them leaves (and a `--no-stop` one leaves while its run lives), and
+    /// what a service's uninstall leaves to sweep. Under `Leave` the records a run still holds are left and
+    /// nothing is waited for; everything else is as it is under `Stop`.
     fn uninstall_absent(&self, id: &Id, in_flight: RunInFlight) -> Result<()> {
-        if in_flight == RunInFlight::Leave {
-            return Err(leave_not_built(id, "Windows"));
-        }
-        self.task_uninstall_absent(id)
+        self.task_uninstall_absent(id, in_flight)
     }
 
     fn enable(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {

@@ -91,6 +91,11 @@ pub trait ServiceManager {
     /// stand-in's path is refused with [`Error::StandinBlocked`] whenever the job goetia removes is there. Other
     /// states: README "Uninstalling a daemon".
     ///
+    /// **Windows task**: the task is disabled and deleted with no listing, hold or stop of a run. A run still
+    /// going keeps its run records, the removal's marker and the shim file it uses until an `uninstall` or
+    /// `install` of the id after it has ended, and an `install` of the id meanwhile (a task or a service) is
+    /// refused with [`Error::RunRecordsHeld`], registering nothing. A Windows service refuses `Leave`, with nothing changed.
+    ///
     /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other
     /// service or process uses once its own host has exited. If that cleanup fails the service is
@@ -99,7 +104,7 @@ pub trait ServiceManager {
     /// when it has nothing left to do.
     ///
     /// A Windows task's `uninstall` disables the task, so no scheduled run starts from then on, and stops
-    /// every live run before it deletes the task. One that fails or is interrupted leaves the task disabled
+    /// every live run before it deletes the task (with `Leave`, see above). One that fails or is interrupted leaves the task disabled
     /// or, after the delete, only its run records: re-run `uninstall`, or run the install again with
     /// `--force`. Once it has closed the task's run records, `enable`, `disable`, `run`, and a `stop` that
     /// finds a run to wait for refuse until one of those two has finished.

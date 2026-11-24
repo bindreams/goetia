@@ -192,8 +192,10 @@ pub(crate) trait Backend {
     /// the CLI renders as success, so that re-running `uninstall` is how a failed cleanup is retried.
     /// Never called for an id that is foreign or whose state is undetermined.
     ///
-    /// `in_flight` as for [`ServiceManager::uninstall`], for a backend whose leftover has a run (systemd's
-    /// stand-in: see its `standin` module); a backend with none ignores it.
+    /// `in_flight` as for [`ServiceManager::uninstall`], for a backend whose leftover has a run: systemd's
+    /// stand-in (see its `standin` module), and a Windows task's run records, which `Leave` removes only if
+    /// no run holds them and never waits for, where `Stop` waits for the run to release them. A backend
+    /// with none ignores it.
     fn uninstall_absent(&self, _id: &Id, _in_flight: RunInFlight) -> Result<()> {
         Ok(())
     }
@@ -434,15 +436,16 @@ pub(crate) struct Scan<S> {
     pub reported: Vec<Installed>,
 }
 
-// RunInFlight::Leave, until every backend honours it ==================================================================
+// RunInFlight::Leave, where it is not built yet =======================================================================
 
-/// The refusal of [`RunInFlight::Leave`] by `manager`, a backend that does not honour it yet: nothing
-/// was read or changed, and `uninstall` without `--no-stop` still works.
+/// The refusal of [`RunInFlight::Leave`] for `what`, a kind of daemon that does not honour it yet (launchd, a
+/// Windows service): the removal has changed nothing, and
+/// `uninstall` without `--no-stop` still works. Systemd and a Windows task honour it.
 #[cfg(any(target_os = "macos", windows))]
-pub(crate) fn leave_not_built(id: &Id, manager: &str) -> Error {
+pub(crate) fn leave_not_built(id: &Id, what: &str) -> Error {
     Error::Invalid {
         daemon: id.to_string(),
-        message: format!("`--no-stop` is not built for {manager} yet, so nothing was changed: uninstall without it"),
+        message: format!("`--no-stop` is not built for {what} yet, so nothing was changed: uninstall without it"),
         source: None,
     }
 }

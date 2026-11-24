@@ -498,6 +498,11 @@ fn no_note(_: &Path, _: PauseKind) {
     panic!("nothing holds the directory, so there is nothing to wait for");
 }
 
+/// The lock of a `remove_all` whose caller holds none to take.
+fn no_lock() -> Result<()> {
+    Ok(())
+}
+
 /// `remove_all` while `holder` (what a `run` or a stop holds) is alive. A thread drops `holder` when the
 /// note is made, so the wait ends on the real condition and nothing is slept for. Returns the result and,
 /// when a note was made, what the directory held at the first one: a pin that closes can bring a second
@@ -511,10 +516,13 @@ fn remove_all_while_held(runs: &Runs, holder: impl Send) -> (Result<()>, Option<
             let _ = released.recv();
             drop(holder);
         });
-        let result = runs.remove_all(|_, _| {
-            seen.get_or_insert_with(|| names(runs));
-            let _ = release.send(());
-        });
+        let result = runs.remove_all(
+            |_, _| {
+                seen.get_or_insert_with(|| names(runs));
+                let _ = release.send(());
+            },
+            no_lock,
+        );
         drop(release);
         result
     });
@@ -528,10 +536,10 @@ fn remove_all_clears_the_directory_and_its_pins_that_nothing_holds() {
     fs::write(runs.dir.join("pin-stale.pin"), "").unwrap();
     fs::write(runs.dir.join(format!("{}.json.tmp", instance(2).hex())), "").unwrap();
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 }
 
 /// A pin left by a power cut, of an account the writer has no entry for, is told from a live one by its
@@ -545,7 +553,7 @@ fn remove_all_does_not_wait_for_a_stale_pin_it_has_no_entry_on() {
     let system_only = Descriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
     crate::backend::scm::test_support::set_dacl(&system_only, &stale).unwrap();
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
 }
@@ -563,14 +571,14 @@ fn remove_all_with_pins_it_cannot_tell_about_deletes_nothing_and_names_each() {
     let before = names(&runs);
     let refused = Undeletable::new(&runs.dir, &["pin-odd.pin", "pin-odd2.pin"]);
 
-    let failed = runs.remove_all(no_note).unwrap_err();
+    let failed = runs.remove_all(no_note, no_lock).unwrap_err();
 
     let said = failed.report().to_string();
     assert!(said.contains("pin-odd.pin"), "{said}");
     assert!(said.contains("pin-odd2.pin"), "{said}");
     assert_eq!(names(&runs), before, "nothing was deleted");
     drop(refused);
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
     assert!(!runs.dir.exists());
 }
 
@@ -589,10 +597,13 @@ fn remove_all_takes_a_file_whose_delete_is_pending_as_deleted() {
     let mut handles = Some((pending_pin, pending_record, writing));
     let mut noted = Vec::new();
 
-    runs.remove_all(|path, _| {
-        noted.push(path.to_path_buf());
-        drop(handles.take());
-    })
+    runs.remove_all(
+        |path, _| {
+            noted.push(path.to_path_buf());
+            drop(handles.take());
+        },
+        no_lock,
+    )
     .unwrap();
 
     assert_eq!(noted, [temp], "a pending delete is no pause");
@@ -612,12 +623,15 @@ fn remove_all_waits_for_a_temp_file_the_shim_is_writing_and_names_it() {
     let mut noted = Vec::new();
     let mut writing = Some(writing);
 
-    runs.remove_all(|held, _| {
-        noted.push(held.to_path_buf());
-        if held == temp {
-            drop(writing.take());
-        }
-    })
+    runs.remove_all(
+        |held, _| {
+            noted.push(held.to_path_buf());
+            if held == temp {
+                drop(writing.take());
+            }
+        },
+        no_lock,
+    )
     .unwrap();
 
     assert_eq!(noted, [temp], "one pause, named once");
@@ -639,7 +653,7 @@ fn remove_all_deletes_a_pin_whose_name_is_not_unicode() {
     units.extend(".pin".encode_utf16());
     fs::write(runs.dir.join(OsString::from_wide(&units)), "").unwrap();
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
 }
@@ -649,7 +663,7 @@ fn remove_all_of_a_directory_that_is_gone_is_done_without_waiting() {
     let dir = tempfile::tempdir().unwrap();
     let runs = Runs::of(dir.path(), &id());
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 }
 
 /// While a `run` waits, its pin is held and nothing in the directory is deleted: the removal says it
@@ -791,10 +805,13 @@ fn remove_all_refuses_a_new_pin_while_it_waits_on_one() {
     let mut probes = Vec::new();
     let mut pin = Some(pin);
 
-    runs.remove_all(|_, _| {
-        probes.push((runs.marker.exists(), runs.hold().err().map(|e| e.kind())));
-        drop(pin.take());
-    })
+    runs.remove_all(
+        |_, _| {
+            probes.push((runs.marker.exists(), runs.hold().err().map(|e| e.kind())));
+            drop(pin.take());
+        },
+        no_lock,
+    )
     .unwrap();
 
     assert!(!probes.is_empty(), "the removal waited");
@@ -1455,7 +1472,7 @@ fn remove_all_removes_a_provisional_file() {
     pin.write_stopping(&instance(1), 1).unwrap();
     drop(pin);
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
 }
@@ -1514,7 +1531,7 @@ fn remove_all_is_not_blocked_by_a_marker_a_cut_short_removal_left() {
     runs.write(&record(1, 1), None).unwrap();
     leave_marker(&runs);
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
 }
@@ -1528,7 +1545,7 @@ fn remove_all_removes_files_and_directories_of_names_that_are_not_goetias() {
     // A directory in it: made as an account that may add one.
     crate::backend::scm::test_support::directory_with_a_file(&runs.dir.join("sub"));
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
 }
@@ -1548,7 +1565,7 @@ fn remove_all_removes_a_directory_or_a_link_whose_name_is_a_pins_a_records_or_a_
     junction(&runs.dir.join("b.pin"), target.path());
     junction(&runs.dir.join(file_of(&instance(4))), target.path());
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
@@ -1583,12 +1600,15 @@ fn remove_all_waits_for_a_file_another_program_holds_and_names_it() {
     let mut noted = Vec::new();
     let mut held = Some(held);
 
-    runs.remove_all(|path, _| {
-        noted.push(path.to_path_buf());
-        if path == held_path {
-            drop(held.take());
-        }
-    })
+    runs.remove_all(
+        |path, _| {
+            noted.push(path.to_path_buf());
+            if path == held_path {
+                drop(held.take());
+            }
+        },
+        no_lock,
+    )
     .unwrap();
 
     assert_eq!(noted, [held_path], "one pause, named once");
@@ -1611,14 +1631,17 @@ fn remove_all_names_each_thing_it_waits_for_as_it_changes() {
 
     // Each handle goes when the path it holds is named: a note for anything else (another program's
     // hold on a file of ours) lets neither go early.
-    runs.remove_all(|path, _| {
-        noted.push(path.to_path_buf());
-        if path == temp {
-            drop(writing.take());
-        } else if path == pending {
-            drop(reader.take());
-        }
-    })
+    runs.remove_all(
+        |path, _| {
+            noted.push(path.to_path_buf());
+            if path == temp {
+                drop(writing.take());
+            } else if path == pending {
+                drop(reader.take());
+            }
+        },
+        no_lock,
+    )
     .unwrap();
 
     assert_eq!(noted, [temp, pending], "each path is named once, when it changes");
@@ -1637,14 +1660,14 @@ fn remove_all_fails_at_once_naming_a_directory_of_a_foreign_name_it_cannot_remov
     directory_with_a_file(&sub);
     let holder = directory_held_open(&sub.join("inner"));
 
-    let failed = runs.remove_all(no_note).unwrap_err();
+    let failed = runs.remove_all(no_note, no_lock).unwrap_err();
 
     let text = failed.to_string();
     assert!(text.contains(&sub.display().to_string()), "{text}");
     assert!(!text.contains("inner"), "the top directory is named: {text}");
     assert!(runs.marker.exists());
     drop(holder);
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
     assert!(!runs.dir.exists());
 }
 
@@ -1662,12 +1685,15 @@ fn remove_all_waits_for_a_handle_on_the_directory_that_shares_no_delete_and_name
     let mut holder = Some(holder);
     let mut noted = Vec::new();
 
-    runs.remove_all(|path, _| {
-        noted.push(path.to_path_buf());
-        if path == runs.dir {
-            drop(holder.take());
-        }
-    })
+    runs.remove_all(
+        |path, _| {
+            noted.push(path.to_path_buf());
+            if path == runs.dir {
+                drop(holder.take());
+            }
+        },
+        no_lock,
+    )
     .unwrap();
 
     assert_eq!(noted, std::slice::from_ref(&runs.dir), "one pause, named once");
@@ -1687,7 +1713,7 @@ fn remove_all_removes_a_directory_at_once_while_a_handle_that_shares_delete_is_o
         .open(&runs.dir)
         .unwrap();
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
@@ -1767,7 +1793,7 @@ fn a_failed_removal_leaves_its_marker_beside_the_directory() {
     let (_dir, runs) = fixture();
     let _held = directory_held_open(&runs.dir.join(file_of(&instance(1))));
 
-    let failed = runs.remove_all(no_note).unwrap_err();
+    let failed = runs.remove_all(no_note, no_lock).unwrap_err();
 
     assert!(failed.to_string().contains(&file_of(&instance(1))), "{failed}");
     assert!(runs.marker.exists());
@@ -1784,7 +1810,7 @@ fn remove_all_makes_no_note_when_nothing_is_held_or_pending() {
     fs::write(runs.dir.join(format!("{}.json.tmp", instance(2).hex())), "").unwrap();
     leave_marker(&runs);
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.dir.exists());
     assert!(!runs.marker.exists());
@@ -1801,7 +1827,7 @@ fn a_marker_is_never_the_directory_of_another_task() {
     made_for(&other, &process_user_sid());
     other.write(&record(1, 1), None).unwrap();
 
-    removed.remove_all(no_note).unwrap();
+    removed.remove_all(no_note, no_lock).unwrap();
 
     assert!(!removed.dir.exists());
     assert_eq!(instances_kept(&other, &[instance(1)]), [true]);
@@ -1847,7 +1873,7 @@ fn remove_all_of_a_link_removes_the_link_and_leaves_what_it_points_to() {
     let (_dir, runs) = fixture();
     let (_target_dir, target) = linked(&runs);
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(fs::symlink_metadata(&runs.dir).is_err(), "the link is gone");
     assert!(!runs.marker.exists());
@@ -1910,7 +1936,7 @@ fn a_link_whose_target_is_gone_is_records_to_remove_and_is_removed() {
     drop(target_dir);
 
     assert!(runs.is_present());
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(fs::symlink_metadata(&runs.dir).is_err(), "the dangling link is gone");
 }
@@ -2189,7 +2215,7 @@ fn a_task_has_records_to_remove_while_its_directory_is_there() {
     made_for(&runs, &process_user_sid());
     assert!(runs.is_present());
 
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
     assert!(!runs.is_present());
 }
 
@@ -2202,7 +2228,7 @@ fn a_marker_with_no_directory_is_something_to_remove() {
     fs::remove_dir(&runs.dir).unwrap();
 
     assert!(runs.is_present());
-    runs.remove_all(no_note).unwrap();
+    runs.remove_all(no_note, no_lock).unwrap();
 
     assert!(!runs.is_present());
     assert!(!runs.marker.exists());

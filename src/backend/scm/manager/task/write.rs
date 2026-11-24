@@ -40,7 +40,7 @@ use crate::backend::scm::sid::{Sid, distinct, sid_from_parts};
 use crate::backend::scm::task_xml::{TaskXml, Token, builtin_sid};
 use crate::backend::{Identity, InstalledService, WriteOutcome};
 use crate::error::{Error, Result};
-use crate::manager::State;
+use crate::manager::{RunInFlight, State};
 use crate::spec::{Builtin, DaemonKind, DaemonSpec, Id};
 
 /// What the machine holds for a task's account once an install has seen to it.
@@ -209,6 +209,8 @@ impl Scm {
     /// records (its shim still writes its record), then the registration alone is deleted (its records stay,
     /// narrowed to the new account) and created, under a fresh token, armed as the old one's triggers say.
     ///
+    /// A create (no `snapshot`) is refused first if something holds the run records ([`refuse_held_records`]).
+    ///
     /// A stored registration whose XML cannot be read at all, or whose account lookup failed for a reason other
     /// than "no such account", fails the write before anything is sent to Task Scheduler: that is not a change of
     /// account.
@@ -222,6 +224,9 @@ impl Scm {
         prepare: impl FnOnce(&TaskAccount) -> Result<Prepared>,
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
+        if snapshot.is_none() {
+            refuse_held_records(id, runs)?;
+        }
         // Read before `prepare` touches the machine.
         let stored = snapshot
             .map(|old| old.stored().map(|stored| (old, stored)))
@@ -443,6 +448,38 @@ fn whose(accounts: &[Sid]) -> &'static str {
     }
 }
 
+/// [`refuse_held_records`] over the records of `id` under the machine's `%ProgramData%`, for an install of a service
+/// at an id that no daemon has: a task of that id may have left records a run still holds.
+///
+/// A native service's install makes and judges no Goetia folders, so the folders are judged first, as a task's
+/// create judges them but making nothing: records under a chain that is not goetia's own are no left run's, and are
+/// neither read nor deleted ([`Runs::chain_is_goetias`]).
+pub(in crate::backend::scm) fn refuse_held_records_at(id: &Id) -> Result<()> {
+    refuse_held_records_in(&program_data()?, id, &FolderCheck::new(CheckPermissions::Enable))
+}
+
+/// [`refuse_held_records_at`] under `program_data`, whose folders `folders` judges.
+fn refuse_held_records_in(program_data: &Path, id: &Id, folders: &FolderCheck) -> Result<()> {
+    let runs = Runs::of(program_data, id);
+    if runs.chain_is_goetias(folders)? {
+        refuse_held_records(id, &runs)
+    } else {
+        Ok(())
+    }
+}
+
+/// Refuses an install of `id` over run records something holds ([`Error::RunRecordsHeld`]), e.g. a run left by
+/// `uninstall --no-stop`. One non-waiting pass over [`Runs::held_pin`]; nothing is changed.
+fn refuse_held_records(id: &Id, runs: &Runs) -> Result<()> {
+    match runs.held_pin()? {
+        Some(pin) => Err(Error::RunRecordsHeld {
+            id: id.to_string(),
+            pin,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// What a write of a task makes besides its registration, and what an up-to-date install makes again
 /// ([`task_beside_with`]): the record directory naming `principal`, and the default log naming `principal` and
 /// `kept_log`, the accounts a service that is being retyped to this task still runs as
@@ -658,7 +695,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         self.refuse_running_task_with(old, |pid| processes.alive(pid))?;
         let gated = gate()?;
-        self.task_remove_with(old, runs, processes)?;
+        self.task_remove_with(old, runs, RunInFlight::Stop, processes)?;
         create(gated)
     }
 
@@ -727,6 +764,7 @@ impl Scm {
     ) -> Result<WriteOutcome> {
         let id = &spec.common().id;
         let service = inspect()?;
+        refuse_held_records(id, runs)?;
         let prepared = prepare(&definition.account())?;
         task_records(id, runs, &prepared.principal, service.as_slice())?;
         retire()?;

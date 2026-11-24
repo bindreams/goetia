@@ -168,6 +168,127 @@ fn install_of_a_task_creates_it_disarmed() {
     fake.finish();
 }
 
+/// An `uninstall --no-stop` from inside a run leaves the run's records, its pin and the removal's marker. An install
+/// of the id while that run lives would narrow the records to its own account and take the marker away under it:
+/// it is refused, before anything is asked of the machine or Task Scheduler, and changes nothing.
+#[skuld::test]
+fn install_over_records_a_run_still_holds_is_refused_and_changes_nothing() {
+    let (dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let before = trustees_of(&records_dir(&dir));
+    let run_pin = runs.hold().unwrap();
+    runs.close().unwrap();
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .task_write_with(&spec, &definition(&spec), None, &runs, &mut Running(vec![]), |_| {
+            panic!("nothing is acquired for an install that is refused")
+        })
+        .unwrap_err();
+
+    let Error::RunRecordsHeld { id, pin } = &refused else {
+        panic!("a pin holds the records of the removed task: {refused:?}")
+    };
+    assert_eq!(id, ID);
+    assert_eq!(pin.parent(), Some(records_dir(&dir).as_path()));
+    assert_eq!(fake.calls(), [], "nothing was sent to Task Scheduler");
+    assert!(runs.is_closed().unwrap(), "the marker stands");
+    assert_eq!(
+        trustees_of(&records_dir(&dir)),
+        before,
+        "the permissions are not touched"
+    );
+    drop(run_pin);
+    fake.finish();
+}
+
+/// The check a task's create and a retype make, and a service's create at an id whose task left records: records a
+/// pin holds are refused with that pin named, and records nothing holds, or none, are not.
+#[skuld::test]
+fn held_records_are_refused_and_free_or_missing_ones_are_not() {
+    let (dir, runs) = made_records();
+    refuse_held_records(&id(), &runs).expect("nothing holds the records");
+
+    let pin = runs.hold().unwrap();
+    let Err(Error::RunRecordsHeld { id: held, pin: named }) = refuse_held_records(&id(), &runs) else {
+        panic!("a pin holds the records")
+    };
+    assert_eq!(held, ID);
+    assert_eq!(named.parent(), Some(records_dir(&dir).as_path()));
+    drop(pin);
+    refuse_held_records(&id(), &runs).expect("the pin is released");
+
+    let (_dir, none) = records();
+    refuse_held_records(&id(), &none).expect("no records, nothing held");
+}
+
+/// A native service's install makes no Goetia folders and judges none, so the check it makes for a left run reads
+/// nothing under a chain nobody judged: a missing one has no records, and one that fails the folder check (here, a
+/// folder an untrusted account owns and can write) is not read either, so a pin in it is neither named nor deleted.
+#[skuld::test]
+fn a_service_create_reads_nothing_under_folders_nobody_judged() {
+    let folders = FolderCheck::new(CheckPermissions::Enable);
+
+    let missing = tempfile::tempdir().unwrap();
+    refuse_held_records_in(missing.path(), &id(), &folders).expect("no `Goetia` folder, no records");
+
+    let (dir, runs) = made_records();
+    let pin = runs.hold().unwrap();
+    refuse_held_records_in(dir.path(), &id(), &folders)
+        .expect("a chain this test made is not goetia's, so it is not read");
+    assert_eq!(
+        std::fs::read_dir(records_dir(&dir)).unwrap().count(),
+        1,
+        "the pin in it is still there"
+    );
+    drop(pin);
+}
+
+/// Folders made as an install makes them are judged and read: a held pin in them refuses the service's install.
+/// Making them needs an elevated token (the `scm` group).
+#[skuld::test]
+fn a_service_create_over_judged_folders_with_a_held_pin_is_refused(#[fixture(scm_group)] _group: &Group) {
+    let dir = tempfile::tempdir().unwrap();
+    let folders = FolderCheck::new(CheckPermissions::Enable);
+    let runs = Runs::of(dir.path(), &id());
+    runs.ensure_roots(&folders).unwrap();
+    runs.ensure(&[system()]).unwrap();
+    refuse_held_records_in(dir.path(), &id(), &folders).expect("no pin is held");
+
+    let pin = runs.hold().unwrap();
+    let Err(Error::RunRecordsHeld { pin: named, .. }) = refuse_held_records_in(dir.path(), &id(), &folders) else {
+        panic!("a pin holds the records in judged folders")
+    };
+    assert_eq!(named.parent(), Some(records_dir(&dir).as_path()));
+    drop(pin);
+}
+
+/// Once the run is over and its pin is gone, the install goes on as it does over any leftover records: it creates
+/// the task, narrows the records and takes the marker away.
+#[skuld::test]
+fn install_over_leftover_records_nothing_holds_goes_on_and_takes_the_marker_away() {
+    let (_dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    runs.close().unwrap();
+    let fake = Fake::new();
+    fake.on_register(Ok(Registration::Created));
+
+    let outcome = scm(&fake)
+        .task_write_with(
+            &spec,
+            &definition(&spec),
+            None,
+            &runs,
+            &mut Running(vec![]),
+            prepared(system(), None),
+        )
+        .unwrap();
+
+    assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
+    assert!(!runs.is_closed().unwrap(), "no marker of the old removal is left");
+    fake.finish();
+}
+
 #[skuld::test]
 fn reinstall_keeps_the_armed_state() {
     let spec = task_spec(Some("30 3 * * *"));
@@ -3137,6 +3258,36 @@ fn a_service_that_runs_is_not_changed_into_a_task() {
     );
     assert_eq!(fake.calls(), []);
     assert!(!records_dir(&dir).exists());
+}
+
+/// A service changed into a task is an install over the id's leftover records too: while a run of a removed task
+/// holds them it is refused, with the service still installed and nothing acquired.
+#[skuld::test]
+fn a_service_is_not_changed_into_a_task_over_records_a_run_still_holds() {
+    let (dir, runs) = made_records();
+    let spec = task_spec(Some("30 3 * * *"));
+    let run_pin = runs.hold().unwrap();
+    runs.close().unwrap();
+    let fake = Fake::new();
+
+    let refused = scm(&fake)
+        .retype_to_task_with(
+            &spec,
+            &definition(&spec),
+            &runs,
+            |_| panic!("nothing is acquired for a retype that is refused"),
+            || Ok(None),
+            || panic!("the service is not removed"),
+        )
+        .unwrap_err();
+
+    let Error::RunRecordsHeld { pin, .. } = &refused else {
+        panic!("a pin holds the records of the removed task: {refused:?}")
+    };
+    assert_eq!(pin.parent(), Some(records_dir(&dir).as_path()));
+    assert_eq!(fake.calls(), []);
+    assert!(runs.is_closed().unwrap(), "the marker stands");
+    drop(run_pin);
 }
 
 /// A real account's password, logon right and the record directory are acquired before the service is

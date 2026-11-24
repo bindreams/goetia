@@ -54,7 +54,7 @@ pub(crate) fn task_as(id: &Id, user: User, schedule: Option<&str>) -> DaemonSpec
     task_spec(id, vec![support::current_exe_str()], schedule, user, None)
 }
 
-fn service_as(id: &Id, protocol: Protocol) -> DaemonSpec {
+pub(crate) fn service_as(id: &Id, protocol: Protocol) -> DaemonSpec {
     let fields = ServiceFields {
         protocol,
         ..service_fields(conformance_mk(id.as_str()))

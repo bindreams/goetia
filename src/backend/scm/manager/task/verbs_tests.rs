@@ -338,10 +338,13 @@ fn a_stop_while_the_records_are_being_removed_fails_and_says_so() {
     let mut held = Some(runs.pin().unwrap());
     let mut during = None;
 
-    runs.remove_all(|_, _| {
-        during.get_or_insert_with(|| stopped(&fake, &mut machine, &runs, Budget::Unbounded));
-        drop(held.take());
-    })
+    runs.remove_all(
+        |_, _| {
+            during.get_or_insert_with(|| stopped(&fake, &mut machine, &runs, Budget::Unbounded));
+            drop(held.take());
+        },
+        || Ok(()),
+    )
     .unwrap();
 
     let failed = during.expect("the removal waited").unwrap_err();

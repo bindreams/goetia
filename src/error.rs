@@ -595,6 +595,21 @@ pub enum Error {
     #[error("{}", account_change_held(id, pin))]
     AccountChangeHeld { id: String, pin: PathBuf },
 
+    /// `install` of an id whose earlier task was uninstalled with `--no-stop` while a run of it went on, or whose
+    /// run records another program holds: `pin` is what holds them. Installing would narrow the records to the new
+    /// account and take the removal's marker away under that holder. Determinate: nothing was registered and the records
+    /// and the marker are as they were; the same classifications as [`Error::AccountChangeHeld`].
+    #[error("{}", run_records_held(id, pin))]
+    RunRecordsHeld { id: String, pin: PathBuf },
+
+    /// An `uninstall` of an id that is not installed was waiting for the run records a left run holds, and an
+    /// `install` took the id back meanwhile (the removal's marker is gone). The uninstall ended at once and removed
+    /// nothing of the new install. Determinate, like [`Error::RunRecordsHeld`].
+    #[error(
+        "`{id}` was installed again while this uninstall waited for its old run records: the new install was left as it is, and nothing of it was removed"
+    )]
+    InstalledAgain { id: String },
+
     /// `uninstall --no-stop` on systemd found a file that is not goetia's at the path of the unit that
     /// keeps a left run alive, and refused: raised whether or not a run is in flight, since the next run
     /// may be, and only for an id whose job goetia removes (a timer alone gets no such unit). Determinate:
@@ -917,6 +932,8 @@ impl Error {
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
+            | Error::RunRecordsHeld { .. }
+            | Error::InstalledAgain { .. }
             | Error::StandinBlocked { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
@@ -1127,6 +1144,8 @@ impl Error {
             | Error::RetypeRunning { .. }
             | Error::AccountChangeRunning { .. }
             | Error::AccountChangeHeld { .. }
+            | Error::RunRecordsHeld { .. }
+            | Error::InstalledAgain { .. }
             | Error::StandinBlocked { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
@@ -1597,7 +1616,8 @@ fn standin_blocked(id: &str, path: &Path) -> String {
 }
 
 /// What can hold a task's run records, worded for a message.
-pub(crate) const RECORD_HOLDERS: &str = "a run that is starting, a `run` or `stop` of the task, or another program";
+pub(crate) const RECORD_HOLDERS: &str = "a run that is starting, a run still going after `uninstall --no-stop`, a `run` or `stop` of the task, or another \
+     program";
 
 /// The message of [`Error::AccountChangeHeld`].
 fn account_change_held(id: &str, pin: &Path) -> String {
@@ -1605,6 +1625,15 @@ fn account_change_held(id: &str, pin: &Path) -> String {
         "`{id}` cannot change its account now: its run records are held (`{}`) by {RECORD_HOLDERS}, and installing \
          it as another account registers it again, which hands them to the new account: wait for that to end, then \
          re-run install",
+        pin.display()
+    )
+}
+
+/// The message of [`Error::RunRecordsHeld`].
+fn run_records_held(id: &str, pin: &Path) -> String {
+    format!(
+        "`{id}` cannot be installed now: the run records of the task uninstalled at that id are held (`{}`) by a run \
+         of it that is still going, or by another program: wait for that to end, then re-run install",
         pin.display()
     )
 }
