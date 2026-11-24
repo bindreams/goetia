@@ -787,7 +787,7 @@ pub(crate) fn parse_type(id: &Id, raw: &str) -> Result<DaemonKind, Error> {
     })
 }
 
-/// The values `type` takes, as the messages write them: "`service` or `task`".
+/// The values `type` takes, joined for messages.
 fn the_kinds_written() -> String {
     DaemonKind::ALL.map(|kind| format!("`{kind}`")).join(" or ")
 }

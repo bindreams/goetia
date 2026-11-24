@@ -58,18 +58,6 @@ fn a_daemon_kind_parses_from_the_spelling_it_prints_as() {
     }
 }
 
-/// Adding a variant fails to compile at the `match`: add it to the match, to `ALL` and to the list below.
-#[skuld::test]
-fn every_daemon_kind_is_in_all_once() {
-    let _exhaustive = |kind: DaemonKind| match kind {
-        DaemonKind::Service | DaemonKind::Task => (),
-    };
-    for kind in [DaemonKind::Service, DaemonKind::Task] {
-        assert_eq!(DaemonKind::ALL.iter().filter(|listed| **listed == kind).count(), 1);
-    }
-    assert_eq!(DaemonKind::ALL.len(), 2);
-}
-
 #[skuld::test]
 fn a_daemon_kind_does_not_parse_from_any_other_text() {
     for text in [

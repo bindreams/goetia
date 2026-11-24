@@ -272,14 +272,13 @@ pub enum DaemonKind {
 }
 
 impl DaemonKind {
-    /// Every variant, in declaration order.
+    /// Every variant.
     pub const ALL: [DaemonKind; 2] = [DaemonKind::Service, DaemonKind::Task];
 
-    /// The one spelling of the kind: the `--json` and text forms of `status` and `list`, the
-    /// manifest's `type:` value that [`parse`](DaemonKind::parse) accepts, the `type` line of `show`
-    /// and of the diff, and the noun in error messages. [`Serialize`](serde::Serialize) and
-    /// [`Display`](std::fmt::Display) go through here, so they cannot drift. The spelling a blob
-    /// persists is separate: it is a serde attribute in `blob.rs`, which needs a literal.
+    /// The one spelling of the kind, used for `--json`, text output, the manifest's `type:` value and
+    /// error messages. [`Serialize`](serde::Serialize) and [`Display`](std::fmt::Display) go through
+    /// here, so they cannot drift. A blob persists a task's `type` separately: a serde attribute in
+    /// `blob.rs`, which needs a literal.
     pub fn as_str(self) -> &'static str {
         match self {
             DaemonKind::Service => "service",
@@ -287,12 +286,11 @@ impl DaemonKind {
         }
     }
 
-    /// The kind [`as_str`](DaemonKind::as_str) spells as `text`, and `None` for any other text.
+    /// The kind whose [`as_str`](DaemonKind::as_str) is exactly `text`.
     pub fn parse(text: &str) -> Option<DaemonKind> {
         DaemonKind::ALL.into_iter().find(|kind| kind.as_str() == text)
     }
 
-    /// The kind that is not this one.
     pub fn other(self) -> DaemonKind {
         match self {
             DaemonKind::Service => DaemonKind::Task,
