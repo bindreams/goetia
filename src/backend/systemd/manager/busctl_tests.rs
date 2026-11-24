@@ -155,8 +155,16 @@ fn only_a_root_busctl_loses_the_system_bus_address() {
         .into_iter()
     };
     let table: [(&str, Vec<String>, &[&str]); 4] = [
-        ("systemctl, root", systemctl::removals(inherited()), &["SYSTEMD_OFFLINE"]),
-        ("systemctl, not root", systemctl::removals(inherited()), &["SYSTEMD_OFFLINE"]),
+        (
+            "systemctl, root",
+            systemctl::removals(inherited()),
+            &["SYSTEMD_OFFLINE"],
+        ),
+        (
+            "systemctl, not root",
+            systemctl::removals(inherited()),
+            &["SYSTEMD_OFFLINE"],
+        ),
         ("busctl, not root", removals(false, inherited()), &["SYSTEMD_OFFLINE"]),
         (
             "busctl, root",
