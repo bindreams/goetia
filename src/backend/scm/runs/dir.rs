@@ -38,14 +38,15 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfoEx,
-    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdInfo, GetFileInformationByHandleEx, READ_CONTROL,
-    SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
+    SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use crate::backend::scm::link::is_link;
+use crate::backend::scm::shim::acl::file_id;
 use crate::backend::scm::wide::wide_null;
 
 /// What every handle in a records directory shares: all of it. A holder that shared less would make
@@ -331,21 +332,3 @@ pub(super) fn delete_by_disposition(file: &File) -> io::Result<()> {
 #[cfg(test)]
 #[path = "dir_tests.rs"]
 mod dir_tests;
-
-/// The volume and file ID of what `file` is open on, which no rename or replacement of its name changes.
-fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: `info` is `size_of::<FILE_ID_INFO>()` writable bytes; the handle is live.
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileIdInfo,
-            (&raw mut info).cast(),
-            size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
-}
