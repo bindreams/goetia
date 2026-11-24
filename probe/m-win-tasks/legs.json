@@ -1,0 +1,18 @@
+[
+  {"name": "q1-listed-system", "cmd": "./q1-listed.ps1 -Kind system", "minutes": 150},
+  {"name": "q1-listed-user", "cmd": "./q1-listed.ps1 -Kind user", "minutes": 150},
+  {"name": "q1-disabled-system", "cmd": "./q1-disabled.ps1 -Kind system", "minutes": 60},
+  {"name": "q1-disabled-user", "cmd": "./q1-disabled.ps1 -Kind user", "minutes": 60},
+  {"name": "q2-update", "cmd": "./q2-update.ps1", "minutes": 90},
+  {"name": "q3-arming", "cmd": "./q3-arming.ps1", "minutes": 120},
+  {"name": "q4-ctrl", "cmd": "./q4-dst.ps1 -Leg ctrl", "minutes": 90},
+  {"name": "q4-d10", "cmd": "./q4-dst.ps1 -Leg d10", "minutes": 90},
+  {"name": "q4-d30", "cmd": "./q4-dst.ps1 -Leg d30", "minutes": 90},
+  {"name": "q4-d68", "cmd": "./q4-dst.ps1 -Leg d68", "minutes": 90},
+  {"name": "q4-d130", "cmd": "./q4-dst.ps1 -Leg d130", "minutes": 150},
+  {"name": "q4-d250", "cmd": "./q4-dst.ps1 -Leg d250", "minutes": 300},
+  {"name": "q4-after", "cmd": "./q4-dst.ps1 -Leg after", "minutes": 90},
+  {"name": "q4-before", "cmd": "./q4-dst.ps1 -Leg before", "minutes": 90},
+  {"name": "q5-log-system", "cmd": "./q5-log.ps1 -Kind system", "minutes": 120},
+  {"name": "q5-log-user", "cmd": "./q5-log.ps1 -Kind user", "minutes": 120}
+]

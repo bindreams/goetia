@@ -1,0 +1,94 @@
+# Throwaway measurement for goetia; never merged. Triggered only by a push to its own branch.
+# Which legs run is named in the head commit's message: `legs: all` or `legs: q1-listed-system q3-arming`.
+name: probe-m-win-tasks
+
+on:
+  push:
+    branches: ["probe/m-win-tasks"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Pick the legs
+        id: pick
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          sel="$(grep -oE 'legs:[ a-z0-9-]*' <<<"$MSG" | head -n1 | sed 's/^legs://' || true)"
+          sel="${sel:-all}"
+          echo "selection: $sel"
+          matrix="$(jq -c --arg sel "$sel" '{include: [.[] | select(($sel | test("(^| )all( |$)")) or ([.name] | inside($sel | split(" "))))]}' probe/m-win-tasks/legs.json)"
+          echo "$matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build tsprobe
+        shell: pwsh
+        run: cargo build --release --locked --manifest-path probe/m-win-tasks/Cargo.toml
+
+      - name: Upload tsprobe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: tsprobe
+          path: probe/m-win-tasks/target/release/tsprobe.exe
+          if-no-files-found: error
+
+  probe:
+    name: ${{ matrix.name }}
+    needs: [setup, build]
+    runs-on: windows-latest
+    timeout-minutes: ${{ matrix.minutes }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download tsprobe
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: tsprobe
+          path: probe/m-win-tasks/target/release
+
+      - name: Probe (${{ matrix.name }})
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force probe-results | Out-Null
+          Set-Location probe/m-win-tasks
+          & ${{ matrix.cmd }} *>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/probe-results/${{ matrix.name }}.txt"
+          exit 0
+
+      - name: Collect the actions' own logs
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path C:\probe\logs) { Copy-Item C:\probe\logs probe-results\logs -Recurse -Force }
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: probe-${{ matrix.name }}
+          path: probe-results/
+          if-no-files-found: ignore
