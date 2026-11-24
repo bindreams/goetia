@@ -293,8 +293,9 @@ fn run_of(mgr: &Scm, id: &Id) -> Result<Exit, Error> {
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn run_returns_the_programs_exit_and_its_lines(#[fixture(scm_group)] _group: &Group) {
-    // Declared first, so it goes last: the task is removed before the directory its log is in.
-    let dir = tempfile::tempdir().expect("tempdir");
+    // Declared first, so it goes last: the task is removed before the directory its log is in. Protected, as an
+    // install requires of the folder of a task's own `logs:`.
+    let dir = support::protected_dir(&[]);
     let guard = TaskGuard::new();
     let id = &guard.id;
     let mgr = support::stock_shim_manager();
@@ -316,7 +317,7 @@ fn run_returns_the_programs_exit_and_its_lines(#[fixture(scm_group)] _group: &Gr
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(scm_group)] _group: &Group) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = support::protected_dir(&[]);
     let guard = TaskGuard::new();
     let id = &guard.id;
     let mgr = support::stock_shim_manager();

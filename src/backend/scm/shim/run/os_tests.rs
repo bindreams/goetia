@@ -359,8 +359,8 @@ fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] di
 // Channels ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
-fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("Goetia").join("logs").join("x.log");
+fn append_makes_the_file_in_a_folder_that_is_there_and_writes_the_line(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("x.log");
 
     Real::default().append(&path, "the line", LogKind::Own).expect("append");
 
@@ -689,7 +689,7 @@ fn open_log_fails_with_the_os_reason_when_the_path_cannot_be_opened(#[fixture(te
 }
 
 /// The daemon's default output is opened as the default failure log is: no folder and no file is made
-/// for it. A `logs:` path of the user's own is made, with its folders.
+/// for it.
 #[skuld::test]
 fn open_log_makes_nothing_of_the_default_log(#[fixture(temp_dir)] dir: &Path) {
     let log = dir.join("Goetia").join("logs").join("daemon.log");
@@ -698,10 +698,29 @@ fn open_log_makes_nothing_of_the_default_log(#[fixture(temp_dir)] dir: &Path) {
 
     assert_eq!(refused.kind(), io::ErrorKind::NotFound);
     assert!(!dir.join("Goetia").exists(), "a folder was made");
+}
+
+/// A `logs:` path of the user's own is judged by `install`, folder and all, and the shim makes no folder for it: a
+/// folder that is not there at start fails the open with the OS's own reason (the failure the supervisor reports
+/// for any log it cannot open), and nothing is made. The file is made in a folder that is.
+#[skuld::test]
+fn open_log_of_an_own_log_makes_no_folder_and_makes_the_file_in_one_that_is_there(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("missing").join("deeper").join("daemon.log");
+
+    let refused = Real::default().open_log(&log, LogKind::Own).expect_err("no folder");
+    let appended = Real::default()
+        .append(&log, "lost", LogKind::Own)
+        .expect_err("no folder");
+
+    for error in [refused, appended] {
+        assert_eq!(error.raw_os_error(), Some(ERROR_PATH_NOT_FOUND as i32), "{error:?}");
+    }
+    assert!(!dir.join("missing").exists(), "a folder was made");
+    let made = dir.join("daemon.log");
     Real::default()
-        .open_log(&log, LogKind::Own)
-        .expect("a user's own `logs` parents are made");
-    assert!(log.is_file());
+        .open_log(&made, LogKind::Own)
+        .expect("a folder that is there");
+    assert!(made.is_file());
 }
 
 /// Records each `write` call; fails them all when `fail` is set.

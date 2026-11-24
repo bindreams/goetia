@@ -19,8 +19,16 @@
 //!   what it runs nor who may change it, so they are accepted. Accounts that may only add files to
 //!   a directory are accepted, and inherit-only ACEs grant nothing here;
 //! - deny ACEs are not credited, wherever they stand.
+//!
+//! The same judgement serves a daemon's own `logs:` path, which the shim, running as the daemon's account,
+//! appends to without following a link ([`ObjectKind::LogFolder`], [`verdict`]'s `daemon`). The daemon's account
+//! is trusted beside the three, since a writer that is the shim's own account gains nothing by redirecting its own
+//! appends. The folder the log's name is looked up in is judged strictly: an account that can add an entry to it
+//! can plant a link, hard link or junction at the log's name.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
+mod log;
 mod protected;
 
 use std::path::PathBuf;
@@ -46,7 +54,7 @@ use std::path::Path;
 #[cfg(windows)]
 use crate::backend::scm::manager::identity;
 #[cfg(windows)]
-use crate::error::{Error, Result};
+use crate::error::{Error, FolderRole, Result};
 
 /// The owner and DACL of one filesystem object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,11 +63,30 @@ pub(crate) struct ObjectSecurity {
     pub(crate) owner: Sid,
     /// Whether the DACL ignores what its parent would have it inherit.
     pub(crate) protected: bool,
-    /// Whether it is a directory (or a link to one), whose rights mean something other than a
-    /// file's: see [`verdict`].
-    pub(crate) directory: bool,
+    /// What it is, which decides what its rights mean: see [`verdict`].
+    pub(crate) kind: ObjectKind,
     /// `None` is a NULL DACL, which grants everyone every right.
     pub(crate) dacl: Option<Vec<Ace>>,
+}
+
+/// What an object is, which decides the rights that count against it: see [`verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectKind {
+    /// A file, which an account can tamper with by writing it, changing its permissions, taking it over or
+    /// deleting it.
+    File,
+    /// A directory (or a link to one), which an account can tamper with by changing its permissions, taking it
+    /// over, deleting or renaming it, or deleting or renaming entries in it.
+    Folder,
+    /// The directory a daemon's own log is looked up in: a [`Folder`](ObjectKind::Folder) in which no untrusted
+    /// account may also add an entry.
+    LogFolder,
+}
+
+impl ObjectKind {
+    fn is_folder(self) -> bool {
+        self != Self::File
+    }
 }
 
 /// An access-control entry that grants or denies a trustee a mask of rights. Ordered field by
@@ -96,6 +123,8 @@ const WRITE_OWNER: u32 = 0x8_0000;
 const FILE_DELETE_CHILD: u32 = 0x40;
 const FILE_WRITE_DATA: u32 = 0x2;
 const FILE_APPEND_DATA: u32 = 0x4;
+const FILE_ADD_FILE: u32 = 0x2;
+const FILE_ADD_SUBDIRECTORY: u32 = 0x4;
 
 // `FILE_GENERIC_MAPPING`'s generic rights, and what each maps to on a file or directory.
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -116,6 +145,7 @@ const TAKE_OWNERSHIP_OF: &str = "take ownership of";
 const DELETE_OR_RENAME: &str = "delete or rename";
 const DELETE_OR_RENAME_ENTRIES_IN: &str = "delete or rename entries in";
 pub const WRITE_TO: &str = "write to";
+pub const ADD_ENTRIES_TO: &str = "add entries to";
 
 /// The rights that let an account replace what is in a folder, in the order they are reported.
 const DIRECTORY_TAMPERING: [(u32, &str); 4] = [
@@ -123,6 +153,16 @@ const DIRECTORY_TAMPERING: [(u32, &str); 4] = [
     (WRITE_OWNER, TAKE_OWNERSHIP_OF),
     (DELETE, DELETE_OR_RENAME),
     (FILE_DELETE_CHILD, DELETE_OR_RENAME_ENTRIES_IN),
+];
+
+/// [`DIRECTORY_TAMPERING`], and the right to add an entry (a file, or a directory, which a link may be too) last: what
+/// is refused of the folder a daemon's own log is looked up in.
+const LOG_FOLDER_TAMPERING: [(u32, &str); 5] = [
+    DIRECTORY_TAMPERING[0],
+    DIRECTORY_TAMPERING[1],
+    DIRECTORY_TAMPERING[2],
+    DIRECTORY_TAMPERING[3],
+    (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY, ADD_ENTRIES_TO),
 ];
 
 /// The rights that let an account change a file's contents, or take it away or hand it over, in the
@@ -137,32 +177,34 @@ const FILE_TAMPERING: [(u32, &str); 4] = [
 // verdict =============================================================================================================
 
 /// Judges `chain` (the target first, then outward to the volume root) by the rules in the module
-/// documentation. Each object is judged by its own kind: a file by [`FILE_TAMPERING`], a directory
-/// by [`DIRECTORY_TAMPERING`]. The folders are judged before any file, since a file inherits what
-/// its folder grants and the folder is what to fix; each kind in the order of `chain`.
-pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsafe> {
-    let folders = chain.iter().filter(|object| object.directory);
-    let files = chain.iter().filter(|object| !object.directory);
+/// documentation. Each object is judged by its own kind: a file by [`FILE_TAMPERING`], a folder by
+/// [`DIRECTORY_TAMPERING`], the log's own folder by [`LOG_FOLDER_TAMPERING`]. The folders are judged before any
+/// file, since a file inherits what its folder grants and the folder is what to fix; each kind in the order of
+/// `chain`. `daemon` is the daemon's account, trusted beside the fixed three; `None` for the shim's own folders.
+pub(crate) fn verdict(chain: &[ObjectSecurity], daemon: Option<&Sid>) -> std::result::Result<(), Unsafe> {
+    let trusted = |sid: &Sid| is_trusted(sid) || daemon == Some(sid);
+    let folders = chain.iter().filter(|object| object.kind.is_folder());
+    let files = chain.iter().filter(|object| !object.kind.is_folder());
     for object in folders.chain(files) {
         let refuse = |account: &Sid, right: &'static str| Unsafe {
             path: object.path.clone(),
             account: account.clone(),
             right,
         };
-        if !is_trusted(&object.owner) {
+        if !trusted(&object.owner) {
             return Err(refuse(&object.owner, OWN));
         }
         let Some(dacl) = &object.dacl else {
             return Err(refuse(&everyone(), DO_ANYTHING_TO));
         };
-        let tampering = if object.directory {
-            &DIRECTORY_TAMPERING
-        } else {
-            &FILE_TAMPERING
+        let tampering: &[(u32, &str)] = match object.kind {
+            ObjectKind::File => &FILE_TAMPERING,
+            ObjectKind::Folder => &DIRECTORY_TAMPERING,
+            ObjectKind::LogFolder => &LOG_FOLDER_TAMPERING,
         };
         let applying = dacl
             .iter()
-            .filter(|ace| ace.allow && ace.flags & INHERIT_ONLY_ACE == 0 && !is_trusted(&ace.trustee));
+            .filter(|ace| ace.allow && ace.flags & INHERIT_ONLY_ACE == 0 && !trusted(&ace.trustee));
         for ace in applying {
             let mask = map_generic(ace.mask);
             if let Some((_, right)) = tampering.iter().find(|(bit, _)| mask & bit != 0) {
@@ -238,18 +280,25 @@ impl FolderCheck {
         if self.mode == CheckPermissions::Disable {
             return Ok(());
         }
-        verdict(&system::read_chain(path)?).map_err(Unsafe::into_error)
+        verdict(&system::read_chain(path)?, None).map_err(Unsafe::into_error)
     }
 }
 
 #[cfg(windows)]
 impl Unsafe {
-    /// The error for this refusal. An account with no name (a deleted one) is written as its SID.
+    /// The error for this refusal of what the shim runs from or goetia reads back. An account with no name (a
+    /// deleted one) is written as its SID.
     fn into_error(self) -> Error {
+        self.into_error_as(FolderRole::Shim)
+    }
+
+    /// The error for this refusal, said for what the object is for.
+    fn into_error_as(self, role: FolderRole) -> Error {
         Error::FolderUnsafe {
             account: account_name(&self.account),
             path: self.path,
             right: self.right,
+            role,
         }
     }
 }
@@ -286,7 +335,7 @@ mod system {
         GetVolumeInformationByHandleW, READ_CONTROL,
     };
 
-    use super::{Ace, BYPASS_ACCESS_CONTROL_ON, ObjectSecurity, Sid, Unsafe, everyone};
+    use super::{Ace, BYPASS_ACCESS_CONTROL_ON, ObjectKind, ObjectSecurity, Sid, Unsafe, everyone};
     use crate::error::{Error, Result};
 
     // The ACE types a file's DACL can hold: allow and deny, plain or conditional. A conditional ACE
@@ -626,12 +675,16 @@ mod system {
             "read the permissions of",
             &path,
         )?;
-        let directory = file.metadata().map(|metadata| {
-            std::os::windows::fs::MetadataExt::file_attributes(&metadata) & FILE_ATTRIBUTE_DIRECTORY != 0
+        let kind = file.metadata().map(|metadata| {
+            if std::os::windows::fs::MetadataExt::file_attributes(&metadata) & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                ObjectKind::Folder
+            } else {
+                ObjectKind::File
+            }
         });
-        match directory {
+        match kind {
             // SAFETY: `owner` and `dacl` point into `descriptor`, which `info` keeps live.
-            Ok(directory) => unsafe { describe(info.descriptor, info.owner, info.dacl, path, directory) },
+            Ok(kind) => unsafe { describe(info.descriptor, info.owner, info.dacl, path, kind) },
             Err(e) => Err(Error::os_at("read the type of", path, e)),
         }
     }
@@ -681,8 +734,7 @@ mod system {
         Ok(Dacl { protected, aces })
     }
 
-    /// Copies the owner, the DACL and whether it is protected out of a security descriptor of a
-    /// directory or, when `directory` is false, a file.
+    /// Copies the owner, the DACL and whether it is protected out of a security descriptor of an object of `kind`.
     ///
     /// # Safety
     /// `descriptor` is a live security descriptor, and `owner` and `dacl` point into it (the DACL
@@ -692,7 +744,7 @@ mod system {
         owner: PSID,
         dacl: *mut ACL,
         path: PathBuf,
-        directory: bool,
+        kind: ObjectKind,
     ) -> Result<ObjectSecurity> {
         // SAFETY: the caller's contract covers `descriptor`.
         let protected = unsafe { is_protected(descriptor, &path)? };
@@ -702,7 +754,7 @@ mod system {
             path,
             owner,
             protected,
-            directory,
+            kind,
             dacl,
         })
     }

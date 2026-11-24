@@ -501,6 +501,22 @@ fn account_needs_password_is_true_for_a_real_account() {
     }
 }
 
+#[skuld::test]
+fn a_virtual_account_names_its_service_in_any_case_and_no_other_account_does() {
+    assert_eq!(virtual_service_name(r"NT SERVICE\my-daemon"), Some("my-daemon"));
+    assert_eq!(virtual_service_name(r"nt service\My-Daemon"), Some("My-Daemon"));
+    for account in [
+        r"NT AUTHORITY\SYSTEM",
+        "svc-account",
+        "NT SERVICE",
+        "NT SERVICE/x",
+        "",
+        "éééééé",
+    ] {
+        assert_eq!(virtual_service_name(account), None, "{account:?}");
+    }
+}
+
 // argv escaping and round trip ========================================================================================
 //
 // `registration` stores `executable`/`arguments` unquoted; `windows-service`

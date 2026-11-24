@@ -57,7 +57,7 @@ mod system {
         OPEN_ALWAYS, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
 
-    use super::super::{ObjectSecurity, system::describe};
+    use super::super::{ObjectKind, ObjectSecurity, system::describe};
     use crate::backend::scm::sid::{Sid, try_sid_display};
     use crate::backend::scm::wide::wide_null;
     use crate::error::{Error, Result};
@@ -237,7 +237,7 @@ mod system {
             }
             // SAFETY: `owner` and `dacl` point into `self.raw`, which is live for the call; the DACL
             // is null only when the descriptor has none, which `describe` reports as a NULL DACL.
-            unsafe { describe(self.raw, owner, dacl, PathBuf::new(), false) }
+            unsafe { describe(self.raw, owner, dacl, PathBuf::new(), ObjectKind::File) }
         }
 
         /// Creates `path`, which must not exist, for writing, with this descriptor. The file is

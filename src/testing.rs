@@ -18,7 +18,7 @@ use crate::spec::{
     TaskSpec, User,
 };
 
-pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
+pub use crate::backend::scm::shim::acl::{ADD_ENTRIES_TO, CHANGE_PERMISSIONS_OF, WRITE_TO};
 
 /// The machine's time zone as goetia reads it for a task's next run, for a test that turns launchd's
 /// local dates into instants.
@@ -77,6 +77,14 @@ pub fn shown_sid(sid: &[u8]) -> String {
 #[cfg(windows)]
 pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     crate::backend::scm::manager::sid_for_account_name(account_name, None).map(|(sid, _kind)| sid)
+}
+
+/// The SID of the account a service registered as `account` runs as, as `install` finds it for the check of the
+/// daemon's own `logs:`: a built-in's, a virtual account's (`NT SERVICE\<name>`, whether or not the service exists),
+/// or a local account's by its name.
+#[cfg(windows)]
+pub fn service_account_sid(account: &str) -> Result<Vec<u8>> {
+    crate::backend::scm::manager::service_account_sid(Some(account), None)
 }
 
 /// Whether the account `sid` holds the logon right `right` (`"SeBatchLogonRight"`), as the local security

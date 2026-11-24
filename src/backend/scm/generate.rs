@@ -472,7 +472,15 @@ pub fn account_needs_password(account: Option<&str>) -> bool {
     if windows_builtin(account).is_some() {
         return false;
     }
-    !account.to_ascii_lowercase().starts_with(r"nt service\")
+    virtual_service_name(account).is_none()
+}
+
+/// The service name of a virtual per-service account, `NT SERVICE\<name>` in any case: `Some("<name>")`. Any other
+/// account is `None`.
+pub(crate) fn virtual_service_name(account: &str) -> Option<&str> {
+    const PREFIX: &str = r"NT SERVICE\";
+    let (prefix, name) = account.split_at_checked(PREFIX.len())?;
+    prefix.eq_ignore_ascii_case(PREFIX).then_some(name)
 }
 
 // Extraction ==========================================================================================================

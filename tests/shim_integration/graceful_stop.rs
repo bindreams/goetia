@@ -482,13 +482,19 @@ fn a_service_account_is_asked_through_the_proxy(#[fixture(scm_group)] _group: &G
             // Held until the service has stopped: the account cannot run the build tree's binary.
             let exe = WorldReadableExe::new(&id);
 
+            let user = user(&id);
+            let User::Name(account) = &user else {
+                panic!("these accounts are named: {user:?}");
+            };
+            let logs = LogDir::for_account(account);
+
             let stopped = run_to_stop(Run {
                 mgr: &mgr,
                 how: StopBy::Goetia,
                 setup,
-                logs: LogDir::world_writable(),
+                logs,
                 exe: exe.path_str(),
-                user: user(&id),
+                user,
                 id,
             });
 

@@ -2401,6 +2401,26 @@ fn the_three_well_known_accounts_have_their_sids() {
     }
 }
 
+/// The SID the check of a task's own log trusts is found by the lookups an install makes and none of its writes: a
+/// well-known account by its SID, a real user by the check that it is a user account.
+#[skuld::test]
+fn a_tasks_account_sid_is_found_without_any_write() {
+    assert_eq!(
+        task_account_sid(&TaskAccount::Service("S-1-5-19".to_string()), None).unwrap(),
+        sid_from_parts(5, &[19])
+    );
+    assert!(task_account_sid(&TaskAccount::Service("S-1-5-21".to_string()), None).is_err());
+
+    // The token's own SID, written as `user.id`: a user account on a developer host, `SYSTEM` on a service host.
+    let token = process_user_sid();
+    let written = sid_display(&token);
+    let name = account_name_of_sid(&token).expect("the token user has a name");
+    match task_account_sid(&TaskAccount::User(name), Some(Written::Sid(&written))) {
+        Ok(sid) => assert_eq!(sid, token),
+        Err(refused) => assert!(refused.to_string().contains("is not a user account"), "{refused}"),
+    }
+}
+
 // Enable and disable ==================================================================================================
 
 /// What the installed XML holds beyond what goetia wrote: a hand edit of a value, which `enable` and

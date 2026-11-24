@@ -1354,7 +1354,7 @@ fn the_marker_line_is_the_first_line_of_the_log() {
     assert_eq!(
         run.fake.opened_log_kind(0),
         LogKind::Own,
-        "the user's own `logs` has its folders made"
+        "the user's own `logs` is opened as its own: the shim makes its file and no folder"
     );
     assert_eq!(run.finish(), Vec::<String>::new());
 }

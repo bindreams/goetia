@@ -15,8 +15,9 @@
 //! caller in `manager.rs`), and neither reference repo (`hole`, `wsm`) has
 //! solved this for any other account.
 
+use windows_sys::Wdk::Storage::FileSystem::RtlCreateServiceSid;
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_INVALID_SID, ERROR_NONE_MAPPED, LocalFree,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_INVALID_SID, ERROR_NONE_MAPPED, LocalFree, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::Authentication::Identity::{
     LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose, LsaNtStatusToWinError, LsaOpenPolicy,
@@ -29,6 +30,7 @@ use windows_sys::Win32::Security::{
 };
 
 use crate::backend::Identity;
+use crate::backend::scm::generate::virtual_service_name;
 use crate::backend::scm::sid::{Sid, copy_sid, is_whole_sid, sid_display};
 use crate::backend::scm::task_xml::builtin_sid;
 use crate::backend::scm::wide::wide_null;
@@ -177,18 +179,56 @@ pub(in crate::backend::scm) fn sid_of_principal(principal: &str) -> Result<Sid> 
 
 /// The SID of the account a service registered as `account`
 /// ([`ScmRegistration::account`](crate::backend::scm::generate::ScmRegistration::account)) runs as: `None` is LocalSystem and a recognised built-in is its well-known SID, neither of which
-/// `LookupAccountNameW` resolves by the spelling goetia registers; any other account is looked up. A
+/// `LookupAccountNameW` resolves by the spelling goetia registers; a virtual account (`NT SERVICE\<name>`) is
+/// [`virtual_account_sid`], whether or not the service exists; any other account is looked up. A
 /// `written` `user.id` is the SID the spec gave, which the logon gate used too: the name it registers is not
-/// looked up again. A virtual account (`NT SERVICE\<id>`) resolves only once the service exists, so call this
-/// after it is created. A real user's SID is the one [`require_user_account`] found, which the caller keeps.
-pub(in crate::backend::scm) fn service_account_sid(account: Option<&str>, written: Option<Written>) -> Result<Sid> {
+/// looked up again. A real user's SID is the one [`require_user_account`] found, which the caller keeps.
+pub(crate) fn service_account_sid(account: Option<&str>, written: Option<Written>) -> Result<Sid> {
     if let Some(Written::Sid(sid)) = written {
         return sid_from_string(sid, Some("user.id"));
     }
     let account = account.unwrap_or_default();
     match windows_builtin(account) {
         Some(builtin) => sid_from_string(builtin_sid(builtin), None),
-        None => sid_for_account_name(account, None).map(|(sid, _kind)| sid),
+        None => match virtual_service_name(account) {
+            Some(service) => virtual_account_sid(service),
+            None => sid_for_account_name(account, None).map(|(sid, _kind)| sid),
+        },
+    }
+}
+
+/// The SID of the virtual account of the service named `service` (`NT SERVICE\<service>`), which the system
+/// computes from the name by `RtlCreateServiceSid`: the account has the same SID whether or not a service of that
+/// name exists, and a lookup of its name finds it only once one does.
+fn virtual_account_sid(service: &str) -> Result<Sid> {
+    let action = || format!("derive the SID of virtual account `NT SERVICE\\{service}`");
+    let mut wide = wide_null(service).map_err(|e| refused_input(action(), e))?;
+    wide.pop();
+    let bytes = u16::try_from(wide.len() * 2)
+        .map_err(|_| refused_input(action(), std::io::Error::other("the name is too long")))?;
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: wide.as_mut_ptr(),
+    };
+    // `SECURITY_MAX_SID_SIZE`.
+    let mut sid = vec![0u8; 68];
+    let mut length = sid.len() as u32;
+    // SAFETY: `name` points at `wide`, live for the call, `Length` bytes of it; `sid` has `length` writable bytes.
+    let status = unsafe { RtlCreateServiceSid(&name, sid.as_mut_ptr().cast(), &mut length) };
+    if status != 0 {
+        // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS` value and cannot fail.
+        let win32 = unsafe { LsaNtStatusToWinError(status) };
+        return Err(account_error(action(), std::io::Error::from_raw_os_error(win32 as i32)));
+    }
+    sid.truncate(length as usize);
+    if is_whole_sid(&sid) {
+        Ok(sid)
+    } else {
+        Err(Error::os(
+            action(),
+            std::io::Error::other("the SID it wrote is not a whole SID"),
+        ))
     }
 }
 

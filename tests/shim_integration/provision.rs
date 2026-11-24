@@ -485,7 +485,9 @@ fn install_refuses_doctored_folder(#[fixture(scm_group)] _group: &Group) {
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
     match mgr.install(&spec, false) {
-        Err(Error::FolderUnsafe { path, account, right }) => {
+        Err(Error::FolderUnsafe {
+            path, account, right, ..
+        }) => {
             assert_eq!(path, doctored.folder);
             assert_eq!(right, goetia::testing::CHANGE_PERMISSIONS_OF);
             assert!(account.ends_with("Users"), "{account}");
@@ -518,7 +520,9 @@ fn install_refuses_a_host_file_users_can_write_to(#[fixture(scm_group)] _group: 
     let standalone = |check| Scm::with_shim(StandaloneShim::new(host.clone(), vec![]), check);
 
     match standalone(CheckPermissions::Enable).install(&spec, false) {
-        Err(Error::FolderUnsafe { path, account, right }) => {
+        Err(Error::FolderUnsafe {
+            path, account, right, ..
+        }) => {
             assert_eq!(path, host);
             assert_eq!(right, goetia::testing::WRITE_TO);
             assert!(account.ends_with("Users"), "{account}");
@@ -652,11 +656,18 @@ fn the_output_of_a_virtual_account_service_lands_in_its_default_log(#[fixture(sc
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
     let (_folder, _folder_guard) = default_folder();
-    let logs = LogDir::world_writable();
+    // A daemon's own log folder is changeable by its own account and no other, so each account has a folder; they
+    // are kept until the test ends, after every service has stopped.
+    let folders = std::cell::RefCell::new(Vec::new());
     let mgr = embedded_manager(None, CheckPermissions::Enable);
 
     let as_user = |label: &str, user: fn(&str) -> User| {
         runs_as(label, &mgr, |id, exe, port| {
+            let user = user(id);
+            let logs = match &user {
+                User::Name(account) => LogDir::for_account(account),
+                _ => LogDir::new(),
+            };
             let spec = ServiceSpec::new({
                 let base = service_fields(simple_spec(
                     id,
@@ -664,15 +675,13 @@ fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
                     &logs,
                 ));
                 ServiceFields {
-                    common: DaemonFields {
-                        user: user(id),
-                        ..base.common
-                    },
+                    common: DaemonFields { user, ..base.common },
                     ..base
                 }
             })
             .map(DaemonSpec::from)
             .unwrap();
+            folders.borrow_mut().push(logs);
             mgr.install(&spec, false)
                 .unwrap_or_else(|e| panic!("{label}: install: {}", e.report()));
         });
@@ -687,6 +696,7 @@ fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
     let password = "Goetia!Test12";
     let account = format!("gt{:08x}", rand::random::<u32>());
     let _user = LocalUserGuard::create(&account, password);
+    let logs = LogDir::for_account(&account);
     runs_as("a local user", &mgr, |id, exe, port| {
         let output = Command::new(support::current_exe_str())
             .arg(INSTALL_AS)

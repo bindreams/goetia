@@ -94,7 +94,9 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
     let listener = ConnectBack::listen();
     let daily = daily_in_half_a_day();
     let mut manifest = Manifest::new(id, runs_until_released(&listener), &daily);
-    // Declared after the manifest, so the task is removed before the directory its log is in.
+    // The folder of the task's own log: protected, as an install requires of one. Declared before the guard, so
+    // the task is removed before the directory its log is in.
+    let log_dir = support::protected_dir(&[]);
     let _guard = ServiceGuard::new(id);
 
     // 1. Installed, the task is idle and disarmed.
@@ -214,7 +216,7 @@ fn the_demonstration_runs_through_the_binary(#[fixture(scm_group)] _group: &Grou
 
     // 4. `run` shows the output and exits with the run's result. The same id, installed again with another
     // command: a disarmed task is replaced.
-    let logs: PathBuf = manifest.dir().join("task.log");
+    let logs: PathBuf = log_dir.path().join("task.log");
     manifest.command = prints_and_exits(7, "a-known-line");
     manifest.logs = Some(logs);
     cli.install(&manifest);

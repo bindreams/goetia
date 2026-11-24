@@ -123,8 +123,12 @@ impl Drop for ShimGuard {
     }
 }
 
-/// A temp dir the test owns, for everything its daemons write: their logs, which the shims' own
+/// A folder the test owns, for everything its daemons write: their logs, which the shims' own
 /// failure lines join once they have read the spec.
+///
+/// Under `%ProgramData%` and protected ([`support::protected_dir`]), as an install requires of the folder of a
+/// daemon's own `logs:`: only SYSTEM, Administrators and the one account its daemons run as can change it, so
+/// every daemon that logs here runs as that account.
 ///
 /// Removed on drop by a [`support::cleanup::DirGuard`]: a daemon may still hold its log while its
 /// service stops. Declared in creation order, before the [`ShimGuard`]s that use it (see the
@@ -132,24 +136,17 @@ impl Drop for ShimGuard {
 pub struct LogDir(support::cleanup::DirGuard);
 
 impl LogDir {
+    /// For daemons that run as SYSTEM.
     pub fn new() -> Self {
-        // `keep` hands the removal to the `DirGuard`, which does not ignore a failure.
-        Self(support::cleanup::DirGuard::new(
-            tempfile::tempdir().expect("tempdir for the daemons' logs").keep(),
-        ))
+        Self(support::protected_dir(&[]))
     }
 
-    /// Like [`Self::new`], but under `%ProgramData%` and writable by every account, for a daemon
-    /// whose service account cannot write the runner's `%TEMP%`.
-    pub fn world_writable() -> Self {
-        let path = support::program_data().join(support::random_test_id());
-        let guard = support::cleanup::DirGuard::new(path.clone());
-        std::fs::create_dir(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
-        let path_str = path
-            .to_str()
-            .unwrap_or_else(|| panic!("{} is not UTF-8", path.display()));
-        support::cmd::run("icacls", &[path_str, "/grant", "*S-1-1-0:(OI)(CI)(M)"]).expect_ok();
-        Self(guard)
+    /// For daemons that run as `account`, written as a `user.name` is (a built-in's name, `NT SERVICE\<id>` for a
+    /// service that is not installed yet, or a local account's).
+    pub fn for_account(account: &str) -> Self {
+        let sid = goetia::testing::service_account_sid(account)
+            .unwrap_or_else(|e| panic!("the SID of `{account}`: {}", e.report()));
+        Self(support::protected_dir(&[goetia::testing::shown_sid(&sid)]))
     }
 
     pub fn path(&self) -> &Path {

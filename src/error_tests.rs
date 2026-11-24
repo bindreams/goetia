@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use std::error::Error as _;
 
-use super::{BoxError, Error, Occupant, PutBackFound, SharedError, VersionReading};
+use super::{BoxError, Error, FolderRole, Occupant, PutBackFound, SharedError, VersionReading};
 use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
 use crate::spec::DaemonKind;
 
@@ -197,6 +197,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             path: PathBuf::new(),
             account: String::new(),
             right: OWN,
+            role: FolderRole::Shim,
         },
         Error::FolderNotAsMade { path: PathBuf::new() },
         Error::TaskFolderKept {
@@ -1065,12 +1066,36 @@ fn report_of_an_unsafe_folder_names_the_path_the_account_and_the_right() {
         path: PathBuf::from("/p"),
         account: "Users".to_string(),
         right: CHANGE_PERMISSIONS_OF,
+        role: FolderRole::Shim,
     };
     assert_eq!(
         e.report().to_string(),
         "refusing to use /p: Users can change permissions of it, so it could replace what goetia keeps in it; fix its permissions"
     );
     assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_an_unsafe_daemon_log_names_the_daemon_and_the_icacls_line_that_fixes_it() {
+    let unsafe_log = |daemon_sid: &str| Error::FolderUnsafe {
+        path: PathBuf::from(r"C:\logs\app"),
+        account: "Users".to_string(),
+        right: "add entries to",
+        role: FolderRole::DaemonLog {
+            folder: PathBuf::from(r"C:\logs\app"),
+            daemon: "Daemon".to_string(),
+            daemon_sid: daemon_sid.to_string(),
+        },
+    };
+    assert_eq!(
+        unsafe_log("S-1-5-19").report().to_string(),
+        r#"refusing to use C:\logs\app: Users can add entries to it, so it could point the log of the daemon, which runs as Daemon, at any file Daemon can write; put `logs:` in a folder that only administrators and Daemon can change (for a folder that exists, run in an elevated prompt `icacls "C:\logs\app" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-19:(OI)(CI)M`), or remove `logs:` to use goetia's own log"#
+    );
+    // SYSTEM and Administrators already hold full control in the line.
+    for sid in ["S-1-5-18", "S-1-5-32-544"] {
+        let text = unsafe_log(sid).report().to_string();
+        assert!(text.contains("*S-1-5-32-544:(OI)(CI)F`)"), "{text}");
+    }
 }
 
 #[skuld::test]
