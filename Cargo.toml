@@ -98,7 +98,7 @@ gethostname = "1.1.0"
 humantime = "2"
 # The times `daemon status` and `daemon list` print, RFC 3339 in the system time zone (`cli::report`), behind
 # `cli`. The default features bundle a zone database where the host has none (Windows).
-jiff = { version = "0.2.43", optional = true }
+jiff = { version = "1.0.0", optional = true }
 # The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
 # costs one fast pass.
 memchr = "2"
@@ -142,7 +142,7 @@ nix = { version = "0.32", features = ["user", "fs", "dir", "event"] }
 # `backend::launchd::next`, the next fire of a task's calendar entries in the system time zone, which
 # `launchd` (calendar intervals only, no next-fire query) cannot tell, with zones read from
 # `/etc/localtime`'s bytes. Unconditional: the launchd backend needs it without the `cli` feature.
-jiff = "0.2.43"
+jiff = "1.0.0"
 
 [target.'cfg(windows)'.dependencies]
 # The real SCM backend (`src/backend/scm/manager.rs`). Not `optional`/`cli`-gated:
@@ -216,7 +216,7 @@ goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.7"
 # The tests' `jiff`: `backend::launchd::next`'s unit tests off macOS, and the integration tests, which cannot see
 # the library's optional `jiff`. Default features bundle a zone database where the host has none (Windows).
-jiff = "0.2.43"
+jiff = "1.0.0"
 libsearch-guard.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
